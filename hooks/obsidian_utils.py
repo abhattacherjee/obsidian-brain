@@ -515,6 +515,52 @@ def get_project_name(cwd: str) -> str:
     return Path(cwd).name if cwd else "unknown"
 
 
+def build_raw_fallback(user_msgs: list[str], metadata: dict) -> str:
+    """Build a note body without AI summarization -- raw data extraction."""
+    sections: list[str] = []
+
+    project = metadata.get("project", "unknown")
+    duration = metadata.get("duration_minutes", 0)
+
+    sections.append("## Summary")
+    sections.append(
+        f"Session in **{project}** ({duration} min). "
+        "AI summary unavailable \u2014 raw extraction below.\n"
+    )
+
+    sections.append("## Key Decisions")
+    sections.append("_Not extracted (AI summary unavailable)._\n")
+
+    sections.append("## Changes Made")
+    files = metadata.get("files_touched", [])
+    if files:
+        for f in files[:20]:
+            sections.append(f"- `{f}`")
+    else:
+        sections.append("None detected.")
+    sections.append("")
+
+    sections.append("## Errors Encountered")
+    errors = metadata.get("errors", [])
+    if errors:
+        for e in errors[:10]:
+            sections.append(f"- {e}")
+    else:
+        sections.append("None.")
+    sections.append("")
+
+    sections.append("## Open Questions / Next Steps")
+    sections.append("_Not extracted (AI summary unavailable)._\n")
+
+    sections.append("## User Messages (raw)")
+    for i, msg in enumerate(user_msgs, 1):
+        snippet = msg[:500].replace("\n", " ")
+        sections.append(f"{i}. {snippet}")
+    sections.append("")
+
+    return "\n".join(sections)
+
+
 def is_resumed_session(
     vault_path: str, sessions_folder: str, session_id: str
 ) -> bool:
