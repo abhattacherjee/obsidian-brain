@@ -65,13 +65,19 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
 
 1. **Read the full file** using the Read tool.
 2. **Extract frontmatter** — preserve it exactly as-is (everything between the opening `---` and closing `---`).
-3. **Extract raw user messages** — look for the content after the summary sections. This is the raw session data to summarize.
-4. **Generate a structured summary** from the raw content. Produce these sections:
-   - `## Summary` — 2-3 sentence overview of what was accomplished
-   - `## Key Decisions` — Bulleted list of architectural or design decisions made
-   - `## Changes Made` — Bulleted list of files changed or features implemented
-   - `## Errors Encountered` — Bulleted list of errors hit and how they were resolved (or "_None._" if clean)
-   - `## Open Questions / Next Steps` — Bulleted list of unfinished items or follow-up tasks
+3. **Extract the full conversation** — look for all content after frontmatter. The raw note now includes:
+   - `## Conversation (raw)` — interleaved user and assistant messages
+   - `## Tool Usage` — commands run, files edited, searches performed
+   - `## Changes Made` — files touched (from tool_use extraction)
+   - `## Errors Encountered` — errors from tool results
+   Read ALL of these sections — they provide the context needed for a high-quality summary.
+
+4. **Generate a detailed, specific summary** from the raw content. Be precise — include file paths, function names, config values, and technical specifics. Produce these sections:
+   - `## Summary` — 3-5 sentence overview. Include: what problem was being solved, what approach was taken, what was the outcome. Name specific technologies, files, and patterns.
+   - `## Key Decisions` — Bulleted list with rationale. Each bullet should explain the decision AND why it was made (e.g., "Chose Redis over Memcached for session store — needed TTL per key for token expiry"). If none, write "None noted."
+   - `## Changes Made` — Bulleted list with file paths and descriptions. Be specific: "Modified `src/auth/handler.ts` — added JWT refresh token rotation with 15min access / 7day refresh windows". Include commit messages if visible. If none, write "None noted."
+   - `## Errors Encountered` — Bulleted list with error messages, root causes, AND fixes. Be specific: "`TypeError: Cannot read property 'token' of undefined` in handler.ts:42 — caused by null user object when session expired, fixed with optional chaining". If none, write "None."
+   - `## Open Questions / Next Steps` — Checkbox list of specific, actionable items. Not vague ("improve performance") but concrete ("Add rate limiting to /api/auth/refresh endpoint, max 10 req/min per user"). If none, write "None."
 5. **Preserve the Session Metadata section** at the bottom if it exists (commits, files touched).
 6. **Write the upgraded note** using the Write tool — same file path. The structure must be:
    - Original frontmatter (unchanged)

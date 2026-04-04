@@ -21,6 +21,7 @@ from obsidian_utils import (  # noqa: E402
     build_raw_fallback,
     extract_assistant_messages,
     extract_session_metadata,
+    extract_tool_uses,
     extract_user_messages,
     generate_summary,
     is_resumed_session,
@@ -161,8 +162,9 @@ def _run() -> None:
     project_slug = slugify(metadata.get("project", "session"))
     filename = make_filename(date_str, project_slug, session_id)
 
-    # 9. Write raw note FIRST -- guarantees a note even if summarization fails
-    raw_body = build_raw_fallback(user_msgs, metadata)
+    # 9. Extract tool usage details and write raw note FIRST
+    tool_uses = extract_tool_uses(messages)
+    raw_body = build_raw_fallback(user_msgs, metadata, assistant_msgs=assistant_msgs, tool_uses=tool_uses)
     raw_content = _build_note(session_id, metadata, raw_body, resumed=resumed)
     if not write_vault_note(vault_path, sessions_folder, filename, raw_content):
         print("[obsidian-brain] failed to write raw note, aborting", file=sys.stderr)

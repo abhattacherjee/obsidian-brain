@@ -510,13 +510,68 @@ def should_skip_session(
     return False
 
 
+def extract_tool_uses(messages: list[dict]) -> list[dict]:
+    """Extract tool usage details from transcript for the raw fallback note.
+
+    Returns a list of dicts: [{"name": "Edit", "detail": "file.py:10-20"}, ...]
+    """
+    tool_uses: list[dict] = []
+    for entry in messages:
+        msg = entry.get("message", {})
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name", "")
+            inp = block.get("input", {}) if isinstance(block.get("input"), dict) else {}
+            detail = ""
+            if name in ("Edit", "Write", "MultiEdit"):
+                fp = inp.get("file_path", "")
+                detail = f"`{fp}`" if fp else ""
+            elif name == "Bash":
+                cmd = inp.get("command", "")[:120]
+                detail = f"`{cmd}`" if cmd else ""
+            elif name == "Read":
+                fp = inp.get("file_path", "")
+                detail = f"`{fp}`" if fp else ""
+            elif name in ("Grep", "Glob"):
+                pattern = inp.get("pattern", "")
+                detail = f'pattern="{pattern}"' if pattern else ""
+            elif name == "WebFetch":
+                url = inp.get("url", "")[:80]
+                detail = url if url else ""
+            elif name == "WebSearch":
+                query = inp.get("query", "")[:80]
+                detail = f'"{query}"' if query else ""
+            elif name == "Agent":
+                desc = inp.get("description", "")[:80]
+                detail = desc if desc else ""
+            else:
+                detail = ""
+
+            if name:
+                tool_uses.append({"name": name, "detail": detail})
+    return tool_uses
+
+
 def get_project_name(cwd: str) -> str:
     """Return the basename of the working directory as the project name."""
     return Path(cwd).name if cwd else "unknown"
 
 
-def build_raw_fallback(user_msgs: list[str], metadata: dict) -> str:
-    """Build a note body without AI summarization -- raw data extraction."""
+def build_raw_fallback(
+    user_msgs: list[str],
+    metadata: dict,
+    assistant_msgs: list[str] | None = None,
+    tool_uses: list[dict] | None = None,
+) -> str:
+    """Build a detailed note body without AI summarization -- raw data extraction.
+
+    Includes user messages, assistant messages, tool usage, files touched,
+    and errors for maximum context when /recall does deferred summarization.
+    """
     sections: list[str] = []
 
     project = metadata.get("project", "unknown")
@@ -534,16 +589,28 @@ def build_raw_fallback(user_msgs: list[str], metadata: dict) -> str:
     sections.append("## Changes Made")
     files = metadata.get("files_touched", [])
     if files:
-        for f in files[:20]:
+        for f in files[:30]:
             sections.append(f"- `{f}`")
     else:
         sections.append("None detected.")
     sections.append("")
 
+    # Tool usage details (commands run, files edited)
+    if tool_uses:
+        sections.append("## Tool Usage")
+        for tu in tool_uses[:30]:
+            name = tu.get("name", "")
+            detail = tu.get("detail", "")
+            if name and detail:
+                sections.append(f"- **{name}**: {detail}")
+            elif name:
+                sections.append(f"- **{name}**")
+        sections.append("")
+
     sections.append("## Errors Encountered")
     errors = metadata.get("errors", [])
     if errors:
-        for e in errors[:10]:
+        for e in errors[:15]:
             sections.append(f"- {e}")
     else:
         sections.append("None.")
@@ -552,10 +619,24 @@ def build_raw_fallback(user_msgs: list[str], metadata: dict) -> str:
     sections.append("## Open Questions / Next Steps")
     sections.append("_Not extracted (AI summary unavailable)._\n")
 
-    sections.append("## User Messages (raw)")
-    for i, msg in enumerate(user_msgs, 1):
-        snippet = msg[:500].replace("\n", " ")
-        sections.append(f"{i}. {snippet}")
+    # Interleaved conversation for /recall to summarize
+    sections.append("## Conversation (raw)")
+    max_turns = 40
+    u_idx, a_idx = 0, 0
+    turn = 0
+    while turn < max_turns and (u_idx < len(user_msgs) or (assistant_msgs and a_idx < len(assistant_msgs))):
+        if u_idx < len(user_msgs):
+            snippet = user_msgs[u_idx][:600].replace("\n", " ")
+            # Skip system noise (task notifications, command loading, etc.)
+            if not snippet.startswith("<task-notification>") and not snippet.startswith("Base directory for this skill:") and not snippet.startswith("<local-command"):
+                sections.append(f"**User:** {snippet}")
+                turn += 1
+            u_idx += 1
+        if assistant_msgs and a_idx < len(assistant_msgs):
+            snippet = assistant_msgs[a_idx][:600].replace("\n", " ")
+            sections.append(f"**Assistant:** {snippet}")
+            a_idx += 1
+            turn += 1
     sections.append("")
 
     return "\n".join(sections)
