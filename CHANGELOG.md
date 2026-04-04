@@ -2,19 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-04-04
+
+### Improved
+
+- **Richer session notes** — raw fallback notes now include assistant messages, tool usage details (commands run, files edited, searches performed), and interleaved conversation (up to 40 turns). System noise (task notifications, skill loading) is filtered out.
+- **Better `/recall` summaries** — summarization prompt now demands specific technical details: file paths, function names, decision rationale, error root causes with fixes, and concrete next steps.
+
+### Fixed
+
+- Raw notes previously only captured user messages (15 max). Now captures full conversation with both sides for `/recall` to produce high-quality summaries.
+
 ## [1.0.0] - 2026-04-04
 
 ### Added
 
-- SessionEnd hook: auto-logs sessions to Obsidian vault with structured frontmatter
-- SessionStart hook: injects last-session context hint
-- PreCompact hook: saves context snapshot before compression
-- `/obsidian-setup` skill: first-run vault configuration
-- `/compress` skill: curated insight capture
-- `/recall` skill: project-scoped context resume with deferred summarization
-- `/vault-search` skill: cross-project search by keyword, tag, or metadata
-- `/decide` skill: architectural decision logging (ADR-lite)
-- `/error-log` skill: error + fix capture
-- `/vault-import` skill: backfill historical sessions
-- 3 Dataview dashboard templates
-- 6 note type templates
+- **Auto-logging** — SessionEnd hook automatically writes structured session notes to your Obsidian vault with YAML frontmatter, tags, and metadata. Uses a write-first pattern: raw note is always saved, AI summary attempted as best-effort upgrade.
+- **Context hints** — SessionStart hook injects a one-line summary of the last session for the current project, giving you immediate continuity.
+- **Context snapshots** — PreCompact hook saves a snapshot of your current context before compression or clear, preserving context that would otherwise be lost.
+- **`/obsidian-setup`** — Interactive first-run configuration. Sets vault path, creates folders, copies Dataview dashboards, writes config.
+- **`/compress`** — Curate and save specific insights from the current session. Suggests candidates or accepts a topic argument. Interactive preview with tag editing.
+- **`/recall`** — Load project-scoped context from vault history. Finds your last session, open items, and all curated insights. Includes deferred summarization — upgrades raw notes with AI summaries on demand.
+- **`/vault-search`** — Search across all sessions and insights by keyword, tag, or structured queries (e.g., `project:api-service type:decision`).
+- **`/decide`** — Log architectural decisions in ADR-lite format: Context, Options, Decision, Rationale, Consequences.
+- **`/error-log`** — Capture errors with root cause, fix, and prevention steps for future reference.
+- **`/vault-import`** — Backfill historical sessions from CC conversation history. Uses `/conversation-search` for discovery and parallel `/context-shield` sub-agents for processing.
+- **Dataview dashboards** — 3 ready-to-use dashboards: Sessions Overview, Project Index, Weekly Review.
+- **Note templates** — 6 templates for all note types: session, insight, decision, error-fix, snapshot, imported session.
+- **Plugin distribution** — Installable via Claude Code plugin system from GitHub.
