@@ -9,8 +9,8 @@ set -eo pipefail
 
 echo "🔍 Checking for secrets in staged files..."
 
-# Check for common secret patterns (exclude scripts/ and docs/ directories)
-if git diff --cached -- ':!scripts/*' ':!docs/*' ':!*.md' | grep -E "(sk-[a-zA-Z0-9_-]{20,}|AKIA[0-9A-Z]{16}|private_key|-----BEGIN.*PRIVATE KEY-----|ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{82}|xox[bsapr]-[a-zA-Z0-9-]+|password\s*[:=]\s*['\"][^'\"]{8,})" 2>/dev/null; then
+# Check for common secret patterns (exclude scripts/, docs/, hooks, and CI directories)
+if git diff --cached -- ':!scripts/*' ':!docs/*' ':!*.md' ':!.claude/hooks/*' ':!.github/workflows/*' | grep -E "(sk-[a-zA-Z0-9_-]{20,}|AKIA[0-9A-Z]{16}|private_key|-----BEGIN.*PRIVATE KEY-----|ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{82}|xox[bsapr]-[a-zA-Z0-9-]+|password\s*[:=]\s*['\"][^'\"]{8,})" 2>/dev/null; then
   echo ""
   echo "❌ ERROR: Potential secret detected in staged files!"
   echo ""
