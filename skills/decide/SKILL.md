@@ -90,6 +90,8 @@ Present the full note to the user including frontmatter:
 ---
 type: claude-decision
 date: YYYY-MM-DD
+source_session: <current-session-id>
+source_session_note: "[[<session-note-filename>]]"
 project: <project-name>
 status: active
 tags:
@@ -128,7 +130,18 @@ tags:
 
 Where:
 - `YYYY-MM-DD` is today's date
+- `<current-session-id>` and `<session-note-filename>` are derived together. First, get the session ID by finding the most recently modified `.jsonl` file:
+  ```bash
+  SESSION_ID=$(ls -t ~/.claude/projects/*"$(basename "$PWD")"/*.jsonl 2>/dev/null | head -1 | xargs -I{} basename {} .jsonl)
+  ```
+  Then derive the 4-char hash and find the matching session note in the vault:
+  ```bash
+  HASH=$(echo -n "$SESSION_ID" | shasum -a 256 | cut -c1-4)
+  SESSION_NOTE=$(ls $VAULT_PATH/$SESSIONS_FOLDER/*-$HASH.md 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.md$//')
+  ```
+  If the session ID can't be derived, use `unknown` for `source_session` and omit `source_session_note`. If the session note doesn't exist yet, include `source_session` but omit `source_session_note`.
 - `<project-name>` is derived from the current working directory name (basename of the git repo root or cwd)
+- The `source_session_note` field creates an Obsidian backlink to the source session note
 
 Ask the user:
 

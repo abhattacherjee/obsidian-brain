@@ -103,6 +103,7 @@ Present the full note to the user including frontmatter:
 type: claude-insight
 date: YYYY-MM-DD
 source_session: <current-session-id>
+source_session_note: "[[<session-note-filename>]]"
 project: <project-name>
 tags:
   - claude/insight
@@ -118,8 +119,18 @@ tags:
 
 Where:
 - `YYYY-MM-DD` is today's date
-- `<current-session-id>` is extracted from the environment variable `CLAUDE_SESSION_ID` if available, otherwise use `unknown`
+- `<current-session-id>` and `<session-note-filename>` are derived together. First, get the session ID by finding the most recently modified `.jsonl` file:
+  ```bash
+  SESSION_ID=$(ls -t ~/.claude/projects/*"$(basename "$PWD")"/*.jsonl 2>/dev/null | head -1 | xargs -I{} basename {} .jsonl)
+  ```
+  Then derive the 4-char hash and find the matching session note in the vault:
+  ```bash
+  HASH=$(echo -n "$SESSION_ID" | shasum -a 256 | cut -c1-4)
+  SESSION_NOTE=$(ls $VAULT_PATH/$SESSIONS_FOLDER/*-$HASH.md 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.md$//')
+  ```
+  If the session ID can't be derived, use `unknown` for `source_session` and omit the `source_session_note` field entirely. If the session note file doesn't exist yet (current session hasn't ended), still include `source_session` but omit `source_session_note`.
 - `<project-name>` is derived from the current working directory name (basename of the git repo root or cwd)
+- The `source_session_note` field creates an Obsidian backlink from the insight to its source session, enabling bidirectional navigation in the graph view
 
 Ask the user:
 

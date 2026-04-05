@@ -1,6 +1,8 @@
 ---
 type: claude-decision
 date: {{date}}
+source_session: {{source_session}}
+source_session_note: "[[{{source_session_note}}]]"
 project: {{project}}
 status: active
 tags:
