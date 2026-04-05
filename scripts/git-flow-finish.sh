@@ -417,13 +417,20 @@ else
   # Ensure [Unreleased] header exists in CHANGELOG.md
   if [[ -f CHANGELOG.md ]]; then
     if ! grep -q '## \[Unreleased\]' CHANGELOG.md; then
-      # Add [Unreleased] header at the top (after the file header)
-      sed -i '' '/^## \[/i\
-## [Unreleased]\
-' CHANGELOG.md
+      # Add [Unreleased] header once before the first version header, portably
+      changelog_tmp="$(mktemp)"
+      awk '
+        BEGIN { inserted = 0 }
+        /^## \[/ && !inserted {
+          print "## [Unreleased]"
+          print ""
+          inserted = 1
+        }
+        { print }
+      ' CHANGELOG.md > "$changelog_tmp"
+      mv "$changelog_tmp" CHANGELOG.md
       log_ok "Added [Unreleased] header to CHANGELOG.md"
     else
-      # Ensure [Unreleased] section is empty (no leftover entries)
       log_ok "[Unreleased] header already exists in CHANGELOG.md"
     fi
   fi

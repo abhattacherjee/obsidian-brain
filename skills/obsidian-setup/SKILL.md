@@ -33,7 +33,7 @@ cat ~/.claude/obsidian-brain-config.json 2>/dev/null
 > - **reconfigure** — start fresh (will overwrite config and dashboards)
 > - **cancel** — exit setup
 
-If **upgrade**: store `MODE=upgrade`. Use `vault_path` from the existing config. Skip to Step 5 (Create vault folders — `mkdir -p` is already safe). In upgrade mode:
+If **upgrade**: store `MODE=upgrade`. Store `VAULT_PATH` from the existing config's `vault_path` field. Also extract `sessions_folder` (default `claude-sessions`), `insights_folder` (default `claude-insights`), and `dashboards_folder` (default `claude-dashboards`). Skip to Step 5 (Create vault folders — `mkdir -p` is already safe). In upgrade mode:
 - Step 5 (Create vault folders): runs normally (`mkdir -p` is idempotent)
 - Step 6 (Install dashboards): only write dashboard files that do NOT already exist (`test -f` before each write)
 - Step 7 (Write config): SKIP entirely — preserve existing config
