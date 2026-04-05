@@ -5,24 +5,23 @@
 # Installed by /harden-repo
 #
 # Usage:
-#   ./scripts/git-flow-finish.sh <branch-type> <version> [--skip-changelog] [--dry-run]
+#   ./scripts/git-flow-finish.sh <branch-type> <version> [--dry-run]
 #
 # Examples:
 #   ./scripts/git-flow-finish.sh hotfix v1.0.6
 #   ./scripts/git-flow-finish.sh release v2.0.0
 #   ./scripts/git-flow-finish.sh hotfix v1.0.6 --dry-run
-#   ./scripts/git-flow-finish.sh hotfix v1.0.6 --skip-changelog
 
 set -eu
 
 # ── Constants ──────────────────────────────────────────────────────
 REPO=""
 BRANCH_TYPE=""
+BRANCH_TYPE_CAPITALIZED=""
 VERSION=""
 VERSION_NUMBER=""
 SOURCE_BRANCH=""
 DRY_RUN=false
-SKIP_CHANGELOG=false
 MERGE_VIA_PR=false
 
 # ── Functions ──────────────────────────────────────────────────────
@@ -36,14 +35,13 @@ Arguments:
   version       Version with v prefix (e.g., v1.0.6)
 
 Options:
-  --skip-changelog  Skip changelog promotion (already done by sub-agents)
   --dry-run         Show what would be done without executing
   --help, -h        Show this help message
 
 Examples:
   git-flow-finish.sh hotfix v1.0.6
   git-flow-finish.sh release v2.0.0
-  git-flow-finish.sh hotfix v1.0.6 --skip-changelog --dry-run
+  git-flow-finish.sh hotfix v1.0.6 --dry-run
 
 What this script does:
   1. Merges the source branch to main (--no-ff)
@@ -240,7 +238,6 @@ shift 2
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=true ;;
-    --skip-changelog) SKIP_CHANGELOG=true ;;
     --help|-h) usage ;;
     *) die "Unknown option: $1" ;;
   esac
@@ -291,6 +288,9 @@ fi
 
 log_ok "On $SOURCE_BRANCH, clean, all pushed"
 
+# Capitalize first letter (POSIX-compatible; ${VAR^} requires bash 4+ and macOS ships bash 3.2)
+BRANCH_TYPE_CAPITALIZED="$(echo "$BRANCH_TYPE" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+
 # ── Phase 1: Merge to Main ────────────────────────────────────────
 
 log_phase "MERGE TO MAIN"
@@ -300,9 +300,6 @@ if $DRY_RUN; then
 else
   git checkout main
   git pull origin main
-
-  # Capitalize first letter (POSIX-compatible; ${VAR^} requires bash 4+ and macOS ships bash 3.2)
-  BRANCH_TYPE_CAPITALIZED="$(echo "$BRANCH_TYPE" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
 
   git merge --no-ff "$SOURCE_BRANCH" -m "$(cat <<EOF
 Merge $SOURCE_BRANCH into main
@@ -342,7 +339,9 @@ log_phase "CREATE GITHUB RELEASE"
 
 # Push tag to remote (gh release create uses --target but having the tag pushed ensures annotated tag)
 if ! $DRY_RUN && ! $MERGE_VIA_PR; then
-  git push origin "$VERSION" 2>/dev/null || true
+  if ! git push origin "$VERSION" 2>&1; then
+    log "⚠️  Failed to push tag $VERSION to remote. gh release create will create the tag."
+  fi
 fi
 create_github_release "$VERSION"
 
@@ -381,8 +380,12 @@ Merge main into develop (sync $VERSION merge commit)
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
-)" || log "⚠️  Main sync merge had conflicts (non-fatal, develop content is correct)"
-    log_ok "Develop ancestry now includes main's merge commit"
+)"; then
+      log_ok "Develop ancestry now includes main's merge commit"
+    else
+      git merge --abort 2>/dev/null || true
+      log "⚠️  Could not sync main merge commit into develop. Run manually: git merge origin/main"
+    fi
   else
     log_ok "Develop already includes all main commits"
   fi
@@ -411,8 +414,8 @@ else
     log_skip "bump-version.sh not found — skip version bump"
   fi
 
-  # Stage and commit all version file changes
-  git add -A
+  # Stage version file changes (avoid git add -A which could stage unintended files)
+  git add .claude-plugin/plugin.json package.json pyproject.toml Cargo.toml version.txt 2>/dev/null || true
   if ! git diff --cached --quiet; then
     git commit -m "$(cat <<EOF
 chore(develop): bump version for next development cycle

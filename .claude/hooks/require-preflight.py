@@ -8,9 +8,9 @@ This hook BLOCKS git commit commands unless a valid preflight token exists.
 Claude must run `./scripts/commit-preflight.sh` before committing.
 
 The token is:
-- Created by commit-preflight.sh after tests pass
+- Created by commit-preflight.sh after checks pass
 - Valid for 5 minutes
-- One-time use (consumed after successful validation)
+- One-time use for regular commits (consumed after validation); reusable for --amend
 """
 
 import hashlib
@@ -78,9 +78,9 @@ def allow() -> None:
 def main():
     try:
         input_data = json.load(sys.stdin)
-    except json.JSONDecodeError:
-        # Invalid input - allow (don't break on edge cases)
-        allow()
+    except (json.JSONDecodeError, ValueError):
+        # Security gate must fail closed, not open
+        block("Preflight hook received invalid input. Blocking commit as a safety measure.")
 
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
@@ -114,9 +114,9 @@ You must run the preflight check before committing:
     ./scripts/commit-preflight.sh
 
 This ensures:
-  ✓ Lint passes
-  ✓ Unit tests pass
-  ✓ Relevant API/E2E tests are noted
+  ✓ Secret scanning passes
+  ✓ Lint passes (if configured)
+  ✓ Tests pass (if configured)
 
 The preflight creates a one-time token that allows the next commit.
 
@@ -135,7 +135,10 @@ Then retry your commit.""")
             token_data = json.load(f)
     except (json.JSONDecodeError, IOError):
         # Token file corrupted - require new preflight
-        os.remove(TOKEN_FILE)
+        try:
+            os.remove(TOKEN_FILE)
+        except OSError:
+            pass
         block(f"""❌ COMMIT BLOCKED: Invalid preflight token!
 
 The token file is corrupted. Please run preflight again:
@@ -149,7 +152,10 @@ Then retry your commit.""")
     current_time = int(time.time())
 
     if current_time > expires:
-        os.remove(TOKEN_FILE)
+        try:
+            os.remove(TOKEN_FILE)
+        except OSError:
+            pass
         time_ago = current_time - expires
         block(f"""❌ COMMIT BLOCKED: Preflight token expired!
 
@@ -165,9 +171,12 @@ Then retry your commit.""")
     checks_run = token_data.get("checks_run", "none")
     staged_count = token_data.get("staged_files", 0)
 
-    # For amend, we're more lenient but still consume the token
+    # For amend, we're more lenient — don't consume the token
     if not is_amend:
-        os.remove(TOKEN_FILE)
+        try:
+            os.remove(TOKEN_FILE)
+        except OSError:
+            pass
 
     # Token valid - allow commit
     # Output verification status for audit trail

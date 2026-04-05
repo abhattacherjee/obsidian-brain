@@ -69,8 +69,10 @@ def check_changelog_has_unreleased_entries():
             return True, f"{len(entries)} entries found under [Unreleased]"
 
         return False, "[Unreleased] section has no entries"
+    except (PermissionError, OSError) as e:
+        return None, f"Cannot read CHANGELOG.md: {e}"
     except Exception as e:
-        return False, str(e)
+        return None, f"Unexpected error checking changelog: {e}"
 
 
 def get_pr_base_branch(command):
@@ -125,8 +127,8 @@ def _targets_this_project(cmd):
 def main():
     try:
         input_data = json.load(sys.stdin)
-    except json.JSONDecodeError:
-        sys.exit(0)
+    except (json.JSONDecodeError, ValueError):
+        block("Changelog hook received invalid input. Blocking PR as a safety measure.")
 
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
@@ -146,7 +148,10 @@ def main():
     # Check if changelog has entries under [Unreleased]
     has_entries, reason = check_changelog_has_unreleased_entries()
 
-    if has_entries:
+    # None means filesystem error — block with the actual error, not changelog instructions
+    if has_entries is None:
+        block(f"❌ PR BLOCKED: {reason}")
+    elif has_entries:
         add_context(f"✅ Changelog check: {reason}")
     else:
         # Get commits for context in the error message

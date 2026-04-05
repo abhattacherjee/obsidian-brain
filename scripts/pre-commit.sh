@@ -5,7 +5,7 @@
 #
 # Installed by /harden-repo
 
-set -e
+set -eo pipefail
 
 echo "🔍 Checking for secrets in staged files..."
 

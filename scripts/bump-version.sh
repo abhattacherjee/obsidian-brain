@@ -1,5 +1,5 @@
 #!/bin/bash
-# bump-version.sh — Semantic versioning for any project
+# bump-version.sh — Semantic versioning (targets .claude-plugin/plugin.json)
 # Usage: ./scripts/bump-version.sh <major|minor|patch|X.Y.Z>
 #
 # Installed by /harden-repo

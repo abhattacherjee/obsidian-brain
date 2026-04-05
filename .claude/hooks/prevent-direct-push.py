@@ -68,7 +68,7 @@ try:
         stderr=subprocess.DEVNULL,
         text=True
     ).strip()
-except:
+except (subprocess.CalledProcessError, FileNotFoundError):
     current_branch = ""
 
 # Allow Git Flow finish operations
@@ -118,20 +118,16 @@ if current_branch in ["main", "develop"]:
             except subprocess.CalledProcessError:
                 pass
 
-# Check if pushing to main or develop
-push_cmd = command
-is_force_push = "--force" in push_cmd or "-f" in push_cmd
-
 # Check if command or current branch targets protected branches
 targets_protected = (
-    "origin main" in push_cmd or
-    "origin develop" in push_cmd or
+    "origin main" in command or
+    "origin develop" in command or
     current_branch in ["main", "develop"]
 )
 
-# Block direct push to main/develop (unless force push which is already dangerous)
-if targets_protected and not is_force_push:
-    if current_branch in ["main", "develop"] or "origin main" in push_cmd or "origin develop" in push_cmd:
+# Block direct push to main/develop (including force pushes)
+if targets_protected:
+    if current_branch in ["main", "develop"] or "origin main" in command or "origin develop" in command:
         reason = f"""❌ Direct push to main/develop is not allowed!
 
 Protected branches:

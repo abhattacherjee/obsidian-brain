@@ -16,8 +16,6 @@ import re
 def _targets_this_project(cmd: str) -> bool:
     """Check if the command targets a repo within this project.
 
-    Installed by /harden-repo into target repo's .claude/hooks/
-
     Hooks run in their own process (cwd = project dir), so git commands in
     the hook inspect the wrong repo when Claude does 'cd /other/repo && git checkout -b'.
     Parse the cd target from the command to determine the effective repo.

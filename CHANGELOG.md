@@ -15,10 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GitHub Actions CI** — Secret scan on all PRs, changelog check on PRs to main, release verification on main push
 - **Branch protection** — PR reviews required on main and develop with status check enforcement (admin-lenient)
 
-### Changed
-
-### Fixed
-
 ## [1.1.0] - 2026-04-04
 
 ### Improved
