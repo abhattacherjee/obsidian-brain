@@ -29,7 +29,7 @@ If the file does not exist or is invalid JSON, tell the user:
 
 Stop here if config is missing.
 
-Parse the JSON and extract `vault_path` and `insights_folder`. Store them as `VAULT_PATH` and `INSIGHTS_FOLDER` (default `claude-insights`).
+Parse the JSON and extract `vault_path`, `insights_folder`, and `sessions_folder`. Store them as `VAULT_PATH`, `INSIGHTS_FOLDER` (default `claude-insights`), and `SESSIONS_FOLDER` (default `claude-sessions`).
 
 ### Step 2 — Validate vault access
 
@@ -103,6 +103,7 @@ Present the full note to the user including frontmatter:
 type: claude-insight
 date: YYYY-MM-DD
 source_session: <current-session-id>
+source_session_note: "[[<session-note-filename>]]"
 project: <project-name>
 tags:
   - claude/insight
@@ -118,8 +119,25 @@ tags:
 
 Where:
 - `YYYY-MM-DD` is today's date
-- `<current-session-id>` is extracted from the environment variable `CLAUDE_SESSION_ID` if available, otherwise use `unknown`
+- `<current-session-id>` and `<session-note-filename>` are derived together. First, get the session ID by finding the most recently modified `.jsonl` file:
+  ```bash
+  SESSION_ID=$(ls -t ~/.claude/projects/*"$(basename "$PWD")"/*.jsonl 2>/dev/null | head -1 | xargs -I{} basename {} .jsonl)
+  ```
+  **Important:** If `SESSION_ID` is empty (glob matched nothing), use `unknown` for `source_session` and omit `source_session_note` entirely. Do NOT proceed to hash derivation with an empty string.
+
+  If `SESSION_ID` is non-empty, derive the 4-char hash and find the matching session note:
+  ```bash
+  HASH=$(echo -n "$SESSION_ID" | shasum -a 256 | cut -c1-4)
+  SESSION_NOTE_PATH=$(ls "$VAULT_PATH/$SESSIONS_FOLDER"/*-"$HASH".md 2>/dev/null | head -1)
+  if [ -n "$SESSION_NOTE_PATH" ]; then
+    SESSION_NOTE=$(basename "$SESSION_NOTE_PATH" .md)
+  else
+    SESSION_NOTE=
+  fi
+  ```
+  If the session note file doesn't exist yet (current session hasn't ended), construct the expected filename as `YYYY-MM-DD-<project-slug>-<HASH>` and include it anyway — Obsidian shows unresolved wikilinks as greyed out, and they auto-resolve once the session note is created at session end.
 - `<project-name>` is derived from the current working directory name (basename of the git repo root or cwd)
+- The `source_session_note` field creates an Obsidian backlink from the insight to its source session, enabling bidirectional navigation in the graph view
 
 Ask the user:
 
