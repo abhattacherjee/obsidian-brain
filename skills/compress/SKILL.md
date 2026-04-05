@@ -128,7 +128,12 @@ Where:
   If `SESSION_ID` is non-empty, derive the 4-char hash and find the matching session note:
   ```bash
   HASH=$(echo -n "$SESSION_ID" | shasum -a 256 | cut -c1-4)
-  SESSION_NOTE=$(ls "$VAULT_PATH/$SESSIONS_FOLDER"/*-"$HASH".md 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.md$//')
+  SESSION_NOTE_PATH=$(ls "$VAULT_PATH/$SESSIONS_FOLDER"/*-"$HASH".md 2>/dev/null | head -1)
+  if [ -n "$SESSION_NOTE_PATH" ]; then
+    SESSION_NOTE=$(basename "$SESSION_NOTE_PATH" .md)
+  else
+    SESSION_NOTE=
+  fi
   ```
   If the session note file doesn't exist yet (current session hasn't ended), construct the expected filename as `YYYY-MM-DD-<project-slug>-<HASH>` and include it anyway — Obsidian shows unresolved wikilinks as greyed out, and they auto-resolve once the session note is created at session end.
 - `<project-name>` is derived from the current working directory name (basename of the git repo root or cwd)
