@@ -116,6 +116,44 @@ YourVault/
   claude-dashboards/     # Dataview query dashboards
 ```
 
+### Folder Details
+
+#### `claude-sessions/` — Session History
+
+Stores auto-logged session notes and context snapshots. Every Claude Code session that meets the minimum threshold (3+ messages, 2+ minutes) gets a note written here automatically on session end.
+
+**What's in each note:** YAML frontmatter (date, project, branch, duration, tags), conversation excerpts (up to 40 turns), tool usage details (commands run, files edited), and either an AI-generated summary or raw data that gets upgraded later.
+
+**How it gets loaded:** When you run `/recall`, the skill reads the **2 most recent sessions** for the current project in detail (most recent in full, second most recent summary + open items only) and lists the **last 5 sessions** as a history table. Unsummarized notes are upgraded with AI summaries on the fly during `/recall`.
+
+**Automatic context hint:** The `SessionStart` hook reads the most recent session note and injects a one-line summary at the start of every new conversation, so you always have minimal continuity without running any command.
+
+#### `claude-insights/` — Curated Knowledge
+
+Stores hand-picked insights you save via `/compress`, `/decide`, and `/error-log`. These are the high-signal notes — decisions you made, patterns you discovered, errors you solved.
+
+**What's in each note:** YAML frontmatter (date, project, topic tags, source session), and a structured body that varies by type: insights have summary + details + context; decisions have context + options + rationale + consequences; error fixes have error + root cause + fix + prevention.
+
+**How it gets loaded:** When you run `/recall`, **all insights** for the current project are included in the context brief. Insights are curated and always relevant, so none are filtered out. If the context brief exceeds ~2000 tokens, insight bodies are truncated (titles preserved) after older session summaries are trimmed first.
+
+#### `claude-dashboards/` — Dataview Queries
+
+Contains Obsidian Dataview dashboard templates that auto-update as notes are added. These are for browsing your vault visually in Obsidian — they don't get loaded into Claude Code sessions.
+
+**Dashboards included:** Sessions Overview (recent activity across all projects), Project Index (sessions grouped by project), Weekly Review (this week's activity).
+
+**Requires:** [Dataview](https://github.com/blacksmithgu/obsidian-dataview) community plugin with JavaScript Queries enabled.
+
+### Context Loading Summary
+
+| Trigger | What Gets Loaded | Automatic? |
+|---------|-----------------|------------|
+| New session starts | One-line hint from last session (SessionStart hook) | Yes |
+| `/recall` | 2 recent sessions + all insights for current project (~2000 tokens) | Manual |
+| `/recall <project>` | Same as above, scoped to a different project | Manual |
+| `/vault-search <query>` | Matching notes across all projects | Manual |
+| Context compression | Snapshot saved to vault (PreCompact hook) | Yes |
+
 ### Note Types
 
 | Type | Tag | Created By |
