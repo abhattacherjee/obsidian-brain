@@ -128,7 +128,7 @@ Where:
   HASH=$(echo -n "$SESSION_ID" | shasum -a 256 | cut -c1-4)
   SESSION_NOTE=$(ls $VAULT_PATH/$SESSIONS_FOLDER/*-$HASH.md 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.md$//')
   ```
-  If the session ID can't be derived, use `unknown` for `source_session` and omit the `source_session_note` field entirely. If the session note file doesn't exist yet (current session hasn't ended), still include `source_session` but omit `source_session_note`.
+  If the session ID can't be derived, use `unknown` for `source_session` and omit the `source_session_note` field entirely. If the session note file doesn't exist yet (current session hasn't ended), construct the expected filename as `YYYY-MM-DD-<project-slug>-<HASH>` and include it anyway — Obsidian shows unresolved wikilinks as greyed out, and they auto-resolve once the session note is created at session end.
 - `<project-name>` is derived from the current working directory name (basename of the git repo root or cwd)
 - The `source_session_note` field creates an Obsidian backlink from the insight to its source session, enabling bidirectional navigation in the graph view
 
