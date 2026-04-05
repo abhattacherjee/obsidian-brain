@@ -378,12 +378,9 @@ EOF
   git fetch origin main
   if git log origin/main --not HEAD --oneline | grep -q .; then
     log "Syncing main merge commit into develop ancestry..."
-    git merge origin/main -m "$(cat <<EOF
-Merge main into develop (sync $VERSION merge commit)
+    if git merge origin/main -m "Merge main into develop (sync $VERSION merge commit)
 
-Co-Authored-By: Claude <noreply@anthropic.com>
-EOF
-)"; then
+Co-Authored-By: Claude <noreply@anthropic.com>"; then
       log_ok "Develop ancestry now includes main's merge commit"
     else
       git merge --abort 2>/dev/null || true

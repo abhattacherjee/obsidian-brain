@@ -69,7 +69,7 @@ def _run() -> None:
         f"Obsidian context: Last session for {project} ({latest['date']}): "
         f"{latest['summary']} Next steps: {latest['next_steps']}"
     )
-    output = {"hookSpecificOutput": {"additionalContext": hint}}
+    output = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": hint}}
 
     try:
         print(json.dumps(output))
