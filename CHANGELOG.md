@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-04-05
+
+### Added
+
+- `/standup` skill: daily/weekly summary generation across projects with AI summarization, context-shield deep reads, and source note backlinks
+- `/link` skill: cross-reference related notes with bidirectional wikilinks and auto-suggestion
+- `/retro` skill: honest session retrospective for meta-learning with session backlinks
+- `/vault-ask` skill: synthesize answers from vault knowledge with source citations and relevance ranking
+- Learning Velocity dashboard: topic frequency from curated insights, retrospective history, error patterns
+- Decision Timeline dashboard: chronological decision tracking with active/superseded status views
+
 ## [1.3.0] - 2026-04-05
 
 ### Fixed
