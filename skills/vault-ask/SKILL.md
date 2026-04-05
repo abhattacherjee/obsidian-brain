@@ -17,15 +17,19 @@ Follow these steps exactly. Do not skip steps or reorder them.
 
 ### Step 1 — Load config
 
-Read `~/.claude/obsidian-brain-config.json` using the Read tool.
+Read `~/.claude/obsidian-brain-config.json`:
 
-If the file does not exist, tell the user:
+```bash
+cat ~/.claude/obsidian-brain-config.json
+```
 
-> Config not found. Run `/obsidian-setup` first to configure your vault path.
+If the file does not exist or is not valid JSON, tell the user:
+
+> Config not found. Run `/obsidian-setup` first to configure your Obsidian vault.
 
 Stop here if config is missing.
 
-Extract `vault_path`, `sessions_folder`, and `insights_folder` from the config. Construct the two search directories:
+Extract `vault_path`, `sessions_folder` (default `claude-sessions`), and `insights_folder` (default `claude-insights`) from the config. Construct the two search directories:
 
 - `SESSIONS_DIR` = `<vault_path>/<sessions_folder>`
 - `INSIGHTS_DIR` = `<vault_path>/<insights_folder>`

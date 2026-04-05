@@ -143,7 +143,7 @@ Split into:
 
 ### Step 6 — Deferred summarization for unsummarized notes
 
-If `UNSUMMARIZED` is empty, skip to Step 6.
+If `UNSUMMARIZED` is empty, skip to Step 7.
 
 For each file in `UNSUMMARIZED`, perform the upgrade (process multiple notes in parallel via sub-agents when there are more than 2):
 
@@ -254,6 +254,8 @@ source_notes:
   - "[[note-filename-2]]"
 tags:
   - claude/standup
+  - claude/project/project-a
+  - claude/project/project-b
 ---
 ```
 
@@ -262,6 +264,7 @@ Where:
 - `date_range` is `"$START_DATE to $END_DATE"` (use the same value for single-day standups)
 - `projects` lists all unique project names found, sorted alphabetically
 - `source_notes` lists every contributing note as a wikilink (filename without `.md`)
+- `tags` includes `claude/standup` plus a `claude/project/<name>` tag for each project covered by the standup
 
 ### Step 11 — Generate filename
 

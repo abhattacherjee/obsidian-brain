@@ -51,7 +51,7 @@ Machine-local config at `~/.claude/obsidian-brain-config.json` (outside the vaul
 
 ### Tag convention
 
-All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight`, `claude/decision`, `claude/error-fix`, `claude/snapshot`, `claude/imported`, `claude/project/<name>`, `claude/topic/<topic>`, `claude/auto`.
+All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight`, `claude/decision`, `claude/error-fix`, `claude/snapshot`, `claude/imported`, `claude/standup`, `claude/retro`, `claude/project/<name>`, `claude/topic/<topic>`, `claude/auto`.
 
 ## Conventions
 

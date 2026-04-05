@@ -123,6 +123,8 @@ tags:
   - claude/project/<project-name>
 ---
 
+# Session Retrospective: <project-name> (<date>)
+
 ## What Went Well
 ...
 
