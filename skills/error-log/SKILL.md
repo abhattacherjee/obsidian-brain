@@ -29,7 +29,7 @@ If the file does not exist or is invalid JSON, tell the user:
 
 Stop here if config is missing.
 
-Parse the JSON and extract `vault_path` and `insights_folder`. Store them as `VAULT_PATH` and `INSIGHTS_FOLDER` (default `claude-insights`).
+Parse the JSON and extract `vault_path`, `insights_folder`, and `sessions_folder`. Store them as `VAULT_PATH`, `INSIGHTS_FOLDER` (default `claude-insights`), and `SESSIONS_FOLDER` (default `claude-sessions`).
 
 ### Step 2 — Validate vault access
 
@@ -126,7 +126,7 @@ Where:
   Then derive the 4-char hash and find the matching session note in the vault:
   ```bash
   HASH=$(echo -n "$SESSION_ID" | shasum -a 256 | cut -c1-4)
-  SESSION_NOTE=$(ls $VAULT_PATH/$SESSIONS_FOLDER/*-$HASH.md 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.md$//')
+  SESSION_NOTE=$(ls "$VAULT_PATH/$SESSIONS_FOLDER"/*-"$HASH".md 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.md$//')
   ```
   If the session ID can't be derived, use `unknown` for `source_session` and omit `source_session_note`. If the session note doesn't exist yet, construct the expected filename as `YYYY-MM-DD-<project-slug>-<HASH>` and include it anyway — Obsidian auto-resolves unresolved wikilinks once the target note is created.
 - `<project-name>` is derived from the current working directory name (basename of the git repo root or cwd)
