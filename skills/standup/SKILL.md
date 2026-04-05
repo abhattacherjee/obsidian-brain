@@ -29,7 +29,21 @@ If the file does not exist or is not valid JSON, tell the user:
 
 Stop here if config is missing. Otherwise, extract `vault_path`, `sessions_folder` (default `claude-sessions`), and `insights_folder` (default `claude-insights`). Store as `VAULT_PATH`, `SESSIONS_FOLDER`, `INSIGHTS_FOLDER`.
 
-### Step 2 — Parse date range from arguments
+### Step 2 — Validate vault access
+
+Run:
+
+```bash
+test -d "$VAULT_PATH/$SESSIONS_FOLDER" && test -d "$VAULT_PATH/$INSIGHTS_FOLDER" && echo "OK" || echo "FAIL"
+```
+
+If FAIL, tell the user:
+
+> The vault folders do not exist or are not accessible. Run `/obsidian-setup` to fix this.
+
+Stop here if FAIL.
+
+### Step 3 — Parse date range from arguments
 
 Inspect the argument passed after `/standup`. Calculate `START_DATE` and `END_DATE` as `YYYY-MM-DD` strings using bash `date` commands.
 
@@ -83,7 +97,7 @@ END_DATE=$(date -d "last week Sunday" +%Y-%m-%d)
 
 Store both dates. Also compute `IS_RANGE` = true if `START_DATE != END_DATE`, false otherwise. This controls the filename slug in Step 10.
 
-### Step 3 — Search for notes in date range (parallel)
+### Step 4 — Search for notes in date range (parallel)
 
 Run two Grep searches in parallel to find notes whose `date:` frontmatter field falls within the range.
 
@@ -113,7 +127,7 @@ If `MATCHED_FILES` is empty, tell the user:
 
 Stop here.
 
-### Step 4 — Identify unsummarized session notes
+### Step 5 — Identify unsummarized session notes
 
 From `MATCHED_FILES`, isolate those in `$SESSIONS_FOLDER/`. Use Grep to check each for the unsummarized marker:
 
@@ -127,7 +141,7 @@ Split into:
 - `UNSUMMARIZED` — session files containing "AI summary unavailable"
 - `SUMMARIZED` — all other matched files (sessions + insights)
 
-### Step 5 — Deferred summarization for unsummarized notes
+### Step 6 — Deferred summarization for unsummarized notes
 
 If `UNSUMMARIZED` is empty, skip to Step 6.
 
@@ -158,22 +172,28 @@ For each file in `UNSUMMARIZED`, perform the upgrade (process multiple notes in 
 
 Move all upgraded files from `UNSUMMARIZED` into the working set alongside `SUMMARIZED`. Track the count of upgraded notes as `UPGRADED_COUNT`.
 
-### Step 6 — Read and distill note content
+### Step 7 — Read and distill note content
 
 Collect all matched files (now all summarized). Apply the /context-shield rule:
 
-- **5 or fewer notes:** Read each file directly using the Read tool. Extract: project name (from frontmatter `project:` field), note type (`type:` field), date, title (first `# Heading`), summary (content of `## Summary` section), decisions (bullets from `## Key Decisions`), errors resolved (bullets from `## Errors Encountered`), open items (checkboxes from `## Open Questions / Next Steps`), and the filename (for wikilinks).
-- **More than 5 notes:** Spawn parallel sub-agents (one per note) to extract the same fields and return distilled summaries. Each sub-agent reads one file and returns: `{project, type, date, title, summary, decisions[], errors_resolved[], open_items[], filename}`.
+For each note, check its size using `wc -l`. Apply the context-shield rule **per note** based on size:
+
+- **Notes under ~100 lines (~3000 tokens):** Read directly using the Read tool.
+- **Notes over ~100 lines:** Spawn a `/context-shield` sub-agent to read in isolation and return a distilled summary.
+
+When multiple notes need sub-agent reads, spawn them in parallel (one sub-agent per note).
+
+From each note (whether read directly or via sub-agent), extract: project name (from frontmatter `project:` field), note type (`type:` field), date, title (first `# Heading`), summary (content of `## Summary` section), decisions (bullets from `## Key Decisions`), errors resolved (bullets from `## Errors Encountered`), open items (checkboxes from `## Open Questions / Next Steps`), and the filename (for wikilinks).
 
 Collect all distilled records as `NOTE_DATA`.
 
-### Step 7 — Group by project
+### Step 8 — Group by project
 
 Group `NOTE_DATA` by `project` field. Sort projects alphabetically. Within each project, sort notes by `date` ascending (oldest first within the range). Separate sessions from insights within each project group.
 
 If any notes have a missing or empty `project` field, group them under `(unknown project)`.
 
-### Step 8 — Generate standup note body
+### Step 9 — Generate standup note body
 
 Build the standup note body using the grouped data. For each project, emit a section:
 
@@ -217,7 +237,7 @@ Precede all project sections with a header block:
 
 If `IS_RANGE` is false (single day), use `# Standup: $DATE` and omit the "Range:" line.
 
-### Step 9 — Build frontmatter
+### Step 10 — Build frontmatter
 
 Construct the `source_notes` array from ALL matched filenames (sessions + insights), formatted as wikilinks:
 
@@ -243,7 +263,7 @@ Where:
 - `projects` lists all unique project names found, sorted alphabetically
 - `source_notes` lists every contributing note as a wikilink (filename without `.md`)
 
-### Step 10 — Generate filename
+### Step 11 — Generate filename
 
 Construct the filename:
 
@@ -264,7 +284,7 @@ Final filename: `YYYY-MM-DD-<slug>-<hash>.md`
 
 Example: `2026-04-05-standup-daily-a3f2.md`
 
-### Step 11 — Write the note
+### Step 12 — Write the note
 
 Run:
 
@@ -284,7 +304,7 @@ Then set permissions:
 chmod 644 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-<slug>-<hash>.md"
 ```
 
-### Step 12 — Present to user
+### Step 13 — Present to user
 
 Display the full standup in the conversation:
 
