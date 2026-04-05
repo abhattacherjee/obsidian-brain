@@ -96,7 +96,7 @@ test -f "$VAULT_PATH/claude-dashboards/<filename>" && echo "EXISTS" || echo "MIS
 ```
 
 If EXISTS and `MODE=upgrade`, skip this file — preserve user customizations.
-If MISSING (or `MODE=reconfigure`), write the file using the Write tool.
+Otherwise (MISSING, or `MODE=fresh`, or `MODE=reconfigure`), write the file using the Write tool.
 
 **Dashboard files to install:**
 
@@ -318,7 +318,7 @@ If FAIL, warn that vault writes are not working and ask the user to check permis
 Check if the claudeception-to-compress nudge is already configured:
 
 ```bash
-grep -r "compress" ~/.claude/settings.json 2>/dev/null | grep -q "claudeception" && echo "EXISTS" || echo "MISSING"
+grep -q "Run ./compress. to save it to your Obsidian vault" ~/.claude/settings.json 2>/dev/null && echo "EXISTS" || echo "MISSING"
 ```
 
 If EXISTS, skip this step — the nudge is already configured.

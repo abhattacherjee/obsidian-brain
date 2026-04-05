@@ -108,7 +108,7 @@ Analyze the full conversation and identify 3-5 additional candidate insights (be
 
 If no claudeception output was detected, present only the standard candidates (same as before — no labels).
 
-Claudeception candidates are **pre-selected by default** — if the user says `all`, they are included. If the user picks specific numbers, normal selection applies.
+When the user says `all`, all candidates (including claudeception ones) are saved. When the user picks specific numbers, only those are saved — standard selection behavior.
 
 Wait for the user to pick. For each selected insight, draft the note content and continue to Step 5. Process selected insights one at a time.
 
