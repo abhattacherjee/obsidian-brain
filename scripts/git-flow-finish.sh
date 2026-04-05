@@ -414,8 +414,22 @@ else
     log_skip "bump-version.sh not found — skip version bump"
   fi
 
-  # Stage version file changes (avoid git add -A which could stage unintended files)
-  git add .claude-plugin/plugin.json package.json pyproject.toml Cargo.toml version.txt 2>/dev/null || true
+  # Ensure [Unreleased] header exists in CHANGELOG.md
+  if [[ -f CHANGELOG.md ]]; then
+    if ! grep -q '## \[Unreleased\]' CHANGELOG.md; then
+      # Add [Unreleased] header at the top (after the file header)
+      sed -i '' '/^## \[/i\
+## [Unreleased]\
+' CHANGELOG.md
+      log_ok "Added [Unreleased] header to CHANGELOG.md"
+    else
+      # Ensure [Unreleased] section is empty (no leftover entries)
+      log_ok "[Unreleased] header already exists in CHANGELOG.md"
+    fi
+  fi
+
+  # Stage version file changes and CHANGELOG (avoid git add -A which could stage unintended files)
+  git add .claude-plugin/plugin.json package.json pyproject.toml Cargo.toml version.txt CHANGELOG.md 2>/dev/null || true
   if ! git diff --cached --quiet; then
     git commit -m "$(cat <<EOF
 chore(develop): bump version for next development cycle
