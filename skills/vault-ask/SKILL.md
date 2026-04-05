@@ -34,6 +34,18 @@ Extract `vault_path`, `sessions_folder` (default `claude-sessions`), and `insigh
 - `SESSIONS_DIR` = `<vault_path>/<sessions_folder>`
 - `INSIGHTS_DIR` = `<vault_path>/<insights_folder>`
 
+Validate vault access:
+
+```bash
+test -d "$SESSIONS_DIR" && test -d "$INSIGHTS_DIR" && echo "OK" || echo "FAIL"
+```
+
+If FAIL, tell the user:
+
+> The vault folders do not exist or are not accessible. Run `/obsidian-setup` to fix this.
+
+Stop here if FAIL.
+
 ### Step 2 — Parse the question
 
 The user provides a question after `/vault-ask`. Extract 3–6 key search terms from it:
@@ -92,9 +104,9 @@ Score each file in `CANDIDATE_FILES` using these rules:
 
 To determine note type and date without reading the full file, run:
 ```
-Read(file_path="<path>", limit=20)
+Read(file_path="<path>", limit=40)
 ```
-to get frontmatter fields (`type:`, `date:`).
+to get frontmatter fields (`type:`, `date:`). Use 40 lines because some notes (e.g., standups with large `source_notes` arrays) have frontmatter exceeding 20 lines. If `type:` or `date:` is not found within the first 40 lines, read the full frontmatter.
 
 Sort `CANDIDATE_FILES` by score descending. Take the top 10. Store as `RANKED_FILES`.
 

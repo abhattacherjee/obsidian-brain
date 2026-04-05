@@ -95,7 +95,20 @@ END_DATE=$(date -d "last week Sunday" +%Y-%m-%d)
 
 **`YYYY-MM-DD to YYYY-MM-DD`:** use the two dates directly as `START_DATE` and `END_DATE`.
 
-Store both dates. Also compute `IS_RANGE` = true if `START_DATE != END_DATE`, false otherwise. This controls the filename slug in Step 10.
+Store both dates. Also compute `IS_RANGE` = true if `START_DATE != END_DATE`, false otherwise. This controls the filename slug in Step 11.
+
+**Validate the parsed dates:** Check that `START_DATE` and `END_DATE` are non-empty and match `YYYY-MM-DD` format. If either is empty or malformed, tell the user:
+
+> Could not parse the date range from your input. Supported formats:
+> - `/standup` (today)
+> - `/standup yesterday`
+> - `/standup this week`
+> - `/standup last week`
+> - `/standup 2026-03-25 to 2026-03-31`
+
+Stop here if validation fails.
+
+Also verify that `START_DATE <= END_DATE`. If not, tell the user the start date must be before or equal to the end date.
 
 ### Step 4 — Search for notes in date range (parallel)
 
