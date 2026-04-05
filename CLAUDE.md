@@ -60,3 +60,12 @@ All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight
 - **Atomic writes:** All vault writes must use temp file + rename pattern (see `write_vault_note()` in `obsidian_utils.py`).
 - **Version:** Bump in both `.claude-plugin/plugin.json` and update `CHANGELOG.md` for releases.
 - **Branching:** Never commit directly to develop/main — use feature branches.
+
+## Git Flow Rules
+
+- Never commit directly to `main` or `develop` — use feature branches
+- Branch naming: `feature/*`, `release/*`, `hotfix/*`
+- Features branch from and merge to `develop`
+- Releases branch from `develop`, merge to both `main` and `develop`
+- Hotfixes branch from `main`, merge to both `main` and `develop`
+- Run `./scripts/commit-preflight.sh` before every commit
