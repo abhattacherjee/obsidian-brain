@@ -23,6 +23,10 @@ CC Session Lifecycle
     |-- /compress ----> You curate & save specific insights
     |-- /recall ------> Loads project context from vault
     |-- /vault-search > Searches across all sessions & insights
+    |-- /standup -----> Generates daily/weekly project summaries
+    |-- /link --------> Cross-references notes with wikilinks
+    |-- /retro -------> Session retrospective & process improvements
+    |-- /vault-ask ---> Synthesized answers from vault knowledge
     +-- SessionEnd ---> Auto-logs session to vault
 ```
 
@@ -70,6 +74,10 @@ Run `/obsidian-setup` after installation. It will:
 | `/decide` | Log architectural decisions (ADR-lite format) |
 | `/error-log` | Capture error + root cause + fix for future reference |
 | `/vault-import` | Backfill historical sessions (requires `/conversation-search` and `/context-shield`) |
+| `/standup` | Generate daily/weekly summary across projects |
+| `/link` | Cross-reference related notes with bidirectional wikilinks |
+| `/retro` | Session retrospective — what worked, what didn't, process improvements |
+| `/vault-ask` | Ask questions and get synthesized answers grounded in vault history |
 
 ### Usage Examples
 
@@ -93,6 +101,24 @@ Run `/obsidian-setup` after installation. It will:
 
 # Import last 30 days of sessions into vault
 /vault-import 30d
+
+# Generate today's standup
+/standup
+
+# Weekly summary
+/standup this week
+
+# Auto-suggest note connections
+/link
+
+# Link specific notes
+/link this session to the redis decision
+
+# Session retrospective
+/retro
+
+# Ask a question across all vault history
+/vault-ask what patterns have I used for error handling?
 ```
 
 ## Auto-Logging
@@ -164,12 +190,14 @@ Contains Obsidian Dataview dashboard templates that auto-update as notes are add
 | Decision | `claude/decision` | `/decide` |
 | Error Fix | `claude/error-fix` | `/error-log` |
 | Imported Session | `claude/imported` | `/vault-import` |
+| Standup | `claude/standup` | `/standup` |
+| Retrospective | `claude/retro` | `/retro` |
 
 ### Tag Convention
 
 All tags use the `claude/` prefix to separate from your existing vault tags:
 
-- `claude/session`, `claude/insight`, `claude/decision`, `claude/error-fix`, `claude/snapshot`
+- `claude/session`, `claude/insight`, `claude/decision`, `claude/error-fix`, `claude/snapshot`, `claude/standup`, `claude/retro`
 - `claude/project/<name>` — project scoping
 - `claude/topic/<topic>` — domain/technology tags
 - `claude/auto` — auto-generated content
@@ -177,11 +205,13 @@ All tags use the `claude/` prefix to separate from your existing vault tags:
 
 ## Dataview Dashboards
 
-Three dashboard templates are installed to `claude-dashboards/`:
+Five dashboard templates are installed to `claude-dashboards/`:
 
 - **Sessions Overview** — recent sessions, insights, and active decisions across all projects
 - **Project Index** — sessions grouped by project with counts and date ranges
 - **Weekly Review** — this week's activity
+- **Learning Velocity** — topic frequency from curated insights, recent retrospectives, and error patterns
+- **Decision Timeline** — chronological view of all decisions with active/superseded status tracking
 
 These use [Dataview](https://github.com/blacksmithgu/obsidian-dataview) queries that auto-update as new notes are added.
 
