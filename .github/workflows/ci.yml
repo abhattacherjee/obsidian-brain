@@ -35,7 +35,7 @@ jobs:
             echo "No diffable content (docs/scripts only) — skipping"
             exit 0
           fi
-          if echo "$DIFF_OUTPUT" | grep -E "(sk-[a-zA-Z0-9_-]{20,}|AKIA[0-9A-Z]{16}|private_key|-----BEGIN.*PRIVATE KEY-----|ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{82}|xox[bsapr]-[a-zA-Z0-9-]+|password\s*[:=]\s*['\"][^'\"]{8,})"; then
+          if echo "$DIFF_OUTPUT" | grep '^+' | grep -v '^+++' | grep -E "(sk-[a-zA-Z0-9_-]{20,}|AKIA[0-9A-Z]{16}|private_key|-----BEGIN.*PRIVATE KEY-----|ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{82}|xox[bsapr]-[a-zA-Z0-9-]+|password\s*[:=]\s*['\"][^'\"]{8,})"; then
             echo "::error::Potential secrets detected in diff"
             exit 1
           fi

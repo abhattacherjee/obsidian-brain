@@ -248,7 +248,7 @@ done
 
 [[ "$BRANCH_TYPE" == "hotfix" || "$BRANCH_TYPE" == "release" ]] || die "branch-type must be 'hotfix' or 'release', got '$BRANCH_TYPE'"
 
-echo "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+' || die "Version must start with v and follow semver (e.g., v1.0.6), got '$VERSION'"
+echo "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$' || die "Version must follow semver (e.g., v1.0.6 or v1.0.6-beta.1), got '$VERSION'"
 
 VERSION_NUMBER="${VERSION#v}"
 SOURCE_BRANCH="${BRANCH_TYPE}/${VERSION}"
@@ -280,7 +280,10 @@ if [[ -n "$(git status --porcelain)" ]]; then
   die "Working directory is not clean. Commit or stash changes first."
 fi
 
-# All commits must be pushed
+# All commits must be pushed (verify upstream is configured first)
+if ! git rev-parse --abbrev-ref "@{u}" >/dev/null 2>&1; then
+  die "No upstream configured for $SOURCE_BRANCH. Push it first: git push -u origin $SOURCE_BRANCH"
+fi
 UNPUSHED=$(git log "@{u}..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' ')
 if [[ "$UNPUSHED" -gt 0 ]]; then
   die "$UNPUSHED unpushed commits. Push them first: git push"

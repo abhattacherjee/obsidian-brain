@@ -96,7 +96,7 @@ if [ "$SKIP_TESTS" = true ]; then
     "expires": $((TIMESTAMP + TOKEN_EXPIRY_SECONDS)),
     "staged_files": $(echo "$STAGED_FILES" | wc -l | tr -d ' '),
     "checks_run": "skipped",
-    "skip_reason": "$SKIP_REASON"
+    "skip_reason": "$(echo "$SKIP_REASON" | sed 's/\\/\\\\/g; s/"/\\"/g')"
 }
 EOF
 )

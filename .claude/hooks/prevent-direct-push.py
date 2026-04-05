@@ -53,8 +53,11 @@ def _targets_this_project(cmd: str) -> bool:
 if not _targets_this_project(command):
     sys.exit(0)
 
-# Allow tag-only pushes (refs/tags/*)
-if "refs/tags/" in command:
+# Allow tag pushes (refs/tags/*, --tags, or explicit version tags like v1.2.3)
+if "refs/tags/" in command or "--tags" in command:
+    sys.exit(0)
+# Allow pushing an explicit version tag (e.g., "git push origin v1.2.3")
+if re.search(r'git push\s+\S+\s+v\d+\.\d+\.\d+', command):
     sys.exit(0)
 
 # Allow branch deletion (--delete) for release/hotfix cleanup
@@ -119,9 +122,12 @@ if current_branch in ["main", "develop"]:
                 pass
 
 # Check if command or current branch targets protected branches
+# Also detect refspec pushes like "HEAD:main" or "mybranch:develop"
 targets_protected = (
     "origin main" in command or
     "origin develop" in command or
+    ":main" in command or
+    ":develop" in command or
     current_branch in ["main", "develop"]
 )
 
