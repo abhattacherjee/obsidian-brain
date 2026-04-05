@@ -1,8 +1,8 @@
 ---
 name: obsidian-setup
-description: "First-run configuration for the Obsidian Brain plugin. Sets up vault path, creates folders, copies dashboard templates, and writes config. Use when: (1) first time installing obsidian-brain, (2) changing vault path, (3) /obsidian-setup command."
+description: "First-run configuration and upgrade for the Obsidian Brain plugin. Sets up vault path, creates folders, copies dashboard templates, configures hookify nudges, and writes config. Idempotent — safe to re-run to pick up new features without overwriting existing config or dashboards. Use when: (1) first time installing obsidian-brain, (2) changing vault path, (3) /obsidian-setup command, (4) upgrading to a new version."
 metadata:
-  version: 1.0.0
+  version: 1.1.0
 ---
 
 # Obsidian Brain Setup
@@ -15,7 +15,39 @@ Configure the obsidian-brain plugin for first use. This skill validates prerequi
 
 Follow these steps exactly. Do not skip steps or reorder them.
 
-### Step 1 — Ask for vault path
+### Step 1 — Check for existing installation
+
+Read `~/.claude/obsidian-brain-config.json`:
+
+```bash
+cat ~/.claude/obsidian-brain-config.json 2>/dev/null
+```
+
+**If the file exists and is valid JSON**, extract `vault_path` and present:
+
+> **Existing obsidian-brain installation detected.**
+> - Vault path: `<vault_path from config>`
+>
+> Would you like to:
+> - **upgrade** — add new features (dashboards, nudges) without touching existing config or dashboards
+> - **reconfigure** — start fresh (will overwrite config and dashboards)
+> - **cancel** — exit setup
+
+If **upgrade**: store `MODE=upgrade`. Use `vault_path` from the existing config. Skip to Step 5 (Create vault folders — `mkdir -p` is already safe). In upgrade mode:
+- Step 5 (Create vault folders): runs normally (`mkdir -p` is idempotent)
+- Step 6 (Install dashboards): only write dashboard files that do NOT already exist (`test -f` before each write)
+- Step 7 (Write config): SKIP entirely — preserve existing config
+- Step 8 (Verify vault access): runs normally
+- Step 9 (Configure claudeception nudge): runs normally (has its own idempotency check)
+- Step 10 (Print success message): show upgrade-specific message
+
+If **reconfigure**: store `MODE=reconfigure`. Proceed to Step 2 (Ask for vault path) as normal — full setup flow.
+
+If **cancel**: stop here.
+
+**If the file does not exist or is invalid JSON**: store `MODE=fresh`. Proceed to Step 2 (Ask for vault path) — first-time setup.
+
+### Step 2 — Ask for vault path
 
 Ask the user:
 
@@ -23,7 +55,7 @@ Ask the user:
 
 Store the response as `VAULT_PATH`. Strip any trailing slash.
 
-### Step 2 — Validate the vault path
+### Step 3 — Validate the vault path
 
 Run:
 
@@ -33,7 +65,7 @@ test -d "$VAULT_PATH" && test -w "$VAULT_PATH" && echo "OK" || echo "FAIL"
 
 If FAIL, tell the user the path does not exist or is not writable and ask them to correct it. Repeat until OK.
 
-### Step 3 — Check claude CLI availability
+### Step 4 — Check claude CLI availability
 
 Run:
 
@@ -47,7 +79,7 @@ If FAIL, warn the user:
 
 Continue regardless — this is a warning, not a blocker.
 
-### Step 4 — Create vault folders
+### Step 5 — Create vault folders
 
 Run:
 
@@ -55,9 +87,18 @@ Run:
 mkdir -p "$VAULT_PATH/claude-sessions" "$VAULT_PATH/claude-insights" "$VAULT_PATH/claude-dashboards"
 ```
 
-### Step 5 — Install dashboard templates
+### Step 6 — Install dashboard templates
 
-Write these three files into the vault. Use the Write tool for each.
+For each dashboard file below, check if it already exists before writing:
+
+```bash
+test -f "$VAULT_PATH/claude-dashboards/<filename>" && echo "EXISTS" || echo "MISSING"
+```
+
+If EXISTS and `MODE=upgrade`, skip this file — preserve user customizations.
+If MISSING (or `MODE=reconfigure`), write the file using the Write tool.
+
+**Dashboard files to install:**
 
 **File: `$VAULT_PATH/claude-dashboards/sessions-overview.md`**
 
@@ -127,15 +168,124 @@ SORT date DESC
 \```
 ```
 
+**File: `$VAULT_PATH/claude-dashboards/learning-velocity.md`**
+
+```markdown
+# Learning Velocity
+
+## Topics by Frequency
+\```dataviewjs
+let pages = dv.pages('"claude-insights"')
+    .where(p => p.tags);
+
+let topics = {};
+for (let p of pages) {
+    let tags = p.tags || [];
+    if (!Array.isArray(tags)) tags = [tags];
+    for (let tag of tags) {
+        if (typeof tag === 'string' && tag.startsWith("claude/topic/")) {
+            let topic = tag.replace("claude/topic/", "");
+            topics[topic] = (topics[topic] || 0) + 1;
+        }
+    }
+}
+
+dv.table(
+    ["Topic", "Notes"],
+    Object.entries(topics)
+        .sort((a, b) => b[1] - a[1])
+        .map(([topic, count]) => [topic, count])
+);
+\```
+
+## Recent Retrospectives
+\```dataview
+TABLE date, project
+FROM "claude-insights"
+WHERE type = "claude-retro"
+SORT date DESC
+LIMIT 10
+\```
+
+## Error Patterns (Most Common)
+\```dataviewjs
+let pages = dv.pages('"claude-insights"')
+    .where(p => p.type === "claude-error-fix");
+
+let topics = {};
+for (let p of pages) {
+    let tags = p.tags || [];
+    if (!Array.isArray(tags)) tags = [tags];
+    for (let tag of tags) {
+        if (typeof tag === 'string' && tag.startsWith("claude/topic/")) {
+            let topic = tag.replace("claude/topic/", "");
+            topics[topic] = (topics[topic] || 0) + 1;
+        }
+    }
+}
+
+dv.table(
+    ["Error Topic", "Occurrences"],
+    Object.entries(topics)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 15)
+        .map(([topic, count]) => [topic, count])
+);
+\```
+```
+
+**File: `$VAULT_PATH/claude-dashboards/decision-timeline.md`**
+
+```markdown
+# Decision Timeline
+
+## Active Decisions
+\```dataview
+TABLE date, project
+FROM "claude-insights"
+WHERE type = "claude-decision" AND status = "active"
+SORT date DESC
+\```
+
+## All Decisions (Chronological)
+\```dataview
+TABLE date, project, status
+FROM "claude-insights"
+WHERE type = "claude-decision"
+SORT date DESC
+\```
+
+## Superseded Decisions
+\```dataview
+TABLE date, project
+FROM "claude-insights"
+WHERE type = "claude-decision" AND status = "superseded"
+SORT date DESC
+\```
+
+## Decisions by Project
+\```dataview
+TABLE length(rows) AS "Decisions", min(rows.date) AS "First", max(rows.date) AS "Last"
+FROM "claude-insights"
+WHERE type = "claude-decision"
+GROUP BY project
+SORT length(rows) DESC
+\```
+```
+
 **Important:** The backslash before the triple backticks above is an escape for this document only. When writing the actual files, use plain triple backticks (no backslash).
 
-### Step 6 — Write config file
+### Step 7 — Write config file
+
+**If `MODE=upgrade`:** Skip this step — preserve existing config.
+
+**If `MODE=fresh` or `MODE=reconfigure`:**
 
 Write `~/.claude/obsidian-brain-config.json` with this exact structure:
 
 ```json
 {
-  "vault_path": "<VAULT_PATH value from Step 1>",
+  "vault_path": "<VAULT_PATH value from Step 2>",
   "sessions_folder": "claude-sessions",
   "insights_folder": "claude-insights",
   "dashboards_folder": "claude-dashboards",
@@ -148,11 +298,11 @@ Write `~/.claude/obsidian-brain-config.json` with this exact structure:
 }
 ```
 
-Replace `<VAULT_PATH value from Step 1>` with the actual vault path. Ensure the file is valid JSON.
+Replace `<VAULT_PATH value from Step 2>` with the actual vault path. Ensure the file is valid JSON.
 
 First run `mkdir -p ~/.claude` to ensure the directory exists.
 
-### Step 7 — Verify vault access
+### Step 8 — Verify vault access
 
 Run:
 
@@ -163,16 +313,44 @@ echo "test" > "$TESTFILE" && test -f "$TESTFILE" && rm "$TESTFILE" && echo "OK" 
 
 If FAIL, warn that vault writes are not working and ask the user to check permissions.
 
-### Step 8 — Print success message
+### Step 9 — Configure claudeception nudge (idempotent)
 
-Print:
+Check if the claudeception-to-compress nudge is already configured:
+
+```bash
+grep -r "compress" ~/.claude/settings.json 2>/dev/null | grep -q "claudeception" && echo "EXISTS" || echo "MISSING"
+```
+
+If EXISTS, skip this step — the nudge is already configured.
+
+If MISSING, invoke `/hookify` with this instruction:
+
+> Create a rule: After claudeception finishes and produces output (skill creation or knowledge extraction), display a non-blocking nudge message: "Claudeception extracted knowledge from this session. Run `/compress` to save it to your Obsidian vault." The trigger should match the `Result: PASS` marker or skill file path output from claudeception.
+
+This is a soft nudge — a suggestion, not automatic execution.
+
+### Step 10 — Print success message
+
+**If `MODE=upgrade`:**
+
+> **Obsidian Brain upgraded!**
+>
+> - Vault path: `<VAULT_PATH>` (unchanged)
+> - Config: preserved (unchanged)
+> - New dashboards: installed (existing dashboards preserved)
+> - Claudeception nudge: configured
+>
+> Re-run `/obsidian-setup` anytime to pick up new features.
+
+**If `MODE=fresh` or `MODE=reconfigure`:**
 
 > **Obsidian Brain setup complete!**
 >
 > - Vault path: `<VAULT_PATH>`
 > - Config written to: `~/.claude/obsidian-brain-config.json`
 > - Folders created: `claude-sessions/`, `claude-insights/`, `claude-dashboards/`
-> - Dashboards installed: `sessions-overview.md`, `project-index.md`, `weekly-review.md`
+> - Dashboards installed: `sessions-overview.md`, `project-index.md`, `weekly-review.md`, `learning-velocity.md`, `decision-timeline.md`
+> - Claudeception nudge: configured (run `/compress` reminder after knowledge extraction)
 >
 > **Next step — install the Dataview plugin in Obsidian:**
 > 1. Open Obsidian Settings > Community Plugins > Browse
