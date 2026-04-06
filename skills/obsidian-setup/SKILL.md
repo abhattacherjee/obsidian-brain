@@ -47,6 +47,45 @@ If **cancel**: stop here.
 
 **If the file does not exist or is invalid JSON**: store `MODE=fresh`. Proceed to Step 2 (Ask for vault path) — first-time setup.
 
+### Step 1.5 — Permission pre-flight check
+
+Before any out-of-workspace writes, test whether Claude Code can write to `~/.claude/`:
+
+```bash
+echo "test" > ~/.claude/.obsidian-brain-canary 2>&1 && rm -f ~/.claude/.obsidian-brain-canary && echo "OK" || echo "FAIL"
+```
+
+If **OK**: proceed silently to Step 2.
+
+If **FAIL**: present the following message using AskUserQuestion:
+
+> **Heads up — setup needs write access outside this project directory.**
+>
+> Obsidian Brain writes config to `~/.claude/` and notes to your Obsidian vault. Your current Claude Code permissions block writes outside the working directory.
+>
+> Choose how to fix this:
+>
+> 1. **Switch permission mode (recommended)** — Press `Shift+Tab` to switch to "accept edits" mode for this session. Or use `/config` to change `permissions.defaultMode` permanently. Then re-run `/obsidian-setup`.
+>
+> 2. **Whitelist paths permanently** — Add `~/.claude` and your vault's parent directory to `sandbox.filesystem.allowWrite` in `~/.claude/settings.json`:
+>    ```json
+>    {
+>      "sandbox": {
+>        "filesystem": {
+>          "allowWrite": ["~/.claude", "~/path/to/vault-parent"]
+>        }
+>      }
+>    }
+>    ```
+>    Then re-run `/obsidian-setup`.
+>
+> 3. **I'll handle it myself** — Continue setup and approve or fix writes as they come up.
+
+**Behavior per option:**
+- **Option 1:** Print the instruction, then stop. User changes mode and re-runs `/obsidian-setup`.
+- **Option 2:** Print the JSON snippet (include the vault parent path if already known from Step 1's existing config). Then stop. User edits settings and re-runs.
+- **Option 3:** Continue with setup as normal. Writes may fail and the user deals with each one.
+
 ### Step 2 — Ask for vault path
 
 Ask the user:
