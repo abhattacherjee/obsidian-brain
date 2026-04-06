@@ -40,8 +40,30 @@ def get_branch_commits():
         return []
 
 
+def check_changelog_modified_on_branch():
+    """Check if CHANGELOG.md was modified on the current branch vs base."""
+    try:
+        cwd = os.environ.get("CLAUDE_PROJECT_DIR", ".")
+        # Check against develop first, fall back to main
+        for base in ["origin/develop", "origin/main"]:
+            check = subprocess.run(
+                ["git", "rev-parse", "--verify", base],
+                capture_output=True, text=True, cwd=cwd
+            )
+            if check.returncode == 0:
+                result = subprocess.run(
+                    ["git", "diff", "--name-only", f"{base}...HEAD", "--", "CHANGELOG.md"],
+                    capture_output=True, text=True, cwd=cwd
+                )
+                if result.returncode == 0:
+                    return bool(result.stdout.strip()), base
+        return None, None  # Could not determine
+    except Exception:
+        return None, None
+
+
 def check_changelog_has_unreleased_entries():
-    """Check if CHANGELOG.md has meaningful entries under [Unreleased]."""
+    """Check if CHANGELOG.md has meaningful NEW entries under [Unreleased]."""
     try:
         changelog_path = os.path.join(
             os.environ.get("CLAUDE_PROJECT_DIR", "."),
@@ -65,10 +87,24 @@ def check_changelog_has_unreleased_entries():
         entries = [line.strip() for line in unreleased_body.split('\n')
                    if line.strip().startswith('- ')]
 
-        if entries:
-            return True, f"{len(entries)} entries found under [Unreleased]"
+        if not entries:
+            return False, "[Unreleased] section has no entries"
 
-        return False, "[Unreleased] section has no entries"
+        # Entries exist — but are they new on this branch or stale?
+        modified, base = check_changelog_modified_on_branch()
+        if modified is None:
+            # Can't determine — trust the entries exist
+            return True, f"{len(entries)} entries found under [Unreleased]"
+        elif modified:
+            return True, f"{len(entries)} entries found under [Unreleased] (modified on this branch)"
+        else:
+            # Entries exist but CHANGELOG.md wasn't modified on this branch — stale!
+            return False, (
+                f"[Unreleased] has {len(entries)} entries, but CHANGELOG.md was NOT "
+                f"modified on this branch (compared to {base}). "
+                f"These are stale entries from a previous release. "
+                f"Add a new entry for your changes"
+            )
     except (PermissionError, OSError) as e:
         return None, f"Cannot read CHANGELOG.md: {e}"
     except Exception as e:
