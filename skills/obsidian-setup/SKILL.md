@@ -315,19 +315,33 @@ If FAIL, warn that vault writes are not working and ask the user to check permis
 
 ### Step 9 — Configure claudeception nudge (idempotent)
 
-Check if the claudeception-to-compress nudge is already configured:
+Check if the claudeception-to-compress nudge is already configured **globally** (in `~/.claude/`, not the project `.claude/`):
 
 ```bash
-grep -q "Run ./compress. to save it to your Obsidian vault" ~/.claude/settings.json 2>/dev/null && echo "EXISTS" || echo "MISSING"
+test -f ~/.claude/hookify.claudeception-compress-nudge.local.md && echo "EXISTS" || echo "MISSING"
 ```
 
 If EXISTS, skip this step — the nudge is already configured.
 
-If MISSING, invoke `/hookify` with this instruction:
+If MISSING, write the hookify rule file directly to `~/.claude/` using the Write tool:
 
-> Create a rule: After claudeception finishes and produces output (skill creation or knowledge extraction), display a non-blocking nudge message: "Claudeception extracted knowledge from this session. Run `/compress` to save it to your Obsidian vault." The trigger should match the `Result: PASS` marker or skill file path output from claudeception.
+**File: `~/.claude/hookify.claudeception-compress-nudge.local.md`**
 
-This is a soft nudge — a suggestion, not automatic execution.
+```markdown
+---
+name: claudeception-compress-nudge
+enabled: true
+event: stop
+pattern: Result:\s*PASS|\.claude/skills/[^/]+/SKILL\.md|created skill|skill file written|extracted knowledge
+action: warn
+---
+
+💡 **Claudeception extracted knowledge from this session.** Run `/compress` to save it to your Obsidian vault.
+```
+
+**Important:** This rule MUST be in `~/.claude/` (global), not the project's `.claude/` directory. The nudge should trigger in any project where claudeception runs, not just obsidian-brain.
+
+This is a soft nudge — a non-blocking suggestion, not automatic execution.
 
 ### Step 10 — Print success message
 
