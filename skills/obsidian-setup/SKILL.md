@@ -120,7 +120,19 @@ Continue regardless — this is a warning, not a blocker.
 
 ### Step 5 — Create vault folders
 
-Run:
+First, test that the vault path is writable:
+
+```bash
+echo "test" > "$VAULT_PATH/.obsidian-brain-canary" 2>&1 && rm -f "$VAULT_PATH/.obsidian-brain-canary" && echo "OK" || echo "FAIL"
+```
+
+If **FAIL**, tell the user:
+
+> **Cannot write to your vault at `$VAULT_PATH`.** This is likely a sandbox restriction. Add your vault's parent directory to `sandbox.filesystem.allowWrite` in `~/.claude/settings.json`, or switch to "accept edits" mode (`Shift+Tab`), then re-run `/obsidian-setup`.
+
+Stop here if FAIL.
+
+If **OK**, create the folders:
 
 ```bash
 mkdir -p "$VAULT_PATH/claude-sessions" "$VAULT_PATH/claude-insights" "$VAULT_PATH/claude-dashboards"
