@@ -238,7 +238,7 @@ Rules:
 - Decisions and errors should be deduplicated across sessions in the same project.
 - Open items should be listed as checkboxes (`- [ ]`).
 
-Precede all project sections with a header block:
+Precede all project sections with a header block that includes a highlights summary and consolidated open items:
 
 ```markdown
 # Standup: $START_DATE to $END_DATE
@@ -246,9 +246,22 @@ Precede all project sections with a header block:
 **Range:** $START_DATE → $END_DATE
 **Projects covered:** $PROJECT_COUNT
 **Sessions:** $SESSION_COUNT | **Insights:** $INSIGHT_COUNT
+
+### Highlights
+- **$PROJECT_A** — 1-2 sentence summary of what was accomplished this period
+- **$PROJECT_B** — 1-2 sentence summary of what was accomplished this period
+
+### Key Open Items
+- [ ] $PROJECT_A: $MOST_IMPORTANT_OPEN_ITEM
+- [ ] $PROJECT_B: $MOST_IMPORTANT_OPEN_ITEM
 ```
 
-If `IS_RANGE` is false (single day), use `# Standup: $DATE` and omit the "Range:" line.
+Rules for the header sections:
+- **Highlights:** Include only projects with substantive work (skip vault-import-only or config-tweak sessions). Write 1-2 sentences per project summarizing the outcome, not the process. Order by impact/significance, not alphabetically.
+- **Key Open Items:** Consolidate the most important open items across all projects (max ~5-7 items). Prefix each with the project name. These are the items that should drive next week's work. Skip low-priority or already-in-progress items.
+- Both sections are written in the saved note AND presented in the conversation output.
+
+If `IS_RANGE` is false (single day), use `# Standup: $DATE` and omit the "Range:" line. For single-day standups, the Highlights section may be omitted if only 1-2 sessions occurred.
 
 ### Step 10 — Build frontmatter
 
