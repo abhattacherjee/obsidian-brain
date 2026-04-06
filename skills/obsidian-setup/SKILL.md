@@ -67,23 +67,23 @@ If **FAIL**: present the following message using AskUserQuestion:
 >
 > 1. **Switch permission mode (recommended)** — Press `Shift+Tab` to switch to "accept edits" mode for this session. Or use `/config` to change `permissions.defaultMode` permanently. Then re-run `/obsidian-setup`.
 >
-> 2. **Whitelist paths permanently** — Add `~/.claude` and your vault's parent directory to `sandbox.filesystem.allowWrite` in `~/.claude/settings.json`:
+> 2. **Whitelist paths permanently** — Add `$HOME/.claude` and your vault's parent directory to `sandbox.filesystem.allowWrite` in `~/.claude/settings.json`. **Use absolute paths** — `~` is not expanded inside JSON string values:
 >    ```json
 >    {
 >      "sandbox": {
 >        "filesystem": {
->          "allowWrite": ["~/.claude", "~/path/to/vault-parent"]
+>          "allowWrite": ["/Users/you/.claude", "/Users/you/Documents/vault-parent"]
 >        }
 >      }
 >    }
 >    ```
->    Then re-run `/obsidian-setup`.
+>    Replace `/Users/you` with your actual home directory (run `echo $HOME` to find it). Then re-run `/obsidian-setup`.
 >
 > 3. **I'll handle it myself** — Continue setup and approve or fix writes as they come up.
 
 **Behavior per option:**
 - **Option 1:** Print the instruction, then stop. User changes mode and re-runs `/obsidian-setup`.
-- **Option 2:** Print the JSON snippet (include the vault parent path if already known from Step 1's existing config). Then stop. User edits settings and re-runs.
+- **Option 2:** Print the JSON snippet with absolute paths. In upgrade mode (`MODE=upgrade`), substitute the known vault parent path from the existing config. In fresh mode, show only the `$HOME/.claude` entry with a note that the vault parent must be added after the user provides the vault path. Then stop. User edits settings and re-runs.
 - **Option 3:** Continue with setup as normal. Writes may fail and the user deals with each one.
 
 ### Step 2 — Ask for vault path

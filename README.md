@@ -246,17 +246,19 @@ Machine-local config at `~/.claude/obsidian-brain-config.json`:
 
 **Cause:** Claude Code's permission mode or filesystem sandbox is blocking writes outside the working directory.
 
-**Fix:** Press `Shift+Tab` and switch to "accept edits" mode, then re-run `/obsidian-setup`. For a permanent fix, use `/config` to change `permissions.defaultMode`, or add paths to `sandbox.filesystem.allowWrite` in `~/.claude/settings.json`:
+**Fix:** Press `Shift+Tab` and switch to "accept edits" mode, then re-run `/obsidian-setup`. For a permanent fix, use `/config` to change `permissions.defaultMode`, or add paths to `sandbox.filesystem.allowWrite` in `~/.claude/settings.json`. **Use absolute paths** — `~` is not expanded inside JSON string values:
 
 ```json
 {
   "sandbox": {
     "filesystem": {
-      "allowWrite": ["~/.claude", "~/path/to/vault-parent"]
+      "allowWrite": ["/Users/you/.claude", "/Users/you/Documents/vault-parent"]
     }
   }
 }
 ```
+
+Replace `/Users/you` with your actual home directory (run `echo $HOME` to find it).
 
 ### `python` not found on macOS
 
