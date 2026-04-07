@@ -600,6 +600,11 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         - files_touched: list[str]
         - errors: list[str]
         - truncated: bool          (True if byte budget kicked in)
+        - warnings: list[str]      (visible issues the caller should surface)
+
+    Warnings are the caller's signal to annotate the upgraded summary — they
+    cover partial-line losses from slicing, malformed JSONL lines, unknown
+    block types, and stat failures. Never fails silently on data loss.
     """
     user_msgs: list[str] = []
     assistant_msgs: list[str] = []
@@ -607,27 +612,64 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
     files_seen: list[str] = []
     errors: list[str] = []
     truncated = False
+    warnings: list[str] = []
+    bad_lines = 0
+    unknown_block_types: set[str] = set()
 
-    try:
-        size = jsonl_path.stat().st_size
-    except OSError:
+    def _empty_result(warning: str) -> dict:
         return {
             "user_msgs": [], "assistant_msgs": [], "tool_uses": [],
             "files_touched": [], "errors": [], "truncated": False,
+            "warnings": [warning],
         }
 
+    try:
+        size = jsonl_path.stat().st_size
+    except OSError as exc:
+        return _empty_result(f"Could not stat transcript file: {exc}")
+
+    if size == 0:
+        return _empty_result("Transcript file is empty (0 bytes).")
+
     if size <= max_bytes:
-        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
+        try:
+            with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError as exc:
+            return _empty_result(f"Could not read transcript file: {exc}")
     else:
-        # Slice: first half + last half of budget
+        # Slice head + tail of the byte budget. Boundary-safe: trim the
+        # last line of head and the first line of tail — both are split
+        # mid-record and would silently fail json.loads otherwise.
         half = max_bytes // 2
-        with open(jsonl_path, "rb") as fh:
-            head = fh.read(half).decode("utf-8", errors="replace")
-            fh.seek(-half, 2)
-            tail = fh.read().decode("utf-8", errors="replace")
-        lines = head.splitlines() + ["{\"__sliced__\": true}"] + tail.splitlines()
+        # Guarantee head and tail do not overlap: tail starts at max(half, size - half).
+        tail_offset = max(half, size - half)
+        try:
+            with open(jsonl_path, "rb") as fh:
+                head_bytes = fh.read(half)
+                fh.seek(tail_offset)
+                tail_bytes = fh.read()
+        except OSError as exc:
+            return _empty_result(f"Could not slice transcript file: {exc}")
+
+        head_lines = head_bytes.decode("utf-8", errors="replace").splitlines()
+        tail_lines = tail_bytes.decode("utf-8", errors="replace").splitlines()
+        partial_dropped = 0
+        # The last line of head is (almost certainly) partial — drop it.
+        if head_lines:
+            head_lines.pop()
+            partial_dropped += 1
+        # The first line of tail is (almost certainly) partial — drop it.
+        if tail_lines:
+            tail_lines.pop(0)
+            partial_dropped += 1
+        lines = head_lines + ['{"__sliced__": true}'] + tail_lines
         truncated = True
+        if partial_dropped:
+            warnings.append(
+                f"Transcript byte budget exceeded ({size} > {max_bytes} bytes) — "
+                f"middle section sliced, {partial_dropped} partial JSONL lines dropped at slice boundaries."
+            )
 
     for raw in lines:
         raw = raw.strip()
@@ -636,6 +678,7 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         try:
             obj = json.loads(raw)
         except json.JSONDecodeError:
+            bad_lines += 1
             continue
         if obj.get("__sliced__"):
             user_msgs.append("[... middle of transcript truncated ...]")
@@ -680,6 +723,8 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
                                     errors.append(txt.strip()[:200])
                     elif isinstance(tr, str) and ("error" in tr.lower()):
                         errors.append(tr.strip()[:200])
+                elif btype:
+                    unknown_block_types.add(btype)
             text = "\n".join(p for p in parts if p)
         else:
             continue
@@ -690,6 +735,13 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         elif role == "assistant":
             assistant_msgs.append(text)
 
+    if bad_lines:
+        warnings.append(f"{bad_lines} malformed JSONL line(s) skipped while re-parsing transcript.")
+    if unknown_block_types:
+        warnings.append(
+            f"Unknown content block types encountered (data may be incomplete): {', '.join(sorted(unknown_block_types))}"
+        )
+
     return {
         "user_msgs": user_msgs,
         "assistant_msgs": assistant_msgs,
@@ -697,6 +749,7 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         "files_touched": files_seen,
         "errors": errors,
         "truncated": truncated,
+        "warnings": warnings,
     }
 
 

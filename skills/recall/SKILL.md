@@ -73,28 +73,34 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    ```
    Store as `RAW_TURNS`.
 
-3. **Locate the source JSONL deterministically.** Use Bash:
+3. **Locate the source JSONL and re-parse it in one shot.** Invoke the helper via argv (no shell interpolation of paths — pass `SESSION_ID` as an argument so session_ids with unusual characters cannot break the quoting). Use a secure temp file:
+
    ```bash
-   find ~/.claude/projects -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1
+   TMPFILE=$(mktemp -t recall-transcript.XXXXXX)
+   trap 'rm -f "$TMPFILE"' EXIT
+   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+   python3 -c '
+   import sys, json
+   sys.path.insert(0, "hooks")
+   from obsidian_utils import find_transcript_jsonl, parse_full_transcript
+   p = find_transcript_jsonl(sys.argv[1])
+   if p is None:
+       print(json.dumps({"jsonl_path": None}))
+   else:
+       data = parse_full_transcript(p)
+       data["jsonl_path"] = str(p)
+       print(json.dumps(data))
+   ' "$SESSION_ID" > "$TMPFILE"
    ```
-   Store the result as `JSONL_PATH` (may be empty).
+
+   Read the JSON from `$TMPFILE` with the Read tool. It contains either `{"jsonl_path": null}` (not found) or the full parsed transcript plus `jsonl_path`, `truncated`, and `warnings`.
 
 4. **Decide which source to summarize from:**
-   - **JSONL_PATH is empty** → use the raw note as the input. After summarizing, append a footnote to the Summary section: `_(Source transcript no longer on disk — summary built from truncated raw extraction.)_`
-   - **JSONL_PATH is set** → count messages in the JSONL: `wc -l < "$JSONL_PATH"`. Store as `JSONL_LINES`.
-     - **JSONL_LINES > RAW_TURNS** → the raw note is truncated. Re-parse the JSONL via:
-       ```bash
-       python3 -c "
-       import sys, json
-       sys.path.insert(0, '$(pwd)/hooks')
-       from obsidian_utils import parse_full_transcript
-       from pathlib import Path
-       data = parse_full_transcript(Path('$JSONL_PATH'))
-       print(json.dumps(data))
-       " > /tmp/recall-transcript-$$.json
-       ```
-       Read `/tmp/recall-transcript-$$.json`, then use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the input to summarization. Delete the temp file when done. If `truncated: true` is set, append `_(Transcript byte budget exceeded — middle section sliced.)_` to the Summary section.
-     - **JSONL_LINES ≤ RAW_TURNS** → no benefit; use the raw note (current path).
+   - **`jsonl_path` is null** → use the raw note as the input. After summarizing, append a footnote to the Summary section: `_(Source transcript no longer on disk — summary built from truncated raw extraction.)_`
+   - **`jsonl_path` is set** → count the message total `len(user_msgs) + len(assistant_msgs)` from the parsed data. Compare to `RAW_TURNS`.
+     - **Parsed total > RAW_TURNS** → the raw note is truncated. Use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the input to summarization.
+     - **Parsed total ≤ RAW_TURNS** → no benefit; use the raw note instead.
+   - **If the parsed data's `warnings` list is non-empty** (regardless of which branch), prepend a visible callout section `## ⚠️ Transcript re-parse warnings` at the top of the upgraded note (above `# <title>`), listing each warning as a bullet. This surfaces partial-line losses, malformed JSONL records, unknown block types, and byte-budget slicing so the user knows what's in the summary and what isn't.
 
 5. **Generate a detailed, specific summary** from whichever input source was chosen above. Be precise — include file paths, function names, config values, and technical specifics. Produce these sections (unchanged from before):
    - `## Summary` — 3-5 sentences
