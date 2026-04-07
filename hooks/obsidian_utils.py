@@ -574,10 +574,17 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
     projects_dir = Path.home() / ".claude" / "projects"
     if not projects_dir.is_dir():
         return None
+    # Reject any session_id containing glob metacharacters — `find -name`
+    # treats its argument as a glob, and UUIDs never contain these, so any
+    # occurrence indicates garbage input rather than a legitimate lookup.
+    if any(c in session_id for c in "*?[]"):
+        return None
     target = f"{session_id}.jsonl"
     try:
         result = subprocess.run(
-            ["find", str(projects_dir), "-name", target, "-type", "f"],
+            # `-print -quit` stops find at the first match so large project
+            # trees don't burn the full 5s timeout scanning unused branches.
+            ["find", str(projects_dir), "-name", target, "-type", "f", "-print", "-quit"],
             capture_output=True, text=True, timeout=5,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -683,9 +690,19 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         if obj.get("__sliced__"):
             user_msgs.append("[... middle of transcript truncated ...]")
             continue
-        msg = obj.get("message") or obj
-        role = msg.get("role")
-        content = msg.get("content")
+        # Match the canonical Claude Code JSONL shape used elsewhere in this
+        # module (extract_user_messages / extract_assistant_messages): the
+        # top-level `type` field is primary, with a fallback to `role` for
+        # flat-format transcripts. `content` lives under `entry.message` in
+        # the CC format and directly on `entry` in flat format.
+        top_type = obj.get("type")
+        if top_type in ("user", "assistant"):
+            role = top_type
+            msg = obj.get("message") or {}
+            content = msg.get("content") if isinstance(msg, dict) else None
+        else:
+            role = obj.get("role")
+            content = obj.get("content")
         if content is None:
             continue
         if isinstance(content, str):
@@ -700,9 +717,13 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
                     parts.append(block.get("text", ""))
                 elif btype == "tool_use":
                     name = block.get("name", "")
-                    inp = block.get("input", {}) or {}
+                    raw_inp = block.get("input")
+                    inp = raw_inp if isinstance(raw_inp, dict) else {}
                     detail = ""
-                    if name in ("Edit", "Write", "Read"):
+                    # MultiEdit is included here for parity with
+                    # extract_tool_uses — without it, files edited via
+                    # MultiEdit would be silently missing from files_touched.
+                    if name in ("Edit", "Write", "Read", "MultiEdit"):
                         fp = inp.get("file_path", "")
                         detail = f"`{fp}`" if fp else ""
                         if fp and fp not in files_seen:
