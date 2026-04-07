@@ -2,7 +2,7 @@
 name: obsidian-setup
 description: "First-run configuration and upgrade for the Obsidian Brain plugin. Sets up vault path, creates folders, copies dashboard templates, configures hookify nudges, and writes config. Idempotent — safe to re-run to pick up new features without overwriting existing config or dashboards. Use when: (1) first time installing obsidian-brain, (2) changing vault path, (3) /obsidian-setup command, (4) upgrading to a new version."
 metadata:
-  version: 1.2.0
+  version: 1.3.0
 ---
 
 # Obsidian Brain Setup
