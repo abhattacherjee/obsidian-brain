@@ -79,9 +79,18 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    from obsidian_utils import find_transcript_jsonl, parse_full_transcript, RAW_NOTE_MAX_TURNS
    p = find_transcript_jsonl(sys.argv[1])
    if p is None:
-       # Always include raw_note_max_turns so the caller can key off one
-       # consistent field regardless of which branch was taken.
-       print(json.dumps({"jsonl_path": None, "raw_note_max_turns": RAW_NOTE_MAX_TURNS}))
+       # Emit the same schema as the success branch so downstream steps
+       # do not need to special-case missing fields. All fields present,
+       # lists empty, booleans False.
+       print(json.dumps({
+           "jsonl_path": None,
+           "user_msgs": [], "assistant_msgs": [], "tool_uses": [],
+           "files_touched": [], "errors": [],
+           "truncated": False,
+           "warnings": [],
+           "raw_note_max_turns": RAW_NOTE_MAX_TURNS,
+           "raw_note_would_truncate": False,
+       }))
    else:
        data = parse_full_transcript(p)
        data["jsonl_path"] = str(p)
