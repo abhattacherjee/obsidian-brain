@@ -643,7 +643,6 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
                 lines = fh.read().splitlines()
         except OSError as exc:
             return _empty_result(f"Could not read transcript file: {exc}")
-        sliced_marker: list[str] = []
     else:
         # Slice head + tail of the byte budget. Boundary-safe: only drop a
         # line when the slice actually cut it mid-record. If head_bytes
@@ -675,7 +674,6 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
             tail_lines.pop(0)
             partial_dropped += 1
         lines = head_lines + tail_lines
-        sliced_marker = ['{"__sliced__": true}']
         truncated = True
         if partial_dropped:
             warnings.append(
@@ -756,10 +754,11 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
                     if snippet not in errors:
                         errors.append(snippet)
 
-    if truncated and sliced_marker:
-        # Inject the middle-truncated marker into user_msgs so it's visible
-        # to the summarization prompt between the head and tail halves.
-        user_msgs.append("[... middle of transcript truncated ...]")
+    # Note: we do not inject a "[... middle truncated ...]" marker into
+    # user_msgs. At this point it would land at the very end of the list
+    # (after the tail slice), not at the actual head/tail boundary, which
+    # would be misleading. The slice is already surfaced via `truncated`
+    # and the `warnings` list, which is what the caller uses for display.
 
     if bad_lines:
         warnings.append(f"{bad_lines} malformed JSONL line(s) skipped while re-parsing transcript.")

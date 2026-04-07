@@ -75,9 +75,9 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
 
 3. **Locate the source JSONL and re-parse it in one shot.** Invoke the helper via argv (no shell interpolation of paths — pass `SESSION_ID` as an argument so session_ids with unusual characters cannot break the quoting). Use a secure temp file:
 
+   Run the following Bash command from the obsidian-brain project root. It prints the parsed transcript JSON **directly to stdout** — no temp files, no traps, no `$TMPFILE` that would need to persist across tool invocations. Capture the stdout from the Bash tool result in the next step:
+
    ```bash
-   TMPFILE=$(mktemp -t recall-transcript.XXXXXX)
-   trap 'rm -f "$TMPFILE"' EXIT
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
    python3 -c '
    import sys, json
@@ -90,10 +90,10 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
        data = parse_full_transcript(p)
        data["jsonl_path"] = str(p)
        print(json.dumps(data))
-   ' "$SESSION_ID" > "$TMPFILE"
+   ' "$SESSION_ID"
    ```
 
-   Read the JSON from `$TMPFILE` with the Read tool. It contains either `{"jsonl_path": null}` (not found) or the full parsed transcript plus `jsonl_path`, `truncated`, and `warnings`.
+   The Bash tool's stdout result is the JSON payload. Parse it directly from the tool response — it contains either `{"jsonl_path": null}` (not found) or the full parsed transcript plus `jsonl_path`, `truncated`, and `warnings`. Very large transcripts can produce multi-MB JSON; if the Bash tool truncates the output, fall back to writing to a known path such as `$VAULT_PATH/.obsidian-brain-transcript-cache.json` and reading it with the Read tool (this file is not in the vault's git repo and is safe to overwrite).
 
 4. **Decide which source to summarize from.** The truncation signal is the parsed user/assistant message count (`len(user_msgs) + len(assistant_msgs)`) compared to `RAW_TURNS`. This is apples-to-apples: both counts represent completed conversation turns extracted via the same logic (`extract_user_messages` / `extract_assistant_messages`) — unlike raw JSONL line counts, which include tool-result envelopes, thinking blocks, system events, and other non-message records and would give false positives.
    - **`jsonl_path` is null** → use the raw note as the input. After summarizing, append a footnote to the Summary section: `_(Source transcript no longer on disk — summary built from truncated raw extraction.)_`
