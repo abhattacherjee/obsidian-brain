@@ -644,16 +644,22 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
         if result.stdout.strip():
             first = result.stdout.strip().split("\n")[0]
             return Path(first) if first else None
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        # Fall through to the pure-Python fallback below — sandboxed or
-        # restricted environments may not have `find` on PATH.
+    except subprocess.TimeoutExpired:
+        # If `find` already timed out on this tree, a pure-Python rglob
+        # will almost certainly be slower — the tree is too large. Treat
+        # timeout as a hard failure so /recall falls back to the raw note
+        # rather than hanging on a worse scan.
+        return None
+    except FileNotFoundError:
+        # `find` not on PATH (sandboxed/minimal container). Fall through
+        # to the pure-Python rglob fallback below.
         pass
     except OSError:
         pass
 
-    # Fallback: pure-Python rglob. Slower on huge trees but dependency-free
-    # so /recall still works when `find` is unavailable (sandboxes, minimal
-    # container images, restricted shells).
+    # Fallback: pure-Python rglob. Only reached when `find` is unavailable,
+    # never when it timed out. Dependency-free so /recall still works in
+    # sandboxed environments that don't ship with `find`.
     try:
         for path in projects_dir.rglob(target):
             if path.is_file():
