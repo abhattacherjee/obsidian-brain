@@ -596,10 +596,12 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
     projects_dir = Path.home() / ".claude" / "projects"
     if not projects_dir.is_dir():
         return None
-    # Reject any session_id containing glob metacharacters — `find -name`
-    # treats its argument as a glob, and UUIDs never contain these, so any
-    # occurrence indicates garbage input rather than a legitimate lookup.
-    if any(c in session_id for c in "*?[]"):
+    # Reject any session_id containing glob metacharacters, path separators,
+    # or whitespace. `find -name` matches basenames and treats its argument
+    # as a glob, so separators would never match and metacharacters would
+    # match the wrong file. UUIDs never contain any of these — an occurrence
+    # indicates garbage input rather than a legitimate lookup.
+    if any(c in session_id for c in "*?[]/\\ \t\n\r"):
         return None
     target = f"{session_id}.jsonl"
     # Primary path: external `find` with -print -quit (fast on large trees).
