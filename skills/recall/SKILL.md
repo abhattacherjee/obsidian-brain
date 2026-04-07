@@ -105,7 +105,7 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    - **`truncated: true`** — the transcript exceeded the 5 MB byte budget and was sliced into head+tail halves. In that case some real content is missing from the middle regardless of the cap simulation, so this must be OR'd with the cap signal.
 
    Decision branches:
-   - **`jsonl_path` is null** → use the raw note as the input. Append to the Summary section: `_(Source transcript no longer on disk — summary built from truncated raw extraction.)_`
+   - **`jsonl_path` is null** → use the raw note as the input. Append to the Summary section: `_(Source transcript not found on disk — summary built from the raw session note; fidelity depends on whether the raw note was itself capped at write time.)_`
    - **`jsonl_path` is set AND (`raw_note_would_truncate == true` OR `truncated == true`)** → re-parse path engages. Use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the summarization input. If `truncated == true`, note that the summary reflects only the head and tail of the transcript.
    - **`jsonl_path` is set AND `raw_note_would_truncate == false` AND `truncated == false`** → the raw note captured everything; use it instead.
    - **If the parsed data's `warnings` list is non-empty** (regardless of which branch), prepend a visible callout section `## ⚠️ Transcript re-parse warnings` at the top of the upgraded note (above `# <title>`), listing each warning as a bullet. This surfaces partial-line losses, malformed JSONL records, unknown block types, and byte-budget slicing so the user knows what's in the summary and what isn't.
