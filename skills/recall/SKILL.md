@@ -41,9 +41,9 @@ basename "$(pwd)"
 
 Store as `PROJECT`. Normalize: lowercase, hyphens for spaces.
 
-### Step 3 — Summarize unsummarized notes (deferred summarization)
+### Step 3 — Summarize unsummarized notes (deferred summarization, truncation-aware)
 
-This is the critical upgrade step. Search for raw/unsummarized session notes matching this project.
+This is the critical upgrade step. Search for raw/unsummarized session notes matching this project, and prefer the original Claude Code transcript JSONL over the truncated raw note when the JSONL has more data.
 
 Use Grep to find notes containing the "AI summary unavailable" marker in the sessions folder:
 
@@ -63,29 +63,54 @@ output_mode: content
 
 For each file that matches BOTH conditions (unsummarized AND belongs to this project):
 
-1. **Read the full file** using the Read tool.
-2. **Extract frontmatter** — preserve it exactly as-is (everything between the opening `---` and closing `---`).
-3. **Extract the full conversation** — look for all content after frontmatter. The raw note now includes:
-   - `## Conversation (raw)` — interleaved user and assistant messages
-   - `## Tool Usage` — commands run, files edited, searches performed
-   - `## Changes Made` — files touched (from tool_use extraction)
-   - `## Errors Encountered` — errors from tool results
-   Read ALL of these sections — they provide the context needed for a high-quality summary.
+1. **Read the raw note in full** with the Read tool. Preserve frontmatter exactly. Extract `session_id` from the frontmatter.
 
-4. **Generate a detailed, specific summary** from the raw content. Be precise — include file paths, function names, config values, and technical specifics. Produce these sections:
-   - `## Summary` — 3-5 sentence overview. Include: what problem was being solved, what approach was taken, what was the outcome. Name specific technologies, files, and patterns.
-   - `## Key Decisions` — Bulleted list with rationale. Each bullet should explain the decision AND why it was made (e.g., "Chose Redis over Memcached for session store — needed TTL per key for token expiry"). If none, write "None noted."
-   - `## Changes Made` — Bulleted list with file paths and descriptions. Be specific: "Modified `src/auth/handler.ts` — added JWT refresh token rotation with 15min access / 7day refresh windows". Include commit messages if visible. If none, write "None noted."
-   - `## Errors Encountered` — Bulleted list with error messages, root causes, AND fixes. Be specific: "`TypeError: Cannot read property 'token' of undefined` in handler.ts:42 — caused by null user object when session expired, fixed with optional chaining". If none, write "None."
-   - `## Open Questions / Next Steps` — Checkbox list of specific, actionable items. Not vague ("improve performance") but concrete ("Add rate limiting to /api/auth/refresh endpoint, max 10 req/min per user"). If none, write "None."
-5. **Preserve the Session Metadata section** at the bottom if it exists (commits, files touched).
-6. **Write the upgraded note** using the Write tool — same file path. The structure must be:
-   - Original frontmatter (unchanged)
+2. **Count conversation turns in the raw note** using Grep:
+   ```
+   pattern: "^\*\*User:\*\*|^\*\*Assistant:\*\*"
+   path: <the note file>
+   output_mode: count
+   ```
+   Store as `RAW_TURNS`.
+
+3. **Locate the source JSONL deterministically.** Use Bash:
+   ```bash
+   find ~/.claude/projects -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1
+   ```
+   Store the result as `JSONL_PATH` (may be empty).
+
+4. **Decide which source to summarize from:**
+   - **JSONL_PATH is empty** → use the raw note as the input. After summarizing, append a footnote to the Summary section: `_(Source transcript no longer on disk — summary built from truncated raw extraction.)_`
+   - **JSONL_PATH is set** → count messages in the JSONL: `wc -l < "$JSONL_PATH"`. Store as `JSONL_LINES`.
+     - **JSONL_LINES > RAW_TURNS** → the raw note is truncated. Re-parse the JSONL via:
+       ```bash
+       python3 -c "
+       import sys, json
+       sys.path.insert(0, '$(pwd)/hooks')
+       from obsidian_utils import parse_full_transcript
+       from pathlib import Path
+       data = parse_full_transcript(Path('$JSONL_PATH'))
+       print(json.dumps(data))
+       " > /tmp/recall-transcript-$$.json
+       ```
+       Read `/tmp/recall-transcript-$$.json`, then use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the input to summarization. Delete the temp file when done. If `truncated: true` is set, append `_(Transcript byte budget exceeded — middle section sliced.)_` to the Summary section.
+     - **JSONL_LINES ≤ RAW_TURNS** → no benefit; use the raw note (current path).
+
+5. **Generate a detailed, specific summary** from whichever input source was chosen above. Be precise — include file paths, function names, config values, and technical specifics. Produce these sections (unchanged from before):
+   - `## Summary` — 3-5 sentences
+   - `## Key Decisions` — bulleted list with rationale
+   - `## Changes Made` — bulleted list with file paths
+   - `## Errors Encountered` — bulleted list with messages, root causes, fixes
+   - `## Open Questions / Next Steps` — checkbox list of concrete actionable items
+
+6. **Write the upgraded note** with the Write tool to the same file path. Preserve original frontmatter unchanged but flip `status: auto-logged` to `status: summarized`. Structure:
+   - Original frontmatter (unchanged except `status`)
    - `# <title from original note>`
-   - The five summary sections generated above
-   - The Session Metadata section (if it existed)
+   - The five summary sections
+   - The existing `## Tool Usage` / `## Changes Made` / `## Errors Encountered` / `## Conversation (raw)` sections from the raw note (preserve them as the audit trail — only the leading summary changes)
+   - The Session Metadata section if present
 
-**Important:** Do NOT modify frontmatter. Do NOT change the filename. Do NOT add or remove tags.
+**Important:** Do NOT modify frontmatter fields other than `status`. Do NOT change the filename. Do NOT add or remove tags.
 
 If no unsummarized notes are found for this project, skip to Step 4.
 
