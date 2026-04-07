@@ -132,41 +132,78 @@ if [ -f "$PLUGIN_JSON" ] && [ -f "$MARKETPLACE_JSON" ]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "🔖 Checking plugin manifest version sync..."
-    VERSION_CHECK=$(python3 - "$PLUGIN_JSON" "$MARKETPLACE_JSON" <<'PY'
-import json, sys
+    # Initialize explicitly so a stale value from an earlier iteration
+    # (if this script is ever sourced or extended) can't leak into the
+    # check and falsely fail on a clean repo.
+    VERSION_SYNC_EXIT=0
+    VERSION_CHECK_STDOUT=""
+    VERSION_CHECK_STDERR=""
+    VERSION_CHECK_TMP=$(mktemp -t preflight-version-XXXXXX)
+    VERSION_CHECK_STDOUT=$(python3 - "$PLUGIN_JSON" "$MARKETPLACE_JSON" 2>"$VERSION_CHECK_TMP" <<'PY'
+import json, sys, traceback
 plugin_path, market_path = sys.argv[1], sys.argv[2]
 try:
     plugin = json.load(open(plugin_path))
     market = json.load(open(market_path))
 except Exception as e:
-    print(f"ERROR: could not parse manifest: {e}")
+    sys.stderr.write(f"parse error: {e}\n")
     sys.exit(2)
 plugin_v = plugin.get("version")
 plugin_name = plugin.get("name")
 if not plugin_v or not plugin_name:
-    print("ERROR: plugin.json missing 'name' or 'version'")
+    sys.stderr.write("plugin.json missing 'name' or 'version'\n")
     sys.exit(2)
-entries = [p for p in market.get("plugins", []) if p.get("name") == plugin_name]
-if not entries:
-    print(f"ERROR: marketplace.json has no entry for '{plugin_name}'")
+try:
+    entries = [p for p in market.get("plugins", []) if p.get("name") == plugin_name]
+    if not entries:
+        sys.stderr.write(f"marketplace.json has no entry for '{plugin_name}'\n")
+        sys.exit(2)
+    market_v = entries[0].get("version")
+    if market_v is None:
+        sys.stderr.write(f"marketplace.json entry for '{plugin_name}' has no 'version' field\n")
+        sys.exit(2)
+    if market_v != plugin_v:
+        print(f"MISMATCH: plugin.json={plugin_v} marketplace.json={market_v}")
+        sys.exit(1)
+    print(f"OK: {plugin_name}@{plugin_v}")
+except Exception:
+    # Defensive: any unexpected crash (KeyError, TypeError on a malformed
+    # entry, etc.) goes to stderr with traceback and exits 2 so the shell
+    # caller can surface it as a structural error, not a version mismatch.
+    sys.stderr.write("unexpected error during version sync check:\n")
+    traceback.print_exc(file=sys.stderr)
     sys.exit(2)
-market_v = entries[0].get("version")
-if market_v != plugin_v:
-    print(f"MISMATCH: plugin.json={plugin_v} marketplace.json={market_v}")
-    sys.exit(1)
-print(f"OK: {plugin_name}@{plugin_v}")
 PY
 ) || VERSION_SYNC_EXIT=$?
-    echo "$VERSION_CHECK"
-    if [ "${VERSION_SYNC_EXIT:-0}" -ne 0 ]; then
-        echo ""
-        echo "❌ Plugin manifest versions are out of sync."
-        echo "   Update .claude-plugin/marketplace.json to match plugin.json,"
-        echo "   or run ./scripts/bump-version.sh which updates both."
-        CHECKS_PASSED=false
-    else
-        CHECKS_RUN="${CHECKS_RUN}version-sync,"
+    VERSION_CHECK_STDERR=$(cat "$VERSION_CHECK_TMP" 2>/dev/null || true)
+    rm -f "$VERSION_CHECK_TMP"
+    if [ -n "$VERSION_CHECK_STDOUT" ]; then
+        echo "$VERSION_CHECK_STDOUT"
     fi
+    case "$VERSION_SYNC_EXIT" in
+        0)
+            CHECKS_RUN="${CHECKS_RUN}version-sync,"
+            ;;
+        1)
+            echo ""
+            echo "❌ Plugin manifest versions are out of sync."
+            echo "   Update .claude-plugin/marketplace.json to match plugin.json,"
+            echo "   or run ./scripts/bump-version.sh which updates both."
+            CHECKS_PASSED=false
+            ;;
+        *)
+            echo ""
+            echo "❌ Plugin manifest version check failed with a structural error:"
+            if [ -n "$VERSION_CHECK_STDERR" ]; then
+                echo "$VERSION_CHECK_STDERR" | sed 's/^/   /'
+            else
+                echo "   (no error output — python exited with code $VERSION_SYNC_EXIT)"
+            fi
+            echo "   Fix the manifest files before committing."
+            CHECKS_PASSED=false
+            ;;
+    esac
+    unset VERSION_SYNC_EXIT VERSION_CHECK_STDOUT VERSION_CHECK_STDERR VERSION_CHECK_TMP
 fi
 
 # ══════════════════════════════════════════════════════════════

@@ -155,23 +155,66 @@ update_version "$PROJECT_ROOT/.claude-plugin/plugin.json" "$NEW_VERSION"
 # to users even though the plugin itself has been released.
 MARKETPLACE_JSON="$PROJECT_ROOT/.claude-plugin/marketplace.json"
 if [[ -f "$MARKETPLACE_JSON" ]]; then
-  python3 - "$MARKETPLACE_JSON" "$NEW_VERSION" <<'PY'
-import json, pathlib, sys
+  PLUGIN_NAME=$(python3 -c "import json; print(json.load(open('$PROJECT_ROOT/.claude-plugin/plugin.json'))['name'])")
+  if ! python3 - "$MARKETPLACE_JSON" "$NEW_VERSION" "$PLUGIN_NAME" <<'PY'
+import json, os, pathlib, sys, tempfile
 path = pathlib.Path(sys.argv[1])
 new_version = sys.argv[2]
-data = json.loads(path.read_text())
-updated = False
-for plugin in data.get("plugins", []):
+plugin_name = sys.argv[3]
+
+try:
+    data = json.loads(path.read_text())
+except Exception as e:
+    sys.stderr.write(f"ERROR: could not parse {path}: {e}\n")
+    sys.exit(2)
+
+plugins = data.get("plugins")
+if not isinstance(plugins, list) or not plugins:
+    sys.stderr.write(f"ERROR: {path} has no 'plugins' array\n")
+    sys.exit(2)
+
+matches = [p for p in plugins if p.get("name") == plugin_name]
+if not matches:
+    sys.stderr.write(
+        f"ERROR: marketplace.json has no entry for plugin '{plugin_name}'. "
+        f"Add an entry before releasing, or the marketplace listing will "
+        f"lie about the version.\n"
+    )
+    sys.exit(1)
+
+changed = 0
+for plugin in matches:
     if plugin.get("version") != new_version:
         plugin["version"] = new_version
-        updated = True
-if updated:
-    path.write_text(json.dumps(data, indent=2) + "\n")
-    print(f"marketplace.json synced to {new_version}")
+        changed += 1
+
+if changed:
+    # Atomic write: temp file in same dir + os.replace. Mirrors the
+    # write_vault_note() convention in hooks/obsidian_utils.py so a
+    # SIGINT or disk-full mid-write cannot corrupt the registry pointer.
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    print(f"marketplace.json: updated {changed} entry for '{plugin_name}' to {new_version}")
 else:
-    print(f"marketplace.json already at {new_version}")
+    print(f"marketplace.json: '{plugin_name}' already at {new_version}")
 PY
-  print_success "Updated marketplace.json plugin entries to $NEW_VERSION"
+  then
+    print_error "Failed to sync marketplace.json — fix the above and re-run"
+    exit 1
+  fi
+  print_success "Synced marketplace.json entry for $PLUGIN_NAME to $NEW_VERSION"
 fi
 
 echo ""
