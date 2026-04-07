@@ -233,12 +233,20 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
     return meta
 
 
-def _entry_content(entry: dict):
-    """Return the content list for a transcript entry, supporting both the
-    canonical CC JSONL shape (nested under entry['message']['content']) and
-    the flat fallback shape (entry['content'] directly). Mirrors the shape
-    handling of extract_user_messages / extract_assistant_messages so the
+def _entry_content(entry: dict) -> str | list | None:
+    """Return the raw transcript content value for an entry.
+
+    Supports both the canonical CC JSONL shape (nested under
+    entry['message']['content']) and the flat fallback shape
+    (entry['content'] directly). Mirrors the shape handling of
+    extract_user_messages / extract_assistant_messages so the
     _extract_* helpers below stay consistent across transcript formats.
+
+    Return value is whatever the transcript stored — typically a
+    list of content blocks (for tool-use / text / tool_result blocks)
+    but can also be a plain string in flat-format transcripts, or
+    None when no content is present. Callers must `isinstance` check
+    before iterating.
     """
     msg = entry.get("message")
     if isinstance(msg, dict):
@@ -676,6 +684,8 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         - errors: list[str]
         - truncated: bool          (True if byte budget kicked in)
         - warnings: list[str]      (visible issues the caller should surface)
+        - raw_note_max_turns: int  (the RAW_NOTE_MAX_TURNS constant, for caller reference)
+        - raw_note_would_truncate: bool  (True iff build_raw_fallback would hit its write cap)
     """
     warnings: list[str] = []
     bad_lines = 0
