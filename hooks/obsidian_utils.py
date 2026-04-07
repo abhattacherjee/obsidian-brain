@@ -26,6 +26,13 @@ from pathlib import Path
 # Default configuration
 # ---------------------------------------------------------------------------
 
+# Shared cap for the raw-note conversation section. Used by build_raw_fallback
+# as the write-time truncation limit, and returned by parse_full_transcript
+# so /recall can deterministically detect truncation by comparing the parsed
+# message total against it — avoiding any dependence on the raw note's
+# message-filtering heuristics.
+RAW_NOTE_MAX_TURNS = 120
+
 _CONFIG_PATH = Path.home() / ".claude" / "obsidian-brain-config.json"
 
 _DEFAULTS: dict = {
@@ -776,6 +783,11 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         "errors": errors,
         "truncated": truncated,
         "warnings": warnings,
+        # The raw-note conversation cap is the only real truncation signal.
+        # /recall compares (len(user_msgs) + len(assistant_msgs)) against
+        # this value to deterministically decide whether the raw note is
+        # missing content, independent of the raw note's message-filtering.
+        "raw_note_max_turns": RAW_NOTE_MAX_TURNS,
     }
 
 
@@ -839,7 +851,7 @@ def build_raw_fallback(
 
     # Interleaved conversation for /recall to summarize
     sections.append("## Conversation (raw)")
-    max_turns = 120
+    max_turns = RAW_NOTE_MAX_TURNS
     u_idx, a_idx = 0, 0
     turn = 0
     while turn < max_turns and (u_idx < len(user_msgs) or (assistant_msgs and a_idx < len(assistant_msgs))):

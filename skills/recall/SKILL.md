@@ -65,13 +65,7 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
 
 1. **Read the raw note in full** with the Read tool. Preserve frontmatter exactly. Extract the `session_id` value from the frontmatter and **store it as `SESSION_ID`** — the Bash snippet in sub-step 3 references this exact variable name.
 
-2. **Count conversation turns in the raw note** using Grep:
-   ```
-   pattern: "^\*\*User:\*\*|^\*\*Assistant:\*\*"
-   path: <the note file>
-   output_mode: count
-   ```
-   Store as `RAW_TURNS`. This counts only user/assistant turn markers in the raw note body — the deliberate signal for "what the raw extraction actually captured".
+2. **No raw-note turn count needed.** Earlier revisions of this skill counted `^\*\*User:\*\*` / `^\*\*Assistant:\*\*` markers in the raw note to detect truncation, but that count is unreliable: the raw fallback's `## Conversation (raw)` section filters out system noise (`<task-notification>`, `<local-command…>`, "Base directory for this skill:", …) and increments its `turn` counter only when a user message is actually written. So a raw note with 40 turn markers does not necessarily correspond to 40 user messages in the transcript. Use the shared `raw_note_max_turns` constant returned by the helper in sub-step 3 instead — it is the only deterministic truncation signal.
 
 3. **Locate the source JSONL and re-parse it in one shot.** Invoke the helper via argv (no shell interpolation of paths — pass `SESSION_ID` as an argument so session_ids with unusual characters cannot break the quoting). The parsed JSON is printed directly to stdout — no temp files, no traps:
 
@@ -95,10 +89,10 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
 
    The Bash tool's stdout result is the JSON payload. Parse it directly from the tool response — it contains either `{"jsonl_path": null}` (not found) or the full parsed transcript plus `jsonl_path`, `truncated`, and `warnings`. Very large transcripts can produce multi-MB JSON; if the Bash tool truncates the output, fall back to writing to a known path such as `$VAULT_PATH/.obsidian-brain-transcript-cache.json` and reading it with the Read tool (this file is not in the vault's git repo and is safe to overwrite).
 
-4. **Decide which source to summarize from.** The truncation signal is the parsed user/assistant message count (`len(user_msgs) + len(assistant_msgs)`) compared to `RAW_TURNS`. This is apples-to-apples: both counts represent completed conversation turns extracted via the same logic (`extract_user_messages` / `extract_assistant_messages`) — unlike raw JSONL line counts, which include tool-result envelopes, thinking blocks, system events, and other non-message records and would give false positives.
+4. **Decide which source to summarize from.** The truncation signal is the parsed user/assistant message total (`len(user_msgs) + len(assistant_msgs)`) compared to the `raw_note_max_turns` field returned in the JSON payload. This is the write-time cap used by `build_raw_fallback` (currently 120) — the single source of truth for "did the raw note lose content". Independent of raw-note filtering heuristics that drop system noise.
    - **`jsonl_path` is null** → use the raw note as the input. After summarizing, append a footnote to the Summary section: `_(Source transcript no longer on disk — summary built from truncated raw extraction.)_`
-   - **`jsonl_path` is set and parsed total > RAW_TURNS** → the raw note is truncated relative to the original transcript. Use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the summarization input.
-   - **`jsonl_path` is set and parsed total ≤ RAW_TURNS** → no benefit; use the raw note instead.
+   - **`jsonl_path` is set and parsed total > `raw_note_max_turns`** → the raw note is truncated relative to the original transcript. Use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the summarization input.
+   - **`jsonl_path` is set and parsed total ≤ `raw_note_max_turns`** → the raw note captured everything; use it instead.
    - **If the parsed data's `warnings` list is non-empty** (regardless of which branch), prepend a visible callout section `## ⚠️ Transcript re-parse warnings` at the top of the upgraded note (above `# <title>`), listing each warning as a bullet. This surfaces partial-line losses, malformed JSONL records, unknown block types, and byte-budget slicing so the user knows what's in the summary and what isn't.
 
 5. **Generate a detailed, specific summary** from whichever input source was chosen above. Be precise — include file paths, function names, config values, and technical specifics. Produce these sections (unchanged from before):
