@@ -233,16 +233,31 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
     return meta
 
 
+def _entry_content(entry: dict):
+    """Return the content list for a transcript entry, supporting both the
+    canonical CC JSONL shape (nested under entry['message']['content']) and
+    the flat fallback shape (entry['content'] directly). Mirrors the shape
+    handling of extract_user_messages / extract_assistant_messages so the
+    _extract_* helpers below stay consistent across transcript formats.
+    """
+    msg = entry.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if content is not None:
+            return content
+    return entry.get("content")
+
+
 def _extract_files_touched(messages: list[dict]) -> list[str]:
     """Extract unique file paths from Edit/Write/MultiEdit tool_use blocks.
 
     Shared between extract_session_metadata (SessionEnd write path) and
-    parse_full_transcript (/recall read path) to prevent drift.
+    parse_full_transcript (/recall read path) to prevent drift. Handles
+    both CC and flat transcript shapes via _entry_content.
     """
     files_seen: list[str] = []
     for entry in messages:
-        msg = entry.get("message", {})
-        content = msg.get("content") if isinstance(msg, dict) else None
+        content = _entry_content(entry)
         if not isinstance(content, list):
             continue
         for block in content:
@@ -264,12 +279,12 @@ def _extract_errors(messages: list[dict]) -> list[str]:
     """Extract unique error snippets from tool_result blocks with is_error=true.
 
     Shared between extract_session_metadata (SessionEnd write path) and
-    parse_full_transcript (/recall read path) to prevent drift.
+    parse_full_transcript (/recall read path) to prevent drift. Handles
+    both CC and flat transcript shapes via _entry_content.
     """
     errors: list[str] = []
     for entry in messages:
-        msg = entry.get("message", {})
-        content = msg.get("content") if isinstance(msg, dict) else None
+        content = _entry_content(entry)
         if not isinstance(content, list):
             continue
         for block in content:
