@@ -122,6 +122,53 @@ else
     CHECKS_PASSED=false
 fi
 
+# ── Plugin manifest version sync ─────────────────────────────
+# Ensures .claude-plugin/marketplace.json registry pointer stays in lockstep
+# with .claude-plugin/plugin.json. Drift has caused the marketplace listing
+# to advertise a stale version to users (bug fixed on 2026-04-07).
+PLUGIN_JSON="$PROJECT_DIR/.claude-plugin/plugin.json"
+MARKETPLACE_JSON="$PROJECT_DIR/.claude-plugin/marketplace.json"
+if [ -f "$PLUGIN_JSON" ] && [ -f "$MARKETPLACE_JSON" ]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🔖 Checking plugin manifest version sync..."
+    VERSION_CHECK=$(python3 - "$PLUGIN_JSON" "$MARKETPLACE_JSON" <<'PY'
+import json, sys
+plugin_path, market_path = sys.argv[1], sys.argv[2]
+try:
+    plugin = json.load(open(plugin_path))
+    market = json.load(open(market_path))
+except Exception as e:
+    print(f"ERROR: could not parse manifest: {e}")
+    sys.exit(2)
+plugin_v = plugin.get("version")
+plugin_name = plugin.get("name")
+if not plugin_v or not plugin_name:
+    print("ERROR: plugin.json missing 'name' or 'version'")
+    sys.exit(2)
+entries = [p for p in market.get("plugins", []) if p.get("name") == plugin_name]
+if not entries:
+    print(f"ERROR: marketplace.json has no entry for '{plugin_name}'")
+    sys.exit(2)
+market_v = entries[0].get("version")
+if market_v != plugin_v:
+    print(f"MISMATCH: plugin.json={plugin_v} marketplace.json={market_v}")
+    sys.exit(1)
+print(f"OK: {plugin_name}@{plugin_v}")
+PY
+) || VERSION_SYNC_EXIT=$?
+    echo "$VERSION_CHECK"
+    if [ "${VERSION_SYNC_EXIT:-0}" -ne 0 ]; then
+        echo ""
+        echo "❌ Plugin manifest versions are out of sync."
+        echo "   Update .claude-plugin/marketplace.json to match plugin.json,"
+        echo "   or run ./scripts/bump-version.sh which updates both."
+        CHECKS_PASSED=false
+    else
+        CHECKS_RUN="${CHECKS_RUN}version-sync,"
+    fi
+fi
+
 # ══════════════════════════════════════════════════════════════
 # LINT SECTION — customized by /harden-repo during installation
 # ══════════════════════════════════════════════════════════════

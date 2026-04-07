@@ -43,6 +43,16 @@ Store as `PROJECT`. Normalize: lowercase, hyphens for spaces.
 
 ### Step 3 — Summarize unsummarized notes (deferred summarization, truncation-aware)
 
+> ⚠️ **THIS STEP IS MANDATORY. DO NOT SKIP IT.**
+>
+> If Grep finds any file matching both "AI summary unavailable" AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 4. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
+>
+> **Large-note handling:** If the `Read` tool errors because the raw note exceeds the 10k token limit, use `offset` + `limit` to read it in chunks (e.g. `limit: 80` repeatedly) and concatenate mentally. Do NOT use that error as a reason to skip the upgrade.
+>
+> **Missing-JSONL fallback:** If `find_transcript_jsonl` returns null, you still produce a summary — from the raw note itself, with the fallback disclaimer specified in sub-step 4. Null JSONL is not a skip signal.
+>
+> **Visibility requirement:** Before Step 4, emit a one-line status: `Step 3: processing N unsummarized note(s) for $PROJECT` (or `Step 3: no unsummarized notes for $PROJECT` if the intersection is empty). This makes the decision auditable in the tool trace.
+
 This is the critical upgrade step. Search for raw/unsummarized session notes matching this project, and prefer the original Claude Code transcript JSONL over the truncated raw note when the JSONL has more data.
 
 Use Grep to find notes containing the "AI summary unavailable" marker in the sessions folder:

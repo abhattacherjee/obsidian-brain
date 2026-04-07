@@ -150,6 +150,30 @@ p.write_text(content)
 
 update_version "$PROJECT_ROOT/.claude-plugin/plugin.json" "$NEW_VERSION"
 
+# Keep the marketplace registry pointer in lockstep with plugin.json.
+# Without this, /plugin marketplace browse advertises a stale version
+# to users even though the plugin itself has been released.
+MARKETPLACE_JSON="$PROJECT_ROOT/.claude-plugin/marketplace.json"
+if [[ -f "$MARKETPLACE_JSON" ]]; then
+  python3 - "$MARKETPLACE_JSON" "$NEW_VERSION" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+new_version = sys.argv[2]
+data = json.loads(path.read_text())
+updated = False
+for plugin in data.get("plugins", []):
+    if plugin.get("version") != new_version:
+        plugin["version"] = new_version
+        updated = True
+if updated:
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    print(f"marketplace.json synced to {new_version}")
+else:
+    print(f"marketplace.json already at {new_version}")
+PY
+  print_success "Updated marketplace.json plugin entries to $NEW_VERSION"
+fi
+
 echo ""
 print_success "Version bumped from $CURRENT_VERSION to $NEW_VERSION"
 echo ""
