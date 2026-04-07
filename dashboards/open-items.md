@@ -2,23 +2,27 @@
 
 Cross-project view of all unchecked `- [ ]` items from session notes' `## Open Questions / Next Steps` sections, scoped to the last 90 days. Items older than 90 days fall off this view — use `/check-items` (unbounded) or `/vault-search` to find them.
 
-## By Project
-
 ```dataviewjs
-let cutoff = dv.date("today").minus(dv.duration("90 days"));
+// Single-pass: scan all sessions in the last 90 days exactly once,
+// build a master list, then render each section from in-memory data.
 
-let pages = dv.pages('"claude-sessions"')
-    .where(p => p.type === "claude-session" && p.date && p.date >= cutoff);
+const cutoff90 = dv.date("today").minus(dv.duration("90 days"));
+const cutoff30 = dv.date("today").minus(dv.duration("30 days"));
+const cutoff7  = dv.date("today").minus(dv.duration("7 days"));
 
-let allItems = [];
-for (let p of pages) {
-    let content = await dv.io.load(p.file.path);
+const pages = dv.pages('"claude-sessions"')
+    .where(p => p.type === "claude-session" && p.date && p.date >= cutoff90);
+
+const allItems = [];
+for (const p of pages) {
+    const content = await dv.io.load(p.file.path);
     if (!content) continue;
-    let match = content.match(/## Open Questions[^\n]*\n([\s\S]*?)(?=\n## |\n# |$)/);
+    // CRLF-tolerant: \r?\n in lookahead, split on /\r?\n/
+    const match = content.match(/## Open Questions[^\r\n]*\r?\n([\s\S]*?)(?=\r?\n## |\r?\n# |$)/);
     if (!match) continue;
-    let lines = match[1].split("\n");
-    for (let line of lines) {
-        let m = line.match(/^- \[ \] (.+)$/);
+    const lines = match[1].split(/\r?\n/);
+    for (const line of lines) {
+        const m = line.match(/^- \[ \] (.+?)\s*$/);
         if (m) {
             allItems.push({
                 project: p.project || "unknown",
@@ -30,122 +34,78 @@ for (let p of pages) {
     }
 }
 
-let byProject = {};
-for (let i of allItems) {
-    if (!byProject[i.project]) byProject[i.project] = [];
-    byProject[i.project].push(i);
-}
-
-let projectNames = Object.keys(byProject).sort();
-for (let project of projectNames) {
-    let items = byProject[project];
-    dv.header(3, project + " (" + items.length + ")");
-    dv.list(items.map(i => i.item + " — " + i.file));
-}
+// ----- By Project -----
+dv.header(2, "By Project");
 
 if (allItems.length === 0) {
     dv.paragraph("No open items in the last 90 days.");
-}
-```
-
-## Recent (last 7 days)
-
-```dataviewjs
-let cutoff = dv.date("today").minus(dv.duration("7 days"));
-
-let pages = dv.pages('"claude-sessions"')
-    .where(p => p.type === "claude-session" && p.date && p.date >= cutoff);
-
-let items = [];
-for (let p of pages) {
-    let content = await dv.io.load(p.file.path);
-    if (!content) continue;
-    let match = content.match(/## Open Questions[^\n]*\n([\s\S]*?)(?=\n## |\n# |$)/);
-    if (!match) continue;
-    let lines = match[1].split("\n");
-    for (let line of lines) {
-        let m = line.match(/^- \[ \] (.+)$/);
-        if (m) items.push({ project: p.project || "unknown", item: m[1], file: p.file.link });
+} else {
+    const byProject = {};
+    for (const i of allItems) {
+        if (!byProject[i.project]) byProject[i.project] = [];
+        byProject[i.project].push(i);
+    }
+    const projectNames = Object.keys(byProject).sort();
+    for (const project of projectNames) {
+        const items = byProject[project];
+        dv.header(3, project + " (" + items.length + ")");
+        // Render as table to preserve clickable file link
+        dv.table(
+            ["Item", "Source"],
+            items.map(i => [i.item, i.file])
+        );
     }
 }
 
-if (items.length === 0) {
+// ----- Recent (last 7 days) -----
+dv.header(2, "Recent (last 7 days)");
+
+const recent = allItems.filter(i => i.date >= cutoff7);
+if (recent.length === 0) {
     dv.paragraph("No open items from sessions in the last 7 days.");
 } else {
-    dv.list(items.map(i => "**[" + i.project + "]** " + i.item + " — " + i.file));
-}
-```
-
-## Items from sessions 30-90 days ago
-
-These are unchecked items captured in session notes that are 30-90 days old. The same item may also appear in a more recent session — in that case it will also show in the "Recent" section above. Filter is by source session date, not by item-tracking duration.
-
-```dataviewjs
-let recentCutoff = dv.date("today").minus(dv.duration("30 days"));
-let oldCutoff = dv.date("today").minus(dv.duration("90 days"));
-
-let pages = dv.pages('"claude-sessions"')
-    .where(p => p.type === "claude-session" && p.date && p.date < recentCutoff && p.date >= oldCutoff);
-
-let items = [];
-for (let p of pages) {
-    let content = await dv.io.load(p.file.path);
-    if (!content) continue;
-    let match = content.match(/## Open Questions[^\n]*\n([\s\S]*?)(?=\n## |\n# |$)/);
-    if (!match) continue;
-    let lines = match[1].split("\n");
-    for (let line of lines) {
-        let m = line.match(/^- \[ \] (.+)$/);
-        if (m) items.push({ project: p.project || "unknown", item: m[1], date: p.date, file: p.file.link });
-    }
+    dv.table(
+        ["Project", "Item", "Source"],
+        recent.map(i => [i.project, i.item, i.file])
+    );
 }
 
-if (items.length === 0) {
-    dv.paragraph("No stale open items.");
+// ----- Items from sessions 30-90 days ago -----
+dv.header(2, "Items from sessions 30-90 days ago");
+dv.paragraph("These are unchecked items captured in session notes that are 30-90 days old. The same item may also appear in a more recent session — in that case it will also show in the \"Recent\" section above. Filter is by source session date, not by item-tracking duration.");
+
+const stale = allItems
+    .filter(i => i.date < cutoff30)
+    .sort((a, b) => a.date - b.date);
+if (stale.length === 0) {
+    dv.paragraph("No items from sessions 30-90 days ago.");
 } else {
-    items.sort((a, b) => a.date - b.date);
-    dv.list(items.map(i => "**[" + i.project + "]** " + i.item + " (from " + i.date.toFormat("yyyy-MM-dd") + ") — " + i.file));
+    dv.table(
+        ["Project", "Item", "From", "Source"],
+        stale.map(i => [i.project, i.item, i.date.toFormat("yyyy-MM-dd"), i.file])
+    );
 }
-```
 
-## Stats
+// ----- Stats -----
+dv.header(2, "Stats");
 
-```dataviewjs
-let cutoff = dv.date("today").minus(dv.duration("90 days"));
-
-let pages = dv.pages('"claude-sessions"')
-    .where(p => p.type === "claude-session" && p.date && p.date >= cutoff);
-
-let total = 0;
-let byProject = {};
+const statsByProject = {};
 let oldestDate = null;
-
-for (let p of pages) {
-    let content = await dv.io.load(p.file.path);
-    if (!content) continue;
-    let match = content.match(/## Open Questions[^\n]*\n([\s\S]*?)(?=\n## |\n# |$)/);
-    if (!match) continue;
-    let lines = match[1].split("\n");
-    for (let line of lines) {
-        if (/^- \[ \] /.test(line)) {
-            total++;
-            let project = p.project || "unknown";
-            byProject[project] = (byProject[project] || 0) + 1;
-            if (!oldestDate || p.date < oldestDate) oldestDate = p.date;
-        }
-    }
+for (const i of allItems) {
+    statsByProject[i.project] = (statsByProject[i.project] || 0) + 1;
+    if (!oldestDate || i.date < oldestDate) oldestDate = i.date;
 }
 
-dv.paragraph("**Total open items (last 90 days):** " + total);
-dv.paragraph("**Projects with open items:** " + Object.keys(byProject).length);
+dv.paragraph("**Total open items (last 90 days):** " + allItems.length);
+dv.paragraph("**Projects with open items:** " + Object.keys(statsByProject).length);
 if (oldestDate) {
     dv.paragraph("**Oldest open item from:** " + oldestDate.toFormat("yyyy-MM-dd"));
 }
 
-if (Object.keys(byProject).length > 0) {
+if (Object.keys(statsByProject).length > 0) {
     dv.table(
         ["Project", "Open Items"],
-        Object.entries(byProject).sort((a, b) => b[1] - a[1])
+        Object.entries(statsByProject).sort((a, b) => b[1] - a[1])
     );
 }
 ```

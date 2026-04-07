@@ -169,16 +169,18 @@ If unsummarized notes were upgraded in Step 3, also mention:
 
 After presenting the context brief, scan the loaded context for evidence that any open items have been completed.
 
-1. **Collect open items for the current project.** Use Grep:
+1. **Collect open items for the current project.** **Re-use the project-scoped file list from Step 4** (the result of Search A — sessions matching `project: $PROJECT`). For each file in that list, run a per-file Grep:
 
 ```
 pattern: ^- \[ \] 
-path: $VAULT_PATH/$SESSIONS_FOLDER/
+path: <each session file from Step 4>
 output_mode: content
 -n: true
 ```
 
-For each match, verify the matching file has `project: $PROJECT` in its frontmatter (re-use the file list from Step 4). Extract `(file_path, line_number, item_text)` tuples for items appearing under a `## Open Questions / Next Steps` section. To verify the section context, read 30 lines before each match and confirm the most recent `## ` heading is `## Open Questions / Next Steps`.
+This avoids an O(vault size) Grep across the entire sessions folder — we already have the project-scoped file list and reuse it directly.
+
+For each match, extract `(file_path, line_number, item_text)` tuples for items appearing under a `## Open Questions / Next Steps` section. To verify the section context, read 30 lines before each match and confirm the most recent `## ` heading is `## Open Questions / Next Steps`.
 
 2. **Skip if zero open items.** If no items found, skip to Step 8 silently.
 

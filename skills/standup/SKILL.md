@@ -198,7 +198,16 @@ When multiple notes need sub-agent reads, spawn them in parallel (one sub-agent 
 
 From each note (whether read directly or via sub-agent), extract: project name (from frontmatter `project:` field), note type (`type:` field), date, title (first `# Heading`), summary (content of `## Summary` section), decisions (bullets from `## Key Decisions`), errors resolved (bullets from `## Errors Encountered`), open items (checkboxes from `## Open Questions / Next Steps`), and the filename (for wikilinks).
 
-**Also extract closed items for the "Closed This Period" section:** For each session note in the date range, check the file modification time using `stat -f %m "$file" 2>/dev/null || stat -c %Y "$file"` (macOS / Linux fallback). Convert to YYYY-MM-DD. If the file was modified within the standup date range (`START_DATE` to `END_DATE`), Grep the file for `- \[x\]` lines under the `## Open Questions / Next Steps` section using the same line-range verification as for open items. Collect `(project, item_text)` tuples for each checked item.
+**Also extract closed items for the "Closed This Period" section:** For each session note in the date range, get the file modification time as a YYYY-MM-DD string (in the local timezone, matching how `START_DATE` and `END_DATE` were calculated):
+
+```bash
+# Get mtime as epoch, then format. Both forms work cross-platform.
+MTIME_DATE=$(date -r "$file" +%Y-%m-%d 2>/dev/null || date -d @"$(stat -c %Y "$file")" +%Y-%m-%d)
+```
+
+The first form (`date -r FILE`) works on macOS. The Linux fallback uses `stat -c %Y` for the epoch then `date -d @EPOCH` to format. Both produce a YYYY-MM-DD string in the local timezone, which matches the format of `START_DATE` and `END_DATE`.
+
+If `MTIME_DATE` is lexicographically within the range (`MTIME_DATE >= START_DATE && MTIME_DATE <= END_DATE`), Grep the file for `- \[x\]` lines under the `## Open Questions / Next Steps` section using the same line-range verification as for open items. Collect `(project, item_text)` tuples for each checked item.
 
 Collect all distilled records as `NOTE_DATA`.
 
