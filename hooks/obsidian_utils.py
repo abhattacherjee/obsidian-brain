@@ -693,9 +693,24 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         half = max_bytes // 2
         # Guarantee head and tail do not overlap: tail starts at max(half, size - half).
         tail_offset = max(half, size - half)
+        # Peek at the byte immediately before tail_offset to determine
+        # whether the tail slice started exactly at the beginning of a
+        # record. If that preceding byte is a newline, tail_offset lies at
+        # a record boundary and the first tail line is complete; otherwise
+        # the record was cut mid-line and the first tail line is partial.
+        # (Checking tail_text[0] == "\n" is wrong — a clean record boundary
+        # means the tail text starts with the first char of a record, not
+        # a newline.)
+        tail_starts_cleanly = False
         try:
             with open(jsonl_path, "rb") as fh:
                 head_bytes = fh.read(half)
+                if tail_offset > 0:
+                    fh.seek(tail_offset - 1)
+                    prev_byte = fh.read(1)
+                    tail_starts_cleanly = prev_byte in (b"\n", b"\r")
+                else:
+                    tail_starts_cleanly = True
                 fh.seek(tail_offset)
                 tail_bytes = fh.read()
         except OSError as exc:
@@ -711,9 +726,9 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         if head_lines and not head_text.endswith(("\n", "\r")):
             head_lines.pop()
             partial_dropped += 1
-        # Drop the first tail line only if tail_bytes did not begin on a
-        # newline (meaning the record is genuinely cut mid-line).
-        if tail_lines and not tail_text.startswith(("\n", "\r")):
+        # Drop the first tail line only if tail_offset did NOT land at a
+        # clean record boundary (byte before tail_offset is not a newline).
+        if tail_lines and not tail_starts_cleanly:
             tail_lines.pop(0)
             partial_dropped += 1
         lines = head_lines + tail_lines
@@ -729,9 +744,10 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
                 f"middle section sliced (both slice boundaries fell on record boundaries cleanly)."
             )
 
-    # First pass: build a normalized entries list in the canonical CC JSONL
-    # shape (top-level `type` plus nested `message.content`). This lets us
-    # delegate tool/error extraction to the existing helpers.
+    # First pass: collect parsed JSONL records into an entries list. The
+    # downstream extract_* helpers accept both the canonical CC shape
+    # (top-level `type` plus nested `message.content`) and the flat
+    # fallback shape, so no explicit normalization is needed here.
     entries: list[dict] = []
     for raw in lines:
         raw = raw.strip()
@@ -740,6 +756,9 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         try:
             obj = json.loads(raw)
         except json.JSONDecodeError:
+            bad_lines += 1
+            continue
+        if not isinstance(obj, dict):
             bad_lines += 1
             continue
         entries.append(obj)
