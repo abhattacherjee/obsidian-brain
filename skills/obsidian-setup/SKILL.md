@@ -405,7 +405,9 @@ if (items.length === 0) {
 }
 \```
 
-## Stale (>30 days, still open, within 90-day window)
+## Items from sessions 30-90 days ago
+
+These are unchecked items captured in session notes that are 30-90 days old. The same item may also appear in a more recent session — in that case it will also show in the "Recent" section above. Filter is by source session date, not by item-tracking duration.
 
 \```dataviewjs
 let recentCutoff = dv.date("today").minus(dv.duration("30 days"));

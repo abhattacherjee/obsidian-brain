@@ -1,6 +1,6 @@
 ---
 name: standup
-description: "Generates daily/weekly standup summaries across all projects from the Obsidian vault. Use when: (1) /standup for today's summary, (2) /standup this week for weekly summary, (3) /standup <date range> for custom range."
+description: "Generates daily/weekly standup summaries across all projects from the Obsidian vault. Includes a Closed This Period section listing items checked off during the window, grouped by project. Use when: (1) /standup for today's summary, (2) /standup this week for weekly summary, (3) /standup <date range> for custom range."
 metadata:
   version: 1.1.0
 ---
@@ -267,7 +267,11 @@ For each project that had at least one item closed within the standup window, re
   - <item text 2>
   - ...
 
-If zero items were closed across all projects, **omit this entire section** — do not render an empty header.
+After the list, append this footnote on its own line in italics:
+
+> _Detected via file modification time — may include items checked off earlier if a session note was edited during this window for unrelated reasons._
+
+If zero items were closed across all projects, **omit this entire section** — do not render an empty header or the footnote.
 
 Order projects alphabetically. Within each project, preserve the order items were extracted (file mtime descending — newest checkoffs first).
 

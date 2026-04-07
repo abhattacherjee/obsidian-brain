@@ -187,7 +187,7 @@ Closed:
 - **<project A>**: <count> items
 - **<project B>**: <count> items
 
-<X> items remain open in the dashboard. View open-items.md in Obsidian for the live list.
+<X> items remain open in the dashboard. View open-items.md in Obsidian for the live list. (Note: the dashboard shows items from the last 90 days only; `/check-items` is unbounded, so checkoffs you just made for items older than 90 days won't appear in the dashboard delta.)
 ```
 
 ### Step 14 — Edge cases
