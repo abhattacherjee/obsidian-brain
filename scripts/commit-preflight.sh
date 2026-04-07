@@ -96,7 +96,7 @@ if [ -f "$PLUGIN_JSON_PRE" ] && [ -f "$MARKETPLACE_JSON_PRE" ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "🔖 Checking plugin manifest version sync..."
     VERSION_SYNC_EXIT=0
-    VERSION_CHECK_TMP=$(mktemp -t preflight-version-XXXXXX)
+    VERSION_CHECK_TMP=$(mktemp "${TMPDIR:-/tmp}/preflight-version.XXXXXX")
     VERSION_CHECK_STDOUT=$(python3 - "$PLUGIN_JSON_PRE" "$MARKETPLACE_JSON_PRE" 2>"$VERSION_CHECK_TMP" <<'PY'
 import json, sys, traceback
 plugin_path, market_path = sys.argv[1], sys.argv[2]
@@ -182,10 +182,13 @@ if [ "$SKIP_TESTS" = true ]; then
     echo ""
 
     # Even in skip mode, version-sync must be recorded if it ran above
-    # — it is the one check that is NEVER actually skipped.
+    # — it is the one check that is NEVER actually skipped. Use a
+    # generic "skipped" marker for everything else (lint, secret scan,
+    # tests are all skipped, not just tests) so the audit trail is
+    # accurate (Copilot iter-5 finding on PR #14).
     SKIP_CHECKS_RUN="skipped"
     if [ "$VERSION_SYNC_RAN" = true ]; then
-        SKIP_CHECKS_RUN="version-sync,skipped-tests"
+        SKIP_CHECKS_RUN="version-sync,skipped"
     fi
     TIMESTAMP=$(date +%s)
     TOKEN_DATA=$(cat <<EOF

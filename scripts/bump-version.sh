@@ -148,23 +148,21 @@ p.write_text(content)
   print_success "Updated $(basename "$file") to $version"
 }
 
-update_version "$PROJECT_ROOT/.claude-plugin/plugin.json" "$NEW_VERSION"
-
-# Keep the marketplace registry pointer in lockstep with plugin.json.
-# Without this, /plugin marketplace browse advertises a stale version
-# to users even though the plugin itself has been released.
-#
-# Mirrors the python3-or-node fallback the rest of this script uses for
-# JSON updates so the marketplace sync works in environments that only
-# have Node.js installed (Copilot iter-2 finding on PR #14).
+# ── Pre-bump marketplace validation (all-or-nothing guard) ──
+# CRITICAL: validate marketplace.json has a matching entry BEFORE we
+# write the new version into plugin.json. Otherwise a marketplace sync
+# failure leaves plugin.json bumped but marketplace.json stale —
+# reintroducing the exact drift this PR exists to prevent (Copilot
+# iter-5 finding on PR #14). Read-only at this point; the actual
+# write happens after plugin.json is updated.
 MARKETPLACE_JSON="$PROJECT_ROOT/.claude-plugin/marketplace.json"
 PLUGIN_JSON="$PROJECT_ROOT/.claude-plugin/plugin.json"
+PLUGIN_NAME=""
 if [[ -f "$MARKETPLACE_JSON" ]]; then
-  # Mirror read_version()'s python-then-node fallback rather than letting
-  # `set -e` abort the script if the python3 read fails (e.g. malformed
-  # plugin.json or missing `name`). Both branches `|| true` so a failing
-  # read leaves PLUGIN_NAME empty and falls through to the next branch.
-  PLUGIN_NAME=""
+  # python-then-node fallback for the name extraction (stays in sync
+  # with read_version()'s pattern). Each branch `|| true` so a failing
+  # read leaves PLUGIN_NAME empty and falls through, with a final guard
+  # printing a clear remediation if neither succeeds.
   if command -v python3 &>/dev/null; then
     PLUGIN_NAME=$(python3 -c "
 import json, sys
@@ -186,6 +184,55 @@ console.log(d.name);
     print_error "Could not read plugin name from $PLUGIN_JSON (need python3 or node, and a valid 'name' field)"
     exit 1
   fi
+
+  # Read-only verification that the entry exists. Same logic as the
+  # write helper below but with no mutation. Aborts the bump if missing.
+  if command -v python3 &>/dev/null; then
+    if ! python3 -c "
+import json, sys
+data = json.load(open(sys.argv[1]))
+plugins = data.get('plugins')
+if not isinstance(plugins, list) or not plugins:
+    sys.stderr.write(f'ERROR: {sys.argv[1]} has no plugins array\n')
+    sys.exit(2)
+matches = [p for p in plugins if p.get('name') == sys.argv[2]]
+if not matches:
+    sys.stderr.write(
+        f\"ERROR: marketplace.json has no entry for plugin '{sys.argv[2]}'. \"
+        f'Add an entry before releasing.\n'
+    )
+    sys.exit(1)
+" "$MARKETPLACE_JSON" "$PLUGIN_NAME"; then
+      print_error "Pre-bump marketplace validation failed — aborting before plugin.json is touched"
+      exit 1
+    fi
+  elif command -v node &>/dev/null; then
+    if ! node -e "
+const fs = require('fs');
+const data = JSON.parse(fs.readFileSync(process.argv[1], 'utf-8'));
+if (!Array.isArray(data.plugins) || data.plugins.length === 0) {
+  process.stderr.write('ERROR: marketplace.json has no plugins array\n');
+  process.exit(2);
+}
+const matches = data.plugins.filter((p) => p && p.name === process.argv[2]);
+if (matches.length === 0) {
+  process.stderr.write(\`ERROR: marketplace.json has no entry for plugin '\${process.argv[2]}'. Add an entry before releasing.\n\`);
+  process.exit(1);
+}
+" "$MARKETPLACE_JSON" "$PLUGIN_NAME"; then
+      print_error "Pre-bump marketplace validation failed — aborting before plugin.json is touched"
+      exit 1
+    fi
+  fi
+fi
+
+update_version "$PROJECT_ROOT/.claude-plugin/plugin.json" "$NEW_VERSION"
+
+# Now perform the actual marketplace.json write. By this point we already
+# verified above that the entry exists, so the only failure modes left
+# are I/O errors (disk full, permissions) which are vanishingly rare and
+# would also affect the plugin.json write that just succeeded.
+if [[ -f "$MARKETPLACE_JSON" ]]; then
 
   SYNC_EXIT=0
   if command -v python3 &>/dev/null; then
