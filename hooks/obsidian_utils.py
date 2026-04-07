@@ -553,11 +553,13 @@ def extract_tool_uses(messages: list[dict]) -> list[dict]:
     """Extract tool usage details from transcript for the raw fallback note.
 
     Returns a list of dicts: [{"name": "Edit", "detail": "file.py:10-20"}, ...]
+
+    Handles both the canonical CC JSONL shape (entry['message']['content'])
+    and the flat fallback shape (entry['content']) via _entry_content.
     """
     tool_uses: list[dict] = []
     for entry in messages:
-        msg = entry.get("message", {})
-        content = msg.get("content") if isinstance(msg, dict) else None
+        content = _entry_content(entry)
         if not isinstance(content, list):
             continue
         for block in content:
@@ -685,9 +687,11 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
             "user_msgs": [], "assistant_msgs": [], "tool_uses": [],
             "files_touched": [], "errors": [], "truncated": False,
             "warnings": [warning],
-            # Always include the shared cap so /recall's decision logic can
-            # key off one consistent field regardless of which branch ran.
+            # Always include the shared cap + derived signal so /recall's
+            # decision logic can key off one consistent schema regardless
+            # of which branch ran. Empty transcripts cannot have truncated.
             "raw_note_max_turns": RAW_NOTE_MAX_TURNS,
+            "raw_note_would_truncate": False,
         }
 
     try:
@@ -820,6 +824,14 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
             f"Unknown content block types encountered (data may be incomplete): {', '.join(sorted(unknown_block_types))}"
         )
 
+    # Simulate the exact write loop in build_raw_fallback to determine
+    # whether the raw fallback would have truncated. This is the only
+    # fully deterministic signal: the cap applies to lines actually
+    # written, and filtered system-noise user messages do not increment
+    # the counter. Simple parsed_total > cap comparison can false-positive
+    # when noise filtering gives headroom.
+    raw_note_would_truncate = _would_raw_fallback_truncate(user_msgs, assistant_msgs)
+
     return {
         "user_msgs": user_msgs,
         "assistant_msgs": assistant_msgs,
@@ -828,12 +840,49 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         "errors": errors,
         "truncated": truncated,
         "warnings": warnings,
-        # The raw-note conversation cap is the only real truncation signal.
-        # /recall compares (len(user_msgs) + len(assistant_msgs)) against
-        # this value to deterministically decide whether the raw note is
-        # missing content, independent of the raw note's message-filtering.
+        # The raw-note cap constant, preserved for backward compatibility
+        # with callers that still want to inspect it.
         "raw_note_max_turns": RAW_NOTE_MAX_TURNS,
+        # Definitive signal: true iff build_raw_fallback would have hit
+        # its write cap before consuming all user+assistant messages.
+        # This is what /recall should branch on.
+        "raw_note_would_truncate": raw_note_would_truncate,
     }
+
+
+def _would_raw_fallback_truncate(
+    user_msgs: list[str], assistant_msgs: list[str]
+) -> bool:
+    """Return True iff build_raw_fallback's write loop would hit its
+    RAW_NOTE_MAX_TURNS cap before consuming all user+assistant messages.
+
+    Mirrors the exact loop in build_raw_fallback so the signal is
+    deterministic: filtered system-noise user messages do not count
+    toward the cap, so a transcript with more total messages than the
+    cap may still fit entirely when enough noise is filtered out.
+    """
+    max_turns = RAW_NOTE_MAX_TURNS
+    u_idx, a_idx = 0, 0
+    turn = 0
+    while turn < max_turns and (
+        u_idx < len(user_msgs)
+        or (assistant_msgs and a_idx < len(assistant_msgs))
+    ):
+        if u_idx < len(user_msgs):
+            snippet = user_msgs[u_idx][:1200].replace("\n", " ")
+            # Same filter as build_raw_fallback: skip system noise.
+            if not (
+                snippet.startswith("<task-notification>")
+                or snippet.startswith("Base directory for this skill:")
+                or snippet.startswith("<local-command")
+            ):
+                turn += 1
+            u_idx += 1
+        if assistant_msgs and a_idx < len(assistant_msgs):
+            a_idx += 1
+            turn += 1
+    # Truncated iff the loop bailed on the cap with inputs remaining.
+    return u_idx < len(user_msgs) or a_idx < len(assistant_msgs)
 
 
 def build_raw_fallback(
