@@ -670,6 +670,9 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
             "user_msgs": [], "assistant_msgs": [], "tool_uses": [],
             "files_touched": [], "errors": [], "truncated": False,
             "warnings": [warning],
+            # Always include the shared cap so /recall's decision logic can
+            # key off one consistent field regardless of which branch ran.
+            "raw_note_max_turns": RAW_NOTE_MAX_TURNS,
         }
 
     try:
