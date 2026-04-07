@@ -591,7 +591,7 @@ def build_raw_fallback(
     sections.append("## Changes Made")
     files = metadata.get("files_touched", [])
     if files:
-        for f in files[:30]:
+        for f in files[:60]:
             sections.append(f"- `{f}`")
     else:
         sections.append("None detected.")
@@ -600,7 +600,7 @@ def build_raw_fallback(
     # Tool usage details (commands run, files edited)
     if tool_uses:
         sections.append("## Tool Usage")
-        for tu in tool_uses[:30]:
+        for tu in tool_uses[:80]:
             name = tu.get("name", "")
             detail = tu.get("detail", "")
             if name and detail:
@@ -612,7 +612,7 @@ def build_raw_fallback(
     sections.append("## Errors Encountered")
     errors = metadata.get("errors", [])
     if errors:
-        for e in errors[:15]:
+        for e in errors[:30]:
             sections.append(f"- {e}")
     else:
         sections.append("None.")
@@ -623,19 +623,19 @@ def build_raw_fallback(
 
     # Interleaved conversation for /recall to summarize
     sections.append("## Conversation (raw)")
-    max_turns = 40
+    max_turns = 120
     u_idx, a_idx = 0, 0
     turn = 0
     while turn < max_turns and (u_idx < len(user_msgs) or (assistant_msgs and a_idx < len(assistant_msgs))):
         if u_idx < len(user_msgs):
-            snippet = user_msgs[u_idx][:600].replace("\n", " ")
+            snippet = user_msgs[u_idx][:1200].replace("\n", " ")
             # Skip system noise (task notifications, command loading, etc.)
             if not snippet.startswith("<task-notification>") and not snippet.startswith("Base directory for this skill:") and not snippet.startswith("<local-command"):
                 sections.append(f"**User:** {snippet}")
                 turn += 1
             u_idx += 1
         if assistant_msgs and a_idx < len(assistant_msgs):
-            snippet = assistant_msgs[a_idx][:600].replace("\n", " ")
+            snippet = assistant_msgs[a_idx][:1200].replace("\n", " ")
             sections.append(f"**Assistant:** {snippet}")
             a_idx += 1
             turn += 1
