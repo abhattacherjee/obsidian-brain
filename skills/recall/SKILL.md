@@ -63,7 +63,7 @@ output_mode: content
 
 For each file that matches BOTH conditions (unsummarized AND belongs to this project):
 
-1. **Read the raw note in full** with the Read tool. Preserve frontmatter exactly. Extract `session_id` from the frontmatter.
+1. **Read the raw note in full** with the Read tool. Preserve frontmatter exactly. Extract the `session_id` value from the frontmatter and **store it as `SESSION_ID`** — the Bash snippet in sub-step 3 references this exact variable name.
 
 2. **Count conversation turns in the raw note** using Grep:
    ```
@@ -71,7 +71,7 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    path: <the note file>
    output_mode: count
    ```
-   Store as `RAW_TURNS`.
+   Store as `RAW_TURNS`. This counts only user/assistant turn markers in the raw note body — the deliberate signal for "what the raw extraction actually captured".
 
 3. **Locate the source JSONL and re-parse it in one shot.** Invoke the helper via argv (no shell interpolation of paths — pass `SESSION_ID` as an argument so session_ids with unusual characters cannot break the quoting). Use a secure temp file:
 
@@ -95,11 +95,10 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
 
    Read the JSON from `$TMPFILE` with the Read tool. It contains either `{"jsonl_path": null}` (not found) or the full parsed transcript plus `jsonl_path`, `truncated`, and `warnings`.
 
-4. **Decide which source to summarize from:**
+4. **Decide which source to summarize from.** The truncation signal is the parsed user/assistant message count (`len(user_msgs) + len(assistant_msgs)`) compared to `RAW_TURNS`. This is apples-to-apples: both counts represent completed conversation turns extracted via the same logic (`extract_user_messages` / `extract_assistant_messages`) — unlike raw JSONL line counts, which include tool-result envelopes, thinking blocks, system events, and other non-message records and would give false positives.
    - **`jsonl_path` is null** → use the raw note as the input. After summarizing, append a footnote to the Summary section: `_(Source transcript no longer on disk — summary built from truncated raw extraction.)_`
-   - **`jsonl_path` is set** → count the message total `len(user_msgs) + len(assistant_msgs)` from the parsed data. Compare to `RAW_TURNS`.
-     - **Parsed total > RAW_TURNS** → the raw note is truncated. Use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the input to summarization.
-     - **Parsed total ≤ RAW_TURNS** → no benefit; use the raw note instead.
+   - **`jsonl_path` is set and parsed total > RAW_TURNS** → the raw note is truncated relative to the original transcript. Use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the summarization input.
+   - **`jsonl_path` is set and parsed total ≤ RAW_TURNS** → no benefit; use the raw note instead.
    - **If the parsed data's `warnings` list is non-empty** (regardless of which branch), prepend a visible callout section `## ⚠️ Transcript re-parse warnings` at the top of the upgraded note (above `# <title>`), listing each warning as a bullet. This surfaces partial-line losses, malformed JSONL records, unknown block types, and byte-budget slicing so the user knows what's in the summary and what isn't.
 
 5. **Generate a detailed, specific summary** from whichever input source was chosen above. Be precise — include file paths, function names, config values, and technical specifics. Produce these sections (unchanged from before):

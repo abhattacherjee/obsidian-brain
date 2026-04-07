@@ -239,7 +239,7 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
                     fp = inp.get("file_path", "")
                     if fp and fp not in files_seen:
                         files_seen.append(fp)
-    meta["files_touched"] = files_seen[:50]
+    meta["files_touched"] = files_seen[:60]
 
     # --- Errors: extract from tool_result blocks with is_error ---
     errors: list[str] = []
@@ -257,7 +257,7 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
                     snippet = err_content.strip()[:200]
                     if snippet not in errors:
                         errors.append(snippet)
-    meta["errors"] = errors[:20]
+    meta["errors"] = errors[:30]
 
     return meta
 
@@ -596,11 +596,19 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
 
 
 def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
-    """Parse a Claude Code transcript JSONL into the same shape as
-    extract_metadata + extract_messages, but WITHOUT the raw-note caps.
+    """Parse a Claude Code transcript JSONL WITHOUT the raw-note caps.
 
-    Applies a hard byte budget so very large transcripts are sliced
-    (head + tail) rather than read entirely. Returns a dict with keys:
+    Delegates to the canonical extract_user_messages / extract_assistant_messages /
+    extract_tool_uses helpers so tool-use and error detection stay in parity
+    with the SessionEnd write path. Never fails silently on data loss —
+    the returned `warnings` list is the caller's signal for every hiccup.
+
+    Applies a hard byte budget. When the transcript exceeds max_bytes, it
+    is sliced into head + tail halves of the budget; partial lines at the
+    slice boundaries are detected (head not ending on \\n, tail not starting
+    on \\n) and dropped explicitly with a warning.
+
+    Returns a dict with keys:
         - user_msgs: list[str]
         - assistant_msgs: list[str]
         - tool_uses: list[dict]   (same shape as extract_tool_uses output)
@@ -608,20 +616,11 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         - errors: list[str]
         - truncated: bool          (True if byte budget kicked in)
         - warnings: list[str]      (visible issues the caller should surface)
-
-    Warnings are the caller's signal to annotate the upgraded summary — they
-    cover partial-line losses from slicing, malformed JSONL lines, unknown
-    block types, and stat failures. Never fails silently on data loss.
     """
-    user_msgs: list[str] = []
-    assistant_msgs: list[str] = []
-    tool_uses: list[dict] = []
-    files_seen: list[str] = []
-    errors: list[str] = []
-    truncated = False
     warnings: list[str] = []
     bad_lines = 0
     unknown_block_types: set[str] = set()
+    truncated = False
 
     def _empty_result(warning: str) -> dict:
         return {
@@ -641,13 +640,14 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
     if size <= max_bytes:
         try:
             with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
-                lines = fh.readlines()
+                lines = fh.read().splitlines()
         except OSError as exc:
             return _empty_result(f"Could not read transcript file: {exc}")
+        sliced_marker: list[str] = []
     else:
-        # Slice head + tail of the byte budget. Boundary-safe: trim the
-        # last line of head and the first line of tail — both are split
-        # mid-record and would silently fail json.loads otherwise.
+        # Slice head + tail of the byte budget. Boundary-safe: only drop a
+        # line when the slice actually cut it mid-record. If head_bytes
+        # ends on a newline, its last line is complete — keep it.
         half = max_bytes // 2
         # Guarantee head and tail do not overlap: tail starts at max(half, size - half).
         tail_offset = max(half, size - half)
@@ -659,25 +659,39 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         except OSError as exc:
             return _empty_result(f"Could not slice transcript file: {exc}")
 
-        head_lines = head_bytes.decode("utf-8", errors="replace").splitlines()
-        tail_lines = tail_bytes.decode("utf-8", errors="replace").splitlines()
+        head_text = head_bytes.decode("utf-8", errors="replace")
+        tail_text = tail_bytes.decode("utf-8", errors="replace")
+        head_lines = head_text.splitlines()
+        tail_lines = tail_text.splitlines()
         partial_dropped = 0
-        # The last line of head is (almost certainly) partial — drop it.
-        if head_lines:
+        # Drop the last head line only if head_bytes did not end on a newline
+        # (meaning the record is genuinely cut mid-line).
+        if head_lines and not head_text.endswith(("\n", "\r")):
             head_lines.pop()
             partial_dropped += 1
-        # The first line of tail is (almost certainly) partial — drop it.
-        if tail_lines:
+        # Drop the first tail line only if tail_bytes did not begin on a
+        # newline (meaning the record is genuinely cut mid-line).
+        if tail_lines and not tail_text.startswith(("\n", "\r")):
             tail_lines.pop(0)
             partial_dropped += 1
-        lines = head_lines + ['{"__sliced__": true}'] + tail_lines
+        lines = head_lines + tail_lines
+        sliced_marker = ['{"__sliced__": true}']
         truncated = True
         if partial_dropped:
             warnings.append(
                 f"Transcript byte budget exceeded ({size} > {max_bytes} bytes) — "
                 f"middle section sliced, {partial_dropped} partial JSONL lines dropped at slice boundaries."
             )
+        else:
+            warnings.append(
+                f"Transcript byte budget exceeded ({size} > {max_bytes} bytes) — "
+                f"middle section sliced (both slice boundaries fell on record boundaries cleanly)."
+            )
 
+    # First pass: build a normalized entries list in the canonical CC JSONL
+    # shape (top-level `type` plus nested `message.content`). This lets us
+    # delegate tool/error extraction to the existing helpers.
+    entries: list[dict] = []
     for raw in lines:
         raw = raw.strip()
         if not raw:
@@ -687,74 +701,65 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
         except json.JSONDecodeError:
             bad_lines += 1
             continue
-        if obj.get("__sliced__"):
-            user_msgs.append("[... middle of transcript truncated ...]")
-            continue
-        # Match the canonical Claude Code JSONL shape used elsewhere in this
-        # module (extract_user_messages / extract_assistant_messages): the
-        # top-level `type` field is primary, with a fallback to `role` for
-        # flat-format transcripts. `content` lives under `entry.message` in
-        # the CC format and directly on `entry` in flat format.
-        top_type = obj.get("type")
-        if top_type in ("user", "assistant"):
-            role = top_type
-            msg = obj.get("message") or {}
-            content = msg.get("content") if isinstance(msg, dict) else None
-        else:
-            role = obj.get("role")
-            content = obj.get("content")
-        if content is None:
-            continue
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            parts: list[str] = []
+        entries.append(obj)
+        # Collect any unexpected content block types for user-visible warnings.
+        msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
             for block in content:
-                if not isinstance(block, dict):
-                    continue
-                btype = block.get("type")
-                if btype == "text":
-                    parts.append(block.get("text", ""))
-                elif btype == "tool_use":
-                    name = block.get("name", "")
-                    raw_inp = block.get("input")
-                    inp = raw_inp if isinstance(raw_inp, dict) else {}
-                    detail = ""
-                    # MultiEdit is included here for parity with
-                    # extract_tool_uses — without it, files edited via
-                    # MultiEdit would be silently missing from files_touched.
-                    if name in ("Edit", "Write", "Read", "MultiEdit"):
-                        fp = inp.get("file_path", "")
-                        detail = f"`{fp}`" if fp else ""
-                        if fp and fp not in files_seen:
-                            files_seen.append(fp)
-                    elif name == "Bash":
-                        detail = f"`{inp.get('command', '')[:120]}`"
-                    elif name == "Grep":
-                        detail = f"pattern=\"{inp.get('pattern', '')}\""
-                    if name:
-                        tool_uses.append({"name": name, "detail": detail})
-                elif btype == "tool_result":
-                    tr = block.get("content", "")
-                    if isinstance(tr, list):
-                        for tb in tr:
-                            if isinstance(tb, dict) and tb.get("type") == "text":
-                                txt = tb.get("text", "")
-                                if "error" in txt.lower() or "Error" in txt:
-                                    errors.append(txt.strip()[:200])
-                    elif isinstance(tr, str) and ("error" in tr.lower()):
-                        errors.append(tr.strip()[:200])
-                elif btype:
-                    unknown_block_types.add(btype)
-            text = "\n".join(p for p in parts if p)
-        else:
+                if isinstance(block, dict):
+                    btype = block.get("type")
+                    if btype and btype not in (
+                        "text", "tool_use", "tool_result", "thinking",
+                        "image", "redacted_thinking",
+                    ):
+                        unknown_block_types.add(btype)
+
+    # Delegate to canonical helpers so behavior stays in parity with the
+    # SessionEnd write path.
+    user_msgs = extract_user_messages(entries)
+    assistant_msgs = extract_assistant_messages(entries)
+    tool_uses = extract_tool_uses(entries)
+
+    # Files touched: mirror extract_session_metadata logic (Edit/Write/MultiEdit).
+    files_seen: list[str] = []
+    for entry in entries:
+        msg = entry.get("message", {})
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
             continue
-        if not text.strip():
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name", "")
+            if name in ("Edit", "Write", "MultiEdit"):
+                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+                fp = inp.get("file_path", "")
+                if fp and fp not in files_seen:
+                    files_seen.append(fp)
+
+    # Errors: mirror extract_session_metadata — use the structured `is_error`
+    # flag on tool_result blocks rather than substring-matching "error".
+    errors: list[str] = []
+    for entry in entries:
+        msg = entry.get("message", {})
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
             continue
-        if role == "user":
-            user_msgs.append(text)
-        elif role == "assistant":
-            assistant_msgs.append(text)
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result" and block.get("is_error"):
+                err_content = block.get("content", "")
+                if isinstance(err_content, str) and err_content.strip():
+                    snippet = err_content.strip()[:200]
+                    if snippet not in errors:
+                        errors.append(snippet)
+
+    if truncated and sliced_marker:
+        # Inject the middle-truncated marker into user_msgs so it's visible
+        # to the summarization prompt between the head and tail halves.
+        user_msgs.append("[... middle of transcript truncated ...]")
 
     if bad_lines:
         warnings.append(f"{bad_lines} malformed JSONL line(s) skipped while re-parsing transcript.")
