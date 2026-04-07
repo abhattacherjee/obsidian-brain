@@ -172,7 +172,7 @@ Stores hand-picked insights you save via `/compress`, `/decide`, and `/error-log
 
 Contains Obsidian Dataview dashboard templates that auto-update as notes are added. These are for browsing your vault visually in Obsidian — they don't get loaded into Claude Code sessions.
 
-**Dashboards included:** Sessions Overview (recent activity across all projects), Project Index (sessions grouped by project), Weekly Review (this week's activity).
+**Dashboards included:** Sessions Overview, Project Index, Weekly Review, Learning Velocity, Decision Timeline, Open Items. See the [Dataview Dashboards](#dataview-dashboards) section below for descriptions.
 
 **Requires:** [Dataview](https://github.com/blacksmithgu/obsidian-dataview) community plugin with JavaScript Queries enabled.
 
