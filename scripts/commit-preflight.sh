@@ -81,6 +81,98 @@ if [ "$AUTO_DETECT" = true ]; then
     echo ""
 fi
 
+# ── Plugin manifest version sync (ALWAYS runs, even in skip modes) ──
+# Must run BEFORE the --docs-only / --skip-tests / --auto early-exit
+# below — those skip modes intentionally bypass tests, but version
+# drift between plugin.json and marketplace.json must NEVER be skipped
+# regardless of flag. This is the gate that catches the bug PR #14
+# was opened to fix; if it lives below the early-exit it provides
+# zero protection against any user who runs preflight with a skip flag
+# (Copilot iter-4 finding on PR #14).
+PLUGIN_JSON_PRE="$PROJECT_DIR/.claude-plugin/plugin.json"
+MARKETPLACE_JSON_PRE="$PROJECT_DIR/.claude-plugin/marketplace.json"
+VERSION_SYNC_RAN=false
+if [ -f "$PLUGIN_JSON_PRE" ] && [ -f "$MARKETPLACE_JSON_PRE" ]; then
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🔖 Checking plugin manifest version sync..."
+    VERSION_SYNC_EXIT=0
+    VERSION_CHECK_TMP=$(mktemp -t preflight-version-XXXXXX)
+    VERSION_CHECK_STDOUT=$(python3 - "$PLUGIN_JSON_PRE" "$MARKETPLACE_JSON_PRE" 2>"$VERSION_CHECK_TMP" <<'PY'
+import json, sys, traceback
+plugin_path, market_path = sys.argv[1], sys.argv[2]
+try:
+    plugin = json.load(open(plugin_path))
+    market = json.load(open(market_path))
+except Exception as e:
+    sys.stderr.write(f"parse error: {e}\n")
+    sys.exit(2)
+plugin_v = plugin.get("version")
+plugin_name = plugin.get("name")
+if not plugin_v or not plugin_name:
+    sys.stderr.write("plugin.json missing 'name' or 'version'\n")
+    sys.exit(2)
+try:
+    entries = [p for p in market.get("plugins", []) if p.get("name") == plugin_name]
+    if not entries:
+        sys.stderr.write(f"marketplace.json has no entry for '{plugin_name}'\n")
+        sys.exit(2)
+    mismatches = []
+    for idx, entry in enumerate(entries):
+        market_v = entry.get("version")
+        if market_v is None:
+            sys.stderr.write(
+                f"marketplace.json entry #{idx} for '{plugin_name}' has no 'version' field\n"
+            )
+            sys.exit(2)
+        if market_v != plugin_v:
+            mismatches.append((idx, market_v))
+    if mismatches:
+        details = ", ".join(f"entry#{i}={v}" for i, v in mismatches)
+        print(f"MISMATCH: plugin.json={plugin_v} marketplace.json={details}")
+        sys.exit(1)
+    suffix = "" if len(entries) == 1 else f" ({len(entries)} entries)"
+    print(f"OK: {plugin_name}@{plugin_v}{suffix}")
+except Exception:
+    sys.stderr.write("unexpected error during version sync check:\n")
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(2)
+PY
+) || VERSION_SYNC_EXIT=$?
+    VERSION_CHECK_STDERR=$(cat "$VERSION_CHECK_TMP" 2>/dev/null || true)
+    rm -f "$VERSION_CHECK_TMP"
+    if [ -n "$VERSION_CHECK_STDOUT" ]; then
+        echo "$VERSION_CHECK_STDOUT"
+    fi
+    case "$VERSION_SYNC_EXIT" in
+        0)
+            VERSION_SYNC_RAN=true
+            ;;
+        1)
+            echo ""
+            echo "❌ Plugin manifest versions are out of sync."
+            echo "   Update .claude-plugin/marketplace.json to match plugin.json,"
+            echo "   or run ./scripts/bump-version.sh which updates both."
+            echo "   This check runs even in --skip-tests modes."
+            rm -f "$TOKEN_FILE"
+            exit 1
+            ;;
+        *)
+            echo ""
+            echo "❌ Plugin manifest version check failed with a structural error:"
+            if [ -n "$VERSION_CHECK_STDERR" ]; then
+                echo "$VERSION_CHECK_STDERR" | sed 's/^/   /'
+            else
+                echo "   (no error output — python exited with code $VERSION_SYNC_EXIT)"
+            fi
+            echo "   Fix the manifest files before committing."
+            rm -f "$TOKEN_FILE"
+            exit 1
+            ;;
+    esac
+    unset VERSION_SYNC_EXIT VERSION_CHECK_STDOUT VERSION_CHECK_STDERR VERSION_CHECK_TMP
+    echo ""
+fi
+
 # Handle skip tests mode
 if [ "$SKIP_TESTS" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -89,13 +181,19 @@ if [ "$SKIP_TESTS" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
+    # Even in skip mode, version-sync must be recorded if it ran above
+    # — it is the one check that is NEVER actually skipped.
+    SKIP_CHECKS_RUN="skipped"
+    if [ "$VERSION_SYNC_RAN" = true ]; then
+        SKIP_CHECKS_RUN="version-sync,skipped-tests"
+    fi
     TIMESTAMP=$(date +%s)
     TOKEN_DATA=$(cat <<EOF
 {
     "created": $TIMESTAMP,
     "expires": $((TIMESTAMP + TOKEN_EXPIRY_SECONDS)),
     "staged_files": $(echo "$STAGED_FILES" | wc -l | tr -d ' '),
-    "checks_run": "skipped",
+    "checks_run": "$SKIP_CHECKS_RUN",
     "skip_reason": "$(echo "$SKIP_REASON" | sed 's/\\/\\\\/g; s/"/\\"/g')"
 }
 EOF
@@ -122,99 +220,12 @@ else
     CHECKS_PASSED=false
 fi
 
-# ── Plugin manifest version sync ─────────────────────────────
-# Ensures .claude-plugin/marketplace.json registry pointer stays in lockstep
-# with .claude-plugin/plugin.json. Drift has caused the marketplace listing
-# to advertise a stale version to users (bug fixed on 2026-04-07).
-PLUGIN_JSON="$PROJECT_DIR/.claude-plugin/plugin.json"
-MARKETPLACE_JSON="$PROJECT_DIR/.claude-plugin/marketplace.json"
-if [ -f "$PLUGIN_JSON" ] && [ -f "$MARKETPLACE_JSON" ]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "🔖 Checking plugin manifest version sync..."
-    # Initialize explicitly so a stale value from an earlier iteration
-    # (if this script is ever sourced or extended) can't leak into the
-    # check and falsely fail on a clean repo.
-    VERSION_SYNC_EXIT=0
-    VERSION_CHECK_STDOUT=""
-    VERSION_CHECK_STDERR=""
-    VERSION_CHECK_TMP=$(mktemp -t preflight-version-XXXXXX)
-    VERSION_CHECK_STDOUT=$(python3 - "$PLUGIN_JSON" "$MARKETPLACE_JSON" 2>"$VERSION_CHECK_TMP" <<'PY'
-import json, sys, traceback
-plugin_path, market_path = sys.argv[1], sys.argv[2]
-try:
-    plugin = json.load(open(plugin_path))
-    market = json.load(open(market_path))
-except Exception as e:
-    sys.stderr.write(f"parse error: {e}\n")
-    sys.exit(2)
-plugin_v = plugin.get("version")
-plugin_name = plugin.get("name")
-if not plugin_v or not plugin_name:
-    sys.stderr.write("plugin.json missing 'name' or 'version'\n")
-    sys.exit(2)
-try:
-    entries = [p for p in market.get("plugins", []) if p.get("name") == plugin_name]
-    if not entries:
-        sys.stderr.write(f"marketplace.json has no entry for '{plugin_name}'\n")
-        sys.exit(2)
-    # Iterate ALL matching entries (not just entries[0]) so a mismatched
-    # secondary entry can't slip through preflight. Symmetric with
-    # bump-version.sh, which updates every matching entry.
-    mismatches = []
-    for idx, entry in enumerate(entries):
-        market_v = entry.get("version")
-        if market_v is None:
-            sys.stderr.write(
-                f"marketplace.json entry #{idx} for '{plugin_name}' has no 'version' field\n"
-            )
-            sys.exit(2)
-        if market_v != plugin_v:
-            mismatches.append((idx, market_v))
-    if mismatches:
-        details = ", ".join(f"entry#{i}={v}" for i, v in mismatches)
-        print(f"MISMATCH: plugin.json={plugin_v} marketplace.json={details}")
-        sys.exit(1)
-    suffix = "" if len(entries) == 1 else f" ({len(entries)} entries)"
-    print(f"OK: {plugin_name}@{plugin_v}{suffix}")
-except Exception:
-    # Defensive: any unexpected crash (KeyError, TypeError on a malformed
-    # entry, etc.) goes to stderr with traceback and exits 2 so the shell
-    # caller can surface it as a structural error, not a version mismatch.
-    sys.stderr.write("unexpected error during version sync check:\n")
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(2)
-PY
-) || VERSION_SYNC_EXIT=$?
-    VERSION_CHECK_STDERR=$(cat "$VERSION_CHECK_TMP" 2>/dev/null || true)
-    rm -f "$VERSION_CHECK_TMP"
-    if [ -n "$VERSION_CHECK_STDOUT" ]; then
-        echo "$VERSION_CHECK_STDOUT"
-    fi
-    case "$VERSION_SYNC_EXIT" in
-        0)
-            CHECKS_RUN="${CHECKS_RUN}version-sync,"
-            ;;
-        1)
-            echo ""
-            echo "❌ Plugin manifest versions are out of sync."
-            echo "   Update .claude-plugin/marketplace.json to match plugin.json,"
-            echo "   or run ./scripts/bump-version.sh which updates both."
-            CHECKS_PASSED=false
-            ;;
-        *)
-            echo ""
-            echo "❌ Plugin manifest version check failed with a structural error:"
-            if [ -n "$VERSION_CHECK_STDERR" ]; then
-                echo "$VERSION_CHECK_STDERR" | sed 's/^/   /'
-            else
-                echo "   (no error output — python exited with code $VERSION_SYNC_EXIT)"
-            fi
-            echo "   Fix the manifest files before committing."
-            CHECKS_PASSED=false
-            ;;
-    esac
-    unset VERSION_SYNC_EXIT VERSION_CHECK_STDOUT VERSION_CHECK_STDERR VERSION_CHECK_TMP
+# Plugin manifest version sync was already verified above (before the
+# skip-tests early-exit) so it cannot be bypassed by --docs-only,
+# --skip-tests, or --auto. Record it in CHECKS_RUN for the normal-mode
+# token bookkeeping.
+if [ "$VERSION_SYNC_RAN" = true ]; then
+    CHECKS_RUN="${CHECKS_RUN}version-sync,"
 fi
 
 # ══════════════════════════════════════════════════════════════
