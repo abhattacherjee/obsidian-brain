@@ -2,7 +2,7 @@
 name: standup
 description: "Generates daily/weekly standup summaries across all projects from the Obsidian vault. Use when: (1) /standup for today's summary, (2) /standup this week for weekly summary, (3) /standup <date range> for custom range."
 metadata:
-  version: 1.0.0
+  version: 1.1.0
 ---
 
 # Standup — Generate Standup Summaries from Obsidian Vault
@@ -198,6 +198,8 @@ When multiple notes need sub-agent reads, spawn them in parallel (one sub-agent 
 
 From each note (whether read directly or via sub-agent), extract: project name (from frontmatter `project:` field), note type (`type:` field), date, title (first `# Heading`), summary (content of `## Summary` section), decisions (bullets from `## Key Decisions`), errors resolved (bullets from `## Errors Encountered`), open items (checkboxes from `## Open Questions / Next Steps`), and the filename (for wikilinks).
 
+**Also extract closed items for the "Closed This Period" section:** For each session note in the date range, check the file modification time using `stat -f %m "$file" 2>/dev/null || stat -c %Y "$file"` (macOS / Linux fallback). Convert to YYYY-MM-DD. If the file was modified within the standup date range (`START_DATE` to `END_DATE`), Grep the file for `- \[x\]` lines under the `## Open Questions / Next Steps` section using the same line-range verification as for open items. Collect `(project, item_text)` tuples for each checked item.
+
 Collect all distilled records as `NOTE_DATA`.
 
 ### Step 8 — Group by project
@@ -255,6 +257,19 @@ Precede all project sections with a header block that includes a highlights summ
 - [ ] $PROJECT_A: $MOST_IMPORTANT_OPEN_ITEM
 - [ ] $PROJECT_B: $MOST_IMPORTANT_OPEN_ITEM
 ```
+
+### Closed This Period
+
+For each project that had at least one item closed within the standup window, render:
+
+- **<project name>** (<N> closed)
+  - <item text 1>
+  - <item text 2>
+  - ...
+
+If zero items were closed across all projects, **omit this entire section** — do not render an empty header.
+
+Order projects alphabetically. Within each project, preserve the order items were extracted (file mtime descending — newest checkoffs first).
 
 Rules for the header sections:
 - **Highlights:** Include only projects with substantive work (skip vault-import-only or config-tweak sessions). Write 1-2 sentences per project summarizing the outcome, not the process. Order by impact/significance, not alphabetically.
