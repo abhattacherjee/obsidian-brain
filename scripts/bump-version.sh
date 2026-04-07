@@ -359,7 +359,21 @@ JS
       # (Copilot iter-2 finding on PR #14).
       ;;
     *)
-      print_error "Failed to sync marketplace.json — fix the above and re-run"
+      # All-or-nothing rollback: marketplace sync failed AFTER plugin.json
+      # was already updated. Restore plugin.json to CURRENT_VERSION so
+      # the working tree is not left in a drifted state. The pre-bump
+      # validation (above) catches the common "missing entry" case before
+      # plugin.json is touched, but a runtime write failure (read-only
+      # file, disk full, permissions change between validation and write)
+      # can only be handled here (Copilot iter-6 finding on PR #14).
+      print_warning "marketplace.json sync failed AFTER plugin.json was updated — rolling plugin.json back to $CURRENT_VERSION"
+      if update_version "$PROJECT_ROOT/.claude-plugin/plugin.json" "$CURRENT_VERSION"; then
+        print_info "plugin.json restored to $CURRENT_VERSION — working tree is consistent"
+      else
+        print_error "ROLLBACK FAILED: plugin.json is at $NEW_VERSION but marketplace.json is at $CURRENT_VERSION."
+        print_error "Manually restore plugin.json to $CURRENT_VERSION before committing."
+      fi
+      print_error "Failed to sync marketplace.json — fix the underlying issue and re-run"
       exit 1
       ;;
   esac
