@@ -73,7 +73,7 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    ```
    Store as `RAW_TURNS`. This counts only user/assistant turn markers in the raw note body — the deliberate signal for "what the raw extraction actually captured".
 
-3. **Locate the source JSONL and re-parse it in one shot.** Invoke the helper via argv (no shell interpolation of paths — pass `SESSION_ID` as an argument so session_ids with unusual characters cannot break the quoting). Use a secure temp file:
+3. **Locate the source JSONL and re-parse it in one shot.** Invoke the helper via argv (no shell interpolation of paths — pass `SESSION_ID` as an argument so session_ids with unusual characters cannot break the quoting). The parsed JSON is printed directly to stdout — no temp files, no traps:
 
    Run the following Bash command from the obsidian-brain project root. It prints the parsed transcript JSON **directly to stdout** — no temp files, no traps, no `$TMPFILE` that would need to persist across tool invocations. Capture the stdout from the Bash tool result in the next step:
 

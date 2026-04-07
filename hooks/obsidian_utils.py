@@ -219,7 +219,19 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
         except Exception:
             pass
 
-    # --- Files touched: extract from tool_use blocks (Edit/Write/MultiEdit) ---
+    # --- Files touched + Errors: delegate to shared helpers ---
+    meta["files_touched"] = _extract_files_touched(messages)[:60]
+    meta["errors"] = _extract_errors(messages)[:30]
+
+    return meta
+
+
+def _extract_files_touched(messages: list[dict]) -> list[str]:
+    """Extract unique file paths from Edit/Write/MultiEdit tool_use blocks.
+
+    Shared between extract_session_metadata (SessionEnd write path) and
+    parse_full_transcript (/recall read path) to prevent drift.
+    """
     files_seen: list[str] = []
     for entry in messages:
         msg = entry.get("message", {})
@@ -234,14 +246,19 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
                 "Write",
                 "MultiEdit",
             ):
-                inp = block.get("input", {})
-                if isinstance(inp, dict):
-                    fp = inp.get("file_path", "")
-                    if fp and fp not in files_seen:
-                        files_seen.append(fp)
-    meta["files_touched"] = files_seen[:60]
+                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+                fp = inp.get("file_path", "")
+                if fp and fp not in files_seen:
+                    files_seen.append(fp)
+    return files_seen
 
-    # --- Errors: extract from tool_result blocks with is_error ---
+
+def _extract_errors(messages: list[dict]) -> list[str]:
+    """Extract unique error snippets from tool_result blocks with is_error=true.
+
+    Shared between extract_session_metadata (SessionEnd write path) and
+    parse_full_transcript (/recall read path) to prevent drift.
+    """
     errors: list[str] = []
     for entry in messages:
         msg = entry.get("message", {})
@@ -257,9 +274,7 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
                     snippet = err_content.strip()[:200]
                     if snippet not in errors:
                         errors.append(snippet)
-    meta["errors"] = errors[:30]
-
-    return meta
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -580,19 +595,32 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
     if any(c in session_id for c in "*?[]"):
         return None
     target = f"{session_id}.jsonl"
+    # Primary path: external `find` with -print -quit (fast on large trees).
     try:
         result = subprocess.run(
-            # `-print -quit` stops find at the first match so large project
-            # trees don't burn the full 5s timeout scanning unused branches.
             ["find", str(projects_dir), "-name", target, "-type", "f", "-print", "-quit"],
             capture_output=True, text=True, timeout=5,
         )
+        if result.returncode == 0 and result.stdout.strip():
+            first = result.stdout.strip().split("\n")[0]
+            return Path(first) if first else None
     except (subprocess.TimeoutExpired, FileNotFoundError):
+        # Fall through to the pure-Python fallback below — sandboxed or
+        # restricted environments may not have `find` on PATH.
+        pass
+    except OSError:
+        pass
+
+    # Fallback: pure-Python rglob. Slower on huge trees but dependency-free
+    # so /recall still works when `find` is unavailable (sandboxes, minimal
+    # container images, restricted shells).
+    try:
+        for path in projects_dir.rglob(target):
+            if path.is_file():
+                return path
+    except OSError:
         return None
-    if result.returncode != 0:
-        return None
-    first = result.stdout.strip().split("\n")[0] if result.stdout.strip() else ""
-    return Path(first) if first else None
+    return None
 
 
 def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
@@ -719,40 +747,13 @@ def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
     assistant_msgs = extract_assistant_messages(entries)
     tool_uses = extract_tool_uses(entries)
 
-    # Files touched: mirror extract_session_metadata logic (Edit/Write/MultiEdit).
-    files_seen: list[str] = []
-    for entry in entries:
-        msg = entry.get("message", {})
-        content = msg.get("content") if isinstance(msg, dict) else None
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            name = block.get("name", "")
-            if name in ("Edit", "Write", "MultiEdit"):
-                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
-                fp = inp.get("file_path", "")
-                if fp and fp not in files_seen:
-                    files_seen.append(fp)
-
-    # Errors: mirror extract_session_metadata — use the structured `is_error`
-    # flag on tool_result blocks rather than substring-matching "error".
-    errors: list[str] = []
-    for entry in entries:
-        msg = entry.get("message", {})
-        content = msg.get("content") if isinstance(msg, dict) else None
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "tool_result" and block.get("is_error"):
-                err_content = block.get("content", "")
-                if isinstance(err_content, str) and err_content.strip():
-                    snippet = err_content.strip()[:200]
-                    if snippet not in errors:
-                        errors.append(snippet)
+    # Files touched + errors: delegate to the shared helpers used by
+    # extract_session_metadata so both code paths stay in lockstep.
+    # No caps applied here — caps belong to the display layer, not
+    # re-parse, so the full summary can see everything the transcript
+    # actually contains.
+    files_seen = _extract_files_touched(entries)
+    errors = _extract_errors(entries)
 
     # Note: we do not inject a "[... middle truncated ...]" marker into
     # user_msgs. At this point it would land at the very end of the list
