@@ -158,14 +158,25 @@ try:
     if not entries:
         sys.stderr.write(f"marketplace.json has no entry for '{plugin_name}'\n")
         sys.exit(2)
-    market_v = entries[0].get("version")
-    if market_v is None:
-        sys.stderr.write(f"marketplace.json entry for '{plugin_name}' has no 'version' field\n")
-        sys.exit(2)
-    if market_v != plugin_v:
-        print(f"MISMATCH: plugin.json={plugin_v} marketplace.json={market_v}")
+    # Iterate ALL matching entries (not just entries[0]) so a mismatched
+    # secondary entry can't slip through preflight. Symmetric with
+    # bump-version.sh, which updates every matching entry.
+    mismatches = []
+    for idx, entry in enumerate(entries):
+        market_v = entry.get("version")
+        if market_v is None:
+            sys.stderr.write(
+                f"marketplace.json entry #{idx} for '{plugin_name}' has no 'version' field\n"
+            )
+            sys.exit(2)
+        if market_v != plugin_v:
+            mismatches.append((idx, market_v))
+    if mismatches:
+        details = ", ".join(f"entry#{i}={v}" for i, v in mismatches)
+        print(f"MISMATCH: plugin.json={plugin_v} marketplace.json={details}")
         sys.exit(1)
-    print(f"OK: {plugin_name}@{plugin_v}")
+    suffix = "" if len(entries) == 1 else f" ({len(entries)} entries)"
+    print(f"OK: {plugin_name}@{plugin_v}{suffix}")
 except Exception:
     # Defensive: any unexpected crash (KeyError, TypeError on a malformed
     # entry, etc.) goes to stderr with traceback and exits 2 so the shell
