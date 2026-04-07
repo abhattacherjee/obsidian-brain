@@ -160,12 +160,30 @@ update_version "$PROJECT_ROOT/.claude-plugin/plugin.json" "$NEW_VERSION"
 MARKETPLACE_JSON="$PROJECT_ROOT/.claude-plugin/marketplace.json"
 PLUGIN_JSON="$PROJECT_ROOT/.claude-plugin/plugin.json"
 if [[ -f "$MARKETPLACE_JSON" ]]; then
+  # Mirror read_version()'s python-then-node fallback rather than letting
+  # `set -e` abort the script if the python3 read fails (e.g. malformed
+  # plugin.json or missing `name`). Both branches `|| true` so a failing
+  # read leaves PLUGIN_NAME empty and falls through to the next branch.
+  PLUGIN_NAME=""
   if command -v python3 &>/dev/null; then
-    PLUGIN_NAME=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['name'])" "$PLUGIN_JSON")
-  elif command -v node &>/dev/null; then
-    PLUGIN_NAME=$(node -e "console.log(require(process.argv[1]).name)" "$PLUGIN_JSON")
-  else
-    print_error "Need python3 or node to sync marketplace.json"
+    PLUGIN_NAME=$(python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+name = d.get('name')
+if not name:
+    sys.exit(1)
+print(name)
+" "$PLUGIN_JSON" 2>/dev/null || true)
+  fi
+  if [[ -z "$PLUGIN_NAME" ]] && command -v node &>/dev/null; then
+    PLUGIN_NAME=$(node -e "
+const d = require(process.argv[1]);
+if (!d.name) process.exit(1);
+console.log(d.name);
+" "$PLUGIN_JSON" 2>/dev/null || true)
+  fi
+  if [[ -z "$PLUGIN_NAME" ]]; then
+    print_error "Could not read plugin name from $PLUGIN_JSON (need python3 or node, and a valid 'name' field)"
     exit 1
   fi
 
@@ -232,7 +250,6 @@ PY
   else
     node - "$MARKETPLACE_JSON" "$NEW_VERSION" "$PLUGIN_NAME" <<'JS' || SYNC_EXIT=$?
 const fs = require('fs');
-const path = require('path');
 const [, , marketPath, newVersion, pluginName] = process.argv;
 
 let data;
