@@ -605,12 +605,18 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
         return None
     target = f"{session_id}.jsonl"
     # Primary path: external `find` with -print -quit (fast on large trees).
+    # Suppress stderr so permission-denied or other noise on unrelated
+    # subtrees does not poison the exit code. Use stdout whenever it's
+    # non-empty regardless of returncode — `find` commonly returns non-zero
+    # after encountering a restricted directory even when it also printed a
+    # legitimate match from a sibling directory.
     try:
         result = subprocess.run(
             ["find", str(projects_dir), "-name", target, "-type", "f", "-print", "-quit"],
-            capture_output=True, text=True, timeout=5,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=5,
         )
-        if result.returncode == 0 and result.stdout.strip():
+        if result.stdout.strip():
             first = result.stdout.strip().split("\n")[0]
             return Path(first) if first else None
     except (subprocess.TimeoutExpired, FileNotFoundError):

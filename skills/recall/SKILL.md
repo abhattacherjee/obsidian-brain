@@ -76,10 +76,12 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    python3 -c '
    import sys, json
    sys.path.insert(0, "hooks")
-   from obsidian_utils import find_transcript_jsonl, parse_full_transcript
+   from obsidian_utils import find_transcript_jsonl, parse_full_transcript, RAW_NOTE_MAX_TURNS
    p = find_transcript_jsonl(sys.argv[1])
    if p is None:
-       print(json.dumps({"jsonl_path": None}))
+       # Always include raw_note_max_turns so the caller can key off one
+       # consistent field regardless of which branch was taken.
+       print(json.dumps({"jsonl_path": None, "raw_note_max_turns": RAW_NOTE_MAX_TURNS}))
    else:
        data = parse_full_transcript(p)
        data["jsonl_path"] = str(p)
@@ -89,10 +91,14 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
 
    The Bash tool's stdout result is the JSON payload. Parse it directly from the tool response — it contains either `{"jsonl_path": null}` (not found) or the full parsed transcript plus `jsonl_path`, `truncated`, and `warnings`. Very large transcripts can produce multi-MB JSON; if the Bash tool truncates the output, fall back to writing to a known path such as `$VAULT_PATH/.obsidian-brain-transcript-cache.json` and reading it with the Read tool (this file is not in the vault's git repo and is safe to overwrite).
 
-4. **Decide which source to summarize from.** The truncation signal is the parsed user/assistant message total (`len(user_msgs) + len(assistant_msgs)`) compared to the `raw_note_max_turns` field returned in the JSON payload. This is the write-time cap used by `build_raw_fallback` (currently 120) — the single source of truth for "did the raw note lose content". Independent of raw-note filtering heuristics that drop system noise.
-   - **`jsonl_path` is null** → use the raw note as the input. After summarizing, append a footnote to the Summary section: `_(Source transcript no longer on disk — summary built from truncated raw extraction.)_`
-   - **`jsonl_path` is set and parsed total > `raw_note_max_turns`** → the raw note is truncated relative to the original transcript. Use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the summarization input.
-   - **`jsonl_path` is set and parsed total ≤ `raw_note_max_turns`** → the raw note captured everything; use it instead.
+4. **Decide which source to summarize from.** The re-parse path should engage whenever the raw note is missing content. Two independent signals mean "raw note is incomplete":
+   - **Cap exceeded** — parsed user/assistant total (`len(user_msgs) + len(assistant_msgs)`) is greater than `raw_note_max_turns` (the write-time cap used by `build_raw_fallback`, currently 120). This is the single source of truth for cap-based truncation, independent of raw-note filtering heuristics.
+   - **Byte budget sliced** — `parse_full_transcript` sets `truncated: true` when the transcript exceeded its 5 MB budget and had to be sliced into head+tail halves. In that case the parsed count may actually be *below* the cap even though real content is missing from the middle, so cap-comparison alone is not sufficient.
+
+   Decision branches:
+   - **`jsonl_path` is null** → use the raw note as the input. Append to the Summary section: `_(Source transcript no longer on disk — summary built from truncated raw extraction.)_`
+   - **`jsonl_path` is set AND (parsed total > `raw_note_max_turns` OR `truncated == true`)** → re-parse path engages. Use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the summarization input. If `truncated == true`, note that the summary reflects only the head and tail of the transcript.
+   - **`jsonl_path` is set AND parsed total ≤ `raw_note_max_turns` AND `truncated == false`** → the raw note captured everything; use it instead.
    - **If the parsed data's `warnings` list is non-empty** (regardless of which branch), prepend a visible callout section `## ⚠️ Transcript re-parse warnings` at the top of the upgraded note (above `# <title>`), listing each warning as a bullet. This surfaces partial-line losses, malformed JSONL records, unknown block types, and byte-budget slicing so the user knows what's in the summary and what isn't.
 
 5. **Generate a detailed, specific summary** from whichever input source was chosen above. Be precise — include file paths, function names, config values, and technical specifics. Produce these sections (unchanged from before):
