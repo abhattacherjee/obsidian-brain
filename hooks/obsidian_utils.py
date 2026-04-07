@@ -563,6 +563,143 @@ def get_project_name(cwd: str) -> str:
     return Path(cwd).name if cwd else "unknown"
 
 
+def find_transcript_jsonl(session_id: str) -> Path | None:
+    """Locate the original Claude Code transcript JSONL by session_id.
+
+    Returns the Path if found, None otherwise. Uses find(1) so it is
+    agnostic to project-path encoding (hyphens vs underscores).
+    """
+    if not session_id or session_id == "unknown":
+        return None
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.is_dir():
+        return None
+    target = f"{session_id}.jsonl"
+    try:
+        result = subprocess.run(
+            ["find", str(projects_dir), "-name", target, "-type", "f"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+    first = result.stdout.strip().split("\n")[0] if result.stdout.strip() else ""
+    return Path(first) if first else None
+
+
+def parse_full_transcript(jsonl_path: Path, max_bytes: int = 5_000_000) -> dict:
+    """Parse a Claude Code transcript JSONL into the same shape as
+    extract_metadata + extract_messages, but WITHOUT the raw-note caps.
+
+    Applies a hard byte budget so very large transcripts are sliced
+    (head + tail) rather than read entirely. Returns a dict with keys:
+        - user_msgs: list[str]
+        - assistant_msgs: list[str]
+        - tool_uses: list[dict]   (same shape as extract_tool_uses output)
+        - files_touched: list[str]
+        - errors: list[str]
+        - truncated: bool          (True if byte budget kicked in)
+    """
+    user_msgs: list[str] = []
+    assistant_msgs: list[str] = []
+    tool_uses: list[dict] = []
+    files_seen: list[str] = []
+    errors: list[str] = []
+    truncated = False
+
+    try:
+        size = jsonl_path.stat().st_size
+    except OSError:
+        return {
+            "user_msgs": [], "assistant_msgs": [], "tool_uses": [],
+            "files_touched": [], "errors": [], "truncated": False,
+        }
+
+    if size <= max_bytes:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    else:
+        # Slice: first half + last half of budget
+        half = max_bytes // 2
+        with open(jsonl_path, "rb") as fh:
+            head = fh.read(half).decode("utf-8", errors="replace")
+            fh.seek(-half, 2)
+            tail = fh.read().decode("utf-8", errors="replace")
+        lines = head.splitlines() + ["{\"__sliced__\": true}"] + tail.splitlines()
+        truncated = True
+
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("__sliced__"):
+            user_msgs.append("[... middle of transcript truncated ...]")
+            continue
+        msg = obj.get("message") or obj
+        role = msg.get("role")
+        content = msg.get("content")
+        if content is None:
+            continue
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    name = block.get("name", "")
+                    inp = block.get("input", {}) or {}
+                    detail = ""
+                    if name in ("Edit", "Write", "Read"):
+                        fp = inp.get("file_path", "")
+                        detail = f"`{fp}`" if fp else ""
+                        if fp and fp not in files_seen:
+                            files_seen.append(fp)
+                    elif name == "Bash":
+                        detail = f"`{inp.get('command', '')[:120]}`"
+                    elif name == "Grep":
+                        detail = f"pattern=\"{inp.get('pattern', '')}\""
+                    if name:
+                        tool_uses.append({"name": name, "detail": detail})
+                elif btype == "tool_result":
+                    tr = block.get("content", "")
+                    if isinstance(tr, list):
+                        for tb in tr:
+                            if isinstance(tb, dict) and tb.get("type") == "text":
+                                txt = tb.get("text", "")
+                                if "error" in txt.lower() or "Error" in txt:
+                                    errors.append(txt.strip()[:200])
+                    elif isinstance(tr, str) and ("error" in tr.lower()):
+                        errors.append(tr.strip()[:200])
+            text = "\n".join(p for p in parts if p)
+        else:
+            continue
+        if not text.strip():
+            continue
+        if role == "user":
+            user_msgs.append(text)
+        elif role == "assistant":
+            assistant_msgs.append(text)
+
+    return {
+        "user_msgs": user_msgs,
+        "assistant_msgs": assistant_msgs,
+        "tool_uses": tool_uses,
+        "files_touched": files_seen,
+        "errors": errors,
+        "truncated": truncated,
+    }
+
+
 def build_raw_fallback(
     user_msgs: list[str],
     metadata: dict,
