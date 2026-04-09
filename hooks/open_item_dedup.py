@@ -121,3 +121,43 @@ def collect_open_items(
             break
 
     return results
+
+
+def find_duplicates(
+    candidate_text: str,
+    existing_items: list[tuple[str, int, str]],
+    threshold: int = 5,
+) -> list[tuple[str, int, str, str]]:
+    """Find items in existing_items that are duplicates of candidate_text.
+
+    Returns [(file_path, line_number, item_text, confidence)] where
+    confidence is "high" (distinctive token match) or "fuzzy" (token overlap).
+    Tier 1 short-circuits: if a distinctive token matches, skip Tier 2.
+    """
+    cleaned = _strip_markdown(candidate_text)
+    candidate_distinctive = _extract_distinctive_tokens(cleaned)
+    candidate_tokens = _tokenize(cleaned)
+
+    matches: list[tuple[str, int, str, str]] = []
+
+    for fpath, line_num, item_text in existing_items:
+        item_lower = item_text.lower()
+
+        # Tier 1: distinctive token match (high confidence, short-circuit)
+        tier1_hit = False
+        for dt in candidate_distinctive:
+            if dt.lower() in item_lower:
+                matches.append((fpath, line_num, item_text, "high"))
+                tier1_hit = True
+                break
+        if tier1_hit:
+            continue
+
+        # Tier 2: fuzzy token overlap (lower confidence)
+        if candidate_tokens:
+            item_cleaned = _strip_markdown(item_text).lower()
+            overlap = sum(1 for t in candidate_tokens if t in item_cleaned)
+            if overlap >= threshold:
+                matches.append((fpath, line_num, item_text, "fuzzy"))
+
+    return matches
