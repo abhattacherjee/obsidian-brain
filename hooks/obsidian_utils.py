@@ -83,7 +83,9 @@ def cache_set(session_id: str, key: str, value) -> None:
     try:
         with open(cache_path, 'r') as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        if isinstance(exc, json.JSONDecodeError):
+            print(f"[obsidian-brain] cache corrupted, resetting: {exc}", file=sys.stderr)
         data = {}
 
     data[key] = value
@@ -93,7 +95,8 @@ def cache_set(session_id: str, key: str, value) -> None:
         with os.fdopen(fd, 'w') as f:
             json.dump(data, f)
         os.rename(tmp, cache_path)
-    except OSError:
+    except OSError as exc:
+        print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
         try:
             os.unlink(tmp)
         except OSError:
@@ -648,8 +651,8 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
                 metadata.get("project", "unknown"),
                 max_sessions=10,
             )
-        except Exception:
-            pass  # best-effort; don't block summarization
+        except Exception as exc:
+            print(f"[obsidian-brain] open item collection failed (non-fatal): {exc}", file=sys.stderr)
 
     if existing_items:
         prompt += "\n\n## Existing Open Items for This Project (DO NOT DUPLICATE)\n"

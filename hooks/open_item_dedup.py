@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 
@@ -18,7 +19,7 @@ _RE_FILE_PATH = re.compile(r'[\w./]+\.(py|md|json|ts|js|tsx|jsx)')
 _RE_PR_REF = re.compile(r'#\d+|PR\s+\d+|issue\s+\d+', re.IGNORECASE)
 _RE_BRANCH = re.compile(r'(?:feature|release|hotfix)/[\w.-]+')
 _RE_VERSION = re.compile(r'v?\d+\.\d+\.\d+')
-_RE_MARKDOWN = re.compile(r'`[^`]*`|\*\*([^*]*)\*\*|_([^_]*)_|\[([^\]]*)\]\([^)]*\)')
+_RE_MARKDOWN = re.compile(r'`([^`]*)`|\*\*([^*]*)\*\*|_([^_]*)_|\[([^\]]*)\]\([^)]*\)')
 
 _STOPWORDS = frozenset({
     'the', 'a', 'an', 'to', 'for', 'in', 'on', 'of', 'and', 'or',
@@ -34,7 +35,7 @@ _COMPLETION_PHRASES = frozenset({
 
 def _strip_markdown(text: str) -> str:
     """Remove backticks, bold, italic, and links. Keep inner text."""
-    return _RE_MARKDOWN.sub(lambda m: m.group(1) or m.group(2) or m.group(3) or '', text)
+    return _RE_MARKDOWN.sub(lambda m: m.group(1) or m.group(2) or m.group(3) or m.group(4) or '', text)
 
 
 def _extract_distinctive_tokens(text: str) -> list[str]:
@@ -89,7 +90,11 @@ def collect_open_items(
         try:
             with open(fpath, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-        except OSError:
+        except OSError as exc:
+            print(f"[obsidian-brain] skipping unreadable note {fname}: {exc}", file=sys.stderr)
+            continue
+        except UnicodeDecodeError as exc:
+            print(f"[obsidian-brain] encoding error in {fname}: {exc}", file=sys.stderr)
             continue
 
         # Check frontmatter for project match (first 20 lines)
@@ -202,7 +207,8 @@ def dedup_note_open_items(
     try:
         with open(note_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-    except OSError:
+    except OSError as exc:
+        print(f"[obsidian-brain] dedup: cannot read {note_path}: {exc}", file=sys.stderr)
         return []
 
     existing = collect_open_items(
@@ -248,7 +254,8 @@ def dedup_note_open_items(
             f.writelines(new_lines)
         os.chmod(tmp_path, 0o644)
         os.rename(tmp_path, note_path)
-    except OSError:
+    except OSError as exc:
+        print(f"[obsidian-brain] dedup: atomic write failed for {note_path}: {exc}", file=sys.stderr)
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -303,18 +310,24 @@ def batch_cascade_checkoff(
         try:
             with open(fpath, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-        except OSError:
+        except OSError as exc:
+            print(f"[obsidian-brain] cascade: cannot read {os.path.basename(fpath)}: {exc}", file=sys.stderr)
             continue
 
-        modified = False
+        file_edit_count = 0
         for ln in line_nums:
             idx = ln - 1  # 0-indexed
             if 0 <= idx < len(lines) and '- [ ] ' in lines[idx]:
                 lines[idx] = lines[idx].replace('- [ ] ', '- [x] ', 1)
-                modified = True
-                edited_count += 1
+                file_edit_count += 1
+            else:
+                print(
+                    f"[obsidian-brain] cascade: line {ln} in {os.path.basename(fpath)} "
+                    f"no longer contains expected checkbox (file may have changed)",
+                    file=sys.stderr,
+                )
 
-        if modified:
+        if file_edit_count > 0:
             note_dir = os.path.dirname(fpath)
             fd, tmp_path = tempfile.mkstemp(
                 prefix='.ob-cascade-', suffix='.md.tmp', dir=note_dir,
@@ -325,7 +338,9 @@ def batch_cascade_checkoff(
                 os.chmod(tmp_path, 0o644)
                 os.rename(tmp_path, fpath)
                 edited_files.add(os.path.basename(fpath))
-            except OSError:
+                edited_count += file_edit_count  # count only after successful write
+            except OSError as exc:
+                print(f"[obsidian-brain] cascade: write failed for {os.path.basename(fpath)}: {exc}", file=sys.stderr)
                 try:
                     os.unlink(tmp_path)
                 except OSError:
