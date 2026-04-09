@@ -1478,15 +1478,22 @@ def upgrade_note_with_summary(
     # Add source note
     new_lines.append(f'\n_(Summary source: {source})_\n')
 
-    # Preserve original audit trail sections (skip frontmatter, and exclude
-    # sections already covered by summary_text: Changes Made, Errors Encountered)
+    # Preserve original audit trail sections (skip frontmatter).
+    # Only exclude ## Changes Made / ## Errors Encountered if summary_text
+    # actually contains them — otherwise preserve the raw audit data.
+    audit_sections = [
+        '## Tool Usage', '## Conversation (raw)',
+        '## Session Metadata', '## Files Touched',
+    ]
+    if '## Changes Made' not in summary_text:
+        audit_sections.append('## Changes Made')
+    if '## Errors Encountered' not in summary_text:
+        audit_sections.append('## Errors Encountered')
+
     in_audit = False
     for line in raw_lines[frontmatter_end:]:
         stripped = line.strip()
-        if stripped.startswith('## Tool Usage') or \
-           stripped.startswith('## Conversation (raw)') or \
-           stripped.startswith('## Session Metadata') or \
-           stripped.startswith('## Files Touched'):
+        if any(stripped.startswith(s) for s in audit_sections):
             in_audit = True
         elif stripped.startswith('## '):
             in_audit = False
@@ -1495,7 +1502,10 @@ def upgrade_note_with_summary(
 
     # Atomic write
     note_dir = os.path.dirname(note_path)
-    fd, tmp_path = tempfile.mkstemp(prefix='.ob-upgrade-', suffix='.md.tmp', dir=note_dir)
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix='.ob-upgrade-', suffix='.md.tmp', dir=note_dir)
+    except OSError as exc:
+        return f"Failed: cannot create temp file in {note_dir}: {exc}"
     try:
         try:
             orig_mode = os.stat(note_path).st_mode
@@ -1514,19 +1524,26 @@ def upgrade_note_with_summary(
 
     # Run dedup pass (non-fatal — note is already upgraded)
     removed = []
+    dedup_failed = False
     try:
         _hooks_dir = os.path.dirname(os.path.abspath(__file__))
         if _hooks_dir not in sys.path:
             sys.path.insert(0, _hooks_dir)
         from open_item_dedup import dedup_note_open_items
         removed = dedup_note_open_items(vault_path, sessions_folder, project, note_path)
-    except Exception as exc:
+    except (ImportError, OSError) as exc:
+        dedup_failed = True
         print(f"[obsidian-brain] dedup failed (non-fatal, note already upgraded): {exc}", file=sys.stderr)
+    except Exception as exc:
+        dedup_failed = True
+        print(f"[obsidian-brain] dedup unexpected error: {exc}", file=sys.stderr)
 
     # Build status
     status = f"Upgraded {os.path.basename(note_path)} (source: {source})"
     if removed:
         status += f", deduped {len(removed)} item(s)"
+    if dedup_failed:
+        status += ", dedup failed (see stderr)"
     if warnings:
         status += f", {len(warnings)} warning(s)"
     return status
