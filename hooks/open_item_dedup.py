@@ -161,3 +161,189 @@ def find_duplicates(
                 matches.append((fpath, line_num, item_text, "fuzzy"))
 
     return matches
+
+
+def cascade_checkoff(
+    checked_item_text: str,
+    existing_items: list[tuple[str, int, str]],
+    source_file: str | None = None,
+    source_line: int | None = None,
+) -> list[tuple[str, int, str, str]]:
+    """Find duplicates of a checked-off item for cascading.
+
+    Excludes the source item by (file, line) to avoid self-matching.
+    Returns [(file_path, line_number, item_text, confidence)].
+    """
+    dupes = find_duplicates(checked_item_text, existing_items)
+    if source_file is not None and source_line is not None:
+        src_abs = os.path.abspath(source_file)
+        dupes = [
+            (f, l, t, c) for f, l, t, c in dupes
+            if not (os.path.abspath(f) == src_abs and l == source_line)
+        ]
+    return dupes
+
+
+def dedup_note_open_items(
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+    note_path: str,
+) -> list[str]:
+    """Remove duplicate open items from a written note. Atomic rewrite.
+
+    Reads note_path, finds - [ ] items in ## Open Questions / Next Steps,
+    checks each against existing items in other session notes. Removes
+    duplicates and rewrites the file atomically.
+
+    Returns list of removed item texts (empty if no duplicates).
+    """
+    try:
+        with open(note_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+
+    existing = collect_open_items(
+        vault_path, sessions_folder, project,
+        max_sessions=10, exclude_path=note_path,
+    )
+    if not existing:
+        return []
+
+    # Find open items section and mark duplicates for removal
+    in_section = False
+    lines_to_remove: set[int] = set()
+    removed_texts: list[str] = []
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == '## Open Questions / Next Steps':
+            in_section = True
+            continue
+        if in_section:
+            if stripped.startswith('## '):
+                break
+            if stripped.startswith('- [ ] '):
+                item_text = stripped[6:]
+                dupes = find_duplicates(item_text, existing)
+                if dupes:
+                    lines_to_remove.add(i)
+                    removed_texts.append(item_text)
+
+    if not lines_to_remove:
+        return []
+
+    # Remove duplicate lines
+    new_lines = [line for i, line in enumerate(lines) if i not in lines_to_remove]
+
+    # Atomic rewrite: temp file + rename
+    note_dir = os.path.dirname(note_path)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix='.ob-dedup-', suffix='.md.tmp', dir=note_dir,
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+        os.chmod(tmp_path, 0o644)
+        os.rename(tmp_path, note_path)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return []
+
+    return removed_texts
+
+
+def batch_cascade_checkoff(
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+    checked_texts: list[str],
+) -> str:
+    """Cascade check-off for multiple items. Edits files directly.
+
+    Collects open items once, finds duplicates for each checked text,
+    auto-checks high-confidence matches, reports fuzzy-only suggestions.
+    Returns a compact summary string.
+    """
+    existing = collect_open_items(vault_path, sessions_folder, project)
+    if not existing:
+        return "No open items found for cascading."
+
+    # Collect all cascade targets, deduped by (file, line)
+    high_targets: dict[tuple[str, int], str] = {}  # (file, line) -> item_text
+    fuzzy_suggestions: list[tuple[str, str]] = []  # (item_text, basename)
+
+    for checked_text in checked_texts:
+        dupes = cascade_checkoff(checked_text, existing)
+        for fpath, line_num, item_text, confidence in dupes:
+            key = (fpath, line_num)
+            if confidence == "high":
+                high_targets[key] = item_text
+            elif key not in high_targets:
+                fuzzy_suggestions.append((item_text, os.path.basename(fpath)))
+
+    if not high_targets and not fuzzy_suggestions:
+        return "No duplicates found for cascading."
+
+    # Edit files for high-confidence targets
+    # Group by file to minimize file rewrites
+    files_to_edit: dict[str, list[int]] = {}
+    for (fpath, line_num), _ in high_targets.items():
+        files_to_edit.setdefault(fpath, []).append(line_num)
+
+    edited_count = 0
+    edited_files: set[str] = set()
+
+    for fpath, line_nums in files_to_edit.items():
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+
+        modified = False
+        for ln in line_nums:
+            idx = ln - 1  # 0-indexed
+            if 0 <= idx < len(lines) and '- [ ] ' in lines[idx]:
+                lines[idx] = lines[idx].replace('- [ ] ', '- [x] ', 1)
+                modified = True
+                edited_count += 1
+
+        if modified:
+            note_dir = os.path.dirname(fpath)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix='.ob-cascade-', suffix='.md.tmp', dir=note_dir,
+            )
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+                os.chmod(tmp_path, 0o644)
+                os.rename(tmp_path, fpath)
+                edited_files.add(os.path.basename(fpath))
+            except OSError:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    # Build summary
+    parts: list[str] = []
+    if edited_count:
+        parts.append(
+            f"Cascaded {edited_count} high-confidence duplicate(s) "
+            f"in {len(edited_files)} file(s)."
+        )
+    if fuzzy_suggestions:
+        parts.append("Fuzzy suggestions (edit manually if same item):")
+        seen: set[str] = set()
+        for item_text, basename in fuzzy_suggestions:
+            key = f"{item_text}|{basename}"
+            if key not in seen:
+                seen.add(key)
+                parts.append(f'  - "{item_text}" in {basename}')
+
+    return "\n".join(parts) if parts else "No duplicates found for cascading."
