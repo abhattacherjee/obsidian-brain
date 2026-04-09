@@ -194,7 +194,11 @@ print(summary)
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT_NAME" "$CHECKED_ITEMS_JSON"
 ```
 
-Where `$CHECKED_ITEMS_JSON` is a JSON array of confirmed item texts for that project (e.g. `'["Fix bug #42", "Land PR #14"]'`). Construct it by JSON-encoding the list from Step 11. Include the cascade summary in the Step 13 report.
+Before running, construct `$CHECKED_ITEMS_JSON` as a JSON array of confirmed item texts for that project from Step 11:
+```bash
+CHECKED_ITEMS_JSON=$(python3 -c "import json; print(json.dumps([\"Fix bug #42\", \"Land PR #14\"]))")
+```
+Replace the example items with the actual confirmed texts. Include the cascade summary in the Step 13 report.
 
 ### Step 13 — Report
 

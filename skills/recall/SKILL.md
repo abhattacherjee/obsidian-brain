@@ -312,7 +312,11 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
     ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$CHECKED_ITEMS_JSON"
     ```
 
-    Where `$CHECKED_ITEMS_JSON` is a JSON array of confirmed item texts from sub-step 7 (e.g. `'["Git-flow migration spec pending", "Land PR #14"]'`). Construct it by JSON-encoding the list of confirmed item texts. Report the cascade summary to the user alongside the checkoff confirmation.
+    Before running, construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts from sub-step 7. Use a Bash heredoc or inline Python to build it:
+    ```bash
+    CHECKED_ITEMS_JSON=$(python3 -c "import json; print(json.dumps([\"Git-flow migration spec pending\", \"Land PR #14\"]))")
+    ```
+    Replace the example items with the actual confirmed item texts. Then run the cascade command above. Report the cascade summary to the user alongside the checkoff confirmation.
 
 Then proceed to Step 8.
 

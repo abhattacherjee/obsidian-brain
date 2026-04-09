@@ -561,7 +561,9 @@ def _dedup_summary_open_items(summary_text: str, existing_items: list) -> str:
         if stripped.startswith('- [ ] '):
             item_text = stripped[6:]
             dupes = find_duplicates(item_text, existing_items)
-            if dupes:
+            # Only auto-remove high-confidence matches; fuzzy could be false positives
+            high_dupes = [d for d in dupes if d[3] == "high"]
+            if high_dupes:
                 removed = True
                 continue  # drop this line
         kept_lines.append(line)

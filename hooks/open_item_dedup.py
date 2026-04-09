@@ -237,7 +237,9 @@ def dedup_note_open_items(
             if stripped.startswith('- [ ] '):
                 item_text = stripped[6:]
                 dupes = find_duplicates(item_text, existing)
-                if dupes:
+                # Only auto-remove high-confidence matches; fuzzy could be false positives
+                high_dupes = [d for d in dupes if d[3] == "high"]
+                if high_dupes:
                     lines_to_remove.add(i)
                     removed_texts.append(item_text)
 
