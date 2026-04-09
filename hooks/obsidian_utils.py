@@ -1418,7 +1418,7 @@ def upgrade_note_with_summary(
     if warnings is None:
         warnings = []
 
-    if "## Summary" not in summary_text:
+    if not re.search(r"^## Summary\s*$", summary_text, re.MULTILINE):
         return f"Failed: malformed summary (no ## Summary section) from {source} for {os.path.basename(note_path)}"
 
     # Read the raw note
