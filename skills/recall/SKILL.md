@@ -102,7 +102,36 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    - `"Upgraded 2026-04-07-obsidian-brain-aeb5.md (source: JSONL transcript), deduped 2 item(s)"`
    - `"Failed: AI summarization returned empty for 2026-04-07-obsidian-brain-aeb5.md"`
 
-   Report the status to the user. If it starts with "Failed:", note the failure but continue to the next unsummarized note (do not stop the entire `/recall` flow).
+   Report the status to the user. If it starts with "Failed:", **collect the note path into a fallback list** but continue to the next unsummarized note.
+
+2. **Sub-agent fallback for failed notes.** If any notes returned "Failed:" status:
+
+   For each failed note, spawn a sub-agent in parallel using the Agent tool:
+
+   ```
+   Agent({
+     description: "Summarize session note <basename>",
+     prompt: "Read the session note at <NOTE_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nReturn ONLY these markdown sections. No preamble, no commentary."
+   })
+   ```
+
+   Spawn all failed notes' sub-agents in a single message (parallel). When each returns, pass its output to the Python pipeline:
+
+   ```bash
+   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+   python3 -c '
+   import sys
+   sys.path.insert(0, "hooks")
+   from obsidian_utils import upgrade_note_with_summary
+   summary = sys.stdin.read()
+   status = upgrade_note_with_summary(sys.argv[1], summary, sys.argv[2], sys.argv[3], sys.argv[4])
+   print(status)
+   ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" <<'SUMMARY_EOF'
+   <paste sub-agent output here>
+   SUMMARY_EOF
+   ```
+
+   Report each result. If the sub-agent also fails (error or malformed summary), note the failure but continue — the note stays unsummarized for the next `/recall`.
 
 If no unsummarized notes are found for this project, skip to Step 4.
 
