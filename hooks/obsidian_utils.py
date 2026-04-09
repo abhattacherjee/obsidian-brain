@@ -1478,14 +1478,18 @@ def upgrade_note_with_summary(
     # Add source note
     new_lines.append(f'\n_(Summary source: {source})_\n')
 
-    # Preserve original audit trail sections
+    # Preserve original audit trail sections (skip frontmatter, and exclude
+    # sections already covered by summary_text: Changes Made, Errors Encountered)
     in_audit = False
-    for line in raw_lines:
+    for line in raw_lines[frontmatter_end:]:
         stripped = line.strip()
-        if stripped.startswith('## Tool Usage') or stripped.startswith('## Errors Encountered') or \
-           stripped.startswith('## Conversation (raw)') or stripped.startswith('## Session Metadata') or \
-           stripped.startswith('## Files Touched') or stripped.startswith('## Changes Made'):
+        if stripped.startswith('## Tool Usage') or \
+           stripped.startswith('## Conversation (raw)') or \
+           stripped.startswith('## Session Metadata') or \
+           stripped.startswith('## Files Touched'):
             in_audit = True
+        elif stripped.startswith('## '):
+            in_audit = False
         if in_audit:
             new_lines.append(line)
 

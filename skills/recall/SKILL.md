@@ -130,10 +130,11 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    status = upgrade_note_with_summary(sys.argv[1], summary, sys.argv[2], sys.argv[3], sys.argv[4])
    print(status)
    ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" <<'SUMMARY_EOF'
-   ## Summary
-   ...the sub-agent's returned markdown sections go here verbatim...
+   <sub-agent output here — NO leading spaces, start lines at column 0>
    SUMMARY_EOF
    ```
+
+   **Important:** The heredoc body must have NO leading indentation — start `## Summary` at column 0. Leading spaces will cause the `## Summary` validation to fail.
 
    Report each result. If the pipeline returns "Failed:", note it but continue — the note stays unsummarized for the next `/recall`.
 
