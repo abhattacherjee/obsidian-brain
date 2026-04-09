@@ -21,7 +21,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from open_item_dedup import collect_open_items, find_duplicates
 
 # ---------------------------------------------------------------------------
 # Default configuration
@@ -319,6 +318,10 @@ def _dedup_summary_open_items(summary_text: str, existing_items: list) -> str:
     Operates on the string before disk write. Uses find_duplicates()
     for matching — same logic as dedup_note_open_items() but on a string.
     """
+    # Lazy import to avoid top-level dependency on hooks/ being on sys.path
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from open_item_dedup import find_duplicates
+
     # Find the ## Open Questions / Next Steps section
     pattern = r'(## Open Questions / Next Steps\n)(.*?)(?=\n## |\Z)'
     match = re.search(pattern, summary_text, re.DOTALL)
@@ -423,6 +426,8 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
     existing_items = []
     if metadata.get("vault_path") and metadata.get("sessions_folder"):
         try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from open_item_dedup import collect_open_items
             existing_items = collect_open_items(
                 metadata["vault_path"],
                 metadata["sessions_folder"],
