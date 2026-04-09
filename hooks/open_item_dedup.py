@@ -11,7 +11,6 @@ import os
 import re
 import sys
 import tempfile
-from pathlib import Path
 
 # --- Module-level compiled regexes (computed once at import) ---
 
@@ -317,7 +316,7 @@ def batch_cascade_checkoff(
         file_edit_count = 0
         for ln in line_nums:
             idx = ln - 1  # 0-indexed
-            if 0 <= idx < len(lines) and '- [ ] ' in lines[idx]:
+            if 0 <= idx < len(lines) and lines[idx].lstrip().startswith('- [ ] '):
                 lines[idx] = lines[idx].replace('- [ ] ', '- [x] ', 1)
                 file_edit_count += 1
             else:

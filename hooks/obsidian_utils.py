@@ -35,16 +35,21 @@ def _get_session_id_fast() -> str:
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_BOOTSTRAP_PREFIX}{project}"
 
-    # Try bootstrap file first (~0.1ms), but validate it's still the newest JSONL
-    import glob as _glob
-    cached_sid = None
+    # Try bootstrap file first (~0.1ms)
     try:
         with open(bootstrap, 'r') as f:
             cached_sid = f.read().strip()
+        if cached_sid:
+            # Cheap validation: check the JSONL file still exists (~0.1ms stat)
+            import glob as _glob
+            pattern = os.path.expanduser(f"~/.claude/projects/*{project}/{cached_sid}.jsonl")
+            if _glob.glob(pattern):
+                return cached_sid
     except OSError:
         pass
 
-    # Always resolve the actual newest JSONL to validate
+    # Fall back to full glob + mtime sort (~5ms)
+    import glob as _glob
     pattern = os.path.expanduser(f"~/.claude/projects/*{project}/*.jsonl")
     matches = _glob.glob(pattern)
     if not matches:
@@ -52,11 +57,7 @@ def _get_session_id_fast() -> str:
     newest = max(matches, key=os.path.getmtime)
     sid = os.path.splitext(os.path.basename(newest))[0]
 
-    # If bootstrap matches current session, use it (avoids re-write)
-    if cached_sid == sid:
-        return sid
-
-    # Write/update bootstrap for next call
+    # Write bootstrap for next call
     try:
         with open(bootstrap, 'w') as f:
             f.write(sid)
@@ -198,7 +199,7 @@ def load_config() -> dict:
     return config
 
 
-def get_session_context(vault_path: str = None, sessions_folder: str = None) -> dict:
+def get_session_context(vault_path: str | None = None, sessions_folder: str | None = None) -> dict:
     """Get session ID, hash, project, and session note name. Cached.
 
     Returns {session_id, hash, project, session_note_name} or
@@ -244,9 +245,10 @@ def read_note_metadata(file_path: str) -> dict | None:
     """
     sid = _get_session_id_fast()
     cache_key = f"metadata:{file_path}"
+    _CACHE_SENTINEL = {"__no_frontmatter__": True}
     cached = cache_get(sid, cache_key)
     if cached is not None:
-        return cached
+        return None if cached == _CACHE_SENTINEL else cached
 
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -259,6 +261,7 @@ def read_note_metadata(file_path: str) -> dict | None:
         return None
 
     if not lines or lines[0].strip() != '---':
+        cache_set(sid, cache_key, _CACHE_SENTINEL)
         return None
 
     meta: dict = {}
@@ -566,7 +569,7 @@ def _dedup_summary_open_items(summary_text: str, existing_items: list) -> str:
     new_body = '\n'.join(kept_lines)
     # If all items removed, add placeholder
     if not any(l.strip().startswith('- [ ]') for l in kept_lines):
-        new_body = 'None new. (See earlier sessions for tracked items.)'
+        new_body = 'None.'
     # Ensure consistent trailing newline before next section
     if not new_body.endswith('\n'):
         new_body += '\n'
