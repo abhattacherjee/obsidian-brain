@@ -212,9 +212,8 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
 
     project = os.path.basename(os.getcwd()).lower().replace(' ', '-')
     if sid == "unknown":
-        ctx = {"session_id": "unknown", "hash": "", "project": project, "session_note_name": ""}
-        cache_set(sid, "session_context", ctx)
-        return ctx
+        # Don't cache "unknown" — would pollute cache shared across projects
+        return {"session_id": "unknown", "hash": "", "project": project, "session_note_name": ""}
 
     h = hashlib.sha256(sid.encode()).hexdigest()[:4]
 

@@ -97,11 +97,15 @@ def collect_open_items(
             continue
 
         # Check frontmatter for project match (first 20 lines)
+        # Strip quotes to handle both `project: foo` and `project: "foo"`
         project_match = False
         for line in lines[:20]:
-            if line.strip() == f'project: {project}':
-                project_match = True
-                break
+            stripped = line.strip()
+            if stripped.startswith('project:'):
+                val = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                if val == project:
+                    project_match = True
+                    break
         if not project_match:
             continue
 
@@ -282,7 +286,7 @@ def batch_cascade_checkoff(
 
     # Collect all cascade targets, deduped by (file, line)
     high_targets: dict[tuple[str, int], str] = {}  # (file, line) -> item_text
-    fuzzy_suggestions: list[tuple[str, str]] = []  # (item_text, basename)
+    fuzzy_raw: list[tuple[tuple[str, int], str, str]] = []  # (key, item_text, basename)
 
     for checked_text in checked_texts:
         dupes = cascade_checkoff(checked_text, existing)
@@ -290,8 +294,14 @@ def batch_cascade_checkoff(
             key = (fpath, line_num)
             if confidence == "high":
                 high_targets[key] = item_text
-            elif key not in high_targets:
-                fuzzy_suggestions.append((item_text, os.path.basename(fpath)))
+            else:
+                fuzzy_raw.append((key, item_text, os.path.basename(fpath)))
+
+    # Filter fuzzy suggestions: exclude any that were promoted to high
+    fuzzy_suggestions = [
+        (text, basename) for key, text, basename in fuzzy_raw
+        if key not in high_targets
+    ]
 
     if not high_targets and not fuzzy_suggestions:
         return "No duplicates found for cascading."
