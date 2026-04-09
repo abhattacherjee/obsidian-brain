@@ -288,17 +288,20 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
 
 Then proceed to Step 8.
 
-### Step 8 — Offer options
+### Step 8 — Show load manifest and offer options
 
-Ask:
+After the context brief, explicitly list what was loaded into the conversation so the user knows exactly what context is available:
 
-> Want me to load this context? Or focus on a specific session/insight?
+> **Loaded into this conversation:**
+> - Full session: *"[most recent session title]"* ([date])
+> - Summary only: *"[second session title]"* ([date])
+> - [N] curated insight(s)
+>
+> Pick any session from the history table above to load it, or ready to start working?
 
-If the user says yes or wants to load it, the context brief is already in the conversation — it is loaded. Confirm:
+The session history table from Step 6 serves as a menu — if the user picks a session by name or date, use the Read tool to load that specific file and present its full contents.
 
-> Context loaded. Ready to continue where you left off.
-
-If the user asks about a specific session or insight, use the Read tool to load that specific file and present its full contents.
+If the user says they're ready to work, the context is already loaded — proceed.
 
 ## Edge Cases
 
