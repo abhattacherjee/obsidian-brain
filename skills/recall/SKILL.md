@@ -129,7 +129,7 @@ Collect both result sets.
 
 From the session files found, sort by date (extract from frontmatter `date:` field or filename). Select:
 
-- **Most recent session** — read in full (this is the primary context)
+- **Most recent session** — read in full (this is the primary context). Store its full path as `MOST_RECENT_SESSION_PATH` for use in Step 7.5.
 - **Second most recent session** — read summary + open questions only
 - **Last 5 sessions** — collect titles and dates for the session list
 

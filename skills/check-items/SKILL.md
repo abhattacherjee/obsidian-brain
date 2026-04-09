@@ -129,7 +129,7 @@ For each open item in a project, run the same matching logic as `/recall` Step 7
 - **Tokenize** the item text into words, lowercase, drop common stopwords (`the`, `a`, `an`, `to`, `for`, `in`, `on`, `of`, `and`, `or`, `but`, `is`, `are`, `was`, `were`, `be`).
 - **Substring match:** Count tokens (3+ chars) appearing as substrings in the project's evidence text (lowercased). If count >= 3, candidate.
 - **Distinctive token match:** If the item contains a file path (`/` or `.py`/`.md`/`.json`/`.ts`/`.js`/`.tsx`/`.jsx`), PR/issue ref (`#\d+`, `PR \d+`, `issue \d+`), branch name (`feature/`, `release/`, `hotfix/`), or version (`v?\d+\.\d+\.\d+`), and that token appears in evidence, mark as candidate even if substring count < 3.
-- **Completion phrase boost:** If a completion phrase (`merged`, `shipped`, `fixed`, `released`, `closed`, `removed`, `implemented`, `deleted`, `done`, `completed`) appears within 200 characters of any matched token in evidence, increase confidence.
+- **Completion phrase boost:** If a completion phrase (`merged`, `shipped`, `fixed`, `released`, `closed`, `removed`, `implemented`, `deleted`, `done`, `completed`) appears within 100 characters on either side (200 chars total window) of any matched token in evidence, increase confidence.
 
 For each candidate, capture a short evidence snippet (the matching sentence or 60-char window around the match).
 

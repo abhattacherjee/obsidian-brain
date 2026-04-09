@@ -323,7 +323,7 @@ def match_items_against_evidence(
 
         # Score: distinctive tokens get higher weight
         score = 0
-        best_match_pos = -1
+        match_positions: list[int] = []
 
         # Check distinctive tokens
         for dt in distinctive:
@@ -331,8 +331,7 @@ def match_items_against_evidence(
             pos = evidence_lower.find(dt_lower)
             if pos >= 0:
                 score += 3
-                if best_match_pos < 0:
-                    best_match_pos = pos
+                match_positions.append(pos)
 
         # Check regular tokens (3+ chars)
         matched_tokens = 0
@@ -340,8 +339,7 @@ def match_items_against_evidence(
             pos = evidence_lower.find(t)
             if pos >= 0:
                 matched_tokens += 1
-                if best_match_pos < 0:
-                    best_match_pos = pos
+                match_positions.append(pos)
 
         score += matched_tokens
 
@@ -349,19 +347,23 @@ def match_items_against_evidence(
         if score < 3:
             continue
 
-        # Completion phrase boost: look for phrases near matched tokens
+        # Completion phrase boost: check ±100 char window around EACH match position
         has_completion_phrase = False
-        if best_match_pos >= 0:
-            window_start = max(0, best_match_pos - 100)
-            window_end = min(len(evidence_lower), best_match_pos + 100)
-            window = evidence_lower[window_start:window_end]
-            for phrase in _COMPLETION_PHRASES:
-                if phrase in window:
-                    has_completion_phrase = True
-                    score += 2
+        if match_positions:
+            for mpos in match_positions:
+                if has_completion_phrase:
                     break
+                window_start = max(0, mpos - 100)
+                window_end = min(len(evidence_lower), mpos + 100)
+                window = evidence_lower[window_start:window_end]
+                for phrase in _COMPLETION_PHRASES:
+                    if phrase in window:
+                        has_completion_phrase = True
+                        score += 2
+                        break
 
-        # Extract evidence snippet (~60 chars around best match)
+        # Extract evidence snippet (~60 chars around best match (first position)
+        best_match_pos = match_positions[0] if match_positions else -1
         snippet = ""
         if best_match_pos >= 0:
             start = max(0, best_match_pos - 30)
@@ -1436,12 +1438,13 @@ def upgrade_unsummarized_note(
         raw_note_would_truncate = parsed.get("raw_note_would_truncate", False)
         truncated = parsed.get("truncated", False)
 
-        if raw_note_would_truncate or truncated:
-            source = "JSONL transcript"
-            if truncated:
-                source += " (head+tail, middle truncated)"
+        # Data always comes from JSONL when found — label accurately
+        if truncated:
+            source = "JSONL transcript (head+tail, middle truncated)"
+        elif raw_note_would_truncate:
+            source = "JSONL transcript (raw note would have truncated)"
         else:
-            source = "raw note (JSONL available but not needed)"
+            source = "JSONL transcript (full, raw note also sufficient)"
     else:
         # Fall back to raw note content for summarization
         source = "raw note (JSONL not found)"
@@ -1503,7 +1506,7 @@ def upgrade_unsummarized_note(
                 break
         if past_first_marker:
             if line.strip().startswith('status:'):
-                new_lines.append(line.replace('auto-logged', 'summarized'))
+                new_lines.append(re.sub(r'^(\s*status:\s*).*', r'\1summarized', line) + '\n' if not line.endswith('\n') else re.sub(r'^(\s*status:\s*).*', r'\1summarized', line))
             else:
                 new_lines.append(line)
 
