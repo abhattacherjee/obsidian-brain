@@ -35,17 +35,16 @@ def _get_session_id_fast() -> str:
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_BOOTSTRAP_PREFIX}{project}"
 
-    # Try bootstrap file first (~0.1ms)
+    # Try bootstrap file first (~0.1ms), but validate it's still the newest JSONL
+    import glob as _glob
+    cached_sid = None
     try:
         with open(bootstrap, 'r') as f:
-            sid = f.read().strip()
-        if sid:
-            return sid
+            cached_sid = f.read().strip()
     except OSError:
         pass
 
-    # Fall back to ls -t (~5ms)
-    import glob as _glob
+    # Always resolve the actual newest JSONL to validate
     pattern = os.path.expanduser(f"~/.claude/projects/*{project}/*.jsonl")
     matches = _glob.glob(pattern)
     if not matches:
@@ -53,7 +52,11 @@ def _get_session_id_fast() -> str:
     newest = max(matches, key=os.path.getmtime)
     sid = os.path.splitext(os.path.basename(newest))[0]
 
-    # Write bootstrap for next call
+    # If bootstrap matches current session, use it (avoids re-write)
+    if cached_sid == sid:
+        return sid
+
+    # Write/update bootstrap for next call
     try:
         with open(bootstrap, 'w') as f:
             f.write(sid)
@@ -560,7 +563,10 @@ def _dedup_summary_open_items(summary_text: str, existing_items: list) -> str:
     new_body = '\n'.join(kept_lines)
     # If all items removed, add placeholder
     if not any(l.strip().startswith('- [ ]') for l in kept_lines):
-        new_body = 'None new. (See earlier sessions for tracked items.)\n'
+        new_body = 'None new. (See earlier sessions for tracked items.)'
+    # Ensure consistent trailing newline before next section
+    if not new_body.endswith('\n'):
+        new_body += '\n'
 
     return summary_text[:match.start()] + section_header + new_body + summary_text[match.end():]
 

@@ -303,15 +303,16 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
     ```bash
     cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
     python3 -c '
-    import sys
+    import sys, json
     sys.path.insert(0, "hooks")
     from open_item_dedup import batch_cascade_checkoff
-    summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:])
+    items = json.loads(sys.argv[4])
+    summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
     print(summary)
-    ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "${CHECKED_ITEMS[@]}"
+    ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$CHECKED_ITEMS_JSON"
     ```
 
-    Where `${CHECKED_ITEMS[@]}` is the list of confirmed item texts from sub-step 7. Report the cascade summary to the user alongside the checkoff confirmation.
+    Where `$CHECKED_ITEMS_JSON` is a JSON array of confirmed item texts from sub-step 7 (e.g. `'["Git-flow migration spec pending", "Land PR #14"]'`). Construct it by JSON-encoding the list of confirmed item texts. Report the cascade summary to the user alongside the checkoff confirmation.
 
 Then proceed to Step 8.
 

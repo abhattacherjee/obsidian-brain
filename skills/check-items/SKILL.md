@@ -91,21 +91,7 @@ For each valid item, extract:
 
 Build a map: `{project → [(file_path, line_number, item_text)]}`.
 
-**Alternative (faster):** Instead of the Grep-based collection above, you can call the Python helper directly:
-
-```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, json
-sys.path.insert(0, "hooks")
-from open_item_dedup import collect_open_items
-items = collect_open_items(sys.argv[1], sys.argv[2], sys.argv[3])
-for f, l, t in items:
-    print(json.dumps({"file": f, "line": l, "text": t, "project": sys.argv[3]}))
-' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
-```
-
-This does the project match + section verification + item extraction in a single pass per file, avoiding the triple-Grep pattern.
+**Note:** For project-scoped collection (e.g. during cascade in Step 12.5), the Python helper `collect_open_items()` from `open_item_dedup` does single-pass extraction per file. It requires a `project` argument, so it's used per-project in the cascade step, not for the cross-project sweep in this step.
 
 ### Step 5 — Skip if zero items
 
@@ -199,15 +185,16 @@ For each project that had confirmed checkoffs, run:
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys
+import sys, json
 sys.path.insert(0, "hooks")
 from open_item_dedup import batch_cascade_checkoff
-summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:])
+items = json.loads(sys.argv[4])
+summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
 print(summary)
-' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "${CHECKED_ITEMS[@]}"
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$CHECKED_ITEMS_JSON"
 ```
 
-Where `${CHECKED_ITEMS[@]}` is the list of confirmed item texts for that project from Step 11. Include the cascade summary in the Step 13 report.
+Where `$CHECKED_ITEMS_JSON` is a JSON array of confirmed item texts for that project (e.g. `'["Fix bug #42", "Land PR #14"]'`). Construct it by JSON-encoding the list from Step 11. Include the cascade summary in the Step 13 report.
 
 ### Step 13 — Report
 

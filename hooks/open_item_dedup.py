@@ -154,9 +154,10 @@ def find_duplicates(
             continue
 
         # Tier 2: fuzzy token overlap (lower confidence)
+        # Use set intersection, not substring — avoids "fix" matching "prefix"
         if candidate_tokens:
-            item_cleaned = _strip_markdown(item_text).lower()
-            overlap = sum(1 for t in candidate_tokens if t in item_cleaned)
+            item_tokens = _tokenize(_strip_markdown(item_text))
+            overlap = len(candidate_tokens & item_tokens)
             if overlap >= threshold:
                 matches.append((fpath, line_num, item_text, "fuzzy"))
 
