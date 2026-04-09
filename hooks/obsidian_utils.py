@@ -650,8 +650,8 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
     if metadata.get("vault_path") and metadata.get("sessions_folder"):
         try:
             _hooks_dir = os.path.dirname(os.path.abspath(__file__))
-    if _hooks_dir not in sys.path:
-        sys.path.insert(0, _hooks_dir)
+            if _hooks_dir not in sys.path:
+                sys.path.insert(0, _hooks_dir)
             from open_item_dedup import collect_open_items
             existing_items = collect_open_items(
                 metadata["vault_path"],

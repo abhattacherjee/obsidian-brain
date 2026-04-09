@@ -253,9 +253,14 @@ def dedup_note_open_items(
         prefix='.ob-dedup-', suffix='.md.tmp', dir=note_dir,
     )
     try:
+        # Preserve original file permissions
+        try:
+            orig_mode = os.stat(note_path).st_mode
+        except OSError:
+            orig_mode = 0o644
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
-        os.chmod(tmp_path, 0o644)
+        os.chmod(tmp_path, orig_mode)
         os.replace(tmp_path, note_path)
     except OSError as exc:
         print(f"[obsidian-brain] dedup: atomic write failed for {note_path}: {exc}", file=sys.stderr)
@@ -342,9 +347,14 @@ def batch_cascade_checkoff(
                 prefix='.ob-cascade-', suffix='.md.tmp', dir=note_dir,
             )
             try:
+                # Preserve original file permissions
+                try:
+                    orig_mode = os.stat(fpath).st_mode
+                except OSError:
+                    orig_mode = 0o644
                 with os.fdopen(fd, 'w', encoding='utf-8') as f:
                     f.writelines(lines)
-                os.chmod(tmp_path, 0o644)
+                os.chmod(tmp_path, orig_mode)
                 os.replace(tmp_path, fpath)
                 edited_files.add(os.path.basename(fpath))
                 edited_count += file_edit_count  # count only after successful write
