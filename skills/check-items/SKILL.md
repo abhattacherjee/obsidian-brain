@@ -20,14 +20,23 @@ Follow these steps exactly. Do not skip steps or reorder them.
 Run:
 
 ```bash
-cat ~/.claude/obsidian-brain-config.json
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys
+sys.path.insert(0, "hooks")
+from obsidian_utils import load_config
+c = load_config()
+print(f"VAULT={c[\"vault_path\"]} SESS={c.get(\"sessions_folder\",\"claude-sessions\")} INS={c.get(\"insights_folder\",\"claude-insights\")}")
+'
 ```
 
-If the file does not exist or is not valid JSON, tell the user:
+Parse the output line to extract `VAULT_PATH`, `SESSIONS_FOLDER`, and `INSIGHTS_FOLDER`.
+
+If the output is empty or errors, tell the user:
 
 > Config not found. Run `/obsidian-setup` first to configure your Obsidian vault.
 
-Stop here if config is missing. Otherwise extract `vault_path` and `sessions_folder` (default `claude-sessions`). Store as `VAULT_PATH` and `SESSIONS_FOLDER`.
+Stop here if config is missing.
 
 ### Step 2 — Validate vault access
 
