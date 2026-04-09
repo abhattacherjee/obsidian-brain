@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from open_item_dedup import collect_open_items, find_duplicates
 
 # ---------------------------------------------------------------------------
 # Default configuration
@@ -312,6 +313,47 @@ def _extract_errors(messages: list[dict]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _dedup_summary_open_items(summary_text: str, existing_items: list) -> str:
+    """Remove duplicate open items from AI-generated summary text.
+
+    Operates on the string before disk write. Uses find_duplicates()
+    for matching — same logic as dedup_note_open_items() but on a string.
+    """
+    # Find the ## Open Questions / Next Steps section
+    pattern = r'(## Open Questions / Next Steps\n)(.*?)(?=\n## |\Z)'
+    match = re.search(pattern, summary_text, re.DOTALL)
+    if not match:
+        return summary_text
+
+    section_header = match.group(1)
+    section_body = match.group(2)
+
+    # Parse individual - [ ] items
+    lines = section_body.split('\n')
+    kept_lines: list[str] = []
+    removed = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('- [ ] '):
+            item_text = stripped[6:]
+            dupes = find_duplicates(item_text, existing_items)
+            if dupes:
+                removed = True
+                continue  # drop this line
+        kept_lines.append(line)
+
+    if not removed:
+        return summary_text
+
+    new_body = '\n'.join(kept_lines)
+    # If all items removed, add placeholder
+    if not any(l.strip().startswith('- [ ]') for l in kept_lines):
+        new_body = 'None new. (See earlier sessions for tracked items.)\n'
+
+    return summary_text[:match.start()] + section_header + new_body + summary_text[match.end():]
+
+
 def generate_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
@@ -377,6 +419,27 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
 - [ ] Checkbox list of unresolved items. Write "None." if none.
 """
 
+    # Layer 1: Append existing open items to prevent AI duplication
+    existing_items = []
+    if metadata.get("vault_path") and metadata.get("sessions_folder"):
+        try:
+            existing_items = collect_open_items(
+                metadata["vault_path"],
+                metadata["sessions_folder"],
+                metadata.get("project", "unknown"),
+                max_sessions=10,
+            )
+        except Exception:
+            pass  # best-effort; don't block summarization
+
+    if existing_items:
+        prompt += "\n\n## Existing Open Items for This Project (DO NOT DUPLICATE)\n"
+        prompt += "The following items are already tracked in older session notes. Do NOT include any item\n"
+        prompt += "that is semantically equivalent to these — same PR, same branch, same task, same file.\n"
+        prompt += "Only add genuinely NEW open items from this session's conversation.\n\n"
+        for _, _, item_text in existing_items:
+            prompt += f"- {item_text}\n"
+
     try:
         result = subprocess.run(
             ["claude", "-p", "--model", model],
@@ -386,7 +449,11 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
             timeout=timeout,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
+            summary_text = result.stdout.strip()
+            # Layer 2: Post-generation dedup pass (string-based, pre-write)
+            if existing_items:
+                summary_text = _dedup_summary_open_items(summary_text, existing_items)
+            return summary_text
         print(
             f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
             f"{result.stderr[:200]}",
