@@ -1419,7 +1419,7 @@ def upgrade_note_with_summary(
         warnings = []
 
     if "## Summary" not in summary_text:
-        return f"Failed: sub-agent returned malformed summary (no ## Summary section) for {os.path.basename(note_path)}"
+        return f"Failed: malformed summary (no ## Summary section) from {source} for {os.path.basename(note_path)}"
 
     # Read the raw note
     try:
