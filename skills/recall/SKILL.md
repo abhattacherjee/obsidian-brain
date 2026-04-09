@@ -115,7 +115,10 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    })
    ```
 
-   Spawn all failed notes' sub-agents in a single message (parallel). When each returns, pass its output to the Python pipeline:
+   Invoke multiple Agent tool calls in the same response turn (one per failed note) so they run in parallel. When each sub-agent returns its structured summary text:
+
+   - If the sub-agent returned an error or empty output, skip that note — log the failure and continue.
+   - Otherwise, pass the returned summary text to the Python pipeline via a heredoc. The Agent tool's return value is text in your context — write it into the heredoc verbatim:
 
    ```bash
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -127,11 +130,12 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    status = upgrade_note_with_summary(sys.argv[1], summary, sys.argv[2], sys.argv[3], sys.argv[4])
    print(status)
    ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" <<'SUMMARY_EOF'
-   <paste sub-agent output here>
+   ## Summary
+   ...the sub-agent's returned markdown sections go here verbatim...
    SUMMARY_EOF
    ```
 
-   Report each result. If the sub-agent also fails (error or malformed summary), note the failure but continue — the note stays unsummarized for the next `/recall`.
+   Report each result. If the pipeline returns "Failed:", note it but continue — the note stays unsummarized for the next `/recall`.
 
 If no unsummarized notes are found for this project, skip to Step 4.
 
