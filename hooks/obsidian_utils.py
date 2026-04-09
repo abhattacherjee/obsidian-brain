@@ -305,13 +305,20 @@ def match_items_against_evidence(
     Returns [{"file": f, "line": l, "text": t, "evidence": snippet, "confidence": score}]
     for items that appear to be completed based on the evidence.
     """
-    _hooks_dir = os.path.dirname(os.path.abspath(__file__))
-    if _hooks_dir not in sys.path:
-        sys.path.insert(0, _hooks_dir)
-    from open_item_dedup import (
-        _strip_markdown, _extract_distinctive_tokens, _tokenize,
-        _COMPLETION_PHRASES,
-    )
+    try:
+        _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+        if _hooks_dir not in sys.path:
+            sys.path.insert(0, _hooks_dir)
+        from open_item_dedup import (
+            _strip_markdown, _extract_distinctive_tokens, _tokenize,
+            _COMPLETION_PHRASES,
+        )
+    except ImportError as exc:
+        print(f"[obsidian-brain] match_items: import failed: {exc}", file=sys.stderr)
+        return []
+
+    if not evidence_text.strip():
+        return []
 
     evidence_lower = evidence_text.lower()
     candidates: list[dict] = []
@@ -1510,12 +1517,19 @@ def upgrade_unsummarized_note(
             else:
                 new_lines.append(line)
 
+    if frontmatter_end == 0:
+        return f"Failed: malformed frontmatter in {os.path.basename(note_path)} (missing closing ---)"
+
     # Add title from original
+    title_found = False
     for line in raw_lines[frontmatter_end:]:
         if line.strip().startswith('# '):
             new_lines.append('\n')
             new_lines.append(line)
+            title_found = True
             break
+    if not title_found:
+        new_lines.append('\n# Untitled Session\n')
 
     # Add warnings if any
     if warnings:
@@ -1560,12 +1574,16 @@ def upgrade_unsummarized_note(
             pass
         return f"Failed: atomic write error for {os.path.basename(note_path)}: {exc}"
 
-    # Run dedup pass
-    _hooks_dir = os.path.dirname(os.path.abspath(__file__))
-    if _hooks_dir not in sys.path:
-        sys.path.insert(0, _hooks_dir)
-    from open_item_dedup import dedup_note_open_items
-    removed = dedup_note_open_items(vault_path, sessions_folder, project, note_path)
+    # Run dedup pass (non-fatal — note is already upgraded)
+    removed = []
+    try:
+        _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+        if _hooks_dir not in sys.path:
+            sys.path.insert(0, _hooks_dir)
+        from open_item_dedup import dedup_note_open_items
+        removed = dedup_note_open_items(vault_path, sessions_folder, project, note_path)
+    except Exception as exc:
+        print(f"[obsidian-brain] dedup failed (non-fatal, note already upgraded): {exc}", file=sys.stderr)
 
     # Build status
     status = f"Upgraded {os.path.basename(note_path)} (source: {source})"

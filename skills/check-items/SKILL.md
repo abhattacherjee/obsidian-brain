@@ -26,6 +26,9 @@ import sys
 sys.path.insert(0, "hooks")
 from obsidian_utils import load_config
 c = load_config()
+if not c.get("vault_path"):
+    print("ERROR: vault_path not configured", file=sys.stderr)
+    sys.exit(1)
 print(f"VAULT={c[\"vault_path\"]} SESS={c.get(\"sessions_folder\",\"claude-sessions\")} INS={c.get(\"insights_folder\",\"claude-insights\")}")
 '
 ```

@@ -26,6 +26,9 @@ import sys
 sys.path.insert(0, "hooks")
 from obsidian_utils import load_config
 c = load_config()
+if not c.get("vault_path"):
+    print("ERROR: vault_path not configured", file=sys.stderr)
+    sys.exit(1)
 print(f"VAULT={c[\"vault_path\"]} SESS={c.get(\"sessions_folder\",\"claude-sessions\")} INS={c.get(\"insights_folder\",\"claude-insights\")}")
 '
 ```
@@ -196,8 +199,12 @@ After presenting the context brief, scan the loaded context for evidence that an
    vault_path, sessions_folder, project = sys.argv[1], sys.argv[2], sys.argv[3]
    evidence_file = sys.argv[4]
 
-   with open(evidence_file, "r") as f:
-       evidence = f.read()
+   try:
+       with open(evidence_file, "r") as f:
+           evidence = f.read()
+   except OSError as exc:
+       print("NO_CANDIDATES")
+       sys.exit(0)
 
    items = collect_open_items(vault_path, sessions_folder, project)
    if not items:
