@@ -293,6 +293,99 @@ def read_note_metadata(file_path: str) -> dict | None:
     return meta
 
 
+def match_items_against_evidence(
+    evidence_text: str,
+    open_items: list[tuple[str, int, str]],
+) -> list[dict]:
+    """Match open items against evidence prose for completion detection.
+
+    Different from find_duplicates() — this matches items (short checkbox
+    lines) against free-form text (summaries, changelogs, commit messages).
+
+    Returns [{"file": f, "line": l, "text": t, "evidence": snippet, "confidence": score}]
+    for items that appear to be completed based on the evidence.
+    """
+    _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+    if _hooks_dir not in sys.path:
+        sys.path.insert(0, _hooks_dir)
+    from open_item_dedup import (
+        _strip_markdown, _extract_distinctive_tokens, _tokenize,
+        _COMPLETION_PHRASES,
+    )
+
+    evidence_lower = evidence_text.lower()
+    candidates: list[dict] = []
+
+    for fpath, line_num, item_text in open_items:
+        cleaned = _strip_markdown(item_text)
+        distinctive = _extract_distinctive_tokens(cleaned)
+        tokens = _tokenize(cleaned)
+
+        # Score: distinctive tokens get higher weight
+        score = 0
+        best_match_pos = -1
+
+        # Check distinctive tokens
+        for dt in distinctive:
+            dt_lower = dt.lower()
+            pos = evidence_lower.find(dt_lower)
+            if pos >= 0:
+                score += 3
+                if best_match_pos < 0:
+                    best_match_pos = pos
+
+        # Check regular tokens (3+ chars)
+        matched_tokens = 0
+        for t in tokens:
+            pos = evidence_lower.find(t)
+            if pos >= 0:
+                matched_tokens += 1
+                if best_match_pos < 0:
+                    best_match_pos = pos
+
+        score += matched_tokens
+
+        # Minimum threshold: 3+ token matches, or any distinctive token match
+        if score < 3:
+            continue
+
+        # Completion phrase boost: look for phrases near matched tokens
+        has_completion_phrase = False
+        if best_match_pos >= 0:
+            window_start = max(0, best_match_pos - 100)
+            window_end = min(len(evidence_lower), best_match_pos + 100)
+            window = evidence_lower[window_start:window_end]
+            for phrase in _COMPLETION_PHRASES:
+                if phrase in window:
+                    has_completion_phrase = True
+                    score += 2
+                    break
+
+        # Extract evidence snippet (~60 chars around best match)
+        snippet = ""
+        if best_match_pos >= 0:
+            start = max(0, best_match_pos - 30)
+            end = min(len(evidence_text), best_match_pos + 30)
+            snippet = evidence_text[start:end].strip()
+            if start > 0:
+                snippet = "..." + snippet
+            if end < len(evidence_text):
+                snippet = snippet + "..."
+
+        candidates.append({
+            "file": fpath,
+            "line": line_num,
+            "text": item_text,
+            "evidence": snippet,
+            "confidence": score,
+            "has_completion_phrase": has_completion_phrase,
+        })
+
+    # Sort by confidence descending
+    candidates.sort(key=lambda c: c["confidence"], reverse=True)
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # Transcript parsing
 # ---------------------------------------------------------------------------
