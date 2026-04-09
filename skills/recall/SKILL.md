@@ -174,36 +174,42 @@ If unsummarized notes were upgraded in Step 3, also mention:
 
 After presenting the context brief, scan the loaded context for evidence that any open items have been completed.
 
-1. **Collect open items for the current project.** **Re-use the project-scoped file list from Step 4** (the result of Search A — sessions matching `project: $PROJECT`). For each file in that list, run a per-file Grep:
+1. **Match open items against evidence in Python.** Run a single Bash call that collects open items and matches them against the most recent session note:
 
-```
-pattern: ^- \[ \] 
-path: <each session file from Step 4>
-output_mode: content
--n: true
-```
+   ```bash
+   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+   python3 -c '
+   import sys, json
+   sys.path.insert(0, "hooks")
+   from obsidian_utils import match_items_against_evidence
+   from open_item_dedup import collect_open_items
 
-This avoids an O(vault size) Grep across the entire sessions folder — we already have the project-scoped file list and reuse it directly.
+   vault_path, sessions_folder, project = sys.argv[1], sys.argv[2], sys.argv[3]
+   evidence_file = sys.argv[4]
 
-For each match, extract `(file_path, line_number, item_text)` tuples for items appearing under a `## Open Questions / Next Steps` section. To verify the section context, read 30 lines before each match and confirm the most recent `## ` heading is `## Open Questions / Next Steps`.
+   with open(evidence_file, "r") as f:
+       evidence = f.read()
 
-2. **Skip if zero open items.** If no items found, skip to Step 8 silently.
+   items = collect_open_items(vault_path, sessions_folder, project)
+   if not items:
+       print("NO_ITEMS")
+       sys.exit(0)
 
-3. **Use loaded context as evidence pool.** The most recent session was already read in full during Step 5. Concatenate the text of its `## Summary`, `## Changes Made`, and `## Errors Encountered` sections — store as `EVIDENCE_TEXT`.
+   candidates = match_items_against_evidence(evidence, items)
+   if not candidates:
+       print("NO_CANDIDATES")
+   else:
+       print(json.dumps(candidates))
+   ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$MOST_RECENT_SESSION_PATH"
+   ```
 
-4. **Match items to evidence.** For each open item:
-   - **Tokenize** the item text into words, lowercase, drop common stopwords (`the`, `a`, `an`, `to`, `for`, `in`, `on`, `of`, `and`, `or`, `but`, `is`, `are`, `was`, `were`, `be`).
-   - **Substring match:** Count how many tokens (3+ characters) appear as substrings in `EVIDENCE_TEXT` (also lowercased). If count >= 3, mark as candidate.
-   - **Distinctive token match:** If the item contains any of these distinctive tokens and they appear in evidence, mark as candidate even if substring count < 3:
-     - File paths (contains `/` or `.py`/`.md`/`.json`/`.ts`/`.js`/`.tsx`/`.jsx`)
-     - PR/issue references (matches `#\d+` or `PR \d+` or `issue \d+`)
-     - Branch names (contains `feature/` or `release/` or `hotfix/`)
-     - Version numbers (matches `v?\d+\.\d+\.\d+`)
-   - **Completion phrase boost:** If a completion phrase (`merged`, `shipped`, `fixed`, `released`, `closed`, `removed`, `implemented`, `deleted`, `done`, `completed`) appears within 200 characters of any matched token in evidence, increase confidence.
+   Where `$MOST_RECENT_SESSION_PATH` is the path to the most recent session note (already read in Step 5).
 
-5. **Skip if no candidates.** Fast path: if zero items match, skip to Step 8.
+2. **Skip if no candidates.** If the output is `NO_ITEMS` or `NO_CANDIDATES`, skip to Step 8 silently.
 
-6. **Present candidates to user.** Print:
+3. **Parse candidates.** The JSON array contains objects with `file`, `line`, `text`, `evidence`, `confidence`, `has_completion_phrase`. Only present items with `confidence >= 3` to the user.
+
+4. **Present candidates to user.** Print:
 
 ```
 I noticed these open items may now be done:
@@ -218,24 +224,24 @@ I noticed these open items may now be done:
 Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
 ```
 
-7. **Wait for user response.** Parse the response:
+5. **Wait for user response.** Parse the response:
    - `none` or empty → skip checkoff entirely, proceed to Step 8
    - `all` → check off all candidates
    - Comma-separated numbers (e.g. `1,3`) → check off only those
 
-8. **For each confirmed checkoff, edit the source file.** Use Read to load the full source file. Find the exact line containing `- [ ] <item text>`. Replace it with `- [x] <item text>`. Use the Edit tool with `replace_all: false` and provide enough context (the full line plus the line before and after if available) to ensure uniqueness within the file. If the line is ambiguous (multiple matches), skip that item and warn:
+6. **For each confirmed checkoff, edit the source file.** Use Read to load the full source file. Find the exact line containing `- [ ] <item text>`. Replace it with `- [x] <item text>`. Use the Edit tool with `replace_all: false` and provide enough context (the full line plus the line before and after if available) to ensure uniqueness within the file. If the line is ambiguous (multiple matches), skip that item and warn:
 
 ```
 ⚠️  Could not check off item "<item text>" — line is not unique in <file>. Edit manually in Obsidian.
 ```
 
-9. **Confirm checkoffs to user.** Print:
+7. **Confirm checkoffs to user.** Print:
 
 ```
 ✅ Checked off N item(s) across <list of files>.
 ```
 
-10. **Cascade check-offs to duplicate items in older notes.** Run a single Bash call that collects, matches, and edits files in Python:
+8. **Cascade check-offs to duplicate items in older notes.** Run a single Bash call that collects, matches, and edits files in Python:
 
     ```bash
     cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -249,7 +255,7 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
     ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$CHECKED_ITEMS_JSON"
     ```
 
-    Before running, construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts from sub-step 7. Use a Bash heredoc or inline Python to build it:
+    Before running, construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts from sub-step 5. Use a Bash heredoc or inline Python to build it:
     ```bash
     CHECKED_ITEMS_JSON=$(python3 -c "import json; print(json.dumps([\"Git-flow migration spec pending\", \"Land PR #14\"]))")
     ```
