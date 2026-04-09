@@ -1385,3 +1385,189 @@ def is_resumed_session(
     for _ in sessions_dir.glob(f"*-{h}.md"):
         return True
     return False
+
+
+def upgrade_unsummarized_note(
+    note_path: str,
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+    summary_model: str = "haiku",
+    summary_timeout: int = 15,
+) -> str:
+    """Upgrade an unsummarized session note with an AI summary.
+
+    Orchestrates: find JSONL → parse transcript → decide source →
+    generate summary → dedup open items → atomic write.
+
+    Returns a one-line status string for the model to relay.
+    """
+    # Read the raw note
+    try:
+        with open(note_path, 'r', encoding='utf-8') as f:
+            raw_lines = f.readlines()
+    except OSError as exc:
+        return f"Failed: cannot read {os.path.basename(note_path)}: {exc}"
+
+    # Extract session_id from frontmatter
+    session_id = None
+    for line in raw_lines[:20]:
+        stripped = line.strip()
+        if stripped.startswith('session_id:'):
+            session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+            break
+    if not session_id:
+        return f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}"
+
+    # Find and parse the JSONL transcript
+    jsonl_path = find_transcript_jsonl(session_id)
+    warnings: list[str] = []
+    user_msgs: list[str] = []
+    assistant_msgs: list[str] = []
+    source = "raw note"
+
+    if jsonl_path:
+        parsed = parse_full_transcript(jsonl_path)
+        user_msgs = parsed.get("user_msgs", [])
+        assistant_msgs = parsed.get("assistant_msgs", [])
+        warnings = parsed.get("warnings", [])
+
+        # Decide which source to use
+        raw_note_would_truncate = parsed.get("raw_note_would_truncate", False)
+        truncated = parsed.get("truncated", False)
+
+        if raw_note_would_truncate or truncated:
+            source = "JSONL transcript"
+            if truncated:
+                source += " (head+tail, middle truncated)"
+        else:
+            source = "raw note (JSONL available but not needed)"
+    else:
+        # Fall back to raw note content for summarization
+        source = "raw note (JSONL not found)"
+        # Extract user/assistant messages from raw note conversation section
+        in_conversation = False
+        for line in raw_lines:
+            stripped = line.strip()
+            if stripped == '## Conversation (raw)':
+                in_conversation = True
+                continue
+            if in_conversation:
+                if stripped.startswith('## '):
+                    break
+                if stripped.startswith('**User:**'):
+                    user_msgs.append(stripped[9:].strip())
+                elif stripped.startswith('**Assistant:**'):
+                    assistant_msgs.append(stripped[14:].strip())
+
+    if not user_msgs and not assistant_msgs:
+        return f"Failed: no conversation content in {os.path.basename(note_path)}"
+
+    # Build metadata for generate_summary
+    metadata: dict = {"project": project, "vault_path": vault_path, "sessions_folder": sessions_folder}
+    for line in raw_lines[:20]:
+        stripped = line.strip()
+        if stripped.startswith('git_branch:'):
+            metadata["git_branch"] = stripped.split(':', 1)[1].strip().strip('"')
+        elif stripped.startswith('duration_minutes:'):
+            try:
+                metadata["duration_minutes"] = float(stripped.split(':', 1)[1].strip())
+            except ValueError:
+                pass
+
+    # Generate summary
+    summary_text = generate_summary(
+        user_msgs, assistant_msgs, metadata,
+        model=summary_model, timeout=summary_timeout,
+    )
+
+    if not summary_text:
+        return f"Failed: AI summarization returned empty for {os.path.basename(note_path)}"
+
+    # Build upgraded note: original frontmatter + new summary + original audit trail
+    new_lines: list[str] = []
+
+    # Copy frontmatter, flipping status
+    past_first_marker = False
+    frontmatter_end = 0
+    for i, line in enumerate(raw_lines):
+        if line.strip() == '---':
+            if not past_first_marker:
+                past_first_marker = True
+                new_lines.append(line)
+                continue
+            else:
+                # End of frontmatter
+                new_lines.append(line)
+                frontmatter_end = i + 1
+                break
+        if past_first_marker:
+            if line.strip().startswith('status:'):
+                new_lines.append(line.replace('auto-logged', 'summarized'))
+            else:
+                new_lines.append(line)
+
+    # Add title from original
+    for line in raw_lines[frontmatter_end:]:
+        if line.strip().startswith('# '):
+            new_lines.append('\n')
+            new_lines.append(line)
+            break
+
+    # Add warnings if any
+    if warnings:
+        new_lines.append('\n## ⚠️ Transcript re-parse warnings\n')
+        for w in warnings:
+            new_lines.append(f'- {w}\n')
+
+    # Add summary sections
+    new_lines.append('\n')
+    new_lines.append(summary_text + '\n')
+
+    # Add source note
+    new_lines.append(f'\n_(Summary source: {source})_\n')
+
+    # Preserve original audit trail sections
+    in_audit = False
+    for line in raw_lines:
+        stripped = line.strip()
+        if stripped.startswith('## Tool Usage') or stripped.startswith('## Errors Encountered') or \
+           stripped.startswith('## Conversation (raw)') or stripped.startswith('## Session Metadata') or \
+           stripped.startswith('## Files Touched'):
+            in_audit = True
+        if in_audit:
+            new_lines.append(line)
+
+    # Atomic write
+    note_dir = os.path.dirname(note_path)
+    fd, tmp_path = tempfile.mkstemp(prefix='.ob-upgrade-', suffix='.md.tmp', dir=note_dir)
+    try:
+        try:
+            orig_mode = os.stat(note_path).st_mode
+        except OSError:
+            orig_mode = 0o644
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+        os.chmod(tmp_path, orig_mode)
+        os.replace(tmp_path, note_path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return f"Failed: atomic write error for {os.path.basename(note_path)}: {exc}"
+
+    # Run dedup pass
+    _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+    if _hooks_dir not in sys.path:
+        sys.path.insert(0, _hooks_dir)
+    from open_item_dedup import dedup_note_open_items
+    removed = dedup_note_open_items(vault_path, sessions_folder, project, note_path)
+
+    # Build status
+    status = f"Upgraded {os.path.basename(note_path)} (source: {source})"
+    if removed:
+        status += f", deduped {len(removed)} item(s)"
+    if warnings:
+        status += f", {len(warnings)} warning(s)"
+    return status
