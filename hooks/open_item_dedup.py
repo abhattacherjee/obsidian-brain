@@ -14,7 +14,7 @@ import tempfile
 
 # --- Module-level compiled regexes (computed once at import) ---
 
-_RE_FILE_PATH = re.compile(r'[\w./]+\.(py|md|json|ts|js|tsx|jsx)')
+_RE_FILE_PATH = re.compile(r'[\w./-]+\.(py|md|json|ts|js|tsx|jsx)')
 _RE_PR_REF = re.compile(r'#\d+|PR\s+\d+|issue\s+\d+', re.IGNORECASE)
 _RE_BRANCH = re.compile(r'(?:feature|release|hotfix)/[\w.-]+')
 _RE_VERSION = re.compile(r'v?\d+\.\d+\.\d+')
@@ -256,7 +256,7 @@ def dedup_note_open_items(
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
         os.chmod(tmp_path, 0o644)
-        os.rename(tmp_path, note_path)
+        os.replace(tmp_path, note_path)
     except OSError as exc:
         print(f"[obsidian-brain] dedup: atomic write failed for {note_path}: {exc}", file=sys.stderr)
         try:
@@ -345,7 +345,7 @@ def batch_cascade_checkoff(
                 with os.fdopen(fd, 'w', encoding='utf-8') as f:
                     f.writelines(lines)
                 os.chmod(tmp_path, 0o644)
-                os.rename(tmp_path, fpath)
+                os.replace(tmp_path, fpath)
                 edited_files.add(os.path.basename(fpath))
                 edited_count += file_edit_count  # count only after successful write
             except OSError as exc:

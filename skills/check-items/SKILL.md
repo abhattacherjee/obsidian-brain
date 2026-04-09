@@ -191,7 +191,7 @@ from open_item_dedup import batch_cascade_checkoff
 items = json.loads(sys.argv[4])
 summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
 print(summary)
-' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$CHECKED_ITEMS_JSON"
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT_NAME" "$CHECKED_ITEMS_JSON"
 ```
 
 Where `$CHECKED_ITEMS_JSON` is a JSON array of confirmed item texts for that project (e.g. `'["Fix bug #42", "Land PR #14"]'`). Construct it by JSON-encoding the list from Step 11. Include the cascade summary in the Step 13 report.

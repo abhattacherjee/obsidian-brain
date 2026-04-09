@@ -95,7 +95,7 @@ def cache_set(session_id: str, key: str, value) -> None:
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(data, f)
-        os.rename(tmp, cache_path)
+        os.replace(tmp, cache_path)
     except OSError as exc:
         print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
         try:
@@ -127,7 +127,7 @@ def cache_invalidate(session_id: str, *keys: str) -> None:
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(data, f)
-        os.rename(tmp, cache_path)
+        os.replace(tmp, cache_path)
     except OSError:
         try:
             os.unlink(tmp)
@@ -206,7 +206,9 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     {session_id: 'unknown', hash: '', project: <cwd basename>, session_note_name: ''}.
     """
     sid = _get_session_id_fast()
-    cached = cache_get(sid, "session_context")
+    # Include args in cache key so different call signatures don't collide
+    cache_key = f"session_context:{vault_path or ''}:{sessions_folder or ''}"
+    cached = cache_get(sid, cache_key)
     if cached is not None:
         return cached
 
@@ -232,7 +234,7 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
         session_note_name = f"{date.today().isoformat()}-{project}-{h}"
 
     ctx = {"session_id": sid, "hash": h, "project": project, "session_note_name": session_note_name}
-    cache_set(sid, "session_context", ctx)
+    cache_set(sid, cache_key, ctx)
     return ctx
 
 
@@ -535,7 +537,9 @@ def _dedup_summary_open_items(summary_text: str, existing_items: list) -> str:
     for matching — same logic as dedup_note_open_items() but on a string.
     """
     # Lazy import to avoid top-level dependency on hooks/ being on sys.path
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+    if _hooks_dir not in sys.path:
+        sys.path.insert(0, _hooks_dir)
     from open_item_dedup import find_duplicates
 
     # Find the ## Open Questions / Next Steps section
@@ -645,7 +649,9 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
     existing_items = []
     if metadata.get("vault_path") and metadata.get("sessions_folder"):
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+    if _hooks_dir not in sys.path:
+        sys.path.insert(0, _hooks_dir)
             from open_item_dedup import collect_open_items
             existing_items = collect_open_items(
                 metadata["vault_path"],
