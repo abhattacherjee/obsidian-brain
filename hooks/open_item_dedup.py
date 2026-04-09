@@ -51,3 +51,73 @@ def _tokenize(text: str) -> set[str]:
     """Lowercase, split, drop stopwords, keep tokens >= 3 chars."""
     words = re.findall(r'[a-z0-9][-a-z0-9/.#]*[a-z0-9]|[a-z0-9]', text.lower())
     return {w for w in words if len(w) >= 3 and w not in _STOPWORDS}
+
+
+def collect_open_items(
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+    max_sessions: int = 10,
+    exclude_path: str | None = None,
+) -> list[tuple[str, int, str]]:
+    """Collect unchecked open items from recent session notes for a project.
+
+    Returns [(file_path, line_number, item_text)] from the most recent
+    max_sessions session notes matching the project. Single-pass per file,
+    early termination, no stat() calls.
+    """
+    sessions_dir = os.path.join(vault_path, sessions_folder)
+    if not os.path.isdir(sessions_dir):
+        return []
+
+    # listdir + reverse sort = newest first (filenames are YYYY-MM-DD-*)
+    all_files = sorted(os.listdir(sessions_dir), reverse=True)
+
+    results: list[tuple[str, int, str]] = []
+    matched = 0
+
+    for fname in all_files:
+        if not fname.endswith('.md') or fname.endswith('-snapshot.md'):
+            continue
+
+        fpath = os.path.join(sessions_dir, fname)
+        if exclude_path and os.path.abspath(fpath) == os.path.abspath(exclude_path):
+            continue
+
+        # Single-pass: read file once, check project in frontmatter,
+        # then extract open items from ## Open Questions / Next Steps
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+
+        # Check frontmatter for project match (first 20 lines)
+        project_match = False
+        for line in lines[:20]:
+            if line.strip() == f'project: {project}':
+                project_match = True
+                break
+        if not project_match:
+            continue
+
+        matched += 1
+
+        # Find ## Open Questions / Next Steps and collect - [ ] items
+        in_section = False
+        for line_num, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped == '## Open Questions / Next Steps':
+                in_section = True
+                continue
+            if in_section:
+                if stripped.startswith('## '):
+                    break  # next section
+                if stripped.startswith('- [ ] '):
+                    item_text = stripped[6:]  # after "- [ ] "
+                    results.append((fpath, line_num, item_text))
+
+        if matched >= max_sessions:
+            break
+
+    return results
