@@ -161,7 +161,16 @@ _DEFAULTS: dict = {
 
 
 def load_config() -> dict:
-    """Read ~/.claude/obsidian-brain-config.json, returning defaults for missing keys."""
+    """Read ~/.claude/obsidian-brain-config.json, returning defaults for missing keys.
+
+    Session-scoped caching: first call loads from disk and writes to cache;
+    subsequent calls within the same session hit the cache.
+    """
+    sid = _get_session_id_fast()
+    cached = cache_get(sid, "config")
+    if cached is not None:
+        return cached
+
     config = dict(_DEFAULTS)
     try:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as fh:
@@ -178,7 +187,100 @@ def load_config() -> dict:
             f"[obsidian-brain] error reading config: {exc}, using defaults",
             file=sys.stderr,
         )
+
+    cache_set(sid, "config", config)
     return config
+
+
+def get_session_context(vault_path: str = None, sessions_folder: str = None) -> dict:
+    """Get session ID, hash, project, and session note name. Cached.
+
+    Returns {session_id, hash, project, session_note_name} or
+    {session_id: 'unknown', hash: '', project: <cwd basename>, session_note_name: ''}.
+    """
+    sid = _get_session_id_fast()
+    cached = cache_get(sid, "session_context")
+    if cached is not None:
+        return cached
+
+    project = os.path.basename(os.getcwd()).lower().replace(' ', '-')
+    if sid == "unknown":
+        ctx = {"session_id": "unknown", "hash": "", "project": project, "session_note_name": ""}
+        cache_set(sid, "session_context", ctx)
+        return ctx
+
+    h = hashlib.sha256(sid.encode()).hexdigest()[:4]
+
+    session_note_name = ""
+    if vault_path and sessions_folder:
+        sessions_dir = os.path.join(vault_path, sessions_folder)
+        if os.path.isdir(sessions_dir):
+            for fname in os.listdir(sessions_dir):
+                if fname.endswith(f'-{h}.md'):
+                    session_note_name = fname[:-3]  # strip .md
+                    break
+
+    # If not found, construct expected name
+    if not session_note_name:
+        from datetime import date
+        session_note_name = f"{date.today().isoformat()}-{project}-{h}"
+
+    ctx = {"session_id": sid, "hash": h, "project": project, "session_note_name": session_note_name}
+    cache_set(sid, "session_context", ctx)
+    return ctx
+
+
+def read_note_metadata(file_path: str) -> dict | None:
+    """Parse YAML frontmatter from a vault note. Returns dict or None.
+
+    Reads first 40 lines, extracts fields between --- markers.
+    Cached per file path within the session.
+    """
+    sid = _get_session_id_fast()
+    cache_key = f"metadata:{file_path}"
+    cached = cache_get(sid, cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = []
+            for i, line in enumerate(f):
+                if i >= 40:
+                    break
+                lines.append(line)
+    except OSError:
+        return None
+
+    if not lines or lines[0].strip() != '---':
+        return None
+
+    meta: dict = {}
+    tags: list[str] = []
+    in_tags = False
+
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == '---':
+            break
+        if stripped.startswith('- ') and in_tags:
+            tags.append(stripped[2:].strip())
+            continue
+        in_tags = False
+        if ':' in stripped:
+            key, _, val = stripped.partition(':')
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key == 'tags':
+                in_tags = True
+                continue
+            meta[key] = val
+
+    if tags:
+        meta['tags'] = tags
+
+    cache_set(sid, cache_key, meta)
+    return meta
 
 
 # ---------------------------------------------------------------------------
