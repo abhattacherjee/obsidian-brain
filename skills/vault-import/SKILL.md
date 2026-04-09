@@ -40,7 +40,7 @@ print(f"VAULT={c[\"vault_path\"]} SESS={c.get(\"sessions_folder\",\"claude-sessi
 
 Parse the output line to extract `VAULT_PATH`, `SESSIONS_FOLDER`, and `INSIGHTS_FOLDER`.
 
-If the file does not exist or is invalid JSON, tell the user:
+If the command exits non-zero or prints ERROR, tell the user:
 
 > Config not found. Please run `/obsidian-setup` first to configure your Obsidian vault.
 
