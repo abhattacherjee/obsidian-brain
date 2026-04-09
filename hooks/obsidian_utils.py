@@ -1432,6 +1432,7 @@ def upgrade_unsummarized_note(
 
     # Find and parse the JSONL transcript
     jsonl_path = find_transcript_jsonl(session_id)
+    parsed: dict = {}
     warnings: list[str] = []
     user_msgs: list[str] = []
     assistant_msgs: list[str] = []
