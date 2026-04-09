@@ -103,7 +103,7 @@ sys.path.insert(0, "hooks")
 from obsidian_utils import load_config, get_session_context
 c = load_config()
 ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
-print(f"SID={ctx[\"session_id\"]} HASH={ctx[\"hash\"]} PROJECT={ctx[\"project\"]} NOTE={ctx[\"session_note_name\"]}")
+print(f"SID={ctx[\"session_id\"]} HASH={ctx[\"hash\"]} PROJECT={ctx[\"project\"]} SESSION_NOTE={ctx[\"session_note_name\"]}")
 '
 ```
 

@@ -372,7 +372,7 @@ def match_items_against_evidence(
                         break
 
         # Extract evidence snippet (~60 chars around best match (first position)
-        best_match_pos = match_positions[0] if match_positions else -1
+        best_match_pos = min(match_positions) if match_positions else -1
         snippet = ""
         if best_match_pos >= 0:
             start = max(0, best_match_pos - 30)
@@ -1458,6 +1458,23 @@ def upgrade_unsummarized_note(
         # Fall back to raw note content for summarization
         source = "raw note (JSONL not found)"
         # Extract user/assistant messages from raw note conversation section
+        in_conversation = False
+        for line in raw_lines:
+            stripped = line.strip()
+            if stripped == '## Conversation (raw)':
+                in_conversation = True
+                continue
+            if in_conversation:
+                if stripped.startswith('## '):
+                    break
+                if stripped.startswith('**User:**'):
+                    user_msgs.append(stripped[9:].strip())
+                elif stripped.startswith('**Assistant:**'):
+                    assistant_msgs.append(stripped[14:].strip())
+
+    # Fall back to raw note if JSONL yielded empty messages (corrupted/empty JSONL)
+    if jsonl_path and not user_msgs and not assistant_msgs:
+        source = "raw note (JSONL found but empty)"
         in_conversation = False
         for line in raw_lines:
             stripped = line.strip()

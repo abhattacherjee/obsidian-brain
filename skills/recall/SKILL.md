@@ -201,7 +201,16 @@ After presenting the context brief, scan the loaded context for evidence that an
 
    try:
        with open(evidence_file, "r") as f:
-           evidence = f.read()
+           content = f.read()
+       # Extract only evidence sections (Summary, Changes, Errors) — exclude
+       # Open Questions to avoid self-matching open items as candidates
+       import re as _re
+       evidence_parts = []
+       for section in ["Summary", "Key Decisions", "Changes Made", "Errors Encountered"]:
+           m = _re.search(rf"## {section}\n(.*?)(?=\n## |\Z)", content, _re.DOTALL)
+           if m:
+               evidence_parts.append(m.group(1))
+       evidence = "\n".join(evidence_parts) if evidence_parts else content
    except OSError as exc:
        print("NO_CANDIDATES")
        sys.exit(0)
