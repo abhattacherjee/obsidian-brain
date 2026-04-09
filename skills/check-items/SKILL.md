@@ -91,6 +91,22 @@ For each valid item, extract:
 
 Build a map: `{project → [(file_path, line_number, item_text)]}`.
 
+**Alternative (faster):** Instead of the Grep-based collection above, you can call the Python helper directly:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys, json
+sys.path.insert(0, "hooks")
+from open_item_dedup import collect_open_items
+items = collect_open_items(sys.argv[1], sys.argv[2], sys.argv[3])
+for f, l, t in items:
+    print(json.dumps({"file": f, "line": l, "text": t, "project": sys.argv[3]}))
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
+```
+
+This does the project match + section verification + item extraction in a single pass per file, avoiding the triple-Grep pattern.
+
 ### Step 5 — Skip if zero items
 
 If the map is empty:
@@ -175,6 +191,23 @@ If the Edit fails because the line is not unique, retry with more context (inclu
 ```
 ⚠️  Could not check off "<item text>" in <basename> — line not unique. Edit manually in Obsidian.
 ```
+
+### Step 12.5 — Cascade check-offs to duplicate items
+
+For each project that had confirmed checkoffs, run:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys
+sys.path.insert(0, "hooks")
+from open_item_dedup import batch_cascade_checkoff
+summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:])
+print(summary)
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "${CHECKED_ITEMS[@]}"
+```
+
+Where `${CHECKED_ITEMS[@]}` is the list of confirmed item texts for that project from Step 11. Include the cascade summary in the Step 13 report.
 
 ### Step 13 — Report
 
