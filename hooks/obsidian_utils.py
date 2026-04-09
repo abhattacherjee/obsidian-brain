@@ -22,6 +22,112 @@ import sys
 import tempfile
 from pathlib import Path
 
+# --- Session-scoped cache ---
+# File-based cache at /tmp/.obsidian-brain-cache-{session_id}.json
+# Avoids repeated vault scans when multiple skills run in one session.
+
+_CACHE_PREFIX = '/tmp/.obsidian-brain-cache-'
+_BOOTSTRAP_PREFIX = '/tmp/.obsidian-brain-sid-'
+
+
+def _get_session_id_fast() -> str:
+    """Derive session ID, using bootstrap file for speed on repeat calls."""
+    project = os.path.basename(os.getcwd())
+    bootstrap = f"{_BOOTSTRAP_PREFIX}{project}"
+
+    # Try bootstrap file first (~0.1ms)
+    try:
+        with open(bootstrap, 'r') as f:
+            sid = f.read().strip()
+        if sid:
+            return sid
+    except OSError:
+        pass
+
+    # Fall back to ls -t (~5ms)
+    import glob as _glob
+    pattern = os.path.expanduser(f"~/.claude/projects/*{project}/*.jsonl")
+    matches = _glob.glob(pattern)
+    if not matches:
+        return "unknown"
+    newest = max(matches, key=os.path.getmtime)
+    sid = os.path.splitext(os.path.basename(newest))[0]
+
+    # Write bootstrap for next call
+    try:
+        with open(bootstrap, 'w') as f:
+            f.write(sid)
+    except OSError:
+        pass
+
+    return sid
+
+
+def cache_get(session_id: str, key: str):
+    """Read a key from the session cache. Returns None on miss."""
+    cache_path = f"{_CACHE_PREFIX}{session_id}.json"
+    try:
+        with open(cache_path, 'r') as f:
+            data = json.load(f)
+        return data.get(key)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def cache_set(session_id: str, key: str, value) -> None:
+    """Write a key to the session cache. Atomic write."""
+    cache_path = f"{_CACHE_PREFIX}{session_id}.json"
+    try:
+        with open(cache_path, 'r') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        data = {}
+
+    data[key] = value
+
+    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir='/tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f)
+        os.rename(tmp, cache_path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def cache_invalidate(session_id: str, *keys: str) -> None:
+    """Remove specific keys from cache. No keys = clear all."""
+    cache_path = f"{_CACHE_PREFIX}{session_id}.json"
+    if not keys:
+        try:
+            os.unlink(cache_path)
+        except OSError:
+            pass
+        return
+
+    try:
+        with open(cache_path, 'r') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    for k in keys:
+        data.pop(k, None)
+
+    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir='/tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f)
+        os.rename(tmp, cache_path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Default configuration
 # ---------------------------------------------------------------------------
