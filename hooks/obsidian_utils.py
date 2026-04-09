@@ -776,8 +776,8 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
         for _, _, item_text in existing_items:
             prompt += f"- {item_text}\n"
 
-    retry_timeout = timeout * 2  # escalate on first timeout
-    for attempt_timeout in (timeout, retry_timeout):
+    attempts = (timeout, timeout * 2)  # escalate on first timeout
+    for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
                 ["claude", "-p", "--model", model],
@@ -804,13 +804,14 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
                 file=sys.stderr,
             )
             break  # won't succeed on retry
-        except subprocess.TimeoutExpired:
-            if attempt_timeout < retry_timeout:
-                print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, retrying with {retry_timeout}s", file=sys.stderr)
+        except subprocess.TimeoutExpired as exc:
+            stderr_snippet = f" stderr: {exc.stderr[:200]}" if exc.stderr else ""
+            if i < len(attempts) - 1:
+                print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, retrying with {attempts[i+1]}s{stderr_snippet}", file=sys.stderr)
                 continue
-            print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, giving up", file=sys.stderr)
+            print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, giving up{stderr_snippet}", file=sys.stderr)
         except Exception as exc:
-            print(f"[obsidian-brain] claude -p error: {exc}", file=sys.stderr)
+            print(f"[obsidian-brain] claude -p error ({type(exc).__name__}): {exc}", file=sys.stderr)
             break  # unknown error, don't retry
 
     return None
