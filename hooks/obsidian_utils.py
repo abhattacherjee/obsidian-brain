@@ -22,6 +22,119 @@ import sys
 import tempfile
 from pathlib import Path
 
+# --- Session-scoped cache ---
+# File-based cache at /tmp/.obsidian-brain-cache-{session_id}.json
+# Avoids repeated vault scans when multiple skills run in one session.
+
+_CACHE_PREFIX = '/tmp/.obsidian-brain-cache-'
+_BOOTSTRAP_PREFIX = '/tmp/.obsidian-brain-sid-'
+
+
+def _get_session_id_fast() -> str:
+    """Derive session ID, using bootstrap file for speed on repeat calls."""
+    project = os.path.basename(os.getcwd())
+    bootstrap = f"{_BOOTSTRAP_PREFIX}{project}"
+
+    # Try bootstrap file first (~0.1ms)
+    try:
+        with open(bootstrap, 'r') as f:
+            cached_sid = f.read().strip()
+        if cached_sid:
+            # Cheap validation: check the JSONL file still exists (~0.1ms stat)
+            import glob as _glob
+            pattern = os.path.expanduser(f"~/.claude/projects/*{project}/{cached_sid}.jsonl")
+            if _glob.glob(pattern):
+                return cached_sid
+    except OSError:
+        pass
+
+    # Fall back to full glob + mtime sort (~5ms)
+    import glob as _glob
+    pattern = os.path.expanduser(f"~/.claude/projects/*{project}/*.jsonl")
+    matches = _glob.glob(pattern)
+    if not matches:
+        return "unknown"
+    newest = max(matches, key=os.path.getmtime)
+    sid = os.path.splitext(os.path.basename(newest))[0]
+
+    # Write bootstrap for next call
+    try:
+        with open(bootstrap, 'w') as f:
+            f.write(sid)
+    except OSError:
+        pass
+
+    return sid
+
+
+def cache_get(session_id: str, key: str):
+    """Read a key from the session cache. Returns None on miss."""
+    cache_path = f"{_CACHE_PREFIX}{session_id}.json"
+    try:
+        with open(cache_path, 'r') as f:
+            data = json.load(f)
+        return data.get(key)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def cache_set(session_id: str, key: str, value) -> None:
+    """Write a key to the session cache. Atomic write."""
+    cache_path = f"{_CACHE_PREFIX}{session_id}.json"
+    try:
+        with open(cache_path, 'r') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        if isinstance(exc, json.JSONDecodeError):
+            print(f"[obsidian-brain] cache corrupted, resetting: {exc}", file=sys.stderr)
+        data = {}
+
+    data[key] = value
+
+    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir='/tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f)
+        os.replace(tmp, cache_path)
+    except OSError as exc:
+        print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def cache_invalidate(session_id: str, *keys: str) -> None:
+    """Remove specific keys from cache. No keys = clear all."""
+    cache_path = f"{_CACHE_PREFIX}{session_id}.json"
+    if not keys:
+        try:
+            os.unlink(cache_path)
+        except OSError:
+            pass
+        return
+
+    try:
+        with open(cache_path, 'r') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    for k in keys:
+        data.pop(k, None)
+
+    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir='/tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f)
+        os.replace(tmp, cache_path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Default configuration
 # ---------------------------------------------------------------------------
@@ -55,7 +168,16 @@ _DEFAULTS: dict = {
 
 
 def load_config() -> dict:
-    """Read ~/.claude/obsidian-brain-config.json, returning defaults for missing keys."""
+    """Read ~/.claude/obsidian-brain-config.json, returning defaults for missing keys.
+
+    Session-scoped caching: first call loads from disk and writes to cache;
+    subsequent calls within the same session hit the cache.
+    """
+    sid = _get_session_id_fast()
+    cached = cache_get(sid, "config")
+    if cached is not None:
+        return cached
+
     config = dict(_DEFAULTS)
     try:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as fh:
@@ -72,7 +194,103 @@ def load_config() -> dict:
             f"[obsidian-brain] error reading config: {exc}, using defaults",
             file=sys.stderr,
         )
+
+    cache_set(sid, "config", config)
     return config
+
+
+def get_session_context(vault_path: str | None = None, sessions_folder: str | None = None) -> dict:
+    """Get session ID, hash, project, and session note name. Cached.
+
+    Returns {session_id, hash, project, session_note_name} or
+    {session_id: 'unknown', hash: '', project: <cwd basename>, session_note_name: ''}.
+    """
+    sid = _get_session_id_fast()
+    # Include args in cache key so different call signatures don't collide
+    cache_key = f"session_context:{vault_path or ''}:{sessions_folder or ''}"
+    cached = cache_get(sid, cache_key)
+    if cached is not None:
+        return cached
+
+    project = os.path.basename(os.getcwd()).lower().replace(' ', '-')
+    if sid == "unknown":
+        # Don't cache "unknown" — would pollute cache shared across projects
+        return {"session_id": "unknown", "hash": "", "project": project, "session_note_name": ""}
+
+    h = hashlib.sha256(sid.encode()).hexdigest()[:4]
+
+    session_note_name = ""
+    if vault_path and sessions_folder:
+        sessions_dir = os.path.join(vault_path, sessions_folder)
+        if os.path.isdir(sessions_dir):
+            for fname in os.listdir(sessions_dir):
+                if fname.endswith(f'-{h}.md'):
+                    session_note_name = fname[:-3]  # strip .md
+                    break
+
+    # If not found, construct expected name
+    if not session_note_name:
+        from datetime import date
+        session_note_name = f"{date.today().isoformat()}-{project}-{h}"
+
+    ctx = {"session_id": sid, "hash": h, "project": project, "session_note_name": session_note_name}
+    cache_set(sid, cache_key, ctx)
+    return ctx
+
+
+def read_note_metadata(file_path: str) -> dict | None:
+    """Parse YAML frontmatter from a vault note. Returns dict or None.
+
+    Reads first 40 lines, extracts fields between --- markers.
+    Cached per file path within the session.
+    """
+    sid = _get_session_id_fast()
+    cache_key = f"metadata:{file_path}"
+    _CACHE_SENTINEL = {"__no_frontmatter__": True}
+    cached = cache_get(sid, cache_key)
+    if cached is not None:
+        return None if cached == _CACHE_SENTINEL else cached
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = []
+            for i, line in enumerate(f):
+                if i >= 40:
+                    break
+                lines.append(line)
+    except OSError:
+        return None
+
+    if not lines or lines[0].strip() != '---':
+        cache_set(sid, cache_key, _CACHE_SENTINEL)
+        return None
+
+    meta: dict = {}
+    tags: list[str] = []
+    in_tags = False
+
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == '---':
+            break
+        if stripped.startswith('- ') and in_tags:
+            tags.append(stripped[2:].strip())
+            continue
+        in_tags = False
+        if ':' in stripped:
+            key, _, val = stripped.partition(':')
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key == 'tags':
+                in_tags = True
+                continue
+            meta[key] = val
+
+    if tags:
+        meta['tags'] = tags
+
+    cache_set(sid, cache_key, meta)
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +530,58 @@ def _extract_errors(messages: list[dict]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _dedup_summary_open_items(summary_text: str, existing_items: list) -> str:
+    """Remove duplicate open items from AI-generated summary text.
+
+    Operates on the string before disk write. Uses find_duplicates()
+    for matching — same logic as dedup_note_open_items() but on a string.
+    """
+    # Lazy import to avoid top-level dependency on hooks/ being on sys.path
+    _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+    if _hooks_dir not in sys.path:
+        sys.path.insert(0, _hooks_dir)
+    from open_item_dedup import find_duplicates
+
+    # Find the ## Open Questions / Next Steps section
+    pattern = r'(## Open Questions / Next Steps\n)(.*?)(?=\n## |\Z)'
+    match = re.search(pattern, summary_text, re.DOTALL)
+    if not match:
+        return summary_text
+
+    section_header = match.group(1)
+    section_body = match.group(2)
+
+    # Parse individual - [ ] items
+    lines = section_body.split('\n')
+    kept_lines: list[str] = []
+    removed = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('- [ ] '):
+            item_text = stripped[6:]
+            dupes = find_duplicates(item_text, existing_items)
+            # Only auto-remove high-confidence matches; fuzzy could be false positives
+            high_dupes = [d for d in dupes if d[3] == "high"]
+            if high_dupes:
+                removed = True
+                continue  # drop this line
+        kept_lines.append(line)
+
+    if not removed:
+        return summary_text
+
+    new_body = '\n'.join(kept_lines)
+    # If all items removed, add placeholder
+    if not any(l.strip().startswith('- [ ]') for l in kept_lines):
+        new_body = 'None.'
+    # Ensure consistent trailing newline before next section
+    if not new_body.endswith('\n'):
+        new_body += '\n'
+
+    return summary_text[:match.start()] + section_header + new_body + summary_text[match.end():]
+
+
 def generate_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
@@ -377,6 +647,31 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
 - [ ] Checkbox list of unresolved items. Write "None." if none.
 """
 
+    # Layer 1: Append existing open items to prevent AI duplication
+    existing_items = []
+    if metadata.get("vault_path") and metadata.get("sessions_folder"):
+        try:
+            _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+            if _hooks_dir not in sys.path:
+                sys.path.insert(0, _hooks_dir)
+            from open_item_dedup import collect_open_items
+            existing_items = collect_open_items(
+                metadata["vault_path"],
+                metadata["sessions_folder"],
+                metadata.get("project", "unknown"),
+                max_sessions=10,
+            )
+        except Exception as exc:
+            print(f"[obsidian-brain] open item collection failed (non-fatal): {exc}", file=sys.stderr)
+
+    if existing_items:
+        prompt += "\n\n## Existing Open Items for This Project (DO NOT DUPLICATE)\n"
+        prompt += "The following items are already tracked in older session notes. Do NOT include any item\n"
+        prompt += "that is semantically equivalent to these — same PR, same branch, same task, same file.\n"
+        prompt += "Only add genuinely NEW open items from this session's conversation.\n\n"
+        for _, _, item_text in existing_items:
+            prompt += f"- {item_text}\n"
+
     try:
         result = subprocess.run(
             ["claude", "-p", "--model", model],
@@ -386,7 +681,11 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
             timeout=timeout,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
+            summary_text = result.stdout.strip()
+            # Layer 2: Post-generation dedup pass (string-based, pre-write)
+            if existing_items:
+                summary_text = _dedup_summary_open_items(summary_text, existing_items)
+            return summary_text
         print(
             f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
             f"{result.stderr[:200]}",

@@ -91,6 +91,8 @@ For each valid item, extract:
 
 Build a map: `{project → [(file_path, line_number, item_text)]}`.
 
+**Note:** For project-scoped collection (e.g. during cascade in Step 12.5), the Python helper `collect_open_items()` from `open_item_dedup` does single-pass extraction per file. It requires a `project` argument, so it's used per-project in the cascade step, not for the cross-project sweep in this step.
+
 ### Step 5 — Skip if zero items
 
 If the map is empty:
@@ -175,6 +177,28 @@ If the Edit fails because the line is not unique, retry with more context (inclu
 ```
 ⚠️  Could not check off "<item text>" in <basename> — line not unique. Edit manually in Obsidian.
 ```
+
+### Step 12.5 — Cascade check-offs to duplicate items
+
+For each project that had confirmed checkoffs, run:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys, json
+sys.path.insert(0, "hooks")
+from open_item_dedup import batch_cascade_checkoff
+items = json.loads(sys.argv[4])
+summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
+print(summary)
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT_NAME" "$CHECKED_ITEMS_JSON"
+```
+
+Before running, construct `$CHECKED_ITEMS_JSON` as a JSON array of confirmed item texts for that project from Step 11:
+```bash
+CHECKED_ITEMS_JSON=$(python3 -c "import json; print(json.dumps([\"Fix bug #42\", \"Land PR #14\"]))")
+```
+Replace the example items with the actual confirmed texts. Include the cascade summary in the Step 13 report.
 
 ### Step 13 — Report
 

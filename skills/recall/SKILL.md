@@ -136,6 +136,25 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
 
 **Important:** Do NOT modify frontmatter fields other than `status`. Do NOT change the filename. Do NOT add or remove tags.
 
+7. **Run dedup pass on the written note** to remove open items that already exist in older sessions:
+
+   ```bash
+   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+   python3 -c '
+   import sys
+   sys.path.insert(0, "hooks")
+   from open_item_dedup import dedup_note_open_items
+   removed = dedup_note_open_items(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
+   if removed:
+       print(f"Deduped: removed {len(removed)} duplicate open item(s)")
+       for r in removed: print(f"  - {r}")
+   else:
+       print("No duplicates found")
+   ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$NOTE_PATH"
+   ```
+
+   Where `$NOTE_PATH` is the full path of the note just written. Report the dedup result to the user as part of the upgrade status.
+
 If no unsummarized notes are found for this project, skip to Step 4.
 
 ### Step 4 — Search for project sessions and insights (parallel)
@@ -278,6 +297,26 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
 ```
 ✅ Checked off N item(s) across <list of files>.
 ```
+
+10. **Cascade check-offs to duplicate items in older notes.** Run a single Bash call that collects, matches, and edits files in Python:
+
+    ```bash
+    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    python3 -c '
+    import sys, json
+    sys.path.insert(0, "hooks")
+    from open_item_dedup import batch_cascade_checkoff
+    items = json.loads(sys.argv[4])
+    summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
+    print(summary)
+    ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$CHECKED_ITEMS_JSON"
+    ```
+
+    Before running, construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts from sub-step 7. Use a Bash heredoc or inline Python to build it:
+    ```bash
+    CHECKED_ITEMS_JSON=$(python3 -c "import json; print(json.dumps([\"Git-flow migration spec pending\", \"Land PR #14\"]))")
+    ```
+    Replace the example items with the actual confirmed item texts. Then run the cascade command above. Report the cascade summary to the user alongside the checkoff confirmation.
 
 Then proceed to Step 8.
 
