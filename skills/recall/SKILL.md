@@ -73,87 +73,24 @@ output_mode: content
 
 For each file that matches BOTH conditions (unsummarized AND belongs to this project):
 
-1. **Read the raw note in full** with the Read tool. Preserve frontmatter exactly. Extract the `session_id` value from the frontmatter and **store it as `SESSION_ID`** — the Bash snippet in sub-step 3 references this exact variable name.
-
-2. **No raw-note turn count needed.** Earlier revisions of this skill counted `^\*\*User:\*\*` / `^\*\*Assistant:\*\*` markers in the raw note to detect truncation, but that count is unreliable. The raw fallback's `## Conversation (raw)` section filters out system noise (`<task-notification>`, `<local-command…>`, "Base directory for this skill:", …) before emitting a `**User:**` line. Its `turn` counter is incremented whenever a `**User:**` OR `**Assistant:**` line is actually written, with user lines sometimes skipped due to noise filtering. So the marker count in a written raw note does not necessarily correspond to the underlying user/assistant message count in the transcript — filtered user messages are invisible. Use the shared `raw_note_max_turns` constant returned by the helper in sub-step 3 instead — it is the only deterministic truncation signal.
-
-3. **Locate the source JSONL and re-parse it in one shot.** Invoke the helper via argv (no shell interpolation of paths — pass `SESSION_ID` as an argument so session_ids with unusual characters cannot break the quoting). The parsed JSON is printed directly to stdout — no temp files, no traps:
-
-   Run the following Bash command from the obsidian-brain project root. It prints the parsed transcript JSON **directly to stdout** — no temp files, no traps, no `$TMPFILE` that would need to persist across tool invocations. Capture the stdout from the Bash tool result in the next step:
-
-   ```bash
-   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-   python3 -c '
-   import sys, json
-   sys.path.insert(0, "hooks")
-   from obsidian_utils import find_transcript_jsonl, parse_full_transcript, RAW_NOTE_MAX_TURNS
-   p = find_transcript_jsonl(sys.argv[1])
-   if p is None:
-       # Emit the same schema as the success branch so downstream steps
-       # do not need to special-case missing fields. All fields present,
-       # lists empty, booleans False.
-       print(json.dumps({
-           "jsonl_path": None,
-           "user_msgs": [], "assistant_msgs": [], "tool_uses": [],
-           "files_touched": [], "errors": [],
-           "truncated": False,
-           "warnings": [],
-           "raw_note_max_turns": RAW_NOTE_MAX_TURNS,
-           "raw_note_would_truncate": False,
-       }))
-   else:
-       data = parse_full_transcript(p)
-       data["jsonl_path"] = str(p)
-       print(json.dumps(data))
-   ' "$SESSION_ID"
-   ```
-
-   The Bash tool's stdout result is the JSON payload. Parse it directly from the tool response — it contains either `{"jsonl_path": null}` (not found) or the full parsed transcript plus `jsonl_path`, `truncated`, and `warnings`. Very large transcripts can produce multi-MB JSON; if the Bash tool truncates the output, fall back to writing to a known path such as `$VAULT_PATH/.obsidian-brain-transcript-cache.json` and reading it with the Read tool (this file is not in the vault's git repo and is safe to overwrite).
-
-4. **Decide which source to summarize from.** Two independent signals mean "raw note is incomplete":
-   - **`raw_note_would_truncate: true`** — `parse_full_transcript` simulates the exact same write loop as `build_raw_fallback` (including the system-noise filter that skips filtered user messages without incrementing the cap counter). This field is true iff that simulation would have bailed on the cap before consuming all messages. It is the fully deterministic signal — immune to false positives from noise filtering or false negatives from cap drift.
-   - **`truncated: true`** — the transcript exceeded the 5 MB byte budget and was sliced into head+tail halves. In that case some real content is missing from the middle regardless of the cap simulation, so this must be OR'd with the cap signal.
-
-   Decision branches:
-   - **`jsonl_path` is null** → use the raw note as the input. Append to the Summary section: `_(Source transcript not found on disk — summary built from the raw session note; fidelity depends on whether the raw note was itself capped at write time.)_`
-   - **`jsonl_path` is set AND (`raw_note_would_truncate == true` OR `truncated == true`)** → re-parse path engages. Use the parsed `user_msgs`, `assistant_msgs`, `tool_uses`, `files_touched`, and `errors` as the summarization input. If `truncated == true`, note that the summary reflects only the head and tail of the transcript.
-   - **`jsonl_path` is set AND `raw_note_would_truncate == false` AND `truncated == false`** → the raw note captured everything; use it instead.
-   - **If the parsed data's `warnings` list is non-empty** (regardless of which branch), prepend a visible callout section `## ⚠️ Transcript re-parse warnings` at the top of the upgraded note (above `# <title>`), listing each warning as a bullet. This surfaces partial-line losses, malformed JSONL records, unknown block types, and byte-budget slicing so the user knows what's in the summary and what isn't.
-
-5. **Generate a detailed, specific summary** from whichever input source was chosen above. Be precise — include file paths, function names, config values, and technical specifics. Produce these sections (unchanged from before):
-   - `## Summary` — 3-5 sentences
-   - `## Key Decisions` — bulleted list with rationale
-   - `## Changes Made` — bulleted list with file paths
-   - `## Errors Encountered` — bulleted list with messages, root causes, fixes
-   - `## Open Questions / Next Steps` — checkbox list of concrete actionable items
-
-6. **Write the upgraded note** with the Write tool to the same file path. Preserve original frontmatter unchanged but flip `status: auto-logged` to `status: summarized`. Structure:
-   - Original frontmatter (unchanged except `status`)
-   - `# <title from original note>`
-   - The five summary sections
-   - The existing `## Tool Usage` / `## Changes Made` / `## Errors Encountered` / `## Conversation (raw)` sections from the raw note (preserve them as the audit trail — only the leading summary changes)
-   - The Session Metadata section if present
-
-**Important:** Do NOT modify frontmatter fields other than `status`. Do NOT change the filename. Do NOT add or remove tags.
-
-7. **Run dedup pass on the written note** to remove open items that already exist in older sessions:
+1. **Run the upgrade pipeline in Python** — a single Bash call that handles JSONL lookup, transcript parsing, source decision, AI summarization, dedup, and atomic write:
 
    ```bash
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
    python3 -c '
    import sys
    sys.path.insert(0, "hooks")
-   from open_item_dedup import dedup_note_open_items
-   removed = dedup_note_open_items(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
-   if removed:
-       print(f"Deduped: removed {len(removed)} duplicate open item(s)")
-       for r in removed: print(f"  - {r}")
-   else:
-       print("No duplicates found")
-   ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$NOTE_PATH"
+   from obsidian_utils import upgrade_unsummarized_note
+   status = upgrade_unsummarized_note(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
+   print(status)
+   ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
    ```
 
-   Where `$NOTE_PATH` is the full path of the note just written. Report the dedup result to the user as part of the upgrade status.
+   Where `$NOTE_PATH` is the full path of the unsummarized note. The function returns a one-line status like:
+   - `"Upgraded 2026-04-07-obsidian-brain-aeb5.md (source: JSONL transcript), deduped 2 item(s)"`
+   - `"Failed: AI summarization returned empty for 2026-04-07-obsidian-brain-aeb5.md"`
+
+   Report the status to the user. If it starts with "Failed:", note the failure but continue to the next unsummarized note (do not stop the entire `/recall` flow).
 
 If no unsummarized notes are found for this project, skip to Step 4.
 
