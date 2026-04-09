@@ -321,6 +321,7 @@ def match_items_against_evidence(
         return []
 
     evidence_lower = evidence_text.lower()
+    evidence_tokens = _tokenize(evidence_text)
     candidates: list[dict] = []
 
     for fpath, line_num, item_text in open_items:
@@ -340,12 +341,13 @@ def match_items_against_evidence(
                 score += 3
                 match_positions.append(pos)
 
-        # Check regular tokens (3+ chars)
-        matched_tokens = 0
-        for t in tokens:
+        # Check regular tokens (3+ chars) — set intersection for word-boundary matching
+        matched_token_set = tokens & evidence_tokens
+        matched_tokens = len(matched_token_set)
+        # Find positions for matched tokens (for evidence snippet extraction)
+        for t in matched_token_set:
             pos = evidence_lower.find(t)
             if pos >= 0:
-                matched_tokens += 1
                 match_positions.append(pos)
 
         score += matched_tokens
@@ -1485,6 +1487,11 @@ def upgrade_unsummarized_note(
             except ValueError:
                 pass
 
+    # Add files_touched and errors from parsed transcript if available
+    if jsonl_path and parsed:
+        metadata["files_touched"] = parsed.get("files_touched", [])
+        metadata["errors"] = parsed.get("errors", [])
+
     # Generate summary
     summary_text = generate_summary(
         user_msgs, assistant_msgs, metadata,
@@ -1550,7 +1557,7 @@ def upgrade_unsummarized_note(
         stripped = line.strip()
         if stripped.startswith('## Tool Usage') or stripped.startswith('## Errors Encountered') or \
            stripped.startswith('## Conversation (raw)') or stripped.startswith('## Session Metadata') or \
-           stripped.startswith('## Files Touched'):
+           stripped.startswith('## Files Touched') or stripped.startswith('## Changes Made'):
             in_audit = True
         if in_audit:
             new_lines.append(line)

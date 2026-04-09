@@ -173,7 +173,7 @@ Where:
   Parse the output to get `SESSION_ID`, `HASH`, `PROJECT`, and `SESSION_NOTE`. Use these for the frontmatter fields.
 
   **Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely.
-- `<project-name>` is derived from the current working directory name (basename of the git repo root or cwd)
+- `<project-name>` is the `PROJECT` value from `get_session_context()` (lowercased, hyphenated basename of cwd)
 - The `source_session_note` field creates an Obsidian backlink from the insight to its source session, enabling bidirectional navigation in the graph view
 
 Ask the user:

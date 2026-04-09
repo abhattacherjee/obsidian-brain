@@ -157,7 +157,7 @@ Where:
   Parse the output to get `SESSION_ID`, `HASH`, `PROJECT`, and `SESSION_NOTE`.
 
   **Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely.
-- `<project-name>` is derived from the current working directory name (basename of the git repo root or cwd)
+- `<project-name>` is the `PROJECT` value from `get_session_context()` (lowercased, hyphenated basename of cwd)
 - The `source_session_note` field creates an Obsidian backlink to the source session note
 
 Ask the user:
