@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from 6 to 4 top-level tasks. Fallback to in-context reads if sub-agent fails.
 - Sub-agent summaries now written to temp files instead of passed through parent
   context via heredocs, saving ~800 tokens per note during batch summarization.
+- Per-note task sub-tasks skipped when N>5 — uses wave-level progress updates
+  instead, saving ~15-20s of parent round-trip overhead at large batch sizes.
+- Context builder sub-agent instructed to read all files in parallel and cap
+  insights at 20 most recent, reducing sequential read bottleneck.
+- Config load and project derivation merged into single Python call, eliminating
+  one parent round (~5s). `/recall` steps renumbered from 8 to 5.
 
 ### Fixed
 - f-string SyntaxError in all 10 skill templates — `python3 -c '...'` one-liners
