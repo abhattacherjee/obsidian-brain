@@ -41,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in conversation excerpts, causing false positives and unnecessary re-summarization.
   Changed from body text pattern (`"AI summary unavailable"`) to frontmatter
   field (`^status: auto-logged`).
+- Legacy notes (119 across all projects) had `status: auto-logged` but already
+  contained real AI summaries from old SessionEnd inline-summarization path.
+  Added defense-in-depth guard to `/recall` Step 2 that checks for `## Summary`
+  before re-summarizing and auto-fixes stale status fields.
 
 ## [1.7.2] - 2026-04-09
 
