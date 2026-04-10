@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used f-strings with dict key access (`c[\"vault_path\"]`) which breaks inside
   Bash single-quoted strings. Replaced with string concatenation across config
   load (10 skills) and session context (4 skills).
+- `/recall` and `/standup` grep for unsummarized notes matched tool-usage logs
+  in conversation excerpts, causing false positives and unnecessary re-summarization.
+  Changed from body text pattern (`"AI summary unavailable"`) to frontmatter
+  field (`^status: auto-logged`).
 
 ## [1.7.2] - 2026-04-09
 
