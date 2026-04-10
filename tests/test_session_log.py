@@ -1,11 +1,6 @@
 # tests/test_session_log.py
 """Tests for _build_note() in obsidian_session_log.py."""
 
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hooks"))
-
 from obsidian_session_log import _build_note
 
 
