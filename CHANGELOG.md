@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/recall` estimated to drop from ~4 min to ~1.5 min. Sub-agent fallback removed.
 - Config load and project derivation merged into single Python call, eliminating
   one parent round (~5s). `/recall` steps renumbered from 8 to 5.
+- Session history table and load manifest titles in `build_context_brief()` now
+  use the first sentence of `## Summary` instead of the generic H1 heading
+  (`Session: project (branch)`), making each row descriptive of what happened.
 
 ### Fixed
 - f-string SyntaxError in all 10 skill templates — `python3 -c '...'` one-liners
