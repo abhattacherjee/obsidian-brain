@@ -2,7 +2,7 @@
 name: recall
 description: "Loads historical context from the Obsidian vault for the current project. Summarizes any unsummarized session notes, then presents a context brief with recent sessions, open items, and curated insights. Also auto-detects open items completed in the most recent loaded session and offers to check them off. Use when: (1) /recall command, (2) /recall <project-name>, (3) resuming work on a project and wanting prior context."
 metadata:
-  version: 1.2.0
+  version: 1.3.0
 ---
 
 # Recall — Load Project Context from Obsidian Vault
@@ -40,6 +40,19 @@ If the output is empty or errors, tell the user:
 > Config not found. Run `/obsidian-setup` first to configure your Obsidian vault.
 
 Stop here if config is missing.
+
+**Create the task manifest** for the full `/recall` flow:
+
+```
+TaskCreate: subject="Find unsummarized notes", activeForm="Searching for unsummarized notes", status immediately set to in_progress
+TaskCreate: subject="Summarize unsummarized notes", activeForm="Summarizing notes"
+TaskCreate: subject="Search sessions and insights", activeForm="Searching vault"
+TaskCreate: subject="Read and rank notes", activeForm="Reading notes"
+TaskCreate: subject="Compose context brief", activeForm="Composing brief"
+TaskCreate: subject="Present results and detect completed items", activeForm="Presenting results"
+```
+
+Track the returned task IDs — you will update them as each step completes. Task #1 is already `in_progress`.
 
 ### Step 2 — Derive project name
 
@@ -239,6 +252,8 @@ If any sub-agents returned empty or invalid summaries, report those notes as sti
 
 ### Step 4 — Search for project sessions and insights (parallel)
 
+Update task #3 to `in_progress`.
+
 Run these two searches in parallel using Grep:
 
 **Search A — Sessions:**
@@ -259,7 +274,11 @@ output_mode: files_with_matches
 
 Collect both result sets.
 
+Update task #3 to `completed`.
+
 ### Step 5 — Rank and select notes
+
+Update task #4 to `in_progress`.
 
 From the session files found, sort by date (extract from frontmatter `date:` field or filename). Select:
 
@@ -274,7 +293,11 @@ Read the selected files using the Read tool. For efficiency:
 - For older sessions, read only the first 50 lines (enough for frontmatter + summary + open questions)
 - Read all insight files in full (they are typically short)
 
+Update task #4 to `completed`.
+
 ### Step 6 — Compose context brief
+
+Update task #5 to `in_progress`.
 
 Build a context brief targeting approximately 2000 tokens. Structure it as follows:
 
@@ -301,7 +324,11 @@ $ALL_INSIGHTS_CONTENT
 
 If the brief exceeds ~2000 tokens, trim older session summaries first, then truncate insight bodies (keep titles).
 
+Update task #5 to `completed`.
+
 ### Step 7 — Present to user
+
+Update task #6 to `in_progress`.
 
 Display:
 
@@ -433,6 +460,8 @@ After the context brief, explicitly list what was loaded into the conversation s
 The session history table from Step 6 serves as a menu — if the user picks a session by name or date, use the Read tool to load that specific file and present its full contents.
 
 If the user says they're ready to work, the context is already loaded — proceed.
+
+Update task #6 to `completed`.
 
 ## Edge Cases
 
