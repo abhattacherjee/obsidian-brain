@@ -983,13 +983,13 @@ def build_context_brief(
             m = _summary_re.search(text)
             if m:
                 most_recent_summary = m.group(1).strip()
+                # Use first sentence of summary as title
+                first_line = most_recent_summary.split('\n')[0].strip()
+                if first_line:
+                    most_recent_title = first_line
             m = _next_steps_re.search(text)
             if m:
                 most_recent_open_items = m.group(1).strip()
-            for line in text.split('\n'):
-                if line.startswith('# '):
-                    most_recent_title = line[2:].strip()
-                    break
         except OSError:
             most_recent_summary = "(could not read session note)"
 
@@ -1006,10 +1006,10 @@ def build_context_brief(
             m = _summary_re.search(text)
             if m:
                 second_summary = m.group(1).strip()
-            for line in lines:
-                if line.startswith('# '):
-                    second_title = line[2:].strip()
-                    break
+                # Use first sentence of summary as title
+                first_line = second_summary.split('\n')[0].strip()
+                if first_line:
+                    second_title = first_line
         except OSError:
             second_summary = "(could not read session note)"
 
@@ -1021,7 +1021,14 @@ def build_context_brief(
         branch = meta.get('git_branch', '')
         try:
             with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                for line_text in f:
+                content_text = f.read()
+            # Prefer first sentence of ## Summary as title (more descriptive)
+            summary_match = re.search(r'## Summary\n(.+)', content_text)
+            if summary_match:
+                title = summary_match.group(1).strip()
+            else:
+                # Fall back to H1 heading
+                for line_text in content_text.split('\n'):
                     if line_text.startswith('# '):
                         title = line_text[2:].strip()
                         break
