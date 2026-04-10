@@ -949,43 +949,57 @@ def find_unsummarized_notes(
         if f.suffix != '.md':
             continue
 
-        meta = read_note_metadata(str(f))
-        if not meta:
+        # Read ENTIRE file from disk — DO NOT use read_note_metadata() which
+        # has a persistent cache that may be stale after status changes.
+        try:
+            content = f.read_text(encoding='utf-8', errors='replace')
+        except OSError:
             continue
 
+        # Parse frontmatter inline (no cache)
+        if not content.startswith('---'):
+            continue
+        fm_end = content.find('\n---', 3)
+        if fm_end == -1:
+            continue
+        frontmatter = content[:fm_end]
+
         # Must be auto-logged
-        if meta.get('status') != 'auto-logged':
+        status_match = re.search(r'^status:\s*(.+)$', frontmatter, re.MULTILINE)
+        if not status_match or status_match.group(1).strip() != 'auto-logged':
             continue
 
         # Must match project
-        fm_project = meta.get('project', '')
+        project_match = re.search(r'^project:\s*(.+)$', frontmatter, re.MULTILINE)
+        if not project_match:
+            continue
+        fm_project = project_match.group(1).strip().strip('"').strip("'")
         if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
             continue
 
         # Defense-in-depth: check if already has a real summary
-        try:
-            with open(f, 'r', encoding='utf-8', errors='replace') as fh:
-                content = fh.read()
-            has_summary = bool(re.search(r'^## Summary', content, re.MULTILINE))
-            has_unavailable = 'AI summary unavailable' in content
+        has_summary = bool(re.search(r'^## Summary', content, re.MULTILINE))
+        has_unavailable = 'AI summary unavailable' in content
 
-            if has_summary and not has_unavailable:
-                # Already summarized by legacy code path — fix status
-                try:
-                    fixed = re.sub(
-                        r'^status: auto-logged',
-                        'status: summarized',
-                        content,
-                        count=1,
-                        flags=re.MULTILINE,
-                    )
-                    with open(f, 'w', encoding='utf-8') as fw:
-                        fw.write(fixed)
-                    auto_fixed += 1
-                except OSError:
-                    pass
-                continue
-        except OSError:
+        if has_summary and not has_unavailable:
+            # Already summarized by legacy code path — fix status on disk
+            try:
+                fixed = re.sub(
+                    r'^status: auto-logged',
+                    'status: summarized',
+                    content,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+                with open(f, 'w', encoding='utf-8') as fw:
+                    fw.write(fixed)
+                # Invalidate cache for this file
+                sid = _get_session_id_fast()
+                cache_key = f"metadata:{str(f)}"
+                cache_set(sid, cache_key, None)
+                auto_fixed += 1
+            except OSError:
+                pass
             continue
 
         unsummarized.append(str(f))
@@ -1874,6 +1888,10 @@ def upgrade_note_with_summary(
     except Exception as exc:
         dedup_failed = True
         print(f"[obsidian-brain] dedup unexpected error: {exc}", file=sys.stderr)
+
+    # Invalidate metadata cache for this note (status changed from auto-logged to summarized)
+    sid = _get_session_id_fast()
+    cache_set(sid, f"metadata:{note_path}", None)
 
     # Build status
     status = f"Upgraded {os.path.basename(note_path)} (source: {source})"
