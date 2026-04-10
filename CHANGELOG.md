@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-04-10
+
 ### Added
 - User-visible task manifest during `/recall` showing progress across all
   steps with per-note granularity during summarization.
