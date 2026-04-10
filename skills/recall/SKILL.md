@@ -269,155 +269,30 @@ If any sub-agents returned empty or invalid summaries, report those notes as sti
 
 For `NO_CONTENT` notes, inform the user: "Note `<basename>` has no session_id or conversation content. Manually edit it in Obsidian to add a summary, or delete it if it's empty."
 
-### Step 3 — Build context brief (sub-agent)
+### Step 3 — Build context brief (Python)
 
 Update task #3 to `in_progress`.
 
-Dispatch a single sub-agent to search, read, rank, compose the context brief, and detect completed open items. The sub-agent does all the heavy file reading in its own context — the parent only receives the compact result.
+Run a single Python call that reads all session and insight files, composes the brief, and detects completed open items — no sub-agent needed:
 
-```
-Agent({
-  description: "Build recall context brief for $PROJECT",
-  prompt: "You are building a context brief for the obsidian-brain /recall skill.
-
-VAULT_PATH: $VAULT_PATH
-SESSIONS_FOLDER: $SESSIONS_FOLDER
-INSIGHTS_FOLDER: $INSIGHTS_FOLDER
-PROJECT: $PROJECT
-UPGRADED_COUNT: <number of notes upgraded in Step 2, or 0>
-
-## Your task
-
-### 1. Search for project sessions and insights (parallel Grep)
-
-Run these two searches in parallel:
-
-Search A — Sessions:
-  pattern: 'project: $PROJECT'
-  path: $VAULT_PATH/$SESSIONS_FOLDER/
-  output_mode: files_with_matches
-
-Search B — Insights:
-  pattern: 'project: $PROJECT'
-  path: $VAULT_PATH/$INSIGHTS_FOLDER/
-  output_mode: files_with_matches
-
-### 2. Rank and select notes
-
-From session files, sort by date (from frontmatter or filename). Select:
-- Most recent session — read in full. Store its path.
-- Second most recent — read first 50 lines (frontmatter + summary + open questions)
-- Last 5 sessions — read first 15 lines each (enough for frontmatter title/date/branch)
-
-From insight files, if 20 or fewer read ALL of them. If more than 20, read only the 20 most recent (by filename date prefix).
-
-**IMPORTANT — Maximize parallel reads to reduce wall time:**
-Read the most recent session, second session (50 lines), older sessions (15 lines each), and all insight files in a SINGLE message turn with all Read calls in parallel. Do NOT read files one at a time — sequential reads are the #1 wall-time bottleneck.
-
-### 3. Compose context brief (~2000 tokens)
-
-Build this structure:
-
-## Project Context: $PROJECT
-
-### Last Session ($DATE)
-$SUMMARY_FROM_MOST_RECENT_SESSION
-
-**Open Items / Next Steps:**
-$OPEN_QUESTIONS_FROM_MOST_RECENT_SESSION
-
-### Previous Session ($DATE)
-$BRIEF_SUMMARY_FROM_SECOND_SESSION
-
-### Curated Insights
-$ALL_INSIGHTS_CONTENT (titles + key points, trim if exceeding ~500 tokens)
-
-### Recent Session History
-| Date | Title | Branch |
-|------|-------|--------|
-| ... last 5 sessions ... |
-
-If the brief exceeds ~2000 tokens, trim older session summaries first, then truncate insight bodies (keep titles).
-
-### 4. Detect completed open items
-
-Run this Bash command:
-
-cd \"\$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys, json
-sys.path.insert(0, \"hooks\")
-from obsidian_utils import match_items_against_evidence
-from open_item_dedup import collect_open_items
-
-vault_path, sessions_folder, project = sys.argv[1], sys.argv[2], sys.argv[3]
-evidence_file = sys.argv[4]
-
-try:
-    with open(evidence_file, \"r\") as f:
-        content = f.read()
-    import re as _re
-    evidence_parts = []
-    for section in [\"Summary\", \"Key Decisions\", \"Changes Made\", \"Errors Encountered\"]:
-        m = _re.search(rf\"## {section}\n(.*?)(?=\n## |\Z)\", content, _re.DOTALL)
-        if m:
-            evidence_parts.append(m.group(1))
-    evidence = \"\n\".join(evidence_parts) if evidence_parts else content
-except OSError:
-    print(\"NO_CANDIDATES\")
-    sys.exit(0)
-
-items = collect_open_items(vault_path, sessions_folder, project)
-if not items:
-    print(\"NO_ITEMS\")
-    sys.exit(0)
-
-candidates = match_items_against_evidence(evidence, items)
-if not candidates:
-    print(\"NO_CANDIDATES\")
-else:
-    filtered = [c for c in candidates if c.get(\"confidence\", 0) >= 3]
-    print(json.dumps(filtered) if filtered else \"NO_CANDIDATES\")
-' \"$VAULT_PATH\" \"$SESSIONS_FOLDER\" \"$PROJECT\" \"<MOST_RECENT_SESSION_PATH>\"
-
-Where <MOST_RECENT_SESSION_PATH> is the full path of the most recent session note you read in step 2.
-
-### 5. Return format
-
-Return EXACTLY this structured format with labeled sections. Do NOT add preamble or commentary outside these sections:
-
-CONTEXT_BRIEF:
-<the composed brief from step 3>
-
-LOAD_MANIFEST:
-full_session_title: <title of most recent session>
-full_session_date: <date>
-full_session_path: <full file path>
-summary_session_title: <title of second session>
-summary_session_date: <date>
-insight_count: <number of insight files found>
-
-MOST_RECENT_SESSION_PATH:
-<full path of most recent session note>
-
-OPEN_ITEM_CANDIDATES:
-<output from step 4 — either NO_CANDIDATES, NO_ITEMS, or a JSON array>
-
-## Edge cases
-- No sessions found: set CONTEXT_BRIEF to 'No session history found for $PROJECT.'
-- No insights found: omit Curated Insights section from brief, set insight_count to 0
-- Very large vault (50+ sessions): only grep, never glob. Limit reads to 5 most recent sessions + all insights."
-})
+import sys
+sys.path.insert(0, "hooks")
+from obsidian_utils import build_context_brief
+print(build_context_brief(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]))
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER" "$PROJECT"
 ```
 
-**Parse the sub-agent return.** Split the returned text on the section labels:
+If the command fails (non-zero exit code), print the error and stop — do not fall back to in-context reads.
+
+**Parse the output.** Split on section labels:
 
 1. Extract `CONTEXT_BRIEF:` — everything between `CONTEXT_BRIEF:` and `LOAD_MANIFEST:`. This is the brief to display.
 2. Extract `LOAD_MANIFEST:` — parse `full_session_title`, `full_session_date`, `full_session_path`, `summary_session_title`, `summary_session_date`, `insight_count`.
 3. Extract `MOST_RECENT_SESSION_PATH:` — the full path for checkoff edits.
 4. Extract `OPEN_ITEM_CANDIDATES:` — either `NO_CANDIDATES`, `NO_ITEMS`, or a JSON array.
-
-**Fallback:** If the sub-agent returns empty, errors, or the return does not contain `CONTEXT_BRIEF:`, fall back to performing Steps 4-6 in-context (the original flow: grep sessions + insights, read files, compose brief). Log a warning: "Context builder sub-agent failed, falling back to in-context reads."
 
 Update task #3 to `completed`.
 
