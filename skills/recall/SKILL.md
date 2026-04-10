@@ -2,7 +2,7 @@
 name: recall
 description: "Loads historical context from the Obsidian vault for the current project. Summarizes any unsummarized session notes, then presents a context brief with recent sessions, open items, and curated insights. Also auto-detects open items completed in the most recent loaded session and offers to check them off. Use when: (1) /recall command, (2) /recall <project-name>, (3) resuming work on a project and wanting prior context."
 metadata:
-  version: 1.3.0
+  version: 1.4.0
 ---
 
 # Recall — Load Project Context from Obsidian Vault
@@ -403,18 +403,90 @@ OPEN_ITEM_CANDIDATES:
 
 Update task #3 to `completed`.
 
-### Step 8 — Show load manifest and offer options
+### Step 5 — Present to user
 
-After the context brief, explicitly list what was loaded into the conversation so the user knows exactly what context is available:
+Update task #4 to `in_progress`.
+
+Display:
+
+> **Here's what I found from your Obsidian vault for `$PROJECT`:**
+
+Then output the `CONTEXT_BRIEF` section from the sub-agent return verbatim.
+
+If unsummarized notes were upgraded in Step 3, also mention:
+
+> _Upgraded N session note(s) with AI summaries._
+
+### Step 5.5 — Detect completed open items (from sub-agent data)
+
+Parse the `OPEN_ITEM_CANDIDATES` section from the sub-agent return.
+
+1. **Skip if no candidates.** If the value is `NO_ITEMS` or `NO_CANDIDATES`, skip to Step 6 silently.
+
+2. **Parse candidates.** The JSON array contains objects with `file`, `line`, `text`, `evidence`, `confidence`, `has_completion_phrase`.
+
+3. **Present candidates to user.** Print:
+
+```
+I noticed these open items may now be done:
+
+1. [x] <item text>
+     From: <basename of source file>
+     Evidence: "<short snippet from evidence showing the match>"
+
+2. [x] <item text>
+     ...
+
+Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
+```
+
+4. **Wait for user response.** Parse the response:
+   - `none` or empty → skip checkoff entirely, proceed to Step 6
+   - `all` → check off all candidates
+   - Comma-separated numbers (e.g. `1,3`) → check off only those
+
+5. **For each confirmed checkoff, edit the source file.** Use Read to load the full source file. Find the exact line containing `- [ ] <item text>`. Replace it with `- [x] <item text>`. Use the Edit tool with `replace_all: false` and provide enough context to ensure uniqueness. If the line is ambiguous, skip and warn:
+
+```
+⚠️  Could not check off item "<item text>" — line is not unique in <file>. Edit manually in Obsidian.
+```
+
+6. **Confirm checkoffs to user.** Print:
+
+```
+✅ Checked off N item(s) across <list of files>.
+```
+
+7. **Cascade check-offs to duplicate items in older notes.** Run:
+
+    ```bash
+    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    python3 -c '
+    import sys, json
+    sys.path.insert(0, "hooks")
+    from open_item_dedup import batch_cascade_checkoff
+    items = json.loads(sys.argv[4])
+    summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
+    print(summary)
+    ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$CHECKED_ITEMS_JSON"
+    ```
+
+    Construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts. Report the cascade summary.
+
+Then proceed to Step 6.
+
+### Step 6 — Show load manifest and offer options
+
+Use the `LOAD_MANIFEST` data from the sub-agent return to show:
 
 > **Loaded into this conversation:**
-> - Full session: *"[most recent session title]"* ([date])
-> - Summary only: *"[second session title]"* ([date])
-> - [N] curated insight(s)
+> - Full session: *"<full_session_title>"* (<full_session_date>)
+> - Summary only: *"<summary_session_title>"* (<summary_session_date>)
+> - <insight_count> curated insight(s)
 >
 > Pick any session from the history table above to load it, or ready to start working?
 
-The session history table from Step 6 serves as a menu — if the user picks a session by name or date, use the Read tool to load that specific file and present its full contents.
+The session history table from the context brief serves as a menu — if the user picks a session by name or date, use the Read tool to load that specific file from `$VAULT_PATH/$SESSIONS_FOLDER/` and present its full contents.
 
 If the user says they're ready to work, the context is already loaded — proceed.
 
