@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   strategy when 2+ unsummarized notes are found, with conditional JSONL
   transcript extraction for truncated sessions. Single-note case unchanged
   (Haiku pipeline + sub-agent fallback).
+- `/recall` Steps 4-7.5 now delegated to a single context builder sub-agent,
+  reducing parent context from ~14k to ~6.5k tokens. Task manifest collapsed
+  from 6 to 4 top-level tasks. Fallback to in-context reads if sub-agent fails.
 
 ## [1.7.2] - 2026-04-09
 
