@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- pytest test suite with 101 tests across 7 test files covering all Python hook modules
+- SKILL.md `python3 -c` syntax validation via parameterized compile() tests (26 snippets)
+- 90% line coverage enforcement via pytest-cov (98% achieved on measured modules)
+- `python-tests` CI job in GitHub Actions for all PRs
+- pytest + coverage detection in `commit-preflight.sh` test section
+- `setup.cfg` with pytest and coverage configuration
+
+### Fixed
+- `skills/obsidian-setup/SKILL.md` f-string escape bug caught by snippet validator
+
 ## [1.8.0] - 2026-04-10
 
 ### Added
