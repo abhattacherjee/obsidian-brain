@@ -633,3 +633,30 @@ class TestBuildContextBriefSort:
         )
 
         assert "|  |" in output or "| |" in output
+
+    def test_session_number_column(self, tmp_path, monkeypatch):
+        """Each row should have a sequential number in the first column."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions = tmp_path / "sessions"
+        insights = tmp_path / "insights"
+        sessions.mkdir()
+        insights.mkdir()
+
+        _make_session_note(
+            sessions / "2026-04-10-proj-aaaa.md",
+            "proj", "2026-04-10", "main", 10, "First.", mtime=2000,
+        )
+        _make_session_note(
+            sessions / "2026-04-10-proj-bbbb.md",
+            "proj", "2026-04-10", "main", 20, "Second.", mtime=1000,
+        )
+
+        output = obsidian_utils.build_context_brief(
+            str(tmp_path), "sessions", "insights", "proj",
+        )
+
+        rows = [l for l in output.split("\n") if l.startswith("| ") and l[2:3].isdigit()]
+        assert len(rows) == 2
+        assert rows[0].startswith("| 1 |")
+        assert rows[1].startswith("| 2 |")
