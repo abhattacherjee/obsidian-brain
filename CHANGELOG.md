@@ -7,17 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- `/recall` Step 3 now uses parallel sub-agents as the default summarization
-  strategy when 2+ unsummarized notes are found, with conditional JSONL
-  transcript extraction for truncated sessions. Single-note case unchanged
-  (Haiku pipeline + sub-agent fallback).
-
 ### Added
 - User-visible task manifest during `/recall` showing progress across all
   steps with per-note granularity during summarization.
 - `prepare_summary_input()` helper in `obsidian_utils.py` for conditional
   JSONL-to-temp-file extraction.
+- `/dev-test` skill and `test-dev-skill.sh` script for swapping the installed
+  plugin cache with the repo working copy during local testing.
+
+### Changed
+- `/recall` Step 3 now uses parallel sub-agents as the default summarization
+  strategy when 2+ unsummarized notes are found, with conditional JSONL
+  transcript extraction for truncated sessions. Single-note case unchanged
+  (Haiku pipeline + sub-agent fallback).
 
 ## [1.7.2] - 2026-04-09
 

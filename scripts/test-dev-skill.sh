@@ -45,6 +45,9 @@ case "$cmd" in
         echo "Backing up: $CACHE_DIR -> $BACKUP_DIR"
         cp -R "$CACHE_DIR" "$BACKUP_DIR"
 
+        # Auto-restore on failure
+        trap 'echo "ERROR: Install failed partway. Run \"$0 restore\" to recover." >&2' ERR
+
         echo "Installing dev versions..."
 
         # Copy hooks (Python files)
@@ -55,9 +58,13 @@ case "$cmd" in
         for skill_dir in "$REPO_ROOT/skills/"*/; do
             skill_name=$(basename "$skill_dir")
             mkdir -p "$CACHE_DIR/skills/$skill_name"
-            cp "$skill_dir"* "$CACHE_DIR/skills/$skill_name/" 2>/dev/null || true
+            if compgen -G "$skill_dir"* > /dev/null 2>&1; then
+                cp "$skill_dir"* "$CACHE_DIR/skills/$skill_name/"
+            fi
             echo "  skills/$skill_name/ -> cache"
         done
+
+        trap - ERR
 
         echo ""
         echo "Dev version installed to cache (v${PLUGIN_VERSION})."
@@ -72,6 +79,12 @@ case "$cmd" in
             echo "No backup found at $BACKUP_DIR — nothing to restore."
             echo "Current cache is the original version."
             exit 0
+        fi
+
+        # Sanity check: CACHE_DIR must be under CACHE_BASE
+        if [[ "$CACHE_DIR" != "${CACHE_BASE}/"* ]]; then
+            echo "ERROR: CACHE_DIR '$CACHE_DIR' is outside expected base. Aborting." >&2
+            exit 1
         fi
 
         echo "Restoring: $BACKUP_DIR -> $CACHE_DIR"

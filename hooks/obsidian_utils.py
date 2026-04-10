@@ -1601,37 +1601,43 @@ def prepare_summary_input(note_path: str) -> str:
         return f"NO_CONTENT:{note_path}"
 
     # Find and parse JSONL transcript
-    jsonl_path = find_transcript_jsonl(session_id)
-    if not jsonl_path:
-        return f"RAW_OK:{note_path}"
+    try:
+        jsonl_path = find_transcript_jsonl(session_id)
+        if not jsonl_path:
+            return f"RAW_OK:{note_path}"
 
-    parsed = parse_full_transcript(jsonl_path)
-    if not parsed.get("raw_note_would_truncate", False):
-        return f"RAW_OK:{note_path}"
+        parsed = parse_full_transcript(jsonl_path)
 
-    # Raw note would truncate — extract JSONL content to temp file
-    user_msgs = parsed.get("user_msgs", [])
-    assistant_msgs = parsed.get("assistant_msgs", [])
-    if not user_msgs and not assistant_msgs:
-        return f"RAW_OK:{note_path}"
+        # Surface transcript warnings (Issue #1: never discard these)
+        for w in parsed.get("warnings", []):
+            print(f"[obsidian-brain] transcript warning for {os.path.basename(note_path)}: {w}", file=sys.stderr)
 
-    # Sample messages using same logic as generate_summary()
-    if len(user_msgs) > 20:
-        sampled_user = user_msgs[:10] + ["[... middle messages omitted ...]"] + user_msgs[-10:]
-    else:
-        sampled_user = user_msgs
-    if len(assistant_msgs) > 20:
-        sampled_asst = assistant_msgs[:10] + ["[... middle messages omitted ...]"] + assistant_msgs[-10:]
-    else:
-        sampled_asst = assistant_msgs
+        if not parsed.get("raw_note_would_truncate", False):
+            return f"RAW_OK:{note_path}"
 
-    user_sample = "\n---\n".join(sampled_user)[:12000]
-    assistant_sample = "\n---\n".join(sampled_asst)[:12000]
+        # Raw note would truncate — extract JSONL content to temp file
+        user_msgs = parsed.get("user_msgs", [])
+        assistant_msgs = parsed.get("assistant_msgs", [])
+        if not user_msgs and not assistant_msgs:
+            return f"RAW_OK:{note_path}"
 
-    files_touched = parsed.get("files_touched", [])[:15]
-    files_str = ", ".join(files_touched) if files_touched else "none detected"
+        # Sample messages using same logic as generate_summary()
+        if len(user_msgs) > 20:
+            sampled_user = user_msgs[:10] + ["[... middle messages omitted ...]"] + user_msgs[-10:]
+        else:
+            sampled_user = user_msgs
+        if len(assistant_msgs) > 20:
+            sampled_asst = assistant_msgs[:10] + ["[... middle messages omitted ...]"] + assistant_msgs[-10:]
+        else:
+            sampled_asst = assistant_msgs
 
-    content = f"""# Session Summary Input (extracted from JSONL transcript)
+        user_sample = "\n---\n".join(sampled_user)[:12000]
+        assistant_sample = "\n---\n".join(sampled_asst)[:12000]
+
+        files_touched = parsed.get("files_touched", [])[:15]
+        files_str = ", ".join(files_touched) if files_touched else "none detected"
+
+        content = f"""# Session Summary Input (extracted from JSONL transcript)
 
 **Project:** {project}
 **Branch:** {git_branch}
@@ -1647,16 +1653,20 @@ def prepare_summary_input(note_path: str) -> str:
 {assistant_sample}
 """
 
-    # Write to temp file
-    temp_path = f"/tmp/ob-prep-{session_id[:8]}.md"
-    try:
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-    except OSError as exc:
-        print(f"[obsidian-brain] cannot write temp file {temp_path}: {exc}", file=sys.stderr)
-        return f"RAW_OK:{note_path}"
+        # Write to temp file (use full session_id to avoid collisions)
+        temp_path = f"/tmp/ob-prep-{session_id}.md"
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except OSError as exc:
+            print(f"[obsidian-brain] cannot write temp file {temp_path}, falling back to truncated raw note: {exc}", file=sys.stderr)
+            return f"RAW_OK:{note_path}"
 
-    return f"JSONL_PREPPED:{temp_path}:{note_path}"
+        return f"JSONL_PREPPED:{temp_path}:{note_path}"
+
+    except Exception as exc:
+        print(f"[obsidian-brain] unexpected error in JSONL prep for {os.path.basename(note_path)}: {exc}", file=sys.stderr)
+        return f"RAW_OK:{note_path}"
 
 
 def upgrade_unsummarized_note(

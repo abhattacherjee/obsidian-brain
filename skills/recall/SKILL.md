@@ -206,7 +206,9 @@ Where `<READ_PATH>` is:
 - For `RAW_OK` notes: the raw note path
 - For `JSONL_PREPPED` notes: the temp file path (e.g. `/tmp/ob-prep-{hash}.md`)
 
-When all sub-agents return, update each summarize sub-task to completed.
+When all sub-agents return, check each result:
+- If the sub-agent returned a valid summary (contains `## Summary`), update its summarize sub-task to completed.
+- If the sub-agent returned an error, empty output, or no `## Summary` section, update its summarize sub-task subject to `Failed: <basename>` and mark completed. Exclude this note from Wave 3 — it stays unsummarized for the next `/recall`. Report the failure to the user.
 
 ##### Wave 3 — Write back (parallel Bash calls)
 
@@ -236,19 +238,23 @@ SUMMARY_EOF
 
 Launch all write-back Bash calls in a single message turn.
 
-When all return, update each write-back sub-task to completed.
+When all return, parse each result:
+- If the status does NOT start with "Failed:", update the write-back sub-task to completed.
+- If the status starts with "Failed:", update the sub-task subject to `Failed: <basename>` and mark completed. Count it in the failure tally.
 
 ##### Cleanup
 
-Clean up temp files:
+Clean up only the specific temp files created in Wave 1 (not a glob — avoids racing with concurrent `/recall` invocations):
 
 ```bash
-rm -f /tmp/ob-prep-*.md
+rm -f /tmp/ob-prep-<session_id_1>.md /tmp/ob-prep-<session_id_2>.md ...
 ```
 
-Mark task #2 as completed. Report results: how many upgraded, how many skipped, how many failed.
+Mark task #2 as completed. Report results: how many upgraded, how many skipped (NO_CONTENT), how many failed.
 
 If any sub-agents returned empty or invalid summaries, report those notes as still unsummarized — they will be retried on the next `/recall`.
+
+For `NO_CONTENT` notes, inform the user: "Note `<basename>` has no session_id or conversation content. Manually edit it in Obsidian to add a summary, or delete it if it's empty."
 
 ### Step 4 — Search for project sessions and insights (parallel)
 
