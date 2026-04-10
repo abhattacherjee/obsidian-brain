@@ -2,17 +2,11 @@
 
 from __future__ import annotations
 
-import sys
 import os
 import stat
 import tempfile
 
 import pytest
-
-# Ensure hooks/ is on sys.path (conftest.py does this too, but be explicit)
-_HOOKS_DIR = os.path.join(os.path.dirname(__file__), "..", "hooks")
-if os.path.abspath(_HOOKS_DIR) not in sys.path:
-    sys.path.insert(0, os.path.abspath(_HOOKS_DIR))
 
 from open_item_dedup import (
     _strip_markdown,
@@ -601,10 +595,11 @@ def test_batch_cascade_checkoff_fuzzy_suggestions(tmp_vault):
         "myproject",
         ["Check the summarization pipeline configuration for batch recall upgrade process"],
     )
-    # Either reports fuzzy suggestions or no duplicates; if fuzzy it should mention it
+    # Must find fuzzy suggestions for high-overlap input
     assert isinstance(result, str)
-    if "fuzzy" in result.lower():
-        assert "Fuzzy suggestions" in result
+    assert "Fuzzy suggestions" in result, (
+        f"Expected fuzzy suggestions for high-overlap input, got: {result}"
+    )
 
 
 # ---------------------------------------------------------------------------

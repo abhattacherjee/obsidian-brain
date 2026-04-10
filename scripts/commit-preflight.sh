@@ -250,16 +250,22 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "🧪 Running tests..."
 
 # __HARDEN_TEST_START__
-if [ -d "tests" ] && command -v pytest &>/dev/null; then
-    echo "🧪 Running pytest with coverage..."
-    if pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90; then
-        CHECKS_RUN="${CHECKS_RUN}tests,"
+if [ -d "tests" ]; then
+    if command -v pytest &>/dev/null; then
+        echo "🧪 Running pytest with coverage..."
+        if pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90; then
+            CHECKS_RUN="${CHECKS_RUN}tests,"
+        else
+            echo "❌ Tests failed or coverage below 90%"
+            CHECKS_PASSED=false
+        fi
     else
-        echo "❌ Tests failed or coverage below 90%"
+        echo "❌ tests/ directory exists but pytest is not installed"
+        echo "   Install with: pip install pytest pytest-cov"
         CHECKS_PASSED=false
     fi
 else
-    echo "⏭️  No test runner detected — skipping tests"
+    echo "⏭️  No test directory — skipping tests"
 fi
 # __HARDEN_TEST_END__
 

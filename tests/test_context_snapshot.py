@@ -1,7 +1,3 @@
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hooks"))
 from obsidian_context_snapshot import _build_snapshot_body, _build_snapshot_note
 
 
