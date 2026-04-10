@@ -286,7 +286,7 @@ Update task #3 to `completed`. Update task #4 to `in_progress`.
 
 > **Here's what I found from your Obsidian vault for `$PROJECT`:**
 
-Then output the `CONTEXT_BRIEF` section verbatim.
+Then output the `CONTEXT_BRIEF` section. For the session history table, paraphrase each session's Title column into a concise one-line summary (under ~80 characters) that captures the key accomplishment. Keep all other columns (date, duration, branch) verbatim.
 
 If unsummarized notes were upgraded in Step 2, also mention:
 
