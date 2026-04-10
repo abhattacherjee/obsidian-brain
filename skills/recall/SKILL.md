@@ -46,9 +46,7 @@ Stop here if config is missing.
 ```
 TaskCreate: subject="Find unsummarized notes", activeForm="Searching for unsummarized notes"
 TaskCreate: subject="Summarize unsummarized notes", activeForm="Summarizing notes"
-TaskCreate: subject="Search sessions and insights", activeForm="Searching vault"
-TaskCreate: subject="Read and rank notes", activeForm="Reading notes"
-TaskCreate: subject="Compose context brief", activeForm="Composing brief"
+TaskCreate: subject="Build context brief", activeForm="Building context brief"
 TaskCreate: subject="Present results and detect completed items", activeForm="Presenting results"
 ```
 
@@ -280,11 +278,7 @@ output_mode: files_with_matches
 
 Collect both result sets.
 
-Update task #3 to `completed`.
-
 ### Step 5 — Rank and select notes
-
-Update task #4 to `in_progress`.
 
 From the session files found, sort by date (extract from frontmatter `date:` field or filename). Select:
 
@@ -299,11 +293,7 @@ Read the selected files using the Read tool. For efficiency:
 - For older sessions, read only the first 50 lines (enough for frontmatter + summary + open questions)
 - Read all insight files in full (they are typically short)
 
-Update task #4 to `completed`.
-
 ### Step 6 — Compose context brief
-
-Update task #5 to `in_progress`.
 
 Build a context brief targeting approximately 2000 tokens. Structure it as follows:
 
@@ -330,11 +320,11 @@ $ALL_INSIGHTS_CONTENT
 
 If the brief exceeds ~2000 tokens, trim older session summaries first, then truncate insight bodies (keep titles).
 
-Update task #5 to `completed`.
+Update task #3 to `completed`.
 
 ### Step 7 — Present to user
 
-Update task #6 to `in_progress`.
+Update task #4 to `in_progress`.
 
 Display:
 
@@ -467,7 +457,7 @@ The session history table from Step 6 serves as a menu — if the user picks a s
 
 If the user says they're ready to work, the context is already loaded — proceed.
 
-Update task #6 to `completed`.
+Update task #4 to `completed`.
 
 ## Edge Cases
 
