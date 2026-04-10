@@ -592,7 +592,7 @@ class TestBuildContextBriefSort:
             str(tmp_path), "sessions", "insights", "proj",
         )
 
-        assert "| 1h 20m |" in output
+        assert "1h 20m" in output
 
     def test_duration_format_minutes_only(self, tmp_path, monkeypatch):
         """Duration < 60 min should display as Xm."""
@@ -612,10 +612,10 @@ class TestBuildContextBriefSort:
             str(tmp_path), "sessions", "insights", "proj",
         )
 
-        assert "| 27m |" in output
+        assert "27m)" in output
 
     def test_duration_format_zero(self, tmp_path, monkeypatch):
-        """Duration 0 should produce empty string in column."""
+        """Duration 0 should omit duration from header."""
         monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
         sessions = tmp_path / "sessions"
@@ -632,4 +632,26 @@ class TestBuildContextBriefSort:
             str(tmp_path), "sessions", "insights", "proj",
         )
 
-        assert "|  |" in output or "| |" in output
+        # Should show (2026-04-10) without duration
+        assert "(2026-04-10)" in output
+        assert "0m" not in output
+
+    def test_summary_on_second_line(self, tmp_path, monkeypatch):
+        """Summary text should appear indented below the header line."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions = tmp_path / "sessions"
+        insights = tmp_path / "insights"
+        sessions.mkdir()
+        insights.mkdir()
+
+        _make_session_note(
+            sessions / "2026-04-10-proj-aaaa.md",
+            "proj", "2026-04-10", "main", 15, "Built the widget system end to end.",
+        )
+
+        output = obsidian_utils.build_context_brief(
+            str(tmp_path), "sessions", "insights", "proj",
+        )
+
+        assert "   Built the widget system end to end." in output

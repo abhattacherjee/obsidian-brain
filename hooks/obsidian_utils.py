@@ -1112,12 +1112,14 @@ def build_context_brief(
         except OSError:
             second_summary = "(could not read session note)"
 
-    # History table (last 5 sessions)
+    # History list (last 5 sessions) — two-line format: header + summary
     history_rows: list[str] = []
     for i, (fname, fpath, meta) in enumerate(session_files[:5]):
         date = meta.get('date', '')
-        title = meta.get('project', project)
+        h1_title = f"Session: {meta.get('project', project)}"
         branch = meta.get('git_branch', '')
+        if branch:
+            h1_title += f" ({branch})"
         # Format duration as readable time
         dur_min = meta.get('duration_minutes', 0)
         try:
@@ -1130,22 +1132,26 @@ def build_context_brief(
             duration = f"{int(dur_min)}m"
         else:
             duration = ""
+        summary_text = ""
         try:
             with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                 content_text = f.read()
-            # Prefer first sentence of ## Summary as title (more descriptive)
-            summary_match = re.search(r'## Summary\n+(.+)', content_text)
+            # Extract H1 heading for title
+            for line_text in content_text.split('\n'):
+                if line_text.startswith('# '):
+                    h1_title = line_text[2:].strip()
+                    break
+            # Extract full summary paragraph
+            summary_match = re.search(r'## Summary\n+(.+?)(?=\n\n|\n## |\Z)', content_text, re.DOTALL)
             if summary_match:
-                title = summary_match.group(1).strip()
-            else:
-                # Fall back to H1 heading
-                for line_text in content_text.split('\n'):
-                    if line_text.startswith('# '):
-                        title = line_text[2:].strip()
-                        break
+                summary_text = summary_match.group(1).strip()
         except OSError:
             pass
-        history_rows.append(f"| {date} | {duration} | {title} | {branch} |")
+        dur_part = f", {duration}" if duration else ""
+        entry = f"{i+1}. **{h1_title}** ({date}{dur_part})"
+        if summary_text:
+            entry += f"\n   {summary_text}"
+        history_rows.append(entry)
 
     # --- 3. Scan and read insights ---
     insight_entries: list[tuple[str, str]] = []  # (title, key_point)
@@ -1232,8 +1238,6 @@ def build_context_brief(
 
     if history_rows:
         brief_parts.append("\n### Recent Session History")
-        brief_parts.append("| Date | Duration | Title | Branch |")
-        brief_parts.append("|------|----------|-------|--------|")
         brief_parts.extend(history_rows)
 
     brief = "\n".join(brief_parts)
