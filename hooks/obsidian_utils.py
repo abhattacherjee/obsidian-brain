@@ -1132,25 +1132,34 @@ def build_context_brief(
             duration = f"{int(dur_min)}m"
         else:
             duration = ""
-        summary_text = ""
+        title = h1_title
+        summary_bullets: list[str] = []
         try:
             with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                 content_text = f.read()
-            # Extract H1 heading for title
-            for line_text in content_text.split('\n'):
-                if line_text.startswith('# '):
-                    h1_title = line_text[2:].strip()
-                    break
-            # Extract full summary paragraph
-            summary_match = re.search(r'## Summary\n+(.+?)(?=\n\n|\n## |\Z)', content_text, re.DOTALL)
+            # Extract full summary section
+            summary_match = re.search(r'## Summary\n+(.+?)(?=\n## |\Z)', content_text, re.DOTALL)
             if summary_match:
-                summary_text = summary_match.group(1).strip()
+                summary_body = summary_match.group(1).strip()
+                # Split into sentences for title and bullets
+                sentences = re.split(r'(?<=[.!?])\s+', summary_body)
+                sentences = [s.strip() for s in sentences if s.strip()]
+                if sentences:
+                    # First sentence as title, truncated to 80 chars
+                    first = sentences[0]
+                    if len(first) > 80:
+                        title = first[:77] + "..."
+                    else:
+                        title = first
+                    # All sentences as bullets (including first for full context)
+                    for s in sentences:
+                        summary_bullets.append(f"   - {s}")
         except OSError:
             pass
         dur_part = f", {duration}" if duration else ""
-        entry = f"{i+1}. **{h1_title}** ({date}{dur_part})"
-        if summary_text:
-            entry += f"\n   {summary_text}"
+        entry = f"{i+1}. **{title}** ({date}{dur_part})"
+        if summary_bullets:
+            entry += "\n" + "\n".join(summary_bullets)
         history_rows.append(entry)
 
     # --- 3. Scan and read insights ---

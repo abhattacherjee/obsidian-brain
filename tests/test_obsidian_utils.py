@@ -636,8 +636,8 @@ class TestBuildContextBriefSort:
         assert "(2026-04-10)" in output
         assert "0m" not in output
 
-    def test_summary_on_second_line(self, tmp_path, monkeypatch):
-        """Summary text should appear indented below the header line."""
+    def test_summary_as_bullets(self, tmp_path, monkeypatch):
+        """Summary sentences should appear as indented bullets below the header."""
         monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
         sessions = tmp_path / "sessions"
@@ -647,11 +647,39 @@ class TestBuildContextBriefSort:
 
         _make_session_note(
             sessions / "2026-04-10-proj-aaaa.md",
-            "proj", "2026-04-10", "main", 15, "Built the widget system end to end.",
+            "proj", "2026-04-10", "main", 15,
+            "Built the widget system end to end. Added 5 tests for coverage.",
         )
 
         output = obsidian_utils.build_context_brief(
             str(tmp_path), "sessions", "insights", "proj",
         )
 
-        assert "   Built the widget system end to end." in output
+        assert "   - Built the widget system end to end." in output
+        assert "   - Added 5 tests for coverage." in output
+
+    def test_title_truncation(self, tmp_path, monkeypatch):
+        """Titles longer than 80 chars should be truncated with ellipsis."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions = tmp_path / "sessions"
+        insights = tmp_path / "insights"
+        sessions.mkdir()
+        insights.mkdir()
+
+        long_sentence = "This is a very long summary sentence that exceeds eighty characters and should be truncated in the title."
+        _make_session_note(
+            sessions / "2026-04-10-proj-aaaa.md",
+            "proj", "2026-04-10", "main", 10, long_sentence,
+        )
+
+        output = obsidian_utils.build_context_brief(
+            str(tmp_path), "sessions", "insights", "proj",
+        )
+
+        # Title should be truncated (find the numbered list entry)
+        history_line = [l for l in output.split("\n") if l.startswith("1. **")][0]
+        assert "..." in history_line
+        assert len(history_line.split("**")[1]) <= 83  # 80 + "..."
+        # Full sentence should appear in bullets
+        assert f"   - {long_sentence}" in output
