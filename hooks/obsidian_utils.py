@@ -1041,15 +1041,17 @@ def build_context_brief(
     insights_dir = Path(vault_path) / insights_folder
 
     # --- 1. Scan and filter sessions ---
+    def _safe_sort_key(p: Path) -> tuple:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (p.name[:10], mtime)
+
     session_files: list[tuple[str, str, dict]] = []  # (filename, path, metadata)
     if sessions_dir.is_dir():
-        for f in sorted(
-            sessions_dir.iterdir(),
-            key=lambda p: (p.name[:10], p.stat().st_mtime),
-            reverse=True,
-        ):
-            if not f.suffix == '.md':
-                continue
+        md_files = [f for f in sessions_dir.iterdir() if f.suffix == '.md']
+        for f in sorted(md_files, key=_safe_sort_key, reverse=True):
             meta = read_note_metadata(str(f))
             if not meta:
                 continue

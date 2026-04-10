@@ -660,3 +660,48 @@ class TestBuildContextBriefSort:
         assert len(rows) == 2
         assert rows[0].startswith("| 1 |")
         assert rows[1].startswith("| 2 |")
+
+    def test_stat_failure_does_not_crash(self, tmp_path, monkeypatch):
+        """A broken symlink in the sessions dir should not crash build_context_brief."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions = tmp_path / "sessions"
+        insights = tmp_path / "insights"
+        sessions.mkdir()
+        insights.mkdir()
+
+        # Create a valid note
+        _make_session_note(
+            sessions / "2026-04-10-proj-aaaa.md",
+            "proj", "2026-04-10", "main", 15, "Valid session.",
+        )
+        # Create a broken symlink (.md suffix so it passes the filter)
+        broken = sessions / "2026-04-10-proj-broken.md"
+        broken.symlink_to(tmp_path / "nonexistent-target.md")
+
+        output = obsidian_utils.build_context_brief(
+            str(tmp_path), "sessions", "insights", "proj",
+        )
+
+        # Should still produce output with the valid session
+        assert "Valid session." in output
+
+    def test_duration_boundary_60_minutes(self, tmp_path, monkeypatch):
+        """Duration of exactly 60 min should display as 1h 0m."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions = tmp_path / "sessions"
+        insights = tmp_path / "insights"
+        sessions.mkdir()
+        insights.mkdir()
+
+        _make_session_note(
+            sessions / "2026-04-10-proj-aaaa.md",
+            "proj", "2026-04-10", "main", 60, "Boundary session.",
+        )
+
+        output = obsidian_utils.build_context_brief(
+            str(tmp_path), "sessions", "insights", "proj",
+        )
+
+        assert "| 1h 0m |" in output
