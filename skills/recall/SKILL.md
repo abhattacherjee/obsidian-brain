@@ -2,7 +2,7 @@
 name: recall
 description: "Loads historical context from the Obsidian vault for the current project. Summarizes any unsummarized session notes, then presents a context brief with recent sessions, open items, and curated insights. Also auto-detects open items completed in the most recent loaded session and offers to check them off. Use when: (1) /recall command, (2) /recall <project-name>, (3) resuming work on a project and wanting prior context."
 metadata:
-  version: 1.2.0
+  version: 1.3.0
 ---
 
 # Recall — Load Project Context from Obsidian Vault
@@ -41,6 +41,19 @@ If the output is empty or errors, tell the user:
 
 Stop here if config is missing.
 
+**Create the task manifest** for the full `/recall` flow:
+
+```
+TaskCreate: subject="Find unsummarized notes", activeForm="Searching for unsummarized notes"
+TaskCreate: subject="Summarize unsummarized notes", activeForm="Summarizing notes"
+TaskCreate: subject="Search sessions and insights", activeForm="Searching vault"
+TaskCreate: subject="Read and rank notes", activeForm="Reading notes"
+TaskCreate: subject="Compose context brief", activeForm="Composing brief"
+TaskCreate: subject="Present results and detect completed items", activeForm="Presenting results"
+```
+
+Track the returned task IDs — you will update them as each step completes. Immediately set task #1 to `in_progress` via TaskUpdate.
+
 ### Step 2 — Derive project name
 
 If the user passed a project name argument (e.g. `/recall my-project`), use that.
@@ -59,13 +72,9 @@ Store as `PROJECT`. Normalize: lowercase, hyphens for spaces.
 >
 > If Grep finds any file matching both "AI summary unavailable" AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 4. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
 >
-> **Large-note handling:** If the `Read` tool errors because the raw note exceeds the 10k token limit, use `offset` + `limit` to read it in chunks (e.g. `limit: 80` repeatedly) and concatenate mentally. Do NOT use that error as a reason to skip the upgrade.
->
-> **Missing-JSONL fallback:** If `find_transcript_jsonl` returns null, you still produce a summary — from the raw note itself, with the fallback disclaimer specified in sub-step 4. Null JSONL is not a skip signal.
->
 > **Visibility requirement:** Before Step 4, emit a one-line status: `Step 3: processing N unsummarized note(s) for $PROJECT` (or `Step 3: no unsummarized notes for $PROJECT` if the intersection is empty). This makes the decision auditable in the tool trace.
 
-This is the critical upgrade step. Search for raw/unsummarized session notes matching this project, and prefer the original Claude Code transcript JSONL over the truncated raw note when the JSONL has more data.
+Search for raw/unsummarized session notes matching this project.
 
 Use Grep to find notes containing the "AI summary unavailable" marker in the sessions folder:
 
@@ -83,30 +92,39 @@ path: <each matched file>
 output_mode: content
 ```
 
-For each file that matches BOTH conditions (unsummarized AND belongs to this project):
+Count the files that match BOTH conditions (unsummarized AND belongs to this project). Store as `N`.
 
-1. **Run the upgrade pipeline in Python** — a single Bash call that handles JSONL lookup, transcript parsing, source decision, AI summarization, dedup, and atomic write:
+Update task #1 to completed. Update task #2 subject to `Summarize N unsummarized note(s)` and set to `in_progress`.
 
-   ```bash
-   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-   python3 -c '
-   import sys
-   sys.path.insert(0, "hooks")
-   from obsidian_utils import upgrade_unsummarized_note
-   status = upgrade_unsummarized_note(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
-   print(status)
-   ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
-   ```
+#### Path A: N=0 (no unsummarized notes)
 
-   Where `$NOTE_PATH` is the full path of the unsummarized note. The function returns a one-line status like:
-   - `"Upgraded 2026-04-07-obsidian-brain-aeb5.md (source: JSONL transcript), deduped 2 item(s)"`
-   - `"Failed: AI summarization returned empty for 2026-04-07-obsidian-brain-aeb5.md"`
+Update task #2 subject to `No unsummarized notes found` and set to `completed`. Skip to Step 4.
 
-   Report the status to the user. If it starts with "Failed:", **collect the note path into a fallback list** but continue to the next unsummarized note.
+#### Path B: N=1 (single note — Python pipeline)
 
-2. **Sub-agent fallback for failed notes.** If any notes returned "Failed:" status:
+Create a sub-task for the note:
 
-   For each failed note, spawn a sub-agent in parallel using the Agent tool:
+```
+TaskCreate: subject="Haiku pipeline: <basename>", activeForm="Summarizing <basename> via Haiku"
+```
+
+Run the upgrade pipeline in Python:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys
+sys.path.insert(0, "hooks")
+from obsidian_utils import upgrade_unsummarized_note
+status = upgrade_unsummarized_note(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
+print(status)
+' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
+```
+
+If the status starts with "Failed:", use the sub-agent fallback:
+
+1. Update the sub-task subject to `Sub-agent fallback: <basename>`.
+2. Spawn a single sub-agent:
 
    ```
    Agent({
@@ -115,10 +133,7 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    })
    ```
 
-   Invoke multiple Agent tool calls in the same response turn (one per failed note) so they run in parallel. When each sub-agent returns its structured summary text:
-
-   - If the sub-agent returned an error or empty output, skip that note — log the failure and continue.
-   - Otherwise, pass the returned summary text to the Python pipeline via a heredoc. The Agent tool's return value is text in your context — write it into the heredoc verbatim:
+3. If the sub-agent returns a valid summary, write it back via heredoc:
 
    ```bash
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -130,30 +145,120 @@ For each file that matches BOTH conditions (unsummarized AND belongs to this pro
    status = upgrade_note_with_summary(sys.argv[1], summary, sys.argv[2], sys.argv[3], sys.argv[4])
    print(status)
    ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" <<'SUMMARY_EOF'
-## Summary
-1-3 sentence overview from the sub-agent.
-
-## Key Decisions
-- Example bullet from the sub-agent.
-
-## Changes Made
-- Example bullet from the sub-agent.
-
-## Errors Encountered
-None.
-
-## Open Questions / Next Steps
-- [ ] Example follow-up item.
-SUMMARY_EOF
+   <paste sub-agent summary here at column 0, no leading indentation>
+   SUMMARY_EOF
    ```
 
-   **Important:** Paste the sub-agent summary into the heredoc verbatim with NO leading indentation. Start `## Summary` at column 0, and keep the closing `SUMMARY_EOF` terminator at column 0 as well. Leading spaces before the summary content will cause `upgrade_note_with_summary()` validation to fail, and leading spaces before `SUMMARY_EOF` will prevent the heredoc from terminating correctly.
+   **Important:** Paste the sub-agent summary into the heredoc verbatim with NO leading indentation. Start `## Summary` at column 0, and keep the closing `SUMMARY_EOF` terminator at column 0 as well.
 
-   Report each result. If the pipeline returns "Failed:", note it but continue — the note stays unsummarized for the next `/recall`.
+Mark the sub-task and task #2 as completed. Report the result.
 
-If no unsummarized notes are found for this project, skip to Step 4.
+#### Path C: N>=2 (batch — sub-agent-first, three waves)
+
+##### Wave 1 — Prep (parallel Bash calls)
+
+Create a prep sub-task for each note:
+
+```
+TaskCreate: subject="Prep: <basename>", activeForm="Prepping <basename>"
+```
+
+For each unsummarized note, run a parallel Bash call:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys
+sys.path.insert(0, "hooks")
+from obsidian_utils import prepare_summary_input
+result = prepare_summary_input(sys.argv[1])
+print(result)
+' "$NOTE_PATH"
+```
+
+Launch all N Bash calls in a single message turn so they run in parallel.
+
+When all return, update each prep sub-task to completed (include result in subject: e.g. `Prep: ...2322.md (RAW_OK)` or `Prep: ...4653.md (JSONL_PREPPED)`).
+
+Parse each result:
+- `RAW_OK:<note_path>` → sub-agent will read the raw note path
+- `JSONL_PREPPED:<temp_path>:<note_path>` → sub-agent will read the temp file path; track `<note_path>` for Wave 3
+- `NO_CONTENT:<note_path>` → skip this note, report to user
+
+##### Wave 2 — Summarize (parallel sub-agents)
+
+Create a summarize sub-task for each note (excluding NO_CONTENT):
+
+```
+TaskCreate: subject="Summarize: <basename>", activeForm="Summarizing <basename>"
+```
+
+Spawn all sub-agents in a **single message turn** so they run in parallel:
+
+```
+Agent({
+  description: "Summarize session note <basename>",
+  prompt: "Read the file at <READ_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nReturn ONLY these markdown sections. No preamble, no commentary."
+})
+```
+
+Where `<READ_PATH>` is:
+- For `RAW_OK` notes: the raw note path
+- For `JSONL_PREPPED` notes: the temp file path (e.g. `/tmp/ob-prep-{hash}.md`)
+
+When all sub-agents return, check each result:
+- If the sub-agent returned a valid summary (contains `## Summary`), update its summarize sub-task to completed.
+- If the sub-agent returned an error, empty output, or no `## Summary` section, update its summarize sub-task subject to `Failed: <basename>` and mark completed. Exclude this note from Wave 3 — it stays unsummarized for the next `/recall`. Report the failure to the user.
+
+##### Wave 3 — Write back (parallel Bash calls)
+
+Create a write-back sub-task for each note that got a valid summary:
+
+```
+TaskCreate: subject="Write back: <basename>", activeForm="Writing <basename>"
+```
+
+For each sub-agent that returned a valid summary (contains `## Summary`), pipe it through `upgrade_note_with_summary()` via a heredoc:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys
+sys.path.insert(0, "hooks")
+from obsidian_utils import upgrade_note_with_summary
+summary = sys.stdin.read()
+status = upgrade_note_with_summary(sys.argv[1], summary, sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+print(status)
+' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "sub-agent" <<'SUMMARY_EOF'
+<paste sub-agent summary here at column 0>
+SUMMARY_EOF
+```
+
+**Important:** The `$NOTE_PATH` here is always the **original vault note path** (not the temp file), even for JSONL_PREPPED notes.
+
+Launch all write-back Bash calls in a single message turn.
+
+When all return, parse each result:
+- If the status does NOT start with "Failed:", update the write-back sub-task to completed.
+- If the status starts with "Failed:", update the sub-task subject to `Failed: <basename>` and mark completed. Count it in the failure tally.
+
+##### Cleanup
+
+Clean up only the specific temp files created in Wave 1 (not a glob — avoids racing with concurrent `/recall` invocations):
+
+```bash
+rm -f /tmp/ob-prep-<session_id_1>.md /tmp/ob-prep-<session_id_2>.md ...
+```
+
+Mark task #2 as completed. Report results: how many upgraded, how many skipped (NO_CONTENT), how many failed.
+
+If any sub-agents returned empty or invalid summaries, report those notes as still unsummarized — they will be retried on the next `/recall`.
+
+For `NO_CONTENT` notes, inform the user: "Note `<basename>` has no session_id or conversation content. Manually edit it in Obsidian to add a summary, or delete it if it's empty."
 
 ### Step 4 — Search for project sessions and insights (parallel)
+
+Update task #3 to `in_progress`.
 
 Run these two searches in parallel using Grep:
 
@@ -175,7 +280,11 @@ output_mode: files_with_matches
 
 Collect both result sets.
 
+Update task #3 to `completed`.
+
 ### Step 5 — Rank and select notes
+
+Update task #4 to `in_progress`.
 
 From the session files found, sort by date (extract from frontmatter `date:` field or filename). Select:
 
@@ -190,7 +299,11 @@ Read the selected files using the Read tool. For efficiency:
 - For older sessions, read only the first 50 lines (enough for frontmatter + summary + open questions)
 - Read all insight files in full (they are typically short)
 
+Update task #4 to `completed`.
+
 ### Step 6 — Compose context brief
+
+Update task #5 to `in_progress`.
 
 Build a context brief targeting approximately 2000 tokens. Structure it as follows:
 
@@ -217,7 +330,11 @@ $ALL_INSIGHTS_CONTENT
 
 If the brief exceeds ~2000 tokens, trim older session summaries first, then truncate insight bodies (keep titles).
 
+Update task #5 to `completed`.
+
 ### Step 7 — Present to user
+
+Update task #6 to `in_progress`.
 
 Display:
 
@@ -349,6 +466,8 @@ After the context brief, explicitly list what was loaded into the conversation s
 The session history table from Step 6 serves as a menu — if the user picks a session by name or date, use the Read tool to load that specific file and present its full contents.
 
 If the user says they're ready to work, the context is already loaded — proceed.
+
+Update task #6 to `completed`.
 
 ## Edge Cases
 

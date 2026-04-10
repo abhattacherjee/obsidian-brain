@@ -1558,6 +1558,117 @@ def upgrade_note_with_summary(
     return status
 
 
+def prepare_summary_input(note_path: str) -> str:
+    """Check if raw note would truncate; if so, extract JSONL to temp file.
+
+    Called by /recall Step 3 before spawning sub-agents. Determines
+    whether the sub-agent should read the raw note directly or a
+    pre-extracted JSONL temp file with sampled messages.
+
+    Returns one of:
+      RAW_OK:<note_path>
+      JSONL_PREPPED:<temp_file_path>:<note_path>
+      NO_CONTENT:<note_path>
+    """
+    # Read only frontmatter (first 20 lines) — avoids loading large raw notes into memory
+    try:
+        with open(note_path, 'r', encoding='utf-8') as f:
+            raw_lines = [f.readline() for _ in range(20)]
+    except OSError as exc:
+        print(f"[obsidian-brain] cannot read {os.path.basename(note_path)}: {exc}", file=sys.stderr)
+        return f"NO_CONTENT:{note_path}"
+
+    session_id = None
+    project = "unknown"
+    git_branch = "unknown"
+    duration_minutes = 0.0
+    for line in raw_lines:
+        stripped = line.strip()
+        if stripped.startswith('session_id:'):
+            session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+        elif stripped.startswith('project:'):
+            project = stripped.split(':', 1)[1].strip().strip('"')
+        elif stripped.startswith('git_branch:'):
+            git_branch = stripped.split(':', 1)[1].strip().strip('"')
+        elif stripped.startswith('duration_minutes:'):
+            try:
+                duration_minutes = float(stripped.split(':', 1)[1].strip())
+            except ValueError:
+                pass
+
+    if not session_id:
+        print(f"[obsidian-brain] no session_id in {os.path.basename(note_path)}", file=sys.stderr)
+        return f"NO_CONTENT:{note_path}"
+
+    # Find and parse JSONL transcript
+    try:
+        jsonl_path = find_transcript_jsonl(session_id)
+        if not jsonl_path:
+            return f"RAW_OK:{note_path}"
+
+        parsed = parse_full_transcript(jsonl_path)
+
+        # Surface transcript warnings (Issue #1: never discard these)
+        for w in parsed.get("warnings", []):
+            print(f"[obsidian-brain] transcript warning for {os.path.basename(note_path)}: {w}", file=sys.stderr)
+
+        if not parsed.get("raw_note_would_truncate", False):
+            return f"RAW_OK:{note_path}"
+
+        # Raw note would truncate — extract JSONL content to temp file
+        user_msgs = parsed.get("user_msgs", [])
+        assistant_msgs = parsed.get("assistant_msgs", [])
+        if not user_msgs and not assistant_msgs:
+            return f"RAW_OK:{note_path}"
+
+        # Sample messages using same logic as generate_summary()
+        if len(user_msgs) > 20:
+            sampled_user = user_msgs[:10] + ["[... middle messages omitted ...]"] + user_msgs[-10:]
+        else:
+            sampled_user = user_msgs
+        if len(assistant_msgs) > 20:
+            sampled_asst = assistant_msgs[:10] + ["[... middle messages omitted ...]"] + assistant_msgs[-10:]
+        else:
+            sampled_asst = assistant_msgs
+
+        user_sample = "\n---\n".join(sampled_user)[:12000]
+        assistant_sample = "\n---\n".join(sampled_asst)[:12000]
+
+        files_touched = parsed.get("files_touched", [])[:15]
+        files_str = ", ".join(files_touched) if files_touched else "none detected"
+
+        content = f"""# Session Summary Input (extracted from JSONL transcript)
+
+**Project:** {project}
+**Branch:** {git_branch}
+**Duration:** {duration_minutes} minutes
+**Files touched:** {files_str}
+
+## Conversation
+
+### User Messages (sampled)
+{user_sample}
+
+### Assistant Messages (sampled)
+{assistant_sample}
+"""
+
+        # Write to temp file (use full session_id to avoid collisions)
+        temp_path = f"/tmp/ob-prep-{session_id}.md"
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except OSError as exc:
+            print(f"[obsidian-brain] cannot write temp file {temp_path}, falling back to truncated raw note: {exc}", file=sys.stderr)
+            return f"RAW_OK:{note_path}"
+
+        return f"JSONL_PREPPED:{temp_path}:{note_path}"
+
+    except Exception as exc:
+        print(f"[obsidian-brain] unexpected error in JSONL prep for {os.path.basename(note_path)}: {exc}", file=sys.stderr)
+        return f"RAW_OK:{note_path}"
+
+
 def upgrade_unsummarized_note(
     note_path: str,
     vault_path: str,
