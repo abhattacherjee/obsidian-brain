@@ -1141,18 +1141,15 @@ def build_context_brief(
             summary_match = re.search(r'## Summary\n+(.+?)(?=\n## |\Z)', content_text, re.DOTALL)
             if summary_match:
                 summary_body = summary_match.group(1).strip()
-                # Split into sentences for title and bullets
+                # First line of summary as title (full, no truncation)
+                first_line = summary_body.split('\n')[0].strip()
+                if first_line:
+                    title = first_line
+                # All sentences as bullets
                 sentences = re.split(r'(?<=[.!?])\s+', summary_body)
-                sentences = [s.strip() for s in sentences if s.strip()]
-                if sentences:
-                    # First sentence as title, truncated to 80 chars
-                    first = sentences[0]
-                    if len(first) > 80:
-                        title = first[:77] + "..."
-                    else:
-                        title = first
-                    # All sentences as bullets (including first for full context)
-                    for s in sentences:
+                for s in sentences:
+                    s = s.strip()
+                    if s:
                         summary_bullets.append(f"   - {s}")
         except OSError:
             pass

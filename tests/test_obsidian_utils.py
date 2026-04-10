@@ -658,8 +658,8 @@ class TestBuildContextBriefSort:
         assert "   - Built the widget system end to end." in output
         assert "   - Added 5 tests for coverage." in output
 
-    def test_title_truncation(self, tmp_path, monkeypatch):
-        """Titles longer than 80 chars should be truncated with ellipsis."""
+    def test_title_uses_full_first_sentence(self, tmp_path, monkeypatch):
+        """Title should be the full first line of summary, not truncated."""
         monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
         sessions = tmp_path / "sessions"
@@ -667,19 +667,20 @@ class TestBuildContextBriefSort:
         sessions.mkdir()
         insights.mkdir()
 
-        long_sentence = "This is a very long summary sentence that exceeds eighty characters and should be truncated in the title."
+        long_sentence = "This is a very long summary sentence that exceeds eighty characters and should appear in full as the title."
         _make_session_note(
             sessions / "2026-04-10-proj-aaaa.md",
-            "proj", "2026-04-10", "main", 10, long_sentence,
+            "proj", "2026-04-10", "main", 10,
+            long_sentence + " Second sentence here.",
         )
 
         output = obsidian_utils.build_context_brief(
             str(tmp_path), "sessions", "insights", "proj",
         )
 
-        # Title should be truncated (find the numbered list entry)
+        # Title should contain the full first sentence
         history_line = [l for l in output.split("\n") if l.startswith("1. **")][0]
-        assert "..." in history_line
-        assert len(history_line.split("**")[1]) <= 83  # 80 + "..."
-        # Full sentence should appear in bullets
+        assert long_sentence in history_line
+        # Full content should appear in bullets
         assert f"   - {long_sentence}" in output
+        assert "   - Second sentence here." in output
