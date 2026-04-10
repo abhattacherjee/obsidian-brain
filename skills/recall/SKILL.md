@@ -81,7 +81,21 @@ path: <each matched file>
 output_mode: content
 ```
 
-Count the files that match BOTH conditions (unsummarized AND belongs to this project). Store as `N`.
+**Defense-in-depth:** For each file matching both conditions, also verify it genuinely needs summarization by checking if it already has a real `## Summary` section. Use Grep:
+
+```
+pattern: "^## Summary"
+path: <each matched file>
+output_mode: count
+```
+
+If the note has `## Summary` AND does NOT contain `"AI summary unavailable"`, it was summarized by a legacy code path that forgot to flip the status. Skip it (it's already done) and fix the status field:
+
+```bash
+sed -i '' 's/^status: auto-logged/status: summarized/' "$FILE_PATH"
+```
+
+Count only the genuinely unsummarized files. Store as `N`.
 
 Update task #1 to completed. Update task #2 subject to `Summarize N unsummarized note(s)` and set to `in_progress`.
 
