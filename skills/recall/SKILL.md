@@ -68,16 +68,16 @@ Store as `PROJECT`. Normalize: lowercase, hyphens for spaces.
 
 > ⚠️ **THIS STEP IS MANDATORY. DO NOT SKIP IT.**
 >
-> If Grep finds any file matching both "AI summary unavailable" AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 4. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
+> If Grep finds any file matching both `status: auto-logged` AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 4. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
 >
 > **Visibility requirement:** Before Step 4, emit a one-line status: `Step 3: processing N unsummarized note(s) for $PROJECT` (or `Step 3: no unsummarized notes for $PROJECT` if the intersection is empty). This makes the decision auditable in the tool trace.
 
 Search for raw/unsummarized session notes matching this project.
 
-Use Grep to find notes containing the "AI summary unavailable" marker in the sessions folder:
+Use Grep to find unsummarized notes via frontmatter status (NOT body text — body text matches cause false positives from logged tool usage):
 
 ```
-pattern: "AI summary unavailable"
+pattern: "^status: auto-logged"
 path: $VAULT_PATH/$SESSIONS_FOLDER/
 output_mode: files_with_matches
 ```

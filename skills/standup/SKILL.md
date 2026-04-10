@@ -154,16 +154,16 @@ Stop here.
 
 ### Step 5 — Identify unsummarized session notes
 
-From `MATCHED_FILES`, isolate those in `$SESSIONS_FOLDER/`. Use Grep to check each for the unsummarized marker:
+From `MATCHED_FILES`, isolate those in `$SESSIONS_FOLDER/`. Use Grep to check each for the unsummarized frontmatter status (NOT body text — body text matches cause false positives from logged tool usage):
 
 ```
-pattern: "AI summary unavailable"
+pattern: "^status: auto-logged"
 path: <each session file>
 output_mode: files_with_matches
 ```
 
 Split into:
-- `UNSUMMARIZED` — session files containing "AI summary unavailable"
+- `UNSUMMARIZED` — session files with `status: auto-logged` in frontmatter
 - `SUMMARIZED` — all other matched files (sessions + insights)
 
 ### Step 6 — Deferred summarization for unsummarized notes
