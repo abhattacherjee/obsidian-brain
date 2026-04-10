@@ -254,50 +254,52 @@ If any sub-agents returned empty or invalid summaries, report those notes as sti
 
 For `NO_CONTENT` notes, inform the user: "Note `<basename>` has no session_id or conversation content. Manually edit it in Obsidian to add a summary, or delete it if it's empty."
 
-### Step 4 — Search for project sessions and insights (parallel)
+### Step 4 — Build context brief (sub-agent)
 
 Update task #3 to `in_progress`.
 
-Run these two searches in parallel using Grep:
-
-**Search A — Sessions:**
+Dispatch a single sub-agent to search, read, rank, compose the context brief, and detect completed open items. The sub-agent does all the heavy file reading in its own context — the parent only receives the compact result.
 
 ```
-pattern: "project: $PROJECT"
-path: $VAULT_PATH/$SESSIONS_FOLDER/
-output_mode: files_with_matches
-```
+Agent({
+  description: "Build recall context brief for $PROJECT",
+  prompt: "You are building a context brief for the obsidian-brain /recall skill.
 
-**Search B — Insights:**
+VAULT_PATH: $VAULT_PATH
+SESSIONS_FOLDER: $SESSIONS_FOLDER
+INSIGHTS_FOLDER: $INSIGHTS_FOLDER
+PROJECT: $PROJECT
+UPGRADED_COUNT: <number of notes upgraded in Step 3, or 0>
 
-```
-pattern: "project: $PROJECT"
-path: $VAULT_PATH/$INSIGHTS_FOLDER/
-output_mode: files_with_matches
-```
+## Your task
 
-Collect both result sets.
+### 1. Search for project sessions and insights (parallel Grep)
 
-### Step 5 — Rank and select notes
+Run these two searches in parallel:
 
-From the session files found, sort by date (extract from frontmatter `date:` field or filename). Select:
+Search A — Sessions:
+  pattern: 'project: $PROJECT'
+  path: $VAULT_PATH/$SESSIONS_FOLDER/
+  output_mode: files_with_matches
 
-- **Most recent session** — read in full (this is the primary context). Store its full path as `MOST_RECENT_SESSION_PATH` for use in Step 7.5.
-- **Second most recent session** — read summary + open questions only
-- **Last 5 sessions** — collect titles and dates for the session list
+Search B — Insights:
+  pattern: 'project: $PROJECT'
+  path: $VAULT_PATH/$INSIGHTS_FOLDER/
+  output_mode: files_with_matches
 
-From the insights files found, include **all of them** — insights are curated and always relevant.
+### 2. Rank and select notes
 
-Read the selected files using the Read tool. For efficiency:
-- Read the most recent session in full
-- For older sessions, read only the first 50 lines (enough for frontmatter + summary + open questions)
-- Read all insight files in full (they are typically short)
+From session files, sort by date (from frontmatter or filename). Select:
+- Most recent session — read in full. Store its path.
+- Second most recent — read first 50 lines (frontmatter + summary + open questions)
+- Last 5 sessions — collect titles, dates, branches for the history table
 
-### Step 6 — Compose context brief
+From insight files, read ALL of them in full (they are short).
 
-Build a context brief targeting approximately 2000 tokens. Structure it as follows:
+### 3. Compose context brief (~2000 tokens)
 
-```
+Build this structure:
+
 ## Project Context: $PROJECT
 
 ### Last Session ($DATE)
@@ -310,137 +312,96 @@ $OPEN_QUESTIONS_FROM_MOST_RECENT_SESSION
 $BRIEF_SUMMARY_FROM_SECOND_SESSION
 
 ### Curated Insights
-$ALL_INSIGHTS_CONTENT
+$ALL_INSIGHTS_CONTENT (titles + key points, trim if exceeding ~500 tokens)
 
 ### Recent Session History
 | Date | Title | Branch |
 |------|-------|--------|
 | ... last 5 sessions ... |
-```
 
 If the brief exceeds ~2000 tokens, trim older session summaries first, then truncate insight bodies (keep titles).
 
+### 4. Detect completed open items
+
+Run this Bash command:
+
+cd \"\$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"
+python3 -c '
+import sys, json
+sys.path.insert(0, \"hooks\")
+from obsidian_utils import match_items_against_evidence
+from open_item_dedup import collect_open_items
+
+vault_path, sessions_folder, project = sys.argv[1], sys.argv[2], sys.argv[3]
+evidence_file = sys.argv[4]
+
+try:
+    with open(evidence_file, \"r\") as f:
+        content = f.read()
+    import re as _re
+    evidence_parts = []
+    for section in [\"Summary\", \"Key Decisions\", \"Changes Made\", \"Errors Encountered\"]:
+        m = _re.search(rf\"## {section}\n(.*?)(?=\n## |\Z)\", content, _re.DOTALL)
+        if m:
+            evidence_parts.append(m.group(1))
+    evidence = \"\n\".join(evidence_parts) if evidence_parts else content
+except OSError:
+    print(\"NO_CANDIDATES\")
+    sys.exit(0)
+
+items = collect_open_items(vault_path, sessions_folder, project)
+if not items:
+    print(\"NO_ITEMS\")
+    sys.exit(0)
+
+candidates = match_items_against_evidence(evidence, items)
+if not candidates:
+    print(\"NO_CANDIDATES\")
+else:
+    filtered = [c for c in candidates if c.get(\"confidence\", 0) >= 3]
+    print(json.dumps(filtered) if filtered else \"NO_CANDIDATES\")
+' \"$VAULT_PATH\" \"$SESSIONS_FOLDER\" \"$PROJECT\" \"<MOST_RECENT_SESSION_PATH>\"
+
+Where <MOST_RECENT_SESSION_PATH> is the full path of the most recent session note you read in step 2.
+
+### 5. Return format
+
+Return EXACTLY this structured format with labeled sections. Do NOT add preamble or commentary outside these sections:
+
+CONTEXT_BRIEF:
+<the composed brief from step 3>
+
+LOAD_MANIFEST:
+full_session_title: <title of most recent session>
+full_session_date: <date>
+full_session_path: <full file path>
+summary_session_title: <title of second session>
+summary_session_date: <date>
+insight_count: <number of insight files found>
+
+MOST_RECENT_SESSION_PATH:
+<full path of most recent session note>
+
+OPEN_ITEM_CANDIDATES:
+<output from step 4 — either NO_CANDIDATES, NO_ITEMS, or a JSON array>
+
+## Edge cases
+- No sessions found: set CONTEXT_BRIEF to 'No session history found for $PROJECT.'
+- No insights found: omit Curated Insights section from brief, set insight_count to 0
+- Very large vault (50+ sessions): only grep, never glob. Limit reads to 5 most recent sessions + all insights."
+})
+```
+
+**Parse the sub-agent return.** Split the returned text on the section labels:
+
+1. Extract `CONTEXT_BRIEF:` — everything between `CONTEXT_BRIEF:` and `LOAD_MANIFEST:`. This is the brief to display.
+2. Extract `LOAD_MANIFEST:` — parse `full_session_title`, `full_session_date`, `full_session_path`, `summary_session_title`, `summary_session_date`, `insight_count`.
+3. Extract `MOST_RECENT_SESSION_PATH:` — the full path for checkoff edits.
+4. Extract `OPEN_ITEM_CANDIDATES:` — either `NO_CANDIDATES`, `NO_ITEMS`, or a JSON array.
+
+**Fallback:** If the sub-agent returns empty, errors, or the return does not contain `CONTEXT_BRIEF:`, fall back to performing Steps 4-6 in-context (the original flow: grep sessions + insights, read files, compose brief). Log a warning: "Context builder sub-agent failed, falling back to in-context reads."
+
 Update task #3 to `completed`.
-
-### Step 7 — Present to user
-
-Update task #4 to `in_progress`.
-
-Display:
-
-> **Here's what I found from your Obsidian vault for `$PROJECT`:**
-
-Then output the context brief from Step 6.
-
-If unsummarized notes were upgraded in Step 3, also mention:
-
-> _Upgraded N session note(s) with AI summaries._
-
-### Step 7.5 — Detect completed open items (project-scoped auto-detect)
-
-After presenting the context brief, scan the loaded context for evidence that any open items have been completed.
-
-1. **Match open items against evidence in Python.** Run a single Bash call that collects open items and matches them against the most recent session note:
-
-   ```bash
-   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-   python3 -c '
-   import sys, json
-   sys.path.insert(0, "hooks")
-   from obsidian_utils import match_items_against_evidence
-   from open_item_dedup import collect_open_items
-
-   vault_path, sessions_folder, project = sys.argv[1], sys.argv[2], sys.argv[3]
-   evidence_file = sys.argv[4]
-
-   try:
-       with open(evidence_file, "r") as f:
-           content = f.read()
-       # Extract only evidence sections (Summary, Changes, Errors) — exclude
-       # Open Questions to avoid self-matching open items as candidates
-       import re as _re
-       evidence_parts = []
-       for section in ["Summary", "Key Decisions", "Changes Made", "Errors Encountered"]:
-           m = _re.search(rf"## {section}\n(.*?)(?=\n## |\Z)", content, _re.DOTALL)
-           if m:
-               evidence_parts.append(m.group(1))
-       evidence = "\n".join(evidence_parts) if evidence_parts else content
-   except OSError as exc:
-       print("NO_CANDIDATES")
-       sys.exit(0)
-
-   items = collect_open_items(vault_path, sessions_folder, project)
-   if not items:
-       print("NO_ITEMS")
-       sys.exit(0)
-
-   candidates = match_items_against_evidence(evidence, items)
-   if not candidates:
-       print("NO_CANDIDATES")
-   else:
-       print(json.dumps(candidates))
-   ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$MOST_RECENT_SESSION_PATH"
-   ```
-
-   Where `$MOST_RECENT_SESSION_PATH` is the path to the most recent session note (already read in Step 5).
-
-2. **Skip if no candidates.** If the output is `NO_ITEMS` or `NO_CANDIDATES`, skip to Step 8 silently.
-
-3. **Parse candidates.** The JSON array contains objects with `file`, `line`, `text`, `evidence`, `confidence`, `has_completion_phrase`. Only present items with `confidence >= 3` to the user.
-
-4. **Present candidates to user.** Print:
-
-```
-I noticed these open items may now be done:
-
-1. [x] <item text>
-     From: <basename of source file>
-     Evidence: "<short snippet from EVIDENCE_TEXT showing the match>"
-
-2. [x] <item text>
-     ...
-
-Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
-```
-
-5. **Wait for user response.** Parse the response:
-   - `none` or empty → skip checkoff entirely, proceed to Step 8
-   - `all` → check off all candidates
-   - Comma-separated numbers (e.g. `1,3`) → check off only those
-
-6. **For each confirmed checkoff, edit the source file.** Use Read to load the full source file. Find the exact line containing `- [ ] <item text>`. Replace it with `- [x] <item text>`. Use the Edit tool with `replace_all: false` and provide enough context (the full line plus the line before and after if available) to ensure uniqueness within the file. If the line is ambiguous (multiple matches), skip that item and warn:
-
-```
-⚠️  Could not check off item "<item text>" — line is not unique in <file>. Edit manually in Obsidian.
-```
-
-7. **Confirm checkoffs to user.** Print:
-
-```
-✅ Checked off N item(s) across <list of files>.
-```
-
-8. **Cascade check-offs to duplicate items in older notes.** Run a single Bash call that collects, matches, and edits files in Python:
-
-    ```bash
-    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-    python3 -c '
-    import sys, json
-    sys.path.insert(0, "hooks")
-    from open_item_dedup import batch_cascade_checkoff
-    items = json.loads(sys.argv[4])
-    summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
-    print(summary)
-    ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$CHECKED_ITEMS_JSON"
-    ```
-
-    Before running, construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts from sub-step 5. Use a Bash heredoc or inline Python to build it:
-    ```bash
-    CHECKED_ITEMS_JSON=$(python3 -c "import json; print(json.dumps([\"Git-flow migration spec pending\", \"Land PR #14\"]))")
-    ```
-    Replace the example items with the actual confirmed item texts. Then run the cascade command above. Report the cascade summary to the user alongside the checkoff confirmation.
-
-Then proceed to Step 8.
 
 ### Step 8 — Show load manifest and offer options
 
