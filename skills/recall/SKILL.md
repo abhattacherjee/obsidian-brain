@@ -2,7 +2,7 @@
 name: recall
 description: "Loads historical context from the Obsidian vault for the current project. Summarizes any unsummarized session notes, then presents a context brief with recent sessions, open items, and curated insights. Also auto-detects open items completed in the most recent loaded session and offers to check them off. Use when: (1) /recall command, (2) /recall <project-name>, (3) resuming work on a project and wanting prior context."
 metadata:
-  version: 1.3.0
+  version: 1.4.0
 ---
 
 # Recall — Load Project Context from Obsidian Vault
@@ -15,25 +15,28 @@ Searches the Obsidian vault for session notes and insights matching the current 
 
 Follow these steps exactly. Do not skip steps or reorder them.
 
-### Step 1 — Load config
+### Step 1 — Load config and derive project
 
-Run:
+Run a single call that loads config and derives the project name (saves one parent round):
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys
+import sys, os
 sys.path.insert(0, "hooks")
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
     print("ERROR: vault_path not configured", file=sys.stderr)
     sys.exit(1)
-print(f"VAULT={c[\"vault_path\"]} SESS={c.get(\"sessions_folder\",\"claude-sessions\")} INS={c.get(\"insights_folder\",\"claude-insights\")}")
+project = os.path.basename(os.getcwd()).lower().replace(" ", "-")
+print("VAULT=" + c["vault_path"] + " SESS=" + c.get("sessions_folder", "claude-sessions") + " INS=" + c.get("insights_folder", "claude-insights") + " PROJECT=" + project)
 '
 ```
 
-Parse the output line to extract `VAULT_PATH`, `SESSIONS_FOLDER`, and `INSIGHTS_FOLDER`.
+Parse the output to extract `VAULT_PATH`, `SESSIONS_FOLDER`, `INSIGHTS_FOLDER`, and `PROJECT`.
+
+If the user passed a project name argument (e.g. `/recall my-project`), override `PROJECT` with that value.
 
 If the output is empty or errors, tell the user:
 
@@ -46,59 +49,45 @@ Stop here if config is missing.
 ```
 TaskCreate: subject="Find unsummarized notes", activeForm="Searching for unsummarized notes"
 TaskCreate: subject="Summarize unsummarized notes", activeForm="Summarizing notes"
-TaskCreate: subject="Search sessions and insights", activeForm="Searching vault"
-TaskCreate: subject="Read and rank notes", activeForm="Reading notes"
-TaskCreate: subject="Compose context brief", activeForm="Composing brief"
+TaskCreate: subject="Build context brief", activeForm="Building context brief"
 TaskCreate: subject="Present results and detect completed items", activeForm="Presenting results"
 ```
 
 Track the returned task IDs — you will update them as each step completes. Immediately set task #1 to `in_progress` via TaskUpdate.
 
-### Step 2 — Derive project name
-
-If the user passed a project name argument (e.g. `/recall my-project`), use that.
-
-Otherwise, derive from the current working directory:
-
-```bash
-basename "$(pwd)"
-```
-
-Store as `PROJECT`. Normalize: lowercase, hyphens for spaces.
-
-### Step 3 — Summarize unsummarized notes (deferred summarization, truncation-aware)
+### Step 2 — Summarize unsummarized notes (deferred summarization, truncation-aware)
 
 > ⚠️ **THIS STEP IS MANDATORY. DO NOT SKIP IT.**
 >
-> If Grep finds any file matching both "AI summary unavailable" AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 4. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
+> If Grep finds any file matching both `status: auto-logged` AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 3. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
 >
-> **Visibility requirement:** Before Step 4, emit a one-line status: `Step 3: processing N unsummarized note(s) for $PROJECT` (or `Step 3: no unsummarized notes for $PROJECT` if the intersection is empty). This makes the decision auditable in the tool trace.
+> **Visibility requirement:** Before Step 3, emit a one-line status: `Step 2: processing N unsummarized note(s) for $PROJECT` (or `Step 2: no unsummarized notes for $PROJECT` if the intersection is empty). This makes the decision auditable in the tool trace.
 
-Search for raw/unsummarized session notes matching this project.
+Find unsummarized notes for this project in a single Python call (replaces multiple Grep rounds):
 
-Use Grep to find notes containing the "AI summary unavailable" marker in the sessions folder:
-
-```
-pattern: "AI summary unavailable"
-path: $VAULT_PATH/$SESSIONS_FOLDER/
-output_mode: files_with_matches
-```
-
-For each file found, use Grep to confirm it matches the current project:
-
-```
-pattern: "project: $PROJECT"
-path: <each matched file>
-output_mode: content
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys
+sys.path.insert(0, "hooks")
+from obsidian_utils import find_unsummarized_notes
+print(find_unsummarized_notes(sys.argv[1], sys.argv[2], sys.argv[3]))
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-Count the files that match BOTH conditions (unsummarized AND belongs to this project). Store as `N`.
+Parse the JSON output: `{"unsummarized": ["/path/to/note1.md", ...], "auto_fixed": N}`.
+
+The function handles project filtering, defense-in-depth (skips notes with real `## Summary` but stale `auto-logged` status, auto-fixes them), and returns only genuinely unsummarized note paths.
+
+If `auto_fixed > 0`, report: `Auto-fixed N note(s) with stale status.`
+
+Store the length of `unsummarized` as `N`.
 
 Update task #1 to completed. Update task #2 subject to `Summarize N unsummarized note(s)` and set to `in_progress`.
 
 #### Path A: N=0 (no unsummarized notes)
 
-Update task #2 subject to `No unsummarized notes found` and set to `completed`. Skip to Step 4.
+Update task #2 subject to `No unsummarized notes found` and set to `completed`. Skip to Step 3.
 
 #### Path B: N=1 (single note — Python pipeline)
 
@@ -124,16 +113,16 @@ print(status)
 If the status starts with "Failed:", use the sub-agent fallback:
 
 1. Update the sub-task subject to `Sub-agent fallback: <basename>`.
-2. Spawn a single sub-agent:
+2. Spawn a single sub-agent that writes its summary to a temp file:
 
    ```
    Agent({
      description: "Summarize session note <basename>",
-     prompt: "Read the session note at <NOTE_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nReturn ONLY these markdown sections. No preamble, no commentary."
+     prompt: "Read the session note at <NOTE_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nWrite the summary to /tmp/ob-summary-<basename>.md using the Write tool. Return ONLY the single line: WRITTEN:/tmp/ob-summary-<basename>.md"
    })
    ```
 
-3. If the sub-agent returns a valid summary, write it back via heredoc:
+3. If the sub-agent returns `WRITTEN:<path>`, write back via Python reading the temp file:
 
    ```bash
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -141,23 +130,24 @@ If the status starts with "Failed:", use the sub-agent fallback:
    import sys
    sys.path.insert(0, "hooks")
    from obsidian_utils import upgrade_note_with_summary
-   summary = sys.stdin.read()
+   with open(sys.argv[5], "r") as f:
+       summary = f.read()
    status = upgrade_note_with_summary(sys.argv[1], summary, sys.argv[2], sys.argv[3], sys.argv[4])
    print(status)
-   ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" <<'SUMMARY_EOF'
-   <paste sub-agent summary here at column 0, no leading indentation>
-   SUMMARY_EOF
+   ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "/tmp/ob-summary-<basename>.md"
    ```
 
-   **Important:** Paste the sub-agent summary into the heredoc verbatim with NO leading indentation. Start `## Summary` at column 0, and keep the closing `SUMMARY_EOF` terminator at column 0 as well.
+   Then clean up: `rm -f /tmp/ob-summary-<basename>.md`
 
 Mark the sub-task and task #2 as completed. Report the result.
 
 #### Path C: N>=2 (batch — sub-agent-first, three waves)
 
+**Task management threshold:** If N <= 5, create per-note sub-tasks for each wave (prep, summarize, write-back). If N > 5, skip per-note sub-tasks — use a single progress update on task #2 per wave instead (e.g. `Summarize 10 notes: Wave 1 prep complete`). This saves ~15-20s of parent round-trip overhead at large N.
+
 ##### Wave 1 — Prep (parallel Bash calls)
 
-Create a prep sub-task for each note:
+If N <= 5, create a prep sub-task for each note:
 
 ```
 TaskCreate: subject="Prep: <basename>", activeForm="Prepping <basename>"
@@ -178,47 +168,54 @@ print(result)
 
 Launch all N Bash calls in a single message turn so they run in parallel.
 
-When all return, update each prep sub-task to completed (include result in subject: e.g. `Prep: ...2322.md (RAW_OK)` or `Prep: ...4653.md (JSONL_PREPPED)`).
+When all return:
+- If N <= 5: update each prep sub-task to completed (include result in subject: e.g. `Prep: ...2322.md (RAW_OK)`).
+- If N > 5: update task #2 subject to `Summarize N notes: Wave 1 prep complete`.
 
 Parse each result:
 - `RAW_OK:<note_path>` → sub-agent will read the raw note path
 - `JSONL_PREPPED:<temp_path>:<note_path>` → sub-agent will read the temp file path; track `<note_path>` for Wave 3
 - `NO_CONTENT:<note_path>` → skip this note, report to user
 
-##### Wave 2 — Summarize (parallel sub-agents)
+##### Wave 2 — Summarize and write to temp files (parallel sub-agents)
 
-Create a summarize sub-task for each note (excluding NO_CONTENT):
+If N <= 5, create a summarize sub-task for each note (excluding NO_CONTENT):
 
 ```
 TaskCreate: subject="Summarize: <basename>", activeForm="Summarizing <basename>"
 ```
 
-Spawn all sub-agents in a **single message turn** so they run in parallel:
+Spawn all sub-agents in a **single message turn** so they run in parallel. Each sub-agent writes its summary to a temp file instead of returning it — this keeps summary text out of the parent context (~800 tokens saved per note):
 
 ```
 Agent({
   description: "Summarize session note <basename>",
-  prompt: "Read the file at <READ_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nReturn ONLY these markdown sections. No preamble, no commentary."
+  prompt: "Read the file at <READ_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nWrite the summary to the file /tmp/ob-summary-<basename>.md using the Write tool. Return ONLY the single line: WRITTEN:/tmp/ob-summary-<basename>.md"
 })
 ```
 
 Where `<READ_PATH>` is:
 - For `RAW_OK` notes: the raw note path
-- For `JSONL_PREPPED` notes: the temp file path (e.g. `/tmp/ob-prep-{hash}.md`)
+- For `JSONL_PREPPED` notes: the temp file path (e.g. `/tmp/ob-prep-{session_id}.md`)
+
+And `<basename>` is the note filename without extension (e.g. `2026-04-09-obsidian-brain-2322`).
 
 When all sub-agents return, check each result:
-- If the sub-agent returned a valid summary (contains `## Summary`), update its summarize sub-task to completed.
-- If the sub-agent returned an error, empty output, or no `## Summary` section, update its summarize sub-task subject to `Failed: <basename>` and mark completed. Exclude this note from Wave 3 — it stays unsummarized for the next `/recall`. Report the failure to the user.
+- If the sub-agent returned `WRITTEN:<path>`, mark it as succeeded.
+- If the sub-agent returned an error, empty output, or anything else, mark it as failed. Exclude this note from Wave 3 — it stays unsummarized for the next `/recall`. Report the failure to the user.
 
-##### Wave 3 — Write back (parallel Bash calls)
+If N <= 5: update each summarize sub-task to completed (or `Failed: <basename>`).
+If N > 5: update task #2 subject to `Summarize N notes: Wave 2 complete (M succeeded, F failed)`.
 
-Create a write-back sub-task for each note that got a valid summary:
+##### Wave 3 — Write back from temp files (parallel Bash calls)
+
+If N <= 5, create a write-back sub-task for each note that got a `WRITTEN:` status:
 
 ```
 TaskCreate: subject="Write back: <basename>", activeForm="Writing <basename>"
 ```
 
-For each sub-agent that returned a valid summary (contains `## Summary`), pipe it through `upgrade_note_with_summary()` via a heredoc:
+For each successful note, call Python to read the temp summary file and apply it — no heredoc needed, summary stays off parent context:
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -226,28 +223,30 @@ python3 -c '
 import sys
 sys.path.insert(0, "hooks")
 from obsidian_utils import upgrade_note_with_summary
-summary = sys.stdin.read()
+with open(sys.argv[6], "r") as f:
+    summary = f.read()
 status = upgrade_note_with_summary(sys.argv[1], summary, sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
 print(status)
-' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "sub-agent" <<'SUMMARY_EOF'
-<paste sub-agent summary here at column 0>
-SUMMARY_EOF
+' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "sub-agent" "/tmp/ob-summary-<basename>.md"
 ```
 
-**Important:** The `$NOTE_PATH` here is always the **original vault note path** (not the temp file), even for JSONL_PREPPED notes.
+**Important:** `$NOTE_PATH` is always the **original vault note path** (not the temp file), even for JSONL_PREPPED notes.
 
 Launch all write-back Bash calls in a single message turn.
 
 When all return, parse each result:
-- If the status does NOT start with "Failed:", update the write-back sub-task to completed.
-- If the status starts with "Failed:", update the sub-task subject to `Failed: <basename>` and mark completed. Count it in the failure tally.
+- If the status does NOT start with "Failed:", mark as succeeded.
+- If the status starts with "Failed:", mark as failed. Count it in the failure tally.
+
+If N <= 5: update each write-back sub-task accordingly.
+If N > 5: update task #2 subject to `Summarize N notes: Wave 3 complete (M written, F failed)`.
 
 ##### Cleanup
 
-Clean up only the specific temp files created in Wave 1 (not a glob — avoids racing with concurrent `/recall` invocations):
+Clean up all temp files created in Waves 1 and 2 (specific paths only — avoids racing with concurrent `/recall` invocations):
 
 ```bash
-rm -f /tmp/ob-prep-<session_id_1>.md /tmp/ob-prep-<session_id_2>.md ...
+rm -f /tmp/ob-prep-<session_id_1>.md /tmp/ob-prep-<session_id_2>.md /tmp/ob-summary-<basename_1>.md /tmp/ob-summary-<basename_2>.md ...
 ```
 
 Mark task #2 as completed. Report results: how many upgraded, how many skipped (NO_CONTENT), how many failed.
@@ -256,156 +255,59 @@ If any sub-agents returned empty or invalid summaries, report those notes as sti
 
 For `NO_CONTENT` notes, inform the user: "Note `<basename>` has no session_id or conversation content. Manually edit it in Obsidian to add a summary, or delete it if it's empty."
 
-### Step 4 — Search for project sessions and insights (parallel)
+### Step 3 — Build context brief (Python)
 
 Update task #3 to `in_progress`.
 
-Run these two searches in parallel using Grep:
+Run a single Python call that reads all session and insight files, composes the brief, and detects completed open items — no sub-agent needed:
 
-**Search A — Sessions:**
-
-```
-pattern: "project: $PROJECT"
-path: $VAULT_PATH/$SESSIONS_FOLDER/
-output_mode: files_with_matches
-```
-
-**Search B — Insights:**
-
-```
-pattern: "project: $PROJECT"
-path: $VAULT_PATH/$INSIGHTS_FOLDER/
-output_mode: files_with_matches
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys
+sys.path.insert(0, "hooks")
+from obsidian_utils import build_context_brief
+print(build_context_brief(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]))
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER" "$PROJECT"
 ```
 
-Collect both result sets.
+If the command fails (non-zero exit code), print the error and stop — do not fall back to in-context reads.
 
-Update task #3 to `completed`.
+**Parse the output.** Split on section labels:
 
-### Step 5 — Rank and select notes
+1. Extract `<<<OB_CONTEXT_BRIEF>>>` — everything between this delimiter and `<<<OB_LOAD_MANIFEST>>>`. This is the brief to display.
+2. Extract `<<<OB_LOAD_MANIFEST>>>` — parse `full_session_title`, `full_session_date`, `full_session_path`, `summary_session_title`, `summary_session_date`, `insight_count`.
+3. Extract `<<<OB_MOST_RECENT_SESSION_PATH>>>` — the full path for checkoff edits.
+4. Extract `<<<OB_OPEN_ITEM_CANDIDATES>>>` — either `NO_CANDIDATES`, `NO_ITEMS`, or a JSON array.
 
-Update task #4 to `in_progress`.
+Update task #3 to `completed`. Update task #4 to `in_progress`.
 
-From the session files found, sort by date (extract from frontmatter `date:` field or filename). Select:
-
-- **Most recent session** — read in full (this is the primary context). Store its full path as `MOST_RECENT_SESSION_PATH` for use in Step 7.5.
-- **Second most recent session** — read summary + open questions only
-- **Last 5 sessions** — collect titles and dates for the session list
-
-From the insights files found, include **all of them** — insights are curated and always relevant.
-
-Read the selected files using the Read tool. For efficiency:
-- Read the most recent session in full
-- For older sessions, read only the first 50 lines (enough for frontmatter + summary + open questions)
-- Read all insight files in full (they are typically short)
-
-Update task #4 to `completed`.
-
-### Step 6 — Compose context brief
-
-Update task #5 to `in_progress`.
-
-Build a context brief targeting approximately 2000 tokens. Structure it as follows:
-
-```
-## Project Context: $PROJECT
-
-### Last Session ($DATE)
-$SUMMARY_FROM_MOST_RECENT_SESSION
-
-**Open Items / Next Steps:**
-$OPEN_QUESTIONS_FROM_MOST_RECENT_SESSION
-
-### Previous Session ($DATE)
-$BRIEF_SUMMARY_FROM_SECOND_SESSION
-
-### Curated Insights
-$ALL_INSIGHTS_CONTENT
-
-### Recent Session History
-| Date | Title | Branch |
-|------|-------|--------|
-| ... last 5 sessions ... |
-```
-
-If the brief exceeds ~2000 tokens, trim older session summaries first, then truncate insight bodies (keep titles).
-
-Update task #5 to `completed`.
-
-### Step 7 — Present to user
-
-Update task #6 to `in_progress`.
-
-Display:
+**Present the brief immediately** (same turn — saves one parent round):
 
 > **Here's what I found from your Obsidian vault for `$PROJECT`:**
 
-Then output the context brief from Step 6.
+Then output the `CONTEXT_BRIEF` section verbatim.
 
-If unsummarized notes were upgraded in Step 3, also mention:
+If unsummarized notes were upgraded in Step 2, also mention:
 
 > _Upgraded N session note(s) with AI summaries._
 
-### Step 7.5 — Detect completed open items (project-scoped auto-detect)
+### Step 4 — Detect completed open items and show load manifest
 
-After presenting the context brief, scan the loaded context for evidence that any open items have been completed.
+Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
-1. **Match open items against evidence in Python.** Run a single Bash call that collects open items and matches them against the most recent session note:
+1. **Skip if no candidates.** If the value is `NO_ITEMS` or `NO_CANDIDATES`, skip to Step 5 silently.
 
-   ```bash
-   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-   python3 -c '
-   import sys, json
-   sys.path.insert(0, "hooks")
-   from obsidian_utils import match_items_against_evidence
-   from open_item_dedup import collect_open_items
+2. **Parse candidates.** The JSON array contains objects with `file`, `line`, `text`, `evidence`, `confidence`, `has_completion_phrase`.
 
-   vault_path, sessions_folder, project = sys.argv[1], sys.argv[2], sys.argv[3]
-   evidence_file = sys.argv[4]
-
-   try:
-       with open(evidence_file, "r") as f:
-           content = f.read()
-       # Extract only evidence sections (Summary, Changes, Errors) — exclude
-       # Open Questions to avoid self-matching open items as candidates
-       import re as _re
-       evidence_parts = []
-       for section in ["Summary", "Key Decisions", "Changes Made", "Errors Encountered"]:
-           m = _re.search(rf"## {section}\n(.*?)(?=\n## |\Z)", content, _re.DOTALL)
-           if m:
-               evidence_parts.append(m.group(1))
-       evidence = "\n".join(evidence_parts) if evidence_parts else content
-   except OSError as exc:
-       print("NO_CANDIDATES")
-       sys.exit(0)
-
-   items = collect_open_items(vault_path, sessions_folder, project)
-   if not items:
-       print("NO_ITEMS")
-       sys.exit(0)
-
-   candidates = match_items_against_evidence(evidence, items)
-   if not candidates:
-       print("NO_CANDIDATES")
-   else:
-       print(json.dumps(candidates))
-   ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$MOST_RECENT_SESSION_PATH"
-   ```
-
-   Where `$MOST_RECENT_SESSION_PATH` is the path to the most recent session note (already read in Step 5).
-
-2. **Skip if no candidates.** If the output is `NO_ITEMS` or `NO_CANDIDATES`, skip to Step 8 silently.
-
-3. **Parse candidates.** The JSON array contains objects with `file`, `line`, `text`, `evidence`, `confidence`, `has_completion_phrase`. Only present items with `confidence >= 3` to the user.
-
-4. **Present candidates to user.** Print:
+3. **Present candidates to user.** Print:
 
 ```
 I noticed these open items may now be done:
 
 1. [x] <item text>
      From: <basename of source file>
-     Evidence: "<short snippet from EVIDENCE_TEXT showing the match>"
+     Evidence: "<short snippet from evidence showing the match>"
 
 2. [x] <item text>
      ...
@@ -413,24 +315,24 @@ I noticed these open items may now be done:
 Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
 ```
 
-5. **Wait for user response.** Parse the response:
-   - `none` or empty → skip checkoff entirely, proceed to Step 8
+4. **Wait for user response.** Parse the response:
+   - `none` or empty → skip checkoff entirely, proceed to Step 5
    - `all` → check off all candidates
    - Comma-separated numbers (e.g. `1,3`) → check off only those
 
-6. **For each confirmed checkoff, edit the source file.** Use Read to load the full source file. Find the exact line containing `- [ ] <item text>`. Replace it with `- [x] <item text>`. Use the Edit tool with `replace_all: false` and provide enough context (the full line plus the line before and after if available) to ensure uniqueness within the file. If the line is ambiguous (multiple matches), skip that item and warn:
+5. **For each confirmed checkoff, edit the source file.** Use Read to load the full source file. Find the exact line containing `- [ ] <item text>`. Replace it with `- [x] <item text>`. Use the Edit tool with `replace_all: false` and provide enough context to ensure uniqueness. If the line is ambiguous, skip and warn:
 
 ```
 ⚠️  Could not check off item "<item text>" — line is not unique in <file>. Edit manually in Obsidian.
 ```
 
-7. **Confirm checkoffs to user.** Print:
+6. **Confirm checkoffs to user.** Print:
 
 ```
 ✅ Checked off N item(s) across <list of files>.
 ```
 
-8. **Cascade check-offs to duplicate items in older notes.** Run a single Bash call that collects, matches, and edits files in Python:
+7. **Cascade check-offs to duplicate items in older notes.** Run:
 
     ```bash
     cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -444,30 +346,24 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
     ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$CHECKED_ITEMS_JSON"
     ```
 
-    Before running, construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts from sub-step 5. Use a Bash heredoc or inline Python to build it:
-    ```bash
-    CHECKED_ITEMS_JSON=$(python3 -c "import json; print(json.dumps([\"Git-flow migration spec pending\", \"Land PR #14\"]))")
-    ```
-    Replace the example items with the actual confirmed item texts. Then run the cascade command above. Report the cascade summary to the user alongside the checkoff confirmation.
+    Construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts. Report the cascade summary.
 
-Then proceed to Step 8.
+**Show load manifest** (same step — saves one parent round):
 
-### Step 8 — Show load manifest and offer options
-
-After the context brief, explicitly list what was loaded into the conversation so the user knows exactly what context is available:
+Use the `LOAD_MANIFEST` data to show:
 
 > **Loaded into this conversation:**
-> - Full session: *"[most recent session title]"* ([date])
-> - Summary only: *"[second session title]"* ([date])
-> - [N] curated insight(s)
+> - Full session: *"<full_session_title>"* (<full_session_date>)
+> - Summary only: *"<summary_session_title>"* (<summary_session_date>)
+> - <insight_count> curated insight(s)
 >
 > Pick any session from the history table above to load it, or ready to start working?
 
-The session history table from Step 6 serves as a menu — if the user picks a session by name or date, use the Read tool to load that specific file and present its full contents.
+The session history table from the context brief serves as a menu — if the user picks a session by name or date, use the Read tool to load that specific file from `$VAULT_PATH/$SESSIONS_FOLDER/` and present its full contents.
 
 If the user says they're ready to work, the context is already loaded — proceed.
 
-Update task #6 to `completed`.
+Update task #4 to `completed`.
 
 ## Edge Cases
 

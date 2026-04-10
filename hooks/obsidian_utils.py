@@ -245,7 +245,7 @@ def read_note_metadata(file_path: str) -> dict | None:
     Cached per file path within the session.
     """
     sid = _get_session_id_fast()
-    cache_key = f"metadata:{file_path}"
+    cache_key = f"metadata:{os.path.realpath(file_path)}"
     _CACHE_SENTINEL = {"__no_frontmatter__": True}
     cached = cache_get(sid, cache_key)
     if cached is not None:
@@ -925,6 +925,364 @@ def find_latest_session(
     return None
 
 
+def find_unsummarized_notes(
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+) -> str:
+    """Find unsummarized session notes for a project, with defense-in-depth.
+
+    Scans sessions folder for notes with status: auto-logged in frontmatter,
+    filters by project, and checks for false positives (notes that already
+    have a real ## Summary but stale status). Auto-fixes stale status inline.
+
+    Returns JSON string: {"unsummarized": [paths], "auto_fixed": N}
+    """
+    sessions_dir = Path(vault_path) / sessions_folder
+    if not sessions_dir.is_dir():
+        return json.dumps({"unsummarized": [], "auto_fixed": 0})
+
+    unsummarized: list[str] = []
+    auto_fixed = 0
+
+    for f in sorted(sessions_dir.iterdir(), reverse=True):
+        if f.suffix != '.md':
+            continue
+
+        # Read ENTIRE file from disk — DO NOT use read_note_metadata() which
+        # has a persistent cache that may be stale after status changes.
+        try:
+            content = f.read_text(encoding='utf-8', errors='replace')
+        except OSError as exc:
+            print(f"[obsidian-brain] cannot read {f.name}: {exc}", file=sys.stderr)
+            continue
+
+        # Parse frontmatter inline (no cache)
+        if not content.startswith('---'):
+            continue
+        fm_end = content.find('\n---', 3)
+        if fm_end == -1:
+            continue
+        frontmatter = content[:fm_end]
+
+        # Must be auto-logged
+        status_match = re.search(r'^status:\s*(.+)$', frontmatter, re.MULTILINE)
+        if not status_match or status_match.group(1).strip() != 'auto-logged':
+            continue
+
+        # Must match project
+        project_match = re.search(r'^project:\s*(.+)$', frontmatter, re.MULTILINE)
+        if not project_match:
+            continue
+        fm_project = project_match.group(1).strip().strip('"').strip("'")
+        if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
+            continue
+
+        # Defense-in-depth: check if already has a real summary
+        has_summary = bool(re.search(r'^## Summary', content, re.MULTILINE))
+        has_unavailable = 'AI summary unavailable' in content
+
+        if has_summary and not has_unavailable:
+            # Already summarized by legacy code path — fix status on disk
+            try:
+                fixed = re.sub(
+                    r'^status: auto-logged',
+                    'status: summarized',
+                    content,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+                # Atomic write: temp file + rename (per CLAUDE.md convention)
+                fd, tmp = tempfile.mkstemp(
+                    prefix='.ob-fix-', suffix='.md.tmp', dir=str(f.parent)
+                )
+                try:
+                    with os.fdopen(fd, 'w', encoding='utf-8') as fw:
+                        fw.write(fixed)
+                    os.replace(tmp, str(f))
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    continue
+                # Invalidate cache for this file
+                sid = _get_session_id_fast()
+                cache_key = f"metadata:{os.path.realpath(str(f))}"
+                cache_set(sid, cache_key, None)
+                auto_fixed += 1
+            except OSError:
+                pass
+            continue
+
+        unsummarized.append(str(f))
+
+    return json.dumps({"unsummarized": unsummarized, "auto_fixed": auto_fixed})
+
+
+def build_context_brief(
+    vault_path: str,
+    sessions_folder: str,
+    insights_folder: str,
+    project: str,
+) -> str:
+    """Build the /recall context brief entirely in Python.
+
+    Reads session and insight files directly (no sub-agent), composes
+    a structured markdown brief, and runs open-item detection.
+
+    Returns a structured string with labeled sections:
+      CONTEXT_BRIEF: <markdown brief>
+      LOAD_MANIFEST: <key-value metadata>
+      MOST_RECENT_SESSION_PATH: <path>
+      OPEN_ITEM_CANDIDATES: <JSON array or NO_CANDIDATES>
+    """
+    sessions_dir = Path(vault_path) / sessions_folder
+    insights_dir = Path(vault_path) / insights_folder
+
+    # --- 1. Scan and filter sessions ---
+    session_files: list[tuple[str, str, dict]] = []  # (filename, path, metadata)
+    if sessions_dir.is_dir():
+        for f in sorted(sessions_dir.iterdir(), reverse=True):
+            if not f.suffix == '.md':
+                continue
+            meta = read_note_metadata(str(f))
+            if not meta:
+                continue
+            fm_project = meta.get('project', '')
+            if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
+                continue
+            session_files.append((f.name, str(f), meta))
+
+    # --- 2. Read sessions (tiered) ---
+    most_recent_summary = ""
+    most_recent_open_items = ""
+    most_recent_title = ""
+    most_recent_date = ""
+    most_recent_path = ""
+    second_summary = ""
+    second_title = ""
+    second_date = ""
+
+    _summary_re = re.compile(r"## Summary\n(.+?)(?=\n## |\Z)", re.DOTALL)
+    _next_steps_re = re.compile(r"## Open Questions / Next Steps\n(.+?)(?=\n## |\Z)", re.DOTALL)
+
+    if len(session_files) >= 1:
+        _, most_recent_path, meta = session_files[0]
+        most_recent_date = meta.get('date', '')
+        most_recent_title = f"Session: {meta.get('project', project)}"
+        if meta.get('git_branch'):
+            most_recent_title += f" ({meta['git_branch']})"
+        try:
+            text = Path(most_recent_path).read_text(encoding='utf-8', errors='replace')
+            m = _summary_re.search(text)
+            if m:
+                most_recent_summary = m.group(1).strip()
+                # Use first sentence of summary as title
+                first_line = most_recent_summary.split('\n')[0].strip()
+                if first_line:
+                    most_recent_title = first_line
+            m = _next_steps_re.search(text)
+            if m:
+                most_recent_open_items = m.group(1).strip()
+        except OSError:
+            most_recent_summary = "(could not read session note)"
+
+    if len(session_files) >= 2:
+        _, second_path, meta = session_files[1]
+        second_date = meta.get('date', '')
+        second_title = f"Session: {meta.get('project', project)}"
+        if meta.get('git_branch'):
+            second_title += f" ({meta['git_branch']})"
+        try:
+            with open(second_path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = [f.readline() for _ in range(50)]
+            text = ''.join(lines)
+            m = _summary_re.search(text)
+            if m:
+                second_summary = m.group(1).strip()
+                # Use first sentence of summary as title
+                first_line = second_summary.split('\n')[0].strip()
+                if first_line:
+                    second_title = first_line
+        except OSError:
+            second_summary = "(could not read session note)"
+
+    # History table (last 5 sessions)
+    history_rows: list[str] = []
+    for i, (fname, fpath, meta) in enumerate(session_files[:5]):
+        date = meta.get('date', '')
+        title = meta.get('project', project)
+        branch = meta.get('git_branch', '')
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                content_text = f.read()
+            # Prefer first sentence of ## Summary as title (more descriptive)
+            summary_match = re.search(r'## Summary\n+(.+)', content_text)
+            if summary_match:
+                title = summary_match.group(1).strip()
+            else:
+                # Fall back to H1 heading
+                for line_text in content_text.split('\n'):
+                    if line_text.startswith('# '):
+                        title = line_text[2:].strip()
+                        break
+        except OSError:
+            pass
+        history_rows.append(f"| {date} | {title} | {branch} |")
+
+    # --- 3. Scan and read insights ---
+    insight_entries: list[tuple[str, str]] = []  # (title, key_point)
+    insight_count = 0
+    if insights_dir.is_dir():
+        insight_files = sorted(
+            [f for f in insights_dir.iterdir() if f.suffix == '.md'],
+            reverse=True
+        )
+        project_insights: list[Path] = []
+        for f in insight_files:
+            meta = read_note_metadata(str(f))
+            if not meta:
+                continue
+            fm_project = meta.get('project', '')
+            if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
+                continue
+            project_insights.append(f)
+
+        insight_count = len(project_insights)
+        for f in project_insights[:20]:
+            title = f.stem
+            key_point = ""
+            try:
+                with open(f, 'r', encoding='utf-8', errors='replace') as fh:
+                    past_frontmatter = False
+                    frontmatter_closed = False
+                    for line_text in fh:
+                        stripped = line_text.strip()
+                        if stripped == '---':
+                            if not past_frontmatter:
+                                past_frontmatter = True
+                                continue
+                            else:
+                                frontmatter_closed = True
+                                continue
+                        if not frontmatter_closed:
+                            continue
+                        if stripped.startswith('# '):
+                            title = stripped[2:].strip()
+                            continue
+                        if stripped and not stripped.startswith('#') and not stripped.startswith('---'):
+                            key_point = stripped[:100]
+                            break
+            except OSError:
+                pass
+            insight_entries.append((title, key_point))
+
+    # Trim insights to ~500 tokens (~375 words, ~1875 chars)
+    insight_text_parts: list[str] = []
+    total_chars = 0
+    for title, key_point in insight_entries:
+        entry = f"- **{title}**"
+        if key_point:
+            entry += f" — {key_point}"
+        if total_chars + len(entry) > 1875:
+            insight_text_parts.append(f"- **{title}**")
+            total_chars += len(title) + 6
+            if total_chars > 2200:
+                break
+            continue
+        insight_text_parts.append(entry)
+        total_chars += len(entry)
+
+    insights_section = "\n".join(insight_text_parts) if insight_text_parts else "No curated insights yet for this project."
+
+    # --- 4. Compose brief ---
+    brief_parts: list[str] = [f"## Project Context: {project}"]
+
+    if most_recent_summary:
+        brief_parts.append(f"\n### Last Session ({most_recent_date})")
+        brief_parts.append(most_recent_summary)
+        if most_recent_open_items:
+            brief_parts.append(f"\n**Open Items / Next Steps:**\n{most_recent_open_items}")
+    else:
+        brief_parts.append(f"\nNo session history found for {project}.")
+
+    if second_summary:
+        brief_parts.append(f"\n### Previous Session ({second_date})")
+        brief_parts.append(second_summary)
+
+    brief_parts.append(f"\n### Curated Insights")
+    brief_parts.append(insights_section)
+
+    if history_rows:
+        brief_parts.append("\n### Recent Session History")
+        brief_parts.append("| Date | Title | Branch |")
+        brief_parts.append("|------|-------|--------|")
+        brief_parts.extend(history_rows)
+
+    brief = "\n".join(brief_parts)
+
+    # --- 5. Open-item detection ---
+    candidates_output = "NO_CANDIDATES"
+    if most_recent_path:
+        try:
+            _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+            if _hooks_dir not in sys.path:
+                sys.path.insert(0, _hooks_dir)
+            from open_item_dedup import collect_open_items
+
+            evidence_parts: list[str] = []
+            try:
+                content = Path(most_recent_path).read_text(encoding='utf-8', errors='replace')
+                for section in ["Summary", "Key Decisions", "Changes Made", "Errors Encountered"]:
+                    m = re.search(rf"## {section}\n(.*?)(?=\n## |\Z)", content, re.DOTALL)
+                    if m:
+                        evidence_parts.append(m.group(1))
+            except OSError:
+                pass
+
+            evidence = "\n".join(evidence_parts)
+            if evidence:
+                items = collect_open_items(vault_path, sessions_folder, project)
+                if not items:
+                    candidates_output = "NO_ITEMS"
+                elif items:
+                    candidates = match_items_against_evidence(evidence, items)
+                    if candidates:
+                        filtered = [c for c in candidates if c.get("confidence", 0) >= 3]
+                        if filtered:
+                            candidates_output = json.dumps(filtered)
+        except Exception as exc:
+            print(f"[obsidian-brain] open-item detection failed (non-fatal): {exc}", file=sys.stderr)
+
+    # --- 6. Compose structured output ---
+    manifest_lines = [
+        f"full_session_title: {most_recent_title or '(none)'}",
+        f"full_session_date: {most_recent_date or '(none)'}",
+        f"full_session_path: {most_recent_path or '(none)'}",
+        f"summary_session_title: {second_title or '(none)'}",
+        f"summary_session_date: {second_date or '(none)'}",
+        f"insight_count: {insight_count}",
+    ]
+
+    # Use unique delimiters that cannot appear in user-authored markdown content
+    output_parts = [
+        "<<<OB_CONTEXT_BRIEF>>>",
+        brief,
+        "",
+        "<<<OB_LOAD_MANIFEST>>>",
+        "\n".join(manifest_lines),
+        "",
+        "<<<OB_MOST_RECENT_SESSION_PATH>>>",
+        most_recent_path,
+        "",
+        "<<<OB_OPEN_ITEM_CANDIDATES>>>",
+        candidates_output,
+    ]
+
+    return "\n".join(output_parts)
+
+
 # ---------------------------------------------------------------------------
 # Filename / slug helpers
 # ---------------------------------------------------------------------------
@@ -1546,6 +1904,10 @@ def upgrade_note_with_summary(
     except Exception as exc:
         dedup_failed = True
         print(f"[obsidian-brain] dedup unexpected error: {exc}", file=sys.stderr)
+
+    # Invalidate metadata cache for this note (status changed from auto-logged to summarized)
+    sid = _get_session_id_fast()
+    cache_set(sid, f"metadata:{os.path.realpath(note_path)}", None)
 
     # Build status
     status = f"Upgraded {os.path.basename(note_path)} (source: {source})"
