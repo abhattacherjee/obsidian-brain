@@ -39,3 +39,54 @@ def test_at_least_one_snippet_found():
     assert len(_SNIPPETS) >= 10, (
         f"Expected at least 10 python3 -c snippets, found {len(_SNIPPETS)}"
     )
+
+
+def test_no_hardcoded_hooks_path():
+    """No snippet should use the old hardcoded sys.path.insert(0, "hooks")."""
+    for name, code in _SNIPPETS:
+        assert 'sys.path.insert(0, "hooks")' not in code, (
+            f"Snippet {name} uses hardcoded hooks path. "
+            "Use glob-based cache resolution instead."
+        )
+
+
+def test_snippets_use_cache_glob():
+    """Every snippet that imports from hooks should use the cache glob pattern."""
+    for name, code in _SNIPPETS:
+        if "from obsidian_utils" in code or "from open_item_dedup" in code:
+            assert "plugins/cache/" in code, (
+                f"Snippet {name} imports from hooks but doesn't use "
+                "cache glob pattern for path resolution."
+            )
+
+
+def test_cache_glob_finds_installed_hooks():
+    """The glob pattern used in skills should match the actual installed cache."""
+    matches = sorted(glob.glob(os.path.expanduser(
+        "~/.claude/plugins/cache/*/obsidian-brain/*/hooks"
+    )))
+    # This test only passes when the plugin is installed
+    if not matches:
+        pytest.skip("obsidian-brain plugin not installed in cache")
+    hooks_dir = matches[-1]
+    assert os.path.isfile(os.path.join(hooks_dir, "obsidian_utils.py")), (
+        f"Cache hooks dir {hooks_dir} exists but obsidian_utils.py not found"
+    )
+
+
+def test_snippets_import_os_before_expanduser():
+    """Snippets using os.path.expanduser must import os first."""
+    for name, code in _SNIPPETS:
+        if "os.path.expanduser" not in code:
+            continue
+        lines = code.strip().split("\n")
+        os_imported = False
+        for line in lines:
+            if re.search(r'\bimport\b.*\bos\b', line):
+                os_imported = True
+            if "os.path.expanduser" in line:
+                assert os_imported, (
+                    f"Snippet {name} uses os.path.expanduser "
+                    "before importing os"
+                )
+                break
