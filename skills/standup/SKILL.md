@@ -420,25 +420,31 @@ When open items are checked off in the standup note (either during generation or
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
+echo '$CHECKED_ITEMS_JSON' | python3 -c '
 import sys, json, os
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from open_item_dedup import batch_cascade_checkoff
-items = json.loads(sys.argv[4])
+items = json.load(sys.stdin)
 summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
 print(summary)
-' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "$CHECKED_ITEMS_JSON"
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-Where `$CHECKED_ITEMS_JSON` is a JSON array of the confirmed item texts for that project, and `$PROJECT` is the project name.
+Where `$CHECKED_ITEMS_JSON` is a JSON array of the confirmed item texts for that project (passed via stdin to avoid shell quoting issues with special characters in item text), and `$PROJECT` is the project name.
 
 Run one call per project that has completed items. If multiple projects have items, run the calls in parallel.
+
+If the command exits non-zero or prints errors to stderr, report the error to the user:
+
+> Cascade checkoff failed for $PROJECT: [first line of error]. The standup note is unaffected.
 
 **14c — Report cascade results.** After all cascade calls complete, report:
 
 > Cascaded N checkoff(s) across M vault note(s) for project(s): list.
 
-If `batch_cascade_checkoff` is unavailable (import error), skip this step silently — the standup note itself is already correct, and `/recall` will handle cascading on next invocation.
+If `batch_cascade_checkoff` is unavailable (import error), warn the user:
+
+> Could not cascade checkoffs: [error details]. The standup note is correct, but duplicate open items in other session notes were not updated. Run `/recall` to cascade manually.
 
 ## Edge Cases
 
