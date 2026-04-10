@@ -294,7 +294,7 @@ If unsummarized notes were upgraded in Step 2, also mention:
 
 ### Step 4 — Detect completed open items and show load manifest
 
-Parse the `OPEN_ITEM_CANDIDATES` section from the sub-agent return.
+Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
 1. **Skip if no candidates.** If the value is `NO_ITEMS` or `NO_CANDIDATES`, skip to Step 5 silently.
 

@@ -991,8 +991,20 @@ def find_unsummarized_notes(
                     count=1,
                     flags=re.MULTILINE,
                 )
-                with open(f, 'w', encoding='utf-8') as fw:
-                    fw.write(fixed)
+                # Atomic write: temp file + rename (per CLAUDE.md convention)
+                fd, tmp = tempfile.mkstemp(
+                    prefix='.ob-fix-', suffix='.md.tmp', dir=str(f.parent)
+                )
+                try:
+                    with os.fdopen(fd, 'w', encoding='utf-8') as fw:
+                        fw.write(fixed)
+                    os.replace(tmp, str(f))
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    continue
                 # Invalidate cache for this file
                 sid = _get_session_id_fast()
                 cache_key = f"metadata:{str(f)}"
@@ -1105,7 +1117,7 @@ def build_context_brief(
             with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                 content_text = f.read()
             # Prefer first sentence of ## Summary as title (more descriptive)
-            summary_match = re.search(r'## Summary\n(.+)', content_text)
+            summary_match = re.search(r'## Summary\n+(.+)', content_text)
             if summary_match:
                 title = summary_match.group(1).strip()
             else:
