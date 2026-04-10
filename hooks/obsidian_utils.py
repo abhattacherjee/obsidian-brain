@@ -1145,7 +1145,7 @@ def build_context_brief(
                         break
         except OSError:
             pass
-        history_rows.append(f"| {date} | {duration} | {title} | {branch} |")
+        history_rows.append(f"| {i+1} | {date} | {duration} | {title} | {branch} |")
 
     # --- 3. Scan and read insights ---
     insight_entries: list[tuple[str, str]] = []  # (title, key_point)
@@ -1232,8 +1232,8 @@ def build_context_brief(
 
     if history_rows:
         brief_parts.append("\n### Recent Session History")
-        brief_parts.append("| Date | Duration | Title | Branch |")
-        brief_parts.append("|------|----------|-------|--------|")
+        brief_parts.append("| # | Date | Duration | Title | Branch |")
+        brief_parts.append("|---|------|----------|-------|--------|")
         brief_parts.extend(history_rows)
 
     brief = "\n".join(brief_parts)
