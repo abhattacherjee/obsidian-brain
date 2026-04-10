@@ -16,25 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plugin cache with the repo working copy during local testing.
 
 ### Changed
-- `/recall` Step 3 now uses parallel sub-agents as the default summarization
+- `/recall` Step 2 now uses parallel sub-agents as the default summarization
   strategy when 2+ unsummarized notes are found, with conditional JSONL
-  transcript extraction for truncated sessions. Single-note case unchanged
-  (Haiku pipeline + sub-agent fallback).
-- `/recall` Steps 4-7.5 now delegated to a single context builder sub-agent,
-  reducing parent context from ~14k to ~6.5k tokens. Task manifest collapsed
-  from 6 to 4 top-level tasks. Fallback to in-context reads if sub-agent fails.
-- Sub-agent summaries now written to temp files instead of passed through parent
-  context via heredocs, saving ~800 tokens per note during batch summarization.
-- Per-note task sub-tasks skipped when N>5 — uses wave-level progress updates
-  instead, saving ~15-20s of parent round-trip overhead at large batch sizes.
-- `/recall` Step 3 context builder replaced from sub-agent (~145s, 70 Read calls)
-  to pure Python `build_context_brief()` function (<3s, direct file I/O). Total
-  `/recall` estimated to drop from ~4 min to ~1.5 min. Sub-agent fallback removed.
-- Config load and project derivation merged into single Python call, eliminating
-  one parent round (~5s). `/recall` steps renumbered from 8 to 5.
-- Session history table and load manifest titles in `build_context_brief()` now
-  use the first sentence of `## Summary` instead of the generic H1 heading
-  (`Session: project (branch)`), making each row descriptive of what happened.
+  transcript extraction for truncated sessions. Sub-agent summaries written to
+  temp files (no heredoc pass-through). Per-note sub-tasks skipped when N>5.
+  Single-note case unchanged (Haiku pipeline + sub-agent fallback).
+- `/recall` Step 3 context building done by pure Python `build_context_brief()`
+  function (<3s, direct file I/O) instead of sub-agent (~145s, 70 Read calls).
+  Unsummarized note detection also moved to Python `find_unsummarized_notes()`.
+  Total `/recall` reduced from ~4 min to ~1.3 min.
+- `/recall` steps reduced from 8 to 4. Config + project merged into single call.
+  Task manifest collapsed from 6 to 4 top-level tasks.
+- Session history table titles use first sentence of `## Summary` instead of
+  generic H1 heading, making each row descriptive of what happened.
 
 ### Fixed
 - f-string SyntaxError in all 10 skill templates — `python3 -c '...'` one-liners

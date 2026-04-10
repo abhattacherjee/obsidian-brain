@@ -1244,7 +1244,9 @@ def build_context_brief(
             evidence = "\n".join(evidence_parts)
             if evidence:
                 items = collect_open_items(vault_path, sessions_folder, project)
-                if items:
+                if not items:
+                    candidates_output = "NO_ITEMS"
+                elif items:
                     candidates = match_items_against_evidence(evidence, items)
                     if candidates:
                         filtered = [c for c in candidates if c.get("confidence", 0) >= 3]
@@ -1255,11 +1257,11 @@ def build_context_brief(
 
     # --- 6. Compose structured output ---
     manifest_lines = [
-        f"full_session_title: {most_recent_title}",
-        f"full_session_date: {most_recent_date}",
-        f"full_session_path: {most_recent_path}",
-        f"summary_session_title: {second_title}",
-        f"summary_session_date: {second_date}",
+        f"full_session_title: {most_recent_title or '(none)'}",
+        f"full_session_date: {most_recent_date or '(none)'}",
+        f"full_session_path: {most_recent_path or '(none)'}",
+        f"summary_session_title: {second_title or '(none)'}",
+        f"summary_session_date: {second_date or '(none)'}",
         f"insight_count: {insight_count}",
     ]
 
