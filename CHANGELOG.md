@@ -27,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context via heredocs, saving ~800 tokens per note during batch summarization.
 - Per-note task sub-tasks skipped when N>5 — uses wave-level progress updates
   instead, saving ~15-20s of parent round-trip overhead at large batch sizes.
-- Context builder sub-agent instructed to read all files in parallel and cap
-  insights at 20 most recent, reducing sequential read bottleneck.
+- `/recall` Step 3 context builder replaced from sub-agent (~145s, 70 Read calls)
+  to pure Python `build_context_brief()` function (<3s, direct file I/O). Total
+  `/recall` estimated to drop from ~4 min to ~1.5 min. Sub-agent fallback removed.
 - Config load and project derivation merged into single Python call, eliminating
   one parent round (~5s). `/recall` steps renumbered from 8 to 5.
 
