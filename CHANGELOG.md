@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-04-10
+
 ### Added
 - pytest test suite with 101 tests across 7 test files covering all Python hook modules
 - SKILL.md `python3 -c` syntax validation via parameterized compile() tests (26 snippets)
@@ -17,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `skills/obsidian-setup/SKILL.md` f-string escape bug caught by snippet validator
+
+### Changed
+- Upgraded GitHub Actions from v4/v5 to v6 (Node.js 24 compatible)
+- `commit-preflight.sh` now fails if `tests/` directory exists but pytest is not installed
 
 ## [1.8.0] - 2026-04-10
 
