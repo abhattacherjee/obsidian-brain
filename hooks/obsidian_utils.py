@@ -245,7 +245,7 @@ def read_note_metadata(file_path: str) -> dict | None:
     Cached per file path within the session.
     """
     sid = _get_session_id_fast()
-    cache_key = f"metadata:{file_path}"
+    cache_key = f"metadata:{os.path.realpath(file_path)}"
     _CACHE_SENTINEL = {"__no_frontmatter__": True}
     cached = cache_get(sid, cache_key)
     if cached is not None:
@@ -953,7 +953,8 @@ def find_unsummarized_notes(
         # has a persistent cache that may be stale after status changes.
         try:
             content = f.read_text(encoding='utf-8', errors='replace')
-        except OSError:
+        except OSError as exc:
+            print(f"[obsidian-brain] cannot read {f.name}: {exc}", file=sys.stderr)
             continue
 
         # Parse frontmatter inline (no cache)
@@ -1007,7 +1008,7 @@ def find_unsummarized_notes(
                     continue
                 # Invalidate cache for this file
                 sid = _get_session_id_fast()
-                cache_key = f"metadata:{str(f)}"
+                cache_key = f"metadata:{os.path.realpath(str(f))}"
                 cache_set(sid, cache_key, None)
                 auto_fixed += 1
             except OSError:
@@ -1262,17 +1263,18 @@ def build_context_brief(
         f"insight_count: {insight_count}",
     ]
 
+    # Use unique delimiters that cannot appear in user-authored markdown content
     output_parts = [
-        "CONTEXT_BRIEF:",
+        "<<<OB_CONTEXT_BRIEF>>>",
         brief,
         "",
-        "LOAD_MANIFEST:",
+        "<<<OB_LOAD_MANIFEST>>>",
         "\n".join(manifest_lines),
         "",
-        "MOST_RECENT_SESSION_PATH:",
+        "<<<OB_MOST_RECENT_SESSION_PATH>>>",
         most_recent_path,
         "",
-        "OPEN_ITEM_CANDIDATES:",
+        "<<<OB_OPEN_ITEM_CANDIDATES>>>",
         candidates_output,
     ]
 
@@ -1903,7 +1905,7 @@ def upgrade_note_with_summary(
 
     # Invalidate metadata cache for this note (status changed from auto-logged to summarized)
     sid = _get_session_id_fast()
-    cache_set(sid, f"metadata:{note_path}", None)
+    cache_set(sid, f"metadata:{os.path.realpath(note_path)}", None)
 
     # Build status
     status = f"Upgraded {os.path.basename(note_path)} (source: {source})"
