@@ -152,9 +152,11 @@ Mark the sub-task and task #2 as completed. Report the result.
 
 #### Path C: N>=2 (batch — sub-agent-first, three waves)
 
+**Task management threshold:** If N <= 5, create per-note sub-tasks for each wave (prep, summarize, write-back). If N > 5, skip per-note sub-tasks — use a single progress update on task #2 per wave instead (e.g. `Summarize 10 notes: Wave 1 prep complete`). This saves ~15-20s of parent round-trip overhead at large N.
+
 ##### Wave 1 — Prep (parallel Bash calls)
 
-Create a prep sub-task for each note:
+If N <= 5, create a prep sub-task for each note:
 
 ```
 TaskCreate: subject="Prep: <basename>", activeForm="Prepping <basename>"
@@ -175,7 +177,9 @@ print(result)
 
 Launch all N Bash calls in a single message turn so they run in parallel.
 
-When all return, update each prep sub-task to completed (include result in subject: e.g. `Prep: ...2322.md (RAW_OK)` or `Prep: ...4653.md (JSONL_PREPPED)`).
+When all return:
+- If N <= 5: update each prep sub-task to completed (include result in subject: e.g. `Prep: ...2322.md (RAW_OK)`).
+- If N > 5: update task #2 subject to `Summarize N notes: Wave 1 prep complete`.
 
 Parse each result:
 - `RAW_OK:<note_path>` → sub-agent will read the raw note path
@@ -184,7 +188,7 @@ Parse each result:
 
 ##### Wave 2 — Summarize and write to temp files (parallel sub-agents)
 
-Create a summarize sub-task for each note (excluding NO_CONTENT):
+If N <= 5, create a summarize sub-task for each note (excluding NO_CONTENT):
 
 ```
 TaskCreate: subject="Summarize: <basename>", activeForm="Summarizing <basename>"
@@ -206,12 +210,15 @@ Where `<READ_PATH>` is:
 And `<basename>` is the note filename without extension (e.g. `2026-04-09-obsidian-brain-2322`).
 
 When all sub-agents return, check each result:
-- If the sub-agent returned `WRITTEN:<path>`, update its summarize sub-task to completed.
-- If the sub-agent returned an error, empty output, or anything else, update its summarize sub-task subject to `Failed: <basename>` and mark completed. Exclude this note from Wave 3 — it stays unsummarized for the next `/recall`. Report the failure to the user.
+- If the sub-agent returned `WRITTEN:<path>`, mark it as succeeded.
+- If the sub-agent returned an error, empty output, or anything else, mark it as failed. Exclude this note from Wave 3 — it stays unsummarized for the next `/recall`. Report the failure to the user.
+
+If N <= 5: update each summarize sub-task to completed (or `Failed: <basename>`).
+If N > 5: update task #2 subject to `Summarize N notes: Wave 2 complete (M succeeded, F failed)`.
 
 ##### Wave 3 — Write back from temp files (parallel Bash calls)
 
-Create a write-back sub-task for each note that got a `WRITTEN:` status:
+If N <= 5, create a write-back sub-task for each note that got a `WRITTEN:` status:
 
 ```
 TaskCreate: subject="Write back: <basename>", activeForm="Writing <basename>"
@@ -237,8 +244,11 @@ print(status)
 Launch all write-back Bash calls in a single message turn.
 
 When all return, parse each result:
-- If the status does NOT start with "Failed:", update the write-back sub-task to completed.
-- If the status starts with "Failed:", update the sub-task subject to `Failed: <basename>` and mark completed. Count it in the failure tally.
+- If the status does NOT start with "Failed:", mark as succeeded.
+- If the status starts with "Failed:", mark as failed. Count it in the failure tally.
+
+If N <= 5: update each write-back sub-task accordingly.
+If N > 5: update task #2 subject to `Summarize N notes: Wave 3 complete (M written, F failed)`.
 
 ##### Cleanup
 
@@ -292,9 +302,12 @@ Search B — Insights:
 From session files, sort by date (from frontmatter or filename). Select:
 - Most recent session — read in full. Store its path.
 - Second most recent — read first 50 lines (frontmatter + summary + open questions)
-- Last 5 sessions — collect titles, dates, branches for the history table
+- Last 5 sessions — read first 15 lines each (enough for frontmatter title/date/branch)
 
-From insight files, read ALL of them in full (they are short).
+From insight files, if 20 or fewer read ALL of them. If more than 20, read only the 20 most recent (by filename date prefix).
+
+**IMPORTANT — Maximize parallel reads to reduce wall time:**
+Read the most recent session, second session (50 lines), older sessions (15 lines each), and all insight files in a SINGLE message turn with all Read calls in parallel. Do NOT read files one at a time — sequential reads are the #1 wall-time bottleneck.
 
 ### 3. Compose context brief (~2000 tokens)
 
