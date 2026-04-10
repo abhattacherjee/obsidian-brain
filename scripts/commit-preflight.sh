@@ -250,7 +250,17 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "🧪 Running tests..."
 
 # __HARDEN_TEST_START__
-echo "⏭️  No test runner detected — skipping tests"
+if [ -d "tests" ] && command -v pytest &>/dev/null; then
+    echo "🧪 Running pytest with coverage..."
+    if pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90; then
+        CHECKS_RUN="${CHECKS_RUN}tests,"
+    else
+        echo "❌ Tests failed or coverage below 90%"
+        CHECKS_PASSED=false
+    fi
+else
+    echo "⏭️  No test runner detected — skipping tests"
+fi
 # __HARDEN_TEST_END__
 
 echo ""

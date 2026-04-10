@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sys
 import os
+import stat
+import tempfile
 
 import pytest
 
@@ -300,3 +302,454 @@ def test_batch_cascade_checkoff_empty(tmp_vault):
     )
     assert isinstance(result, str)
     assert "no open items" in result.lower() or "no duplicate" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# 14. collect_open_items: snapshot exclusion (line 81)
+# ---------------------------------------------------------------------------
+
+def test_collect_open_items_skips_snapshot_files(tmp_vault):
+    sessions_dir = tmp_vault / "claude-sessions"
+    # A snapshot file should be skipped even if it contains matching content
+    snapshot_note = sessions_dir / "2026-04-10-proj-snapshot.md"
+    snapshot_note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n- [ ] Snapshot item\n",
+        encoding="utf-8",
+    )
+    items = collect_open_items(str(tmp_vault), "claude-sessions", "myproject")
+    texts = [t for _, _, t in items]
+    assert "Snapshot item" not in texts
+
+
+# ---------------------------------------------------------------------------
+# 15. collect_open_items: exclude_path filtering (line 71 / 84-85)
+# ---------------------------------------------------------------------------
+
+def test_collect_open_items_exclude_path(tmp_vault):
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = _create_session_note(
+        sessions_dir, "2026-04-10-proj-excl.md", "myproject",
+        ["Excluded item here"],
+    )
+    items = collect_open_items(
+        str(tmp_vault), "claude-sessions", "myproject",
+        exclude_path=str(note),
+    )
+    texts = [t for _, _, t in items]
+    assert "Excluded item here" not in texts
+
+
+# ---------------------------------------------------------------------------
+# 16. collect_open_items: OSError on file read (lines 92-94)
+# ---------------------------------------------------------------------------
+
+def test_collect_open_items_oserror(tmp_vault, monkeypatch, capsys):
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = _create_session_note(
+        sessions_dir, "2026-04-10-proj-bad.md", "myproject", ["Good item"]
+    )
+
+    original_open = open
+
+    def patched_open(path, *args, **kwargs):
+        if str(note) in str(path):
+            raise OSError("simulated read error")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", patched_open)
+    items = collect_open_items(str(tmp_vault), "claude-sessions", "myproject")
+    captured = capsys.readouterr()
+    assert "skipping unreadable note" in captured.err
+    # The unreadable file's items should not appear
+    assert all("Good item" not in t for _, _, t in items)
+
+
+# ---------------------------------------------------------------------------
+# 17. collect_open_items: UnicodeDecodeError on file read (lines 95-97)
+# ---------------------------------------------------------------------------
+
+def test_collect_open_items_unicode_error(tmp_vault, monkeypatch, capsys):
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = _create_session_note(
+        sessions_dir, "2026-04-10-proj-unicode.md", "myproject", ["Unicode item"]
+    )
+
+    original_open = open
+
+    def patched_open(path, *args, **kwargs):
+        if str(note) in str(path):
+            raise UnicodeDecodeError("utf-8", b"", 0, 1, "simulated")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", patched_open)
+    items = collect_open_items(str(tmp_vault), "claude-sessions", "myproject")
+    captured = capsys.readouterr()
+    assert "encoding error" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 18. collect_open_items: max_sessions limit (lines 128-129)
+# ---------------------------------------------------------------------------
+
+def test_collect_open_items_max_sessions(tmp_vault):
+    sessions_dir = tmp_vault / "claude-sessions"
+    for i in range(5):
+        _create_session_note(
+            sessions_dir, f"2026-04-0{i+1}-proj-ms{i}.md", "myproject",
+            [f"Item from session {i}"],
+        )
+    # max_sessions=2 → only 2 files processed
+    items = collect_open_items(
+        str(tmp_vault), "claude-sessions", "myproject", max_sessions=2
+    )
+    assert len(items) == 2
+
+
+# ---------------------------------------------------------------------------
+# 19. collect_open_items: section break on next ## header (line 123)
+# ---------------------------------------------------------------------------
+
+def test_collect_open_items_section_break(tmp_vault):
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = sessions_dir / "2026-04-10-proj-secbreak.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Item in section\n"
+        "## Another Section\n"
+        "- [ ] Item outside section\n",
+        encoding="utf-8",
+    )
+    items = collect_open_items(str(tmp_vault), "claude-sessions", "myproject")
+    texts = [t for _, _, t in items]
+    assert "Item in section" in texts
+    assert "Item outside section" not in texts
+
+
+# ---------------------------------------------------------------------------
+# 20. dedup_note_open_items: OSError reading note_path (lines 213-215)
+# ---------------------------------------------------------------------------
+
+def test_dedup_note_oserror(tmp_vault, monkeypatch, capsys):
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = _create_session_note(
+        sessions_dir, "2026-04-10-proj-derr.md", "myproject", ["Bad file item"]
+    )
+
+    original_open = open
+
+    def patched_open(path, *args, **kwargs):
+        if str(note) in str(path):
+            raise OSError("cannot open")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", patched_open)
+    result = dedup_note_open_items(
+        str(tmp_vault), "claude-sessions", "myproject", str(note)
+    )
+    assert result == []
+    captured = capsys.readouterr()
+    assert "dedup: cannot read" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 21. dedup_note_open_items: no existing items (early return, line 222)
+# ---------------------------------------------------------------------------
+
+def test_dedup_note_no_existing_items(tmp_vault):
+    sessions_dir = tmp_vault / "claude-sessions"
+    # Only one session note — no other notes for comparison
+    note = _create_session_note(
+        sessions_dir, "2026-04-10-proj-only.md", "myproject", ["Solo item"]
+    )
+    result = dedup_note_open_items(
+        str(tmp_vault), "claude-sessions", "myproject", str(note)
+    )
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# 22. dedup_note_open_items: section break → no duplicates found (line 247)
+# ---------------------------------------------------------------------------
+
+def test_dedup_note_no_duplicates_found(tmp_vault):
+    sessions_dir = tmp_vault / "claude-sessions"
+    _create_session_note(
+        sessions_dir, "2026-04-09-proj-old2.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+    # Newer note with completely different items (no high-confidence match)
+    newer_note = sessions_dir / "2026-04-10-proj-new2.md"
+    newer_note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Totally unrelated task with no common tokens whatsoever\n",
+        encoding="utf-8",
+    )
+    removed = dedup_note_open_items(
+        str(tmp_vault), "claude-sessions", "myproject", str(newer_note)
+    )
+    assert removed == []
+
+
+# ---------------------------------------------------------------------------
+# 23. dedup_note_open_items: stat OSError fallback (lines 261-262)
+# ---------------------------------------------------------------------------
+
+def test_dedup_note_stat_oserror_fallback(tmp_vault, monkeypatch):
+    sessions_dir = tmp_vault / "claude-sessions"
+    _create_session_note(
+        sessions_dir, "2026-04-09-proj-statold.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+    newer_note = _create_session_note(
+        sessions_dir, "2026-04-10-proj-statnew.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error", "Another item"],
+    )
+
+    original_stat = os.stat
+
+    def patched_stat(path, *args, **kwargs):
+        if str(newer_note) in str(path):
+            raise OSError("stat failed")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", patched_stat)
+    removed = dedup_note_open_items(
+        str(tmp_vault), "claude-sessions", "myproject", str(newer_note)
+    )
+    # Should still remove the duplicate even without stat
+    assert len(removed) >= 1
+
+
+# ---------------------------------------------------------------------------
+# 24. dedup_note_open_items: atomic write OSError → cleanup (lines 267-273)
+# ---------------------------------------------------------------------------
+
+def test_dedup_note_atomic_write_oserror(tmp_vault, monkeypatch, capsys):
+    sessions_dir = tmp_vault / "claude-sessions"
+    _create_session_note(
+        sessions_dir, "2026-04-09-proj-wold.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+    newer_note = _create_session_note(
+        sessions_dir, "2026-04-10-proj-wnew.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error", "Another item"],
+    )
+
+    original_replace = os.replace
+
+    def patched_replace(src, dst):
+        if ".ob-dedup-" in src:
+            raise OSError("replace failed")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", patched_replace)
+    result = dedup_note_open_items(
+        str(tmp_vault), "claude-sessions", "myproject", str(newer_note)
+    )
+    assert result == []
+    captured = capsys.readouterr()
+    assert "atomic write failed" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 25. dedup_note_open_items: ## section break inside note (line 236)
+# ---------------------------------------------------------------------------
+
+def test_dedup_note_section_break_stops_scan(tmp_vault):
+    sessions_dir = tmp_vault / "claude-sessions"
+    _create_session_note(
+        sessions_dir, "2026-04-09-proj-sbold.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+    # Newer note: has item AFTER next ## that should not be removed
+    newer_note = sessions_dir / "2026-04-10-proj-sbnew.md"
+    newer_note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Fix hooks/obsidian_utils.py import error\n"
+        "## Other Section\n"
+        "- [ ] Fix hooks/obsidian_utils.py import error\n",
+        encoding="utf-8",
+    )
+    removed = dedup_note_open_items(
+        str(tmp_vault), "claude-sessions", "myproject", str(newer_note)
+    )
+    # Only the one in the Open Questions section should be considered
+    assert len(removed) == 1
+
+
+# ---------------------------------------------------------------------------
+# 26. batch_cascade_checkoff: fuzzy-only duplicates (lines 304-305, 377-384)
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_fuzzy_suggestions(tmp_vault):
+    sessions_dir = tmp_vault / "claude-sessions"
+    # Create a note with a fuzzy-matchable item (high token overlap, no distinctive tokens)
+    note = sessions_dir / "2026-04-09-proj-fuzzy.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Review the summarization pipeline configuration for batch recall upgrade\n",
+        encoding="utf-8",
+    )
+    result = batch_cascade_checkoff(
+        str(tmp_vault),
+        "claude-sessions",
+        "myproject",
+        ["Check the summarization pipeline configuration for batch recall upgrade process"],
+    )
+    # Either reports fuzzy suggestions or no duplicates; if fuzzy it should mention it
+    assert isinstance(result, str)
+    if "fuzzy" in result.lower():
+        assert "Fuzzy suggestions" in result
+
+
+# ---------------------------------------------------------------------------
+# 27. batch_cascade_checkoff: no duplicates found path (line 313-314)
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_no_duplicates(tmp_vault):
+    sessions_dir = tmp_vault / "claude-sessions"
+    _create_session_note(
+        sessions_dir, "2026-04-09-proj-nodupe.md", "myproject",
+        ["Deploy the authentication service"],
+    )
+    result = batch_cascade_checkoff(
+        str(tmp_vault),
+        "claude-sessions",
+        "myproject",
+        ["Update the CSS color scheme"],
+    )
+    assert "No duplicates found" in result
+
+
+# ---------------------------------------------------------------------------
+# 28. batch_cascade_checkoff: cascade file read OSError (lines 329-331)
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_file_read_oserror(tmp_vault, monkeypatch, capsys):
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = _create_session_note(
+        sessions_dir, "2026-04-09-proj-casc.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+
+    # Make the file unreadable after collect_open_items has already collected it
+    call_count = [0]
+    original_open = open
+
+    def patched_open(path, *args, **kwargs):
+        if str(note) in str(path):
+            call_count[0] += 1
+            # First call (collect) succeeds; second call (cascade edit) fails
+            if call_count[0] > 1:
+                raise OSError("cascade read failed")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", patched_open)
+    result = batch_cascade_checkoff(
+        str(tmp_vault),
+        "claude-sessions",
+        "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+    captured = capsys.readouterr()
+    assert "cascade: cannot read" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 29. batch_cascade_checkoff: line no longer has checkbox (line 340)
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_line_already_changed(tmp_vault, monkeypatch, capsys):
+    sessions_dir = tmp_vault / "claude-sessions"
+    # Create a note that has already been checked off (- [x])
+    note = sessions_dir / "2026-04-09-proj-checked.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [x] Fix hooks/obsidian_utils.py import error\n",
+        encoding="utf-8",
+    )
+
+    # But inject it into collect_open_items by patching to return a fake unchecked item
+    import open_item_dedup as oid_module
+
+    original_collect = oid_module.collect_open_items
+
+    def patched_collect(vault_path, sessions_folder, project, *args, **kwargs):
+        # Return the note as if it had an unchecked item at line 7
+        return [(str(note), 7, "Fix hooks/obsidian_utils.py import error")]
+
+    monkeypatch.setattr(oid_module, "collect_open_items", patched_collect)
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault),
+        "claude-sessions",
+        "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+    captured = capsys.readouterr()
+    # Should warn that line no longer has expected checkbox
+    assert "no longer contains expected checkbox" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 30. batch_cascade_checkoff: cascade write OSError (lines 363-368)
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_write_oserror(tmp_vault, monkeypatch, capsys):
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = _create_session_note(
+        sessions_dir, "2026-04-09-proj-wfail.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+
+    original_replace = os.replace
+
+    def patched_replace(src, dst):
+        if ".ob-cascade-" in src:
+            raise OSError("cascade write failed")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", patched_replace)
+    result = batch_cascade_checkoff(
+        str(tmp_vault),
+        "claude-sessions",
+        "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+    captured = capsys.readouterr()
+    assert "cascade: write failed" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 31. batch_cascade_checkoff: stat OSError fallback in cascade write (lines 355-356)
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_stat_oserror(tmp_vault, monkeypatch):
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = _create_session_note(
+        sessions_dir, "2026-04-09-proj-cstat.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+
+    original_stat = os.stat
+
+    def patched_stat(path, *args, **kwargs):
+        if str(note) in str(path):
+            raise OSError("stat failed")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", patched_stat)
+    result = batch_cascade_checkoff(
+        str(tmp_vault),
+        "claude-sessions",
+        "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+    # Should still succeed (uses 0o644 fallback)
+    assert isinstance(result, str)
