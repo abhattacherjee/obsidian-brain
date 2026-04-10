@@ -7,11 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- `/recall` session history switched from table to numbered list with two-line format: bold header (title, date, duration) followed by indented summary paragraph for immediate scope visibility
-
 ### Fixed
-- `/recall` session history now sorts by date descending then mtime descending, so sessions from the same day appear in true chronological order instead of random hash order
+- `/recall` session history table now sorts by date descending then mtime descending, so sessions from the same day appear in true chronological order instead of random hash order
+- `/recall` session history table now includes a Duration column showing session length in readable format (e.g. `1h 20m`, `27m`)
 
 ## [1.8.1] - 2026-04-10
 

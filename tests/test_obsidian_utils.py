@@ -592,7 +592,7 @@ class TestBuildContextBriefSort:
             str(tmp_path), "sessions", "insights", "proj",
         )
 
-        assert "1h 20m" in output
+        assert "| 1h 20m |" in output
 
     def test_duration_format_minutes_only(self, tmp_path, monkeypatch):
         """Duration < 60 min should display as Xm."""
@@ -612,10 +612,10 @@ class TestBuildContextBriefSort:
             str(tmp_path), "sessions", "insights", "proj",
         )
 
-        assert "27m)" in output
+        assert "| 27m |" in output
 
     def test_duration_format_zero(self, tmp_path, monkeypatch):
-        """Duration 0 should omit duration from header."""
+        """Duration 0 should produce empty string in column."""
         monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
         sessions = tmp_path / "sessions"
@@ -632,55 +632,4 @@ class TestBuildContextBriefSort:
             str(tmp_path), "sessions", "insights", "proj",
         )
 
-        # Should show (2026-04-10) without duration
-        assert "(2026-04-10)" in output
-        assert "0m" not in output
-
-    def test_summary_as_bullets(self, tmp_path, monkeypatch):
-        """Summary sentences should appear as indented bullets below the header."""
-        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
-
-        sessions = tmp_path / "sessions"
-        insights = tmp_path / "insights"
-        sessions.mkdir()
-        insights.mkdir()
-
-        _make_session_note(
-            sessions / "2026-04-10-proj-aaaa.md",
-            "proj", "2026-04-10", "main", 15,
-            "Built the widget system end to end. Added 5 tests for coverage.",
-        )
-
-        output = obsidian_utils.build_context_brief(
-            str(tmp_path), "sessions", "insights", "proj",
-        )
-
-        assert "   - Built the widget system end to end." in output
-        assert "   - Added 5 tests for coverage." in output
-
-    def test_title_uses_full_first_sentence(self, tmp_path, monkeypatch):
-        """Title should be the full first line of summary, not truncated."""
-        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
-
-        sessions = tmp_path / "sessions"
-        insights = tmp_path / "insights"
-        sessions.mkdir()
-        insights.mkdir()
-
-        long_sentence = "This is a very long summary sentence that exceeds eighty characters and should appear in full as the title."
-        _make_session_note(
-            sessions / "2026-04-10-proj-aaaa.md",
-            "proj", "2026-04-10", "main", 10,
-            long_sentence + " Second sentence here.",
-        )
-
-        output = obsidian_utils.build_context_brief(
-            str(tmp_path), "sessions", "insights", "proj",
-        )
-
-        # Title should contain the full first sentence
-        history_line = [l for l in output.split("\n") if l.startswith("1. **")][0]
-        assert long_sentence in history_line
-        # Full content should appear in bullets
-        assert f"   - {long_sentence}" in output
-        assert "   - Second sentence here." in output
+        assert "|  |" in output or "| |" in output
