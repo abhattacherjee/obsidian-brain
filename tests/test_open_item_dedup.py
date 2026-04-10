@@ -816,11 +816,12 @@ def test_batch_cascade_checkoff_multiple_items(tmp_vault):
         ],
     )
     assert isinstance(result, str)
-    # Verify at least one item was actually checked off on disk
+    # Verify both items were actually checked off on disk
     all_content = ""
     for f in sessions_dir.iterdir():
         all_content += f.read_text(encoding="utf-8")
     assert "- [x] Merge feature/auth-fix into develop" in all_content
+    assert "- [x] Update hooks/obsidian_utils.py" in all_content
 
 
 # ---------------------------------------------------------------------------
@@ -848,10 +849,11 @@ def test_batch_cascade_checkoff_modifies_files(tmp_vault):
         ["Merge feature/auth-fix into develop"],
     )
 
-    # Both notes should have the item checked off (cascade checks all matches)
+    # At least one note should have the item checked off
     content_a = (sessions_dir / "2026-04-08-proj-src.md").read_text(encoding="utf-8")
     content_b = (sessions_dir / "2026-04-09-proj-dup.md").read_text(encoding="utf-8")
-    assert "- [x] Merge feature/auth-fix into develop" in content_a + content_b
+    assert "- [x] Merge feature/auth-fix into develop" in content_a \
+        or "- [x] Merge feature/auth-fix into develop" in content_b
     # Non-matching item should remain untouched
     assert "- [ ] Unrelated task here" in content_b
 

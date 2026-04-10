@@ -420,7 +420,7 @@ When open items are checked off in the standup note (either during generation or
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-echo '$CHECKED_ITEMS_JSON' | python3 -c '
+printf '%s' "$CHECKED_ITEMS_JSON" | python3 -c '
 import sys, json, os
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from open_item_dedup import batch_cascade_checkoff
@@ -434,9 +434,11 @@ Where `$CHECKED_ITEMS_JSON` is a JSON array of the confirmed item texts for that
 
 Run one call per project that has completed items. If multiple projects have items, run the calls in parallel.
 
-If the command exits non-zero or prints errors to stderr, report the error to the user:
+If the command exits with a non-zero exit code, report the error to the user:
 
-> Cascade checkoff failed for $PROJECT: [first line of error]. The standup note is unaffected.
+> Cascade checkoff failed for $PROJECT: [first line of stderr]. The standup note is unaffected.
+
+Note: `batch_cascade_checkoff()` may emit warnings to stderr while still succeeding (e.g., a specific line changed). Only treat non-zero exit code as a failure.
 
 **14c — Report cascade results.** After all cascade calls complete, report:
 
