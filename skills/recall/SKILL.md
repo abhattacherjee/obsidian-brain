@@ -15,25 +15,28 @@ Searches the Obsidian vault for session notes and insights matching the current 
 
 Follow these steps exactly. Do not skip steps or reorder them.
 
-### Step 1 — Load config
+### Step 1 — Load config and derive project
 
-Run:
+Run a single call that loads config and derives the project name (saves one parent round):
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys
+import sys, os
 sys.path.insert(0, "hooks")
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
     print("ERROR: vault_path not configured", file=sys.stderr)
     sys.exit(1)
-print("VAULT=" + c["vault_path"] + " SESS=" + c.get("sessions_folder", "claude-sessions") + " INS=" + c.get("insights_folder", "claude-insights"))
+project = os.path.basename(os.getcwd()).lower().replace(" ", "-")
+print("VAULT=" + c["vault_path"] + " SESS=" + c.get("sessions_folder", "claude-sessions") + " INS=" + c.get("insights_folder", "claude-insights") + " PROJECT=" + project)
 '
 ```
 
-Parse the output line to extract `VAULT_PATH`, `SESSIONS_FOLDER`, and `INSIGHTS_FOLDER`.
+Parse the output to extract `VAULT_PATH`, `SESSIONS_FOLDER`, `INSIGHTS_FOLDER`, and `PROJECT`.
+
+If the user passed a project name argument (e.g. `/recall my-project`), override `PROJECT` with that value.
 
 If the output is empty or errors, tell the user:
 
@@ -52,25 +55,13 @@ TaskCreate: subject="Present results and detect completed items", activeForm="Pr
 
 Track the returned task IDs — you will update them as each step completes. Immediately set task #1 to `in_progress` via TaskUpdate.
 
-### Step 2 — Derive project name
-
-If the user passed a project name argument (e.g. `/recall my-project`), use that.
-
-Otherwise, derive from the current working directory:
-
-```bash
-basename "$(pwd)"
-```
-
-Store as `PROJECT`. Normalize: lowercase, hyphens for spaces.
-
-### Step 3 — Summarize unsummarized notes (deferred summarization, truncation-aware)
+### Step 2 — Summarize unsummarized notes (deferred summarization, truncation-aware)
 
 > ⚠️ **THIS STEP IS MANDATORY. DO NOT SKIP IT.**
 >
-> If Grep finds any file matching both `status: auto-logged` AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 4. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
+> If Grep finds any file matching both `status: auto-logged` AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 3. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
 >
-> **Visibility requirement:** Before Step 4, emit a one-line status: `Step 3: processing N unsummarized note(s) for $PROJECT` (or `Step 3: no unsummarized notes for $PROJECT` if the intersection is empty). This makes the decision auditable in the tool trace.
+> **Visibility requirement:** Before Step 3, emit a one-line status: `Step 2: processing N unsummarized note(s) for $PROJECT` (or `Step 2: no unsummarized notes for $PROJECT` if the intersection is empty). This makes the decision auditable in the tool trace.
 
 Search for raw/unsummarized session notes matching this project.
 
@@ -96,7 +87,7 @@ Update task #1 to completed. Update task #2 subject to `Summarize N unsummarized
 
 #### Path A: N=0 (no unsummarized notes)
 
-Update task #2 subject to `No unsummarized notes found` and set to `completed`. Skip to Step 4.
+Update task #2 subject to `No unsummarized notes found` and set to `completed`. Skip to Step 3.
 
 #### Path B: N=1 (single note — Python pipeline)
 
@@ -264,7 +255,7 @@ If any sub-agents returned empty or invalid summaries, report those notes as sti
 
 For `NO_CONTENT` notes, inform the user: "Note `<basename>` has no session_id or conversation content. Manually edit it in Obsidian to add a summary, or delete it if it's empty."
 
-### Step 4 — Build context brief (sub-agent)
+### Step 3 — Build context brief (sub-agent)
 
 Update task #3 to `in_progress`.
 
@@ -279,7 +270,7 @@ VAULT_PATH: $VAULT_PATH
 SESSIONS_FOLDER: $SESSIONS_FOLDER
 INSIGHTS_FOLDER: $INSIGHTS_FOLDER
 PROJECT: $PROJECT
-UPGRADED_COUNT: <number of notes upgraded in Step 3, or 0>
+UPGRADED_COUNT: <number of notes upgraded in Step 2, or 0>
 
 ## Your task
 
@@ -416,7 +407,7 @@ OPEN_ITEM_CANDIDATES:
 
 Update task #3 to `completed`.
 
-### Step 5 — Present to user
+### Step 4 — Present to user
 
 Update task #4 to `in_progress`.
 
@@ -426,15 +417,15 @@ Display:
 
 Then output the `CONTEXT_BRIEF` section from the sub-agent return verbatim.
 
-If unsummarized notes were upgraded in Step 3, also mention:
+If unsummarized notes were upgraded in Step 2, also mention:
 
 > _Upgraded N session note(s) with AI summaries._
 
-### Step 5.5 — Detect completed open items (from sub-agent data)
+### Step 4.5 — Detect completed open items (from sub-agent data)
 
 Parse the `OPEN_ITEM_CANDIDATES` section from the sub-agent return.
 
-1. **Skip if no candidates.** If the value is `NO_ITEMS` or `NO_CANDIDATES`, skip to Step 6 silently.
+1. **Skip if no candidates.** If the value is `NO_ITEMS` or `NO_CANDIDATES`, skip to Step 5 silently.
 
 2. **Parse candidates.** The JSON array contains objects with `file`, `line`, `text`, `evidence`, `confidence`, `has_completion_phrase`.
 
@@ -454,7 +445,7 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
 ```
 
 4. **Wait for user response.** Parse the response:
-   - `none` or empty → skip checkoff entirely, proceed to Step 6
+   - `none` or empty → skip checkoff entirely, proceed to Step 5
    - `all` → check off all candidates
    - Comma-separated numbers (e.g. `1,3`) → check off only those
 
@@ -486,9 +477,9 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
 
     Construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts. Report the cascade summary.
 
-Then proceed to Step 6.
+Then proceed to Step 5.
 
-### Step 6 — Show load manifest and offer options
+### Step 5 — Show load manifest and offer options
 
 Use the `LOAD_MANIFEST` data from the sub-agent return to show:
 
