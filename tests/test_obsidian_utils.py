@@ -1,0 +1,490 @@
+# tests/test_obsidian_utils.py
+"""Tests for obsidian_utils.py — config, metadata, messages, I/O, upgrade, sampling."""
+
+import hashlib
+import json
+import os
+import uuid
+
+import pytest
+
+import obsidian_utils
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _unique_sid() -> str:
+    """Return a unique string to use as a fake session ID (bypasses cache)."""
+    return f"test-sid-{uuid.uuid4().hex}"
+
+
+# ===========================================================================
+# Section 1: Config & session context
+# ===========================================================================
+
+
+class TestLoadConfig:
+    def test_load_config_valid(self, tmp_path, monkeypatch):
+        """Write a valid config JSON, verify it merges with defaults."""
+        config_file = tmp_path / "obsidian-brain-config.json"
+        user_cfg = {
+            "vault_path": str(tmp_path / "vault"),
+            "sessions_folder": "my-sessions",
+        }
+        config_file.write_text(json.dumps(user_cfg), encoding="utf-8")
+
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        result = obsidian_utils.load_config()
+
+        assert result["vault_path"] == str(tmp_path / "vault")
+        assert result["sessions_folder"] == "my-sessions"
+        # Default keys still present
+        assert result["insights_folder"] == "claude-insights"
+        assert result["min_messages"] == 3
+        assert result["summary_model"] == "haiku"
+
+    def test_load_config_missing(self, tmp_path, monkeypatch):
+        """Monkeypatch to nonexistent path — defaults should be returned."""
+        monkeypatch.setattr(
+            obsidian_utils, "_CONFIG_PATH", tmp_path / "no-such-config.json"
+        )
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        result = obsidian_utils.load_config()
+
+        assert result["vault_path"] == ""
+        assert result["sessions_folder"] == "claude-sessions"
+        assert result["min_messages"] == 3
+        assert result["auto_log_enabled"] is True
+
+    def test_get_project_name(self):
+        """Test get_project_name with a path and with empty string."""
+        assert obsidian_utils.get_project_name("/home/user/my-project") == "my-project"
+        assert obsidian_utils.get_project_name("") == "unknown"
+
+
+# ===========================================================================
+# Section 2: Frontmatter parsing
+# ===========================================================================
+
+
+class TestReadNoteMetadata:
+    def test_read_note_metadata_valid(self, sample_session_note, monkeypatch):
+        """Parse valid frontmatter and verify fields + tags."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        meta = obsidian_utils.read_note_metadata(str(sample_session_note))
+
+        assert meta is not None
+        assert meta["type"] == "claude-session"
+        assert meta["date"] == "2026-04-10"
+        assert meta["session_id"] == "test-session-id-1234"
+        assert meta["project"] == "test-project"
+        assert meta["status"] == "summarized"
+        assert "claude/session" in meta["tags"]
+        assert "claude/project/test-project" in meta["tags"]
+        assert "claude/auto" in meta["tags"]
+
+    def test_read_note_metadata_no_frontmatter(self, tmp_path, monkeypatch):
+        """File without --- markers should return None."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "plain.md"
+        note.write_text("# Just a heading\n\nNo frontmatter here.\n", encoding="utf-8")
+
+        result = obsidian_utils.read_note_metadata(str(note))
+        assert result is None
+
+    def test_read_note_metadata_empty_file(self, tmp_path, monkeypatch):
+        """Empty file should return None."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "empty.md"
+        note.write_text("", encoding="utf-8")
+
+        result = obsidian_utils.read_note_metadata(str(note))
+        assert result is None
+
+
+# ===========================================================================
+# Section 3: Message extraction
+# ===========================================================================
+
+
+class TestMessageExtraction:
+    def test_extract_user_messages(self, sample_jsonl):
+        """Extract user messages from JSONL transcript — expect 2."""
+        entries = obsidian_utils.read_transcript(str(sample_jsonl))
+        msgs = obsidian_utils.extract_user_messages(entries)
+        assert len(msgs) == 2
+        assert "Fix the login bug" in msgs[0]
+        assert "deploy" in msgs[1].lower()
+
+    def test_extract_assistant_messages(self, sample_jsonl):
+        """Extract assistant messages — expect 2 including text from content blocks."""
+        entries = obsidian_utils.read_transcript(str(sample_jsonl))
+        msgs = obsidian_utils.extract_assistant_messages(entries)
+        assert len(msgs) == 2
+        assert "login handler" in msgs[0].lower()
+        assert "deployed" in msgs[1].lower() or "done" in msgs[1].lower()
+
+    def test_extract_user_messages_empty(self):
+        """Empty list returns []."""
+        assert obsidian_utils.extract_user_messages([]) == []
+
+
+# ===========================================================================
+# Section 4: Slug & filename
+# ===========================================================================
+
+
+class TestSlugAndFilename:
+    def test_slugify(self):
+        """Lowercases, replaces spaces/special chars, truncates at 40, empty returns 'session'."""
+        assert obsidian_utils.slugify("Hello World") == "hello-world"
+        assert obsidian_utils.slugify("Fix: AUTH bug #42!") == "fix-auth-bug-42"
+        # Truncates at 40
+        long_text = "a" * 50
+        result = obsidian_utils.slugify(long_text)
+        assert len(result) <= 40
+        # Empty string returns "session"
+        assert obsidian_utils.slugify("") == "session"
+        # Only special chars → "session"
+        assert obsidian_utils.slugify("---") == "session"
+
+    def test_make_filename(self):
+        """Verify format YYYY-MM-DD-slug-hash.md with sha256[:4]; test suffix parameter."""
+        session_id = "test-session-abc"
+        expected_hash = hashlib.sha256(session_id.encode()).hexdigest()[:4]
+
+        filename = obsidian_utils.make_filename("2026-04-10", "my-slug", session_id)
+        assert filename == f"2026-04-10-my-slug-{expected_hash}.md"
+
+        # With suffix
+        filename_suffixed = obsidian_utils.make_filename(
+            "2026-04-10", "my-slug", session_id, suffix="-snapshot"
+        )
+        assert filename_suffixed == f"2026-04-10-my-slug-{expected_hash}-snapshot.md"
+
+
+# ===========================================================================
+# Section 5: Session skip logic
+# ===========================================================================
+
+
+class TestShouldSkipSession:
+    def test_should_skip_session_short(self):
+        """Below message threshold → True."""
+        assert obsidian_utils.should_skip_session(["hello", "world"], 10.0) is True
+
+    def test_should_skip_session_long(self):
+        """Meets thresholds → False."""
+        msgs = ["msg1", "msg2", "msg3", "msg4"]
+        assert obsidian_utils.should_skip_session(msgs, 5.0) is False
+
+    def test_should_skip_session_short_duration(self):
+        """Known short duration (>0, <min_duration) → True."""
+        msgs = ["msg1", "msg2", "msg3", "msg4"]
+        assert obsidian_utils.should_skip_session(msgs, 1.0, min_duration=2.0) is True
+
+    def test_should_skip_session_zero_duration(self):
+        """Zero (unknown) duration bypasses duration check → False."""
+        msgs = ["msg1", "msg2", "msg3", "msg4"]
+        # zero duration means unknown — do not skip based on duration
+        assert obsidian_utils.should_skip_session(msgs, 0.0, min_duration=2.0) is False
+
+
+# ===========================================================================
+# Section 6: Transcript parsing
+# ===========================================================================
+
+
+class TestReadTranscript:
+    def test_read_transcript_valid_jsonl(self, sample_jsonl):
+        """Read valid JSONL — expect 4 entries."""
+        entries = obsidian_utils.read_transcript(str(sample_jsonl))
+        assert len(entries) == 4
+
+    def test_read_transcript_empty(self, tmp_path):
+        """Empty file → []."""
+        empty = tmp_path / "empty.jsonl"
+        empty.write_text("", encoding="utf-8")
+        result = obsidian_utils.read_transcript(str(empty))
+        assert result == []
+
+    def test_read_transcript_nonexistent(self, tmp_path):
+        """Missing file → []."""
+        result = obsidian_utils.read_transcript(str(tmp_path / "no-such.jsonl"))
+        assert result == []
+
+
+# ===========================================================================
+# Section 7: Matching
+# ===========================================================================
+
+
+class TestMatchItemsAgainstEvidence:
+    def test_match_items_against_evidence_match(self, tmp_path):
+        """Evidence with distinctive tokens matches the open item."""
+        # Create a fake file for the item reference
+        fake_file = str(tmp_path / "session-note.md")
+        item_text = "implement login authentication handler"
+        evidence = (
+            "Implemented the login authentication handler for user sessions. "
+            "The feature is complete and deployed."
+        )
+        open_items = [(fake_file, 10, item_text)]
+
+        results = obsidian_utils.match_items_against_evidence(evidence, open_items)
+        assert len(results) >= 1
+        assert results[0]["confidence"] >= 3
+
+    def test_match_items_against_evidence_no_match(self, tmp_path):
+        """Completely dissimilar evidence → []."""
+        fake_file = str(tmp_path / "session-note.md")
+        item_text = "refactor the database migration scripts"
+        evidence = "The UI was redesigned with a new color palette."
+        open_items = [(fake_file, 5, item_text)]
+
+        results = obsidian_utils.match_items_against_evidence(evidence, open_items)
+        assert results == []
+
+    def test_match_items_against_evidence_empty_evidence(self, tmp_path):
+        """Empty/whitespace evidence → []."""
+        fake_file = str(tmp_path / "session-note.md")
+        open_items = [(fake_file, 1, "add unit tests for authentication")]
+
+        assert obsidian_utils.match_items_against_evidence("", open_items) == []
+        assert obsidian_utils.match_items_against_evidence("   ", open_items) == []
+
+
+# ===========================================================================
+# Section 8: File I/O
+# ===========================================================================
+
+
+class TestWriteVaultNote:
+    def test_write_vault_note_creates_file(self, tmp_vault):
+        """Write succeeds and content is correct."""
+        content = "# Test Note\n\nHello, vault!\n"
+        result = obsidian_utils.write_vault_note(
+            str(tmp_vault), "claude-sessions", "test-note.md", content
+        )
+        assert result is True
+        written = (tmp_vault / "claude-sessions" / "test-note.md").read_text(encoding="utf-8")
+        assert written == content
+
+    def test_write_vault_note_creates_dirs(self, tmp_vault):
+        """Creates missing directories."""
+        content = "# New Folder Note\n"
+        result = obsidian_utils.write_vault_note(
+            str(tmp_vault), "new-folder/sub-folder", "note.md", content
+        )
+        assert result is True
+        assert (tmp_vault / "new-folder" / "sub-folder" / "note.md").exists()
+
+    def test_write_vault_note_permissions(self, tmp_vault):
+        """Written file has 0o644 permissions."""
+        obsidian_utils.write_vault_note(
+            str(tmp_vault), "claude-sessions", "perm-test.md", "content\n"
+        )
+        note_path = tmp_vault / "claude-sessions" / "perm-test.md"
+        mode = oct(note_path.stat().st_mode & 0o777)
+        assert mode == oct(0o644)
+
+
+# ===========================================================================
+# Section 9: Upgrade pipeline
+# ===========================================================================
+
+
+class TestUpgradeNoteWithSummary:
+    def test_upgrade_note_with_summary_valid(self, sample_unsummarized_note, tmp_vault, monkeypatch):
+        """Valid summary with all sections — status flipped and content inserted."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "Fixed the login bug and deployed to production.\n\n"
+            "## Key Decisions\n"
+            "- Used JWT for session management.\n\n"
+            "## Changes Made\n"
+            "- `src/auth.py` — new authentication handler\n\n"
+            "## Errors Encountered\n"
+            "None.\n\n"
+            "## Open Questions / Next Steps\n"
+            "- [ ] Add integration tests\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Upgraded")
+        content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "status: summarized" in content
+        assert "## Summary" in content
+        assert "Fixed the login bug" in content
+
+    def test_upgrade_note_with_summary_malformed(self, sample_unsummarized_note, tmp_vault):
+        """Summary without '## Summary' → starts with 'Failed:'."""
+        bad_summary = "This summary has no proper sections.\n\nJust random text."
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            bad_summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+        assert result.startswith("Failed:")
+
+    def test_upgrade_note_with_summary_no_frontmatter(self, tmp_vault, monkeypatch):
+        """Note without --- frontmatter → starts with 'Failed:'."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_vault / "claude-sessions" / "no-frontmatter.md"
+        note.write_text("# No frontmatter here\n\nJust content.\n", encoding="utf-8")
+
+        valid_summary = (
+            "## Summary\nSomething happened.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(note),
+            valid_summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+        assert result.startswith("Failed:")
+
+
+# ===========================================================================
+# Section 10: Prepare summary input
+# ===========================================================================
+
+
+class TestPrepareSummaryInput:
+    def test_prepare_summary_input_no_session_id(self, tmp_path):
+        """Note without session_id → 'NO_CONTENT:...'."""
+        note = tmp_path / "no-session-id.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-10\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "---\n\n"
+            "# Session\n\n## Summary\nSomething.\n",
+            encoding="utf-8",
+        )
+        result = obsidian_utils.prepare_summary_input(str(note))
+        assert result.startswith("NO_CONTENT:")
+
+    def test_prepare_summary_input_no_jsonl(self, tmp_path, monkeypatch):
+        """Has session_id, JSONL not found → 'RAW_OK:...'."""
+        note = tmp_path / "with-session-id.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-10\n"
+            "session_id: fake-session-no-jsonl\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "---\n\n"
+            "# Session\n\n## Summary\nSomething.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+        result = obsidian_utils.prepare_summary_input(str(note))
+        assert result.startswith("RAW_OK:")
+
+    def test_prepare_summary_input_read_error(self, tmp_path):
+        """Nonexistent file → 'NO_CONTENT:...'."""
+        result = obsidian_utils.prepare_summary_input(str(tmp_path / "ghost.md"))
+        assert result.startswith("NO_CONTENT:")
+
+
+# ===========================================================================
+# Section 11: Sampling logic (mock-based)
+# ===========================================================================
+
+
+class TestGenerateSummarySampling:
+    """Test message sampling and truncation inside generate_summary()."""
+
+    def _fake_run_factory(self, captured: dict):
+        """Return a fake subprocess.run that captures its input."""
+        def fake_run(cmd, **kwargs):
+            captured["prompt"] = kwargs.get("input", "")
+            return type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": "## Summary\nDone.\n", "stderr": ""},
+            )()
+        return fake_run
+
+    def test_generate_summary_sampling_under_20(self, monkeypatch):
+        """15 messages — no '[... middle messages omitted ...]' marker."""
+        captured: dict = {}
+        monkeypatch.setattr("subprocess.run", self._fake_run_factory(captured))
+
+        user_msgs = [f"user message {i}" for i in range(15)]
+        assistant_msgs = [f"assistant response {i}" for i in range(15)]
+        metadata = {"project": "test", "git_branch": "main", "duration_minutes": 5, "files_touched": []}
+
+        obsidian_utils.generate_summary(user_msgs, assistant_msgs, metadata)
+
+        assert captured.get("prompt") is not None
+        assert "[... middle messages omitted ...]" not in captured["prompt"]
+        # All messages should appear
+        assert "user message 0" in captured["prompt"]
+        assert "user message 14" in captured["prompt"]
+
+    def test_generate_summary_sampling_over_20(self, monkeypatch):
+        """30 messages — marker present, first/last present, middle absent."""
+        captured: dict = {}
+        monkeypatch.setattr("subprocess.run", self._fake_run_factory(captured))
+
+        user_msgs = [f"user message {i}" for i in range(30)]
+        assistant_msgs = [f"assistant response {i}" for i in range(30)]
+        metadata = {"project": "test", "git_branch": "main", "duration_minutes": 10, "files_touched": []}
+
+        obsidian_utils.generate_summary(user_msgs, assistant_msgs, metadata)
+
+        prompt = captured.get("prompt", "")
+        assert "[... middle messages omitted ...]" in prompt
+        # First and last 10 present
+        assert "user message 0" in prompt
+        assert "user message 29" in prompt
+        # Middle absent
+        assert "user message 15" not in prompt
+
+    def test_generate_summary_truncation_12k(self, monkeypatch):
+        """15 messages of 1000 chars each — total prompt stays bounded."""
+        captured: dict = {}
+        monkeypatch.setattr("subprocess.run", self._fake_run_factory(captured))
+
+        user_msgs = ["u" * 1000 for _ in range(15)]
+        assistant_msgs = ["a" * 1000 for _ in range(15)]
+        metadata = {"project": "test", "git_branch": "main", "duration_minutes": 5, "files_touched": []}
+
+        obsidian_utils.generate_summary(user_msgs, assistant_msgs, metadata)
+
+        prompt = captured.get("prompt", "")
+        # 15 msgs × 1000 chars + separators ≤ 12000 for user + 12000 for assistant + overhead
+        # The join is truncated at 12000 each, so total user+assistant ≤ 24000
+        assert len(prompt) < 30000  # generous upper bound; key check is it's bounded
