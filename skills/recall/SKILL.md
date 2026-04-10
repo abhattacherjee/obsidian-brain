@@ -23,7 +23,7 @@ Run a single call that loads config and derives the project name (saves one pare
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-sys.path.insert(0, "hooks")
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
@@ -69,7 +69,7 @@ Find unsummarized notes for this project in a single Python call (replaces multi
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys
-sys.path.insert(0, "hooks")
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import find_unsummarized_notes
 print(find_unsummarized_notes(sys.argv[1], sys.argv[2], sys.argv[3]))
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
@@ -103,7 +103,7 @@ Run the upgrade pipeline in Python:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys
-sys.path.insert(0, "hooks")
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import upgrade_unsummarized_note
 status = upgrade_unsummarized_note(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
 print(status)
@@ -128,7 +128,7 @@ If the status starts with "Failed:", use the sub-agent fallback:
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
    python3 -c '
    import sys
-   sys.path.insert(0, "hooks")
+   import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
    from obsidian_utils import upgrade_note_with_summary
    with open(sys.argv[5], "r") as f:
        summary = f.read()
@@ -159,7 +159,7 @@ For each unsummarized note, run a parallel Bash call:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys
-sys.path.insert(0, "hooks")
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import prepare_summary_input
 result = prepare_summary_input(sys.argv[1])
 print(result)
@@ -221,7 +221,7 @@ For each successful note, call Python to read the temp summary file and apply it
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys
-sys.path.insert(0, "hooks")
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import upgrade_note_with_summary
 with open(sys.argv[6], "r") as f:
     summary = f.read()
@@ -265,7 +265,7 @@ Run a single Python call that reads all session and insight files, composes the 
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys
-sys.path.insert(0, "hooks")
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import build_context_brief
 print(build_context_brief(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]))
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER" "$PROJECT"
@@ -338,7 +338,7 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
     cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
     python3 -c '
     import sys, json
-    sys.path.insert(0, "hooks")
+    import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
     from open_item_dedup import batch_cascade_checkoff
     items = json.loads(sys.argv[4])
     summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
