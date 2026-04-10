@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contained real AI summaries from old SessionEnd inline-summarization path.
   Added defense-in-depth guard to `/recall` Step 2 and `/standup` Step 5 that
   checks for `## Summary` before re-summarizing and auto-fixes stale status fields.
+- Stale metadata cache caused `find_unsummarized_notes()` to skip genuinely
+  unsummarized notes and re-summarize already-upgraded ones. Function now reads
+  frontmatter directly from disk, and `upgrade_note_with_summary()` invalidates
+  cache entries after status changes.
 
 ## [1.7.2] - 2026-04-09
 
