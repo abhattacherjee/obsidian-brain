@@ -68,7 +68,7 @@ Find unsummarized notes for this project in a single Python call (replaces multi
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys
+import sys, os
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import find_unsummarized_notes
 print(find_unsummarized_notes(sys.argv[1], sys.argv[2], sys.argv[3]))
@@ -102,7 +102,7 @@ Run the upgrade pipeline in Python:
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys
+import sys, os
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import upgrade_unsummarized_note
 status = upgrade_unsummarized_note(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
@@ -158,7 +158,7 @@ For each unsummarized note, run a parallel Bash call:
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys
+import sys, os
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import prepare_summary_input
 result = prepare_summary_input(sys.argv[1])
@@ -220,7 +220,7 @@ For each successful note, call Python to read the temp summary file and apply it
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys
+import sys, os
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import upgrade_note_with_summary
 with open(sys.argv[6], "r") as f:
@@ -264,7 +264,7 @@ Run a single Python call that reads all session and insight files, composes the 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys
+import sys, os
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import build_context_brief
 print(build_context_brief(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]))

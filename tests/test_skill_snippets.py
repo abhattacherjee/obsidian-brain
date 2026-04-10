@@ -72,3 +72,21 @@ def test_cache_glob_finds_installed_hooks():
     assert os.path.isfile(os.path.join(hooks_dir, "obsidian_utils.py")), (
         f"Cache hooks dir {hooks_dir} exists but obsidian_utils.py not found"
     )
+
+
+def test_snippets_import_os_before_expanduser():
+    """Snippets using os.path.expanduser must import os first."""
+    for name, code in _SNIPPETS:
+        if "os.path.expanduser" not in code:
+            continue
+        lines = code.strip().split("\n")
+        os_imported = False
+        for line in lines:
+            if re.search(r'\bimport\b.*\bos\b', line):
+                os_imported = True
+            if "os.path.expanduser" in line:
+                assert os_imported, (
+                    f"Snippet {name} uses os.path.expanduser "
+                    "before importing os"
+                )
+                break
