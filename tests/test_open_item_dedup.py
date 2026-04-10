@@ -746,3 +746,123 @@ def test_batch_cascade_checkoff_stat_oserror(tmp_vault, monkeypatch):
     )
     # Should still succeed (uses 0o644 fallback)
     assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# 32. batch_cascade_checkoff: multi-project isolation (standup Step 14)
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_multi_project_isolation(tmp_vault):
+    """Cascade for project A must not affect project B's open items."""
+    sessions_dir = tmp_vault / "claude-sessions"
+
+    # Project A has a matching item
+    _create_session_note(
+        sessions_dir, "2026-04-09-proj-a1.md", "project-alpha",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+    # Project B has the same text but different project
+    _create_session_note(
+        sessions_dir, "2026-04-09-proj-b1.md", "project-beta",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+
+    # Cascade only for project-alpha
+    result = batch_cascade_checkoff(
+        str(tmp_vault),
+        "claude-sessions",
+        "project-alpha",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+
+    # Project B's note should still have the unchecked item
+    content_b = (sessions_dir / "2026-04-09-proj-b1.md").read_text(encoding="utf-8")
+    assert "- [ ] Fix hooks/obsidian_utils.py import error" in content_b
+
+
+# ---------------------------------------------------------------------------
+# 33. batch_cascade_checkoff: multiple items in single call (standup Step 14)
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_multiple_items(tmp_vault):
+    """Standup may pass multiple completed items for one project at once."""
+    sessions_dir = tmp_vault / "claude-sessions"
+
+    _create_session_note(
+        sessions_dir, "2026-04-08-proj-multi1.md", "myproject",
+        ["Merge feature/auth-fix into develop", "Update hooks/obsidian_utils.py"],
+    )
+    _create_session_note(
+        sessions_dir, "2026-04-09-proj-multi2.md", "myproject",
+        ["Merge feature/auth-fix into develop"],
+    )
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault),
+        "claude-sessions",
+        "myproject",
+        [
+            "Merge feature/auth-fix into develop",
+            "Update hooks/obsidian_utils.py",
+        ],
+    )
+    assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# 34. batch_cascade_checkoff: verifies file modification (standup Step 14)
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_modifies_files(tmp_vault):
+    """After cascade, duplicate items in other notes should be checked off."""
+    sessions_dir = tmp_vault / "claude-sessions"
+
+    # Two notes with the same distinctive-token item
+    _create_session_note(
+        sessions_dir, "2026-04-08-proj-src.md", "myproject",
+        ["Merge feature/auth-fix into develop"],
+    )
+    note_b = _create_session_note(
+        sessions_dir, "2026-04-09-proj-dup.md", "myproject",
+        ["Merge feature/auth-fix into develop", "Unrelated task here"],
+    )
+
+    batch_cascade_checkoff(
+        str(tmp_vault),
+        "claude-sessions",
+        "myproject",
+        ["Merge feature/auth-fix into develop"],
+    )
+
+    content = note_b.read_text(encoding="utf-8")
+    # The cascaded item should now be checked off in at least one note
+    # (which note gets checked depends on which is treated as source vs duplicate)
+    all_content = ""
+    for f in sessions_dir.iterdir():
+        all_content += f.read_text(encoding="utf-8")
+    # At least one note should have the checked-off version
+    assert "- [x] Merge feature/auth-fix into develop" in all_content
+
+
+# ---------------------------------------------------------------------------
+# 35. batch_cascade_checkoff: empty items list (standup Step 14 edge case)
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_empty_items_list(tmp_vault):
+    """Passing an empty items list should return gracefully."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    _create_session_note(
+        sessions_dir, "2026-04-09-proj-empty.md", "myproject",
+        ["Some open item"],
+    )
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault),
+        "claude-sessions",
+        "myproject",
+        [],
+    )
+    assert isinstance(result, str)
+    # Original item should remain unchecked
+    content = (sessions_dir / "2026-04-09-proj-empty.md").read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content

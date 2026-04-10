@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `/standup` Step 14: cascade completed open items across vault notes using `batch_cascade_checkoff()` — when items are marked done in standup, all matching `- [ ]` entries in other session notes are automatically checked off
+
 ## [1.8.2] - 2026-04-10
 
 ### Added
