@@ -45,7 +45,7 @@ case "$cmd" in
         echo "Backing up: $CACHE_DIR -> $BACKUP_DIR"
         cp -R "$CACHE_DIR" "$BACKUP_DIR"
 
-        # Auto-restore on failure
+        # On failure, warn user to restore manually
         trap 'echo "ERROR: Install failed partway. Run \"$0 restore\" to recover." >&2' ERR
 
         echo "Installing dev versions..."
@@ -98,7 +98,7 @@ case "$cmd" in
 
     status)
         echo "Plugin: $PLUGIN_NAME"
-        echo "Repo version: $PLUGIN_VERSION"
+        echo "Installed cache version: $PLUGIN_VERSION"
         echo "Cache dir: $CACHE_DIR"
         echo ""
 

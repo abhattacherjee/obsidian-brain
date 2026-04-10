@@ -44,7 +44,7 @@ Stop here if config is missing.
 **Create the task manifest** for the full `/recall` flow:
 
 ```
-TaskCreate: subject="Find unsummarized notes", activeForm="Searching for unsummarized notes", status immediately set to in_progress
+TaskCreate: subject="Find unsummarized notes", activeForm="Searching for unsummarized notes"
 TaskCreate: subject="Summarize unsummarized notes", activeForm="Summarizing notes"
 TaskCreate: subject="Search sessions and insights", activeForm="Searching vault"
 TaskCreate: subject="Read and rank notes", activeForm="Reading notes"
@@ -52,7 +52,7 @@ TaskCreate: subject="Compose context brief", activeForm="Composing brief"
 TaskCreate: subject="Present results and detect completed items", activeForm="Presenting results"
 ```
 
-Track the returned task IDs — you will update them as each step completes. Task #1 is already `in_progress`.
+Track the returned task IDs — you will update them as each step completes. Immediately set task #1 to `in_progress` via TaskUpdate.
 
 ### Step 2 — Derive project name
 

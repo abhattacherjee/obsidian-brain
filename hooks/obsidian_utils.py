@@ -1570,10 +1570,10 @@ def prepare_summary_input(note_path: str) -> str:
       JSONL_PREPPED:<temp_file_path>:<note_path>
       NO_CONTENT:<note_path>
     """
-    # Read frontmatter to extract session_id
+    # Read only frontmatter (first 20 lines) — avoids loading large raw notes into memory
     try:
         with open(note_path, 'r', encoding='utf-8') as f:
-            raw_lines = f.readlines()
+            raw_lines = [f.readline() for _ in range(20)]
     except OSError as exc:
         print(f"[obsidian-brain] cannot read {os.path.basename(note_path)}: {exc}", file=sys.stderr)
         return f"NO_CONTENT:{note_path}"
@@ -1582,7 +1582,7 @@ def prepare_summary_input(note_path: str) -> str:
     project = "unknown"
     git_branch = "unknown"
     duration_minutes = 0.0
-    for line in raw_lines[:20]:
+    for line in raw_lines:
         stripped = line.strip()
         if stripped.startswith('session_id:'):
             session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
