@@ -29,7 +29,7 @@ c = load_config()
 if not c.get("vault_path"):
     print("ERROR: vault_path not configured", file=sys.stderr)
     sys.exit(1)
-print(f"VAULT={c[\"vault_path\"]} SESS={c.get(\"sessions_folder\",\"claude-sessions\")} INS={c.get(\"insights_folder\",\"claude-insights\")}")
+print("VAULT=" + c["vault_path"] + " SESS=" + c.get("sessions_folder", "claude-sessions") + " INS=" + c.get("insights_folder", "claude-insights"))
 '
 ```
 
@@ -122,16 +122,16 @@ print(status)
 If the status starts with "Failed:", use the sub-agent fallback:
 
 1. Update the sub-task subject to `Sub-agent fallback: <basename>`.
-2. Spawn a single sub-agent:
+2. Spawn a single sub-agent that writes its summary to a temp file:
 
    ```
    Agent({
      description: "Summarize session note <basename>",
-     prompt: "Read the session note at <NOTE_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nReturn ONLY these markdown sections. No preamble, no commentary."
+     prompt: "Read the session note at <NOTE_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nWrite the summary to /tmp/ob-summary-<basename>.md using the Write tool. Return ONLY the single line: WRITTEN:/tmp/ob-summary-<basename>.md"
    })
    ```
 
-3. If the sub-agent returns a valid summary, write it back via heredoc:
+3. If the sub-agent returns `WRITTEN:<path>`, write back via Python reading the temp file:
 
    ```bash
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -139,15 +139,14 @@ If the status starts with "Failed:", use the sub-agent fallback:
    import sys
    sys.path.insert(0, "hooks")
    from obsidian_utils import upgrade_note_with_summary
-   summary = sys.stdin.read()
+   with open(sys.argv[5], "r") as f:
+       summary = f.read()
    status = upgrade_note_with_summary(sys.argv[1], summary, sys.argv[2], sys.argv[3], sys.argv[4])
    print(status)
-   ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" <<'SUMMARY_EOF'
-   <paste sub-agent summary here at column 0, no leading indentation>
-   SUMMARY_EOF
+   ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "/tmp/ob-summary-<basename>.md"
    ```
 
-   **Important:** Paste the sub-agent summary into the heredoc verbatim with NO leading indentation. Start `## Summary` at column 0, and keep the closing `SUMMARY_EOF` terminator at column 0 as well.
+   Then clean up: `rm -f /tmp/ob-summary-<basename>.md`
 
 Mark the sub-task and task #2 as completed. Report the result.
 
@@ -183,7 +182,7 @@ Parse each result:
 - `JSONL_PREPPED:<temp_path>:<note_path>` → sub-agent will read the temp file path; track `<note_path>` for Wave 3
 - `NO_CONTENT:<note_path>` → skip this note, report to user
 
-##### Wave 2 — Summarize (parallel sub-agents)
+##### Wave 2 — Summarize and write to temp files (parallel sub-agents)
 
 Create a summarize sub-task for each note (excluding NO_CONTENT):
 
@@ -191,32 +190,34 @@ Create a summarize sub-task for each note (excluding NO_CONTENT):
 TaskCreate: subject="Summarize: <basename>", activeForm="Summarizing <basename>"
 ```
 
-Spawn all sub-agents in a **single message turn** so they run in parallel:
+Spawn all sub-agents in a **single message turn** so they run in parallel. Each sub-agent writes its summary to a temp file instead of returning it — this keeps summary text out of the parent context (~800 tokens saved per note):
 
 ```
 Agent({
   description: "Summarize session note <basename>",
-  prompt: "Read the file at <READ_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nReturn ONLY these markdown sections. No preamble, no commentary."
+  prompt: "Read the file at <READ_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nWrite the summary to the file /tmp/ob-summary-<basename>.md using the Write tool. Return ONLY the single line: WRITTEN:/tmp/ob-summary-<basename>.md"
 })
 ```
 
 Where `<READ_PATH>` is:
 - For `RAW_OK` notes: the raw note path
-- For `JSONL_PREPPED` notes: the temp file path (e.g. `/tmp/ob-prep-{hash}.md`)
+- For `JSONL_PREPPED` notes: the temp file path (e.g. `/tmp/ob-prep-{session_id}.md`)
+
+And `<basename>` is the note filename without extension (e.g. `2026-04-09-obsidian-brain-2322`).
 
 When all sub-agents return, check each result:
-- If the sub-agent returned a valid summary (contains `## Summary`), update its summarize sub-task to completed.
-- If the sub-agent returned an error, empty output, or no `## Summary` section, update its summarize sub-task subject to `Failed: <basename>` and mark completed. Exclude this note from Wave 3 — it stays unsummarized for the next `/recall`. Report the failure to the user.
+- If the sub-agent returned `WRITTEN:<path>`, update its summarize sub-task to completed.
+- If the sub-agent returned an error, empty output, or anything else, update its summarize sub-task subject to `Failed: <basename>` and mark completed. Exclude this note from Wave 3 — it stays unsummarized for the next `/recall`. Report the failure to the user.
 
-##### Wave 3 — Write back (parallel Bash calls)
+##### Wave 3 — Write back from temp files (parallel Bash calls)
 
-Create a write-back sub-task for each note that got a valid summary:
+Create a write-back sub-task for each note that got a `WRITTEN:` status:
 
 ```
 TaskCreate: subject="Write back: <basename>", activeForm="Writing <basename>"
 ```
 
-For each sub-agent that returned a valid summary (contains `## Summary`), pipe it through `upgrade_note_with_summary()` via a heredoc:
+For each successful note, call Python to read the temp summary file and apply it — no heredoc needed, summary stays off parent context:
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -224,15 +225,14 @@ python3 -c '
 import sys
 sys.path.insert(0, "hooks")
 from obsidian_utils import upgrade_note_with_summary
-summary = sys.stdin.read()
+with open(sys.argv[6], "r") as f:
+    summary = f.read()
 status = upgrade_note_with_summary(sys.argv[1], summary, sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
 print(status)
-' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "sub-agent" <<'SUMMARY_EOF'
-<paste sub-agent summary here at column 0>
-SUMMARY_EOF
+' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "sub-agent" "/tmp/ob-summary-<basename>.md"
 ```
 
-**Important:** The `$NOTE_PATH` here is always the **original vault note path** (not the temp file), even for JSONL_PREPPED notes.
+**Important:** `$NOTE_PATH` is always the **original vault note path** (not the temp file), even for JSONL_PREPPED notes.
 
 Launch all write-back Bash calls in a single message turn.
 
@@ -242,10 +242,10 @@ When all return, parse each result:
 
 ##### Cleanup
 
-Clean up only the specific temp files created in Wave 1 (not a glob — avoids racing with concurrent `/recall` invocations):
+Clean up all temp files created in Waves 1 and 2 (specific paths only — avoids racing with concurrent `/recall` invocations):
 
 ```bash
-rm -f /tmp/ob-prep-<session_id_1>.md /tmp/ob-prep-<session_id_2>.md ...
+rm -f /tmp/ob-prep-<session_id_1>.md /tmp/ob-prep-<session_id_2>.md /tmp/ob-summary-<basename_1>.md /tmp/ob-summary-<basename_2>.md ...
 ```
 
 Mark task #2 as completed. Report results: how many upgraded, how many skipped (NO_CONTENT), how many failed.
