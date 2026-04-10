@@ -488,3 +488,148 @@ class TestGenerateSummarySampling:
         # 15 msgs × 1000 chars + separators ≤ 12000 for user + 12000 for assistant + overhead
         # The join is truncated at 12000 each, so total user+assistant ≤ 24000
         assert len(prompt) < 30000  # generous upper bound; key check is it's bounded
+
+
+# ===========================================================================
+# Section 7: build_context_brief — sort order and duration
+# ===========================================================================
+
+def _make_session_note(path, project, date, branch, duration, summary, mtime=None):
+    """Helper: write a minimal session note and optionally set its mtime."""
+    content = f"""---
+type: claude-session
+date: {date}
+project: {project}
+git_branch: {branch}
+duration_minutes: {duration}
+status: summarized
+---
+
+# Session: {project} ({branch})
+
+## Summary
+{summary}
+"""
+    path.write_text(content, encoding="utf-8")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+
+
+class TestBuildContextBriefSort:
+    """Verify hybrid sort (date desc, mtime desc within same date) and duration column."""
+
+    def test_same_day_sorted_by_mtime(self, tmp_path, monkeypatch):
+        """Sessions from the same day should sort by mtime descending, not filename."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions = tmp_path / "sessions"
+        insights = tmp_path / "insights"
+        sessions.mkdir()
+        insights.mkdir()
+
+        # Create two notes from the same day — 'aaaa' is alphabetically first
+        # but should sort SECOND because its mtime is older.
+        _make_session_note(
+            sessions / "2026-04-10-proj-aaaa.md",
+            "proj", "2026-04-10", "main", 30, "First created session.", mtime=1000,
+        )
+        _make_session_note(
+            sessions / "2026-04-10-proj-zzzz.md",
+            "proj", "2026-04-10", "main", 60, "Second created session.", mtime=2000,
+        )
+
+        output = obsidian_utils.build_context_brief(
+            str(tmp_path), "sessions", "insights", "proj",
+        )
+
+        # The more recent mtime (zzzz) should appear first in the table
+        zzzz_pos = output.find("Second created session.")
+        aaaa_pos = output.find("First created session.")
+        assert zzzz_pos < aaaa_pos, "mtime-newer session should appear first"
+
+    def test_different_days_sorted_by_date(self, tmp_path, monkeypatch):
+        """Older-date session should not float up even if its mtime is newer."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions = tmp_path / "sessions"
+        insights = tmp_path / "insights"
+        sessions.mkdir()
+        insights.mkdir()
+
+        # April 5 note has a NEWER mtime than April 10 note
+        _make_session_note(
+            sessions / "2026-04-05-proj-aaaa.md",
+            "proj", "2026-04-05", "main", 10, "Older date session.", mtime=9999,
+        )
+        _make_session_note(
+            sessions / "2026-04-10-proj-bbbb.md",
+            "proj", "2026-04-10", "main", 20, "Newer date session.", mtime=1000,
+        )
+
+        output = obsidian_utils.build_context_brief(
+            str(tmp_path), "sessions", "insights", "proj",
+        )
+
+        newer_pos = output.find("Newer date session.")
+        older_pos = output.find("Older date session.")
+        assert newer_pos < older_pos, "date descending should take priority over mtime"
+
+    def test_duration_format_hours_minutes(self, tmp_path, monkeypatch):
+        """Duration >= 60 min should display as Xh Ym."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions = tmp_path / "sessions"
+        insights = tmp_path / "insights"
+        sessions.mkdir()
+        insights.mkdir()
+
+        _make_session_note(
+            sessions / "2026-04-10-proj-aaaa.md",
+            "proj", "2026-04-10", "main", 80.3, "Long session.",
+        )
+
+        output = obsidian_utils.build_context_brief(
+            str(tmp_path), "sessions", "insights", "proj",
+        )
+
+        assert "| 1h 20m |" in output
+
+    def test_duration_format_minutes_only(self, tmp_path, monkeypatch):
+        """Duration < 60 min should display as Xm."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions = tmp_path / "sessions"
+        insights = tmp_path / "insights"
+        sessions.mkdir()
+        insights.mkdir()
+
+        _make_session_note(
+            sessions / "2026-04-10-proj-aaaa.md",
+            "proj", "2026-04-10", "main", 27, "Short session.",
+        )
+
+        output = obsidian_utils.build_context_brief(
+            str(tmp_path), "sessions", "insights", "proj",
+        )
+
+        assert "| 27m |" in output
+
+    def test_duration_format_zero(self, tmp_path, monkeypatch):
+        """Duration 0 should produce empty string in column."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions = tmp_path / "sessions"
+        insights = tmp_path / "insights"
+        sessions.mkdir()
+        insights.mkdir()
+
+        _make_session_note(
+            sessions / "2026-04-10-proj-aaaa.md",
+            "proj", "2026-04-10", "main", 0, "No duration.",
+        )
+
+        output = obsidian_utils.build_context_brief(
+            str(tmp_path), "sessions", "insights", "proj",
+        )
+
+        assert "|  |" in output or "| |" in output
