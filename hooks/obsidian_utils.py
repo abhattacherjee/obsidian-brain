@@ -925,6 +925,74 @@ def find_latest_session(
     return None
 
 
+def find_unsummarized_notes(
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+) -> str:
+    """Find unsummarized session notes for a project, with defense-in-depth.
+
+    Scans sessions folder for notes with status: auto-logged in frontmatter,
+    filters by project, and checks for false positives (notes that already
+    have a real ## Summary but stale status). Auto-fixes stale status inline.
+
+    Returns JSON string: {"unsummarized": [paths], "auto_fixed": N}
+    """
+    sessions_dir = Path(vault_path) / sessions_folder
+    if not sessions_dir.is_dir():
+        return json.dumps({"unsummarized": [], "auto_fixed": 0})
+
+    unsummarized: list[str] = []
+    auto_fixed = 0
+
+    for f in sorted(sessions_dir.iterdir(), reverse=True):
+        if f.suffix != '.md':
+            continue
+
+        meta = read_note_metadata(str(f))
+        if not meta:
+            continue
+
+        # Must be auto-logged
+        if meta.get('status') != 'auto-logged':
+            continue
+
+        # Must match project
+        fm_project = meta.get('project', '')
+        if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
+            continue
+
+        # Defense-in-depth: check if already has a real summary
+        try:
+            with open(f, 'r', encoding='utf-8', errors='replace') as fh:
+                content = fh.read()
+            has_summary = bool(re.search(r'^## Summary', content, re.MULTILINE))
+            has_unavailable = 'AI summary unavailable' in content
+
+            if has_summary and not has_unavailable:
+                # Already summarized by legacy code path — fix status
+                try:
+                    fixed = re.sub(
+                        r'^status: auto-logged',
+                        'status: summarized',
+                        content,
+                        count=1,
+                        flags=re.MULTILINE,
+                    )
+                    with open(f, 'w', encoding='utf-8') as fw:
+                        fw.write(fixed)
+                    auto_fixed += 1
+                except OSError:
+                    pass
+                continue
+        except OSError:
+            continue
+
+        unsummarized.append(str(f))
+
+    return json.dumps({"unsummarized": unsummarized, "auto_fixed": auto_fixed})
+
+
 def build_context_brief(
     vault_path: str,
     sessions_folder: str,

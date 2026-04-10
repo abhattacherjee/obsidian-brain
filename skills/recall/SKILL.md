@@ -63,39 +63,25 @@ Track the returned task IDs — you will update them as each step completes. Imm
 >
 > **Visibility requirement:** Before Step 3, emit a one-line status: `Step 2: processing N unsummarized note(s) for $PROJECT` (or `Step 2: no unsummarized notes for $PROJECT` if the intersection is empty). This makes the decision auditable in the tool trace.
 
-Search for raw/unsummarized session notes matching this project.
-
-Use Grep to find unsummarized notes via frontmatter status (NOT body text — body text matches cause false positives from logged tool usage):
-
-```
-pattern: "^status: auto-logged"
-path: $VAULT_PATH/$SESSIONS_FOLDER/
-output_mode: files_with_matches
-```
-
-For each file found, use Grep to confirm it matches the current project:
-
-```
-pattern: "project: $PROJECT"
-path: <each matched file>
-output_mode: content
-```
-
-**Defense-in-depth:** For each file matching both conditions, also verify it genuinely needs summarization by checking if it already has a real `## Summary` section. Use Grep:
-
-```
-pattern: "^## Summary"
-path: <each matched file>
-output_mode: count
-```
-
-If the note has `## Summary` AND does NOT contain `"AI summary unavailable"`, it was summarized by a legacy code path that forgot to flip the status. Skip it (it's already done) and fix the status field:
+Find unsummarized notes for this project in a single Python call (replaces multiple Grep rounds):
 
 ```bash
-sed -i '' 's/^status: auto-logged/status: summarized/' "$FILE_PATH"
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys
+sys.path.insert(0, "hooks")
+from obsidian_utils import find_unsummarized_notes
+print(find_unsummarized_notes(sys.argv[1], sys.argv[2], sys.argv[3]))
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-Count only the genuinely unsummarized files. Store as `N`.
+Parse the JSON output: `{"unsummarized": ["/path/to/note1.md", ...], "auto_fixed": N}`.
+
+The function handles project filtering, defense-in-depth (skips notes with real `## Summary` but stale `auto-logged` status, auto-fixes them), and returns only genuinely unsummarized note paths.
+
+If `auto_fixed > 0`, report: `Auto-fixed N note(s) with stale status.`
+
+Store the length of `unsummarized` as `N`.
 
 Update task #1 to completed. Update task #2 subject to `Summarize N unsummarized note(s)` and set to `in_progress`.
 
@@ -294,23 +280,19 @@ If the command fails (non-zero exit code), print the error and stop — do not f
 3. Extract `MOST_RECENT_SESSION_PATH:` — the full path for checkoff edits.
 4. Extract `OPEN_ITEM_CANDIDATES:` — either `NO_CANDIDATES`, `NO_ITEMS`, or a JSON array.
 
-Update task #3 to `completed`.
+Update task #3 to `completed`. Update task #4 to `in_progress`.
 
-### Step 4 — Present to user
-
-Update task #4 to `in_progress`.
-
-Display:
+**Present the brief immediately** (same turn — saves one parent round):
 
 > **Here's what I found from your Obsidian vault for `$PROJECT`:**
 
-Then output the `CONTEXT_BRIEF` section from the sub-agent return verbatim.
+Then output the `CONTEXT_BRIEF` section verbatim.
 
 If unsummarized notes were upgraded in Step 2, also mention:
 
 > _Upgraded N session note(s) with AI summaries._
 
-### Step 4.5 — Detect completed open items (from sub-agent data)
+### Step 4 — Detect completed open items and show load manifest
 
 Parse the `OPEN_ITEM_CANDIDATES` section from the sub-agent return.
 
@@ -366,11 +348,9 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
 
     Construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts. Report the cascade summary.
 
-Then proceed to Step 5.
+**Show load manifest** (same step — saves one parent round):
 
-### Step 5 — Show load manifest and offer options
-
-Use the `LOAD_MANIFEST` data from the sub-agent return to show:
+Use the `LOAD_MANIFEST` data to show:
 
 > **Loaded into this conversation:**
 > - Full session: *"<full_session_title>"* (<full_session_date>)
