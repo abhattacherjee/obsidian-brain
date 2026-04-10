@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/recall` Steps 4-7.5 now delegated to a single context builder sub-agent,
   reducing parent context from ~14k to ~6.5k tokens. Task manifest collapsed
   from 6 to 4 top-level tasks. Fallback to in-context reads if sub-agent fails.
+- Sub-agent summaries now written to temp files instead of passed through parent
+  context via heredocs, saving ~800 tokens per note during batch summarization.
+
+### Fixed
+- Config load `python3 -c` one-liner used f-strings with dict key access
+  (`c[\"vault_path\"]`) which breaks inside Bash single-quoted strings.
+  Replaced with string concatenation.
 
 ## [1.7.2] - 2026-04-09
 
