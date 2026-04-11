@@ -20,6 +20,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from obsidian_utils import (  # noqa: E402
+    _bootstrap_prefix,
     find_latest_session,
     get_project_name,
     load_config,
@@ -30,18 +31,14 @@ from obsidian_utils import (  # noqa: E402
 # Bootstrap-file + audit-log helpers
 # ---------------------------------------------------------------------------
 
-_BOOTSTRAP_PREFIX_DEFAULT = "/tmp/.obsidian-brain-sid-"
 _HOOK_LOG_NAME = "obsidian-brain-hook.log"
 _HOOK_LOG_MAX_BYTES = 100 * 1024  # 100 KB
-
-
-def _bootstrap_prefix() -> str:
-    return os.environ.get("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", _BOOTSTRAP_PREFIX_DEFAULT)
 
 
 def _write_bootstrap_atomic(project: str, session_id: str) -> bool:
     """Write session_id to the project's bootstrap file. Returns True on success."""
     path = f"{_bootstrap_prefix()}{project}"
+    tmp = None
     try:
         dir_name = os.path.dirname(path) or "/tmp"
         os.makedirs(dir_name, exist_ok=True)
@@ -49,10 +46,17 @@ def _write_bootstrap_atomic(project: str, session_id: str) -> bool:
         with os.fdopen(fd, "w") as f:
             f.write(session_id)
         os.replace(tmp, path)
+        tmp = None  # consumed by replace
         return True
     except OSError as exc:
         print(f"[obsidian-brain] bootstrap write failed: {exc}", file=sys.stderr)
         return False
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool) -> None:

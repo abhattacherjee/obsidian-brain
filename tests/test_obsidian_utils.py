@@ -734,7 +734,7 @@ def test_get_session_id_fast_rejects_stale_bootstrap(tmp_path, monkeypatch):
     bootstrap.write_text("old-sid-0000", encoding="utf-8")
     os.utime(bootstrap, (time.time() - 3600, time.time() - 3600))
 
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
     result = obsidian_utils._get_session_id_fast()
     assert result == "new-sid-9999", f"expected newest sid, got {result}"
@@ -763,7 +763,7 @@ def test_get_session_id_fast_trusts_fresh_bootstrap(tmp_path, monkeypatch):
     bootstrap.write_text("fresh-sid-1234", encoding="utf-8")
     os.utime(bootstrap, (time.time() - 60, time.time() - 60))
 
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
     result = obsidian_utils._get_session_id_fast()
     assert result == "fresh-sid-1234"
@@ -792,8 +792,8 @@ def test_get_session_id_fast_invalidates_when_cached_jsonl_deleted(tmp_path, mon
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
     bootstrap.write_text("deleted-sid-0000", encoding="utf-8")
 
-    monkeypatch.setattr(
-        obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setenv(
+        "OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
     )
 
     result = obsidian_utils._get_session_id_fast()
@@ -819,7 +819,7 @@ def test_check_hook_status_matches(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
 
     bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", bootstrap_prefix)
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
     bootstrap.write_text("live-sid-1111", encoding="utf-8")
     # Make bootstrap newer than the JSONL so the fast path trusts it
@@ -847,8 +847,8 @@ def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
     monkeypatch.chdir(proj_dir)
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    monkeypatch.setattr(
-        obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setenv(
+        "OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
     )
 
     status = obsidian_utils.check_hook_status()

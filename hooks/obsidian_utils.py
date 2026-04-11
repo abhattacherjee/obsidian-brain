@@ -30,22 +30,29 @@ _CACHE_PREFIX = '/tmp/.obsidian-brain-cache-'
 _BOOTSTRAP_PREFIX = '/tmp/.obsidian-brain-sid-'
 
 
+def _bootstrap_prefix() -> str:
+    """Return the bootstrap file prefix, honoring OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX env override."""
+    return os.environ.get("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", _BOOTSTRAP_PREFIX)
+
+
 def _get_session_id_fast() -> str:
     """Derive session ID, using bootstrap file for speed on repeat calls.
 
     Validation strategy:
       1. Read bootstrap file (~0.1 ms)
       2. Verify cached JSONL still exists
-      3. Verify bootstrap mtime > newest JSONL mtime (~5 ms glob)
+      3. Verify the newest JSONL in the project dir has the SAME sid as the
+         bootstrap cache (compares basename, not mtime).
       If all checks pass, return cached sid; otherwise fall through to the
       full glob + mtime sort (authoritative slow path).
 
-    The mtime check ensures the bootstrap is invalidated when a new session
-    starts (which creates a newer JSONL) even if the SessionStart hook did
-    not get to refresh the bootstrap file.
+    Comparing basenames (not mtimes) is important because the active
+    session's JSONL file is appended throughout the session, so its mtime
+    increases continuously. A naive mtime comparison would invalidate the
+    bootstrap on every call after a few seconds, defeating the optimization.
     """
     project = os.path.basename(os.getcwd())
-    bootstrap = f"{_BOOTSTRAP_PREFIX}{project}"
+    bootstrap = f"{_bootstrap_prefix()}{project}"
 
     import glob as _glob
     pattern = os.path.expanduser(f"~/.claude/projects/*{project}/*.jsonl")
@@ -55,17 +62,20 @@ def _get_session_id_fast() -> str:
         with open(bootstrap, 'r') as f:
             cached_sid = f.read().strip()
         if cached_sid:
-            bootstrap_mtime = os.path.getmtime(bootstrap)
             cached_pattern = os.path.expanduser(
                 f"~/.claude/projects/*{project}/{cached_sid}.jsonl"
             )
             if _glob.glob(cached_pattern):
+                # Determine the newest JSONL; if its basename equals cached_sid,
+                # the cache is still authoritative. Otherwise a new session has
+                # started and we must fall through to the slow path.
                 all_matches = _glob.glob(pattern)
                 if all_matches:
-                    newest_mtime = max(os.path.getmtime(p) for p in all_matches)
-                    if bootstrap_mtime > newest_mtime:
+                    newest = max(all_matches, key=os.path.getmtime)
+                    newest_sid = os.path.splitext(os.path.basename(newest))[0]
+                    if newest_sid == cached_sid:
                         return cached_sid
-                    # else: a newer JSONL exists; bootstrap is stale, fall through
+                    # else: different session is newest; bootstrap is stale
                 else:
                     return cached_sid  # no other JSONLs; trust cache
     except OSError:
@@ -232,7 +242,7 @@ def check_hook_status() -> dict:
     path is returning a stale value).
     """
     project = os.path.basename(os.getcwd())
-    bootstrap = f"{_BOOTSTRAP_PREFIX}{project}"
+    bootstrap = f"{_bootstrap_prefix()}{project}"
 
     # Read bootstrap BEFORE calling _get_session_id_fast(), which may refresh
     # the bootstrap file as a side effect on its slow path.

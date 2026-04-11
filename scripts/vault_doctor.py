@@ -36,30 +36,37 @@ import vault_doctor_checks  # noqa: E402
 
 
 def _load_config(args) -> dict:
-    """Resolve vault path + folders from args → env → obsidian-brain config."""
-    vault = args.vault or os.environ.get("OBSIDIAN_BRAIN_VAULT")
-    sessions = args.sessions_folder or os.environ.get(
-        "OBSIDIAN_BRAIN_SESSIONS_FOLDER", "claude-sessions"
-    )
-    insights = args.insights_folder or os.environ.get(
-        "OBSIDIAN_BRAIN_INSIGHTS_FOLDER", "claude-insights"
-    )
+    """Resolve vault path + folders from args → env → obsidian-brain config file.
 
-    if not vault:
-        # Read the config file directly (bypass obsidian_utils.load_config's
-        # session cache, which can return stale values from previous runs).
+    Precedence (strict): CLI arg > env var > config file > default.
+    """
+    vault = args.vault or os.environ.get("OBSIDIAN_BRAIN_VAULT")
+    env_sessions = os.environ.get("OBSIDIAN_BRAIN_SESSIONS_FOLDER")
+    env_insights = os.environ.get("OBSIDIAN_BRAIN_INSIGHTS_FOLDER")
+    sessions = args.sessions_folder or env_sessions
+    insights = args.insights_folder or env_insights
+
+    if not vault or not sessions or not insights:
+        # Fall back to config file only for values not yet resolved.
+        # Read directly (bypass obsidian_utils.load_config's session cache,
+        # which can be stale when the CLI runs outside a live session).
         cfg_path = Path.home() / ".claude" / "obsidian-brain-config.json"
         try:
             with open(cfg_path, "r", encoding="utf-8") as fh:
                 cfg = json.load(fh)
             if isinstance(cfg, dict):
-                vault = cfg.get("vault_path", "") or vault
-                if not args.sessions_folder:
-                    sessions = cfg.get("sessions_folder", sessions)
-                if not args.insights_folder:
-                    insights = cfg.get("insights_folder", insights)
+                if not vault:
+                    vault = cfg.get("vault_path", "")
+                if not sessions:
+                    sessions = cfg.get("sessions_folder", "claude-sessions")
+                if not insights:
+                    insights = cfg.get("insights_folder", "claude-insights")
         except (OSError, json.JSONDecodeError):
             pass
+
+    # Apply defaults for any unresolved folders
+    sessions = sessions or "claude-sessions"
+    insights = insights or "claude-insights"
 
     if not vault:
         print(
