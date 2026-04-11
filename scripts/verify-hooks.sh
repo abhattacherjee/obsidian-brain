@@ -62,8 +62,9 @@ if ! tail -5 "$LOG" 2>/dev/null | grep -q "bootstrap_updated=true"; then
     exit 1
 fi
 
-# Advisory: the bootstrap file should exist (it may have been overwritten
-# with the real session sid by load_config(); that is expected).
+# Advisory: the bootstrap file should exist. After commit f26d93c, the
+# slow path no longer writes the bootstrap, so this check should
+# consistently match the dummy sid we just wrote (no racing overwrite).
 if [[ ! -f "$BOOTSTRAP" ]]; then
     echo "[WARN] bootstrap file $BOOTSTRAP does not exist"
     echo "  the hook log shows bootstrap_updated=true, so this is unusual"

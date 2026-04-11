@@ -342,6 +342,17 @@ def check_hook_status() -> dict:
             "current_sid": current_sid,
         }
 
+    if current_sid == "unknown":
+        return {
+            "ok": False,
+            "message": (
+                "could not determine current session id from JSONLs "
+                "(no session files found)"
+            ),
+            "bootstrap_sid": bootstrap_sid,
+            "current_sid": current_sid,
+        }
+
     if bootstrap_sid == current_sid:
         return {
             "ok": True,
