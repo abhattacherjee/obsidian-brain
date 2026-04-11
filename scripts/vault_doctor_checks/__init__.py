@@ -43,12 +43,26 @@ _CHECKS: dict[str, object] = {}
 
 
 def _discover() -> None:
-    """Import every submodule and register ones that expose the check interface."""
+    """Import every submodule and register ones that expose the check interface.
+
+    Per-module exceptions (ImportError, SyntaxError, etc.) are logged to
+    stderr and the offending module is skipped, so one broken check cannot
+    take down the whole dispatcher. This keeps the system pluggable.
+    """
     if _CHECKS:
         return
     package = __name__
+    import sys as _sys
     for mod_info in pkgutil.iter_modules(__path__):
-        mod = importlib.import_module(f"{package}.{mod_info.name}")
+        try:
+            mod = importlib.import_module(f"{package}.{mod_info.name}")
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[vault_doctor] failed to load check '{mod_info.name}': "
+                f"{type(exc).__name__}: {exc}",
+                file=_sys.stderr,
+            )
+            continue
         name = getattr(mod, "NAME", None)
         if name and callable(getattr(mod, "scan", None)) and callable(getattr(mod, "apply", None)):
             _CHECKS[name] = mod

@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `_get_session_id_fast()` now detects a new session by comparing the newest JSONL's basename against the cached sid (with a same-second mtime tie-breaker that trusts the hook-written bootstrap), invalidating the cache when a different session has become authoritative. This is defense-in-depth against the rare case where the SessionStart hook did not fire.
 
 ### Changed
-- SessionEnd hook now cleans up the per-session disk cache file `/tmp/.ob-cache-<sid>.json` to prevent `/tmp` accumulation over time.
+- SessionEnd hook now cleans up the per-session disk cache file `/tmp/.obsidian-brain-cache-<sid>.json` to prevent `/tmp` accumulation over time.
 
 ## [1.8.2] - 2026-04-10
 

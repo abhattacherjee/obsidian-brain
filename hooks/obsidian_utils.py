@@ -35,6 +35,19 @@ def _bootstrap_prefix() -> str:
     return os.environ.get("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", _BOOTSTRAP_PREFIX)
 
 
+def _safe_mtime(path: str) -> float:
+    """Return file mtime, or -1.0 if the path is missing/unstatable.
+
+    Used by _get_session_id_fast() and similar helpers that need best-effort
+    mtime comparison over globs — filesystem races (a JSONL rotated between
+    glob and stat) must not crash the caller.
+    """
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return -1.0
+
+
 def _get_session_id_fast() -> str:
     """Derive session ID, using bootstrap file for speed on repeat calls.
 
@@ -80,32 +93,42 @@ def _get_session_id_fast() -> str:
                 # resolution.
                 all_matches = _glob.glob(pattern)
                 if all_matches:
-                    newest_mtime, newest_path = max(
-                        ((os.path.getmtime(p), p) for p in all_matches),
-                    )
-                    newest_sid = os.path.splitext(os.path.basename(newest_path))[0]
-                    if newest_sid == cached_sid:
-                        return cached_sid
-                    # Tie-breaker: if the cached JSONL's mtime equals the
-                    # newest mtime, trust the cached sid. This handles the
-                    # same-second race where the previous session's JSONL and
-                    # the current session's JSONL report identical mtimes on
-                    # coarse-resolution filesystems, and the SessionStart hook
-                    # has already authoritatively written the current sid.
-                    cached_mtime = os.path.getmtime(cached_matches[0])
-                    if cached_mtime == newest_mtime:
-                        return cached_sid
-                    # Otherwise a different session is strictly newer; fall through.
+                    # Determine the newest JSONL deterministically via (mtime, path).
+                    # _safe_mtime returns -1.0 for files that disappear between glob
+                    # and stat, so transient races never crash the caller.
+                    entries = [(_safe_mtime(p), p) for p in all_matches]
+                    viable = [(m, p) for m, p in entries if m >= 0]
+                    if viable:
+                        newest_mtime, newest_path = max(viable)
+                        newest_sid = os.path.splitext(os.path.basename(newest_path))[0]
+                        if newest_sid == cached_sid:
+                            return cached_sid
+                        # Tie-breaker: if the cached JSONL's mtime equals the
+                        # newest mtime, trust the cached sid. This handles the
+                        # same-second race where the previous session's JSONL and
+                        # the current session's JSONL report identical mtimes on
+                        # coarse-resolution filesystems, and the SessionStart hook
+                        # has already authoritatively written the current sid.
+                        cached_mtime = _safe_mtime(cached_matches[0])
+                        if cached_mtime >= 0 and cached_mtime == newest_mtime:
+                            return cached_sid
+                        # Otherwise a different session is strictly newer; fall through.
+                    else:
+                        return cached_sid  # no viable JSONLs; trust cache
                 else:
                     return cached_sid  # no other JSONLs; trust cache
     except OSError:
         pass
 
-    # Slow path: full glob + mtime sort with deterministic tiebreaker
+    # Slow path: full glob + mtime sort with deterministic tiebreaker.
+    # Use _safe_mtime so a JSONL deleted or rotated between glob and stat
+    # cannot crash the caller (e.g. load_config).
     matches = _glob.glob(pattern)
-    if not matches:
+    entries = [(_safe_mtime(p), p) for p in matches]
+    viable = [(m, p) for m, p in entries if m >= 0]
+    if not viable:
         return "unknown"
-    _, newest = max(((os.path.getmtime(p), p) for p in matches))
+    _, newest = max(viable)
     sid = os.path.splitext(os.path.basename(newest))[0]
 
     # Refresh bootstrap for next call

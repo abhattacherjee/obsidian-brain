@@ -96,15 +96,15 @@ class TestBuildNote:
 
 
 def test_cleanup_session_cache_removes_file(tmp_path, monkeypatch):
-    """_cleanup_session_cache removes /tmp/.ob-cache-<sid>.json for the ended session."""
+    """_cleanup_session_cache removes /tmp/.obsidian-brain-cache-<sid>.json for the ended session."""
     import obsidian_utils
     from pathlib import Path
 
     sid = "cleanup-sid-9999"
-    cache_path = tmp_path / f".ob-cache-{sid}.json"
+    cache_path = tmp_path / f".obsidian-brain-cache-{sid}.json"
     cache_path.write_text("{}", encoding="utf-8")
 
-    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / ".ob-cache-"))
+    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / ".obsidian-brain-cache-"))
 
     # Import the session_log module (it lives in hooks/ which is on sys.path via conftest)
     import importlib.util
@@ -124,7 +124,7 @@ def test_cleanup_session_cache_handles_missing_file(tmp_path, monkeypatch):
     import obsidian_utils
     from pathlib import Path
 
-    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / ".ob-cache-"))
+    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / ".obsidian-brain-cache-"))
 
     import importlib.util
     spec = importlib.util.spec_from_file_location(
@@ -144,10 +144,10 @@ def test_cleanup_session_cache_empty_sid_noop(tmp_path, monkeypatch):
     from pathlib import Path
 
     # Create a file that would match an empty-sid pattern to make sure we DON'T touch it
-    canary = tmp_path / ".ob-cache-.json"
+    canary = tmp_path / ".obsidian-brain-cache-.json"
     canary.write_text("{}", encoding="utf-8")
 
-    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / ".ob-cache-"))
+    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / ".obsidian-brain-cache-"))
 
     import importlib.util
     spec = importlib.util.spec_from_file_location(
