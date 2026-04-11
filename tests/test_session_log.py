@@ -93,3 +93,69 @@ class TestBuildNote:
 
         # Must have title
         assert "# Session: x" in result
+
+
+def test_cleanup_session_cache_removes_file(tmp_path, monkeypatch):
+    """_cleanup_session_cache removes /tmp/.obsidian-brain-cache-<sid>.json for the ended session."""
+    import obsidian_utils
+    from pathlib import Path
+
+    sid = "cleanup-sid-9999"
+    cache_path = tmp_path / f".obsidian-brain-cache-{sid}.json"
+    cache_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / ".obsidian-brain-cache-"))
+
+    # Import the session_log module (it lives in hooks/ which is on sys.path via conftest)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "obsidian_session_log",
+        str(Path(__file__).parent.parent / "hooks" / "obsidian_session_log.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    mod._cleanup_session_cache(sid)
+    assert not cache_path.exists(), "cache file should have been removed"
+
+
+def test_cleanup_session_cache_handles_missing_file(tmp_path, monkeypatch):
+    """_cleanup_session_cache is a no-op when the cache file doesn't exist."""
+    import obsidian_utils
+    from pathlib import Path
+
+    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / ".obsidian-brain-cache-"))
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "obsidian_session_log",
+        str(Path(__file__).parent.parent / "hooks" / "obsidian_session_log.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # Should not raise even when the file doesn't exist
+    mod._cleanup_session_cache("nonexistent-sid")
+
+
+def test_cleanup_session_cache_empty_sid_noop(tmp_path, monkeypatch):
+    """_cleanup_session_cache with empty sid does nothing."""
+    import obsidian_utils
+    from pathlib import Path
+
+    # Create a file that would match an empty-sid pattern to make sure we DON'T touch it
+    canary = tmp_path / ".obsidian-brain-cache-.json"
+    canary.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / ".obsidian-brain-cache-"))
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "obsidian_session_log",
+        str(Path(__file__).parent.parent / "hooks" / "obsidian_session_log.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    mod._cleanup_session_cache("")
+    assert canary.exists(), "empty sid should not touch any files"

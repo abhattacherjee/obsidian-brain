@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `/standup` Step 14: cascade completed open items across vault notes using `batch_cascade_checkoff()` — when items are marked done in standup, all matching `- [ ]` entries in other session notes are automatically checked off
+- `/vault-doctor` skill — diagnostic and repair tool for the Obsidian vault with a pluggable check-module registry. Ships with a `source-sessions` check that scans the last 7 days of insight/decision/error-fix/retro notes, detects stale `source_session` backlinks by matching note mtimes against JSONL session windows, and atomically rewrites only the affected frontmatter fields under `--apply` with per-project confirmation and automatic backups.
+- `~/.claude/obsidian-brain-hook.log` — rolling audit log of SessionStart hook invocations with the authoritative session id, rotated at 100 KB.
+- `scripts/verify-hooks.sh` — manual diagnostic that simulates a SessionStart hook invocation and confirms the bootstrap and log were written.
+- `/recall` brief now leads with a `[OK]`/`[WARN]` SessionStart hook status line.
+
+### Fixed
+- Session hint hook now writes the authoritative session id to the bootstrap cache, fixing stale `source_session` backlinks that pointed at previous sessions when `/compress`, `/decide`, `/error-log`, or `/retro` were run in a second-or-later session of a given project.
+- `_get_session_id_fast()` now detects a new session by comparing the newest JSONL's basename against the cached sid (with a same-second mtime tie-breaker that trusts the hook-written bootstrap), invalidating the cache when a different session has become authoritative. This is defense-in-depth against the rare case where the SessionStart hook did not fire.
+
+### Changed
+- SessionEnd hook now cleans up the per-session disk cache file `/tmp/.obsidian-brain-cache-<sid>.json` to prevent `/tmp` accumulation over time.
 
 ## [1.8.2] - 2026-04-10
 
