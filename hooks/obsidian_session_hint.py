@@ -7,9 +7,11 @@ a context hint via additionalContext. No summarization at SessionStart
 (deferred to /recall skill). Always exits 0.
 """
 
+import datetime
 import json
 import os
 import sys
+import tempfile
 
 # ---------------------------------------------------------------------------
 # Import shared utilities
@@ -22,6 +24,58 @@ from obsidian_utils import (  # noqa: E402
     get_project_name,
     load_config,
 )
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap-file + audit-log helpers
+# ---------------------------------------------------------------------------
+
+_BOOTSTRAP_PREFIX_DEFAULT = "/tmp/.obsidian-brain-sid-"
+_HOOK_LOG_NAME = "obsidian-brain-hook.log"
+_HOOK_LOG_MAX_BYTES = 100 * 1024  # 100 KB
+
+
+def _bootstrap_prefix() -> str:
+    return os.environ.get("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", _BOOTSTRAP_PREFIX_DEFAULT)
+
+
+def _write_bootstrap_atomic(project: str, session_id: str) -> bool:
+    """Write session_id to the project's bootstrap file. Returns True on success."""
+    path = f"{_bootstrap_prefix()}{project}"
+    try:
+        dir_name = os.path.dirname(path) or "/tmp"
+        os.makedirs(dir_name, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".ob-sid-", suffix=".tmp", dir=dir_name)
+        with os.fdopen(fd, "w") as f:
+            f.write(session_id)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        print(f"[obsidian-brain] bootstrap write failed: {exc}", file=sys.stderr)
+        return False
+
+
+def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool) -> None:
+    """Append a one-line audit record; rotate the log when it exceeds the cap."""
+    log_dir = os.path.join(os.path.expanduser("~"), ".claude")
+    log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        try:
+            if os.path.getsize(log_path) > _HOOK_LOG_MAX_BYTES:
+                os.replace(log_path, log_path + ".1")
+        except OSError:
+            pass  # no existing log; nothing to rotate
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        short_sid = (session_id or "unknown")[:8]
+        line = (
+            f"{timestamp} SessionStart project={project} sid={short_sid} "
+            f"bootstrap_updated={'true' if bootstrap_updated else 'false'}\n"
+        )
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError as exc:
+        print(f"[obsidian-brain] hook log append failed: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -47,16 +101,25 @@ def _run() -> None:
 
     cwd = hook_input.get("cwd", os.getcwd())
 
-    # 2. Load config
+    # 2. Derive project name (needed for bootstrap before vault config).
+    project = get_project_name(cwd)
+
+    # 2a. Refresh the bootstrap file with the authoritative session_id from stdin.
+    # This runs regardless of vault configuration so the bootstrap stays current
+    # even when obsidian-brain is not fully configured.
+    session_id = hook_input.get("session_id", "")
+    bootstrap_updated = False
+    if session_id:
+        bootstrap_updated = _write_bootstrap_atomic(project, session_id)
+    _append_hook_log(project, session_id, bootstrap_updated)
+
+    # 3. Load config
     config = load_config()
     vault_path = config.get("vault_path", "")
     if not vault_path:
         return
 
     sessions_folder = config.get("sessions_folder", "claude-sessions")
-
-    # 3. Derive project name
-    project = get_project_name(cwd)
 
     # 4. Find latest session note for this project
     latest = find_latest_session(vault_path, sessions_folder, project)
