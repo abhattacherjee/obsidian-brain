@@ -552,32 +552,69 @@ class TestUpgradeNoteWithSummary:
     ):
         """Post-write: the Summary block extraction regex must terminate
         at `##\\tKey Decisions` (tab separator), not swallow the next
-        section. Regression guard for Copilot #7 round 7 (lookahead must
-        allow any whitespace after the ## delimiter)."""
+        section. If it failed to terminate, a signature that lives ONLY
+        in the next tabbed section would false-positive the body check.
+
+        The clobber moves the signature out of the Summary body and into
+        the tabbed Key Decisions section — so:
+          - correct regex termination → Summary block is empty of signature
+            → Failed: summary body missing
+          - buggy regex (swallows the tabbed section) → Summary block
+            contains the signature → phantom Upgraded
+
+        Regression guard for Copilot round 7 #2 (lookahead must allow any
+        whitespace after the `##` delimiter) AND round 8 (the round-7 test
+        was branch-confused because it only checked the happy path)."""
         monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
         summary = (
             "## Summary\n"
             "TAB_BOUNDARY_SIGNATURE content line.\n\n"
-            "##\tKey Decisions\n"
-            "None noted.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
             "## Changes Made\nNone noted.\n\n"
             "## Errors Encountered\nNone.\n\n"
             "## Open Questions / Next Steps\nNone.\n"
         )
 
-        result = obsidian_utils.upgrade_note_with_summary(
-            str(sample_unsummarized_note),
-            summary,
-            str(tmp_vault),
-            "claude-sessions",
-            "test-project",
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+
+        # Stale content: valid YAML frontmatter with status: summarized,
+        # an empty Summary body, and the signature hiding in a tab-
+        # separated next section. If the extraction regex terminates
+        # properly at `##\t`, the Summary block will be empty (no signature)
+        # and the function must return Failed. If it fails to terminate,
+        # it swallows the Key Decisions section and false-positives.
+        clobber_content = (
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-10\n"
+            "project: test-project\n"
+            "session_id: stale-session\n"
+            "status: summarized\n"
+            "---\n"
+            "\n# Clobbered\n\n"
+            "## Summary\n\n"
+            "##\tKey Decisions\n"
+            "- TAB_BOUNDARY_SIGNATURE content line.\n"
         )
 
-        assert result.startswith("Upgraded"), f"expected Upgraded, got {result!r}"
-        disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
-        assert "status: summarized" in disk_content
-        assert "TAB_BOUNDARY_SIGNATURE content line." in disk_content
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(clobber_content)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "summary body missing" in result, (
+            f"expected body-branch message, got {result!r}"
+        )
 
     def test_upgrade_note_with_summary_hash_prefixed_content_is_not_a_heading(
         self, sample_unsummarized_note, tmp_vault, monkeypatch
