@@ -2177,7 +2177,13 @@ def upgrade_note_with_summary(
     if summary_match is None:
         return f"Failed: post-write verification — ## Summary section not found in {os.path.basename(note_path)}"
     summary_block = summary_match.group(1)
-    if summary_signature not in summary_block:
+    # Compare at line granularity — a substring match could false-positive
+    # if the signature is a substring of some other line in the Summary
+    # (e.g. the signature is "Fixed the bug." and an adjacent line says
+    # "Before: Fixed the bug. After: also broken."). The signature must
+    # appear as its own stripped line in the Summary block on disk.
+    summary_block_lines = {line.strip() for line in summary_block.split('\n')}
+    if summary_signature not in summary_block_lines:
         return f"Failed: post-write verification — summary body missing from {os.path.basename(note_path)}"
 
     # Run dedup pass (non-fatal — note is already upgraded)

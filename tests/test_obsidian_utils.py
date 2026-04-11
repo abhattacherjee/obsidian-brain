@@ -513,6 +513,60 @@ class TestUpgradeNoteWithSummary:
             f"expected body-branch message, got {result!r}"
         )
 
+    def test_upgrade_note_with_summary_body_check_is_line_granular(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Signature must match as a full stripped line in the Summary block,
+        not as a substring of another line. Regression guard for Copilot #4."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        # Signature is "Short sig." — could false-positive as a substring
+        # of "Before: Short sig. After: also changed." if the check used
+        # a substring match instead of line equality.
+        summary = (
+            "## Summary\n"
+            "Short sig.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+
+        # Stale content has `## Summary` with a line that CONTAINS "Short sig."
+        # as a substring but is not equal to it. Under a substring check
+        # this false-positives; under line-granularity it must fail.
+        fake_content = (
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-10\n"
+            "project: test-project\n"
+            "session_id: stale-session\n"
+            "status: summarized\n"
+            "---\n"
+            "\n# Stale content\n\n"
+            "## Summary\nBefore: Short sig. After: something else entirely.\n"
+        )
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(fake_content)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "summary body missing" in result, (
+            f"expected line-granular miss, got {result!r}"
+        )
+
     def test_upgrade_note_with_summary_accepts_bare_filename(
         self, sample_unsummarized_note, tmp_vault, monkeypatch
     ):
