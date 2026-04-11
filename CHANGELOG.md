@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `upgrade_note_with_summary()` now fsyncs the rewritten note and re-reads it from disk after `os.replace()` to confirm `status: summarized` and the summary body signature are actually present before returning `Upgraded`. If post-write verification fails, the function returns `Failed: post-write verification ...` so callers (and `/recall`) can no longer be told "Upgraded" about a note that did not actually receive its summary.
+
 ## [1.9.0] - 2026-04-11
 
 ### Added

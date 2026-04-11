@@ -371,6 +371,78 @@ class TestUpgradeNoteWithSummary:
         )
         assert result.startswith("Failed:")
 
+    def test_upgrade_note_with_summary_post_write_verification_detects_loss(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """If a concurrent writer clobbers the file between write and verify,
+        the function must return Failed instead of phantom Upgraded."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "SIGNATURE_MARKER_FOR_VERIFICATION_TEST line one.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        # Simulate clobber: monkeypatch os.replace so that AFTER the real
+        # replace completes, a second writer immediately overwrites the
+        # target file with stale "auto-logged" content.
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+        stale_content = sample_unsummarized_note.read_text(encoding="utf-8")
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(stale_content)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str,
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        # Must fail loudly, not report phantom success.
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "verification" in result.lower()
+
+    def test_upgrade_note_with_summary_persists_to_disk(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Happy path: the summary signature is readable from disk after return."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "UNIQUE_POST_WRITE_CHECK_PHRASE landed on disk successfully.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Upgraded")
+        # Re-read from disk (not cached text).
+        disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "status: summarized" in disk_content
+        assert "UNIQUE_POST_WRITE_CHECK_PHRASE landed on disk successfully." in disk_content
+
 
 # ===========================================================================
 # Section 10: Prepare summary input

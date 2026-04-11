@@ -2072,7 +2072,8 @@ def upgrade_note_with_summary(
         if in_audit:
             new_lines.append(line)
 
-    # Atomic write
+    # Atomic write with fsync + post-write verification.
+    # Guarantees the summary actually landed on disk before returning success.
     note_dir = os.path.dirname(note_path)
     try:
         fd, tmp_path = tempfile.mkstemp(prefix='.ob-upgrade-', suffix='.md.tmp', dir=note_dir)
@@ -2085,6 +2086,8 @@ def upgrade_note_with_summary(
             orig_mode = 0o644
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp_path, orig_mode)
         os.replace(tmp_path, note_path)
     except OSError as exc:
@@ -2093,6 +2096,35 @@ def upgrade_note_with_summary(
         except OSError:
             pass
         return f"Failed: atomic write error for {os.path.basename(note_path)}: {exc}"
+
+    # Post-write verification: re-read the target file and confirm the
+    # summary actually landed. Protects against silent write-loss from
+    # concurrent writers, filesystem races, or phantom "success" returns.
+    try:
+        with open(note_path, 'r', encoding='utf-8') as f:
+            verify_content = f.read()
+    except OSError as exc:
+        return f"Failed: post-write read verification failed for {os.path.basename(note_path)}: {exc}"
+
+    if 'status: summarized' not in verify_content:
+        return f"Failed: post-write verification — status not flipped to summarized in {os.path.basename(note_path)}"
+
+    # Use the first non-header line of the summary as a signature.
+    # Strip the '## Summary' header and any blank lines to find the first
+    # real content line, then check it appears verbatim in the target file.
+    summary_lines = summary_text.split('\n')
+    signature = None
+    in_summary = False
+    for line in summary_lines:
+        if line.strip() == '## Summary':
+            in_summary = True
+            continue
+        if in_summary and line.strip() and not line.strip().startswith('#'):
+            signature = line.strip()
+            break
+
+    if signature and signature not in verify_content:
+        return f"Failed: post-write verification — summary body missing from {os.path.basename(note_path)}"
 
     # Run dedup pass (non-fatal — note is already upgraded)
     removed = []
