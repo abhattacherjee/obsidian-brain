@@ -1,0 +1,208 @@
+"""Tests for the source_sessions vault_doctor check module."""
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+_SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+sys.path.insert(0, str(_SCRIPTS_DIR))
+
+
+@pytest.fixture
+def doctor_vault(tmp_path):
+    """Tmp vault layout with folders + JSONL home for session matching."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    (vault / "claude-insights").mkdir(parents=True)
+    (vault / "claude-decisions").mkdir(parents=True)
+    (vault / "claude-error-fixes").mkdir(parents=True)
+    (vault / "claude-retros").mkdir(parents=True)
+    claude_home = tmp_path / ".claude" / "projects" / "-Users-foo-proj1"
+    claude_home.mkdir(parents=True)
+    return {
+        "vault": vault,
+        "home": tmp_path,
+        "jsonl_dir": claude_home,
+        "project": "proj1",
+    }
+
+
+def _write_jsonl(path: Path, first_ts: str, last_ts_mtime: float) -> None:
+    """Write a minimal JSONL with two entries and set mtime to last_ts_mtime."""
+    payload = [
+        {"type": "user", "timestamp": first_ts},
+        {"type": "assistant", "timestamp": first_ts},
+    ]
+    path.write_text("\n".join(json.dumps(p) for p in payload) + "\n", encoding="utf-8")
+    os.utime(path, (last_ts_mtime, last_ts_mtime))
+
+
+def _write_session_note(dir_path: Path, date: str, project: str, sid: str, hash_: str) -> Path:
+    note = dir_path / f"{date}-{project}-{hash_}.md"
+    note.write_text(
+        f"---\n"
+        f"type: claude-session\n"
+        f"date: {date}\n"
+        f"session_id: {sid}\n"
+        f"project: {project}\n"
+        f"status: summarized\n"
+        f"---\n"
+        f"# Session\n## Summary\nstub\n",
+        encoding="utf-8",
+    )
+    return note
+
+
+def _write_insight(dir_path: Path, date: str, slug: str, project: str, src_sid: str,
+                   src_note_basename: str, mtime: float) -> Path:
+    note = dir_path / f"{date}-{slug}.md"
+    note.write_text(
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: {date}\n"
+        f"source_session: {src_sid}\n"
+        f'source_session_note: "[[{src_note_basename}]]"\n'
+        f"project: {project}\n"
+        f"tags:\n"
+        f"  - claude/insight\n"
+        f"  - claude/project/{project}\n"
+        f"---\n"
+        f"# Test insight\n",
+        encoding="utf-8",
+    )
+    os.utime(note, (mtime, mtime))
+    return note
+
+
+def test_scan_flags_insight_stamped_to_wrong_session(doctor_vault, monkeypatch):
+    """Insight mtime falls in session-B window but references session-A → stale."""
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # Session A: 2026-04-09 10:00–11:00
+    a_start = time.mktime(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
+    a_end = a_start + 3600
+    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-09T10:00:00Z", a_end)
+    _write_session_note(v / "claude-sessions", "2026-04-09", "proj1", "sid-a", "aaaa")
+
+    # Session B: 2026-04-10 14:00–15:00
+    b_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    b_end = b_start + 3600
+    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_end)
+    _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
+
+    # Insight captured 2026-04-10 14:30 but wrongly stamped with sid-a
+    insight_mtime = b_start + 1800
+    _write_insight(
+        v / "claude-insights",
+        "2026-04-10",
+        "stale-insight-0001",
+        "proj1",
+        "sid-a",
+        "2026-04-09-proj1-aaaa",
+        insight_mtime,
+    )
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=7, project="proj1"
+    )
+    assert len(issues) == 1
+    iss = issues[0]
+    assert "stale-insight-0001" in iss.note_path
+    assert iss.current_source == "[[2026-04-09-proj1-aaaa]]"
+    assert iss.proposed_source == "[[2026-04-10-proj1-bbbb]]"
+    assert iss.project == "proj1"
+    assert iss.extra.get("proposed_sid") == "sid-b"
+
+
+def test_scan_ignores_correct_insight(doctor_vault, monkeypatch):
+    """Insight mtime matches its referenced session window → not flagged."""
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    monkeypatch.setenv("HOME", str(home))
+
+    a_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    a_end = a_start + 3600
+    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-10T14:00:00Z", a_end)
+    _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-a", "aaaa")
+
+    _write_insight(
+        v / "claude-insights",
+        "2026-04-10",
+        "good-insight",
+        "proj1",
+        "sid-a",
+        "2026-04-10-proj1-aaaa",
+        a_start + 1800,
+    )
+
+    issues = check.scan(str(v), "claude-sessions", "claude-insights", days=7, project="proj1")
+    assert issues == []
+
+
+def test_scan_honors_days_window(doctor_vault, monkeypatch):
+    """Notes older than `days` are not scanned."""
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    monkeypatch.setenv("HOME", str(home))
+
+    old_ts = time.time() - 30 * 86400
+    _write_jsonl(jsonl_dir / "sid-old.jsonl", "2026-03-12T10:00:00Z", old_ts + 3600)
+    _write_session_note(v / "claude-sessions", "2026-03-12", "proj1", "sid-old", "0aaa")
+    _write_insight(
+        v / "claude-insights",
+        "2026-03-12",
+        "ancient-insight",
+        "proj1",
+        "wrong-sid",
+        "2026-03-12-proj1-0aaa",
+        old_ts + 1800,
+    )
+
+    issues = check.scan(str(v), "claude-sessions", "claude-insights", days=7, project="proj1")
+    assert issues == []  # outside 7-day window
+
+
+def test_scan_marks_unresolved_when_no_window_matches(doctor_vault, monkeypatch):
+    """Insight whose mtime does not fall inside any session window → UNRESOLVED (or not flagged)."""
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    monkeypatch.setenv("HOME", str(home))
+
+    a_start = time.mktime(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
+    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-10T10:00:00Z", a_start + 3600)
+    _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-a", "aaaa")
+
+    # Insight captured at 20:00 — no session window covers it, and current source 'wrong-sid' isn't a real session
+    gap_mtime = time.mktime(time.strptime("2026-04-10 20:00", "%Y-%m-%d %H:%M"))
+    _write_insight(
+        v / "claude-insights",
+        "2026-04-10",
+        "gap-insight",
+        "proj1",
+        "wrong-sid",  # doesn't match any session
+        "2026-04-10-proj1-wrong",
+        gap_mtime,
+    )
+
+    issues = check.scan(str(v), "claude-sessions", "claude-insights", days=7, project="proj1")
+    # Either reported as unresolved, or not flagged at all — but not silently repointed
+    for iss in issues:
+        assert iss.extra.get("unresolved", False) is True
