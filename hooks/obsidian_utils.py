@@ -2072,8 +2072,48 @@ def upgrade_note_with_summary(
         if in_audit:
             new_lines.append(line)
 
-    # Atomic write
-    note_dir = os.path.dirname(note_path)
+    # Extract the summary body signature BEFORE writing so we can fail the
+    # upgrade with a clear "malformed summary" error rather than silently
+    # degrading post-write verification. The signature is the first non-blank,
+    # non-heading line of the Summary section — used to prove on re-read that
+    # the body actually landed, not just the status flip.
+    #
+    # Heading detection follows ATX-heading rules strictly: `#{1,6}` must be
+    # followed by whitespace or end-of-line. A line like `#1234 issue ref` or
+    # `#hashtag note` is legitimate content, not a heading, and must not be
+    # skipped — otherwise it could produce a false "empty or heading-only
+    # Summary body" failure when it is the first real content line.
+    #
+    # The level-2 break uses `##(?:\s|$)` (any whitespace after, or EOL) so
+    # a tab-separated or double-space-separated next section like
+    # `##\tKey Decisions` still terminates the Summary block cleanly.
+    _atx_heading_re = re.compile(r'^#{1,6}(?:\s|$)')
+    _h2_re = re.compile(r'^##(?:\s|$)')
+    summary_signature = None
+    in_summary = False
+    for line in summary_text.split('\n'):
+        if line.strip() == '## Summary':
+            in_summary = True
+            continue
+        if in_summary:
+            stripped = line.strip()
+            if _h2_re.match(stripped):
+                break  # next top-level section — Summary body was empty
+            if _atx_heading_re.match(stripped):
+                continue  # sub-heading inside Summary — skip but keep looking
+            if stripped:
+                summary_signature = stripped
+                break
+
+    if summary_signature is None:
+        return f"Failed: malformed summary (empty or heading-only Summary body) from {source} for {os.path.basename(note_path)}"
+
+    # Atomic write with fsync + post-write verification.
+    # Guarantees the summary actually landed on disk before returning success.
+    # `or "."` handles the case where note_path is a bare filename (no
+    # directory component), which would otherwise produce `dir=""` and
+    # crash tempfile.mkstemp on every platform.
+    note_dir = os.path.dirname(note_path) or "."
     try:
         fd, tmp_path = tempfile.mkstemp(prefix='.ob-upgrade-', suffix='.md.tmp', dir=note_dir)
     except OSError as exc:
@@ -2085,14 +2125,83 @@ def upgrade_note_with_summary(
             orig_mode = 0o644
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp_path, orig_mode)
         os.replace(tmp_path, note_path)
+        # fsync the containing directory so the rename itself is durable
+        # across a crash, not just the file contents.
+        try:
+            dir_fd = os.open(note_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Directory fsync is best-effort on filesystems that don't
+            # support it (e.g. some network mounts). The in-process
+            # verification below is the real guarantee for non-crash
+            # failure modes.
+            pass
     except OSError as exc:
         try:
             os.unlink(tmp_path)
-        except OSError:
-            pass
+        except OSError as cleanup_exc:
+            print(
+                f"[obsidian-brain] failed to clean up temp file {tmp_path}: {cleanup_exc}",
+                file=sys.stderr,
+            )
         return f"Failed: atomic write error for {os.path.basename(note_path)}: {exc}"
+
+    # Post-write verification: re-read the target file and confirm the
+    # summary actually landed. Protects against silent write-loss from
+    # concurrent writers, filesystem races, or phantom "success" returns.
+    try:
+        with open(note_path, 'r', encoding='utf-8') as f:
+            verify_content = f.read()
+    except OSError as exc:
+        return f"Failed: post-write read verification failed for {os.path.basename(note_path)}: {exc}"
+
+    # Scope the status check to the YAML frontmatter block so a note body
+    # that happens to mention "status: summarized" (in a conversation
+    # excerpt, a code block, or this very PR's diff) cannot false-positive
+    # the check. Anchor to the start of the file (allowing an optional
+    # UTF-8 BOM) so a Markdown horizontal rule `---` in the body cannot
+    # be mistaken for the opening frontmatter delimiter.
+    fm_match = re.match(
+        r'\ufeff?---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)',
+        verify_content,
+        re.DOTALL,
+    )
+    if fm_match is None:
+        return f"Failed: post-write verification — YAML frontmatter not found at start of {os.path.basename(note_path)}"
+    frontmatter_block = fm_match.group(1)
+    if not re.search(r'^\s*status:\s*summarized\s*$', frontmatter_block, re.MULTILINE):
+        return f"Failed: post-write verification — status not flipped to summarized in {os.path.basename(note_path)}"
+
+    # Scope the signature check to the ## Summary section specifically.
+    # Checking the whole file would false-positive if the signature text
+    # happens to appear in a preserved audit trail (Conversation raw,
+    # Tool Usage), even though the actual Summary body was clobbered.
+    # Boundary uses `##(?:\s|$)` to be consistent with ATX-heading rules —
+    # tab-separated or multi-space-separated next sections still terminate
+    # the Summary block extraction cleanly.
+    summary_match = re.search(
+        r'^## Summary\s*\n(.*?)(?=^##(?:\s|$)|\Z)',
+        verify_content,
+        re.MULTILINE | re.DOTALL,
+    )
+    if summary_match is None:
+        return f"Failed: post-write verification — ## Summary section not found in {os.path.basename(note_path)}"
+    summary_block = summary_match.group(1)
+    # Compare at line granularity — a substring match could false-positive
+    # if the signature is a substring of some other line in the Summary
+    # (e.g. the signature is "Fixed the bug." and an adjacent line says
+    # "Before: Fixed the bug. After: also broken."). The signature must
+    # appear as its own stripped line in the Summary block on disk.
+    summary_block_lines = {line.strip() for line in summary_block.split('\n')}
+    if summary_signature not in summary_block_lines:
+        return f"Failed: post-write verification — summary body missing from {os.path.basename(note_path)}"
 
     # Run dedup pass (non-fatal — note is already upgraded)
     removed = []

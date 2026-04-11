@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `upgrade_note_with_summary()` now guarantees that a returned `Upgraded` status means the summary actually landed on disk. The rewritten tempfile is `fsync`'d before `os.replace()`, the parent directory is `fsync`'d after the rename (crash-durable rename), and the target file is re-read and verified before the function returns. Verification checks that `status: summarized` appears in the **YAML frontmatter block** (anchored to the start of the file via `re.match`, not a whole-file substring match — so a body that happens to mention the literal string or contains a Markdown `---` horizontal rule cannot false-positive) AND that the first real content line of the supplied summary is present in the **`## Summary` section** as its own stripped line (line-granularity, not substring match). Empty or heading-only Summary bodies are rejected upfront with `Failed: malformed summary`. Post-write mismatches return distinct `Failed: post-write verification — …` statuses (status not flipped, summary body missing, `## Summary` section not found, YAML frontmatter not found at start, post-write read failure) so callers (and `/recall`) can no longer be told "Upgraded" about a note that did not actually receive its summary.
+
 ## [1.9.0] - 2026-04-11
 
 ### Added
