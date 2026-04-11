@@ -36,6 +36,24 @@ from obsidian_utils import (  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
+# Session cache cleanup
+# ---------------------------------------------------------------------------
+
+
+def _cleanup_session_cache(session_id: str) -> None:
+    """Remove the per-session disk cache file for a finished session."""
+    if not session_id:
+        return
+    try:
+        import obsidian_utils
+        cache_path = f"{obsidian_utils._CACHE_PREFIX}{session_id}.json"
+        if os.path.exists(cache_path):
+            os.unlink(cache_path)
+    except OSError as exc:
+        print(f"[obsidian-brain] session cache cleanup failed: {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Note construction
 # ---------------------------------------------------------------------------
 
@@ -172,6 +190,9 @@ def _run() -> None:
         print("[obsidian-brain] failed to write raw note, aborting", file=sys.stderr)
         return
     print("[obsidian-brain] raw note written (summarization deferred to /recall)", file=sys.stderr)
+
+    # 10. Clean up per-session disk cache (best-effort, success path only)
+    _cleanup_session_cache(session_id)
 
 
 if __name__ == "__main__":
