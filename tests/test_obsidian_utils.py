@@ -456,6 +456,63 @@ class TestUpgradeNoteWithSummary:
             f"expected body-branch message, got {result!r}"
         )
 
+    def test_upgrade_note_with_summary_body_check_scoped_to_summary_section(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Signature check must be scoped to ## Summary — if the signature
+        appears only in a preserved audit trail (not in Summary body), the
+        function must still return Failed. Regression guard for Copilot #1."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "AUDIT_TRAIL_FALSE_POSITIVE_SIGNATURE test line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+
+        # Craft stale content that:
+        #   - passes the frontmatter status check (status: summarized)
+        #   - has a ## Summary section with a DIFFERENT body
+        #   - leaks the signature into an audit trail section
+        # If the signature check were whole-file, it would pass here. It
+        # must only pass when the signature is in the Summary block.
+        fake_content = (
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-10\n"
+            "project: test-project\n"
+            "session_id: stale-session\n"
+            "status: summarized\n"
+            "---\n"
+            "\n# Stale content\n\n"
+            "## Summary\nThis is a different body that does not contain the signature.\n\n"
+            "## Tool Usage\n"
+            "- Message: AUDIT_TRAIL_FALSE_POSITIVE_SIGNATURE test line.\n"
+        )
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(fake_content)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "summary body missing" in result, (
+            f"expected body-branch message, got {result!r}"
+        )
+
     def test_upgrade_note_with_summary_rejects_empty_body(
         self, sample_unsummarized_note, tmp_vault, monkeypatch
     ):

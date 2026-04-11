@@ -2157,7 +2157,19 @@ def upgrade_note_with_summary(
     if not re.search(r'^\s*status:\s*summarized\s*$', frontmatter_block, re.MULTILINE):
         return f"Failed: post-write verification — status not flipped to summarized in {os.path.basename(note_path)}"
 
-    if summary_signature not in verify_content:
+    # Scope the signature check to the ## Summary section specifically.
+    # Checking the whole file would false-positive if the signature text
+    # happens to appear in a preserved audit trail (Conversation raw,
+    # Tool Usage), even though the actual Summary body was clobbered.
+    summary_match = re.search(
+        r'^## Summary\s*\n(.*?)(?=^## |\Z)',
+        verify_content,
+        re.MULTILINE | re.DOTALL,
+    )
+    if summary_match is None:
+        return f"Failed: post-write verification — ## Summary section not found in {os.path.basename(note_path)}"
+    summary_block = summary_match.group(1)
+    if summary_signature not in summary_block:
         return f"Failed: post-write verification — summary body missing from {os.path.basename(note_path)}"
 
     # Run dedup pass (non-fatal — note is already upgraded)
