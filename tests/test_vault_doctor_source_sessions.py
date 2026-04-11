@@ -524,3 +524,68 @@ def test_jsonl_dir_for_project_deterministic_same_mtime_tiebreak(tmp_path, monke
     result2 = check._jsonl_dir_for_project("proj1")
     assert result1 is not None
     assert result1 == result2, f"non-deterministic: {result1} vs {result2}"
+
+
+def test_apply_rejects_path_traversal_in_project_name(doctor_vault, tmp_path):
+    """An issue with a malicious project name cannot write outside backup_root."""
+    import vault_doctor_checks.source_sessions as check
+    from vault_doctor_checks import Issue
+
+    v = doctor_vault["vault"]
+    note = v / "claude-insights" / "2026-04-10-malicious.md"
+    note.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-04-10\n"
+        "source_session: sid-a\n"
+        'source_session_note: "[[old]]"\n'
+        "project: ../../../etc\n"
+        "---\n"
+        "# x\n",
+        encoding="utf-8",
+    )
+
+    issue = Issue(
+        check="source-sessions",
+        note_path=str(note),
+        project="../../../etc",  # malicious
+        current_source="[[old]]",
+        proposed_source="[[new]]",
+        reason="test",
+        confidence=0.95,
+        extra={"proposed_sid": "sid-b"},
+    )
+
+    backup_root = tmp_path / "backups"
+    results = check.apply([issue], str(backup_root))
+
+    # Backup must go under a sanitized slug inside backup_root, never outside
+    assert len(results) == 1
+    if results[0].status == "applied":
+        # If it succeeded, the backup path must still be under backup_root
+        bp = Path(results[0].backup_path).resolve()
+        br = Path(backup_root).resolve()
+        assert br in bp.parents, (
+            f"backup escaped root: {bp} not under {br}"
+        )
+    elif results[0].status == "error":
+        # Acceptable — sanitizer or defensive check rejected it.
+        pass
+    else:
+        assert False, f"unexpected status: {results[0].status}"
+
+
+def test_safe_project_slug_sanitizes_dots_and_separators():
+    """_safe_project_slug strips path-traversal payloads."""
+    import vault_doctor_checks.source_sessions as check
+
+    result = check._safe_project_slug("../../../etc")
+    assert "/" not in result
+    assert ".." not in result
+
+    result = check._safe_project_slug("foo/bar")
+    assert "/" not in result
+
+    assert check._safe_project_slug("") == "unknown"
+    assert check._safe_project_slug("...") == "unknown"
+    assert check._safe_project_slug("valid-name_1") == "valid-name_1"

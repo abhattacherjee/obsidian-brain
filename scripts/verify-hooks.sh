@@ -35,7 +35,11 @@ BOOTSTRAP="/tmp/.obsidian-brain-sid-$PROJECT"
 LOG="$HOME/.claude/obsidian-brain-hook.log"
 
 echo "→ Simulating SessionStart hook for project=$PROJECT"
-printf '{"cwd": "%s", "session_id": "%s"}' "$(pwd)" "$DUMMY_SID" \
+# Build the JSON payload via json.dumps so a cwd containing quotes,
+# backslashes, or newlines cannot produce an invalid-JSON stdin that
+# the hook would reject as malformed.
+python3 -c 'import json,sys; print(json.dumps({"cwd": sys.argv[1], "session_id": sys.argv[2]}))' \
+    "$(pwd)" "$DUMMY_SID" \
     | python3 "$HOOK" >/dev/null
 
 # Log is append-only and the authoritative proof the hook fired.

@@ -39,6 +39,34 @@ _EXTRA_INSIGHT_FOLDERS = [
 _FRONT_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _WIKI_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
+# Character class used to sanitize a project name into a filesystem-safe
+# path component. Anything outside [A-Za-z0-9_-] is replaced with '_'.
+_SAFE_PROJECT_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _safe_project_slug(project: str) -> str:
+    """Sanitize a project name for use as a filesystem path component.
+
+    Replaces any character that isn't alphanumeric, underscore, or hyphen
+    with an underscore. Empty or dot-only results become 'unknown' so the
+    resulting path can never escape the parent directory via '..' tricks.
+    This is used when joining an untrusted frontmatter `project` value onto
+    a backup directory root in apply().
+    """
+    if not project:
+        return "unknown"
+    # Strip dots FIRST, before the regex replacement. A dot-only input like
+    # "..." would otherwise become "___" after sub() and the subsequent
+    # strip(".") would be a no-op, leaving an ugly placeholder instead of
+    # collapsing to "unknown". Stripping dots first also defeats any
+    # leading/trailing '..' path-traversal pattern regardless of how the
+    # character class evolves.
+    stripped = project.strip(".")
+    if not stripped:
+        return "unknown"
+    slug = _SAFE_PROJECT_RE.sub("_", stripped)
+    return slug or "unknown"
+
 
 def _parse_frontmatter(text: str) -> dict:
     """Parse a flat key: value YAML frontmatter block. Nested blocks ignored."""
@@ -117,7 +145,13 @@ def _jsonl_dir_for_project(project: str) -> Path | None:
     the scan. Directories that disappear mid-scan are treated as missing.
     """
     home = os.environ.get("HOME", os.path.expanduser("~"))
-    pattern = os.path.join(home, ".claude", "projects", f"*{project}")
+    # glob.escape() neutralizes '*', '?', and '[' inside the project name so a
+    # project called e.g. "foo[bar]" cannot cause the glob to match unintended
+    # directories under ~/.claude/projects/. The leading '*' before the
+    # (escaped) project remains a real wildcard — that's how we match the
+    # path-encoded prefix Claude Code adds to the directory name.
+    safe_project = glob.escape(project)
+    pattern = os.path.join(home, ".claude", "projects", f"*{safe_project}")
     matches = glob.glob(pattern)
     if not matches:
         return None
@@ -391,12 +425,22 @@ def apply(issues, backup_root) -> list[Result]:
             continue
 
         # Stage 1: backup (failure → note unchanged, no backup)
+        # issue.project comes from untrusted frontmatter; sanitize it through
+        # _safe_project_slug() before joining so a value like "../../../etc"
+        # cannot cause the backup write to escape backup_root. The resolved
+        # post-check below is defense-in-depth against any future helper bug.
         try:
-            project_backup_dir = Path(backup_root) / issue.project
+            project_backup_dir = Path(backup_root) / _safe_project_slug(issue.project)
             project_backup_dir.mkdir(parents=True, exist_ok=True)
             backup_path = project_backup_dir / Path(issue.note_path).name
+            resolved_root = Path(backup_root).resolve()
+            resolved_backup = backup_path.resolve()
+            if resolved_root not in resolved_backup.parents:
+                raise ValueError(
+                    f"backup path {backup_path} would escape backup_root {backup_root}"
+                )
             shutil.copy2(issue.note_path, backup_path)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             results.append(
                 Result(
                     check=NAME,
