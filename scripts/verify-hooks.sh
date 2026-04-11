@@ -21,7 +21,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOOK="$REPO_ROOT/hooks/obsidian_session_hint.py"
-PROJECT="$(basename "$(pwd)" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')"
+HOOKS_DIR="$REPO_ROOT/hooks"
+# Derive PROJECT via the same helper the hook uses, so the bootstrap path
+# agrees with the hook regardless of how get_project_name() evolves.
+PROJECT="$(python3 -c "import sys; sys.path.insert(0, '$HOOKS_DIR'); from obsidian_utils import get_project_name; print(get_project_name('$(pwd)'))")"
 DUMMY_SID="verify-hooks-$(date +%s)"
 BOOTSTRAP="/tmp/.obsidian-brain-sid-$PROJECT"
 LOG="$HOME/.claude/obsidian-brain-hook.log"

@@ -26,9 +26,10 @@ NAME = "source-sessions"
 DESCRIPTION = "Detect and repair stale source_session backlinks"
 DEFAULT_WINDOW_DAYS = 7
 
-# Insight-type folders we scan. Each is relative to vault root.
-_INSIGHT_FOLDERS = [
-    "claude-insights",
+# Auxiliary insight-type folders we always scan in addition to the
+# user-configured insights folder. These are conventional names; if a user
+# customizes them, they can add a follow-up feature request.
+_EXTRA_INSIGHT_FOLDERS = [
     "claude-decisions",
     "claude-error-fixes",
     "claude-retros",
@@ -109,14 +110,30 @@ def _jsonl_window(jsonl_path: str) -> tuple[float, float] | None:
 
 
 def _jsonl_dir_for_project(project: str) -> Path | None:
-    """Find ~/.claude/projects/*<project>/ directory for this project name."""
+    """Find ~/.claude/projects/*<project>/ directory for this project name.
+
+    Wraps os.path.getmtime in a try/except so a transient filesystem race
+    (a matched directory being deleted between glob and stat) cannot crash
+    the scan. Directories that disappear mid-scan are treated as missing.
+    """
     home = os.environ.get("HOME", os.path.expanduser("~"))
     pattern = os.path.join(home, ".claude", "projects", f"*{project}")
     matches = glob.glob(pattern)
     if not matches:
         return None
+
+    def _safe_mtime(p: str) -> float:
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return -1.0  # treat as effectively-missing
+
+    scored = [(m, _safe_mtime(m)) for m in matches]
+    viable = [(m, t) for m, t in scored if t >= 0]
+    if not viable:
+        return None
     # Pick the most recently modified directory if multiple match (path encoding variants)
-    return Path(max(matches, key=os.path.getmtime))
+    return Path(max(viable, key=lambda pair: pair[1])[0])
 
 
 def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:
@@ -186,21 +203,28 @@ def _find_matching_session(
 def scan(
     vault_path: str,
     sessions_folder: str,
-    insights_folder: str,  # kept for signature uniformity; we iterate all _INSIGHT_FOLDERS
+    insights_folder: str,
     days: int,
     project: str | None = None,
 ) -> list[Issue]:
     """Detect stale source_session backlinks modified within the last `days` days."""
-    _ = insights_folder  # explicitly unused; we scan all _INSIGHT_FOLDERS
     vault = Path(vault_path)
     cutoff = time.time() - days * 86400
     sessions_dir = vault / sessions_folder
+
+    # Honor the user's configured insights folder as the primary, then scan
+    # the conventional auxiliary folders (decisions, error-fixes, retros)
+    # alongside it. Avoid duplicating the primary folder if a user happens
+    # to configure it to one of the extras.
+    scan_folders = [insights_folder] + [
+        f for f in _EXTRA_INSIGHT_FOLDERS if f != insights_folder
+    ]
 
     issues: list[Issue] = []
     session_index_cache: dict[str, dict[str, dict]] = {}
     jsonl_dir_cache: dict[str, Path | None] = {}
 
-    for folder in _INSIGHT_FOLDERS:
+    for folder in scan_folders:
         folder_path = vault / folder
         if not folder_path.is_dir():
             continue
@@ -234,8 +258,19 @@ def scan(
             jsonl_dir = jsonl_dir_cache[note_project]
 
             current_sid = fm.get("source_session", "")
-            m = _WIKI_RE.search(fm.get("source_session_note", ""))
+            raw_src_note = fm.get("source_session_note", "")
+            m = _WIKI_RE.search(raw_src_note)
             current_src_basename = m.group(1) if m else ""
+
+            # Build a clean current_source display string. Avoid emitting
+            # a bare "[[]]" when the frontmatter is missing or malformed —
+            # fall back to the raw value, or an empty string.
+            if current_src_basename:
+                current_source_display = f"[[{current_src_basename}]]"
+            elif raw_src_note:
+                current_source_display = raw_src_note
+            else:
+                current_source_display = ""
 
             match = _find_matching_session(mtime, jsonl_dir, idx)
             if match is None:
@@ -249,7 +284,7 @@ def scan(
                             check=NAME,
                             note_path=str(note),
                             project=note_project,
-                            current_source=f"[[{current_src_basename}]]" if current_src_basename else "",
+                            current_source=current_source_display,
                             proposed_source="",
                             reason="no session window contains note mtime",
                             confidence=0.0,
@@ -266,7 +301,7 @@ def scan(
                     check=NAME,
                     note_path=str(note),
                     project=note_project,
-                    current_source=f"[[{current_src_basename}]]",
+                    current_source=current_source_display,
                     proposed_source=f"[[{match['basename']}]]",
                     reason=(
                         f"note mtime {datetime.fromtimestamp(mtime, timezone.utc).isoformat(timespec='seconds')}"

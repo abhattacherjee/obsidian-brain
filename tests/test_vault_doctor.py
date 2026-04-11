@@ -45,7 +45,7 @@ def test_issue_and_result_dataclasses_importable():
 
 def test_cli_dry_run_reports_issues(tmp_path):
     """vault_doctor.py --check source-sessions reports without applying."""
-    import subprocess, json, sys, os, time, json as _json
+    import subprocess, json, sys, os, time, calendar, json as _json
     from pathlib import Path
 
     vault = tmp_path / "vault"
@@ -54,7 +54,7 @@ def test_cli_dry_run_reports_issues(tmp_path):
     claude_home = tmp_path / ".claude" / "projects" / "-x-proj1"
     claude_home.mkdir(parents=True)
 
-    b_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
     (claude_home / "sid-b.jsonl").write_text(
         _json.dumps({"type": "user", "timestamp": "2026-04-10T14:00:00Z"}) + "\n",
         encoding="utf-8",
@@ -97,7 +97,7 @@ def test_cli_dry_run_reports_issues(tmp_path):
 
 def test_cli_apply_with_yes(tmp_path):
     """vault_doctor.py --apply --yes patches the file non-interactively."""
-    import subprocess, json, sys, os, time, json as _json
+    import subprocess, json, sys, os, time, calendar, json as _json
     from pathlib import Path
 
     vault = tmp_path / "vault"
@@ -106,7 +106,7 @@ def test_cli_apply_with_yes(tmp_path):
     claude_home = tmp_path / ".claude" / "projects" / "-x-proj1"
     claude_home.mkdir(parents=True)
 
-    b_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
     (claude_home / "sid-b.jsonl").write_text(
         _json.dumps({"type": "user", "timestamp": "2026-04-10T14:00:00Z"}) + "\n",
         encoding="utf-8",

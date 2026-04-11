@@ -1,5 +1,6 @@
 """End-to-end integration test for /vault-doctor source-sessions flow."""
 
+import calendar
 import json
 import os
 import subprocess
@@ -21,8 +22,8 @@ def test_end_to_end_scan_apply_verify(tmp_path):
     cc_projects.mkdir(parents=True)
 
     # Two sessions on different days
-    a_start = time.mktime(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
-    b_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    a_start = calendar.timegm(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
+    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
 
     (cc_projects / "sid-a.jsonl").write_text(
         json.dumps({"type": "user", "timestamp": "2026-04-09T10:00:00Z"}) + "\n",

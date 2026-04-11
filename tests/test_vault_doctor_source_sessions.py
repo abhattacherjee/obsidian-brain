@@ -1,5 +1,6 @@
 """Tests for the source_sessions vault_doctor check module."""
 
+import calendar
 import json
 import os
 import sys
@@ -88,13 +89,13 @@ def test_scan_flags_insight_stamped_to_wrong_session(doctor_vault, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
 
     # Session A: 2026-04-09 10:00–11:00
-    a_start = time.mktime(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
+    a_start = calendar.timegm(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
     a_end = a_start + 3600
     _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-09T10:00:00Z", a_end)
     _write_session_note(v / "claude-sessions", "2026-04-09", "proj1", "sid-a", "aaaa")
 
     # Session B: 2026-04-10 14:00–15:00
-    b_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
     b_end = b_start + 3600
     _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_end)
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
@@ -132,7 +133,7 @@ def test_scan_ignores_correct_insight(doctor_vault, monkeypatch):
     jsonl_dir = doctor_vault["jsonl_dir"]
     monkeypatch.setenv("HOME", str(home))
 
-    a_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    a_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
     a_end = a_start + 3600
     _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-10T14:00:00Z", a_end)
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-a", "aaaa")
@@ -186,12 +187,12 @@ def test_scan_marks_unresolved_when_no_window_matches(doctor_vault, monkeypatch)
     jsonl_dir = doctor_vault["jsonl_dir"]
     monkeypatch.setenv("HOME", str(home))
 
-    a_start = time.mktime(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
+    a_start = calendar.timegm(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
     _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-10T10:00:00Z", a_start + 3600)
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-a", "aaaa")
 
     # Insight captured at 20:00 — no session window covers it, and current source 'wrong-sid' isn't a real session
-    gap_mtime = time.mktime(time.strptime("2026-04-10 20:00", "%Y-%m-%d %H:%M"))
+    gap_mtime = calendar.timegm(time.strptime("2026-04-10 20:00", "%Y-%m-%d %H:%M"))
     _write_insight(
         v / "claude-insights",
         "2026-04-10",
@@ -220,8 +221,8 @@ def test_apply_rewrites_only_source_session_fields(doctor_vault, tmp_path, monke
     jsonl_dir = doctor_vault["jsonl_dir"]
     monkeypatch.setenv("HOME", str(home))
 
-    a_start = time.mktime(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
-    b_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    a_start = calendar.timegm(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
+    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
     _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-09T10:00:00Z", a_start + 3600)
     _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_start + 3600)
     _write_session_note(v / "claude-sessions", "2026-04-09", "proj1", "sid-a", "aaaa")
@@ -359,19 +360,19 @@ def test_scan_latest_start_wins_on_boundary_tie(doctor_vault, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
 
     # Session A: 10:00 - 14:05 (mtime)
-    a_start = time.mktime(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
-    a_mtime = time.mktime(time.strptime("2026-04-10 14:05", "%Y-%m-%d %H:%M"))
+    a_start = calendar.timegm(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
+    a_mtime = calendar.timegm(time.strptime("2026-04-10 14:05", "%Y-%m-%d %H:%M"))
     _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-10T10:00:00Z", a_mtime)
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-a", "aaaa")
 
     # Session B: 14:00 - 15:00 (mtime) — overlaps session A from 14:00-14:05
-    b_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
     b_mtime = b_start + 3600
     _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_mtime)
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
 
     # Insight captured at 14:02 — inside BOTH windows
-    insight_mtime = time.mktime(time.strptime("2026-04-10 14:02", "%Y-%m-%d %H:%M"))
+    insight_mtime = calendar.timegm(time.strptime("2026-04-10 14:02", "%Y-%m-%d %H:%M"))
     _write_insight(
         v / "claude-insights",
         "2026-04-10",
