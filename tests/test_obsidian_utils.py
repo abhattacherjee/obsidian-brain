@@ -513,6 +513,71 @@ class TestUpgradeNoteWithSummary:
             f"expected body-branch message, got {result!r}"
         )
 
+    def test_upgrade_note_with_summary_hash_prefixed_content_is_not_a_heading(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """A line starting with `#` followed by non-whitespace (e.g. `#1234`
+        or `#hashtag`) is legitimate Markdown content, not an ATX heading,
+        and must be accepted as the signature. Regression guard for
+        Copilot #6 (strict ATX heading detection)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        # First real content line starts with `#` but is not an ATX heading.
+        summary = (
+            "## Summary\n"
+            "#1234 issue reference — fixed the auth bug.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Upgraded"), (
+            f"expected Upgraded, got {result!r} — hash-prefixed content line "
+            f"was incorrectly classified as a heading"
+        )
+        disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "status: summarized" in disk_content
+        assert "#1234 issue reference — fixed the auth bug." in disk_content
+
+    def test_upgrade_note_with_summary_skips_sub_headings_inside_summary(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """A legitimate ATX sub-heading like `### Context` inside the Summary
+        block should be skipped, and the next real content line becomes the
+        signature. Pins the "sub-heading != break" branch of the new logic."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "### Context\n"
+            "The real signature is on this line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Upgraded"), f"expected Upgraded, got {result!r}"
+        disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "The real signature is on this line." in disk_content
+
     def test_upgrade_note_with_summary_body_check_is_line_granular(
         self, sample_unsummarized_note, tmp_vault, monkeypatch
     ):

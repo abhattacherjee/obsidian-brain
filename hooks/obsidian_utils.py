@@ -2077,6 +2077,13 @@ def upgrade_note_with_summary(
     # degrading post-write verification. The signature is the first non-blank,
     # non-heading line of the Summary section — used to prove on re-read that
     # the body actually landed, not just the status flip.
+    #
+    # Heading detection follows ATX-heading rules strictly: `#{1,6}` must be
+    # followed by whitespace or end-of-line. A line like `#1234 issue ref` or
+    # `#hashtag note` is legitimate content, not a heading, and must not be
+    # skipped — otherwise it could produce a false "empty or heading-only
+    # Summary body" failure when it is the first real content line.
+    _atx_heading_re = re.compile(r'^#{1,6}(?:\s|$)')
     summary_signature = None
     in_summary = False
     for line in summary_text.split('\n'):
@@ -2085,9 +2092,11 @@ def upgrade_note_with_summary(
             continue
         if in_summary:
             stripped = line.strip()
-            if stripped.startswith('## '):
-                break  # next top-level section — Summary body was empty
-            if stripped and not stripped.startswith('#'):
+            if _atx_heading_re.match(stripped):
+                if stripped.startswith('## '):
+                    break  # next top-level section — Summary body was empty
+                continue  # sub-heading inside Summary — skip but keep looking
+            if stripped:
                 summary_signature = stripped
                 break
 
