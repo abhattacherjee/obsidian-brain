@@ -203,6 +203,9 @@ def test_scan_marks_unresolved_when_no_window_matches(doctor_vault, monkeypatch)
     )
 
     issues = check.scan(str(v), "claude-sessions", "claude-insights", days=7, project="proj1")
-    # Either reported as unresolved, or not flagged at all — but not silently repointed
-    for iss in issues:
-        assert iss.extra.get("unresolved", False) is True
+    assert len(issues) == 1, f"expected exactly 1 unresolved issue, got {len(issues)}"
+    iss = issues[0]
+    assert iss.extra.get("unresolved") is True
+    assert iss.confidence == 0.0
+    assert iss.proposed_source == ""
+    assert "gap-insight" in iss.note_path

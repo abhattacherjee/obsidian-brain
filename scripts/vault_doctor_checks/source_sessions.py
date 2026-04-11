@@ -134,19 +134,31 @@ def _find_matching_session(
     jsonl_dir: Path | None,
     session_note_index: dict[str, dict],
 ) -> dict | None:
-    """Return the session note dict (+ 'sid' key) whose JSONL window contains capture_time."""
+    """Return the session note dict (+ 'sid' key) whose JSONL window contains capture_time.
+
+    Iteration is deterministic (sorted by filename). When multiple windows
+    contain capture_time (boundary tie between a previous session's end and
+    a new session's start), the session with the LATEST first_ts wins — the
+    most recently started session is the one actively capturing insights.
+    """
     if not jsonl_dir or not jsonl_dir.is_dir():
         return None
-    for jsonl in jsonl_dir.glob("*.jsonl"):
+    candidates: list[tuple[float, str]] = []
+    for jsonl in sorted(jsonl_dir.glob("*.jsonl")):
         sid = jsonl.stem
+        if sid not in session_note_index:
+            continue
         window = _jsonl_window(str(jsonl))
         if window is None:
             continue
         first_ts, last_ts = window
         if first_ts <= capture_time <= last_ts:
-            if sid in session_note_index:
-                return {**session_note_index[sid], "sid": sid}
-    return None
+            candidates.append((first_ts, sid))
+    if not candidates:
+        return None
+    # Latest-start wins on boundary ties
+    _, best_sid = max(candidates)
+    return {**session_note_index[best_sid], "sid": best_sid}
 
 
 def scan(
