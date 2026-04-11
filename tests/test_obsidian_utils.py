@@ -831,7 +831,7 @@ def test_build_context_brief_prepends_hook_status(tmp_path):
     (vault / "sessions").mkdir(parents=True)
     (vault / "insights").mkdir(parents=True)
 
-    status_line = "✓ SessionStart hook fired; bootstrap matches current session"
+    status_line = "[OK] SessionStart hook fired; bootstrap matches current session"
     output = obsidian_utils.build_context_brief(
         str(vault),
         "sessions",

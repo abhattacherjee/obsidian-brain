@@ -33,7 +33,7 @@ printf '{"cwd": "%s", "session_id": "%s"}' "$(pwd)" "$DUMMY_SID" \
 # Log is append-only and the authoritative proof the hook fired.
 # The dummy sid is truncated to 8 chars in the log ("verify-h").
 if ! tail -5 "$LOG" 2>/dev/null | grep -q "sid=verify-h"; then
-    echo "✗ FAIL: hook log does not contain a verify-hooks entry" >&2
+    echo "[FAIL] hook log does not contain a verify-hooks entry" >&2
     echo "  log path: $LOG" >&2
     echo "  last 5 lines:" >&2
     tail -5 "$LOG" >&2 || true
@@ -41,7 +41,7 @@ if ! tail -5 "$LOG" 2>/dev/null | grep -q "sid=verify-h"; then
 fi
 
 if ! tail -5 "$LOG" 2>/dev/null | grep -q "bootstrap_updated=true"; then
-    echo "✗ FAIL: hook log does not show bootstrap_updated=true" >&2
+    echo "[FAIL] hook log does not show bootstrap_updated=true" >&2
     echo "  log path: $LOG" >&2
     tail -5 "$LOG" >&2 || true
     exit 1
@@ -50,10 +50,10 @@ fi
 # Advisory: the bootstrap file should exist (it may have been overwritten
 # with the real session sid by load_config(); that is expected).
 if [[ ! -f "$BOOTSTRAP" ]]; then
-    echo "⚠ WARN: bootstrap file $BOOTSTRAP does not exist"
+    echo "[WARN] bootstrap file $BOOTSTRAP does not exist"
     echo "  the hook log shows bootstrap_updated=true, so this is unusual"
 fi
 
-echo "✓ Hook fired, bootstrap written, log updated."
+echo "[OK] Hook fired, bootstrap written, log updated."
 echo "  bootstrap: $BOOTSTRAP"
 echo "  log:       $LOG"

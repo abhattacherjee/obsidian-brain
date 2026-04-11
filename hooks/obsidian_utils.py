@@ -1109,8 +1109,8 @@ def build_context_brief(
         sessions_folder: Folder name (relative to vault) containing sessions.
         insights_folder: Folder name (relative to vault) containing insights.
         project: Project slug to filter on.
-        hook_status_line: Optional pre-formatted status line (e.g. "✓ …" or
-            "⚠ …") to prepend to the brief so /recall can surface SessionStart
+        hook_status_line: Optional pre-formatted status line (e.g. "[OK] …" or
+            "[WARN] …") to prepend to the brief so /recall can surface SessionStart
             hook health at a glance.
 
     Returns a structured string with labeled sections:

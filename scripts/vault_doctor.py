@@ -105,21 +105,21 @@ def _run_scan(mod, cfg: dict, days: int, project: str | None) -> list:
     )
 
 
-def _print_report_human(issues_by_check: dict, stderr=sys.stderr) -> None:
+def _print_report_human(issues_by_check: dict) -> None:
     total = sum(len(v) for v in issues_by_check.values())
-    print(f"\nvault_doctor report — {total} issue(s) across {len(issues_by_check)} check(s)", file=stderr)
+    print(f"\nvault_doctor report — {total} issue(s) across {len(issues_by_check)} check(s)", file=sys.stderr)
     for check_name, issues in issues_by_check.items():
         by_project: dict[str, list] = {}
         for i in issues:
             by_project.setdefault(i.project, []).append(i)
         for proj, proj_issues in sorted(by_project.items()):
-            print(f"\n  Project: {proj}  [{check_name}]", file=stderr)
+            print(f"\n  Project: {proj}  [{check_name}]", file=sys.stderr)
             for i in proj_issues:
                 mark = "!" if i.extra.get("unresolved") else "x"
-                print(f"    {mark} {Path(i.note_path).name}", file=stderr)
-                print(f"      current:  {i.current_source}", file=stderr)
-                print(f"      proposed: {i.proposed_source or '(unresolved)'}", file=stderr)
-                print(f"      reason:   {i.reason}", file=stderr)
+                print(f"    {mark} {Path(i.note_path).name}", file=sys.stderr)
+                print(f"      current:  {i.current_source}", file=sys.stderr)
+                print(f"      proposed: {i.proposed_source or '(unresolved)'}", file=sys.stderr)
+                print(f"      reason:   {i.reason}", file=sys.stderr)
 
 
 def main() -> int:
