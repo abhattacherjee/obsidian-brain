@@ -209,3 +209,141 @@ def test_scan_marks_unresolved_when_no_window_matches(doctor_vault, monkeypatch)
     assert iss.confidence == 0.0
     assert iss.proposed_source == ""
     assert "gap-insight" in iss.note_path
+
+
+def test_apply_rewrites_only_source_session_fields(doctor_vault, tmp_path, monkeypatch):
+    """After apply, only source_session/source_session_note change; body+tags preserved."""
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    monkeypatch.setenv("HOME", str(home))
+
+    a_start = time.mktime(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
+    b_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-09T10:00:00Z", a_start + 3600)
+    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_start + 3600)
+    _write_session_note(v / "claude-sessions", "2026-04-09", "proj1", "sid-a", "aaaa")
+    _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
+
+    # Build an insight with extra tags and body content we want preserved
+    note = v / "claude-insights" / "2026-04-10-rewrite-me.md"
+    note.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-04-10\n"
+        "source_session: sid-a\n"
+        'source_session_note: "[[2026-04-09-proj1-aaaa]]"\n'
+        "project: proj1\n"
+        "tags:\n"
+        "  - claude/insight\n"
+        "  - claude/project/proj1\n"
+        "  - claude/topic/foo\n"
+        "---\n"
+        "\n"
+        "# My insight\n"
+        "\n"
+        "Body line 1\n"
+        "Body line 2 with [[2026-04-09-proj1-aaaa]] reference in body\n",
+        encoding="utf-8",
+    )
+    os.utime(note, (b_start + 1800, b_start + 1800))
+
+    # Capture the original body for byte-identity comparison
+    original_text = note.read_text(encoding="utf-8")
+    original_body = original_text.split("---\n", 2)[-1]
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=7, project="proj1"
+    )
+    assert len(issues) == 1, f"expected 1 issue, got {len(issues)}"
+
+    backup_root = tmp_path / "backups"
+    results = check.apply(issues, str(backup_root))
+
+    assert len(results) == 1
+    assert results[0].status == "applied"
+    assert results[0].backup_path is not None
+    assert Path(results[0].backup_path).exists()
+
+    patched = note.read_text(encoding="utf-8")
+    # Frontmatter targets rewritten
+    assert "source_session: sid-b" in patched
+    assert 'source_session_note: "[[2026-04-10-proj1-bbbb]]"' in patched
+    # Untouched frontmatter preserved
+    assert "claude/topic/foo" in patched
+    assert "type: claude-insight" in patched
+    assert "tags:\n  - claude/insight" in patched
+    # Body byte-identical
+    patched_body = patched.split("---\n", 2)[-1]
+    assert patched_body == original_body, "body must be byte-identical after frontmatter rewrite"
+    # Backup file matches the pre-patch content
+    assert Path(results[0].backup_path).read_text(encoding="utf-8") == original_text
+
+
+def test_apply_skips_unresolved(doctor_vault, tmp_path):
+    """Issues marked unresolved are skipped, never rewritten."""
+    import vault_doctor_checks.source_sessions as check
+    from vault_doctor_checks import Issue
+
+    v = doctor_vault["vault"]
+    note = v / "claude-insights" / "2026-04-10-unresolved.md"
+    original = (
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-04-10\n"
+        "source_session: gone-sid\n"
+        'source_session_note: "[[does-not-exist]]"\n'
+        "project: proj1\n"
+        "---\n"
+        "# unresolved\n"
+    )
+    note.write_text(original, encoding="utf-8")
+
+    issue = Issue(
+        check="source-sessions",
+        note_path=str(note),
+        project="proj1",
+        current_source="[[does-not-exist]]",
+        proposed_source="",
+        reason="no window",
+        confidence=0.0,
+        extra={"unresolved": True},
+    )
+
+    backup_root = tmp_path / "backups"
+    results = check.apply([issue], str(backup_root))
+    assert len(results) == 1
+    assert results[0].status == "unresolved"
+    assert results[0].backup_path is None
+    # File must be byte-identical
+    assert note.read_text(encoding="utf-8") == original
+
+
+def test_apply_errors_on_missing_proposed_sid(doctor_vault, tmp_path):
+    """Issue with no proposed_sid returns status=error, file untouched."""
+    import vault_doctor_checks.source_sessions as check
+    from vault_doctor_checks import Issue
+
+    v = doctor_vault["vault"]
+    note = v / "claude-insights" / "2026-04-10-noprop.md"
+    original = "---\ntype: claude-insight\nproject: proj1\nsource_session: x\n---\n# x\n"
+    note.write_text(original, encoding="utf-8")
+
+    issue = Issue(
+        check="source-sessions",
+        note_path=str(note),
+        project="proj1",
+        current_source="[[foo]]",
+        proposed_source="[[bar]]",  # proposed basename exists but extra['proposed_sid'] is missing
+        reason="test",
+        confidence=0.95,
+        extra={},  # no proposed_sid
+    )
+
+    backup_root = tmp_path / "backups"
+    results = check.apply([issue], str(backup_root))
+    assert results[0].status == "error"
+    assert "proposed_sid" in (results[0].error or "")
+    assert note.read_text(encoding="utf-8") == original

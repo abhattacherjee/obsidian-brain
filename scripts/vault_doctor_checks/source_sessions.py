@@ -258,5 +258,112 @@ def scan(
     return issues
 
 
+def _rewrite_frontmatter(text: str, new_sid: str, new_basename: str) -> str:
+    """Rewrite only source_session and source_session_note in the frontmatter block.
+
+    Body, tags, and all other frontmatter fields are preserved byte-identically.
+    If either field is missing from the block, append it.
+    """
+    m = _FRONT_RE.match(text)
+    if not m:
+        raise ValueError("no frontmatter block found")
+    fm_block = m.group(1)
+    body = text[m.end():]
+
+    new_lines: list[str] = []
+    saw_sid = False
+    saw_src_note = False
+    for line in fm_block.splitlines():
+        if line.startswith("source_session:"):
+            new_lines.append(f"source_session: {new_sid}")
+            saw_sid = True
+        elif line.startswith("source_session_note:"):
+            new_lines.append(f'source_session_note: "[[{new_basename}]]"')
+            saw_src_note = True
+        else:
+            new_lines.append(line)
+
+    if not saw_sid:
+        new_lines.append(f"source_session: {new_sid}")
+    if not saw_src_note:
+        new_lines.append(f'source_session_note: "[[{new_basename}]]"')
+
+    return "---\n" + "\n".join(new_lines) + "\n---\n" + body
+
+
 def apply(issues, backup_root) -> list[Result]:
-    raise NotImplementedError("implemented in Task 8")
+    """Apply fixes: back up each file, then atomically rewrite frontmatter.
+
+    Unresolved issues are skipped. Missing proposed_sid in extra yields
+    status='error'. All writes are atomic (temp file + os.replace).
+    """
+    import shutil
+    import tempfile
+
+    results: list[Result] = []
+    os.makedirs(backup_root, exist_ok=True)
+
+    for issue in issues:
+        if issue.extra.get("unresolved"):
+            results.append(
+                Result(
+                    check=NAME,
+                    note_path=issue.note_path,
+                    status="unresolved",
+                    backup_path=None,
+                    error=None,
+                )
+            )
+            continue
+
+        proposed_sid = issue.extra.get("proposed_sid", "")
+        proposed_basename = issue.proposed_source.strip().lstrip("[").rstrip("]")
+        if not proposed_sid or not proposed_basename:
+            results.append(
+                Result(
+                    check=NAME,
+                    note_path=issue.note_path,
+                    status="error",
+                    error="missing proposed_sid or proposed_source",
+                )
+            )
+            continue
+
+        try:
+            # Backup before modifying
+            project_backup_dir = Path(backup_root) / issue.project
+            project_backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = project_backup_dir / Path(issue.note_path).name
+            shutil.copy2(issue.note_path, backup_path)
+
+            # Read, patch, atomic write
+            with open(issue.note_path, "r", encoding="utf-8") as f:
+                text = f.read()
+            new_text = _rewrite_frontmatter(text, proposed_sid, proposed_basename)
+
+            fd, tmp = tempfile.mkstemp(
+                prefix=".vd-", suffix=".md.tmp", dir=os.path.dirname(issue.note_path)
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(new_text)
+            os.replace(tmp, issue.note_path)
+
+            results.append(
+                Result(
+                    check=NAME,
+                    note_path=issue.note_path,
+                    status="applied",
+                    backup_path=str(backup_path),
+                )
+            )
+        except (OSError, ValueError) as exc:
+            results.append(
+                Result(
+                    check=NAME,
+                    note_path=issue.note_path,
+                    status="error",
+                    error=str(exc),
+                )
+            )
+
+    return results
