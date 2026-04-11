@@ -37,10 +37,20 @@ _HOOK_LOG_MAX_BYTES = 100 * 1024  # 100 KB
 
 def _write_bootstrap_atomic(project: str, session_id: str) -> bool:
     """Write session_id to the project's bootstrap file. Returns True on success."""
-    path = f"{_bootstrap_prefix()}{project}"
+    # Force absolute path so os.path.dirname() always returns a real
+    # directory. If OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX is a relative path with
+    # no dir component, dirname() would return "" and we'd fall back to
+    # "/tmp" — but then os.replace(tmp, path) could raise EXDEV when /tmp
+    # is on a different filesystem (e.g., tmpfs) than the relative target.
+    # Making the target absolute keeps the temp file and target on the
+    # same filesystem, so os.replace() is always safe.
+    path = os.path.abspath(f"{_bootstrap_prefix()}{project}")
     tmp = None
     try:
-        dir_name = os.path.dirname(path) or "/tmp"
+        dir_name = os.path.dirname(path)
+        if not dir_name:
+            # Defensive fallback — should be unreachable after abspath().
+            dir_name = "/tmp"
         os.makedirs(dir_name, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".ob-sid-", suffix=".tmp", dir=dir_name)
         with os.fdopen(fd, "w", encoding="utf-8") as f:

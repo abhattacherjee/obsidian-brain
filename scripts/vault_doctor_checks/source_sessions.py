@@ -430,9 +430,18 @@ def apply(issues, backup_root) -> list[Result]:
         # cannot cause the backup write to escape backup_root. The resolved
         # post-check below is defense-in-depth against any future helper bug.
         try:
-            project_backup_dir = Path(backup_root) / _safe_project_slug(issue.project)
+            # Preserve the source folder name in the backup path to prevent
+            # basename collisions across insight-type folders (e.g., an
+            # insight and a retro both named 2026-04-10-foo.md would otherwise
+            # clobber each other's backups). The resulting layout is
+            # <backup_root>/<project>/<folder>/<basename>.
+            note_path = Path(issue.note_path)
+            source_folder = note_path.parent.name  # e.g., "claude-insights"
+            project_backup_dir = (
+                Path(backup_root) / _safe_project_slug(issue.project) / source_folder
+            )
             project_backup_dir.mkdir(parents=True, exist_ok=True)
-            backup_path = project_backup_dir / Path(issue.note_path).name
+            backup_path = project_backup_dir / note_path.name
             resolved_root = Path(backup_root).resolve()
             resolved_backup = backup_path.resolve()
             if resolved_root not in resolved_backup.parents:

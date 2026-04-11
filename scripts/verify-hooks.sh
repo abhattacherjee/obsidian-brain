@@ -9,13 +9,16 @@
 # Exit:  0 on success, non-zero on any failure.
 #
 # Note on the bootstrap check:
-#   load_config() inside the hook calls _get_session_id_fast(), which
-#   refreshes the bootstrap file with the authoritative session_id
-#   derived from ~/.claude/projects/*. When this script runs inside a
-#   live Claude Code session, that overwrite races with our dummy-sid
-#   write, so the bootstrap file may end up containing the real sid by
-#   the time we read it. The append-only hook log is the authoritative
-#   signal that our invocation ran; the bootstrap check is advisory.
+#   After commit f26d93c, only the SessionStart hook writes the
+#   bootstrap file. The previous slow-path "refresh" behavior in
+#   _get_session_id_fast() was removed because it could clobber the
+#   hook's authoritative write within the same hook invocation when
+#   Claude Code fires SessionStart before flushing the new session's
+#   JSONL to disk. This script verifies the hook fired via the
+#   append-only hook log at ~/.claude/obsidian-brain-hook.log — that
+#   is the authoritative signal. The bootstrap file check is advisory
+#   and should now also show the dummy sid (no racing slow path
+#   overwriting it).
 
 set -euo pipefail
 
