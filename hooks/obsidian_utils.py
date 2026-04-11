@@ -220,6 +220,57 @@ def load_config() -> dict:
     return config
 
 
+def check_hook_status() -> dict:
+    """Inspect the bootstrap file to report SessionStart hook health.
+
+    Returns:
+        {"ok": bool, "message": str, "bootstrap_sid": str, "current_sid": str}
+
+    "ok" is True if the bootstrap file exists and matches the current session.
+    "ok" is False if the bootstrap is missing or points at a different sid
+    (which would indicate the SessionStart hook did not fire, or the fast
+    path is returning a stale value).
+    """
+    project = os.path.basename(os.getcwd())
+    bootstrap = f"{_BOOTSTRAP_PREFIX}{project}"
+
+    # Read bootstrap BEFORE calling _get_session_id_fast(), which may refresh
+    # the bootstrap file as a side effect on its slow path.
+    try:
+        with open(bootstrap, "r") as f:
+            bootstrap_sid = f.read().strip()
+    except OSError:
+        bootstrap_sid = None
+
+    current_sid = _get_session_id_fast()
+
+    if bootstrap_sid is None:
+        return {
+            "ok": False,
+            "message": "bootstrap file missing — SessionStart hook may not have fired",
+            "bootstrap_sid": "",
+            "current_sid": current_sid,
+        }
+
+    if bootstrap_sid == current_sid:
+        return {
+            "ok": True,
+            "message": "SessionStart hook fired; bootstrap matches current session",
+            "bootstrap_sid": bootstrap_sid,
+            "current_sid": current_sid,
+        }
+
+    return {
+        "ok": False,
+        "message": (
+            f"bootstrap sid {bootstrap_sid[:8]} does not match current "
+            f"session {current_sid[:8]} — hook may be stale"
+        ),
+        "bootstrap_sid": bootstrap_sid,
+        "current_sid": current_sid,
+    }
+
+
 def get_session_context(vault_path: str | None = None, sessions_folder: str | None = None) -> dict:
     """Get session ID, hash, project, and session note name. Cached.
 
@@ -1046,11 +1097,21 @@ def build_context_brief(
     sessions_folder: str,
     insights_folder: str,
     project: str,
+    hook_status_line: str | None = None,
 ) -> str:
     """Build the /recall context brief entirely in Python.
 
     Reads session and insight files directly (no sub-agent), composes
     a structured markdown brief, and runs open-item detection.
+
+    Args:
+        vault_path: Obsidian vault root.
+        sessions_folder: Folder name (relative to vault) containing sessions.
+        insights_folder: Folder name (relative to vault) containing insights.
+        project: Project slug to filter on.
+        hook_status_line: Optional pre-formatted status line (e.g. "✓ …" or
+            "⚠ …") to prepend to the brief so /recall can surface SessionStart
+            hook health at a glance.
 
     Returns a structured string with labeled sections:
       CONTEXT_BRIEF: <markdown brief>
@@ -1236,7 +1297,11 @@ def build_context_brief(
     insights_section = "\n".join(insight_text_parts) if insight_text_parts else "No curated insights yet for this project."
 
     # --- 4. Compose brief ---
-    brief_parts: list[str] = [f"## Project Context: {project}"]
+    brief_parts: list[str] = []
+    if hook_status_line:
+        brief_parts.append(hook_status_line)
+        brief_parts.append("")
+    brief_parts.append(f"## Project Context: {project}")
 
     if most_recent_summary:
         brief_parts.append(f"\n### Last Session ({most_recent_date})")

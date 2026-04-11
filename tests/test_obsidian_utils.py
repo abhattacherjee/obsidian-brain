@@ -767,3 +767,109 @@ def test_get_session_id_fast_trusts_fresh_bootstrap(tmp_path, monkeypatch):
 
     result = obsidian_utils._get_session_id_fast()
     assert result == "fresh-sid-1234"
+
+
+def test_check_hook_status_matches(tmp_path, monkeypatch):
+    """check_hook_status returns ok=True when bootstrap matches current sid."""
+    import obsidian_utils
+    import os
+
+    project_basename = "stat-proj"
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+    jsonl = cc_projects / "live-sid-1111.jsonl"
+    jsonl.write_text("{}", encoding="utf-8")
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text("live-sid-1111", encoding="utf-8")
+    # Make bootstrap newer than the JSONL so the fast path trusts it
+    import time
+    os.utime(jsonl, (time.time() - 3600, time.time() - 3600))
+    os.utime(bootstrap, (time.time() - 60, time.time() - 60))
+
+    status = obsidian_utils.check_hook_status()
+    assert status["ok"] is True
+    assert status["bootstrap_sid"] == "live-sid-1111"
+    assert status["current_sid"] == "live-sid-1111"
+
+
+def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
+    """check_hook_status returns ok=False when bootstrap file is absent."""
+    import obsidian_utils
+
+    project_basename = "missing-proj"
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+    (cc_projects / "sid-xxxx.jsonl").write_text("{}", encoding="utf-8")
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    monkeypatch.setattr(
+        obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
+    )
+
+    status = obsidian_utils.check_hook_status()
+    assert status["ok"] is False
+    assert "missing" in status["message"]
+
+
+def test_build_context_brief_prepends_hook_status(tmp_path):
+    """build_context_brief prepends the hook_status_line when provided."""
+    import obsidian_utils
+
+    vault = tmp_path / "vault"
+    (vault / "sessions").mkdir(parents=True)
+    (vault / "insights").mkdir(parents=True)
+
+    status_line = "✓ SessionStart hook fired; bootstrap matches current session"
+    output = obsidian_utils.build_context_brief(
+        str(vault),
+        "sessions",
+        "insights",
+        "nonexistent-project",
+        hook_status_line=status_line,
+    )
+
+    # Extract the CONTEXT_BRIEF section and verify the first content line
+    # is the status line, appearing before the "## Project Context" header.
+    assert "<<<OB_CONTEXT_BRIEF>>>" in output
+    brief_section = output.split("<<<OB_CONTEXT_BRIEF>>>", 1)[1].split("<<<OB_LOAD_MANIFEST>>>", 1)[0]
+    brief_lines = [ln for ln in brief_section.split("\n") if ln.strip()]
+    assert brief_lines[0] == status_line
+    # Header should still exist after the status line
+    assert any(ln.startswith("## Project Context") for ln in brief_lines)
+    # Ensure the status line appears BEFORE the header
+    status_idx = brief_lines.index(status_line)
+    header_idx = next(i for i, ln in enumerate(brief_lines) if ln.startswith("## Project Context"))
+    assert status_idx < header_idx
+
+
+def test_build_context_brief_without_hook_status(tmp_path):
+    """build_context_brief omits the status line when not provided (default)."""
+    import obsidian_utils
+
+    vault = tmp_path / "vault"
+    (vault / "sessions").mkdir(parents=True)
+    (vault / "insights").mkdir(parents=True)
+
+    output = obsidian_utils.build_context_brief(
+        str(vault),
+        "sessions",
+        "insights",
+        "nonexistent-project",
+    )
+
+    brief_section = output.split("<<<OB_CONTEXT_BRIEF>>>", 1)[1].split("<<<OB_LOAD_MANIFEST>>>", 1)[0]
+    brief_lines = [ln for ln in brief_section.split("\n") if ln.strip()]
+    # First non-empty line should be the Project Context header, not a status line
+    assert brief_lines[0].startswith("## Project Context")
