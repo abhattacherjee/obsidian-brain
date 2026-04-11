@@ -132,8 +132,12 @@ def _jsonl_dir_for_project(project: str) -> Path | None:
     viable = [(m, t) for m, t in scored if t >= 0]
     if not viable:
         return None
-    # Pick the most recently modified directory if multiple match (path encoding variants)
-    return Path(max(viable, key=lambda pair: pair[1])[0])
+    # Pick the most recently modified directory if multiple match (path
+    # encoding variants). Deterministic tiebreak: sort by (mtime, path) so
+    # same-mtime dirs pick the same winner across runs instead of depending
+    # on glob order. Matches the (mtime, path) pattern used for JSONL
+    # selection elsewhere in the fast path.
+    return Path(max(viable, key=lambda pair: (pair[1], pair[0]))[0])
 
 
 def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:

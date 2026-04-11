@@ -122,14 +122,23 @@ def _get_session_id_fast() -> str:
                         newest_sid = os.path.splitext(os.path.basename(newest_path))[0]
                         if newest_sid == cached_sid:
                             return cached_sid
-                        # Tie-breaker: if the cached JSONL's mtime equals the
-                        # newest mtime, trust the cached sid. This handles the
-                        # same-second race where the previous session's JSONL and
-                        # the current session's JSONL report identical mtimes on
-                        # coarse-resolution filesystems, and the SessionStart hook
-                        # has already authoritatively written the current sid.
-                        cached_mtime = _safe_mtime(cached_matches[0])
-                        if cached_mtime >= 0 and cached_mtime == newest_mtime:
+                        # Tie-breaker: if ANY cached JSONL matches the newest
+                        # mtime (across all worktree/project-dir matches), trust
+                        # the cache. When multiple project-dir variants exist
+                        # (e.g. worktrees), the cached sid's JSONL may appear in
+                        # several of them; comparing only cached_matches[0]
+                        # could miss the tie and cause an unnecessary
+                        # fall-through. This handles the same-second race where
+                        # the previous session's JSONL and the current
+                        # session's JSONL report identical mtimes on
+                        # coarse-resolution filesystems, and the SessionStart
+                        # hook has already authoritatively written the current
+                        # sid.
+                        cached_mtimes = [_safe_mtime(p) for p in cached_matches]
+                        cached_newest = max(
+                            (m for m in cached_mtimes if m >= 0), default=-1.0
+                        )
+                        if cached_newest == newest_mtime:
                             return cached_sid
                         # Otherwise a different session is strictly newer; fall through.
                     else:

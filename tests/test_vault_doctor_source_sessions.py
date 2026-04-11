@@ -502,3 +502,25 @@ def test_apply_preserves_note_mtime(doctor_vault, tmp_path, monkeypatch):
         str(v), "claude-sessions", "claude-insights", days=7, project="proj1"
     )
     assert rescan_issues == [], f"re-scan should be clean, got: {rescan_issues}"
+
+
+def test_jsonl_dir_for_project_deterministic_same_mtime_tiebreak(tmp_path, monkeypatch):
+    """Two dirs with identical mtimes: winner is deterministic across runs."""
+    import vault_doctor_checks.source_sessions as check
+    import os
+
+    dir_a = tmp_path / ".claude" / "projects" / "-aaa-proj1"
+    dir_b = tmp_path / ".claude" / "projects" / "-bbb-proj1"
+    dir_a.mkdir(parents=True)
+    dir_b.mkdir(parents=True)
+    now = 1700000000.0
+    os.utime(dir_a, (now, now))
+    os.utime(dir_b, (now, now))
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # Both runs should return the same winner
+    result1 = check._jsonl_dir_for_project("proj1")
+    result2 = check._jsonl_dir_for_project("proj1")
+    assert result1 is not None
+    assert result1 == result2, f"non-deterministic: {result1} vs {result2}"

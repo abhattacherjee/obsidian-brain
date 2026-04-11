@@ -943,3 +943,49 @@ def test_get_session_id_fast_same_second_tiebreaker(tmp_path, monkeypatch):
     assert result == "aaa-previous", (
         f"expected cached sid to win same-mtime tie, got {result}"
     )
+
+
+def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypatch):
+    """When multiple project dirs contain the cached sid's JSONL, at least one
+    must tie the newest mtime for the cache to be trusted."""
+    import obsidian_utils
+    import os
+    import time
+
+    project_basename = "multi-proj"
+    # Two project-dir variants (like worktrees)
+    dir_a = tmp_path / ".claude" / "projects" / f"-alpha-{project_basename}"
+    dir_b = tmp_path / ".claude" / "projects" / f"-beta-{project_basename}"
+    dir_a.mkdir(parents=True)
+    dir_b.mkdir(parents=True)
+
+    cached_sid = "shared-sid-1234"
+    # Put the cached sid's jsonl in BOTH project dirs
+    a_jsonl = dir_a / f"{cached_sid}.jsonl"
+    b_jsonl = dir_b / f"{cached_sid}.jsonl"
+    other_jsonl = dir_b / "other-sid-5678.jsonl"
+    a_jsonl.write_text("{}", encoding="utf-8")
+    b_jsonl.write_text("{}", encoding="utf-8")
+    other_jsonl.write_text("{}", encoding="utf-8")
+
+    # Scenario: a_jsonl is OLDER, b_jsonl matches newest mtime, other_jsonl
+    # is also at newest mtime. Tiebreaker MUST trust the cache because
+    # at least one cached match (b_jsonl) ties newest mtime.
+    now = time.time()
+    os.utime(a_jsonl, (now - 3600, now - 3600))  # old
+    os.utime(b_jsonl, (now, now))  # tied with other
+    os.utime(other_jsonl, (now, now))  # tied with b
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text(cached_sid, encoding="utf-8")
+
+    result = obsidian_utils._get_session_id_fast()
+    assert result == cached_sid, (
+        f"expected cached sid to win via multi-match tiebreaker, got {result}"
+    )
