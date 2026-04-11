@@ -371,28 +371,25 @@ class TestUpgradeNoteWithSummary:
         )
         assert result.startswith("Failed:")
 
-    def test_upgrade_note_with_summary_post_write_verification_detects_loss(
+    def test_upgrade_note_with_summary_post_write_detects_status_not_flipped(
         self, sample_unsummarized_note, tmp_vault, monkeypatch
     ):
-        """If a concurrent writer clobbers the file between write and verify,
-        the function must return Failed instead of phantom Upgraded."""
+        """Clobber with original (auto-logged) content — status-flip branch fires."""
         monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
         summary = (
             "## Summary\n"
-            "SIGNATURE_MARKER_FOR_VERIFICATION_TEST line one.\n\n"
+            "SIGNATURE_MARKER_FOR_STATUS_BRANCH landed successfully.\n\n"
             "## Key Decisions\nNone noted.\n\n"
             "## Changes Made\nNone noted.\n\n"
             "## Errors Encountered\nNone.\n\n"
             "## Open Questions / Next Steps\nNone.\n"
         )
 
-        # Simulate clobber: monkeypatch os.replace so that AFTER the real
-        # replace completes, a second writer immediately overwrites the
-        # target file with stale "auto-logged" content.
         real_replace = os.replace
         note_path_str = str(sample_unsummarized_note)
         stale_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "status: auto-logged" in stale_content  # sanity check fixture
 
         def clobbering_replace(src, dst, *args, **kwargs):
             real_replace(src, dst, *args, **kwargs)
@@ -403,16 +400,133 @@ class TestUpgradeNoteWithSummary:
         monkeypatch.setattr(os, "replace", clobbering_replace)
 
         result = obsidian_utils.upgrade_note_with_summary(
-            note_path_str,
-            summary,
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "status not flipped" in result, (
+            f"expected status-branch message, got {result!r}"
+        )
+
+    def test_upgrade_note_with_summary_post_write_detects_body_missing(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Clobber preserves status: summarized but strips the body signature —
+        signature branch MUST fire (regression guard for deleted body check)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "BODY_BRANCH_SIGNATURE_LINE that must appear on disk.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+
+        # Craft stale content that passes status check but lacks the signature.
+        fake_summarized = (
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-10\n"
+            "project: test-project\n"
+            "session_id: stale-session\n"
+            "status: summarized\n"
+            "---\n"
+            "\n# Stale content\n\n## Summary\nDifferent prior summary body.\n"
+        )
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(fake_summarized)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "summary body missing" in result, (
+            f"expected body-branch message, got {result!r}"
+        )
+
+    def test_upgrade_note_with_summary_rejects_empty_body(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Summary with header but no body content fails loudly (not phantom OK)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        empty_body_summary = (
+            "## Summary\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            empty_body_summary,
             str(tmp_vault),
             "claude-sessions",
             "test-project",
         )
 
-        # Must fail loudly, not report phantom success.
         assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
-        assert "verification" in result.lower()
+        assert "malformed summary" in result.lower()
+        assert "empty or heading-only" in result.lower()
+
+    def test_upgrade_note_with_summary_post_write_read_failure(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Post-write re-read raising OSError → Failed (not phantom success)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "POST_READ_FAILURE_SIGNATURE content line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        import builtins
+        real_open = builtins.open
+        note_path_str = str(sample_unsummarized_note)
+        replace_done = {"flag": False}
+        real_replace = os.replace
+
+        def flagging_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                replace_done["flag"] = True
+
+        def failing_open(path, mode="r", *args, **kwargs):
+            if (
+                replace_done["flag"]
+                and str(path) == note_path_str
+                and "r" in mode
+                and "w" not in mode
+            ):
+                raise OSError("simulated post-write read failure")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", flagging_replace)
+        monkeypatch.setattr(builtins, "open", failing_open)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "post-write read verification failed" in result
 
     def test_upgrade_note_with_summary_persists_to_disk(
         self, sample_unsummarized_note, tmp_vault, monkeypatch

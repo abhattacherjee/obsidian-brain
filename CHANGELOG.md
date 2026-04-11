@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- `upgrade_note_with_summary()` now fsyncs the rewritten note and re-reads it from disk after `os.replace()` to confirm `status: summarized` and the summary body signature are actually present before returning `Upgraded`. If post-write verification fails, the function returns `Failed: post-write verification ...` so callers (and `/recall`) can no longer be told "Upgraded" about a note that did not actually receive its summary.
+- `upgrade_note_with_summary()` now guarantees that a returned `Upgraded` status means the summary actually landed on disk. The rewritten tempfile is `fsync`'d before `os.replace()`, the parent directory is `fsync`'d after the rename (crash-durable rename), and the target file is re-read and verified before the function returns. Verification checks that `status: summarized` appears in the **frontmatter block** (scoped, not a whole-file substring match — so a body that happens to mention the literal string cannot false-positive) AND that the first real content line of the supplied summary is present verbatim. Empty-body summaries are rejected upfront with `Failed: malformed summary`. All failure modes return `Failed: post-write verification — …` instead of phantom `Upgraded`, so callers (and `/recall`) can no longer be told "Upgraded" about a note that did not actually receive its summary.
 
 ## [1.9.0] - 2026-04-11
 
