@@ -31,33 +31,54 @@ _BOOTSTRAP_PREFIX = '/tmp/.obsidian-brain-sid-'
 
 
 def _get_session_id_fast() -> str:
-    """Derive session ID, using bootstrap file for speed on repeat calls."""
+    """Derive session ID, using bootstrap file for speed on repeat calls.
+
+    Validation strategy:
+      1. Read bootstrap file (~0.1 ms)
+      2. Verify cached JSONL still exists
+      3. Verify bootstrap mtime >= newest JSONL mtime (~5 ms glob)
+      If all checks pass, return cached sid; otherwise fall through to the
+      full glob + mtime sort (authoritative slow path).
+
+    The mtime check ensures the bootstrap is invalidated when a new session
+    starts (which creates a newer JSONL) even if the SessionStart hook did
+    not get to refresh the bootstrap file.
+    """
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_BOOTSTRAP_PREFIX}{project}"
 
-    # Try bootstrap file first (~0.1ms)
+    import glob as _glob
+    pattern = os.path.expanduser(f"~/.claude/projects/*{project}/*.jsonl")
+
+    # Fast path: bootstrap file
     try:
         with open(bootstrap, 'r') as f:
             cached_sid = f.read().strip()
         if cached_sid:
-            # Cheap validation: check the JSONL file still exists (~0.1ms stat)
-            import glob as _glob
-            pattern = os.path.expanduser(f"~/.claude/projects/*{project}/{cached_sid}.jsonl")
-            if _glob.glob(pattern):
-                return cached_sid
+            bootstrap_mtime = os.path.getmtime(bootstrap)
+            cached_pattern = os.path.expanduser(
+                f"~/.claude/projects/*{project}/{cached_sid}.jsonl"
+            )
+            if _glob.glob(cached_pattern):
+                all_matches = _glob.glob(pattern)
+                if all_matches:
+                    newest_mtime = max(os.path.getmtime(p) for p in all_matches)
+                    if bootstrap_mtime >= newest_mtime:
+                        return cached_sid
+                    # else: a newer JSONL exists; bootstrap is stale, fall through
+                else:
+                    return cached_sid  # no other JSONLs; trust cache
     except OSError:
         pass
 
-    # Fall back to full glob + mtime sort (~5ms)
-    import glob as _glob
-    pattern = os.path.expanduser(f"~/.claude/projects/*{project}/*.jsonl")
+    # Slow path: full glob + mtime sort
     matches = _glob.glob(pattern)
     if not matches:
         return "unknown"
     newest = max(matches, key=os.path.getmtime)
     sid = os.path.splitext(os.path.basename(newest))[0]
 
-    # Write bootstrap for next call
+    # Refresh bootstrap for next call
     try:
         with open(bootstrap, 'w') as f:
             f.write(sid)

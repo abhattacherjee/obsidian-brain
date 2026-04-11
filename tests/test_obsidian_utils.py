@@ -705,3 +705,65 @@ class TestBuildContextBriefSort:
         )
 
         assert "| 1h 0m |" in output
+
+
+def test_get_session_id_fast_rejects_stale_bootstrap(tmp_path, monkeypatch):
+    """Fast path must fall through to slow path when a newer JSONL exists."""
+    import obsidian_utils
+    import os
+    import time
+
+    # Fake ~/.claude/projects/<project>/ with two JSONL files
+    project_basename = "fake-proj-abc"
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+
+    old_jsonl = cc_projects / "old-sid-0000.jsonl"
+    new_jsonl = cc_projects / "new-sid-9999.jsonl"
+    old_jsonl.write_text("{}", encoding="utf-8")
+    new_jsonl.write_text("{}", encoding="utf-8")
+    os.utime(old_jsonl, (time.time() - 7200, time.time() - 7200))
+    os.utime(new_jsonl, (time.time() - 60, time.time() - 60))
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir(exist_ok=True)
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text("old-sid-0000", encoding="utf-8")
+    os.utime(bootstrap, (time.time() - 3600, time.time() - 3600))
+
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+
+    result = obsidian_utils._get_session_id_fast()
+    assert result == "new-sid-9999", f"expected newest sid, got {result}"
+
+
+def test_get_session_id_fast_trusts_fresh_bootstrap(tmp_path, monkeypatch):
+    """Fast path must return bootstrap sid when bootstrap is newer than all JSONLs."""
+    import obsidian_utils
+    import os
+    import time
+
+    project_basename = "fresh-proj-xyz"
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+
+    jsonl = cc_projects / "fresh-sid-1234.jsonl"
+    jsonl.write_text("{}", encoding="utf-8")
+    os.utime(jsonl, (time.time() - 3600, time.time() - 3600))
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir(exist_ok=True)
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text("fresh-sid-1234", encoding="utf-8")
+    os.utime(bootstrap, (time.time() - 60, time.time() - 60))
+
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+
+    result = obsidian_utils._get_session_id_fast()
+    assert result == "fresh-sid-1234"
