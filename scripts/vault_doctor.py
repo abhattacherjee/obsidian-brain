@@ -7,7 +7,10 @@ Dry-run by default — requires --apply to write anything.
 Config priority:
   1. CLI args (--vault, --sessions-folder, --insights-folder)
   2. Env vars (OBSIDIAN_BRAIN_VAULT, *_SESSIONS_FOLDER, *_INSIGHTS_FOLDER)
-  3. ~/.claude/obsidian-brain-config.json via hooks/obsidian_utils.load_config()
+  3. ~/.claude/obsidian-brain-config.json (read directly via json.load
+     to avoid hooks/obsidian_utils.load_config()'s session-scoped cache,
+     which can be stale when the CLI runs outside a live Claude Code
+     session)
 
 Exit codes:
   0 — clean, no issues

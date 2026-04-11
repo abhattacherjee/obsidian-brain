@@ -24,7 +24,12 @@ HOOK="$REPO_ROOT/hooks/obsidian_session_hint.py"
 HOOKS_DIR="$REPO_ROOT/hooks"
 # Derive PROJECT via the same helper the hook uses, so the bootstrap path
 # agrees with the hook regardless of how get_project_name() evolves.
-PROJECT="$(python3 -c "import sys; sys.path.insert(0, '$HOOKS_DIR'); from obsidian_utils import get_project_name; print(get_project_name('$(pwd)'))")"
+PROJECT="$(python3 -c "
+import sys
+sys.path.insert(0, sys.argv[1])
+from obsidian_utils import get_project_name
+print(get_project_name(sys.argv[2]))
+" "$HOOKS_DIR" "$(pwd)")"
 DUMMY_SID="verify-hooks-$(date +%s)"
 BOOTSTRAP="/tmp/.obsidian-brain-sid-$PROJECT"
 LOG="$HOME/.claude/obsidian-brain-hook.log"

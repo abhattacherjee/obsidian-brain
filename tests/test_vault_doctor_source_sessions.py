@@ -443,3 +443,62 @@ def test_jsonl_dir_for_project_picks_newest_worktree(tmp_path, monkeypatch):
     assert str(result).endswith("-Users-bar-worktrees-proj1"), (
         f"expected newer dir, got {result}"
     )
+
+
+def test_apply_preserves_note_mtime(doctor_vault, tmp_path, monkeypatch):
+    """After apply, the patched note's mtime equals its pre-apply mtime.
+
+    This is load-bearing: scan() uses note mtime as capture_time. If apply
+    updated mtime to 'now', a subsequent scan would match the note's new
+    mtime against the current session's window, not the original capture
+    session — re-flagging every fixed note on every run.
+    """
+    import vault_doctor_checks.source_sessions as check
+    import os
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    monkeypatch.setenv("HOME", str(home))
+
+    import calendar, time
+    a_start = calendar.timegm(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
+    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-09T10:00:00Z", a_start + 3600)
+    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_start + 3600)
+    _write_session_note(v / "claude-sessions", "2026-04-09", "proj1", "sid-a", "aaaa")
+    _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
+
+    original_mtime = b_start + 1800  # 2026-04-10 14:30
+    _write_insight(
+        v / "claude-insights",
+        "2026-04-10",
+        "mtime-preserve",
+        "proj1",
+        "sid-a",
+        "2026-04-09-proj1-aaaa",
+        original_mtime,
+    )
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=7, project="proj1"
+    )
+    assert len(issues) == 1
+
+    backup_root = tmp_path / "backups"
+    results = check.apply(issues, str(backup_root))
+    assert results[0].status == "applied"
+
+    # Critical: mtime must be preserved
+    note_path = issues[0].note_path
+    new_mtime = os.path.getmtime(note_path)
+    assert abs(new_mtime - original_mtime) < 1.0, (
+        f"mtime not preserved: original={original_mtime}, new={new_mtime}"
+    )
+
+    # And a re-scan with the patched note should find nothing (proves the
+    # self-reinforcing bug is not reintroduced)
+    rescan_issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=7, project="proj1"
+    )
+    assert rescan_issues == [], f"re-scan should be clean, got: {rescan_issues}"

@@ -403,8 +403,26 @@ def apply(issues, backup_root) -> list[Result]:
             )
             continue
 
+        # Capture original stat so we can preserve mtime across the rewrite.
+        # scan() uses note mtime as capture_time for JSONL window matching —
+        # updating mtime on apply would cause re-runs to re-flag fixed notes.
+        try:
+            original_stat = os.stat(issue.note_path)
+        except OSError as exc:
+            results.append(
+                Result(
+                    check=NAME,
+                    note_path=issue.note_path,
+                    status="error",
+                    backup_path=str(backup_path),
+                    error=f"stat failed: {exc}",
+                )
+            )
+            continue
+
         # Stage 2: read/patch/atomic-write (failure → note may or may not be
         # patched; backup exists so the user can recover)
+        tmp = None
         try:
             with open(issue.note_path, "r", encoding="utf-8") as f:
                 text = f.read()
@@ -416,6 +434,23 @@ def apply(issues, backup_root) -> list[Result]:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(new_text)
             os.replace(tmp, issue.note_path)
+            tmp = None  # replaced successfully; nothing to clean up
+
+            # Restore original atime/mtime so future scans see the same
+            # capture_time the scan that flagged this note saw.
+            try:
+                os.utime(
+                    issue.note_path,
+                    (original_stat.st_atime, original_stat.st_mtime),
+                )
+            except OSError as exc:
+                # Non-fatal: the rewrite succeeded, but mtime preservation failed.
+                # Log to stderr but still mark as applied (backup exists for recovery).
+                print(
+                    f"[vault_doctor] warning: failed to restore mtime on "
+                    f"{issue.note_path}: {exc}",
+                    file=sys.stderr,
+                )
 
             results.append(
                 Result(
@@ -435,5 +470,13 @@ def apply(issues, backup_root) -> list[Result]:
                     error=f"rewrite failed (backup preserved): {type(exc).__name__}: {exc}",
                 )
             )
+        finally:
+            # Best-effort cleanup of any orphaned temp file left behind when
+            # os.replace didn't consume it (e.g., exception before/during replace).
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     return results
