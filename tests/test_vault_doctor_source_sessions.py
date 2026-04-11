@@ -347,3 +347,98 @@ def test_apply_errors_on_missing_proposed_sid(doctor_vault, tmp_path):
     assert results[0].status == "error"
     assert "proposed_sid" in (results[0].error or "")
     assert note.read_text(encoding="utf-8") == original
+
+
+def test_scan_latest_start_wins_on_boundary_tie(doctor_vault, monkeypatch):
+    """When two session windows both contain capture_time, latest first_ts wins."""
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # Session A: 10:00 - 14:05 (mtime)
+    a_start = time.mktime(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
+    a_mtime = time.mktime(time.strptime("2026-04-10 14:05", "%Y-%m-%d %H:%M"))
+    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-10T10:00:00Z", a_mtime)
+    _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-a", "aaaa")
+
+    # Session B: 14:00 - 15:00 (mtime) — overlaps session A from 14:00-14:05
+    b_start = time.mktime(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    b_mtime = b_start + 3600
+    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_mtime)
+    _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
+
+    # Insight captured at 14:02 — inside BOTH windows
+    insight_mtime = time.mktime(time.strptime("2026-04-10 14:02", "%Y-%m-%d %H:%M"))
+    _write_insight(
+        v / "claude-insights",
+        "2026-04-10",
+        "boundary-tie-insight",
+        "proj1",
+        "sid-a",  # currently (wrongly) stamped with the older session
+        "2026-04-10-proj1-aaaa",
+        insight_mtime,
+    )
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=7, project="proj1"
+    )
+    assert len(issues) == 1
+    # Latest first_ts wins: sid-b (started at 14:00) beats sid-a (started at 10:00)
+    assert issues[0].extra.get("proposed_sid") == "sid-b"
+    assert issues[0].proposed_source == "[[2026-04-10-proj1-bbbb]]"
+
+
+def test_jsonl_window_returns_none_when_all_lines_unparseable(tmp_path):
+    """Fully corrupt JSONL returns None, not a fabricated window."""
+    import vault_doctor_checks.source_sessions as check
+
+    bad = tmp_path / "corrupt.jsonl"
+    bad.write_text("this is not json\nthis either\n", encoding="utf-8")
+    assert check._jsonl_window(str(bad)) is None
+
+
+def test_jsonl_window_falls_back_when_parsed_but_no_timestamps(tmp_path):
+    """JSONL with valid JSON but no timestamp field → mtime-3600 fallback."""
+    import vault_doctor_checks.source_sessions as check
+    import json
+    import os
+
+    jsonl = tmp_path / "no-ts.jsonl"
+    jsonl.write_text(
+        json.dumps({"type": "user"}) + "\n" + json.dumps({"type": "assistant"}) + "\n",
+        encoding="utf-8",
+    )
+    mtime = 1700000000.0
+    os.utime(jsonl, (mtime, mtime))
+    window = check._jsonl_window(str(jsonl))
+    assert window is not None
+    first_ts, last_ts = window
+    assert last_ts == mtime
+    assert first_ts == mtime - 3600
+
+
+def test_jsonl_dir_for_project_picks_newest_worktree(tmp_path, monkeypatch):
+    """Two .claude/projects/*proj1 dirs exist (path encoding variants) → newest-mtime wins."""
+    import vault_doctor_checks.source_sessions as check
+    import os
+    import time as _time
+
+    # Both dirs end with "proj1" so the `*proj1` glob matches both. Simulates
+    # two encoded path variants for the same project name (e.g. after a user
+    # moved the checkout between machines or worktrees).
+    older = tmp_path / ".claude" / "projects" / "-Users-foo-proj1"
+    newer = tmp_path / ".claude" / "projects" / "-Users-bar-worktrees-proj1"
+    older.mkdir(parents=True)
+    newer.mkdir(parents=True)
+    os.utime(older, (_time.time() - 3600, _time.time() - 3600))
+    os.utime(newer, (_time.time() - 60, _time.time() - 60))
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    result = check._jsonl_dir_for_project("proj1")
+    assert result is not None
+    assert str(result).endswith("-Users-bar-worktrees-proj1"), (
+        f"expected newer dir, got {result}"
+    )

@@ -769,6 +769,39 @@ def test_get_session_id_fast_trusts_fresh_bootstrap(tmp_path, monkeypatch):
     assert result == "fresh-sid-1234"
 
 
+def test_get_session_id_fast_invalidates_when_cached_jsonl_deleted(tmp_path, monkeypatch):
+    """Bootstrap points at a sid whose JSONL has been removed — slow path picks newest survivor."""
+    import obsidian_utils
+    import os
+    import time
+
+    project_basename = "deleted-proj"
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+
+    # Create only the "surviving" JSONL; the cached one in the bootstrap doesn't exist on disk
+    survivor = cc_projects / "survivor-sid-ffff.jsonl"
+    survivor.write_text("{}", encoding="utf-8")
+    os.utime(survivor, (time.time() - 60, time.time() - 60))
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text("deleted-sid-0000", encoding="utf-8")
+
+    monkeypatch.setattr(
+        obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
+    )
+
+    result = obsidian_utils._get_session_id_fast()
+    assert result == "survivor-sid-ffff", (
+        f"expected fast path to fall through and return newest survivor, got {result}"
+    )
+
+
 def test_check_hook_status_matches(tmp_path, monkeypatch):
     """check_hook_status returns ok=True when bootstrap matches current sid."""
     import obsidian_utils

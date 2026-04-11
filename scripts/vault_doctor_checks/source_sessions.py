@@ -15,6 +15,7 @@ import glob
 import json
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,12 +68,21 @@ def _parse_iso_ts(ts: str) -> float | None:
 
 
 def _jsonl_window(jsonl_path: str) -> tuple[float, float] | None:
-    """Return (first_entry_ts, mtime) for a JSONL session file, or None."""
+    """Return (first_entry_ts, mtime) for a JSONL session file, or None.
+
+    Returns None when the file is unreadable or every line fails to parse.
+    Falls back to `mtime - 3600` ONLY when lines parsed successfully but no
+    entry had a 'timestamp' field — this is a known JSONL schema variant.
+    A fully corrupt file returns None so `_find_matching_session` skips it
+    rather than fabricating a window that could produce false-positive
+    stale flags.
+    """
     try:
         mtime = os.path.getmtime(jsonl_path)
     except OSError:
         return None
     first_ts: float | None = None
+    parsed_any = False
     try:
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -80,6 +90,7 @@ def _jsonl_window(jsonl_path: str) -> tuple[float, float] | None:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                parsed_any = True
                 ts = _parse_iso_ts(entry.get("timestamp", ""))
                 if ts is not None:
                     first_ts = ts
@@ -87,7 +98,12 @@ def _jsonl_window(jsonl_path: str) -> tuple[float, float] | None:
     except OSError:
         return None
     if first_ts is None:
-        # Fallback: loose 1-hour lower bound before mtime
+        if not parsed_any:
+            print(
+                f"[vault_doctor] JSONL has no parseable lines: {jsonl_path}",
+                file=sys.stderr,
+            )
+            return None
         first_ts = mtime - 3600
     return (first_ts, mtime)
 
@@ -116,6 +132,12 @@ def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:
         except OSError:
             continue
         fm = _parse_frontmatter(text)
+        if not fm and text.startswith("---"):
+            print(
+                f"[vault_doctor] malformed frontmatter, skipped: {entry}",
+                file=sys.stderr,
+            )
+            continue
         if fm.get("project") != project:
             continue
         sid = fm.get("session_id", "")
@@ -329,14 +351,26 @@ def apply(issues, backup_root) -> list[Result]:
             )
             continue
 
+        # Stage 1: backup (failure → note unchanged, no backup)
         try:
-            # Backup before modifying
             project_backup_dir = Path(backup_root) / issue.project
             project_backup_dir.mkdir(parents=True, exist_ok=True)
             backup_path = project_backup_dir / Path(issue.note_path).name
             shutil.copy2(issue.note_path, backup_path)
+        except OSError as exc:
+            results.append(
+                Result(
+                    check=NAME,
+                    note_path=issue.note_path,
+                    status="error",
+                    error=f"backup failed (note unchanged): {exc}",
+                )
+            )
+            continue
 
-            # Read, patch, atomic write
+        # Stage 2: read/patch/atomic-write (failure → note may or may not be
+        # patched; backup exists so the user can recover)
+        try:
             with open(issue.note_path, "r", encoding="utf-8") as f:
                 text = f.read()
             new_text = _rewrite_frontmatter(text, proposed_sid, proposed_basename)
@@ -356,13 +390,14 @@ def apply(issues, backup_root) -> list[Result]:
                     backup_path=str(backup_path),
                 )
             )
-        except (OSError, ValueError) as exc:
+        except Exception as exc:  # per-issue isolation; don't abort the loop
             results.append(
                 Result(
                     check=NAME,
                     note_path=issue.note_path,
                     status="error",
-                    error=str(exc),
+                    backup_path=str(backup_path),  # user can recover from this
+                    error=f"rewrite failed (backup preserved): {type(exc).__name__}: {exc}",
                 )
             )
 
