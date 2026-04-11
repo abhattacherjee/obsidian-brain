@@ -60,11 +60,12 @@ Stop here if the dispatcher is missing.
 Always run with `--json` first so you can parse the output deterministically. Pass through only the flags the user provided:
 
 ```bash
-python3 "$DISPATCHER" \
-    ${CHECK:+--check "$CHECK"} \
-    ${DAYS:+--days "$DAYS"} \
-    ${PROJECT:+--project "$PROJECT"} \
-    --json
+ARGS=()
+[[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
+[[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
+[[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
+ARGS+=(--json)
+python3 "$DISPATCHER" "${ARGS[@]}"
 ```
 
 Capture stdout as the JSON report. Exit codes:
@@ -122,11 +123,12 @@ If the user DID pass `fix`:
 Re-run the dispatcher with `--apply` (do NOT pass `--yes` — let the dispatcher prompt per project interactively):
 
 ```bash
-python3 "$DISPATCHER" \
-    ${CHECK:+--check "$CHECK"} \
-    ${DAYS:+--days "$DAYS"} \
-    ${PROJECT:+--project "$PROJECT"} \
-    --apply
+ARGS=()
+[[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
+[[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
+[[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
+ARGS+=(--apply)
+python3 "$DISPATCHER" "${ARGS[@]}"
 ```
 
 The dispatcher will prompt `Apply N fix(es) for project 'X' in check 'Y'? [y/N]` on stderr for each project. Relay each prompt to the user and pipe their response to the dispatcher's stdin.

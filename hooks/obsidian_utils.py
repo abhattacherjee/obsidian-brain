@@ -57,7 +57,8 @@ def _slow_path_newest_sid() -> str:
     """
     project = os.path.basename(os.getcwd())
     import glob as _glob
-    pattern = os.path.expanduser(f"~/.claude/projects/*{project}/*.jsonl")
+    safe_project = _glob.escape(project)
+    pattern = os.path.expanduser(f"~/.claude/projects/*{safe_project}/*.jsonl")
     matches = _glob.glob(pattern)
     entries = [(_safe_mtime(p), p) for p in matches]
     viable = [(m, p) for m, p in entries if m >= 0]
@@ -94,15 +95,17 @@ def _get_session_id_fast() -> str:
     bootstrap = f"{_bootstrap_prefix()}{project}"
 
     import glob as _glob
-    pattern = os.path.expanduser(f"~/.claude/projects/*{project}/*.jsonl")
+    safe_project = _glob.escape(project)
+    pattern = os.path.expanduser(f"~/.claude/projects/*{safe_project}/*.jsonl")
 
     # Fast path: bootstrap file
     try:
         with open(bootstrap, 'r') as f:
             cached_sid = f.read().strip()
         if cached_sid:
+            safe_cached = _glob.escape(cached_sid)
             cached_pattern = os.path.expanduser(
-                f"~/.claude/projects/*{project}/{cached_sid}.jsonl"
+                f"~/.claude/projects/*{safe_project}/{safe_cached}.jsonl"
             )
             cached_matches = _glob.glob(cached_pattern)
             if cached_matches:
