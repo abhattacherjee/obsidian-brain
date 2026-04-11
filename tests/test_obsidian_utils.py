@@ -513,6 +513,61 @@ class TestUpgradeNoteWithSummary:
             f"expected body-branch message, got {result!r}"
         )
 
+    def test_upgrade_note_with_summary_frontmatter_anchored_to_file_start(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Clobber writes content with no YAML frontmatter but with a Markdown
+        horizontal rule `---` and `status: summarized` in the body. The
+        frontmatter scope check must fail because the opening `---` is not
+        anchored to the start of the file. Regression guard for Copilot #3."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "FRONTMATTER_ANCHOR_SIGNATURE content line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+
+        # No YAML frontmatter at start — just a title, a Markdown HR, and
+        # a line that SAYS status: summarized in the body text. If the
+        # frontmatter detector was not start-anchored, it would scoop the
+        # HR as "frontmatter" and find the status line within it.
+        fake_content = (
+            "# Stale session with no frontmatter\n"
+            "\n"
+            "Some narrative text here.\n"
+            "\n"
+            "---\n"
+            "status: summarized\n"
+            "(this is a body line that LOOKS like frontmatter)\n"
+            "---\n"
+            "\n"
+            "## Summary\nFRONTMATTER_ANCHOR_SIGNATURE content line.\n"
+        )
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(fake_content)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "YAML frontmatter not found at start" in result, (
+            f"expected anchored-frontmatter message, got {result!r}"
+        )
+
     def test_upgrade_note_with_summary_rejects_empty_body(
         self, sample_unsummarized_note, tmp_vault, monkeypatch
     ):

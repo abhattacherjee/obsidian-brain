@@ -2145,15 +2145,20 @@ def upgrade_note_with_summary(
     except OSError as exc:
         return f"Failed: post-write read verification failed for {os.path.basename(note_path)}: {exc}"
 
-    # Scope the status check to the frontmatter block so a note body
-    # that happens to mention the literal string "status: summarized"
-    # (in a conversation excerpt, a code block, or this very PR's diff)
-    # cannot false-positive the check.
-    fm_start = verify_content.find('---')
-    fm_end = verify_content.find('\n---', fm_start + 3) if fm_start != -1 else -1
-    if fm_start == -1 or fm_end == -1:
-        return f"Failed: post-write verification — frontmatter not found in {os.path.basename(note_path)}"
-    frontmatter_block = verify_content[fm_start:fm_end]
+    # Scope the status check to the YAML frontmatter block so a note body
+    # that happens to mention "status: summarized" (in a conversation
+    # excerpt, a code block, or this very PR's diff) cannot false-positive
+    # the check. Anchor to the start of the file (allowing an optional
+    # UTF-8 BOM) so a Markdown horizontal rule `---` in the body cannot
+    # be mistaken for the opening frontmatter delimiter.
+    fm_match = re.match(
+        r'\ufeff?---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)',
+        verify_content,
+        re.DOTALL,
+    )
+    if fm_match is None:
+        return f"Failed: post-write verification — YAML frontmatter not found at start of {os.path.basename(note_path)}"
+    frontmatter_block = fm_match.group(1)
     if not re.search(r'^\s*status:\s*summarized\s*$', frontmatter_block, re.MULTILINE):
         return f"Failed: post-write verification — status not flipped to summarized in {os.path.basename(note_path)}"
 
