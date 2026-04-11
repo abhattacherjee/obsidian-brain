@@ -37,7 +37,7 @@ Parse the user's invocation into flags:
 Locate the Python dispatcher via the standard plugin cache glob, with a fallback for local dev sessions where the repo is checked out as `$PWD`:
 
 ```bash
-DISPATCHER="$(ls -d ~/.claude/plugins/cache/*/obsidian-brain/*/scripts/vault_doctor.py 2>/dev/null | tail -1)"
+DISPATCHER="$(ls -dt ~/.claude/plugins/cache/*/obsidian-brain/*/scripts/vault_doctor.py 2>/dev/null | head -1)"
 if [[ -z "$DISPATCHER" ]]; then
     if [[ -f "$(pwd)/scripts/vault_doctor.py" ]]; then
         DISPATCHER="$(pwd)/scripts/vault_doctor.py"

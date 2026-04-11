@@ -48,6 +48,25 @@ def _safe_mtime(path: str) -> float:
         return -1.0
 
 
+def _slow_path_newest_sid() -> str:
+    """Determine the current session id by scanning JSONL files directly.
+
+    Bootstrap-independent — does NOT read, write, or trust the bootstrap
+    cache. Used by health checks that must not be fooled by stale cache
+    entries. Returns 'unknown' if no JSONLs are found for the current cwd.
+    """
+    project = os.path.basename(os.getcwd())
+    import glob as _glob
+    pattern = os.path.expanduser(f"~/.claude/projects/*{project}/*.jsonl")
+    matches = _glob.glob(pattern)
+    entries = [(_safe_mtime(p), p) for p in matches]
+    viable = [(m, p) for m, p in entries if m >= 0]
+    if not viable:
+        return "unknown"
+    _, newest = max(viable)
+    return os.path.splitext(os.path.basename(newest))[0]
+
+
 def _get_session_id_fast() -> str:
     """Derive session ID, using bootstrap file for speed on repeat calls.
 
@@ -287,15 +306,18 @@ def check_hook_status() -> dict:
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
 
-    # Read bootstrap BEFORE calling _get_session_id_fast(), which may refresh
-    # the bootstrap file as a side effect on its slow path.
+    # Read bootstrap BEFORE deriving current_sid so we see its real state.
     try:
         with open(bootstrap, "r") as f:
             bootstrap_sid = f.read().strip()
     except OSError:
         bootstrap_sid = None
 
-    current_sid = _get_session_id_fast()
+    # Use the bootstrap-independent slow path so the check isn't circular.
+    # _get_session_id_fast() can return the cached bootstrap value, which
+    # would make this health check report OK even when the bootstrap is
+    # stale.
+    current_sid = _slow_path_newest_sid()
 
     if bootstrap_sid is None:
         return {

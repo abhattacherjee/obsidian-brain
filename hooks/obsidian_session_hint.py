@@ -43,7 +43,7 @@ def _write_bootstrap_atomic(project: str, session_id: str) -> bool:
         dir_name = os.path.dirname(path) or "/tmp"
         os.makedirs(dir_name, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".ob-sid-", suffix=".tmp", dir=dir_name)
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(session_id)
         os.replace(tmp, path)
         tmp = None  # consumed by replace

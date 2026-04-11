@@ -134,6 +134,14 @@ def _print_report_human(issues_by_check: dict) -> None:
 
 def main() -> int:
     args = _build_parser().parse_args()
+
+    if args.days is not None and args.days <= 0:
+        print(
+            f"error: --days must be positive, got {args.days}",
+            file=sys.stderr,
+        )
+        return 3
+
     cfg = _load_config(args)
 
     if args.check:

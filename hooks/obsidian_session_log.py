@@ -49,7 +49,7 @@ def _cleanup_session_cache(session_id: str) -> None:
         cache_path = f"{obsidian_utils._CACHE_PREFIX}{session_id}.json"
         if os.path.exists(cache_path):
             os.unlink(cache_path)
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001 — best-effort cleanup, never fatal
         print(f"[obsidian-brain] session cache cleanup failed: {exc}", file=sys.stderr)
 
 
