@@ -726,7 +726,7 @@ def test_get_session_id_fast_rejects_stale_bootstrap(tmp_path, monkeypatch):
     os.utime(new_jsonl, (time.time() - 60, time.time() - 60))
 
     proj_dir = tmp_path / project_basename
-    proj_dir.mkdir(exist_ok=True)
+    proj_dir.mkdir()
     monkeypatch.chdir(proj_dir)
     monkeypatch.setenv("HOME", str(tmp_path))
 
@@ -755,7 +755,7 @@ def test_get_session_id_fast_trusts_fresh_bootstrap(tmp_path, monkeypatch):
     os.utime(jsonl, (time.time() - 3600, time.time() - 3600))
 
     proj_dir = tmp_path / project_basename
-    proj_dir.mkdir(exist_ok=True)
+    proj_dir.mkdir()
     monkeypatch.chdir(proj_dir)
     monkeypatch.setenv("HOME", str(tmp_path))
 

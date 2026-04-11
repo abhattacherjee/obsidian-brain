@@ -36,7 +36,7 @@ def _get_session_id_fast() -> str:
     Validation strategy:
       1. Read bootstrap file (~0.1 ms)
       2. Verify cached JSONL still exists
-      3. Verify bootstrap mtime >= newest JSONL mtime (~5 ms glob)
+      3. Verify bootstrap mtime > newest JSONL mtime (~5 ms glob)
       If all checks pass, return cached sid; otherwise fall through to the
       full glob + mtime sort (authoritative slow path).
 
@@ -63,7 +63,7 @@ def _get_session_id_fast() -> str:
                 all_matches = _glob.glob(pattern)
                 if all_matches:
                     newest_mtime = max(os.path.getmtime(p) for p in all_matches)
-                    if bootstrap_mtime >= newest_mtime:
+                    if bootstrap_mtime > newest_mtime:
                         return cached_sid
                     # else: a newer JSONL exists; bootstrap is stale, fall through
                 else:
