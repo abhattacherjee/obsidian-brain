@@ -41,15 +41,22 @@ def _get_session_id_fast() -> str:
     Validation strategy:
       1. Read bootstrap file (~0.1 ms)
       2. Verify cached JSONL still exists
-      3. Verify the newest JSONL in the project dir has the SAME sid as the
-         bootstrap cache (compares basename, not mtime).
-      If all checks pass, return cached sid; otherwise fall through to the
-      full glob + mtime sort (authoritative slow path).
+      3. Determine the newest JSONL deterministically via (mtime, path)
+         tuple comparison. Ties broken by path string so the result is
+         reproducible on filesystems with 1-second mtime resolution.
+      4. If the newest JSONL's basename equals the cached sid, trust the
+         cache. If the cached JSONL shares the newest mtime (same-second
+         race), also trust the cache — the SessionStart hook has already
+         authoritatively written the current sid and same-mtime ties
+         effectively mean "these happened simultaneously."
+      5. Otherwise fall through to the slow path (full glob + deterministic
+         max) which is the authoritative answer.
 
-    Comparing basenames (not mtimes) is important because the active
-    session's JSONL file is appended throughout the session, so its mtime
-    increases continuously. A naive mtime comparison would invalidate the
-    bootstrap on every call after a few seconds, defeating the optimization.
+    Comparing basenames rather than mtime values directly is important
+    because the active session's JSONL is appended throughout the session,
+    so its mtime increases continuously. A naive mtime comparison would
+    invalidate the bootstrap on every call after a few seconds, defeating
+    the optimization.
     """
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
@@ -65,27 +72,40 @@ def _get_session_id_fast() -> str:
             cached_pattern = os.path.expanduser(
                 f"~/.claude/projects/*{project}/{cached_sid}.jsonl"
             )
-            if _glob.glob(cached_pattern):
-                # Determine the newest JSONL; if its basename equals cached_sid,
-                # the cache is still authoritative. Otherwise a new session has
-                # started and we must fall through to the slow path.
+            cached_matches = _glob.glob(cached_pattern)
+            if cached_matches:
+                # Determine the newest JSONL deterministically: order by
+                # (mtime, path). Ties broken by path string so results are
+                # reproducible across filesystems that report 1-second mtime
+                # resolution.
                 all_matches = _glob.glob(pattern)
                 if all_matches:
-                    newest = max(all_matches, key=os.path.getmtime)
-                    newest_sid = os.path.splitext(os.path.basename(newest))[0]
+                    newest_mtime, newest_path = max(
+                        ((os.path.getmtime(p), p) for p in all_matches),
+                    )
+                    newest_sid = os.path.splitext(os.path.basename(newest_path))[0]
                     if newest_sid == cached_sid:
                         return cached_sid
-                    # else: different session is newest; bootstrap is stale
+                    # Tie-breaker: if the cached JSONL's mtime equals the
+                    # newest mtime, trust the cached sid. This handles the
+                    # same-second race where the previous session's JSONL and
+                    # the current session's JSONL report identical mtimes on
+                    # coarse-resolution filesystems, and the SessionStart hook
+                    # has already authoritatively written the current sid.
+                    cached_mtime = os.path.getmtime(cached_matches[0])
+                    if cached_mtime == newest_mtime:
+                        return cached_sid
+                    # Otherwise a different session is strictly newer; fall through.
                 else:
                     return cached_sid  # no other JSONLs; trust cache
     except OSError:
         pass
 
-    # Slow path: full glob + mtime sort
+    # Slow path: full glob + mtime sort with deterministic tiebreaker
     matches = _glob.glob(pattern)
     if not matches:
         return "unknown"
-    newest = max(matches, key=os.path.getmtime)
+    _, newest = max(((os.path.getmtime(p), p) for p in matches))
     sid = os.path.splitext(os.path.basename(newest))[0]
 
     # Refresh bootstrap for next call

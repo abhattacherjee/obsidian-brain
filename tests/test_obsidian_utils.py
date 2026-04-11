@@ -906,3 +906,40 @@ def test_build_context_brief_without_hook_status(tmp_path):
     brief_lines = [ln for ln in brief_section.split("\n") if ln.strip()]
     # First non-empty line should be the Project Context header, not a status line
     assert brief_lines[0].startswith("## Project Context")
+
+
+def test_get_session_id_fast_same_second_tiebreaker(tmp_path, monkeypatch):
+    """Same-second mtime ties: cached sid wins when its JSONL is tied for newest."""
+    import obsidian_utils
+    import os
+    import time
+
+    project_basename = "tie-proj"
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+
+    # Two JSONLs with IDENTICAL mtimes
+    now = time.time()
+    old_jsonl = cc_projects / "aaa-previous.jsonl"
+    current_jsonl = cc_projects / "zzz-current.jsonl"
+    old_jsonl.write_text("{}", encoding="utf-8")
+    current_jsonl.write_text("{}", encoding="utf-8")
+    os.utime(old_jsonl, (now, now))
+    os.utime(current_jsonl, (now, now))
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+
+    # Bootstrap claims "aaa-previous" is current. Because path-sort tiebreak
+    # would otherwise pick "zzz-current" (lexicographically larger) as the
+    # newest, the cached sid must win via the same-mtime tie-breaker.
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text("aaa-previous", encoding="utf-8")
+
+    result = obsidian_utils._get_session_id_fast()
+    assert result == "aaa-previous", (
+        f"expected cached sid to win same-mtime tie, got {result}"
+    )
