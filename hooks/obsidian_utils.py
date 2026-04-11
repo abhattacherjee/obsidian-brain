@@ -2083,7 +2083,12 @@ def upgrade_note_with_summary(
     # `#hashtag note` is legitimate content, not a heading, and must not be
     # skipped — otherwise it could produce a false "empty or heading-only
     # Summary body" failure when it is the first real content line.
+    #
+    # The level-2 break uses `##(?:\s|$)` (any whitespace after, or EOL) so
+    # a tab-separated or double-space-separated next section like
+    # `##\tKey Decisions` still terminates the Summary block cleanly.
     _atx_heading_re = re.compile(r'^#{1,6}(?:\s|$)')
+    _h2_re = re.compile(r'^##(?:\s|$)')
     summary_signature = None
     in_summary = False
     for line in summary_text.split('\n'):
@@ -2092,9 +2097,9 @@ def upgrade_note_with_summary(
             continue
         if in_summary:
             stripped = line.strip()
+            if _h2_re.match(stripped):
+                break  # next top-level section — Summary body was empty
             if _atx_heading_re.match(stripped):
-                if stripped.startswith('## '):
-                    break  # next top-level section — Summary body was empty
                 continue  # sub-heading inside Summary — skip but keep looking
             if stripped:
                 summary_signature = stripped
@@ -2178,8 +2183,11 @@ def upgrade_note_with_summary(
     # Checking the whole file would false-positive if the signature text
     # happens to appear in a preserved audit trail (Conversation raw,
     # Tool Usage), even though the actual Summary body was clobbered.
+    # Boundary uses `##(?:\s|$)` to be consistent with ATX-heading rules —
+    # tab-separated or multi-space-separated next sections still terminate
+    # the Summary block extraction cleanly.
     summary_match = re.search(
-        r'^## Summary\s*\n(.*?)(?=^## |\Z)',
+        r'^## Summary\s*\n(.*?)(?=^##(?:\s|$)|\Z)',
         verify_content,
         re.MULTILINE | re.DOTALL,
     )

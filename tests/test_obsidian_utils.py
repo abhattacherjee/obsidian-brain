@@ -513,6 +513,72 @@ class TestUpgradeNoteWithSummary:
             f"expected body-branch message, got {result!r}"
         )
 
+    def test_upgrade_note_with_summary_tab_separated_next_section_breaks_cleanly(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Pre-write: an empty Summary body followed by `##\\tKey Decisions`
+        (tab separator, not space) must still be recognized as the next
+        top-level section so the loop breaks and the malformed-body check
+        fires. Regression guard for Copilot #6 round 7 (level-2 heading
+        must match any whitespace, not just space)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        # Empty Summary body, next section uses a TAB after `##`.
+        tab_summary = (
+            "## Summary\n\n"
+            "##\tKey Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            tab_summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        # Must fail malformed — if the break condition missed the tab,
+        # the loop would pick up "Key Decisions" text as the signature
+        # and proceed to an Upgraded state with an empty real Summary.
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "malformed summary" in result.lower()
+        assert "empty or heading-only" in result.lower()
+
+    def test_upgrade_note_with_summary_post_write_tab_separated_section_boundary(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Post-write: the Summary block extraction regex must terminate
+        at `##\\tKey Decisions` (tab separator), not swallow the next
+        section. Regression guard for Copilot #7 round 7 (lookahead must
+        allow any whitespace after the ## delimiter)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "TAB_BOUNDARY_SIGNATURE content line.\n\n"
+            "##\tKey Decisions\n"
+            "None noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Upgraded"), f"expected Upgraded, got {result!r}"
+        disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "status: summarized" in disk_content
+        assert "TAB_BOUNDARY_SIGNATURE content line." in disk_content
+
     def test_upgrade_note_with_summary_hash_prefixed_content_is_not_a_heading(
         self, sample_unsummarized_note, tmp_vault, monkeypatch
     ):
