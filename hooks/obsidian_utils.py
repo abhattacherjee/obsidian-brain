@@ -90,6 +90,13 @@ def _get_session_id_fast() -> str:
     so its mtime increases continuously. A naive mtime comparison would
     invalidate the bootstrap on every call after a few seconds, defeating
     the optimization.
+
+    The slow path is strictly READ-ONLY — it never writes the bootstrap
+    file. The SessionStart hook is the sole authoritative writer of the
+    bootstrap. Writing from the slow path would clobber the hook's correct
+    write if the slow path ran during the hook's own invocation (which
+    happens whenever downstream hook code calls a function that triggers
+    this, before CC has flushed the new session's JSONL to disk).
     """
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
@@ -152,24 +159,20 @@ def _get_session_id_fast() -> str:
         pass
 
     # Slow path: full glob + mtime sort with deterministic tiebreaker.
-    # Use _safe_mtime so a JSONL deleted or rotated between glob and stat
-    # cannot crash the caller (e.g. load_config).
+    # This path is READ-ONLY — never writes the bootstrap file. The
+    # SessionStart hook is the sole authoritative writer. Writing here
+    # would clobber the hook's correct write if the slow path ran
+    # during the hook's own invocation (which happens whenever the
+    # hook's downstream code calls a function that triggers this).
+    # Use _safe_mtime so a JSONL deleted or rotated between glob and
+    # stat cannot crash the caller (e.g. load_config).
     matches = _glob.glob(pattern)
     entries = [(_safe_mtime(p), p) for p in matches]
     viable = [(m, p) for m, p in entries if m >= 0]
     if not viable:
         return "unknown"
     _, newest = max(viable)
-    sid = os.path.splitext(os.path.basename(newest))[0]
-
-    # Refresh bootstrap for next call
-    try:
-        with open(bootstrap, 'w') as f:
-            f.write(sid)
-    except OSError:
-        pass
-
-    return sid
+    return os.path.splitext(os.path.basename(newest))[0]
 
 
 def cache_get(session_id: str, key: str):
