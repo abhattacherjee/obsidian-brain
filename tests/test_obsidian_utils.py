@@ -513,6 +513,37 @@ class TestUpgradeNoteWithSummary:
             f"expected body-branch message, got {result!r}"
         )
 
+    def test_upgrade_note_with_summary_accepts_bare_filename(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Bare filename (no directory component) must not crash tempfile.mkstemp.
+        Regression guard for Copilot #3 latent bug (low-confidence suppressed)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+        # cd into the note's parent so a bare filename resolves correctly.
+        monkeypatch.chdir(sample_unsummarized_note.parent)
+
+        summary = (
+            "## Summary\n"
+            "BARE_FILENAME_SIGNATURE content line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            sample_unsummarized_note.name,  # bare filename, no directory
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Upgraded"), f"expected Upgraded, got {result!r}"
+        disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "status: summarized" in disk_content
+        assert "BARE_FILENAME_SIGNATURE content line." in disk_content
+
     def test_upgrade_note_with_summary_frontmatter_anchored_to_file_start(
         self, sample_unsummarized_note, tmp_vault, monkeypatch
     ):

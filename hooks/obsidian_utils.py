@@ -2096,7 +2096,10 @@ def upgrade_note_with_summary(
 
     # Atomic write with fsync + post-write verification.
     # Guarantees the summary actually landed on disk before returning success.
-    note_dir = os.path.dirname(note_path)
+    # `or "."` handles the case where note_path is a bare filename (no
+    # directory component), which would otherwise produce `dir=""` and
+    # crash tempfile.mkstemp on every platform.
+    note_dir = os.path.dirname(note_path) or "."
     try:
         fd, tmp_path = tempfile.mkstemp(prefix='.ob-upgrade-', suffix='.md.tmp', dir=note_dir)
     except OSError as exc:
