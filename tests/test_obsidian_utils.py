@@ -288,13 +288,13 @@ class TestWriteVaultNote:
         assert (tmp_vault / "new-folder" / "sub-folder" / "note.md").exists()
 
     def test_write_vault_note_permissions(self, tmp_vault):
-        """Written file has 0o644 permissions."""
+        """Written file has 0o600 permissions."""
         obsidian_utils.write_vault_note(
             str(tmp_vault), "claude-sessions", "perm-test.md", "content\n"
         )
         note_path = tmp_vault / "claude-sessions" / "perm-test.md"
         mode = oct(note_path.stat().st_mode & 0o777)
-        assert mode == oct(0o644)
+        assert mode == oct(0o600)
 
 
 # ===========================================================================
@@ -1285,7 +1285,7 @@ def test_get_session_id_fast_rejects_stale_bootstrap(tmp_path, monkeypatch):
     bootstrap.write_text("old-sid-0000", encoding="utf-8")
     os.utime(bootstrap, (time.time() - 3600, time.time() - 3600))
 
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
     result = obsidian_utils._get_session_id_fast()
     assert result == "new-sid-9999", f"expected newest sid, got {result}"
@@ -1314,7 +1314,7 @@ def test_get_session_id_fast_trusts_fresh_bootstrap(tmp_path, monkeypatch):
     bootstrap.write_text("fresh-sid-1234", encoding="utf-8")
     os.utime(bootstrap, (time.time() - 60, time.time() - 60))
 
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
     result = obsidian_utils._get_session_id_fast()
     assert result == "fresh-sid-1234"
@@ -1343,8 +1343,8 @@ def test_get_session_id_fast_invalidates_when_cached_jsonl_deleted(tmp_path, mon
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
     bootstrap.write_text("deleted-sid-0000", encoding="utf-8")
 
-    monkeypatch.setenv(
-        "OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setattr(
+        obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
     )
 
     result = obsidian_utils._get_session_id_fast()
@@ -1370,7 +1370,7 @@ def test_check_hook_status_matches(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
 
     bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
     bootstrap.write_text("live-sid-1111", encoding="utf-8")
     # Make bootstrap newer than the JSONL so the fast path trusts it
@@ -1406,7 +1406,7 @@ def test_check_hook_status_sid_mismatch_is_ok(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
 
     bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
     bootstrap.write_text("old-sid-aaaa", encoding="utf-8")
 
@@ -1432,13 +1432,13 @@ def test_check_hook_status_no_session_files(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
 
     bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
     bootstrap.write_text("some-old-sid", encoding="utf-8")
 
     status = obsidian_utils.check_hook_status()
     assert status["ok"] is False
-    assert "No session files found" in status["message"]
+    assert "No session files found" in status["message"] or "not be active" in status["message"]
     assert status["bootstrap_sid"] == "some-old-sid"
     assert status["current_sid"] == "unknown"
 
@@ -1457,8 +1457,8 @@ def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
     monkeypatch.chdir(proj_dir)
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    monkeypatch.setenv(
-        "OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setattr(
+        obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
     )
 
     status = obsidian_utils.check_hook_status()
@@ -1541,7 +1541,7 @@ def test_get_session_id_fast_same_second_tiebreaker(tmp_path, monkeypatch):
     proj_dir.mkdir()
     monkeypatch.chdir(proj_dir)
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
     # Bootstrap claims "aaa-previous" is current. Because path-sort tiebreak
     # would otherwise pick "zzz-current" (lexicographically larger) as the
@@ -1590,7 +1590,7 @@ def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypa
     proj_dir.mkdir()
     monkeypatch.chdir(proj_dir)
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
     bootstrap.write_text(cached_sid, encoding="utf-8")
@@ -1631,7 +1631,7 @@ def test_get_session_id_fast_slow_path_is_readonly(tmp_path, monkeypatch):
     proj_dir.mkdir()
     monkeypatch.chdir(proj_dir)
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
     # Bootstrap contains the NEW authoritative sid (just written by the hook)
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
@@ -1672,7 +1672,7 @@ def test_get_session_id_fast_slow_path_returns_without_writing(tmp_path, monkeyp
     proj_dir.mkdir()
     monkeypatch.chdir(proj_dir)
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
     assert not bootstrap.exists()

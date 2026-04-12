@@ -18,22 +18,38 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+# --- Secure working directory ---
+# All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
+# This prevents symlink attacks and cache poisoning on multi-user systems.
+
+_SECURE_DIR = os.path.expanduser("~/.claude/obsidian-brain")
+
+
+def _ensure_secure_dir() -> str:
+    """Create and return the secure working directory with 0o700 permissions."""
+    os.makedirs(_SECURE_DIR, mode=0o700, exist_ok=True)
+    st = os.stat(_SECURE_DIR)
+    if st.st_mode & 0o077:
+        os.chmod(_SECURE_DIR, 0o700)
+    return _SECURE_DIR
+
+
 # --- Session-scoped cache ---
-# File-based cache at /tmp/.obsidian-brain-cache-{session_id}.json
 # Avoids repeated vault scans when multiple skills run in one session.
 
-_CACHE_PREFIX = '/tmp/.obsidian-brain-cache-'
-_BOOTSTRAP_PREFIX = '/tmp/.obsidian-brain-sid-'
+_CACHE_PREFIX = os.path.join(_SECURE_DIR, "cache-")
+_BOOTSTRAP_PREFIX = os.path.join(_SECURE_DIR, "sid-")
 
 
 def _bootstrap_prefix() -> str:
-    """Return the bootstrap file prefix, honoring OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX env override."""
-    return os.environ.get("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", _BOOTSTRAP_PREFIX)
+    """Return the bootstrap file prefix. Fixed to secure directory."""
+    return _BOOTSTRAP_PREFIX
 
 
 def _safe_mtime(path: str) -> float:
@@ -189,6 +205,7 @@ def cache_get(session_id: str, key: str):
 
 def cache_set(session_id: str, key: str, value) -> None:
     """Write a key to the session cache. Atomic write."""
+    _ensure_secure_dir()
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
     try:
         with open(cache_path, 'r') as f:
@@ -200,7 +217,7 @@ def cache_set(session_id: str, key: str, value) -> None:
 
     data[key] = value
 
-    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir='/tmp')
+    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(data, f)
@@ -232,7 +249,7 @@ def cache_invalidate(session_id: str, *keys: str) -> None:
     for k in keys:
         data.pop(k, None)
 
-    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir='/tmp')
+    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(data, f)
@@ -303,6 +320,15 @@ def load_config() -> dict:
             f"[obsidian-brain] error reading config: {exc}, using defaults",
             file=sys.stderr,
         )
+
+    # Auto-fix config file permissions if group/world readable
+    try:
+        config_stat = os.stat(_CONFIG_PATH)
+        if config_stat.st_mode & 0o077:
+            os.chmod(_CONFIG_PATH, 0o600)
+            print("[obsidian-brain] fixed config permissions to 0o600", file=sys.stderr)
+    except OSError:
+        pass
 
     cache_set(sid, "config", config)
     return config
@@ -990,6 +1016,27 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
 
 
 # ---------------------------------------------------------------------------
+# Secret scrubbing
+# ---------------------------------------------------------------------------
+
+_SECRET_PATTERNS = [
+    (re.compile(r'gh[ps]_[A-Za-z0-9_]{36,}'), '[REDACTED:github-token]'),
+    (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED:aws-key]'),
+    (re.compile(r'(?i)(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+'), r'\1=[REDACTED]'),
+    (re.compile(r'-----BEGIN [A-Z ]+-----'), '[REDACTED:pem-header]'),
+    (re.compile(r'(?i)Bearer\s+[A-Za-z0-9._\-]{20,}'), 'Bearer [REDACTED]'),
+    (re.compile(r'(?i)(key|secret|token)\s*[=:]\s*[A-Za-z0-9+/=]{40,}'), r'\1=[REDACTED:base64]'),
+]
+
+
+def scrub_secrets(text: str) -> str:
+    """Best-effort redaction of common secret patterns."""
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Vault operations
 # ---------------------------------------------------------------------------
 
@@ -997,7 +1044,7 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
 def write_vault_note(
     vault_path: str, folder: str, filename: str, content: str
 ) -> bool:
-    """Atomic write: temp file + chmod 0o644 + rename into vault folder.
+    """Atomic write: temp file + chmod 0o600 + rename into vault folder.
 
     Creates the target folder if it does not exist.  Returns True on success.
     """
@@ -1012,6 +1059,13 @@ def write_vault_note(
         return False
 
     dest = dest_dir / filename
+
+    # Path traversal check
+    vault_real = Path(vault_path).resolve()
+    if not dest.resolve().is_relative_to(vault_real):
+        print(f"[obsidian-brain] path traversal blocked: {dest}", file=sys.stderr)
+        return False
+
     try:
         fd, tmp_path = tempfile.mkstemp(
             dir=str(dest_dir), prefix=".ob-", suffix=".md.tmp"
@@ -1019,7 +1073,7 @@ def write_vault_note(
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(content)
-            os.chmod(tmp_path, 0o644)
+            os.chmod(tmp_path, 0o600)
             os.rename(tmp_path, str(dest))
         except Exception:
             try:
@@ -1032,6 +1086,49 @@ def write_vault_note(
         return False
 
     print(f"[obsidian-brain] wrote {dest}", file=sys.stderr)
+    return True
+
+
+def flip_note_status(path: str, old_status: str, new_status: str) -> bool:
+    """Atomically change a note's frontmatter status field.
+
+    Reads the file, replaces 'status: <old>' with 'status: <new>' in the
+    frontmatter, and writes back via temp file + rename.
+    Returns True on success.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as exc:
+        print(f"[obsidian-brain] cannot read {path}: {exc}", file=sys.stderr)
+        return False
+
+    old_line = f"status: {old_status}"
+    new_line = f"status: {new_status}"
+    if old_line not in content:
+        return False
+
+    new_content = content.replace(old_line, new_line, 1)
+
+    dir_path = os.path.dirname(path)
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=dir_path, prefix=".ob-flip-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(new_content)
+            orig_mode = stat.S_IMODE(os.stat(path).st_mode)
+            os.chmod(tmp_path, orig_mode)
+            os.rename(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        print(f"[obsidian-brain] flip_note_status failed for {path}: {exc}", file=sys.stderr)
+        return False
+
     return True
 
 
@@ -1687,6 +1784,10 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
         )
         if result.stdout.strip():
             first = result.stdout.strip().split("\n")[0]
+            if first:
+                real_first = os.path.realpath(first)
+                if not real_first.startswith(str(projects_dir.resolve()) + os.sep):
+                    return None
             return Path(first) if first else None
     except subprocess.TimeoutExpired:
         # If `find` already timed out on this tree, a pure-Python rglob
@@ -1950,6 +2051,7 @@ def build_raw_fallback(
     metadata: dict,
     assistant_msgs: list[str] | None = None,
     tool_uses: list[dict] | None = None,
+    config: dict | None = None,
 ) -> str:
     """Build a detailed note body without AI summarization -- raw data extraction.
 
@@ -2003,25 +2105,26 @@ def build_raw_fallback(
     sections.append("## Open Questions / Next Steps")
     sections.append("_Not extracted (AI summary unavailable)._\n")
 
-    # Interleaved conversation for /recall to summarize
-    sections.append("## Conversation (raw)")
-    max_turns = RAW_NOTE_MAX_TURNS
-    u_idx, a_idx = 0, 0
-    turn = 0
-    while turn < max_turns and (u_idx < len(user_msgs) or (assistant_msgs and a_idx < len(assistant_msgs))):
-        if u_idx < len(user_msgs):
-            snippet = user_msgs[u_idx][:1200].replace("\n", " ")
-            # Skip system noise (task notifications, command loading, etc.)
-            if not snippet.startswith("<task-notification>") and not snippet.startswith("Base directory for this skill:") and not snippet.startswith("<local-command"):
-                sections.append(f"**User:** {snippet}")
+    # Interleaved conversation for /recall to summarize (controlled by config toggle)
+    if (config or {}).get("log_raw_messages", True):
+        sections.append("## Conversation (raw)")
+        max_turns = RAW_NOTE_MAX_TURNS
+        u_idx, a_idx = 0, 0
+        turn = 0
+        while turn < max_turns and (u_idx < len(user_msgs) or (assistant_msgs and a_idx < len(assistant_msgs))):
+            if u_idx < len(user_msgs):
+                snippet = scrub_secrets(user_msgs[u_idx][:1200].replace("\n", " "))
+                # Skip system noise (task notifications, command loading, etc.)
+                if not snippet.startswith("<task-notification>") and not snippet.startswith("Base directory for this skill:") and not snippet.startswith("<local-command"):
+                    sections.append(f"**User:** {snippet}")
+                    turn += 1
+                u_idx += 1
+            if assistant_msgs and a_idx < len(assistant_msgs):
+                snippet = scrub_secrets(assistant_msgs[a_idx][:1200].replace("\n", " "))
+                sections.append(f"**Assistant:** {snippet}")
+                a_idx += 1
                 turn += 1
-            u_idx += 1
-        if assistant_msgs and a_idx < len(assistant_msgs):
-            snippet = assistant_msgs[a_idx][:1200].replace("\n", " ")
-            sections.append(f"**Assistant:** {snippet}")
-            a_idx += 1
-            turn += 1
-    sections.append("")
+        sections.append("")
 
     return "\n".join(sections)
 
@@ -2191,7 +2294,7 @@ def upgrade_note_with_summary(
         try:
             orig_mode = os.stat(note_path).st_mode
         except OSError:
-            orig_mode = 0o644
+            orig_mode = 0o600
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
             f.flush()
@@ -2399,7 +2502,7 @@ def prepare_summary_input(note_path: str) -> str:
 """
 
         # Write to temp file (use full session_id to avoid collisions)
-        temp_path = f"/tmp/ob-prep-{session_id}.md"
+        temp_path = os.path.join(_ensure_secure_dir(), f"prep-{session_id}.md")
         try:
             with open(temp_path, 'w', encoding='utf-8') as f:
                 f.write(content)

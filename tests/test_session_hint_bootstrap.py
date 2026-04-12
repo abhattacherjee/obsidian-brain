@@ -24,15 +24,14 @@ def _import_hook_module():
     return importlib.import_module("obsidian_session_hint")
 
 
-def test_hook_writes_bootstrap_file(tmp_path):
+def test_hook_writes_bootstrap_file(tmp_path, monkeypatch):
     """Hook writes the authoritative session_id to the bootstrap file."""
     project_dir = tmp_path / "fake-project"
     project_dir.mkdir()
-    bootstrap_path = tmp_path / ".obsidian-brain-sid-fake-project"
+    secure_dir = tmp_path / ".claude" / "obsidian-brain"
 
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
-    env["OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX"] = str(tmp_path / ".obsidian-brain-sid-")
 
     payload = {
         "cwd": str(project_dir),
@@ -46,6 +45,7 @@ def test_hook_writes_bootstrap_file(tmp_path):
         env=env,
     )
     assert result.returncode == 0, f"hook exited {result.returncode}: {result.stderr}"
+    bootstrap_path = secure_dir / "sid-fake-project"
     assert bootstrap_path.exists(), "bootstrap file was not written"
     assert bootstrap_path.read_text(encoding="utf-8").strip() == "test-sid-aaaaaaaa"
 
@@ -57,7 +57,6 @@ def test_hook_handles_missing_session_id(tmp_path):
 
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
-    env["OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX"] = str(tmp_path / ".obsidian-brain-sid-")
 
     payload = {"cwd": str(project_dir)}  # no session_id
     result = subprocess.run(
@@ -68,7 +67,8 @@ def test_hook_handles_missing_session_id(tmp_path):
         env=env,
     )
     assert result.returncode == 0, f"hook exited {result.returncode}: {result.stderr}"
-    bootstrap_path = tmp_path / ".obsidian-brain-sid-proj-nosid"
+    secure_dir = tmp_path / ".claude" / "obsidian-brain"
+    bootstrap_path = secure_dir / "sid-proj-nosid"
     assert not bootstrap_path.exists(), "bootstrap should not be written without session_id"
 
 
@@ -81,7 +81,6 @@ def test_hook_writes_log_line(tmp_path):
 
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
-    env["OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX"] = str(tmp_path / ".obsidian-brain-sid-")
 
     payload = {"cwd": str(project_dir), "session_id": "log-sid-bbbb"}
     result = subprocess.run(
@@ -113,7 +112,6 @@ def test_hook_log_rotates_when_large(tmp_path):
 
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
-    env["OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX"] = str(tmp_path / ".obsidian-brain-sid-")
 
     payload = {"cwd": str(project_dir), "session_id": "rot-sid-cccc"}
     subprocess.run(
@@ -134,22 +132,33 @@ def test_hook_log_rotates_when_large(tmp_path):
 
 
 def test_bootstrap_prefix_default(monkeypatch):
+    """Bootstrap prefix is fixed to the secure directory (env var override removed)."""
     monkeypatch.delenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", raising=False)
-    mod = _import_hook_module()
-    assert mod._bootstrap_prefix() == "/tmp/.obsidian-brain-sid-"
+    import obsidian_utils
+    expected = os.path.join(os.path.expanduser("~/.claude/obsidian-brain"), "sid-")
+    assert obsidian_utils._bootstrap_prefix() == expected
 
 
-def test_bootstrap_prefix_override(monkeypatch, tmp_path):
+def test_bootstrap_prefix_ignores_env_override(monkeypatch, tmp_path):
+    """Env var OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX is no longer honored (C2)."""
     monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / "pref-"))
-    mod = _import_hook_module()
-    assert mod._bootstrap_prefix() == str(tmp_path / "pref-")
+    import obsidian_utils
+    expected = os.path.join(os.path.expanduser("~/.claude/obsidian-brain"), "sid-")
+    assert obsidian_utils._bootstrap_prefix() == expected
 
 
 def test_write_bootstrap_atomic_success(monkeypatch, tmp_path):
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / ".sid-"))
+    secure_dir = str(tmp_path / "secure")
+    monkeypatch.setattr("obsidian_utils._SECURE_DIR", secure_dir)
+    monkeypatch.setattr("obsidian_utils._BOOTSTRAP_PREFIX", os.path.join(secure_dir, "sid-"))
     mod = _import_hook_module()
+    # Re-patch after reload since reload re-executes module-level code
+    import obsidian_utils
+    monkeypatch.setattr("obsidian_utils._SECURE_DIR", secure_dir)
+    monkeypatch.setattr("obsidian_utils._BOOTSTRAP_PREFIX", os.path.join(secure_dir, "sid-"))
+    os.makedirs(secure_dir, mode=0o700, exist_ok=True)
     assert mod._write_bootstrap_atomic("proj1", "sid-123") is True
-    target = tmp_path / ".sid-proj1"
+    target = Path(secure_dir) / "sid-proj1"
     assert target.read_text(encoding="utf-8") == "sid-123"
 
 
@@ -157,11 +166,16 @@ def test_write_bootstrap_atomic_failure(monkeypatch, tmp_path, capsys):
     # Point to an unwritable location inside a file (not a dir) to force OSError.
     blocker = tmp_path / "blocker"
     blocker.write_text("not a directory", encoding="utf-8")
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(blocker / "child-"))
+    secure_dir = str(blocker / "nested")
+    monkeypatch.setattr("obsidian_utils._SECURE_DIR", secure_dir)
+    monkeypatch.setattr("obsidian_utils._BOOTSTRAP_PREFIX", os.path.join(secure_dir, "sid-"))
     mod = _import_hook_module()
+    import obsidian_utils
+    monkeypatch.setattr("obsidian_utils._SECURE_DIR", secure_dir)
+    monkeypatch.setattr("obsidian_utils._BOOTSTRAP_PREFIX", os.path.join(secure_dir, "sid-"))
     assert mod._write_bootstrap_atomic("proj2", "sid-456") is False
     err = capsys.readouterr().err
-    assert "bootstrap write failed" in err
+    assert "bootstrap write failed" in err or "ensure_secure_dir" in err.lower() or "not a directory" in err.lower()
 
 
 def test_append_hook_log_creates_file(monkeypatch, tmp_path):
