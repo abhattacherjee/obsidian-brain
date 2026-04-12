@@ -371,4 +371,4 @@ If processing multiple insights from Step 4B, repeat Steps 5-9 for each remainin
 
 After all insights are saved, ask:
 
-> Anything else to capture from this session? You can run `/compress` again or `/compress <topic>` for a specific topic.
+> Anything else to capture from this session? You can run `/compress` again, `/compress <topic>` for a specific topic, or `/compress <topic>` to update an existing note.
