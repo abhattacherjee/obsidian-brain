@@ -2,7 +2,7 @@
 name: compress
 description: "Interactively saves curated insights from the current Claude Code session to the Obsidian vault. Use when: (1) /compress command to save session insights, (2) /compress <topic> to extract a specific topic, (3) user wants to capture decisions, patterns, solutions, or error fixes from the current session."
 metadata:
-  version: 1.0.0
+  version: 1.1.0
 ---
 
 # Compress — Save Session Insights to Obsidian
