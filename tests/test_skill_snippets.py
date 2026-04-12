@@ -75,16 +75,25 @@ def test_cache_glob_finds_installed_hooks():
 
 
 def test_snippets_import_os_before_expanduser():
-    """Snippets using os.path.expanduser must import os first."""
+    """Snippets using os.path.expanduser must import os on a PRIOR line.
+
+    The check must not false-pass by matching 'os' in usage lines like
+    ``import glob; ... os.path.expanduser(...)``. Only actual import
+    statements count: ``import os``, ``import sys, os``, etc.
+    """
+    # Matches 'import os' as a standalone import or in a comma-separated list
+    _IMPORT_OS_RE = re.compile(
+        r'^\s*import\s+(?:[\w]+\s*,\s*)*os(?:\s*,|\s*$)'
+    )
     for name, code in _SNIPPETS:
         if "os.path.expanduser" not in code:
             continue
         lines = code.strip().split("\n")
         os_imported = False
         for line in lines:
-            if re.search(r'\bimport\b.*\bos\b', line):
+            if _IMPORT_OS_RE.search(line):
                 os_imported = True
-            if "os.path.expanduser" in line:
+            if "os.path.expanduser" in line and not _IMPORT_OS_RE.search(line):
                 assert os_imported, (
                     f"Snippet {name} uses os.path.expanduser "
                     "before importing os"
