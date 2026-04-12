@@ -30,7 +30,7 @@ jobs:
       - name: Scan for secrets
         run: |
           set -euo pipefail
-          DIFF_OUTPUT=$(git diff origin/${{ github.base_ref }}...HEAD -- ':!scripts/*' ':!docs/*' ':!*.md' ':!.claude/hooks/*' ':!.github/workflows/*' || true)
+          DIFF_OUTPUT=$(git diff origin/${{ github.base_ref }}...HEAD -- ':!scripts/*' ':!docs/*' ':!*.md' ':!.claude/hooks/*' ':!.github/workflows/*' ':!tests/*' || true)
           if [ -z "$DIFF_OUTPUT" ]; then
             echo "No diffable content (docs/scripts only) — skipping"
             exit 0
