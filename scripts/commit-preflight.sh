@@ -16,7 +16,7 @@ set -e
 
 # Project-scoped token path (must match require-preflight.py)
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROJECT_HASH=$(python3 -c "import hashlib; print(hashlib.md5('$(realpath "$PROJECT_DIR")'.encode()).hexdigest()[:8])")
+PROJECT_HASH=$(python3 -c "import hashlib, sys; print(hashlib.md5(sys.argv[1].encode()).hexdigest()[:8])" "$(realpath "$PROJECT_DIR")")
 TOKEN_FILE="/tmp/.preflight-token-${PROJECT_HASH}"
 TOKEN_EXPIRY_SECONDS=300  # Token valid for 5 minutes
 
