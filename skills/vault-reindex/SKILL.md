@@ -28,11 +28,13 @@ c = load_config()
 if not c.get("vault_path"):
     print("ERROR: vault_path not configured", file=sys.stderr)
     sys.exit(1)
-print("VAULT=" + c["vault_path"] + " SESS=" + c.get("sessions_folder", "claude-sessions") + " INS=" + c.get("insights_folder", "claude-insights"))
+print("VAULT=" + c["vault_path"])
+print("SESS=" + c.get("sessions_folder", "claude-sessions"))
+print("INS=" + c.get("insights_folder", "claude-insights"))
 '
 ```
 
-Parse the output line to extract `VAULT`, `SESS`, and `INS` values.
+Parse each output line as KEY=VALUE, splitting on the first `=`.
 
 If config is missing or the command fails, tell the user:
 
@@ -42,21 +44,18 @@ Stop here if config is missing.
 
 ### Step 2 — Rebuild
 
-Run, substituting the values extracted in Step 1:
+Run, passing the config values as command-line arguments (never interpolate into Python source):
 
 ```bash
 python3 -c '
 import sys, os, glob, time, json
 sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from vault_index import rebuild_index
-vault_path = "<VAULT>"
-folders = ["<SESS>", "<INS>"]
 t0 = time.time()
-stats = rebuild_index(vault_path, folders)
-elapsed = time.time() - t0
-stats["elapsed"] = round(elapsed, 1)
+stats = rebuild_index(sys.argv[1], [sys.argv[2], sys.argv[3]])
+stats["elapsed"] = round(time.time() - t0, 1)
 print(json.dumps(stats))
-'
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
 ```
 
 If the command fails (non-zero exit or exception in output), tell the user:

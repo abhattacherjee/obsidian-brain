@@ -320,7 +320,7 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
 
     # Set permissions
     try:
-        os.chmod(db_path, 0o644)
+        os.chmod(db_path, 0o600)
     except OSError:
         pass
 
@@ -352,7 +352,7 @@ def rebuild_index(vault_path: str, folders: list[str], db_path: str | None = Non
         conn.close()
 
     try:
-        os.chmod(db_path, 0o644)
+        os.chmod(db_path, 0o600)
     except OSError:
         pass
 
@@ -562,16 +562,17 @@ def query_related_notes(
             for tag in topic_tags:
                 if len(results) >= limit:
                     break
+                escaped_tag = tag.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 sql = (
                     f"SELECT path, type, date, project, title, tags, status, "
                     f"source_session, source_note, size "
-                    f"FROM notes WHERE tags LIKE ? AND project = ? "
+                    f"FROM notes WHERE tags LIKE ? ESCAPE '\\' AND project = ? "
                     f"{type_filter} "
                     f"ORDER BY date DESC"
                 )
                 try:
                     rows = conn.execute(
-                        sql, [f"%{tag}%", project] + type_params
+                        sql, [f"%{escaped_tag}%", project] + type_params
                     ).fetchall()
                     for row in rows:
                         d = dict(row)
