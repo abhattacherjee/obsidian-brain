@@ -240,7 +240,10 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
 
     # Insert/update files
     for abs_path_str, abs_path in disk_files.items():
-        st = abs_path.stat()
+        try:
+            st = abs_path.stat()
+        except OSError:
+            continue  # File deleted/moved between rglob and stat
         file_mtime = st.st_mtime
         file_size = st.st_size
 
@@ -319,11 +322,12 @@ def rebuild_index(vault_path: str, folders: list[str], db_path: str | None = Non
     if db_path is None:
         db_path = _default_db_path()
 
-    # Delete existing DB
-    try:
-        os.remove(db_path)
-    except OSError:
-        pass
+    # Delete existing DB and WAL/SHM sidecars
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(db_path + suffix)
+        except OSError:
+            pass
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 

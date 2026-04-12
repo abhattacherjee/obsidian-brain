@@ -81,7 +81,7 @@ results = search_vault(
     limit=20,
 )
 print(json.dumps(results))
-' "$QUERY" "$PROJECT_FILTER"
+' "$QUERY" "$PROJECT"
 ```
 
 If the output is a non-empty JSON array: parse and present results (path, title, type, date, excerpt) using the format in Step 6. Skip Steps 4 and 5 below.
