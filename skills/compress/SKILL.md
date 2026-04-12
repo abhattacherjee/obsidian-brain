@@ -9,7 +9,7 @@ metadata:
 
 Analyze the current conversation, extract valuable insights, and save them as structured notes in the Obsidian vault. Supports both interactive multi-insight selection and targeted single-topic extraction.
 
-**Tools needed:** Bash, Write, Read
+**Tools needed:** Bash, Write, Read, Edit
 
 ## Procedure
 
@@ -73,24 +73,28 @@ import sys, os, json
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from vault_index import ensure_index, search_vault
 from obsidian_utils import load_config
-c = load_config()
-vp = c["vault_path"]
-folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
-db = ensure_index(vp, folders)
-results = search_vault(db, sys.argv[1], note_type="claude-insight", limit=3)
-results += search_vault(db, sys.argv[1], note_type="claude-decision", limit=3)
-# Sort combined results by rank (most negative = best match)
-results.sort(key=lambda r: r["rank"])
-# Apply high-confidence threshold: top result must have rank <= -5.0
-# AND must be significantly ahead of #2 (at least 1.5x better rank)
-if results:
-    top = results[0]
-    rank_gap_ok = len(results) < 2 or abs(top["rank"]) > abs(results[1]["rank"]) * 1.5
-    if top["rank"] <= -5.0 and rank_gap_ok:
-        print(json.dumps({"match": True, "path": top["path"], "title": top["title"], "date": top["date"], "tags": top["tags"], "rank": top["rank"]}))
+try:
+    c = load_config()
+    vp = c["vault_path"]
+    folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
+    db = ensure_index(vp, folders)
+    results = search_vault(db, sys.argv[1], note_type="claude-insight", limit=3)
+    results += search_vault(db, sys.argv[1], note_type="claude-decision", limit=3)
+    # Sort combined results by rank (most negative = best match)
+    results.sort(key=lambda r: r["rank"])
+    # Apply high-confidence threshold: top result must have rank <= -5.0
+    # AND must be significantly ahead of #2 (at least 1.5x better rank)
+    if results:
+        top = results[0]
+        rank_gap_ok = len(results) < 2 or abs(top["rank"]) > abs(results[1]["rank"]) * 1.5
+        if top["rank"] <= -5.0 and rank_gap_ok:
+            print(json.dumps({"match": True, "path": top["path"], "title": top["title"], "date": top["date"], "tags": top["tags"], "rank": top["rank"]}))
+        else:
+            print(json.dumps({"match": False}))
     else:
         print(json.dumps({"match": False}))
-else:
+except Exception as e:
+    print(f"Warning: could not search vault index: {e}", file=sys.stderr)
     print(json.dumps({"match": False}))
 ' "$TOPIC"
 ~~~
