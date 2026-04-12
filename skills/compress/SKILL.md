@@ -120,6 +120,94 @@ Analyze the current conversation for content related to the user's specified top
 
 Skip to Step 5.
 
+### Step 4A-update — Append to existing note
+
+This step is reached when the user chose "update" in Step 3.5. The matched note path is `$MATCH_PATH`.
+
+#### 4A-update.1 — Read the existing note
+
+Use the Read tool to read the full contents of `$MATCH_PATH`. Note the existing frontmatter tags and whether a `last_updated` field is already present.
+
+#### 4A-update.2 — Draft the update section
+
+Analyze the current conversation for content related to the topic. Draft a dated update section:
+
+~~~markdown
+## Update (YYYY-MM-DD)
+
+<New content about this topic from today's session. Include:
+- New findings, corrections, or extensions to the original insight
+- Code snippets or commands if relevant
+- Context on why this update was triggered>
+~~~
+
+Where `YYYY-MM-DD` is today's date.
+
+**Important:** Do NOT rewrite or duplicate existing content. The update section captures only what is NEW from this session.
+
+#### 4A-update.3 — Show preview and ask for edits
+
+Present ONLY the new update section (not the full existing note):
+
+> **Update section to append to "< existing note title>":**
+>
+> (show the drafted `## Update (YYYY-MM-DD)` section)
+>
+> Preview above. Would you like to:
+> - **save** — append this update
+> - **edit content** — tell me what to change
+> - **cancel** — discard this update
+
+Wait for the user's response. Apply edits and re-show if requested. Repeat until the user says **save** or **cancel**.
+
+If **cancel**, stop here.
+
+#### 4A-update.4 — Append the update section
+
+Use the Edit tool to append the update section at the end of the note body. Find the last non-empty line of the note and insert after it.
+
+**Insertion point:** If the note ends with metadata sections like `_(Summary source: ...)_` or `## Tool Usage`, insert BEFORE those trailing sections. Otherwise append at the very end.
+
+#### 4A-update.5 — Update frontmatter
+
+Use the Edit tool to update the frontmatter of the existing note:
+
+1. **`last_updated` field:** If `last_updated:` already exists in the frontmatter, replace its value with today's date. If it does not exist, add `last_updated: YYYY-MM-DD` after the `date:` line.
+
+2. **New topic tags:** Generate 1-3 topic tags from the update content (same logic as Step 5). For each new tag, check if it already exists in the `tags:` list. Only append tags that are NOT already present. Add new tags at the end of the tags list, before the closing `---`.
+
+**Do NOT change:** `date`, `source_session`, `source_session_note`, or `type` fields. These record the original creation context.
+
+#### 4A-update.6 — Re-sync vault index
+
+Run:
+
+~~~bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys, os
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from vault_index import ensure_index
+from obsidian_utils import load_config
+c = load_config()
+vp = c["vault_path"]
+folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
+ensure_index(vp, folders)
+print("OK")
+'
+~~~
+
+#### 4A-update.7 — Confirm
+
+Print:
+
+> **Note updated!**
+> - File: `$MATCH_PATH`
+> - Added section: "Update (YYYY-MM-DD)"
+> - New tags: `<list of newly added tags>` (or "none")
+
+Skip to Step 10 (offer follow-up). Do NOT proceed through Steps 5-9 (those are the create-new flow).
+
 ### Step 4B — Multi-insight suggestion
 
 **First, check for claudeception output** using layered detection:
