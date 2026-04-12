@@ -371,10 +371,10 @@ class TestQueryRelatedNotes:
                 "type": "claude-insight",
                 "date": "2026-04-10",
                 "project": "proj",
-                "session_id": "sess-A",
+                "source_session": "sess-A",
                 "tags": ["claude/insight"],
             },
-            body="# Insight: Backlinked\n\nThis is linked via session.",
+            body="# Insight: Backlinked\n\nThis is linked via source_session.",
         )
 
         # Note linked via topic tag

@@ -554,7 +554,7 @@ This is a soft nudge — a non-blocking suggestion, not automatic execution.
 > - Config: preserved (unchanged)
 > - New dashboards: installed (existing dashboards preserved)
 > - Claudeception nudge: configured
-> - Vault index: N notes indexed (run `/vault-reindex` to rebuild)
+> - Vault index: N notes indexed (run `/vault-reindex` to rebuild) — _or omit this line if Step 8.5 failed_
 >
 > Re-run `/obsidian-setup` anytime to pick up new features.
 
@@ -567,7 +567,7 @@ This is a soft nudge — a non-blocking suggestion, not automatic execution.
 > - Folders created: `claude-sessions/`, `claude-insights/`, `claude-dashboards/`
 > - Dashboards installed: `sessions-overview.md`, `project-index.md`, `weekly-review.md`, `learning-velocity.md`, `decision-timeline.md`, `open-items.md`
 > - Claudeception nudge: configured (run `/compress` reminder after knowledge extraction)
-> - Vault index: N notes indexed (run `/vault-reindex` to rebuild)
+> - Vault index: N notes indexed (run `/vault-reindex` to rebuild) — _or omit this line if Step 8.5 failed_
 >
 > **Next step — install the Dataview plugin in Obsidian:**
 > 1. Open Obsidian Settings > Community Plugins > Browse

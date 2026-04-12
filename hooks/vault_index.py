@@ -290,10 +290,11 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
         # Corrupt DB — delete and recreate
         print(f"[vault-index] Corrupt or incompatible DB ({exc}); rebuilding {db_path}",
               file=sys.stderr)
-        try:
-            os.remove(db_path)
-        except OSError:
-            pass
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(db_path + suffix)
+            except OSError:
+                pass
         conn = _connect(db_path)
         try:
             _init_schema(conn)
@@ -431,7 +432,7 @@ def search_vault(
             sql += "AND n.type = ? "
             params.append(note_type)
 
-        sql += "ORDER BY rank LIMIT ?"
+        sql += "ORDER BY f.rank LIMIT ?"
         params.append(limit)
 
         rows = conn.execute(sql, params).fetchall()
@@ -575,7 +576,7 @@ def query_related_notes(
                         f"JOIN notes n ON n.rowid = f.rowid "
                         f"WHERE notes_fts MATCH ? AND n.project = ? "
                         f"{type_filter} "
-                        f"ORDER BY rank LIMIT ?"
+                        f"ORDER BY f.rank LIMIT ?"
                     )
                     try:
                         rows = conn.execute(
