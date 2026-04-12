@@ -309,15 +309,16 @@ def load_config() -> dict:
 
 
 def check_hook_status() -> dict:
-    """Inspect the bootstrap file to report SessionStart hook health.
+    """Inspect the bootstrap file to report session-logging health.
 
     Returns:
         {"ok": bool, "message": str, "bootstrap_sid": str, "current_sid": str}
 
-    "ok" is True if the bootstrap file exists and matches the current session.
-    "ok" is False if the bootstrap is missing or points at a different sid
-    (which would indicate the SessionStart hook did not fire, or the fast
-    path is returning a stale value).
+    "ok" is True if the bootstrap file exists (session logging is active).
+    A SID mismatch (bootstrap points at a previous session) is normal after
+    reconnects and does NOT indicate a problem — sessions are still logged.
+    "ok" is False only when the bootstrap file is missing entirely or no
+    session files can be found.
     """
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
@@ -338,7 +339,7 @@ def check_hook_status() -> dict:
     if bootstrap_sid is None:
         return {
             "ok": False,
-            "message": "bootstrap file missing — SessionStart hook may not have fired",
+            "message": "Session logging may not be active — run /obsidian-setup to configure",
             "bootstrap_sid": "",
             "current_sid": current_sid,
         }
@@ -346,28 +347,25 @@ def check_hook_status() -> dict:
     if current_sid == "unknown":
         return {
             "ok": False,
-            "message": (
-                "could not determine current session id from JSONLs "
-                "(no session files found)"
-            ),
+            "message": "No session files found — run /obsidian-setup to verify configuration",
             "bootstrap_sid": bootstrap_sid,
             "current_sid": current_sid,
         }
 
-    if bootstrap_sid == current_sid:
+    # Bootstrap exists = session logging is working. SID mismatch is
+    # expected after reconnects and is not a problem — keep ok=True
+    # but include diagnostic detail for debugging.
+    if bootstrap_sid != current_sid:
         return {
             "ok": True,
-            "message": "SessionStart hook fired; bootstrap matches current session",
+            "message": "Session logging active (resumed session)",
             "bootstrap_sid": bootstrap_sid,
             "current_sid": current_sid,
         }
 
     return {
-        "ok": False,
-        "message": (
-            f"bootstrap sid {bootstrap_sid[:8]} does not match current "
-            f"session {current_sid[:8]} — hook may be stale"
-        ),
+        "ok": True,
+        "message": "Session logging active",
         "bootstrap_sid": bootstrap_sid,
         "current_sid": current_sid,
     }
@@ -865,7 +863,7 @@ def generate_summary(
     assistant_msgs: list[str],
     metadata: dict,
     model: str = "haiku",
-    timeout: int = 15,
+    timeout: int = 30,
 ) -> str | None:
     """Call ``claude -p --model <model>`` to summarize the session.
 
@@ -2422,7 +2420,7 @@ def upgrade_unsummarized_note(
     sessions_folder: str,
     project: str,
     summary_model: str = "haiku",
-    summary_timeout: int = 15,
+    summary_timeout: int | None = None,
 ) -> str:
     """Upgrade an unsummarized session note with an AI summary.
 
@@ -2529,9 +2527,11 @@ def upgrade_unsummarized_note(
         metadata["errors"] = parsed.get("errors", [])
 
     # Generate summary
+    gen_kwargs: dict = {"model": summary_model}
+    if summary_timeout is not None:
+        gen_kwargs["timeout"] = summary_timeout
     summary_text = generate_summary(
-        user_msgs, assistant_msgs, metadata,
-        model=summary_model, timeout=summary_timeout,
+        user_msgs, assistant_msgs, metadata, **gen_kwargs,
     )
 
     if not summary_text:

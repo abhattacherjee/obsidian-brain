@@ -273,7 +273,7 @@ print(build_context_brief(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], ho
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER" "$PROJECT"
 ```
 
-The first line of the emitted `CONTEXT_BRIEF` is always the hook-status line (prefixed `[OK]` when the SessionStart hook fired and bootstrap matches the current sid, `[WARN]` otherwise). Preserve it verbatim when displaying the brief — it is the user's only visible signal that hooks are alive.
+The first line of the emitted `CONTEXT_BRIEF` is always the hook-status line. If it starts with `[OK]`, omit it from the displayed output — the user doesn't need to see "session logging active" every time. If it starts with `[WARN]`, display it verbatim so the user knows to take action (e.g., run `/obsidian-setup`).
 
 If the command fails (non-zero exit code), print the error and stop — do not fall back to in-context reads.
 

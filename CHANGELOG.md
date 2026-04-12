@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/vault-ask` FTS pre-filter — reduces sub-agent file reads by pre-filtering with FTS5
 
 ### Changed
+- Haiku summarization timeout bumped from 15s to 30s (retry escalation: 30s/60s). Empirical measurement showed ~9-10s CLI startup overhead, leaving insufficient time for generation at 15s.
+- `upgrade_unsummarized_note()` timeout is now a passthrough to `generate_summary()` — single source of truth instead of duplicated defaults.
+- `check_hook_status()` SID mismatch (common after reconnects) is now `ok=True`. Only warns when bootstrap file is missing or no session files are found.
+- `/recall` hook-status messages reworded for end users: `[OK]` lines suppressed from output, `[WARN]` shows actionable guidance.
+- README updated with vault-index architecture details and `/vault-reindex` skill.
 - `build_context_brief()` insight loading now surfaces contextually relevant insights via layered ranking (backlinks → tags → FTS keywords) instead of most-recent-by-mtime. Falls back to the original file scan if the vault index is unavailable.
 - `/vault-search` and `/vault-ask` FTS snippets now call `ensure_index()` before `search_vault()` so newly written notes are always picked up.
 - FTS5 schema uses contentless tables (`content=''`) — orphaned FTS entries are filtered out by JOIN, no DELETE needed.
