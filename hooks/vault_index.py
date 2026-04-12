@@ -9,7 +9,6 @@ DB location: ~/.claude/obsidian-brain-vault.db (outside vault, alongside config)
 import os
 import re
 import sqlite3
-import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
