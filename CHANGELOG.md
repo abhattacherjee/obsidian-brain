@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `hooks/vault_index.py` — SQLite + FTS5 vault index with lazy mtime-based sync, layered ranking queries (backlinks → tags → FTS keywords), and sub-millisecond ad-hoc search
+- `/vault-reindex` skill — full index rebuild for recovery, setup, and after bulk Obsidian edits
+- `/obsidian-setup` Step 8.5 — bootstraps vault index on first setup and upgrades
+- `/vault-search` FTS fast path — tries instant FTS5 search before falling back to Grep
+- `/vault-ask` FTS pre-filter — reduces sub-agent file reads by pre-filtering with FTS5
+
+### Changed
+- `build_context_brief()` insight loading now surfaces contextually relevant insights via layered ranking (backlinks → tags → FTS keywords) instead of most-recent-by-mtime. Falls back to the original file scan if the vault index is unavailable.
+- `/vault-search` and `/vault-ask` FTS snippets now call `ensure_index()` before `search_vault()` so newly written notes are always picked up.
+- FTS5 schema uses contentless tables (`content=''`) — orphaned FTS entries are filtered out by JOIN, no DELETE needed.
+- `build_context_brief()` fallback narrowed from `except Exception` to `except (sqlite3.Error, OSError)` so programming bugs propagate instead of silently degrading to file scan.
+- All `vault_index.py` public functions use `try/finally` for connection cleanup.
+- Corrupt DB recovery now removes WAL/SHM sidecar files and logs to stderr.
+- Layer query failures log to stderr instead of silently passing.
+
 ### Fixed
+- FTS5 hyphen-as-NOT bug: `_sanitize_fts_query()` now replaces hyphens with spaces before tokenization. Previously, `"maintain-catalog"` was interpreted as `"maintain" NOT "catalog"` by FTS5's unicode61 tokenizer.
+- Contentless FTS5 delete compatibility: `_upsert_note()` and `_delete_note()` no longer use `DELETE FROM notes_fts` (invalid for contentless tables). Orphaned FTS entries are filtered by the JOIN in all queries.
+- `source_session` column mapping: `_upsert_note()` now correctly reads `parsed.get("source_session")` instead of `parsed.get("session_id")`.
+- Missing `import os` in `/recall` Step 4 cascade checkoff inline Python snippet.
 - `upgrade_note_with_summary()` now guarantees that a returned `Upgraded` status means the summary actually landed on disk. The rewritten tempfile is `fsync`'d before `os.replace()`, the parent directory is `fsync`'d after the rename (crash-durable rename), and the target file is re-read and verified before the function returns. Verification checks that `status: summarized` appears in the **YAML frontmatter block** (anchored to the start of the file via `re.match`, not a whole-file substring match — so a body that happens to mention the literal string or contains a Markdown `---` horizontal rule cannot false-positive) AND that the first real content line of the supplied summary is present in the **`## Summary` section** as its own stripped line (line-granularity, not substring match). Empty or heading-only Summary bodies are rejected upfront with `Failed: malformed summary`. Post-write mismatches return distinct `Failed: post-write verification — …` statuses (status not flipped, summary body missing, `## Summary` section not found, YAML frontmatter not found at start, post-write read failure) so callers (and `/recall`) can no longer be told "Upgraded" about a note that did not actually receive its summary.
 
 ## [1.9.0] - 2026-04-11

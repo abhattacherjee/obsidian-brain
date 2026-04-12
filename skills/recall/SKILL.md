@@ -127,7 +127,7 @@ If the status starts with "Failed:", use the sub-agent fallback:
    ```bash
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
    python3 -c '
-   import sys
+   import sys, os
    import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
    from obsidian_utils import upgrade_note_with_summary
    with open(sys.argv[5], "r") as f:
@@ -341,7 +341,7 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
     ```bash
     cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
     python3 -c '
-    import sys, json
+    import sys, os, json
     import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
     from open_item_dedup import batch_cascade_checkoff
     items = json.loads(sys.argv[4])
