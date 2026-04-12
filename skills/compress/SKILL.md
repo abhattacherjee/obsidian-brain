@@ -82,7 +82,7 @@ results += search_vault(db, sys.argv[1], note_type="claude-decision", limit=3)
 # Sort combined results by rank (most negative = best match)
 results.sort(key=lambda r: r["rank"])
 # Apply high-confidence threshold: top result must have rank <= -5.0
-# AND must be significantly ahead of #2 (at least 3x better rank)
+# AND must be significantly ahead of #2 (at least 1.5x better rank)
 if results:
     top = results[0]
     rank_gap_ok = len(results) < 2 or abs(top["rank"]) > abs(results[1]["rank"]) * 1.5
@@ -95,7 +95,7 @@ else:
 ' "$TOPIC"
 ~~~
 
-Parse the JSON output.
+Parse the JSON output. If `match` is `true`, store the `path` field as `MATCH_PATH` and the `title` field as `MATCH_TITLE`.
 
 **If `match` is `false`:** No existing note found. Proceed silently to Step 4A (create new note).
 
@@ -164,9 +164,11 @@ If **cancel**, stop here.
 
 #### 4A-update.4 — Append the update section
 
-Use the Edit tool to append the update section at the end of the note body. Find the last non-empty line of the note and insert after it.
+Use the Edit tool to append the update section to the note body.
 
-**Insertion point:** If the note ends with metadata sections like `_(Summary source: ...)_` or `## Tool Usage`, insert BEFORE those trailing sections. Otherwise append at the very end.
+**Insertion point:** Scan the note from the bottom for these trailing metadata patterns: `_(Summary source: ...)_`, `## Tool Usage`, `## Conversation (raw)`, `## Session Metadata`, `## Files Touched`. If any are found, insert the update section on a new line immediately BEFORE the first trailing section. If none are found, append at the very end of the file.
+
+Use the Edit tool with the first line of the trailing section (or the last line of the file) as `old_string`, and prepend the update section + a blank line before it.
 
 #### 4A-update.5 — Update frontmatter
 
@@ -192,8 +194,11 @@ from obsidian_utils import load_config
 c = load_config()
 vp = c["vault_path"]
 folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
-ensure_index(vp, folders)
-print("OK")
+try:
+    ensure_index(vp, folders)
+    print("OK")
+except Exception as e:
+    print(f"WARN: re-sync failed (non-fatal): {e}")
 '
 ~~~
 
@@ -371,4 +376,4 @@ If processing multiple insights from Step 4B, repeat Steps 5-9 for each remainin
 
 After all insights are saved, ask:
 
-> Anything else to capture from this session? You can run `/compress` again, `/compress <topic>` for a specific topic, or `/compress <topic>` to update an existing note.
+> Anything else to capture from this session? You can run `/compress` again or `/compress <topic>` to extract a specific topic (will offer to update if an existing note matches).
