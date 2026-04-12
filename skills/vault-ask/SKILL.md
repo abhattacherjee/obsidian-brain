@@ -77,9 +77,12 @@ Before spawning search agents, try the vault index for instant results. Join `SE
 python3 -c '
 import sys, os, json, glob
 sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
-from vault_index import search_vault
+from obsidian_utils import load_config
+from vault_index import ensure_index, search_vault
+c = load_config()
+db = ensure_index(c["vault_path"], [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")])
 results = search_vault(
-    os.path.expanduser("~/.claude/obsidian-brain-vault.db"),
+    db,
     sys.argv[1],
     project=sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "None" else None,
     limit=15,
