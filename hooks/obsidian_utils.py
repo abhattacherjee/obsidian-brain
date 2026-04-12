@@ -1352,46 +1352,58 @@ def build_context_brief(
     if most_recent_summary:
         _session_summary = most_recent_summary
 
+    _use_vault_index = True
     try:
         from vault_index import ensure_index, query_related_notes
-        db_path = ensure_index(vault_path, [sessions_folder, insights_folder])
-        ranked_notes = query_related_notes(
-            db_path=db_path,
-            project=project,
-            session_ids=_session_ids,
-            session_tags=_session_tags,
-            session_summary=_session_summary,
-            limit=20,
-        )
-        insight_count = len(ranked_notes)
-        for note in ranked_notes:
-            title = note["title"]
-            key_point = ""
-            note_path = note["path"]
-            try:
-                with open(note_path, "r", encoding="utf-8", errors="replace") as fh:
-                    past_frontmatter = False
-                    frontmatter_closed = False
-                    for line_text in fh:
-                        stripped = line_text.strip()
-                        if stripped == "---":
-                            if not past_frontmatter:
-                                past_frontmatter = True
+    except ImportError:
+        _use_vault_index = False
+
+    if _use_vault_index:
+        try:
+            db_path = ensure_index(vault_path, [sessions_folder, insights_folder])
+            ranked_notes = query_related_notes(
+                db_path=db_path,
+                project=project,
+                session_ids=_session_ids,
+                session_tags=_session_tags,
+                session_summary=_session_summary,
+                note_types=["claude-insight", "claude-decision", "claude-error-fix", "claude-retro"],
+                limit=20,
+            )
+            insight_count = len(ranked_notes)
+            for note in ranked_notes:
+                title = note["title"]
+                key_point = ""
+                note_path = note["path"]
+                try:
+                    with open(note_path, "r", encoding="utf-8", errors="replace") as fh:
+                        past_frontmatter = False
+                        frontmatter_closed = False
+                        for line_text in fh:
+                            stripped = line_text.strip()
+                            if stripped == "---":
+                                if not past_frontmatter:
+                                    past_frontmatter = True
+                                    continue
+                                else:
+                                    frontmatter_closed = True
+                                    continue
+                            if not frontmatter_closed:
                                 continue
-                            else:
-                                frontmatter_closed = True
+                            if stripped.startswith("# "):
                                 continue
-                        if not frontmatter_closed:
-                            continue
-                        if stripped.startswith("# "):
-                            continue
-                        if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
-                            key_point = stripped[:100]
-                            break
-            except OSError:
-                pass
-            insight_entries.append((title, key_point))
-    except Exception:
+                            if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
+                                key_point = stripped[:100]
+                                break
+                except OSError:
+                    pass
+                insight_entries.append((title, key_point))
+        except Exception as _vi_exc:
+            print(f"[obsidian-brain] vault index failed ({type(_vi_exc).__name__}: {_vi_exc}); "
+                  "falling back to file scan", file=sys.stderr)
+            _use_vault_index = False
+
+    if not _use_vault_index:
         # Fallback to original file scan if vault index unavailable
         if insights_dir.is_dir():
             insight_files = sorted(

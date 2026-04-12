@@ -78,7 +78,7 @@ class TestInsertAndSync:
                 "type": "claude-session",
                 "date": "2026-04-10",
                 "project": "myproj",
-                "session_id": "sess-1234",
+                "source_session": "sess-1234",
                 "source_session_note": "[[2026-04-09-myproj-prev.md]]",
                 "tags": ["claude/session", "claude/project/myproj"],
                 "status": "summarized",
@@ -457,3 +457,171 @@ class TestCorruptDB:
         count = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
         conn.close()
         assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# Additional edge case tests (from review)
+# ---------------------------------------------------------------------------
+
+
+class TestIndexNoteFailurePaths:
+    """index_note() returns False for various failure modes."""
+
+    def test_index_note_nonexistent_db(self, tmp_vault):
+        result = vault_index.index_note("/tmp/nonexistent.db", "/tmp/some.md")
+        assert result is False
+
+    def test_index_note_nonexistent_note(self, tmp_vault):
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+        result = vault_index.index_note(db, "/tmp/nonexistent-note.md")
+        assert result is False
+
+    def test_index_note_no_frontmatter(self, tmp_vault):
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+        note = tmp_vault / "claude-sessions" / "plain.md"
+        note.write_text("Just plain text, no frontmatter.", encoding="utf-8")
+        result = vault_index.index_note(db, str(note))
+        assert result is False
+
+
+class TestLayeredRankingStrong:
+    """Stronger assertions on layered ranking order."""
+
+    def test_all_three_layers_present(self, tmp_vault):
+        """All three layers contribute results and maintain order."""
+        # Layer 1: backlink
+        _write_note(
+            tmp_vault / "claude-insights" / "2026-04-10-bl.md",
+            {
+                "type": "claude-insight",
+                "date": "2026-04-10",
+                "project": "proj",
+                "source_session": "sess-X",
+                "tags": ["claude/insight"],
+            },
+            "# Backlinked\n\nDirect provenance.",
+        )
+        # Layer 2: tag match (no backlink)
+        _write_note(
+            tmp_vault / "claude-insights" / "2026-04-10-tg.md",
+            {
+                "type": "claude-insight",
+                "date": "2026-04-10",
+                "project": "proj",
+                "tags": ["claude/insight", "claude/topic/perf"],
+            },
+            "# Tagged\n\nRelated by topic.",
+        )
+        # Layer 3: FTS only (no backlink, no shared tag)
+        _write_note(
+            tmp_vault / "claude-insights" / "2026-04-10-kw.md",
+            {
+                "type": "claude-insight",
+                "date": "2026-04-10",
+                "project": "proj",
+                "tags": ["claude/insight"],
+            },
+            "# Keyword\n\nOptimization and performance caching patterns.",
+        )
+
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db
+        )
+
+        results = vault_index.query_related_notes(
+            db_path=db,
+            project="proj",
+            session_ids=["sess-X"],
+            session_tags=["claude/topic/perf"],
+            session_summary="Working on caching and optimization performance",
+            limit=20,
+        )
+
+        assert len(results) == 3
+        layers = [r["layer"] for r in results]
+        assert layers[0] == "backlink"
+        assert layers[1] == "tag"
+        assert layers[2] == "fts"
+        # No duplicates
+        paths = [r["path"] for r in results]
+        assert len(set(paths)) == 3
+
+    def test_deduplication_across_layers(self, tmp_vault):
+        """A note matching Layer 1 is not duplicated in Layer 2."""
+        _write_note(
+            tmp_vault / "claude-insights" / "2026-04-10-both.md",
+            {
+                "type": "claude-insight",
+                "date": "2026-04-10",
+                "project": "proj",
+                "source_session": "sess-Y",
+                "tags": ["claude/insight", "claude/topic/auth"],
+            },
+            "# Both Layers\n\nMatches backlink and tag.",
+        )
+
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db
+        )
+
+        results = vault_index.query_related_notes(
+            db_path=db,
+            project="proj",
+            session_ids=["sess-Y"],
+            session_tags=["claude/topic/auth"],
+            session_summary="authentication patterns",
+            limit=20,
+        )
+
+        assert len(results) == 1
+        assert results[0]["layer"] == "backlink"  # found in Layer 1, not duplicated
+
+
+class TestBuildContextBriefFallback:
+    """build_context_brief() falls back to file scan when vault index is unavailable."""
+
+    def test_fallback_when_vault_index_import_fails(self, tmp_vault, mock_config, monkeypatch):
+        """Insights still appear when vault_index module is missing."""
+        import obsidian_utils
+
+        # Create an insight note
+        insight = tmp_vault / "claude-insights" / "2026-04-10-test-insight.md"
+        insight.write_text(
+            "---\n"
+            "type: claude-insight\n"
+            "date: 2026-04-10\n"
+            "project: test-project\n"
+            "tags:\n"
+            "  - claude/insight\n"
+            "---\n\n"
+            "# Fallback Insight\n\n"
+            "This should appear via file scan fallback.\n",
+            encoding="utf-8",
+        )
+
+        # Stub session ID and cache
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: "test-sid")
+        monkeypatch.setattr(obsidian_utils, "cache_get", lambda *a: None)
+        monkeypatch.setattr(obsidian_utils, "cache_set", lambda *a: None)
+
+        # Block vault_index import by removing it from sys.modules and path
+        import sys as _sys
+        monkeypatch.delitem(_sys.modules, "vault_index", raising=False)
+        original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "vault_index":
+                raise ImportError("vault_index not available")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.__import__", mock_import)
+
+        brief = obsidian_utils.build_context_brief(
+            str(tmp_vault), "claude-sessions", "claude-insights", "test-project",
+        )
+
+        assert "Fallback Insight" in brief

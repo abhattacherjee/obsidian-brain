@@ -9,6 +9,7 @@ DB location: ~/.claude/obsidian-brain-vault.db (outside vault, alongside config)
 import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -34,8 +35,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
     title,
     body,
     tags,
-    content=notes,
-    content_rowid='rowid'
+    content=''
 );
 """
 
@@ -184,7 +184,7 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
             parsed.get("date"),
             parsed.get("project"),
             parsed.get("title", ""),
-            parsed.get("session_id"),
+            parsed.get("source_session"),
             parsed.get("source_note"),
             parsed.get("tags", ""),
             parsed.get("status"),
@@ -281,19 +281,25 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
 
     try:
         conn = _connect(db_path)
-        _init_schema(conn)
-        _sync(conn, vault_path, folders)
-        conn.close()
-    except sqlite3.DatabaseError:
+        try:
+            _init_schema(conn)
+            _sync(conn, vault_path, folders)
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as exc:
         # Corrupt DB — delete and recreate
+        print(f"[vault-index] Corrupt or incompatible DB ({exc}); rebuilding {db_path}",
+              file=sys.stderr)
         try:
             os.remove(db_path)
         except OSError:
             pass
         conn = _connect(db_path)
-        _init_schema(conn)
-        _sync(conn, vault_path, folders)
-        conn.close()
+        try:
+            _init_schema(conn)
+            _sync(conn, vault_path, folders)
+        finally:
+            conn.close()
 
     # Set permissions
     try:
@@ -321,9 +327,11 @@ def rebuild_index(vault_path: str, folders: list[str], db_path: str | None = Non
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
     conn = _connect(db_path)
-    _init_schema(conn)
-    stats = _sync(conn, vault_path, folders)
-    conn.close()
+    try:
+        _init_schema(conn)
+        stats = _sync(conn, vault_path, folders)
+    finally:
+        conn.close()
 
     try:
         os.chmod(db_path, 0o644)
@@ -349,10 +357,16 @@ def index_note(db_path: str, note_path: str) -> bool:
 
     try:
         conn = _connect(db_path)
-        _upsert_note(conn, note_path, parsed, st.st_mtime, st.st_size)
-        conn.commit()
-        conn.close()
-        return True
+        try:
+            _upsert_note(conn, note_path, parsed, st.st_mtime, st.st_size)
+            conn.commit()
+            return True
+        except sqlite3.Error as exc:
+            print(f"[vault-index] index_note failed for {note_path}: {exc}",
+                  file=sys.stderr)
+            return False
+        finally:
+            conn.close()
     except sqlite3.Error:
         return False
 
@@ -419,12 +433,11 @@ def search_vault(
 
     try:
         rows = conn.execute(sql, params).fetchall()
-        results = [dict(row) for row in rows]
-        conn.close()
-        return results
+        return [dict(row) for row in rows]
     except sqlite3.Error:
-        conn.close()
         return []
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -498,19 +511,21 @@ def query_related_notes(
             f"SELECT path, type, date, project, title, tags, status, "
             f"source_session, source_note, size "
             f"FROM notes WHERE source_session IN ({placeholders}) "
+            f"AND project = ? "
             f"{type_filter} "
             f"ORDER BY date DESC"
         )
         try:
-            rows = conn.execute(sql, session_ids + type_params).fetchall()
+            rows = conn.execute(sql, session_ids + [project] + type_params).fetchall()
             for row in rows:
                 d = dict(row)
                 d["layer"] = "backlink"
                 if d["path"] not in seen_paths:
                     results.append(d)
                     seen_paths.add(d["path"])
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as exc:
+            print(f"[vault-index] Layer 1 (backlinks) query failed: {exc}",
+                  file=sys.stderr)
 
     # Layer 2: Tag overlap (claude/topic/* tags)
     topic_tags = [t for t in session_tags if t.startswith("claude/topic/")]
@@ -535,8 +550,9 @@ def query_related_notes(
                     if d["path"] not in seen_paths:
                         results.append(d)
                         seen_paths.add(d["path"])
-            except sqlite3.Error:
-                pass
+            except sqlite3.Error as exc:
+                print(f"[vault-index] Layer 2 (tags) query failed: {exc}",
+                      file=sys.stderr)
 
     # Layer 3: FTS keyword search
     if len(results) < limit and session_summary:
@@ -564,8 +580,9 @@ def query_related_notes(
                         if d["path"] not in seen_paths:
                             results.append(d)
                             seen_paths.add(d["path"])
-                except sqlite3.Error:
-                    pass
+                except sqlite3.Error as exc:
+                    print(f"[vault-index] Layer 3 (FTS) query failed: {exc}",
+                          file=sys.stderr)
 
     conn.close()
     return results[:limit]
