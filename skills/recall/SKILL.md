@@ -127,7 +127,7 @@ If the status starts with "Failed:", use the sub-agent fallback:
    ```bash
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
    python3 -c '
-   import sys, os
+   import sys
    import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
    from obsidian_utils import upgrade_note_with_summary
    with open(sys.argv[5], "r") as f:
@@ -273,7 +273,7 @@ print(build_context_brief(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], ho
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER" "$PROJECT"
 ```
 
-The first line of the emitted `CONTEXT_BRIEF` is always the hook-status line. If it starts with `[OK]`, omit it from the displayed output — the user doesn't need to see "session logging active" every time. If it starts with `[WARN]`, display it verbatim so the user knows to take action (e.g., run `/obsidian-setup`).
+The first line of the emitted `CONTEXT_BRIEF` is always the hook-status line (prefixed `[OK]` when the SessionStart hook fired and bootstrap matches the current sid, `[WARN]` otherwise). Preserve it verbatim when displaying the brief — it is the user's only visible signal that hooks are alive.
 
 If the command fails (non-zero exit code), print the error and stop — do not fall back to in-context reads.
 
@@ -341,7 +341,7 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
     ```bash
     cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
     python3 -c '
-    import sys, os, json
+    import sys, json
     import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
     from open_item_dedup import batch_cascade_checkoff
     items = json.loads(sys.argv[4])

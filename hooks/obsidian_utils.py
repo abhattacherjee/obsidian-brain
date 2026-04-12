@@ -17,7 +17,6 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -309,16 +308,15 @@ def load_config() -> dict:
 
 
 def check_hook_status() -> dict:
-    """Inspect the bootstrap file to report session-logging health.
+    """Inspect the bootstrap file to report SessionStart hook health.
 
     Returns:
         {"ok": bool, "message": str, "bootstrap_sid": str, "current_sid": str}
 
-    "ok" is True if the bootstrap file exists (session logging is active).
-    A SID mismatch (bootstrap points at a previous session) is normal after
-    reconnects and does NOT indicate a problem — sessions are still logged.
-    "ok" is False only when the bootstrap file is missing entirely or no
-    session files can be found.
+    "ok" is True if the bootstrap file exists and matches the current session.
+    "ok" is False if the bootstrap is missing or points at a different sid
+    (which would indicate the SessionStart hook did not fire, or the fast
+    path is returning a stale value).
     """
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
@@ -339,7 +337,7 @@ def check_hook_status() -> dict:
     if bootstrap_sid is None:
         return {
             "ok": False,
-            "message": "Session logging may not be active — run /obsidian-setup to configure",
+            "message": "bootstrap file missing — SessionStart hook may not have fired",
             "bootstrap_sid": "",
             "current_sid": current_sid,
         }
@@ -347,25 +345,28 @@ def check_hook_status() -> dict:
     if current_sid == "unknown":
         return {
             "ok": False,
-            "message": "No session files found — run /obsidian-setup to verify configuration",
+            "message": (
+                "could not determine current session id from JSONLs "
+                "(no session files found)"
+            ),
             "bootstrap_sid": bootstrap_sid,
             "current_sid": current_sid,
         }
 
-    # Bootstrap exists = session logging is working. SID mismatch is
-    # expected after reconnects and is not a problem — keep ok=True
-    # but include diagnostic detail for debugging.
-    if bootstrap_sid != current_sid:
+    if bootstrap_sid == current_sid:
         return {
             "ok": True,
-            "message": "Session logging active (resumed session)",
+            "message": "SessionStart hook fired; bootstrap matches current session",
             "bootstrap_sid": bootstrap_sid,
             "current_sid": current_sid,
         }
 
     return {
-        "ok": True,
-        "message": "Session logging active",
+        "ok": False,
+        "message": (
+            f"bootstrap sid {bootstrap_sid[:8]} does not match current "
+            f"session {current_sid[:8]} — hook may be stale"
+        ),
         "bootstrap_sid": bootstrap_sid,
         "current_sid": current_sid,
     }
@@ -863,7 +864,7 @@ def generate_summary(
     assistant_msgs: list[str],
     metadata: dict,
     model: str = "haiku",
-    timeout: int = 30,
+    timeout: int = 15,
 ) -> str | None:
     """Call ``claude -p --model <model>`` to summarize the session.
 
@@ -1331,122 +1332,52 @@ def build_context_brief(
             pass
         history_rows.append(f"| {i+1} | {date} | {duration} | {title} | {branch} |")
 
-    # --- 3. Load insights via vault index (layered ranking) ---
+    # --- 3. Scan and read insights ---
     insight_entries: list[tuple[str, str]] = []  # (title, key_point)
     insight_count = 0
+    if insights_dir.is_dir():
+        insight_files = sorted(
+            [f for f in insights_dir.iterdir() if f.suffix == '.md'],
+            reverse=True
+        )
+        project_insights: list[Path] = []
+        for f in insight_files:
+            meta = read_note_metadata(str(f))
+            if not meta:
+                continue
+            fm_project = meta.get('project', '')
+            if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
+                continue
+            project_insights.append(f)
 
-    # Collect session context for layered ranking
-    _session_ids: list[str] = []
-    _session_tags: list[str] = []
-    _session_summary = ""
-    for _, _, _meta in session_files[:5]:
-        sid = _meta.get("session_id", "")
-        if sid:
-            _session_ids.append(sid)
-        for tag in _meta.get("tags", []):
-            if "claude/topic/" in tag and tag not in _session_tags:
-                _session_tags.append(tag)
-
-    # Build summary from loaded sessions
-    if most_recent_summary:
-        _session_summary = most_recent_summary
-
-    _use_vault_index = True
-    try:
-        from vault_index import ensure_index, query_related_notes
-    except ImportError:
-        _use_vault_index = False
-
-    if _use_vault_index:
-        try:
-            db_path = ensure_index(vault_path, [sessions_folder, insights_folder])
-            ranked_notes = query_related_notes(
-                db_path=db_path,
-                project=project,
-                session_ids=_session_ids,
-                session_tags=_session_tags,
-                session_summary=_session_summary,
-                note_types=["claude-insight", "claude-decision", "claude-error-fix", "claude-retro"],
-                limit=20,
-            )
-            insight_count = len(ranked_notes)
-            for note in ranked_notes:
-                title = note["title"]
-                key_point = ""
-                note_path = note["path"]
-                try:
-                    with open(note_path, "r", encoding="utf-8", errors="replace") as fh:
-                        past_frontmatter = False
-                        frontmatter_closed = False
-                        for line_text in fh:
-                            stripped = line_text.strip()
-                            if stripped == "---":
-                                if not past_frontmatter:
-                                    past_frontmatter = True
-                                    continue
-                                else:
-                                    frontmatter_closed = True
-                                    continue
-                            if not frontmatter_closed:
+        insight_count = len(project_insights)
+        for f in project_insights[:20]:
+            title = f.stem
+            key_point = ""
+            try:
+                with open(f, 'r', encoding='utf-8', errors='replace') as fh:
+                    past_frontmatter = False
+                    frontmatter_closed = False
+                    for line_text in fh:
+                        stripped = line_text.strip()
+                        if stripped == '---':
+                            if not past_frontmatter:
+                                past_frontmatter = True
                                 continue
-                            if stripped.startswith("# "):
+                            else:
+                                frontmatter_closed = True
                                 continue
-                            if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
-                                key_point = stripped[:100]
-                                break
-                except OSError:
-                    pass
-                insight_entries.append((title, key_point))
-        except (sqlite3.Error, OSError) as _vi_exc:
-            print(f"[obsidian-brain] vault index failed ({type(_vi_exc).__name__}: {_vi_exc}); "
-                  "falling back to file scan", file=sys.stderr)
-            _use_vault_index = False
-
-    if not _use_vault_index:
-        # Fallback to original file scan if vault index unavailable
-        if insights_dir.is_dir():
-            insight_files = sorted(
-                [f for f in insights_dir.iterdir() if f.suffix == '.md'],
-                reverse=True
-            )
-            project_insights: list[Path] = []
-            for f in insight_files:
-                meta = read_note_metadata(str(f))
-                if not meta:
-                    continue
-                fm_project = meta.get('project', '')
-                if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
-                    continue
-                project_insights.append(f)
-
-            insight_count = len(project_insights)
-            for f in project_insights[:20]:
-                title = f.stem
-                key_point = ""
-                try:
-                    with open(f, 'r', encoding='utf-8', errors='replace') as fh:
-                        past_frontmatter = False
-                        frontmatter_closed = False
-                        for line_text in fh:
-                            stripped = line_text.strip()
-                            if stripped == '---':
-                                if not past_frontmatter:
-                                    past_frontmatter = True
-                                    continue
-                                else:
-                                    frontmatter_closed = True
-                                    continue
-                            if not frontmatter_closed:
-                                continue
-                            if stripped.startswith('# '):
-                                title = stripped[2:].strip()
-                                continue
-                            if stripped and not stripped.startswith('#') and not stripped.startswith('---'):
-                                key_point = stripped[:100]
-                                break
-                except OSError:
-                    pass
-                insight_entries.append((title, key_point))
+                        if not frontmatter_closed:
+                            continue
+                        if stripped.startswith('# '):
+                            title = stripped[2:].strip()
+                            continue
+                        if stripped and not stripped.startswith('#') and not stripped.startswith('---'):
+                            key_point = stripped[:100]
+                            break
+            except OSError:
+                pass
+            insight_entries.append((title, key_point))
 
     # Trim insights to ~500 tokens (~375 words, ~1875 chars)
     insight_text_parts: list[str] = []
@@ -2141,48 +2072,8 @@ def upgrade_note_with_summary(
         if in_audit:
             new_lines.append(line)
 
-    # Extract the summary body signature BEFORE writing so we can fail the
-    # upgrade with a clear "malformed summary" error rather than silently
-    # degrading post-write verification. The signature is the first non-blank,
-    # non-heading line of the Summary section — used to prove on re-read that
-    # the body actually landed, not just the status flip.
-    #
-    # Heading detection follows ATX-heading rules strictly: `#{1,6}` must be
-    # followed by whitespace or end-of-line. A line like `#1234 issue ref` or
-    # `#hashtag note` is legitimate content, not a heading, and must not be
-    # skipped — otherwise it could produce a false "empty or heading-only
-    # Summary body" failure when it is the first real content line.
-    #
-    # The level-2 break uses `##(?:\s|$)` (any whitespace after, or EOL) so
-    # a tab-separated or double-space-separated next section like
-    # `##\tKey Decisions` still terminates the Summary block cleanly.
-    _atx_heading_re = re.compile(r'^#{1,6}(?:\s|$)')
-    _h2_re = re.compile(r'^##(?:\s|$)')
-    summary_signature = None
-    in_summary = False
-    for line in summary_text.split('\n'):
-        if line.strip() == '## Summary':
-            in_summary = True
-            continue
-        if in_summary:
-            stripped = line.strip()
-            if _h2_re.match(stripped):
-                break  # next top-level section — Summary body was empty
-            if _atx_heading_re.match(stripped):
-                continue  # sub-heading inside Summary — skip but keep looking
-            if stripped:
-                summary_signature = stripped
-                break
-
-    if summary_signature is None:
-        return f"Failed: malformed summary (empty or heading-only Summary body) from {source} for {os.path.basename(note_path)}"
-
-    # Atomic write with fsync + post-write verification.
-    # Guarantees the summary actually landed on disk before returning success.
-    # `or "."` handles the case where note_path is a bare filename (no
-    # directory component), which would otherwise produce `dir=""` and
-    # crash tempfile.mkstemp on every platform.
-    note_dir = os.path.dirname(note_path) or "."
+    # Atomic write
+    note_dir = os.path.dirname(note_path)
     try:
         fd, tmp_path = tempfile.mkstemp(prefix='.ob-upgrade-', suffix='.md.tmp', dir=note_dir)
     except OSError as exc:
@@ -2194,83 +2085,14 @@ def upgrade_note_with_summary(
             orig_mode = 0o644
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
-            f.flush()
-            os.fsync(f.fileno())
         os.chmod(tmp_path, orig_mode)
         os.replace(tmp_path, note_path)
-        # fsync the containing directory so the rename itself is durable
-        # across a crash, not just the file contents.
-        try:
-            dir_fd = os.open(note_dir, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            # Directory fsync is best-effort on filesystems that don't
-            # support it (e.g. some network mounts). The in-process
-            # verification below is the real guarantee for non-crash
-            # failure modes.
-            pass
     except OSError as exc:
         try:
             os.unlink(tmp_path)
-        except OSError as cleanup_exc:
-            print(
-                f"[obsidian-brain] failed to clean up temp file {tmp_path}: {cleanup_exc}",
-                file=sys.stderr,
-            )
+        except OSError:
+            pass
         return f"Failed: atomic write error for {os.path.basename(note_path)}: {exc}"
-
-    # Post-write verification: re-read the target file and confirm the
-    # summary actually landed. Protects against silent write-loss from
-    # concurrent writers, filesystem races, or phantom "success" returns.
-    try:
-        with open(note_path, 'r', encoding='utf-8') as f:
-            verify_content = f.read()
-    except OSError as exc:
-        return f"Failed: post-write read verification failed for {os.path.basename(note_path)}: {exc}"
-
-    # Scope the status check to the YAML frontmatter block so a note body
-    # that happens to mention "status: summarized" (in a conversation
-    # excerpt, a code block, or this very PR's diff) cannot false-positive
-    # the check. Anchor to the start of the file (allowing an optional
-    # UTF-8 BOM) so a Markdown horizontal rule `---` in the body cannot
-    # be mistaken for the opening frontmatter delimiter.
-    fm_match = re.match(
-        r'\ufeff?---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)',
-        verify_content,
-        re.DOTALL,
-    )
-    if fm_match is None:
-        return f"Failed: post-write verification — YAML frontmatter not found at start of {os.path.basename(note_path)}"
-    frontmatter_block = fm_match.group(1)
-    if not re.search(r'^\s*status:\s*summarized\s*$', frontmatter_block, re.MULTILINE):
-        return f"Failed: post-write verification — status not flipped to summarized in {os.path.basename(note_path)}"
-
-    # Scope the signature check to the ## Summary section specifically.
-    # Checking the whole file would false-positive if the signature text
-    # happens to appear in a preserved audit trail (Conversation raw,
-    # Tool Usage), even though the actual Summary body was clobbered.
-    # Boundary uses `##(?:\s|$)` to be consistent with ATX-heading rules —
-    # tab-separated or multi-space-separated next sections still terminate
-    # the Summary block extraction cleanly.
-    summary_match = re.search(
-        r'^## Summary\s*\n(.*?)(?=^##(?:\s|$)|\Z)',
-        verify_content,
-        re.MULTILINE | re.DOTALL,
-    )
-    if summary_match is None:
-        return f"Failed: post-write verification — ## Summary section not found in {os.path.basename(note_path)}"
-    summary_block = summary_match.group(1)
-    # Compare at line granularity — a substring match could false-positive
-    # if the signature is a substring of some other line in the Summary
-    # (e.g. the signature is "Fixed the bug." and an adjacent line says
-    # "Before: Fixed the bug. After: also broken."). The signature must
-    # appear as its own stripped line in the Summary block on disk.
-    summary_block_lines = {line.strip() for line in summary_block.split('\n')}
-    if summary_signature not in summary_block_lines:
-        return f"Failed: post-write verification — summary body missing from {os.path.basename(note_path)}"
 
     # Run dedup pass (non-fatal — note is already upgraded)
     removed = []
@@ -2420,7 +2242,7 @@ def upgrade_unsummarized_note(
     sessions_folder: str,
     project: str,
     summary_model: str = "haiku",
-    summary_timeout: int | None = None,
+    summary_timeout: int = 15,
 ) -> str:
     """Upgrade an unsummarized session note with an AI summary.
 
@@ -2527,11 +2349,9 @@ def upgrade_unsummarized_note(
         metadata["errors"] = parsed.get("errors", [])
 
     # Generate summary
-    gen_kwargs: dict = {"model": summary_model}
-    if summary_timeout is not None:
-        gen_kwargs["timeout"] = summary_timeout
     summary_text = generate_summary(
-        user_msgs, assistant_msgs, metadata, **gen_kwargs,
+        user_msgs, assistant_msgs, metadata,
+        model=summary_model, timeout=summary_timeout,
     )
 
     if not summary_text:
