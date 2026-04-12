@@ -272,3 +272,62 @@ class TestFlipNoteStatus:
         assert "project: my-project" in content
         assert "claude/session" in content
         assert "# Title" in content
+
+    def test_flip_note_status_only_changes_frontmatter_not_body(self, tmp_path):
+        """Status string in body must not be modified."""
+        from obsidian_utils import flip_note_status
+        note = tmp_path / "test-note.md"
+        note.write_text(
+            "---\nstatus: auto-logged\nproject: test\n---\n"
+            "The old status: auto-logged was changed.\n"
+        )
+        flip_note_status(str(note), "auto-logged", "summarized")
+        content = note.read_text()
+        assert "status: summarized" in content.split("---")[1]  # frontmatter
+        assert "status: auto-logged was changed" in content  # body preserved
+
+    def test_flip_note_status_ignores_body_when_frontmatter_differs(self, tmp_path):
+        """Body containing old status should not be modified if frontmatter status differs."""
+        from obsidian_utils import flip_note_status
+        note = tmp_path / "test-note.md"
+        note.write_text(
+            "---\nstatus: summarized\nproject: test\n---\n"
+            "Previously it was status: auto-logged\n"
+        )
+        result = flip_note_status(str(note), "auto-logged", "summarized")
+        assert result is False  # not found in frontmatter
+        content = note.read_text()
+        assert "Previously it was status: auto-logged" in content  # body untouched
+
+    def test_flip_note_status_returns_false_when_absent(self, tmp_path):
+        from obsidian_utils import flip_note_status
+        note = tmp_path / "test-note.md"
+        note.write_text("---\nstatus: summarized\n---\nContent\n")
+        result = flip_note_status(str(note), "auto-logged", "summarized")
+        assert result is False
+
+    def test_flip_note_status_returns_false_for_missing_file(self, tmp_path):
+        from obsidian_utils import flip_note_status
+        result = flip_note_status(str(tmp_path / "nonexistent.md"), "auto-logged", "summarized")
+        assert result is False
+
+
+class TestPathTraversalFilename:
+    """Additional path traversal tests for filename and symlink vectors."""
+
+    def test_write_vault_note_blocks_filename_traversal(self, tmp_path):
+        from obsidian_utils import write_vault_note
+        result = write_vault_note(str(tmp_path), "sessions", "../../../etc/passwd", "evil")
+        assert result is False
+
+    def test_write_vault_note_blocks_absolute_filename(self, tmp_path):
+        from obsidian_utils import write_vault_note
+        result = write_vault_note(str(tmp_path), "sessions", "/etc/passwd", "evil")
+        assert result is False
+
+    def test_write_vault_note_no_dir_created_on_traversal(self, tmp_path):
+        """Traversal check must run BEFORE mkdir to prevent side-effect directory creation."""
+        from obsidian_utils import write_vault_note
+        evil_dir = tmp_path / ".." / ".." / "evil-dir-test"
+        write_vault_note(str(tmp_path), "../../evil-dir-test", "test.md", "payload")
+        assert not evil_dir.exists()

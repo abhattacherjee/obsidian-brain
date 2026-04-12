@@ -324,11 +324,15 @@ def load_config() -> dict:
     # Auto-fix config file permissions if group/world readable
     try:
         config_stat = os.stat(_CONFIG_PATH)
-        if config_stat.st_mode & 0o077:
-            os.chmod(_CONFIG_PATH, 0o600)
-            print("[obsidian-brain] fixed config permissions to 0o600", file=sys.stderr)
     except OSError:
-        pass
+        pass  # file doesn't exist or can't stat — nothing to fix
+    else:
+        if config_stat.st_mode & 0o077:
+            try:
+                os.chmod(_CONFIG_PATH, 0o600)
+                print("[obsidian-brain] fixed config permissions to 0o600", file=sys.stderr)
+            except OSError as exc:
+                print(f"[obsidian-brain] WARNING: config is world-readable and chmod failed: {exc}", file=sys.stderr)
 
     cache_set(sid, "config", config)
     return config
@@ -1049,6 +1053,14 @@ def write_vault_note(
     Creates the target folder if it does not exist.  Returns True on success.
     """
     dest_dir = Path(vault_path) / folder
+    dest = dest_dir / filename
+
+    # Path traversal check — BEFORE any filesystem side effects
+    vault_real = Path(vault_path).resolve()
+    if not dest.resolve().is_relative_to(vault_real):
+        print(f"[obsidian-brain] path traversal blocked: {dest}", file=sys.stderr)
+        return False
+
     try:
         dest_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1056,14 +1068,6 @@ def write_vault_note(
             f"[obsidian-brain] cannot create vault dir {dest_dir}: {exc}",
             file=sys.stderr,
         )
-        return False
-
-    dest = dest_dir / filename
-
-    # Path traversal check
-    vault_real = Path(vault_path).resolve()
-    if not dest.resolve().is_relative_to(vault_real):
-        print(f"[obsidian-brain] path traversal blocked: {dest}", file=sys.stderr)
         return False
 
     try:
@@ -1105,10 +1109,18 @@ def flip_note_status(path: str, old_status: str, new_status: str) -> bool:
 
     old_line = f"status: {old_status}"
     new_line = f"status: {new_status}"
-    if old_line not in content:
+
+    # Constrain replacement to the frontmatter block (between --- delimiters)
+    if not content.startswith("---"):
+        return False
+    end_idx = content.index("\n---", 3) + 1 if "\n---" in content[3:] else -1
+    if end_idx < 0:
+        return False
+    frontmatter = content[:end_idx]
+    if old_line not in frontmatter:
         return False
 
-    new_content = content.replace(old_line, new_line, 1)
+    new_content = frontmatter.replace(old_line, new_line, 1) + content[end_idx:]
 
     dir_path = os.path.dirname(path)
     try:
@@ -1788,7 +1800,8 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
                 real_first = os.path.realpath(first)
                 if not real_first.startswith(str(projects_dir.resolve()) + os.sep):
                     return None
-            return Path(first) if first else None
+                return Path(real_first)
+            return None
     except subprocess.TimeoutExpired:
         # If `find` already timed out on this tree, a pure-Python rglob
         # will almost certainly be slower — the tree is too large. Treat
@@ -1808,7 +1821,10 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
     try:
         for path in projects_dir.rglob(target):
             if path.is_file():
-                return path
+                real = os.path.realpath(str(path))
+                if not real.startswith(str(projects_dir.resolve()) + os.sep):
+                    return None
+                return Path(real)
     except OSError:
         return None
     return None

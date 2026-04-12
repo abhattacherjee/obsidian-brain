@@ -78,10 +78,13 @@ config_path = os.path.expanduser("~/.claude/obsidian-brain-config.json")
 with open(config_path, "r") as f:
     config = json.load(f)
 config[sys.argv[1]] = json.loads(sys.argv[2])
-with open(config_path, "w") as f:
+import tempfile
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(config_path), suffix=".tmp")
+with os.fdopen(fd, "w") as f:
     json.dump(config, f, indent=2)
     f.write("\n")
-os.chmod(config_path, 0o600)
+os.chmod(tmp, 0o600)
+os.rename(tmp, config_path)
 print("OK")
 ' "$KEY" "$JSON_VALUE"
 ```
