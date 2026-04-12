@@ -1384,6 +1384,38 @@ def test_check_hook_status_matches(tmp_path, monkeypatch):
     assert status["current_sid"] == "live-sid-1111"
 
 
+def test_check_hook_status_sid_mismatch_is_ok(tmp_path, monkeypatch):
+    """SID mismatch (e.g. after reconnect) is ok=True when bootstrap exists."""
+    import obsidian_utils
+    import os, time
+
+    project_basename = "mismatch-proj"
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+    # Two JSONLs: old one matching bootstrap, newer one for current session
+    old_jsonl = cc_projects / "old-sid-aaaa.jsonl"
+    old_jsonl.write_text("{}", encoding="utf-8")
+    new_jsonl = cc_projects / "new-sid-bbbb.jsonl"
+    new_jsonl.write_text("{}", encoding="utf-8")
+    os.utime(old_jsonl, (time.time() - 3600, time.time() - 3600))
+    os.utime(new_jsonl, (time.time() - 10, time.time() - 10))
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text("old-sid-aaaa", encoding="utf-8")
+
+    status = obsidian_utils.check_hook_status()
+    assert status["ok"] is True
+    assert status["current_sid"] == "new-sid-bbbb"
+    assert status["bootstrap_sid"] == "old-sid-aaaa"
+
+
 def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
     """check_hook_status returns ok=False when bootstrap file is absent."""
     import obsidian_utils
@@ -1404,7 +1436,7 @@ def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
 
     status = obsidian_utils.check_hook_status()
     assert status["ok"] is False
-    assert "missing" in status["message"]
+    assert "not be active" in status["message"]
 
 
 def test_build_context_brief_prepends_hook_status(tmp_path):
@@ -1415,7 +1447,7 @@ def test_build_context_brief_prepends_hook_status(tmp_path):
     (vault / "sessions").mkdir(parents=True)
     (vault / "insights").mkdir(parents=True)
 
-    status_line = "[OK] SessionStart hook fired; bootstrap matches current session"
+    status_line = "[OK] Session logging active"
     output = obsidian_utils.build_context_brief(
         str(vault),
         "sessions",
