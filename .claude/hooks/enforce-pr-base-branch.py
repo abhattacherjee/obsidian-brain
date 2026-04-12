@@ -95,10 +95,12 @@ if re.search(r'(?:^|[;&|]\s*)gh\s+pr\s+create\b', command):
     sys.exit(0)
 
 # ── gh pr merge: verify base branch before merging ──
-# Handles both "gh pr merge 30" and "gh pr merge" (no PR number = current branch's PR).
-pr_merge_match = re.search(r'(?:^|[;&|]\s*)gh\s+pr\s+merge(?:\s+(\d+))?(?:\s|$)', command)
-if pr_merge_match:
-    pr_number = pr_merge_match.group(1)
+# Handles "gh pr merge 30", "gh pr merge --squash 30", and "gh pr merge" (no number).
+if re.search(r'(?:^|[;&|]\s*)gh\s+pr\s+merge\b', command):
+    # Extract PR number from anywhere in the args (handles flags before number)
+    pr_number_match = re.search(r'gh\s+pr\s+merge\b.*?(\d+)', command)
+    pr_number = pr_number_match.group(1) if pr_number_match else None
+
     if not pr_number:
         # Resolve PR number from current branch
         try:
@@ -119,25 +121,26 @@ if pr_merge_match:
             "Merge blocked because the base-branch safety check could not run."
         )
 
+    # Get both base and head ref from the PR itself (not current branch)
     try:
-        base_ref = subprocess.check_output(
-            ["gh", "pr", "view", pr_number, "--json", "baseRefName", "--jq", ".baseRefName"],
+        pr_info = subprocess.check_output(
+            ["gh", "pr", "view", pr_number, "--json", "baseRefName,headRefName",
+             "--jq", ".baseRefName + \" \" + .headRefName"],
             stderr=subprocess.DEVNULL, text=True
         ).strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
+        base_ref, head_ref = pr_info.split(" ", 1)
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         deny(
             f"⚠️ Cannot verify PR #{pr_number} base branch (gh pr view failed).\n\n"
             "Merge blocked because the safety check could not run.\n"
             "Common causes: gh auth expired, network issue, invalid PR number."
         )
 
-    branch = get_current_branch()
-
-    # Feature branches should only merge to develop
-    if branch.startswith("feature/") and base_ref != "develop":
+    # Use the PR's head ref (not current branch) for Git Flow classification
+    if head_ref.startswith("feature/") and base_ref != "develop":
         deny(
             f"❌ PR #{pr_number} targets '{base_ref}' but feature branches must merge to 'develop'!\n\n"
-            f"Current branch: {branch}\n"
+            f"PR head: {head_ref}\n"
             f"PR base: {base_ref}\n\n"
             f"Fix: close this PR and recreate with --base develop:\n"
             f"  gh pr close {pr_number}\n"
@@ -145,10 +148,10 @@ if pr_merge_match:
         )
 
     # Release/hotfix branches merge to main
-    if (branch.startswith("release/") or branch.startswith("hotfix/")) and base_ref != "main":
+    if (head_ref.startswith("release/") or head_ref.startswith("hotfix/")) and base_ref != "main":
         deny(
-            f"❌ PR #{pr_number} targets '{base_ref}' but {branch.split('/')[0]} branches must merge to 'main'!\n\n"
-            f"Current branch: {branch}\n"
+            f"❌ PR #{pr_number} targets '{base_ref}' but {head_ref.split('/')[0]} branches must merge to 'main'!\n\n"
+            f"PR head: {head_ref}\n"
             f"PR base: {base_ref}\n\n"
             f"Fix: close this PR and recreate with --base main:\n"
             f"  gh pr close {pr_number}\n"
