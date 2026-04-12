@@ -69,11 +69,13 @@ def get_current_branch() -> str:
 
 
 # ── gh pr create: enforce --base develop for feature branches ──
-if "gh pr create" in command:
+# Use command-boundary regex to avoid false positives on strings containing
+# "gh pr create" (e.g. echo, grep, heredocs).
+if re.search(r'(?:^|[;&|]\s*)gh\s+pr\s+create\b', command):
     branch = get_current_branch()
     if branch.startswith("feature/"):
-        # Check if --base is specified
-        base_match = re.search(r'--base\s+(\S+)', command)
+        # Check if --base is specified (supports both --base X and --base=X)
+        base_match = re.search(r'--base[=\s]+(\S+)', command)
         if not base_match:
             deny(
                 f"❌ PR base branch not specified!\n\n"
@@ -93,17 +95,41 @@ if "gh pr create" in command:
     sys.exit(0)
 
 # ── gh pr merge: verify base branch before merging ──
-pr_merge_match = re.search(r'gh pr merge\s+(\d+)', command)
+# Handles both "gh pr merge 30" and "gh pr merge" (no PR number = current branch's PR).
+pr_merge_match = re.search(r'(?:^|[;&|]\s*)gh\s+pr\s+merge(?:\s+(\d+))?(?:\s|$)', command)
 if pr_merge_match:
     pr_number = pr_merge_match.group(1)
+    if not pr_number:
+        # Resolve PR number from current branch
+        try:
+            pr_number = subprocess.check_output(
+                ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            deny(
+                "⚠️ Cannot determine PR number from current branch.\n\n"
+                "Merge blocked because the base-branch safety check could not run.\n"
+                "Specify the PR number explicitly: gh pr merge <number> --squash"
+            )
+
+    if not pr_number:
+        deny(
+            "⚠️ No open PR found for the current branch.\n\n"
+            "Merge blocked because the base-branch safety check could not run."
+        )
+
     try:
         base_ref = subprocess.check_output(
             ["gh", "pr", "view", pr_number, "--json", "baseRefName", "--jq", ".baseRefName"],
             stderr=subprocess.DEVNULL, text=True
         ).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
-        # Can't determine base — allow but warn
-        sys.exit(0)
+        deny(
+            f"⚠️ Cannot verify PR #{pr_number} base branch (gh pr view failed).\n\n"
+            "Merge blocked because the safety check could not run.\n"
+            "Common causes: gh auth expired, network issue, invalid PR number."
+        )
 
     branch = get_current_branch()
 
