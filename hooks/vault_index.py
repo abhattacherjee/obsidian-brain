@@ -97,24 +97,22 @@ def _parse_note(file_path: str) -> dict | None:
     Returns None for files that can't be parsed.
     """
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            lines = []
-            for i, line in enumerate(f):
-                if i >= 40:
-                    break
-                lines.append(line)
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            full_text = f.read()
     except OSError:
         return None
 
+    lines = full_text.split("\n")
     if not lines or lines[0].strip() != "---":
         return None
 
+    # Parse frontmatter (first 40 lines)
     meta: dict = {}
     tags: list[str] = []
     in_tags = False
     end_idx = None
 
-    for idx, line in enumerate(lines[1:], start=1):
+    for idx, line in enumerate(lines[1:40], start=1):
         stripped = line.strip()
         if stripped == "---":
             end_idx = idx
@@ -133,24 +131,24 @@ def _parse_note(file_path: str) -> dict | None:
             meta[key] = val
 
     if end_idx is None:
-        # No closing --- found
         return None
 
     if tags:
         meta["tags"] = ",".join(tags)
 
-    # Extract title from first heading after frontmatter
+    # Body: everything after closing ---
+    body_lines = lines[end_idx + 1:]
+    body = "\n".join(body_lines).strip()
+    meta["body"] = body
+
+    # Extract title from first H1 heading in body
     title = meta.get("title", "")
     if not title:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    stripped = line.strip()
-                    if stripped.startswith("# "):
-                        title = stripped[2:].strip()
-                        break
-        except OSError:
-            pass
+        for bl in body_lines:
+            stripped = bl.strip()
+            if stripped.startswith("# "):
+                title = stripped[2:].strip()
+                break
     meta["title"] = title
 
     # Handle source_session_note -> source_note (strip [[wikilink]])
@@ -158,19 +156,6 @@ def _parse_note(file_path: str) -> dict | None:
     if source_note_raw:
         meta["source_note"] = source_note_raw.strip("[]").replace("[[", "").replace("]]", "")
 
-    # Read body (everything after frontmatter)
-    body = ""
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            full_text = f.read()
-        # Find second --- and take everything after
-        parts = full_text.split("---", 2)
-        if len(parts) >= 3:
-            body = parts[2].strip()
-    except OSError:
-        pass
-
-    meta["body"] = body
     return meta
 
 
@@ -232,15 +217,14 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
     vault = Path(vault_path)
     stats = {"inserted": 0, "skipped": 0, "deleted": 0, "by_type": {}}
 
-    # Collect all .md files in target folders
-    disk_files: dict[str, Path] = {}  # rel_path -> absolute Path
+    # Collect all .md files in target folders (keyed by absolute path)
+    disk_files: dict[str, Path] = {}  # abs_path_str -> Path object
     for folder in folders:
         folder_path = vault / folder
         if not folder_path.is_dir():
             continue
         for md_file in folder_path.rglob("*.md"):
-            rel = str(md_file.relative_to(vault))
-            disk_files[rel] = md_file
+            disk_files[str(md_file)] = md_file
 
     # Get indexed files
     indexed = {
@@ -249,19 +233,19 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
     }
 
     # Delete removed files
-    for rel_path in list(indexed.keys()):
-        if rel_path not in disk_files:
-            _delete_note(conn, rel_path)
+    for abs_path_str in list(indexed.keys()):
+        if abs_path_str not in disk_files:
+            _delete_note(conn, abs_path_str)
             stats["deleted"] += 1
 
     # Insert/update files
-    for rel_path, abs_path in disk_files.items():
+    for abs_path_str, abs_path in disk_files.items():
         st = abs_path.stat()
         file_mtime = st.st_mtime
         file_size = st.st_size
 
         # Skip if mtime unchanged (0.001 tolerance)
-        if rel_path in indexed and abs(file_mtime - indexed[rel_path]) < 0.001:
+        if abs_path_str in indexed and abs(file_mtime - indexed[abs_path_str]) < 0.001:
             stats["skipped"] += 1
             continue
 
@@ -270,7 +254,7 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
             stats["skipped"] += 1
             continue
 
-        _upsert_note(conn, rel_path, parsed, file_mtime, file_size)
+        _upsert_note(conn, abs_path_str, parsed, file_mtime, file_size)
         note_type = parsed.get("type", "unknown")
         stats["by_type"][note_type] = stats["by_type"].get(note_type, 0) + 1
         stats["inserted"] += 1
