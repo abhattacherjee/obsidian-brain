@@ -66,6 +66,17 @@ case "$cmd" in
 
         trap - ERR
 
+        # Run security tests against installed cache
+        echo ""
+        echo "Running security tests..."
+        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+        if [ -f "$SCRIPT_DIR/test-security.sh" ]; then
+            bash "$SCRIPT_DIR/test-security.sh"
+            if [ $? -ne 0 ]; then
+                echo "WARNING: Security tests failed. Fix before testing in a live session."
+            fi
+        fi
+
         echo ""
         echo "Dev version installed to cache (v${PLUGIN_VERSION})."
         echo "Start a NEW Claude Code session to pick up the changes."
