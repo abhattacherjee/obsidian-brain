@@ -332,6 +332,33 @@ class TestSearchVault:
         )
         assert results == []
 
+    def test_ensure_index_syncs_new_files_before_search(self, tmp_vault):
+        """ensure_index() picks up files added after initial index build."""
+        db = str(tmp_vault / "test.db")
+        # Build initial index with one note
+        _write_note(
+            tmp_vault / "claude-insights" / "2026-04-12-old.md",
+            {"type": "claude-insight", "date": "2026-04-12", "project": "test"},
+            "# Old Insight\n\nExisting content about caching.",
+        )
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db)
+
+        # Add a new note AFTER initial index
+        _write_note(
+            tmp_vault / "claude-insights" / "2026-04-12-new.md",
+            {"type": "claude-insight", "date": "2026-04-12", "project": "test"},
+            "# Fresh Discovery\n\nBrand new insight about performance tuning.",
+        )
+
+        # Without re-syncing, search won't find it
+        results_stale = vault_index.search_vault(db, "performance tuning")
+        assert not any("Fresh" in r["title"] for r in results_stale)
+
+        # After ensure_index (lazy sync), the new note is found
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db)
+        results_fresh = vault_index.search_vault(db, "performance tuning")
+        assert any("Fresh" in r["title"] for r in results_fresh)
+
     def test_search_vault_hyphenated_query(self, tmp_vault):
         """Hyphenated queries find notes containing both words (not NOT)."""
         # Create a note with "maintain" and "catalog" in body
