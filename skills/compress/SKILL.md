@@ -95,7 +95,9 @@ else:
 ' "$TOPIC"
 ~~~
 
-Parse the JSON output. If `match` is `true`, store the `path` field as `MATCH_PATH` and the `title` field as `MATCH_TITLE`.
+Parse the JSON output. If the script exits non-zero or the output cannot be parsed as JSON, treat it as `{"match": false}` and proceed silently (log a note: "Could not search vault index; creating new note.").
+
+If `match` is `true`, store the `path` field as `MATCH_PATH` and the `title` field as `MATCH_TITLE`. Format `tags` by splitting on commas and joining with `, `. If `tags` is empty or null, display "no tags".
 
 **If `match` is `false`:** No existing note found. Proceed silently to Step 4A (create new note).
 
@@ -169,6 +171,8 @@ Use the Edit tool to append the update section to the note body.
 **Insertion point:** Scan the note from the bottom for these trailing metadata patterns: `_(Summary source: ...)_`, `## Tool Usage`, `## Conversation (raw)`, `## Session Metadata`, `## Files Touched`. If any are found, insert the update section on a new line immediately BEFORE the first trailing section. If none are found, append at the very end of the file.
 
 Use the Edit tool with the first line of the trailing section (or the last line of the file) as `old_string`, and prepend the update section + a blank line before it.
+
+**Verify:** After the Edit, use the Read tool to confirm the `## Update (YYYY-MM-DD)` heading is present in the note. If it is not, tell the user: "Failed to append update section — file may have unexpected structure. Please edit manually at `$MATCH_PATH`." Do NOT proceed to 4A-update.5 if the append failed.
 
 #### 4A-update.5 — Update frontmatter
 
