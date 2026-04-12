@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `enforce-pr-base-branch.py` PreToolUse hook — blocks pull request creation without `--base develop` on feature branches and verifies base branch before merge, preventing accidental merges to main
 - `hooks/vault_index.py` — SQLite + FTS5 vault index with lazy mtime-based sync, layered ranking queries (backlinks → tags → FTS keywords), and sub-millisecond ad-hoc search
 - `/vault-reindex` skill — full index rebuild for recovery, setup, and after bulk Obsidian edits
 - `/obsidian-setup` Step 8.5 — bootstraps vault index on first setup and upgrades
