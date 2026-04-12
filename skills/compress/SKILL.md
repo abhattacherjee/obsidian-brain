@@ -59,8 +59,56 @@ Stop here if FAIL.
 
 Check if the user provided a topic argument after `/compress`.
 
-- **With argument** (e.g. `/compress rate limiting strategy`): Go to Step 4A.
+- **With argument** (e.g. `/compress rate limiting strategy`): Go to Step 3.5.
 - **Without argument** (bare `/compress`): Go to Step 4B.
+
+### Step 3.5 — Search for existing notes on this topic
+
+Run a single Python call to search the vault index for existing notes matching the topic:
+
+~~~bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys, os, json
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from vault_index import ensure_index, search_vault
+from obsidian_utils import load_config
+c = load_config()
+vp = c["vault_path"]
+folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
+db = ensure_index(vp, folders)
+results = search_vault(db, sys.argv[1], note_type="claude-insight", limit=3)
+results += search_vault(db, sys.argv[1], note_type="claude-decision", limit=3)
+# Sort combined results by rank (most negative = best match)
+results.sort(key=lambda r: r["rank"])
+# Apply high-confidence threshold: top result must have rank <= -5.0
+# AND must be significantly ahead of #2 (at least 3x better rank)
+if results:
+    top = results[0]
+    rank_gap_ok = len(results) < 2 or abs(top["rank"]) > abs(results[1]["rank"]) * 1.5
+    if top["rank"] <= -5.0 and rank_gap_ok:
+        print(json.dumps({"match": True, "path": top["path"], "title": top["title"], "date": top["date"], "tags": top["tags"], "rank": top["rank"]}))
+    else:
+        print(json.dumps({"match": False}))
+else:
+    print(json.dumps({"match": False}))
+' "$TOPIC"
+~~~
+
+Parse the JSON output.
+
+**If `match` is `false`:** No existing note found. Proceed silently to Step 4A (create new note).
+
+**If `match` is `true`:** Present the match to the user:
+
+> Found an existing note on this topic:
+> **"<title>"** (<date>, <tags as comma-separated list>)
+>
+> Would you like to **update** this note or **create new**?
+
+Wait for the user's response:
+- **"update"** → Go to Step 4A-update.
+- **"create new"** → Go to Step 4A (create new note as before).
 
 ### Step 4A — Single-topic extraction
 
