@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-04-12
+
 ### Security
 - **CRITICAL:** Move all temp/cache files from `/tmp` to `~/.claude/obsidian-brain/` (0o700) — prevents symlink attacks (C1)
 - **CRITICAL:** Remove `OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX` env var override — prevents arbitrary file write (C2)
