@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `/compress <topic>` update mode — searches vault index for existing notes via FTS5 and offers to append a dated `## Update (YYYY-MM-DD)` section instead of creating duplicates
+- New `last_updated` frontmatter field set on each append to existing insight/decision notes
+- New topic tags from update content are appended without duplicating existing tags
 - `enforce-pr-base-branch.py` PreToolUse hook — blocks pull request creation without `--base develop` on feature branches and verifies base branch before merge, preventing accidental merges to main
 - `hooks/vault_index.py` — SQLite + FTS5 vault index with lazy mtime-based sync, layered ranking queries (backlinks → tags → FTS keywords), and sub-millisecond ad-hoc search
 - `/vault-reindex` skill — full index rebuild for recovery, setup, and after bulk Obsidian edits
