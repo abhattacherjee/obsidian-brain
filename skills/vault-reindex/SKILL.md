@@ -28,11 +28,13 @@ c = load_config()
 if not c.get("vault_path"):
     print("ERROR: vault_path not configured", file=sys.stderr)
     sys.exit(1)
-print("VAULT=" + c["vault_path"] + " SESS=" + c.get("sessions_folder", "claude-sessions") + " INS=" + c.get("insights_folder", "claude-insights"))
+print("VAULT=" + c["vault_path"])
+print("SESS=" + c.get("sessions_folder", "claude-sessions"))
+print("INS=" + c.get("insights_folder", "claude-insights"))
 '
 ```
 
-Parse the output line to extract `VAULT`, `SESS`, and `INS` values.
+Parse each output line as KEY=VALUE, splitting on the first `=`.
 
 If config is missing or the command fails, tell the user:
 

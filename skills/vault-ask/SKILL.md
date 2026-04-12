@@ -30,11 +30,14 @@ if not c.get("vault_path"):
     print("ERROR: vault_path not configured", file=sys.stderr)
     sys.exit(1)
 project = os.path.basename(os.getcwd()).lower().replace(" ", "-")
-print("VAULT=" + c["vault_path"] + " SESS=" + c.get("sessions_folder", "claude-sessions") + " INS=" + c.get("insights_folder", "claude-insights") + " PROJECT=" + project)
+print("VAULT=" + c["vault_path"])
+print("SESS=" + c.get("sessions_folder", "claude-sessions"))
+print("INS=" + c.get("insights_folder", "claude-insights"))
+print("PROJECT=" + project)
 '
 ```
 
-Parse the output line to extract `VAULT_PATH`, `SESSIONS_FOLDER`, `INSIGHTS_FOLDER`, and `PROJECT`.
+Parse each output line as KEY=VALUE, splitting on the first `=`.
 
 If the command exits non-zero or prints ERROR, tell the user:
 
