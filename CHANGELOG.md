@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Haiku summarization timeout bumped from 15s to 30s (retry escalation: 30s/60s). Empirical measurement showed ~9-10s CLI startup overhead, leaving insufficient time for generation at 15s.
+- `upgrade_unsummarized_note()` timeout is now a passthrough to `generate_summary()` — single source of truth instead of duplicated defaults.
+- `check_hook_status()` SID mismatch (common after reconnects) is now `ok=True`. Only warns when bootstrap file is missing entirely.
+- `/recall` hook-status messages reworded for end users: `[OK]` lines suppressed from output, `[WARN]` shows actionable guidance.
+- README updated with vault-index architecture details.
+
 ### Added
 - `hooks/vault_index.py` — SQLite + FTS5 vault index with lazy mtime-based sync, layered ranking queries (backlinks → tags → FTS keywords), and sub-millisecond ad-hoc search
 - `/vault-reindex` skill — full index rebuild for recovery, setup, and after bulk Obsidian edits
