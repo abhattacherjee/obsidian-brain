@@ -1418,7 +1418,7 @@ def test_check_hook_status_sid_mismatch_is_ok(tmp_path, monkeypatch):
 
 
 def test_check_hook_status_no_session_files(tmp_path, monkeypatch):
-    """check_hook_status returns ok=False when bootstrap exists but no JONLs."""
+    """check_hook_status returns ok=False when bootstrap exists but no JSONLs."""
     import obsidian_utils
 
     project_basename = "no-sessions-proj"
