@@ -371,6 +371,557 @@ class TestUpgradeNoteWithSummary:
         )
         assert result.startswith("Failed:")
 
+    def test_upgrade_note_with_summary_post_write_detects_status_not_flipped(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Clobber with original (auto-logged) content — status-flip branch fires."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "SIGNATURE_MARKER_FOR_STATUS_BRANCH landed successfully.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+        stale_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "status: auto-logged" in stale_content  # sanity check fixture
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(stale_content)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "status not flipped" in result, (
+            f"expected status-branch message, got {result!r}"
+        )
+
+    def test_upgrade_note_with_summary_post_write_detects_body_missing(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Clobber preserves status: summarized but strips the body signature —
+        signature branch MUST fire (regression guard for deleted body check)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "BODY_BRANCH_SIGNATURE_LINE that must appear on disk.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+
+        # Craft stale content that passes status check but lacks the signature.
+        fake_summarized = (
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-10\n"
+            "project: test-project\n"
+            "session_id: stale-session\n"
+            "status: summarized\n"
+            "---\n"
+            "\n# Stale content\n\n## Summary\nDifferent prior summary body.\n"
+        )
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(fake_summarized)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "summary body missing" in result, (
+            f"expected body-branch message, got {result!r}"
+        )
+
+    def test_upgrade_note_with_summary_body_check_scoped_to_summary_section(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Signature check must be scoped to ## Summary — if the signature
+        appears only in a preserved audit trail (not in Summary body), the
+        function must still return Failed. Regression guard for Copilot #1."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "AUDIT_TRAIL_FALSE_POSITIVE_SIGNATURE test line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+
+        # Craft stale content that:
+        #   - passes the frontmatter status check (status: summarized)
+        #   - has a ## Summary section with a DIFFERENT body
+        #   - leaks the signature into an audit trail section
+        # If the signature check were whole-file, it would pass here. It
+        # must only pass when the signature is in the Summary block.
+        fake_content = (
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-10\n"
+            "project: test-project\n"
+            "session_id: stale-session\n"
+            "status: summarized\n"
+            "---\n"
+            "\n# Stale content\n\n"
+            "## Summary\nThis is a different body that does not contain the signature.\n\n"
+            "## Tool Usage\n"
+            "- Message: AUDIT_TRAIL_FALSE_POSITIVE_SIGNATURE test line.\n"
+        )
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(fake_content)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "summary body missing" in result, (
+            f"expected body-branch message, got {result!r}"
+        )
+
+    def test_upgrade_note_with_summary_tab_separated_next_section_breaks_cleanly(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Pre-write: an empty Summary body followed by `##\\tKey Decisions`
+        (tab separator, not space) must still be recognized as the next
+        top-level section so the loop breaks and the malformed-body check
+        fires. Regression guard for Copilot #6 round 7 (level-2 heading
+        must match any whitespace, not just space)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        # Empty Summary body, next section uses a TAB after `##`.
+        tab_summary = (
+            "## Summary\n\n"
+            "##\tKey Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            tab_summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        # Must fail malformed — if the break condition missed the tab,
+        # the loop would pick up "Key Decisions" text as the signature
+        # and proceed to an Upgraded state with an empty real Summary.
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "malformed summary" in result.lower()
+        assert "empty or heading-only" in result.lower()
+
+    def test_upgrade_note_with_summary_post_write_tab_separated_section_boundary(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Post-write: the Summary block extraction regex must terminate
+        at `##\\tKey Decisions` (tab separator), not swallow the next
+        section. If it failed to terminate, a signature that lives ONLY
+        in the next tabbed section would false-positive the body check.
+
+        The clobber moves the signature out of the Summary body and into
+        the tabbed Key Decisions section — so:
+          - correct regex termination → Summary block is empty of signature
+            → Failed: summary body missing
+          - buggy regex (swallows the tabbed section) → Summary block
+            contains the signature → phantom Upgraded
+
+        Regression guard for Copilot round 7 #2 (lookahead must allow any
+        whitespace after the `##` delimiter) AND round 8 (the round-7 test
+        was branch-confused because it only checked the happy path)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "TAB_BOUNDARY_SIGNATURE content line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+
+        # Stale content: valid YAML frontmatter with status: summarized,
+        # an empty Summary body, and the signature hiding in a tab-
+        # separated next section. If the extraction regex terminates
+        # properly at `##\t`, the Summary block will be empty (no signature)
+        # and the function must return Failed. If it fails to terminate,
+        # it swallows the Key Decisions section and false-positives.
+        clobber_content = (
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-10\n"
+            "project: test-project\n"
+            "session_id: stale-session\n"
+            "status: summarized\n"
+            "---\n"
+            "\n# Clobbered\n\n"
+            "## Summary\n\n"
+            "##\tKey Decisions\n"
+            "- TAB_BOUNDARY_SIGNATURE content line.\n"
+        )
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(clobber_content)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "summary body missing" in result, (
+            f"expected body-branch message, got {result!r}"
+        )
+
+    def test_upgrade_note_with_summary_hash_prefixed_content_is_not_a_heading(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """A line starting with `#` followed by non-whitespace (e.g. `#1234`
+        or `#hashtag`) is legitimate Markdown content, not an ATX heading,
+        and must be accepted as the signature. Regression guard for
+        Copilot #6 (strict ATX heading detection)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        # First real content line starts with `#` but is not an ATX heading.
+        summary = (
+            "## Summary\n"
+            "#1234 issue reference — fixed the auth bug.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Upgraded"), (
+            f"expected Upgraded, got {result!r} — hash-prefixed content line "
+            f"was incorrectly classified as a heading"
+        )
+        disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "status: summarized" in disk_content
+        assert "#1234 issue reference — fixed the auth bug." in disk_content
+
+    def test_upgrade_note_with_summary_skips_sub_headings_inside_summary(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """A legitimate ATX sub-heading like `### Context` inside the Summary
+        block should be skipped, and the next real content line becomes the
+        signature. Pins the "sub-heading != break" branch of the new logic."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "### Context\n"
+            "The real signature is on this line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Upgraded"), f"expected Upgraded, got {result!r}"
+        disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "The real signature is on this line." in disk_content
+
+    def test_upgrade_note_with_summary_body_check_is_line_granular(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Signature must match as a full stripped line in the Summary block,
+        not as a substring of another line. Regression guard for Copilot #4."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        # Signature is "Short sig." — could false-positive as a substring
+        # of "Before: Short sig. After: also changed." if the check used
+        # a substring match instead of line equality.
+        summary = (
+            "## Summary\n"
+            "Short sig.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+
+        # Stale content has `## Summary` with a line that CONTAINS "Short sig."
+        # as a substring but is not equal to it. Under a substring check
+        # this false-positives; under line-granularity it must fail.
+        fake_content = (
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-10\n"
+            "project: test-project\n"
+            "session_id: stale-session\n"
+            "status: summarized\n"
+            "---\n"
+            "\n# Stale content\n\n"
+            "## Summary\nBefore: Short sig. After: something else entirely.\n"
+        )
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(fake_content)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "summary body missing" in result, (
+            f"expected line-granular miss, got {result!r}"
+        )
+
+    def test_upgrade_note_with_summary_accepts_bare_filename(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Bare filename (no directory component) must not crash tempfile.mkstemp.
+        Regression guard for Copilot #3 latent bug (low-confidence suppressed)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+        # cd into the note's parent so a bare filename resolves correctly.
+        monkeypatch.chdir(sample_unsummarized_note.parent)
+
+        summary = (
+            "## Summary\n"
+            "BARE_FILENAME_SIGNATURE content line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            sample_unsummarized_note.name,  # bare filename, no directory
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Upgraded"), f"expected Upgraded, got {result!r}"
+        disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "status: summarized" in disk_content
+        assert "BARE_FILENAME_SIGNATURE content line." in disk_content
+
+    def test_upgrade_note_with_summary_frontmatter_anchored_to_file_start(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Clobber writes content with no YAML frontmatter but with a Markdown
+        horizontal rule `---` and `status: summarized` in the body. The
+        frontmatter scope check must fail because the opening `---` is not
+        anchored to the start of the file. Regression guard for Copilot #3."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "FRONTMATTER_ANCHOR_SIGNATURE content line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        real_replace = os.replace
+        note_path_str = str(sample_unsummarized_note)
+
+        # No YAML frontmatter at start — just a title, a Markdown HR, and
+        # a line that SAYS status: summarized in the body text. If the
+        # frontmatter detector was not start-anchored, it would scoop the
+        # HR as "frontmatter" and find the status line within it.
+        fake_content = (
+            "# Stale session with no frontmatter\n"
+            "\n"
+            "Some narrative text here.\n"
+            "\n"
+            "---\n"
+            "status: summarized\n"
+            "(this is a body line that LOOKS like frontmatter)\n"
+            "---\n"
+            "\n"
+            "## Summary\nFRONTMATTER_ANCHOR_SIGNATURE content line.\n"
+        )
+
+        def clobbering_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(fake_content)
+
+        monkeypatch.setattr(os, "replace", clobbering_replace)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "YAML frontmatter not found at start" in result, (
+            f"expected anchored-frontmatter message, got {result!r}"
+        )
+
+    def test_upgrade_note_with_summary_rejects_empty_body(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Summary with header but no body content fails loudly (not phantom OK)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        empty_body_summary = (
+            "## Summary\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            empty_body_summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "malformed summary" in result.lower()
+        assert "empty or heading-only" in result.lower()
+
+    def test_upgrade_note_with_summary_post_write_read_failure(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Post-write re-read raising OSError → Failed (not phantom success)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "POST_READ_FAILURE_SIGNATURE content line.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        import builtins
+        real_open = builtins.open
+        note_path_str = str(sample_unsummarized_note)
+        replace_done = {"flag": False}
+        real_replace = os.replace
+
+        def flagging_replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if str(dst) == note_path_str:
+                replace_done["flag"] = True
+
+        def failing_open(path, mode="r", *args, **kwargs):
+            if (
+                replace_done["flag"]
+                and str(path) == note_path_str
+                and "r" in mode
+                and "w" not in mode
+            ):
+                raise OSError("simulated post-write read failure")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", flagging_replace)
+        monkeypatch.setattr(builtins, "open", failing_open)
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            note_path_str, summary, str(tmp_vault), "claude-sessions", "test-project"
+        )
+
+        assert result.startswith("Failed:"), f"expected Failed:, got {result!r}"
+        assert "post-write read verification failed" in result
+
+    def test_upgrade_note_with_summary_persists_to_disk(
+        self, sample_unsummarized_note, tmp_vault, monkeypatch
+    ):
+        """Happy path: the summary signature is readable from disk after return."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        summary = (
+            "## Summary\n"
+            "UNIQUE_POST_WRITE_CHECK_PHRASE landed on disk successfully.\n\n"
+            "## Key Decisions\nNone noted.\n\n"
+            "## Changes Made\nNone noted.\n\n"
+            "## Errors Encountered\nNone.\n\n"
+            "## Open Questions / Next Steps\nNone.\n"
+        )
+
+        result = obsidian_utils.upgrade_note_with_summary(
+            str(sample_unsummarized_note),
+            summary,
+            str(tmp_vault),
+            "claude-sessions",
+            "test-project",
+        )
+
+        assert result.startswith("Upgraded")
+        # Re-read from disk (not cached text).
+        disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
+        assert "status: summarized" in disk_content
+        assert "UNIQUE_POST_WRITE_CHECK_PHRASE landed on disk successfully." in disk_content
+
 
 # ===========================================================================
 # Section 10: Prepare summary input
@@ -833,6 +1384,65 @@ def test_check_hook_status_matches(tmp_path, monkeypatch):
     assert status["current_sid"] == "live-sid-1111"
 
 
+def test_check_hook_status_sid_mismatch_is_ok(tmp_path, monkeypatch):
+    """SID mismatch (e.g. after reconnect) is ok=True when bootstrap exists."""
+    import obsidian_utils
+    import os, time
+
+    project_basename = "mismatch-proj"
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+    # Two JSONLs: old one matching bootstrap, newer one for current session
+    old_jsonl = cc_projects / "old-sid-aaaa.jsonl"
+    old_jsonl.write_text("{}", encoding="utf-8")
+    new_jsonl = cc_projects / "new-sid-bbbb.jsonl"
+    new_jsonl.write_text("{}", encoding="utf-8")
+    os.utime(old_jsonl, (time.time() - 3600, time.time() - 3600))
+    os.utime(new_jsonl, (time.time() - 10, time.time() - 10))
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text("old-sid-aaaa", encoding="utf-8")
+
+    status = obsidian_utils.check_hook_status()
+    assert status["ok"] is True
+    assert status["current_sid"] == "new-sid-bbbb"
+    assert status["bootstrap_sid"] == "old-sid-aaaa"
+    assert "resumed session" in status["message"]
+
+
+def test_check_hook_status_no_session_files(tmp_path, monkeypatch):
+    """check_hook_status returns ok=False when bootstrap exists but no JSONLs."""
+    import obsidian_utils
+
+    project_basename = "no-sessions-proj"
+    # CC projects dir exists but has NO .jsonl files
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text("some-old-sid", encoding="utf-8")
+
+    status = obsidian_utils.check_hook_status()
+    assert status["ok"] is False
+    assert "No session files found" in status["message"]
+    assert status["bootstrap_sid"] == "some-old-sid"
+    assert status["current_sid"] == "unknown"
+
+
 def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
     """check_hook_status returns ok=False when bootstrap file is absent."""
     import obsidian_utils
@@ -853,7 +1463,7 @@ def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
 
     status = obsidian_utils.check_hook_status()
     assert status["ok"] is False
-    assert "missing" in status["message"]
+    assert "not be active" in status["message"]
 
 
 def test_build_context_brief_prepends_hook_status(tmp_path):
@@ -864,7 +1474,7 @@ def test_build_context_brief_prepends_hook_status(tmp_path):
     (vault / "sessions").mkdir(parents=True)
     (vault / "insights").mkdir(parents=True)
 
-    status_line = "[OK] SessionStart hook fired; bootstrap matches current session"
+    status_line = "[OK] Session logging active"
     output = obsidian_utils.build_context_brief(
         str(vault),
         "sessions",
