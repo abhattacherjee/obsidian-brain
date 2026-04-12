@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1398,7 +1399,7 @@ def build_context_brief(
                 except OSError:
                     pass
                 insight_entries.append((title, key_point))
-        except Exception as _vi_exc:
+        except (sqlite3.Error, OSError) as _vi_exc:
             print(f"[obsidian-brain] vault index failed ({type(_vi_exc).__name__}: {_vi_exc}); "
                   "falling back to file scan", file=sys.stderr)
             _use_vault_index = False

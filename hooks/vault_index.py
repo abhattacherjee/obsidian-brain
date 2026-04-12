@@ -408,33 +408,37 @@ def search_vault(
 
     try:
         conn = _connect(db_path)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        print(f"[vault-index] search_vault could not connect: {exc}",
+              file=sys.stderr)
         return []
 
-    sql = (
-        "SELECT n.path, n.type, n.date, n.project, n.title, n.tags, n.status, "
-        "n.source_session, n.source_note, n.size, "
-        "rank "
-        "FROM notes_fts f "
-        "JOIN notes n ON n.rowid = f.rowid "
-        "WHERE notes_fts MATCH ? "
-    )
-    params: list = [sanitized]
-
-    if project:
-        sql += "AND n.project = ? "
-        params.append(project)
-    if note_type:
-        sql += "AND n.type = ? "
-        params.append(note_type)
-
-    sql += "ORDER BY rank LIMIT ?"
-    params.append(limit)
-
     try:
+        sql = (
+            "SELECT n.path, n.type, n.date, n.project, n.title, n.tags, n.status, "
+            "n.source_session, n.source_note, n.size, "
+            "rank "
+            "FROM notes_fts f "
+            "JOIN notes n ON n.rowid = f.rowid "
+            "WHERE notes_fts MATCH ? "
+        )
+        params: list = [sanitized]
+
+        if project:
+            sql += "AND n.project = ? "
+            params.append(project)
+        if note_type:
+            sql += "AND n.type = ? "
+            params.append(note_type)
+
+        sql += "ORDER BY rank LIMIT ?"
+        params.append(limit)
+
         rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        print(f"[vault-index] search_vault query failed: {exc}",
+              file=sys.stderr)
         return []
     finally:
         conn.close()
@@ -491,98 +495,102 @@ def query_related_notes(
 
     try:
         conn = _connect(db_path)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        print(f"[vault-index] query_related_notes could not connect: {exc}",
+              file=sys.stderr)
         return []
 
-    results: list[dict] = []
-    seen_paths: set[str] = set()
+    try:
+        results: list[dict] = []
+        seen_paths: set[str] = set()
 
-    type_filter = ""
-    type_params: list = []
-    if note_types:
-        placeholders = ",".join("?" for _ in note_types)
-        type_filter = f"AND type IN ({placeholders})"
-        type_params = list(note_types)
+        type_filter = ""
+        type_params: list = []
+        if note_types:
+            placeholders = ",".join("?" for _ in note_types)
+            type_filter = f"AND type IN ({placeholders})"
+            type_params = list(note_types)
 
-    # Layer 1: Backlinks — notes whose source_session matches loaded sessions
-    if session_ids:
-        placeholders = ",".join("?" for _ in session_ids)
-        sql = (
-            f"SELECT path, type, date, project, title, tags, status, "
-            f"source_session, source_note, size "
-            f"FROM notes WHERE source_session IN ({placeholders}) "
-            f"AND project = ? "
-            f"{type_filter} "
-            f"ORDER BY date DESC"
-        )
-        try:
-            rows = conn.execute(sql, session_ids + [project] + type_params).fetchall()
-            for row in rows:
-                d = dict(row)
-                d["layer"] = "backlink"
-                if d["path"] not in seen_paths:
-                    results.append(d)
-                    seen_paths.add(d["path"])
-        except sqlite3.Error as exc:
-            print(f"[vault-index] Layer 1 (backlinks) query failed: {exc}",
-                  file=sys.stderr)
-
-    # Layer 2: Tag overlap (claude/topic/* tags)
-    topic_tags = [t for t in session_tags if t.startswith("claude/topic/")]
-    if topic_tags and len(results) < limit:
-        for tag in topic_tags:
-            if len(results) >= limit:
-                break
+        # Layer 1: Backlinks — notes whose source_session matches loaded sessions
+        if session_ids:
+            placeholders = ",".join("?" for _ in session_ids)
             sql = (
                 f"SELECT path, type, date, project, title, tags, status, "
                 f"source_session, source_note, size "
-                f"FROM notes WHERE tags LIKE ? AND project = ? "
+                f"FROM notes WHERE source_session IN ({placeholders}) "
+                f"AND project = ? "
                 f"{type_filter} "
                 f"ORDER BY date DESC"
             )
             try:
-                rows = conn.execute(
-                    sql, [f"%{tag}%", project] + type_params
-                ).fetchall()
+                rows = conn.execute(sql, session_ids + [project] + type_params).fetchall()
                 for row in rows:
                     d = dict(row)
-                    d["layer"] = "tag"
+                    d["layer"] = "backlink"
                     if d["path"] not in seen_paths:
                         results.append(d)
                         seen_paths.add(d["path"])
             except sqlite3.Error as exc:
-                print(f"[vault-index] Layer 2 (tags) query failed: {exc}",
+                print(f"[vault-index] Layer 1 (backlinks) query failed: {exc}",
                       file=sys.stderr)
 
-    # Layer 3: FTS keyword search
-    if len(results) < limit and session_summary:
-        keywords = extract_keywords(session_summary)
-        if keywords:
-            fts_query = _sanitize_fts_query(" ".join(keywords))
-            if fts_query:
-                remaining = limit - len(results)
+        # Layer 2: Tag overlap (claude/topic/* tags)
+        topic_tags = [t for t in session_tags if t.startswith("claude/topic/")]
+        if topic_tags and len(results) < limit:
+            for tag in topic_tags:
+                if len(results) >= limit:
+                    break
                 sql = (
-                    f"SELECT n.path, n.type, n.date, n.project, n.title, n.tags, "
-                    f"n.status, n.source_session, n.source_note, n.size "
-                    f"FROM notes_fts f "
-                    f"JOIN notes n ON n.rowid = f.rowid "
-                    f"WHERE notes_fts MATCH ? AND n.project = ? "
+                    f"SELECT path, type, date, project, title, tags, status, "
+                    f"source_session, source_note, size "
+                    f"FROM notes WHERE tags LIKE ? AND project = ? "
                     f"{type_filter} "
-                    f"ORDER BY rank LIMIT ?"
+                    f"ORDER BY date DESC"
                 )
                 try:
                     rows = conn.execute(
-                        sql, [fts_query, project] + type_params + [remaining]
+                        sql, [f"%{tag}%", project] + type_params
                     ).fetchall()
                     for row in rows:
                         d = dict(row)
-                        d["layer"] = "fts"
+                        d["layer"] = "tag"
                         if d["path"] not in seen_paths:
                             results.append(d)
                             seen_paths.add(d["path"])
                 except sqlite3.Error as exc:
-                    print(f"[vault-index] Layer 3 (FTS) query failed: {exc}",
+                    print(f"[vault-index] Layer 2 (tags) query failed: {exc}",
                           file=sys.stderr)
 
-    conn.close()
-    return results[:limit]
+        # Layer 3: FTS keyword search
+        if len(results) < limit and session_summary:
+            keywords = extract_keywords(session_summary)
+            if keywords:
+                fts_query = _sanitize_fts_query(" ".join(keywords))
+                if fts_query:
+                    remaining = limit - len(results)
+                    sql = (
+                        f"SELECT n.path, n.type, n.date, n.project, n.title, n.tags, "
+                        f"n.status, n.source_session, n.source_note, n.size "
+                        f"FROM notes_fts f "
+                        f"JOIN notes n ON n.rowid = f.rowid "
+                        f"WHERE notes_fts MATCH ? AND n.project = ? "
+                        f"{type_filter} "
+                        f"ORDER BY rank LIMIT ?"
+                    )
+                    try:
+                        rows = conn.execute(
+                            sql, [fts_query, project] + type_params + [remaining]
+                        ).fetchall()
+                        for row in rows:
+                            d = dict(row)
+                            d["layer"] = "fts"
+                            if d["path"] not in seen_paths:
+                                results.append(d)
+                                seen_paths.add(d["path"])
+                    except sqlite3.Error as exc:
+                        print(f"[vault-index] Layer 3 (FTS) query failed: {exc}",
+                              file=sys.stderr)
+
+        return results[:limit]
+    finally:
+        conn.close()
