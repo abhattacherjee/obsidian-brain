@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Escape bash `[[` conditionals in raw conversation excerpts to prevent Obsidian from parsing them as wikilinks
+
+### Added
+- `escape_wikilinks()` helper in `obsidian_utils.py`
+- `spurious-wikilinks` vault-doctor check — detects and repairs unescaped `[[` in existing session notes
+
 ## [2.0.0] - 2026-04-12
 
 ### Security

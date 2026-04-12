@@ -179,6 +179,63 @@ class TestRawMessageToggle:
         assert "## Conversation (raw)" in result
 
 
+class TestWikilinkEscaping:
+    """Bash [[ ]] conditionals must not become Obsidian wikilinks."""
+
+    def test_escape_wikilinks_basic(self):
+        from obsidian_utils import escape_wikilinks
+        assert escape_wikilinks("if [[ $X == y ]]; then") == r"if \[\[ $X == y ]]; then"
+
+    def test_escape_wikilinks_no_false_positive(self):
+        from obsidian_utils import escape_wikilinks
+        # Single brackets should not be touched
+        assert escape_wikilinks("if [ $X == y ]; then") == "if [ $X == y ]; then"
+
+    def test_escape_wikilinks_empty(self):
+        from obsidian_utils import escape_wikilinks
+        assert escape_wikilinks("") == ""
+
+    def test_escape_wikilinks_multiple(self):
+        from obsidian_utils import escape_wikilinks
+        text = "[[ a ]] && [[ b ]]"
+        assert text.count("[[") == 2
+        result = escape_wikilinks(text)
+        assert "[[" not in result
+        assert r"\[\[" in result
+
+    def test_build_raw_fallback_escapes_wikilinks_in_user_msgs(self):
+        from obsidian_utils import build_raw_fallback
+        result = build_raw_fallback(
+            ['if [[ $CURRENT_BRANCH == feature/* ]]; then echo yes; fi'],
+            {"project": "test", "duration_minutes": 5},
+            config={"log_raw_messages": True},
+        )
+        assert "[[" not in result.split("## Conversation (raw)")[1]
+        assert r"\[\[" in result
+
+    def test_build_raw_fallback_escapes_wikilinks_in_assistant_msgs(self):
+        from obsidian_utils import build_raw_fallback
+        result = build_raw_fallback(
+            ["user msg"],
+            {"project": "test", "duration_minutes": 5},
+            assistant_msgs=['Run: if [[ $VAR ]]; then ...'],
+            config={"log_raw_messages": True},
+        )
+        assert r"\[\[" in result
+
+    def test_build_raw_fallback_escapes_wikilinks_in_tool_usage(self):
+        from obsidian_utils import build_raw_fallback
+        result = build_raw_fallback(
+            ["user msg"],
+            {"project": "test", "duration_minutes": 5},
+            tool_uses=[{"name": "Bash", "detail": 'if [[ -f foo ]]; then rm foo; fi'}],
+            config={"log_raw_messages": True},
+        )
+        tool_section = result.split("## Tool Usage")[1].split("##")[0]
+        assert "[[" not in tool_section
+        assert r"\[\[" in tool_section
+
+
 class TestShellInjectionFix:
     """H4: commit-preflight.sh uses sys.argv, not path interpolation."""
 
