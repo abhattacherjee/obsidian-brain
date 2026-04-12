@@ -249,6 +249,7 @@ def cache_invalidate(session_id: str, *keys: str) -> None:
     for k in keys:
         data.pop(k, None)
 
+    _ensure_secure_dir()
     fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
     try:
         with os.fdopen(fd, 'w') as f:
@@ -1823,7 +1824,7 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
             if path.is_file():
                 real = os.path.realpath(str(path))
                 if not real.startswith(str(projects_dir.resolve()) + os.sep):
-                    return None
+                    continue  # skip symlinks escaping projects_dir
                 return Path(real)
     except OSError:
         return None
@@ -2097,12 +2098,12 @@ def build_raw_fallback(
         sections.append("None detected.")
     sections.append("")
 
-    # Tool usage details (commands run, files edited)
+    # Tool usage details (commands run, files edited) — scrubbed for secrets
     if tool_uses:
         sections.append("## Tool Usage")
         for tu in tool_uses[:80]:
             name = tu.get("name", "")
-            detail = tu.get("detail", "")
+            detail = scrub_secrets(tu.get("detail", ""))
             if name and detail:
                 sections.append(f"- **{name}**: {detail}")
             elif name:

@@ -24,7 +24,7 @@ def _import_hook_module():
     return importlib.import_module("obsidian_session_hint")
 
 
-def test_hook_writes_bootstrap_file(tmp_path, monkeypatch):
+def test_hook_writes_bootstrap_file(tmp_path):
     """Hook writes the authoritative session_id to the bootstrap file."""
     project_dir = tmp_path / "fake-project"
     project_dir.mkdir()

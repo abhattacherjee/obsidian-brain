@@ -71,8 +71,7 @@ case "$cmd" in
         echo "Running security tests..."
         SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
         if [ -f "$SCRIPT_DIR/test-security.sh" ]; then
-            bash "$SCRIPT_DIR/test-security.sh"
-            if [ $? -ne 0 ]; then
+            if ! bash "$SCRIPT_DIR/test-security.sh"; then
                 echo "WARNING: Security tests failed. Fix before testing in a live session."
             fi
         fi

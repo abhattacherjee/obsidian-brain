@@ -8,10 +8,6 @@ from unittest.mock import patch
 
 import pytest
 
-# Import from repo hooks directly
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'hooks'))
-
 
 class TestSecureDirectory:
     """C1: All temp/cache files use ~/.claude/obsidian-brain/ instead of /tmp."""
