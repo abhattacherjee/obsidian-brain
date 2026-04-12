@@ -384,10 +384,14 @@ def index_note(db_path: str, note_path: str) -> bool:
 def _sanitize_fts_query(query: str) -> str:
     """Sanitize user input for FTS5 MATCH.
 
-    Wraps each word in double quotes and joins with OR.
+    Replaces hyphens with spaces (FTS5 unicode61 tokenizer treats hyphens
+    as token separators, so "maintain-catalog" inside quotes becomes
+    "maintain" NOT "catalog"). Then wraps each word in quotes and joins
+    with OR.
     """
-    # Extract alphanumeric words
-    words = re.findall(r"[a-zA-Z0-9_/-]+", query)
+    # Replace hyphens with spaces before tokenization to avoid FTS5 NOT operator
+    query = query.replace("-", " ")
+    words = re.findall(r"[a-zA-Z0-9_/]+", query)
     if not words:
         return ""
     return " OR ".join(f'"{w}"' for w in words)

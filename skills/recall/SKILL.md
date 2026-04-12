@@ -341,7 +341,7 @@ Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
     ```bash
     cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
     python3 -c '
-    import sys, json
+    import sys, os, json
     import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
     from open_item_dedup import batch_cascade_checkoff
     items = json.loads(sys.argv[4])
