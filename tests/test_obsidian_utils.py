@@ -1414,6 +1414,33 @@ def test_check_hook_status_sid_mismatch_is_ok(tmp_path, monkeypatch):
     assert status["ok"] is True
     assert status["current_sid"] == "new-sid-bbbb"
     assert status["bootstrap_sid"] == "old-sid-aaaa"
+    assert "resumed session" in status["message"]
+
+
+def test_check_hook_status_no_session_files(tmp_path, monkeypatch):
+    """check_hook_status returns ok=False when bootstrap exists but no JONLs."""
+    import obsidian_utils
+
+    project_basename = "no-sessions-proj"
+    # CC projects dir exists but has NO .jsonl files
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text("some-old-sid", encoding="utf-8")
+
+    status = obsidian_utils.check_hook_status()
+    assert status["ok"] is False
+    assert "No session files found" in status["message"]
+    assert status["bootstrap_sid"] == "some-old-sid"
+    assert status["current_sid"] == "unknown"
 
 
 def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):

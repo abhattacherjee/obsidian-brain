@@ -347,13 +347,22 @@ def check_hook_status() -> dict:
     if current_sid == "unknown":
         return {
             "ok": False,
-            "message": "No session files found — this may be a new project",
+            "message": "No session files found — run /obsidian-setup to verify configuration",
             "bootstrap_sid": bootstrap_sid,
             "current_sid": current_sid,
         }
 
     # Bootstrap exists = session logging is working. SID mismatch is
-    # expected after reconnects and is not a problem.
+    # expected after reconnects and is not a problem — keep ok=True
+    # but include diagnostic detail for debugging.
+    if bootstrap_sid != current_sid:
+        return {
+            "ok": True,
+            "message": "Session logging active (resumed session)",
+            "bootstrap_sid": bootstrap_sid,
+            "current_sid": current_sid,
+        }
+
     return {
         "ok": True,
         "message": "Session logging active",
