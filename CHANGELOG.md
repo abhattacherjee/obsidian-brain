@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **CRITICAL:** Move all temp/cache files from `/tmp` to `~/.claude/obsidian-brain/` (0o700) — prevents symlink attacks (C1)
+- **CRITICAL:** Remove `OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX` env var override — prevents arbitrary file write (C2)
+- **HIGH:** Add path traversal validation to `write_vault_note()` — blocks `../` escape from vault (H1)
+- **HIGH:** Add `scrub_secrets()` — best-effort regex redaction of API keys, tokens, passwords in raw session notes (H2)
+- **HIGH:** Add `log_raw_messages` config toggle — disable raw conversation logging entirely (H2)
+- **HIGH:** Validate `transcript_path` stays inside `~/.claude/projects/` (H3)
+- **HIGH:** Fix shell injection in `commit-preflight.sh` — pass path via `sys.argv` (H4)
+- Change all file permissions from 0o644 to 0o600 for vault notes, DB, and config (M1, M2)
+- Fix SKILL.md config output to newline-separated KEY=VALUE — supports vault paths with spaces (M3)
+- Fix `vault-reindex` to use `sys.argv` instead of inline interpolation (M4)
+- Replace `sed -i` in standup with atomic `flip_note_status()` (M5)
+- Cap `sys.stdin.read()` to 1MB in all hook entry points (M6)
+- Escape LIKE wildcards in vault_index tag queries (M7)
+- Validate `find_transcript_jsonl` output stays inside projects dir (M8)
+- Standardize JSON cascade checkoff calls to use stdin pattern (L1)
+
 ### Added
+- `/vault-config` skill — interactive settings menu for toggling obsidian-brain configuration
+- `scripts/test-security.sh` — automated security validation (27 checks), runs from `/dev-test install` and CI
+- `security-tests` CI job — runs security checks on every PR
+- Security Patterns section in CLAUDE.md
 - `/compress <topic>` update mode — searches vault index for existing notes via FTS5 and offers to append a dated `## Update (YYYY-MM-DD)` section instead of creating duplicates
 - New `last_updated` frontmatter field set on each append to existing insight/decision notes
 - New topic tags from update content are appended without duplicating existing tags
