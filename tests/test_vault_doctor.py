@@ -163,6 +163,94 @@ def test_cli_unknown_check_errors(tmp_path):
     assert result.returncode == 3, f"expected exit 3, got {result.returncode}"
 
 
+def test_registry_lists_spurious_wikilinks_check():
+    """The registry auto-discovers the spurious_wikilinks check module."""
+    import vault_doctor_checks
+    importlib.reload(vault_doctor_checks)
+    names = vault_doctor_checks.list_checks()
+    assert "spurious-wikilinks" in names
+
+
+def test_spurious_wikilinks_scan_detects_bash_conditionals(tmp_path):
+    """scan() finds unescaped [[ in conversation lines."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    (vault / "claude-sessions" / "2026-04-12-proj-abcd.md").write_text(
+        "---\ntype: claude-session\nproject: proj\n---\n"
+        "# Session\n"
+        '**User:** if [[ $BRANCH == feature/* ]]; then echo yes; fi\n'
+        "**Assistant:** ok\n",
+        encoding="utf-8",
+    )
+    from vault_doctor_checks import spurious_wikilinks
+    issues = spurious_wikilinks.scan(str(vault), "claude-sessions", "claude-insights", 9999)
+    assert len(issues) == 1
+    assert issues[0].project == "proj"
+    assert "1 line(s)" in issues[0].current_source
+
+
+def test_spurious_wikilinks_scan_ignores_escaped(tmp_path):
+    """scan() does not flag already-escaped \\[\\[."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    (vault / "claude-sessions" / "2026-04-12-proj-abcd.md").write_text(
+        "---\ntype: claude-session\nproject: proj\n---\n"
+        "# Session\n"
+        r'**User:** if \[\[ $BRANCH == feature/* ]]; then echo yes; fi' + "\n",
+        encoding="utf-8",
+    )
+    from vault_doctor_checks import spurious_wikilinks
+    issues = spurious_wikilinks.scan(str(vault), "claude-sessions", "claude-insights", 9999)
+    assert len(issues) == 0
+
+
+def test_spurious_wikilinks_scan_ignores_non_conversation_lines(tmp_path):
+    """scan() does not flag [[ in non-conversation lines (e.g., frontmatter wikilinks)."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    (vault / "claude-sessions" / "2026-04-12-proj-abcd.md").write_text(
+        '---\ntype: claude-session\nproject: proj\nsource_session_note: "[[2026-04-12-proj-1234]]"\n---\n'
+        "# Session\n"
+        "Normal text with no bash.\n",
+        encoding="utf-8",
+    )
+    from vault_doctor_checks import spurious_wikilinks
+    issues = spurious_wikilinks.scan(str(vault), "claude-sessions", "claude-insights", 9999)
+    assert len(issues) == 0
+
+
+def test_spurious_wikilinks_apply_escapes_and_backs_up(tmp_path):
+    """apply() escapes [[ and creates a backup."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    note = vault / "claude-sessions" / "2026-04-12-proj-abcd.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: proj\n---\n"
+        "# Session\n"
+        '**User:** if [[ $X == y ]]; then echo yes; fi\n'
+        "**Assistant:** sure\n",
+        encoding="utf-8",
+    )
+
+    from vault_doctor_checks import spurious_wikilinks
+    issues = spurious_wikilinks.scan(str(vault), "claude-sessions", "claude-insights", 9999)
+    assert len(issues) == 1
+
+    backup_root = str(tmp_path / "backups")
+    results = spurious_wikilinks.apply(issues, backup_root)
+    assert len(results) == 1
+    assert results[0].status == "applied"
+    assert results[0].backup_path is not None
+
+    patched = note.read_text(encoding="utf-8")
+    assert "[[" not in patched.split("# Session")[1]
+    assert r"\[\[" in patched
+
+    # Backup contains original
+    backup_content = Path(results[0].backup_path).read_text(encoding="utf-8")
+    assert "[[" in backup_content
+
+
 def test_cli_missing_vault_errors(tmp_path, monkeypatch):
     """Missing vault config → exit 3."""
     import subprocess, sys, os
