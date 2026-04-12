@@ -70,6 +70,20 @@ jobs:
       - name: Run tests with coverage
         run: pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90
 
+  # ── Security tests — runs on all PRs ──────────────────────────
+  security-tests:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Run security tests
+        env:
+          OB_HOOKS_DIR: hooks
+        run: bash scripts/test-security.sh
+
   # ── Post-merge: release verification (main only, advisory) ─
   detect-release-merge:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
