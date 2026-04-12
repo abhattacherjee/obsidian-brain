@@ -332,6 +332,33 @@ class TestSearchVault:
         )
         assert results == []
 
+    def test_search_vault_hyphenated_query(self, tmp_vault):
+        """Hyphenated queries find notes containing both words (not NOT)."""
+        # Create a note with "maintain" and "catalog" in body
+        _write_note(
+            tmp_vault / "claude-insights" / "maintain-catalogs.md",
+            {"type": "claude-insight", "date": "2026-04-12", "project": "test"},
+            "# Maintain Catalogs\n\nAlways use /maintain-catalogs for catalog additions.",
+        )
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db
+        )
+
+        # "maintain-catalog" should find the note (not exclude it via NOT)
+        results = vault_index.search_vault(db, "maintain-catalog")
+        assert len(results) >= 1
+        assert any("Maintain" in r["title"] for r in results)
+
+    def test_sanitize_fts_query_strips_hyphens(self):
+        """_sanitize_fts_query replaces hyphens with spaces to avoid FTS5 NOT."""
+        from vault_index import _sanitize_fts_query
+
+        result = _sanitize_fts_query("maintain-catalog")
+        assert "-" not in result
+        assert '"maintain"' in result
+        assert '"catalog"' in result
+
 
 # ---------------------------------------------------------------------------
 # Commit 4: extract_keywords + query_related_notes + corrupt DB
