@@ -1332,35 +1332,49 @@ def build_context_brief(
             pass
         history_rows.append(f"| {i+1} | {date} | {duration} | {title} | {branch} |")
 
-    # --- 3. Scan and read insights ---
+    # --- 3. Load insights via vault index (layered ranking) ---
     insight_entries: list[tuple[str, str]] = []  # (title, key_point)
     insight_count = 0
-    if insights_dir.is_dir():
-        insight_files = sorted(
-            [f for f in insights_dir.iterdir() if f.suffix == '.md'],
-            reverse=True
-        )
-        project_insights: list[Path] = []
-        for f in insight_files:
-            meta = read_note_metadata(str(f))
-            if not meta:
-                continue
-            fm_project = meta.get('project', '')
-            if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
-                continue
-            project_insights.append(f)
 
-        insight_count = len(project_insights)
-        for f in project_insights[:20]:
-            title = f.stem
+    # Collect session context for layered ranking
+    _session_ids: list[str] = []
+    _session_tags: list[str] = []
+    _session_summary = ""
+    for _, _, _meta in session_files[:5]:
+        sid = _meta.get("session_id", "")
+        if sid:
+            _session_ids.append(sid)
+        for tag in _meta.get("tags", []):
+            if "claude/topic/" in tag and tag not in _session_tags:
+                _session_tags.append(tag)
+
+    # Build summary from loaded sessions
+    if most_recent_summary:
+        _session_summary = most_recent_summary
+
+    try:
+        from vault_index import ensure_index, query_related_notes
+        db_path = ensure_index(vault_path, [sessions_folder, insights_folder])
+        ranked_notes = query_related_notes(
+            db_path=db_path,
+            project=project,
+            session_ids=_session_ids,
+            session_tags=_session_tags,
+            session_summary=_session_summary,
+            limit=20,
+        )
+        insight_count = len(ranked_notes)
+        for note in ranked_notes:
+            title = note["title"]
             key_point = ""
+            note_path = note["path"]
             try:
-                with open(f, 'r', encoding='utf-8', errors='replace') as fh:
+                with open(note_path, "r", encoding="utf-8", errors="replace") as fh:
                     past_frontmatter = False
                     frontmatter_closed = False
                     for line_text in fh:
                         stripped = line_text.strip()
-                        if stripped == '---':
+                        if stripped == "---":
                             if not past_frontmatter:
                                 past_frontmatter = True
                                 continue
@@ -1369,15 +1383,59 @@ def build_context_brief(
                                 continue
                         if not frontmatter_closed:
                             continue
-                        if stripped.startswith('# '):
-                            title = stripped[2:].strip()
+                        if stripped.startswith("# "):
                             continue
-                        if stripped and not stripped.startswith('#') and not stripped.startswith('---'):
+                        if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
                             key_point = stripped[:100]
                             break
             except OSError:
                 pass
             insight_entries.append((title, key_point))
+    except Exception:
+        # Fallback to original file scan if vault index unavailable
+        if insights_dir.is_dir():
+            insight_files = sorted(
+                [f for f in insights_dir.iterdir() if f.suffix == '.md'],
+                reverse=True
+            )
+            project_insights: list[Path] = []
+            for f in insight_files:
+                meta = read_note_metadata(str(f))
+                if not meta:
+                    continue
+                fm_project = meta.get('project', '')
+                if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
+                    continue
+                project_insights.append(f)
+
+            insight_count = len(project_insights)
+            for f in project_insights[:20]:
+                title = f.stem
+                key_point = ""
+                try:
+                    with open(f, 'r', encoding='utf-8', errors='replace') as fh:
+                        past_frontmatter = False
+                        frontmatter_closed = False
+                        for line_text in fh:
+                            stripped = line_text.strip()
+                            if stripped == '---':
+                                if not past_frontmatter:
+                                    past_frontmatter = True
+                                    continue
+                                else:
+                                    frontmatter_closed = True
+                                    continue
+                            if not frontmatter_closed:
+                                continue
+                            if stripped.startswith('# '):
+                                title = stripped[2:].strip()
+                                continue
+                            if stripped and not stripped.startswith('#') and not stripped.startswith('---'):
+                                key_point = stripped[:100]
+                                break
+                except OSError:
+                    pass
+                insight_entries.append((title, key_point))
 
     # Trim insights to ~500 tokens (~375 words, ~1875 chars)
     insight_text_parts: list[str] = []
