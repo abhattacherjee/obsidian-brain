@@ -77,6 +77,11 @@ def _slow_path_newest_sid() -> str:
     safe_project = _glob.escape(project)
     pattern = os.path.expanduser(f"~/.claude/projects/*{safe_project}/*.jsonl")
     matches = _glob.glob(pattern)
+    # Fallback: Claude Code normalizes underscores to hyphens in project dirs
+    if not matches and "_" in safe_project:
+        alt = safe_project.replace("_", "-")
+        pattern = os.path.expanduser(f"~/.claude/projects/*{alt}/*.jsonl")
+        matches = _glob.glob(pattern)
     entries = [(_safe_mtime(p), p) for p in matches]
     viable = [(m, p) for m, p in entries if m >= 0]
     if not viable:

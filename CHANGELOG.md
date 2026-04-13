@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Add `from __future__ import annotations` to `vault_index.py` and `obsidian_context_snapshot.py` — fixes PEP 604 `TypeError` on macOS system Python 3.9.6
+- Fix false "No session files found" warning in `check_hook_status()` when project directory contains underscores (Claude Code normalizes `_` to `-` in project paths)
 
 ### Added
 - Regression test `test_hooks_future_annotations` ensuring all hook files with PEP 604/585 syntax include the `__future__` import
+- Test `test_slow_path_underscore_to_hyphen_fallback` for underscore-to-hyphen project path matching
 
 ## [2.0.1] - 2026-04-12
 

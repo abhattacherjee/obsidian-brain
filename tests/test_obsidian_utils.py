@@ -1443,6 +1443,26 @@ def test_check_hook_status_no_session_files(tmp_path, monkeypatch):
     assert status["current_sid"] == "unknown"
 
 
+def test_slow_path_underscore_to_hyphen_fallback(tmp_path, monkeypatch):
+    """_slow_path_newest_sid matches when cwd has underscores but CC dir has hyphens."""
+    import obsidian_utils
+
+    # cwd basename has underscores
+    proj_dir = tmp_path / "personal_ws"
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # Claude Code normalizes underscores to hyphens in project dir names
+    cc_projects = tmp_path / ".claude" / "projects" / "-Users-foo-personal-ws"
+    cc_projects.mkdir(parents=True)
+    jsonl = cc_projects / "abc123.jsonl"
+    jsonl.write_text("{}", encoding="utf-8")
+
+    sid = obsidian_utils._slow_path_newest_sid()
+    assert sid == "abc123", f"Expected 'abc123' but got '{sid}' — hyphen fallback failed"
+
+
 def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
     """check_hook_status returns ok=False when bootstrap file is absent."""
     import obsidian_utils
