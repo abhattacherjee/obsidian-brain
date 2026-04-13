@@ -74,6 +74,26 @@ def test_cache_glob_finds_installed_hooks():
     )
 
 
+def test_no_tail_c_in_skills():
+    """SKILL.md files must not use 'tail -c' for hash extraction.
+
+    tail -c counts raw bytes including trailing newlines, producing fewer
+    visible characters than expected (e.g. 3 hex chars instead of 4).
+    Use 'cut -c' instead. Lines containing "Do NOT use" are warnings, not usage.
+    """
+    _TAIL_C_RE = re.compile(r'tail -c')
+    _WARNING_RE = re.compile(r'Do NOT use.*tail -c')
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill_name = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                if _TAIL_C_RE.search(line) and not _WARNING_RE.search(line):
+                    raise AssertionError(
+                        f"Skill {skill_name} line {lineno} uses 'tail -c' which "
+                        "miscounts bytes due to trailing newlines. Use 'cut -c' instead."
+                    )
+
+
 def test_hooks_future_annotations():
     """Hook .py files using PEP 604/585 type hints must have 'from __future__ import annotations'.
 

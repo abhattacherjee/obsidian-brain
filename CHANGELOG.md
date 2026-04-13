@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Regression test `test_hooks_future_annotations` ensuring all hook files with PEP 604/585 syntax include the `__future__` import
 - Test `test_slow_path_underscore_to_hyphen_fallback` for underscore-to-hyphen project path matching
+- Test `test_no_tail_c_in_skills` preventing `tail -c` usage in SKILL.md files
 
 ## [2.0.1] - 2026-04-12
 
