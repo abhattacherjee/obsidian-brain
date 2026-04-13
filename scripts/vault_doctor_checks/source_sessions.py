@@ -153,6 +153,11 @@ def _jsonl_dir_for_project(project: str) -> Path | None:
     safe_project = glob.escape(project)
     pattern = os.path.join(home, ".claude", "projects", f"*{safe_project}")
     matches = glob.glob(pattern)
+    # Fallback: Claude Code normalizes underscores to hyphens in project dirs
+    if not matches and "_" in safe_project:
+        alt = safe_project.replace("_", "-")
+        pattern = os.path.join(home, ".claude", "projects", f"*{alt}")
+        matches = glob.glob(pattern)
     if not matches:
         return None
 

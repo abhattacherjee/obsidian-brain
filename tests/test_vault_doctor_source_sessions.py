@@ -526,6 +526,19 @@ def test_jsonl_dir_for_project_deterministic_same_mtime_tiebreak(tmp_path, monke
     assert result1 == result2, f"non-deterministic: {result1} vs {result2}"
 
 
+def test_jsonl_dir_for_project_underscore_to_hyphen_fallback(tmp_path, monkeypatch):
+    """Project with underscores matches CC dir with hyphens."""
+    import vault_doctor_checks.source_sessions as check
+
+    cc_dir = tmp_path / ".claude" / "projects" / "-Users-foo-my-project"
+    cc_dir.mkdir(parents=True)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    result = check._jsonl_dir_for_project("my_project")
+    assert result is not None, "Expected hyphen fallback to match"
+    assert str(result).endswith("-Users-foo-my-project")
+
+
 def test_apply_rejects_path_traversal_in_project_name(doctor_vault, tmp_path):
     """An issue with a malicious project name cannot write outside backup_root."""
     import vault_doctor_checks.source_sessions as check

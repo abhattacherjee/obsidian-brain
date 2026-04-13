@@ -65,6 +65,24 @@ def _safe_mtime(path: str) -> float:
         return -1.0
 
 
+def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str]:
+    """Glob ~/.claude/projects/*<project>/<suffix>, with underscore-to-hyphen fallback.
+
+    Claude Code normalizes underscores to hyphens in project directory names,
+    so a project at ``personal_ws/`` gets stored as ``personal-ws/``.
+    """
+    import glob as _glob
+    pattern = os.path.expanduser(
+        f"~/.claude/projects/*{safe_project}/{suffix}"
+    )
+    matches = _glob.glob(pattern)
+    if not matches and "_" in safe_project:
+        alt = safe_project.replace("_", "-")
+        pattern = os.path.expanduser(f"~/.claude/projects/*{alt}/{suffix}")
+        matches = _glob.glob(pattern)
+    return matches
+
+
 def _slow_path_newest_sid() -> str:
     """Determine the current session id by scanning JSONL files directly.
 
@@ -72,16 +90,10 @@ def _slow_path_newest_sid() -> str:
     cache. Used by health checks that must not be fooled by stale cache
     entries. Returns 'unknown' if no JSONLs are found for the current cwd.
     """
-    project = os.path.basename(os.getcwd())
     import glob as _glob
+    project = os.path.basename(os.getcwd())
     safe_project = _glob.escape(project)
-    pattern = os.path.expanduser(f"~/.claude/projects/*{safe_project}/*.jsonl")
-    matches = _glob.glob(pattern)
-    # Fallback: Claude Code normalizes underscores to hyphens in project dirs
-    if not matches and "_" in safe_project:
-        alt = safe_project.replace("_", "-")
-        pattern = os.path.expanduser(f"~/.claude/projects/*{alt}/*.jsonl")
-        matches = _glob.glob(pattern)
+    matches = _glob_project_jsonls(safe_project)
     entries = [(_safe_mtime(p), p) for p in matches]
     viable = [(m, p) for m, p in entries if m >= 0]
     if not viable:
@@ -120,12 +132,10 @@ def _get_session_id_fast() -> str:
     happens whenever downstream hook code calls a function that triggers
     this, before CC has flushed the new session's JSONL to disk).
     """
+    import glob as _glob
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
-
-    import glob as _glob
     safe_project = _glob.escape(project)
-    pattern = os.path.expanduser(f"~/.claude/projects/*{safe_project}/*.jsonl")
 
     # Fast path: bootstrap file
     try:
@@ -133,16 +143,15 @@ def _get_session_id_fast() -> str:
             cached_sid = f.read().strip()
         if cached_sid:
             safe_cached = _glob.escape(cached_sid)
-            cached_pattern = os.path.expanduser(
-                f"~/.claude/projects/*{safe_project}/{safe_cached}.jsonl"
+            cached_matches = _glob_project_jsonls(
+                safe_project, f"{safe_cached}.jsonl"
             )
-            cached_matches = _glob.glob(cached_pattern)
             if cached_matches:
                 # Determine the newest JSONL deterministically: order by
                 # (mtime, path). Ties broken by path string so results are
                 # reproducible across filesystems that report 1-second mtime
                 # resolution.
-                all_matches = _glob.glob(pattern)
+                all_matches = _glob_project_jsonls(safe_project)
                 if all_matches:
                     # Determine the newest JSONL deterministically via (mtime, path).
                     # _safe_mtime returns -1.0 for files that disappear between glob
@@ -188,7 +197,7 @@ def _get_session_id_fast() -> str:
     # hook's downstream code calls a function that triggers this).
     # Use _safe_mtime so a JSONL deleted or rotated between glob and
     # stat cannot crash the caller (e.g. load_config).
-    matches = _glob.glob(pattern)
+    matches = _glob_project_jsonls(safe_project)
     entries = [(_safe_mtime(p), p) for p in matches]
     viable = [(m, p) for m, p in entries if m >= 0]
     if not viable:

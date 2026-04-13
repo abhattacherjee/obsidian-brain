@@ -1463,6 +1463,31 @@ def test_slow_path_underscore_to_hyphen_fallback(tmp_path, monkeypatch):
     assert sid == "abc123", f"Expected 'abc123' but got '{sid}' — hyphen fallback failed"
 
 
+def test_fast_path_underscore_to_hyphen_fallback(tmp_path, monkeypatch):
+    """_get_session_id_fast matches when cwd has underscores but CC dir has hyphens."""
+    import obsidian_utils
+
+    proj_dir = tmp_path / "my_project"
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # CC dir uses hyphens
+    cc_projects = tmp_path / ".claude" / "projects" / "-Users-foo-my-project"
+    cc_projects.mkdir(parents=True)
+    jsonl = cc_projects / "sess-fast-123.jsonl"
+    jsonl.write_text("{}", encoding="utf-8")
+
+    # Bootstrap file points to the correct sid
+    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    bootstrap = tmp_path / ".obsidian-brain-sid-my_project"
+    bootstrap.write_text("sess-fast-123", encoding="utf-8")
+
+    sid = obsidian_utils._get_session_id_fast()
+    assert sid == "sess-fast-123", f"Expected 'sess-fast-123' but got '{sid}'"
+
+
 def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
     """check_hook_status returns ok=False when bootstrap file is absent."""
     import obsidian_utils

@@ -9,12 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Add `from __future__ import annotations` to `vault_index.py` and `obsidian_context_snapshot.py` — fixes PEP 604 `TypeError` on macOS system Python 3.9.6
-- Fix false "No session files found" warning in `check_hook_status()` when project directory contains underscores (Claude Code normalizes `_` to `-` in project paths)
+- Fix underscore-to-hyphen project path matching across all 3 functions that glob `~/.claude/projects/`: `_slow_path_newest_sid()`, `_get_session_id_fast()`, and `_jsonl_dir_for_project()` — extracted shared `_glob_project_jsonls()` helper
 - Fix ambiguous hash instructions in 4 skills (error-log, decide, compress, vault-import) — replace vague `md5` with explicit `cut -c` commands to prevent `tail -c 4` newline byte bug producing 3-char hashes
 
 ### Added
+- `_glob_project_jsonls()` helper in `obsidian_utils.py` — centralizes `~/.claude/projects/` globbing with underscore-to-hyphen fallback
 - Regression test `test_hooks_future_annotations` ensuring all hook files with PEP 604/585 syntax include the `__future__` import
-- Test `test_slow_path_underscore_to_hyphen_fallback` for underscore-to-hyphen project path matching
+- Tests for underscore-to-hyphen fallback in `_slow_path_newest_sid`, `_get_session_id_fast`, and `_jsonl_dir_for_project`
 - Test `test_no_tail_c_in_skills` preventing `tail -c` usage in SKILL.md files
 
 ## [2.0.1] - 2026-04-12
