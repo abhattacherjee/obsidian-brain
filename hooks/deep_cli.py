@@ -48,6 +48,26 @@ def run_pipeline(vault_path: str, sessions_folder: str, insights_folder: str) ->
         sessions_folder,
         insights_folder,
     )
+
+    # Filter out recently acted-on items so they aren't re-recommended
+    acted = _load_acted_items()
+    if acted and os.path.isfile(output_path):
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                pipeline_data = json.load(f)
+            groups = pipeline_data.get("items", {}).get("groups", [])
+            original_count = len(groups)
+            filtered = [g for g in groups if g.get("representative", "") not in acted]
+            if len(filtered) < original_count:
+                pipeline_data["items"]["groups"] = filtered
+                pipeline_data["items"]["group_count"] = len(filtered)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(pipeline_data, f, indent=2)
+                skipped = original_count - len(filtered)
+                print(f"[obsidian-brain] filtered {skipped} recently acted-on item(s)", file=sys.stderr)
+        except (OSError, json.JSONDecodeError):
+            pass  # best-effort filtering
+
     print(status)
 
 
@@ -69,14 +89,44 @@ def run_present(vault_path: str, sessions_folder: str, insights_folder: str) -> 
     print(output)
 
 
+_ACTED_ITEMS_PATH = os.path.expanduser("~/.claude/obsidian-brain/deep-acted-items.json")
+_ACTED_TTL_SECONDS = 86400  # 24 hours
+
+
+def _load_acted_items() -> set[str]:
+    """Load recently acted-on item texts (within TTL)."""
+    if not os.path.isfile(_ACTED_ITEMS_PATH):
+        return set()
+    try:
+        import time
+        if time.time() - os.path.getmtime(_ACTED_ITEMS_PATH) > _ACTED_TTL_SECONDS:
+            os.remove(_ACTED_ITEMS_PATH)
+            return set()
+        with open(_ACTED_ITEMS_PATH, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def _save_acted_items(items: set[str]) -> None:
+    """Persist acted-on item texts (append to existing)."""
+    existing = _load_acted_items()
+    combined = existing | items
+    os.makedirs(os.path.dirname(_ACTED_ITEMS_PATH), exist_ok=True)
+    with open(_ACTED_ITEMS_PATH, "w", encoding="utf-8") as f:
+        json.dump(sorted(combined), f)
+
+
 def run_batch_edit() -> None:
     """Batch edit vault files (checkoffs, link additions).
 
     Reads JSON array of ``[filepath, old_text, new_text]`` triples from stdin.
     Prints ``Applied N/M edits``.
+    Records acted-on items so they aren't re-recommended on next run.
     """
     edits = json.load(sys.stdin)
     success = 0
+    acted_texts: set[str] = set()
     for filepath, old_text, new_text in edits:
         try:
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -86,6 +136,12 @@ def run_batch_edit() -> None:
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(content)
                 success += 1
+                # Track the item text (strip checkbox prefix for matching)
+                item_text = old_text.replace("- [ ] ", "").replace("- [x] ", "").strip()
+                if item_text:
+                    acted_texts.add(item_text)
         except OSError as e:
             print(f"[obsidian-brain] edit failed {filepath}: {e}", file=sys.stderr)
+    if acted_texts:
+        _save_acted_items(acted_texts)
     print(f"Applied {success}/{len(edits)} edits")
