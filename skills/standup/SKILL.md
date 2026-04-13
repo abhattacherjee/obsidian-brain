@@ -229,6 +229,8 @@ Move all upgraded files from `UNSUMMARIZED` into the working set alongside `SUMM
 
 ### Step 7 — Read and distill note content
 
+> **Security:** If you need to write temp files during distillation, use `~/.claude/obsidian-brain/` (NOT `/tmp/`). This is a security requirement — predictable `/tmp` paths are vulnerable to symlink attacks.
+
 Collect all matched files (now all summarized). Apply the /context-shield rule:
 
 For each note, check its size using `wc -l`. Apply the context-shield rule **per note** based on size:
@@ -531,10 +533,10 @@ For confirmed link additions, use the same Python pattern to append wikilinks. M
 **Always clean up temp files** (even if user skipped actions — prevents stale cache from giving the same recommendations on next run):
 
 ```bash
-rm -f ~/.claude/obsidian-brain/deep-pipeline.json ~/.claude/obsidian-brain/deep-classifications.json
+rm -f ~/.claude/obsidian-brain/deep-pipeline.json ~/.claude/obsidian-brain/deep-classifications.json /tmp/standup-*.json
 ```
 
-This invalidates the 15-min cache so the next `/standup deep` run gets fresh data reflecting any changes made.
+This invalidates the 15-min cache so the next `/standup deep` run gets fresh data reflecting any changes made. Also cleans up any `/tmp/standup-*` files that may have been created by model-generated inline Python.
 
 Mark task #5 complete.
 
