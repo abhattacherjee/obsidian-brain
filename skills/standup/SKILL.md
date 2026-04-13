@@ -462,22 +462,24 @@ If `batch_cascade_checkoff` is unavailable (import error), warn the user:
 
 Skip to Edge Cases if `IS_DEEP` is false.
 
-**Step 14b — Create deep task manifest.** Create 5 tasks:
+**Step 14b — Create deep task manifest.** You MUST create these 5 tasks using the TaskCreate tool NOW (not later, not optionally — this is how the user tracks progress):
 
-- TaskCreate: subject="Collect data and gather evidence", activeForm="Analyzing vault and git history"
-- TaskCreate: subject="Classify open items", activeForm="Classifying items with AI"
-- TaskCreate: subject="Present deep analysis", activeForm="Presenting recommendations"
-- TaskCreate: subject="Execute confirmed actions", activeForm="Executing actions"
-- TaskCreate: subject="Cascade checkoffs", activeForm="Cascading checkoffs"
+```
+TaskCreate: subject="Collect data and gather evidence", activeForm="Analyzing vault and git history"
+TaskCreate: subject="Classify open items", activeForm="Classifying items with AI"
+TaskCreate: subject="Present deep analysis", activeForm="Presenting recommendations"
+TaskCreate: subject="Execute confirmed actions", activeForm="Executing actions"
+TaskCreate: subject="Cascade checkoffs", activeForm="Cascading checkoffs"
+```
 
-Set task #1 to in_progress.
+Set task #1 to `in_progress` via TaskUpdate immediately after creation.
 
-**Step 15 — Collect data and gather evidence.** Run a single Python call:
+**Step 15 — Collect data and gather evidence.** First check for a fresh cache (avoids re-running the full pipeline if `/standup deep` or `/emerge` was run recently with the same data):
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '{"basenames": %s, "projects": %s}' "$NOTE_BASENAMES_JSON" "$PROJECTS_JSON" | python3 -c '
-import sys, os, json
+import sys, os, json, time
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from open_item_dedup import deep_analysis_pipeline
 
@@ -485,10 +487,26 @@ data = json.load(sys.stdin)
 basenames = data["basenames"]
 projects_json = json.dumps(data["projects"])
 output_path = os.path.expanduser("~/.claude/obsidian-brain/deep-pipeline.json")
+
+# Cache check: reuse if exists and < 15 min old
+if os.path.isfile(output_path):
+    age = time.time() - os.path.getmtime(output_path)
+    if age < 900:  # 15 minutes
+        with open(output_path) as f:
+            cached = json.load(f)
+        items = cached.get("items", {})
+        n = items.get("total_raw", 0)
+        g = items.get("group_count", 0)
+        e = sum(1 for v in cached.get("evidence", {}).values() if v.get("commits") or v.get("releases"))
+        print(f"CACHED:{n}:{g}:{e}")
+        sys.exit(0)
+
 status = deep_analysis_pipeline(basenames, projects_json, output_path, sys.argv[1], sys.argv[2], sys.argv[3])
 print(status)
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
 ```
+
+If the status starts with `CACHED:`, report "Using cached deep analysis (< 15 min old)" and skip to Step 16.
 
 Where `$NOTE_BASENAMES_JSON` is a JSON array of note basenames from Step 7's NOTE_DATA, and `$PROJECTS_JSON` is the JSON string from Step 8's project list. Both are passed via stdin to avoid shell argument injection. Mark task #1 complete, task #2 in_progress.
 

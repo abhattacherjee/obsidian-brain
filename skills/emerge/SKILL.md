@@ -27,19 +27,33 @@ Parse DAYS: no arg=30, `Nd`/`N days`=N, `this week`=days since Monday.
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys, os
+import sys, os, time, json
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import load_config, upgrade_and_collect_corpus
 c = load_config()
 if not c.get("vault_path"):
     print("ERROR: vault_path not configured"); sys.exit(1)
 out = os.path.expanduser("~/.claude/obsidian-brain/emerge-corpus.json")
+
+# Cache check: reuse if exists, < 15 min old, and same window
+if os.path.isfile(out) and (time.time() - os.path.getmtime(out)) < 900:
+    with open(out) as f:
+        cached = json.load(f)
+    if cached.get("stats", {}).get("window_days") == int(sys.argv[1]):
+        s = cached["stats"]
+        print("VAULT=" + c["vault_path"])
+        print("INS=" + c.get("insights_folder", "claude-insights"))
+        print("STATUS=CACHED:" + str(s["total_notes"]) + ":0:0")
+        sys.exit(0)
+
 status = upgrade_and_collect_corpus(c["vault_path"], c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights"), int(sys.argv[1]), out)
 print("VAULT=" + c["vault_path"])
 print("INS=" + c.get("insights_folder", "claude-insights"))
 print("STATUS=" + status)
 ' "$DAYS"
 ```
+
+If STATUS starts with `CACHED:`, report "Using cached corpus (< 15 min old, same window)" and skip to Step 2.
 
 Parse STATUS (`OK:<total>:<upgraded>:<failed>` or `EMPTY:0:0:0`). EMPTY -> tell user to widen window, stop. Report upgrades. If `failed > 0` -> Step 1f, else Step 2. Mark task #1 `completed`.
 ### Step 1f — Sub-agent fallback (skip if no failures)
