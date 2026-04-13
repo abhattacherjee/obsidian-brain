@@ -519,3 +519,47 @@ class TestCorpusInsightsFolder:
         )
         assert result["note_count"] == 1
         assert result["notes"][0]["type"] == "claude-insight"
+
+
+# ---------------------------------------------------------------------------
+# upgrade_and_collect_corpus tests
+# ---------------------------------------------------------------------------
+
+
+class TestUpgradeAndCollectCorpus:
+    def test_writes_corpus_to_output_path(self, tmp_vault, tmp_path):
+        """Corpus JSON written to specified output path."""
+        sess = tmp_vault / "claude-sessions"
+        _write_note(sess / f"{_today_str()}-t-0001.md",
+            {"date": _today_str(), "project": "p", "type": "claude-session", "status": "summarized"},
+            "# T\n\n## Summary\nTest.")
+        output = tmp_path / "corpus.json"
+        status = obsidian_utils.upgrade_and_collect_corpus(
+            str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))
+        assert status.startswith("OK:")
+        assert output.exists()
+        corpus = json.loads(output.read_text())
+        assert corpus["stats"]["total_notes"] == 1
+
+    def test_empty_vault_returns_empty_status(self, tmp_vault, tmp_path):
+        """Empty vault returns EMPTY status."""
+        output = tmp_path / "corpus.json"
+        status = obsidian_utils.upgrade_and_collect_corpus(
+            str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))
+        assert status == "EMPTY:0:0:0"
+
+    def test_status_line_format(self, tmp_vault, tmp_path):
+        """Status line is OK:<total>:<upgraded>:<failed>."""
+        sess = tmp_vault / "claude-sessions"
+        for i in range(3):
+            _write_note(sess / f"{_today_str()}-t-{i:04x}.md",
+                {"date": _today_str(), "project": "p", "type": "claude-session", "status": "summarized"},
+                f"# T{i}\n\n## Summary\nTest {i}.")
+        output = tmp_path / "corpus.json"
+        status = obsidian_utils.upgrade_and_collect_corpus(
+            str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))
+        parts = status.split(":")
+        assert parts[0] == "OK"
+        assert parts[1] == "3"  # total
+        assert parts[2] == "0"  # upgraded (none were auto-logged)
+        assert parts[3] == "0"  # failed

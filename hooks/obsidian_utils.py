@@ -1856,6 +1856,116 @@ def collect_vault_corpus(
     return json.dumps(result, indent=2)
 
 
+def upgrade_and_collect_corpus(
+    vault_path: str,
+    sessions_folder: str,
+    insights_folder: str,
+    days: int,
+    output_path: str,
+) -> str:
+    """Upgrade unsummarized notes then collect corpus in a single pass.
+
+    1. Scan sessions folder for notes with ``status: auto-logged`` within
+       the date window and attempt ``upgrade_unsummarized_note()`` on each.
+    2. Call ``collect_vault_corpus()`` to build the full corpus (including
+       freshly upgraded notes).
+    3. Atomically write corpus JSON to *output_path*.
+    4. Return status line: ``OK:<total>:<upgraded>:<failed>`` or
+       ``EMPTY:0:0:0``.
+    """
+    vault_root = Path(vault_path).resolve()
+    cutoff = datetime.date.today() - datetime.timedelta(days=days)
+
+    upgraded = 0
+    failed = 0
+
+    # --- Phase 1: upgrade unsummarized notes ---
+    sessions_dir = vault_root / sessions_folder
+    if sessions_dir.is_dir():
+        for md_file in sessions_dir.iterdir():
+            if md_file.suffix != ".md":
+                continue
+
+            # Path containment
+            resolved = md_file.resolve()
+            if not resolved.is_relative_to(vault_root):
+                continue
+
+            meta = read_note_metadata(str(md_file))
+            if not meta:
+                continue
+
+            # Date filter
+            date_str = meta.get("date", "")
+            if not date_str:
+                continue
+            try:
+                note_date = datetime.date.fromisoformat(date_str)
+            except (ValueError, TypeError):
+                continue
+            if note_date < cutoff:
+                continue
+
+            # Only upgrade auto-logged notes
+            if meta.get("status") != "auto-logged":
+                continue
+
+            try:
+                result = upgrade_unsummarized_note(
+                    note_path=str(md_file),
+                    vault_path=vault_path,
+                    sessions_folder=sessions_folder,
+                    project=meta.get("project", ""),
+                )
+                if result and not result.startswith("Failed"):
+                    upgraded += 1
+                    # Bust metadata cache for this note
+                    session_id = meta.get("session_id", "")
+                    if session_id:
+                        cache_invalidate(session_id)
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+
+    # --- Phase 2: collect corpus (now includes freshly upgraded notes) ---
+    corpus_json = collect_vault_corpus(
+        vault_path, sessions_folder, insights_folder, days
+    )
+    corpus = json.loads(corpus_json)
+
+    total = corpus.get("note_count", 0)
+    if total == 0:
+        return "EMPTY:0:0:0"
+
+    # Add stats to corpus
+    corpus["stats"] = {
+        "total_notes": total,
+        "upgraded": upgraded,
+        "upgrade_failures": failed,
+    }
+
+    # --- Phase 3: atomic write to output_path ---
+    out = Path(output_path)
+    os.makedirs(str(out.parent), exist_ok=True)
+
+    fd, tmp = tempfile.mkstemp(
+        dir=str(out.parent), suffix=".tmp", prefix=".corpus-"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(corpus, f, indent=2)
+        os.replace(tmp, str(out))
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    return f"OK:{total}:{upgraded}:{failed}"
+
+
 # ---------------------------------------------------------------------------
 # Filename / slug helpers
 # ---------------------------------------------------------------------------
