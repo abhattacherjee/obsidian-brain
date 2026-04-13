@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Regression test `test_hooks_future_annotations` ensuring all hook files with PEP 604/585 syntax include the `__future__` import
 - Tests for underscore-to-hyphen fallback in `_slow_path_newest_sid`, `_get_session_id_fast`, and `_jsonl_dir_for_project`
 - Test `test_no_tail_c_in_skills` preventing `tail -c` usage in SKILL.md files
+- `/emerge` skill — cross-project pattern discovery across vault notes within configurable time window (7d/30d/90d/this week). Python-first pipeline with single AI sub-agent for synthesis. Surfaces technical patterns, process patterns, knowledge gaps, cross-project connections, and unnamed habits.
+- `/standup deep` mode — evidence-based open-item consolidation. Collects all open items across projects, gathers completion evidence from git log, GitHub releases, changelogs, and FTS5 vault search, classifies items as COMPLETED/REDUNDANT/STALE/ACTIVE via AI sub-agent, suggests link/merge opportunities, detects orphaned notes, and cascades checkoffs vault-wide.
+- `collect_vault_corpus()` and `upgrade_and_collect_corpus()` in obsidian_utils.py — single-pass vault scan for pattern analysis with unsummarized note upgrade
+- `deep_analysis_pipeline()` and `build_deep_presentation()` in open_item_dedup.py — similarity pass, item dedup, evidence gathering via subprocess (git/gh), orphan detection
+- Module-level compiled section-parsing regexes (`_RE_SUMMARY`, `_RE_DECISIONS`, `_RE_ERRORS`, `_RE_OPEN_ITEMS`, `_RE_RAW_CONVERSATION`) shared across vault functions
+- SNIP_05 test: glob import validation for SKILL.md snippets
 
 ## [2.0.1] - 2026-04-12
 
