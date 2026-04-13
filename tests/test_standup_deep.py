@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import date
 from unittest.mock import patch
 
 import pytest
@@ -49,6 +50,10 @@ def _make_session_note(sessions_dir, name, project, open_items=None, body=""):
             open_section += f"- [ ] {item}\n"
     full_body = body + open_section
     return _write_note(path, fm, full_body)
+
+
+def _today():
+    return date.today().isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -820,3 +825,89 @@ class TestTempFilePermissions:
         assert result.startswith("OK:")
         mode = os.stat(output_path).st_mode & 0o777
         assert mode == 0o600, f"Expected 0o600, got {oct(mode)}"
+
+
+# ---------------------------------------------------------------------------
+# FTS scoping per-project (Copilot fix 1)
+# ---------------------------------------------------------------------------
+
+
+class TestFtsScopingPerProject:
+    def test_fts_evidence_scoped_to_project(self, tmp_vault):
+        """FTS evidence queries should only look at items from the current project."""
+        sess = tmp_vault / "claude-sessions"
+        # Two projects with different items
+        _write_note(sess / f"{_today()}-proj-a-0001.md",
+            {"date": _today(), "project": "proj-a", "type": "claude-session", "status": "summarized"},
+            "# A\n\n## Summary\nDone.\n\n## Open Questions / Next Steps\n- [ ] Fix alpha bug")
+        _write_note(sess / f"{_today()}-proj-b-0001.md",
+            {"date": _today(), "project": "proj-b", "type": "claude-session", "status": "summarized"},
+            "# B\n\n## Summary\nDone.\n\n## Open Questions / Next Steps\n- [ ] Fix beta bug")
+
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"])
+        output = tmp_vault / "deep.json"
+        with patch.object(open_item_dedup, '_resolve_project_paths', return_value={}):
+            open_item_dedup.deep_analysis_pipeline(
+                [f"{_today()}-proj-a-0001", f"{_today()}-proj-b-0001"],
+                '["proj-a", "proj-b"]',
+                str(output),
+                str(tmp_vault), "claude-sessions", "claude-insights")
+
+        data = json.loads(output.read_text())
+        evidence = data.get("evidence", {})
+        # Each project's fts_mentions should only reference its own items
+        if "proj-a" in evidence and evidence["proj-a"].get("fts_mentions"):
+            for key in evidence["proj-a"]["fts_mentions"]:
+                assert "beta" not in key.lower(), "proj-a FTS mentions should not contain proj-b items"
+
+
+# ---------------------------------------------------------------------------
+# Pipeline dir creation (Copilot fix 3)
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineDirCreation:
+    def test_creates_output_dir_if_missing(self, tmp_vault):
+        """Pipeline creates output directory if it doesn't exist."""
+        sess = tmp_vault / "claude-sessions"
+        bn = f"{_today()}-p-0001"
+        _write_note(sess / f"{bn}.md",
+            {"date": _today(), "project": "p", "type": "claude-session", "status": "summarized"},
+            "# T\n\n## Summary\nDone.")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"])
+
+        # Output to a non-existent subdirectory
+        output = tmp_vault / "nonexistent" / "subdir" / "deep.json"
+        with patch.object(open_item_dedup, '_resolve_project_paths', return_value={}):
+            status = open_item_dedup.deep_analysis_pipeline(
+                [bn], '["p"]', str(output),
+                str(tmp_vault), "claude-sessions", "claude-insights")
+        assert status.startswith("OK:")
+        assert output.exists()
+
+
+# ---------------------------------------------------------------------------
+# Representative key (not canonical)
+# ---------------------------------------------------------------------------
+
+
+class TestRepresentativeKey:
+    def test_groups_use_representative_key(self, tmp_vault):
+        """Pipeline groups use 'representative' key, not 'canonical'."""
+        sess = tmp_vault / "claude-sessions"
+        bn = f"{_today()}-p-0001"
+        _write_note(sess / f"{bn}.md",
+            {"date": _today(), "project": "p", "type": "claude-session", "status": "summarized"},
+            "# T\n\n## Summary\nDone.\n\n## Open Questions / Next Steps\n- [ ] Fix the important bug")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"])
+
+        output = tmp_vault / "deep.json"
+        with patch.object(open_item_dedup, '_resolve_project_paths', return_value={}):
+            open_item_dedup.deep_analysis_pipeline(
+                [bn], '["p"]', str(output),
+                str(tmp_vault), "claude-sessions", "claude-insights")
+
+        data = json.loads(output.read_text())
+        for group in data["items"]["groups"]:
+            assert "representative" in group, f"Group missing 'representative' key: {group.keys()}"
+            assert "canonical" not in group, f"Group has stale 'canonical' key"

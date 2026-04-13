@@ -563,3 +563,21 @@ class TestUpgradeAndCollectCorpus:
         assert parts[1] == "3"  # total
         assert parts[2] == "0"  # upgraded (none were auto-logged)
         assert parts[3] == "0"  # failed
+
+
+class TestUpgradeErrorLogging:
+    def test_failed_upgrade_logged_to_stderr(self, tmp_vault, tmp_path, capsys):
+        """upgrade_and_collect_corpus logs failed upgrade to stderr."""
+        sess = tmp_vault / "claude-sessions"
+        # Write an auto-logged note that will trigger upgrade
+        _write_note(sess / f"{_today_str()}-fail-0001.md",
+            {"date": _today_str(), "project": "p", "type": "claude-session", "status": "auto-logged"},
+            "# Fail\n\n## Summary\nAI summary unavailable")
+        output = tmp_path / "corpus.json"
+        # Mock upgrade to raise
+        with patch("obsidian_utils.upgrade_unsummarized_note", side_effect=RuntimeError("haiku timeout")):
+            status = obsidian_utils.upgrade_and_collect_corpus(
+                str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))
+        assert ":1" in status  # 1 failed
+        captured = capsys.readouterr()
+        assert "haiku timeout" in captured.err
