@@ -498,3 +498,325 @@ class TestPipelineMultiProject:
         assert result.startswith("OK:")
         data = json.loads(open(output_path).read())
         assert data["items"]["total_raw"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Error handling tests (Fix 3, Fix 7)
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineErrorHandling:
+    def test_invalid_projects_json(self, tmp_vault):
+        """Fix 7: Invalid projects JSON returns error instead of crashing."""
+        sessions_dir = tmp_vault / "claude-sessions"
+        _make_session_note(
+            sessions_dir, "2026-04-10-proj-aaaa.md", "proj",
+            open_items=["Some item"],
+        )
+
+        output_path = str(tmp_vault / "pipeline_out.json")
+        basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
+
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db_path
+        )
+
+        with patch.object(open_item_dedup, "_resolve_project_paths", return_value={}):
+            result = open_item_dedup.deep_analysis_pipeline(
+                basenames=basenames,
+                projects_json="{not valid json",
+                output_path=output_path,
+                vault_path=str(tmp_vault),
+                sessions_folder="claude-sessions",
+                insights_folder="claude-insights",
+                db_path=db_path,
+            )
+
+        assert result.startswith("ERROR:invalid projects JSON:")
+
+    def test_ensure_index_failure(self, tmp_vault):
+        """Fix 3: ensure_index failure returns error instead of crashing."""
+        with patch.object(
+            vault_index, "ensure_index", side_effect=RuntimeError("index broken")
+        ):
+            result = open_item_dedup.deep_analysis_pipeline(
+                basenames=["note.md"],
+                projects_json="[]",
+                output_path=str(tmp_vault / "out.json"),
+                vault_path=str(tmp_vault),
+                sessions_folder="claude-sessions",
+                insights_folder="claude-insights",
+            )
+
+        assert result.startswith("ERROR:vault index failed:")
+        assert "index broken" in result
+
+
+class TestPresentationErrorHandling:
+    def test_invalid_basenames_json(self, tmp_vault):
+        """Fix 7: Invalid basenames JSON returns error."""
+        pipeline_path = str(tmp_vault / "pipeline.json")
+        with open(pipeline_path, "w") as f:
+            json.dump({
+                "link_suggestions": [],
+                "merge_suggestions": [],
+                "items": {"total_raw": 0, "groups": [], "group_count": 0},
+                "evidence": {},
+            }, f)
+
+        classifications_path = str(tmp_vault / "classifications.json")
+        with open(classifications_path, "w") as f:
+            json.dump({}, f)
+
+        result = open_item_dedup.build_deep_presentation(
+            pipeline_path=pipeline_path,
+            classifications_path=classifications_path,
+            basenames_json="{bad json",
+            vault_path=str(tmp_vault),
+            sessions_folder="claude-sessions",
+            insights_folder="claude-insights",
+        )
+        assert "Error parsing basenames JSON" in result
+
+
+# ---------------------------------------------------------------------------
+# Classifications wiring tests (Fix 1)
+# ---------------------------------------------------------------------------
+
+
+class TestClassificationsWiring:
+    def test_classifications_list_groups_by_status(self, tmp_vault):
+        """Fix 1: Classifications list is used to group items by status."""
+        sessions_dir = tmp_vault / "claude-sessions"
+        _make_session_note(
+            sessions_dir, "2026-04-10-proj-aaaa.md", "proj",
+            body="## Summary\nSolo work.\n",
+        )
+
+        basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
+        basenames_json = json.dumps(basenames)
+
+        pipeline_path = str(tmp_vault / "pipeline.json")
+        with open(pipeline_path, "w") as f:
+            json.dump({
+                "link_suggestions": [],
+                "merge_suggestions": [],
+                "items": {"total_raw": 3, "groups": [], "group_count": 0},
+                "evidence": {},
+            }, f)
+
+        classifications_path = str(tmp_vault / "classifications.json")
+        with open(classifications_path, "w") as f:
+            json.dump([
+                {
+                    "canonical": "Fix login handler",
+                    "classification": "COMPLETED",
+                    "evidence": "Merged in PR #42",
+                    "project": "proj",
+                    "instances": [{"file": "session-a.md", "line": 10}],
+                },
+                {
+                    "canonical": "Add integration tests",
+                    "classification": "ACTIVE",
+                    "evidence": "",
+                    "project": "proj",
+                    "instances": [{"file": "session-b.md", "line": 20}],
+                },
+                {
+                    "canonical": "Old migration task",
+                    "classification": "STALE",
+                    "evidence": "No activity for 30 days",
+                    "project": "proj",
+                    "instances": [],
+                },
+            ], f)
+
+        result = open_item_dedup.build_deep_presentation(
+            pipeline_path=pipeline_path,
+            classifications_path=classifications_path,
+            basenames_json=basenames_json,
+            vault_path=str(tmp_vault),
+            sessions_folder="claude-sessions",
+            insights_folder="claude-insights",
+        )
+
+        assert "### Completed (1)" in result
+        assert "### Active (1)" in result
+        assert "### Stale (1)" in result
+        assert "Fix login handler" in result
+        assert "Merged in PR #42" in result
+        assert "Add integration tests" in result
+
+    def test_empty_classifications_falls_back_to_raw_groups(self, tmp_vault):
+        """Fix 1: Empty dict classifications falls back to raw pipeline groups."""
+        sessions_dir = tmp_vault / "claude-sessions"
+        _make_session_note(
+            sessions_dir, "2026-04-10-proj-aaaa.md", "proj",
+            body="## Summary\nSolo work.\n",
+        )
+
+        basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
+        basenames_json = json.dumps(basenames)
+
+        pipeline_path = str(tmp_vault / "pipeline.json")
+        with open(pipeline_path, "w") as f:
+            json.dump({
+                "link_suggestions": [],
+                "merge_suggestions": [],
+                "items": {
+                    "total_raw": 2,
+                    "groups": [
+                        {
+                            "project": "proj",
+                            "representative": "Fix login handler",
+                            "members": [
+                                {"file": "a.md", "line": 10, "text": "Fix login handler"},
+                            ],
+                        }
+                    ],
+                    "group_count": 1,
+                },
+                "evidence": {},
+            }, f)
+
+        classifications_path = str(tmp_vault / "classifications.json")
+        with open(classifications_path, "w") as f:
+            json.dump({}, f)
+
+        result = open_item_dedup.build_deep_presentation(
+            pipeline_path=pipeline_path,
+            classifications_path=classifications_path,
+            basenames_json=basenames_json,
+            vault_path=str(tmp_vault),
+            sessions_folder="claude-sessions",
+            insights_folder="claude-insights",
+        )
+
+        # Should use fallback: raw group display
+        assert "duplicate groups detected" in result
+        assert "Fix login handler" in result
+
+    def test_missing_classifications_file_falls_back(self, tmp_vault):
+        """Fix 1: Missing classifications file falls back gracefully."""
+        sessions_dir = tmp_vault / "claude-sessions"
+        _make_session_note(
+            sessions_dir, "2026-04-10-proj-aaaa.md", "proj",
+            body="## Summary\nWork.\n",
+        )
+
+        basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
+        basenames_json = json.dumps(basenames)
+
+        pipeline_path = str(tmp_vault / "pipeline.json")
+        with open(pipeline_path, "w") as f:
+            json.dump({
+                "link_suggestions": [],
+                "merge_suggestions": [],
+                "items": {"total_raw": 0, "groups": [], "group_count": 0},
+                "evidence": {},
+            }, f)
+
+        result = open_item_dedup.build_deep_presentation(
+            pipeline_path=pipeline_path,
+            classifications_path="/nonexistent/classifications.json",
+            basenames_json=basenames_json,
+            vault_path=str(tmp_vault),
+            sessions_folder="claude-sessions",
+            insights_folder="claude-insights",
+        )
+
+        # Should not crash, should use fallback
+        assert "## Open Item Consolidation" in result
+
+
+# ---------------------------------------------------------------------------
+# Subprocess stderr logging tests (Fix 6)
+# ---------------------------------------------------------------------------
+
+
+class TestSubprocessStderrLogging:
+    def test_git_log_failure_logged(self, tmp_vault, capsys):
+        """Fix 6: git log failure stderr is logged."""
+        sessions_dir = tmp_vault / "claude-sessions"
+        _make_session_note(
+            sessions_dir, "2026-04-10-proj-aaaa.md", "proj",
+            open_items=["Item"],
+        )
+
+        fake_repo = tmp_vault / "repos" / "proj"
+        fake_repo.mkdir(parents=True)
+        (fake_repo / ".git").mkdir()
+
+        output_path = str(tmp_vault / "pipeline_out.json")
+        basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
+
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db_path
+        )
+
+        # Mock subprocess.run to simulate git log failure
+        import subprocess as sp
+        original_run = sp.run
+
+        def mock_run(cmd, **kwargs):
+            if cmd[0] == "git" and "log" in cmd:
+                return sp.CompletedProcess(cmd, returncode=128, stdout="", stderr="fatal: not a git repository")
+            if cmd[0] == "gh":
+                return sp.CompletedProcess(cmd, returncode=1, stdout="", stderr="gh not found")
+            return original_run(cmd, **kwargs)
+
+        with patch.object(open_item_dedup, "_resolve_project_paths", return_value={"proj": str(fake_repo)}):
+            with patch("subprocess.run", side_effect=mock_run):
+                result = open_item_dedup.deep_analysis_pipeline(
+                    basenames=basenames,
+                    projects_json='["proj"]',
+                    output_path=output_path,
+                    vault_path=str(tmp_vault),
+                    sessions_folder="claude-sessions",
+                    insights_folder="claude-insights",
+                    db_path=db_path,
+                )
+
+        captured = capsys.readouterr()
+        assert "git log failed" in captured.err
+        assert "gh release list failed" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Temp file permissions tests (Fix 5)
+# ---------------------------------------------------------------------------
+
+
+class TestTempFilePermissions:
+    def test_pipeline_output_permissions(self, tmp_vault):
+        """Fix 5: Pipeline output file has 0o600 permissions."""
+        sessions_dir = tmp_vault / "claude-sessions"
+        _make_session_note(
+            sessions_dir, "2026-04-10-proj-aaaa.md", "proj",
+            open_items=["Item"],
+        )
+
+        output_path = str(tmp_vault / "pipeline_out.json")
+        basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
+
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db_path
+        )
+
+        with patch.object(open_item_dedup, "_resolve_project_paths", return_value={}):
+            result = open_item_dedup.deep_analysis_pipeline(
+                basenames=basenames,
+                projects_json='["proj"]',
+                output_path=output_path,
+                vault_path=str(tmp_vault),
+                sessions_folder="claude-sessions",
+                insights_folder="claude-insights",
+                db_path=db_path,
+            )
+
+        assert result.startswith("OK:")
+        mode = os.stat(output_path).st_mode & 0o777
+        assert mode == 0o600, f"Expected 0o600, got {oct(mode)}"

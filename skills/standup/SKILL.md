@@ -476,19 +476,21 @@ Set task #1 to in_progress.
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-printf '%s' '$NOTE_BASENAMES_JSON' | python3 -c '
+printf '{"basenames": %s, "projects": %s}' "$NOTE_BASENAMES_JSON" "$PROJECTS_JSON" | python3 -c '
 import sys, os, json
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from open_item_dedup import deep_analysis_pipeline
 
-basenames = json.load(sys.stdin)
+data = json.load(sys.stdin)
+basenames = data["basenames"]
+projects_json = json.dumps(data["projects"])
 output_path = os.path.expanduser("~/.claude/obsidian-brain/deep-pipeline.json")
-status = deep_analysis_pipeline(basenames, sys.argv[1], output_path, sys.argv[2], sys.argv[3], sys.argv[4])
+status = deep_analysis_pipeline(basenames, projects_json, output_path, sys.argv[1], sys.argv[2], sys.argv[3])
 print(status)
-' "$PROJECTS_JSON" "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
 ```
 
-Where `$NOTE_BASENAMES_JSON` is a JSON array of note basenames from Step 7's NOTE_DATA, and `$PROJECTS_JSON` is the JSON string from Step 8's project list. Mark task #1 complete, task #2 in_progress.
+Where `$NOTE_BASENAMES_JSON` is a JSON array of note basenames from Step 7's NOTE_DATA, and `$PROJECTS_JSON` is the JSON string from Step 8's project list. Both are passed via stdin to avoid shell argument injection. Mark task #1 complete, task #2 in_progress.
 
 **Step 16 — Classify open items.** Spawn a single Agent sub-agent that:
 1. Reads `~/.claude/obsidian-brain/deep-pipeline.json`

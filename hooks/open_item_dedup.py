@@ -442,7 +442,10 @@ def deep_analysis_pipeline(
 
     # 1. Warm vault index
     folders = [sessions_folder, insights_folder]
-    actual_db = vault_index.ensure_index(vault_path, folders, db_path=db_path)
+    try:
+        actual_db = vault_index.ensure_index(vault_path, folders, db_path=db_path)
+    except Exception as exc:
+        return f"ERROR:vault index failed: {exc}"
 
     # 2. Similarity pass — extract keywords per note, find unlinked similar pairs
     # Build wikilink graph for the window notes
@@ -508,7 +511,10 @@ def deep_analysis_pipeline(
                 link_suggestions.append(entry)
 
     # 3. Collect open items per project
-    projects: list[str] = json.loads(projects_json) if projects_json else []
+    try:
+        projects: list[str] = json.loads(projects_json) if projects_json else []
+    except json.JSONDecodeError as exc:
+        return f"ERROR:invalid projects JSON: {exc}"
     all_raw_items: list[tuple[str, int, str]] = []
     all_groups: list[dict] = []
 
@@ -569,6 +575,8 @@ def deep_analysis_pipeline(
             )
             if proc.returncode == 0:
                 proj_evidence["commits"] = proc.stdout.strip().split("\n")[:20]
+            else:
+                print(f"[obsidian-brain] git log failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
         except (OSError, subprocess.TimeoutExpired):
             pass
 
@@ -580,6 +588,8 @@ def deep_analysis_pipeline(
             )
             if proc.returncode == 0:
                 proj_evidence["releases"] = proc.stdout.strip().split("\n")[:5]
+            else:
+                print(f"[obsidian-brain] gh release list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
         except (OSError, subprocess.TimeoutExpired):
             pass
 
@@ -628,6 +638,7 @@ def deep_analysis_pipeline(
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(output_data, f, indent=2)
+        os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, output_path)
     except OSError as exc:
         print(f"[obsidian-brain] pipeline: write failed: {exc}", file=sys.stderr)
@@ -670,7 +681,10 @@ def build_deep_presentation(
     except (OSError, json.JSONDecodeError):
         classifications = {}
 
-    basenames: list[str] = json.loads(basenames_json) if basenames_json else []
+    try:
+        basenames: list[str] = json.loads(basenames_json) if basenames_json else []
+    except json.JSONDecodeError as exc:
+        return f"Error parsing basenames JSON: {exc}"
 
     # --- Orphan detection ---
     # Build set of all stems referenced via wikilinks across window notes
@@ -718,15 +732,67 @@ def build_deep_presentation(
     items_data = pipeline.get("items", {})
     groups = items_data.get("groups", [])
     total_raw = items_data.get("total_raw", 0)
-    sections.append(f"## Open Item Consolidation\n\n"
-                    f"**{total_raw}** raw items, **{len(groups)}** duplicate groups detected.\n")
-    if groups:
-        for g in groups:
-            rep = g.get("representative", "?")
-            project = g.get("project", "?")
-            members = g.get("members", [])
-            sections.append(f"- **{rep}** ({project}) — {len(members)} occurrences")
-    sections.append("")
+
+    # Use classifications if available (list of dicts with classification/evidence)
+    classified_items: list[dict] = []
+    if isinstance(classifications, list):
+        classified_items = classifications
+
+    if classified_items:
+        # Group classified items by classification
+        by_class: dict[str, list[dict]] = {}
+        for item in classified_items:
+            cls = item.get("classification", "UNKNOWN").upper()
+            by_class.setdefault(cls, []).append(item)
+
+        class_counts = {k: len(v) for k, v in by_class.items()}
+        count_parts = ", ".join(f"**{v}** {k.lower()}" for k, v in sorted(class_counts.items()))
+        sections.append(f"## Open Item Consolidation\n\n"
+                        f"**{total_raw}** raw items classified: {count_parts}.\n")
+
+        # Render each classification group in priority order
+        class_order = ["COMPLETED", "REDUNDANT", "STALE", "ACTIVE"]
+        for cls in class_order:
+            items_in_class = by_class.get(cls, [])
+            if not items_in_class:
+                continue
+            sections.append(f"### {cls.title()} ({len(items_in_class)})\n")
+            for item in items_in_class:
+                canonical = item.get("canonical", "?")
+                evidence = item.get("evidence", "")
+                project = item.get("project", "")
+                instances = item.get("instances", [])
+                proj_label = f" ({project})" if project else ""
+                sections.append(f"- **{canonical}**{proj_label}")
+                if evidence:
+                    sections.append(f"  - Evidence: {evidence}")
+                if instances:
+                    locs = [f"`{inst.get('file', '?')}:{inst.get('line', '?')}`" for inst in instances[:3]]
+                    sections.append(f"  - Found in: {', '.join(locs)}")
+            sections.append("")
+
+        # Show any remaining unclassified groups
+        remaining = {k: v for k, v in by_class.items() if k not in class_order}
+        for cls, items_in_class in sorted(remaining.items()):
+            sections.append(f"### {cls.title()} ({len(items_in_class)})\n")
+            for item in items_in_class:
+                canonical = item.get("canonical", "?")
+                evidence = item.get("evidence", "")
+                sections.append(f"- **{canonical}**")
+                if evidence:
+                    sections.append(f"  - Evidence: {evidence}")
+            sections.append("")
+    else:
+        # Fallback: show raw pipeline groups without classification labels
+        sections.append(f"## Open Item Consolidation\n\n"
+                        f"**{total_raw}** raw items, **{len(groups)}** duplicate groups detected.\n")
+        if groups:
+            for g in groups:
+                rep = g.get("representative", "?")
+                project = g.get("project", "?")
+                members = g.get("members", [])
+                sections.append(f"- **{rep}** ({project}) — {len(members)} occurrences")
+        sections.append("")
 
     # Suggested Links
     link_suggestions = pipeline.get("link_suggestions", [])

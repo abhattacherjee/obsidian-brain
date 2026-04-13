@@ -1925,8 +1925,9 @@ def upgrade_and_collect_corpus(
                         cache_invalidate(session_id)
                 else:
                     failed += 1
-            except Exception:
+            except Exception as exc:
                 failed += 1
+                print(f"[obsidian-brain] upgrade failed for {md_file.name}: {exc}", file=sys.stderr)
 
     # --- Phase 2: collect corpus (now includes freshly upgraded notes) ---
     corpus_json = collect_vault_corpus(
@@ -1955,6 +1956,7 @@ def upgrade_and_collect_corpus(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(corpus, f, indent=2)
+        os.chmod(tmp, 0o600)
         os.replace(tmp, str(out))
     except OSError:
         try:
