@@ -133,8 +133,13 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
         fm_block = content[: end + 4]
         body = content[end + 4:]
 
-        # Replace project value and tag references in frontmatter
-        new_fm = fm_block.replace(f"project: {original}", f"project: {normalized}")
+        # Replace project value (with or without quotes) and tag references
+        new_fm = re.sub(
+            rf"^(project:\s*)[\"']?{re.escape(original)}[\"']?\s*$",
+            rf"\g<1>{normalized}",
+            fm_block,
+            flags=re.MULTILINE,
+        )
         new_fm = new_fm.replace(f"claude/project/{original}", f"claude/project/{normalized}")
 
         if new_fm == fm_block:

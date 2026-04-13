@@ -151,6 +151,34 @@ def test_apply_does_not_touch_body(norm_vault):
     assert "The project my_project uses underscores." in content
 
 
+def test_apply_handles_quoted_project_value(norm_vault):
+    """apply normalizes project even when value is quoted in frontmatter."""
+    import vault_doctor_checks.project_name_normalization as check
+
+    note = norm_vault["sessions"] / "quoted.md"
+    note.write_text(
+        '---\n'
+        'type: claude-session\n'
+        'project: "personal_ws"\n'
+        'tags:\n'
+        '  - claude/project/personal_ws\n'
+        '---\n\n# Quoted\n',
+        encoding="utf-8",
+    )
+
+    issues = check.scan(
+        str(norm_vault["vault"]), "claude-sessions", "claude-insights", 9999
+    )
+    assert len(issues) == 1
+
+    results = check.apply(issues, str(norm_vault["vault"] / ".backups"))
+    assert results[0].status == "applied"
+
+    content = note.read_text(encoding="utf-8")
+    assert "project: personal-ws" in content
+    assert '"personal_ws"' not in content
+
+
 def test_apply_error_missing_extra_fields(norm_vault):
     """apply returns error when Issue.extra lacks original/normalized."""
     from vault_doctor_checks import Issue
