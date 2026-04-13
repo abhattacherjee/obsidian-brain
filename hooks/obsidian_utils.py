@@ -24,6 +24,25 @@ import sys
 import tempfile
 from pathlib import Path
 
+# --- Section-parsing regexes (used by collect_vault_corpus, build_context_brief) ---
+# Each captures the body between a ## heading and the next ## heading (or EOF).
+
+_RE_SUMMARY = re.compile(
+    r"^## Summary\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
+)
+_RE_DECISIONS = re.compile(
+    r"^## Key Decisions\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
+)
+_RE_ERRORS = re.compile(
+    r"^## Errors Encountered\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
+)
+_RE_OPEN_ITEMS = re.compile(
+    r"^## Open Questions / Next Steps\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
+)
+_RE_RAW_CONVERSATION = re.compile(
+    r"^## Conversation \(raw\)\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
+)
+
 # --- Secure working directory ---
 # All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
 # This prevents symlink attacks and cache poisoning on multi-user systems.
@@ -1688,6 +1707,266 @@ def build_context_brief(
     ]
 
     return "\n".join(output_parts)
+
+
+# ---------------------------------------------------------------------------
+# Vault corpus collection (for /emerge pattern discovery)
+# ---------------------------------------------------------------------------
+
+
+def _parse_section_bullets(text: str | None) -> list[str]:
+    """Extract bullet items from a markdown section body.
+
+    Returns empty list for None, empty, or 'None.' content.
+    """
+    if not text:
+        return []
+    stripped = text.strip()
+    if stripped.lower() in ("none.", "none", "n/a", ""):
+        return []
+    items = []
+    for line in stripped.split("\n"):
+        line = line.strip()
+        if line.startswith("- "):
+            items.append(line[2:].strip())
+    return items
+
+
+def collect_vault_corpus(
+    vault_path: str,
+    sessions_folder: str,
+    insights_folder: str,
+    days: int = 7,
+) -> str:
+    """Scan vault session and insight notes, date-filter, extract structured data.
+
+    Returns JSON string with keys: date_range, note_count, notes[].
+    Each note has: file, type, date, project, tags, summary, decisions,
+    errors, open_items.
+
+    Security: path containment via resolve() + is_relative_to().
+    Note: scrub_secrets() is NOT called — content is already scrubbed at write time.
+    """
+    vault_root = Path(vault_path).resolve()
+    cutoff = datetime.date.today() - datetime.timedelta(days=days)
+    end_date = datetime.date.today()
+
+    # Cap limits
+    _MAX_SUMMARY_CHARS = 500
+    _MAX_LIST_ITEMS = 10
+
+    notes_out: list[dict] = []
+
+    # Scan both folders
+    folders = [
+        (sessions_folder, "claude-session"),
+        (insights_folder, "claude-insight"),
+    ]
+
+    for folder_name, default_type in folders:
+        folder = vault_root / folder_name
+        if not folder.is_dir():
+            continue
+
+        for md_file in folder.iterdir():
+            if md_file.suffix != ".md":
+                continue
+
+            # Path containment: reject symlinks pointing outside vault
+            resolved = md_file.resolve()
+            if not resolved.is_relative_to(vault_root):
+                continue
+
+            meta = read_note_metadata(str(md_file))
+            if not meta:
+                continue
+
+            # Date filtering — skip notes without parseable date
+            date_str = meta.get("date", "")
+            if not date_str:
+                continue
+            try:
+                note_date = datetime.date.fromisoformat(date_str)
+            except (ValueError, TypeError):
+                continue
+            if note_date < cutoff:
+                continue
+
+            # Read full note content for section parsing
+            try:
+                content = md_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            # Parse summary — with unsummarized fallback
+            summary = ""
+            m = _RE_SUMMARY.search(content)
+            if m:
+                raw_summary = m.group(1).strip()
+                if "AI summary unavailable" in raw_summary:
+                    # Fall back to raw conversation section
+                    m_raw = _RE_RAW_CONVERSATION.search(content)
+                    if m_raw:
+                        summary = m_raw.group(1).strip()[:_MAX_SUMMARY_CHARS]
+                else:
+                    summary = raw_summary[:_MAX_SUMMARY_CHARS]
+
+            # Parse structured sections
+            m_dec = _RE_DECISIONS.search(content)
+            decisions = _parse_section_bullets(m_dec.group(1) if m_dec else None)[
+                :_MAX_LIST_ITEMS
+            ]
+
+            m_err = _RE_ERRORS.search(content)
+            errors = _parse_section_bullets(m_err.group(1) if m_err else None)[
+                :_MAX_LIST_ITEMS
+            ]
+
+            m_open = _RE_OPEN_ITEMS.search(content)
+            open_items = _parse_section_bullets(m_open.group(1) if m_open else None)[
+                :_MAX_LIST_ITEMS
+            ]
+
+            tags = meta.get("tags", [])
+            if isinstance(tags, str):
+                tags = [tags]
+            tags = tags[:_MAX_LIST_ITEMS]
+
+            note_type = meta.get("type", default_type)
+
+            notes_out.append(
+                {
+                    "file": md_file.name,
+                    "type": note_type,
+                    "date": date_str,
+                    "project": meta.get("project", ""),
+                    "tags": tags,
+                    "summary": summary,
+                    "decisions": decisions,
+                    "errors": errors,
+                    "open_items": open_items,
+                }
+            )
+
+    result = {
+        "date_range": f"{cutoff.isoformat()} to {end_date.isoformat()}",
+        "note_count": len(notes_out),
+        "notes": notes_out,
+    }
+    return json.dumps(result, indent=2)
+
+
+def upgrade_and_collect_corpus(
+    vault_path: str,
+    sessions_folder: str,
+    insights_folder: str,
+    days: int,
+    output_path: str,
+) -> str:
+    """Upgrade unsummarized notes then collect corpus in a single pass.
+
+    1. Scan sessions folder for notes with ``status: auto-logged`` within
+       the date window and attempt ``upgrade_unsummarized_note()`` on each.
+    2. Call ``collect_vault_corpus()`` to build the full corpus (including
+       freshly upgraded notes).
+    3. Atomically write corpus JSON to *output_path*.
+    4. Return status line: ``OK:<total>:<upgraded>:<failed>`` or
+       ``EMPTY:0:0:0``.
+    """
+    vault_root = Path(vault_path).resolve()
+    cutoff = datetime.date.today() - datetime.timedelta(days=days)
+
+    upgraded = 0
+    failed = 0
+
+    # --- Phase 1: upgrade unsummarized notes ---
+    sessions_dir = vault_root / sessions_folder
+    if sessions_dir.is_dir():
+        for md_file in sessions_dir.iterdir():
+            if md_file.suffix != ".md":
+                continue
+
+            # Path containment
+            resolved = md_file.resolve()
+            if not resolved.is_relative_to(vault_root):
+                continue
+
+            meta = read_note_metadata(str(md_file))
+            if not meta:
+                continue
+
+            # Date filter
+            date_str = meta.get("date", "")
+            if not date_str:
+                continue
+            try:
+                note_date = datetime.date.fromisoformat(date_str)
+            except (ValueError, TypeError):
+                continue
+            if note_date < cutoff:
+                continue
+
+            # Only upgrade auto-logged notes
+            if meta.get("status") != "auto-logged":
+                continue
+
+            try:
+                result = upgrade_unsummarized_note(
+                    note_path=str(md_file),
+                    vault_path=vault_path,
+                    sessions_folder=sessions_folder,
+                    project=meta.get("project", ""),
+                )
+                if result and not result.startswith("Failed"):
+                    upgraded += 1
+                    # Bust metadata cache for this note
+                    session_id = meta.get("session_id", "")
+                    if session_id:
+                        cache_invalidate(session_id)
+                else:
+                    failed += 1
+            except Exception as exc:
+                failed += 1
+                print(f"[obsidian-brain] upgrade failed for {md_file.name}: {exc}", file=sys.stderr)
+
+    # --- Phase 2: collect corpus (now includes freshly upgraded notes) ---
+    corpus_json = collect_vault_corpus(
+        vault_path, sessions_folder, insights_folder, days
+    )
+    corpus = json.loads(corpus_json)
+
+    total = corpus.get("note_count", 0)
+    if total == 0:
+        return "EMPTY:0:0:0"
+
+    # Add stats to corpus
+    corpus["stats"] = {
+        "total_notes": total,
+        "upgraded": upgraded,
+        "upgrade_failures": failed,
+        "window_days": days,
+    }
+
+    # --- Phase 3: atomic write to output_path ---
+    out = Path(output_path)
+    os.makedirs(str(out.parent), exist_ok=True)
+
+    fd, tmp = tempfile.mkstemp(
+        dir=str(out.parent), suffix=".tmp", prefix=".corpus-"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(corpus, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(out))
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    return f"OK:{total}:{upgraded}:{failed}"
 
 
 # ---------------------------------------------------------------------------
