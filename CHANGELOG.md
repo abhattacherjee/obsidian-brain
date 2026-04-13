@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Normalize project names (underscore → hyphen) in `get_session_context()`, `extract_session_metadata()`, and vault-doctor `source_sessions.py` comparisons — prevents project name splits in frontmatter tags
 
 ### Added
+- `project-name-normalization` vault-doctor check — detects and auto-fixes underscored project names in frontmatter (both `project:` field and `claude/project/` tags)
 - `_glob_project_jsonls()` helper in `obsidian_utils.py` — centralizes `~/.claude/projects/` globbing with underscore-to-hyphen fallback
 - Regression test `test_hooks_future_annotations` ensuring all hook files with PEP 604/585 syntax include the `__future__` import
 - Tests for underscore-to-hyphen fallback in `_slow_path_newest_sid`, `_get_session_id_fast`, and `_jsonl_dir_for_project`
