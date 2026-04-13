@@ -603,7 +603,7 @@ def deep_analysis_pipeline(
                 pass
 
         # FTS5 search for each open item scoped to THIS project
-        proj_items = [g["canonical"] for g in all_groups if g["project"] == project]
+        proj_items = [g["representative"] for g in all_groups if g["project"] == project]
         fts_mentions: dict[str, int] = {}
         for item_text in proj_items[:10]:  # cap to avoid excessive queries
             kws = vault_index.extract_keywords(item_text, limit=3)
