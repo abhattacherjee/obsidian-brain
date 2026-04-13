@@ -145,8 +145,9 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             ))
             continue
 
-        # Backup original
-        backup_dir = Path(backup_root) / NAME
+        # Backup original (include source folder to avoid cross-folder collisions)
+        source_folder = Path(note_path).parent.name
+        backup_dir = Path(backup_root) / NAME / source_folder
         backup_dir.mkdir(parents=True, exist_ok=True)
         backup_path = backup_dir / Path(note_path).name
         try:
@@ -163,6 +164,7 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
         # Atomic write
         new_content = new_fm + body
         dest = Path(note_path)
+        tmp = None
         try:
             fd, tmp = tempfile.mkstemp(
                 dir=str(dest.parent),
@@ -176,11 +178,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
                 os.close(fd)
             os.chmod(tmp, 0o600)
             os.replace(tmp, str(dest))
+            tmp = None  # consumed by os.replace
         except OSError as exc:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
             results.append(Result(
                 check=NAME,
                 note_path=note_path,
@@ -188,6 +187,12 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
                 error=str(exc),
             ))
             continue
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
         results.append(Result(
             check=NAME,

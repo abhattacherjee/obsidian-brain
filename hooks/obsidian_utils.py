@@ -720,7 +720,7 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
     errors, duration_minutes, commits.
     """
     meta: dict = {
-        "project": Path(cwd).name.replace("_", "-") if cwd else "unknown",
+        "project": Path(cwd).name.lower().replace(" ", "-").replace("_", "-") if cwd else "unknown",
         "project_path": cwd or "",
         "git_branch": "",
         "files_touched": [],

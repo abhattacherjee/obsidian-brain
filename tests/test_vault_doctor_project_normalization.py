@@ -149,3 +149,66 @@ def test_apply_does_not_touch_body(norm_vault):
     assert "claude/project/my-project" in content
     # Body untouched
     assert "The project my_project uses underscores." in content
+
+
+def test_apply_error_missing_extra_fields(norm_vault):
+    """apply returns error when Issue.extra lacks original/normalized."""
+    from vault_doctor_checks import Issue
+    import vault_doctor_checks.project_name_normalization as check
+
+    issue = Issue(
+        check=check.NAME,
+        note_path=str(norm_vault["sessions"] / "fake.md"),
+        project="test",
+        current_source="project: test",
+        proposed_source="project: test",
+        reason="test",
+        extra={},  # missing original/normalized
+    )
+    results = check.apply([issue], str(norm_vault["vault"] / ".backups"))
+    assert len(results) == 1
+    assert results[0].status == "error"
+    assert "missing" in results[0].error
+
+
+def test_apply_error_note_deleted_between_scan_and_apply(norm_vault):
+    """apply returns error when note is deleted after scan."""
+    import vault_doctor_checks.project_name_normalization as check
+
+    note = norm_vault["sessions"] / "session1.md"
+    _write_note(note, "my_app")
+
+    issues = check.scan(
+        str(norm_vault["vault"]), "claude-sessions", "claude-insights", 9999
+    )
+    # Delete the note before apply
+    note.unlink()
+
+    results = check.apply(issues, str(norm_vault["vault"] / ".backups"))
+    assert len(results) == 1
+    assert results[0].status == "error"
+
+
+def test_apply_backup_includes_source_folder(norm_vault):
+    """Backups include the source folder name to avoid cross-folder collisions."""
+    import vault_doctor_checks.project_name_normalization as check
+
+    # Create same-named notes in both folders
+    _write_note(norm_vault["sessions"] / "note.md", "my_app")
+    _write_note(norm_vault["insights"] / "note.md", "my_app", "claude-insight")
+
+    issues = check.scan(
+        str(norm_vault["vault"]), "claude-sessions", "claude-insights", 9999
+    )
+    assert len(issues) == 2
+
+    backup_root = str(norm_vault["vault"] / ".backups")
+    results = check.apply(issues, backup_root)
+
+    applied = [r for r in results if r.status == "applied"]
+    assert len(applied) == 2
+    # Both backups should exist (no collision)
+    paths = [r.backup_path for r in applied]
+    assert len(set(paths)) == 2, f"Backup collision: both backups at same path {paths}"
+    for p in paths:
+        assert os.path.isfile(p)

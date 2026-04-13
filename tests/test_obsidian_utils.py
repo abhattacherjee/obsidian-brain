@@ -1516,6 +1516,16 @@ def test_extract_session_metadata_normalizes_underscores():
     )
 
 
+def test_extract_session_metadata_normalizes_case_and_spaces():
+    """extract_session_metadata lowercases and normalizes spaces like get_session_context."""
+    import obsidian_utils
+
+    meta = obsidian_utils.extract_session_metadata([], "/Users/foo/My Project")
+    assert meta["project"] == "my-project", (
+        f"Expected 'my-project' but got '{meta['project']}' — case/space normalization failed"
+    )
+
+
 def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
     """check_hook_status returns ok=False when bootstrap file is absent."""
     import obsidian_utils
