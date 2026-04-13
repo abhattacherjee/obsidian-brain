@@ -526,11 +526,15 @@ Where `$EDITS_JSON` is a JSON array of `[filepath, old_text, new_text]` triples 
 
 For confirmed link additions, use the same Python pattern to append wikilinks. Mark task #4 complete, task #5 in_progress.
 
-**Step 19 — Cascade checkoffs vault-wide.** For each project with newly checked items, run `batch_cascade_checkoff()` (same as Step 14b) in parallel. Clean up temp files:
+**Step 19 — Cascade checkoffs + cleanup.** For each project with newly checked items, run `batch_cascade_checkoff()` (same as Step 14b) in parallel.
+
+**Always clean up temp files** (even if user skipped actions — prevents stale cache from giving the same recommendations on next run):
 
 ```bash
 rm -f ~/.claude/obsidian-brain/deep-pipeline.json ~/.claude/obsidian-brain/deep-classifications.json
 ```
+
+This invalidates the 15-min cache so the next `/standup deep` run gets fresh data reflecting any changes made.
 
 Mark task #5 complete.
 
