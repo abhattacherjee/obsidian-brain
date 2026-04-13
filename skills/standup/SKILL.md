@@ -479,30 +479,8 @@ Set task #1 to `in_progress` via TaskUpdate immediately after creation.
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '{"basenames": %s, "projects": %s}' "$NOTE_BASENAMES_JSON" "$PROJECTS_JSON" | python3 -c '
-import sys, os, json, time
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
-from open_item_dedup import deep_analysis_pipeline
-
-data = json.load(sys.stdin)
-basenames = data["basenames"]
-projects_json = json.dumps(data["projects"])
-output_path = os.path.expanduser("~/.claude/obsidian-brain/deep-pipeline.json")
-
-# Cache check: reuse if exists and < 15 min old
-if os.path.isfile(output_path):
-    age = time.time() - os.path.getmtime(output_path)
-    if age < 900:  # 15 minutes
-        with open(output_path) as f:
-            cached = json.load(f)
-        items = cached.get("items", {})
-        n = items.get("total_raw", 0)
-        g = items.get("group_count", 0)
-        e = sum(1 for v in cached.get("evidence", {}).values() if v.get("commits") or v.get("releases"))
-        print(f"CACHED:{n}:{g}:{e}")
-        sys.exit(0)
-
-status = deep_analysis_pipeline(basenames, projects_json, output_path, sys.argv[1], sys.argv[2], sys.argv[3])
-print(status)
+import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from deep_cli import run_pipeline; run_pipeline(sys.argv[1], sys.argv[2], sys.argv[3])
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
 ```
 
@@ -522,18 +500,8 @@ Mark task #2 complete, task #3 in_progress.
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '%s' "$NOTE_BASENAMES_JSON" | python3 -c '
-import sys, os, json
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
-from open_item_dedup import build_deep_presentation
-
-basenames_json = sys.stdin.read(1_000_000)
-output = build_deep_presentation(
-    os.path.expanduser("~/.claude/obsidian-brain/deep-pipeline.json"),
-    os.path.expanduser("~/.claude/obsidian-brain/deep-classifications.json"),
-    basenames_json,
-    sys.argv[1], sys.argv[2], sys.argv[3]
-)
-print(output)
+import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from deep_cli import run_present; run_present(sys.argv[1], sys.argv[2], sys.argv[3])
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
 ```
 
@@ -546,21 +514,8 @@ Display the output to the user. Wait for user response — they may confirm acti
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '%s' "$EDITS_JSON" | python3 -c '
-import sys, os, json
-edits = json.load(sys.stdin)
-success = 0
-for filepath, old_text, new_text in edits:
-    try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-        if old_text in content:
-            content = content.replace(old_text, new_text, 1)
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(content)
-            success += 1
-    except OSError as e:
-        print(f"[obsidian-brain] edit failed {filepath}: {e}", file=sys.stderr)
-print(f"Applied {success}/{len(edits)} edits")
+import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from deep_cli import run_batch_edit; run_batch_edit()
 '
 ```
 

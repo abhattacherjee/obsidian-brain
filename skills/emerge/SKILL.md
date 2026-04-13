@@ -27,29 +27,8 @@ Parse DAYS: no arg=30, `Nd`/`N days`=N, `this week`=days since Monday.
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys, os, time, json
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
-from obsidian_utils import load_config, upgrade_and_collect_corpus
-c = load_config()
-if not c.get("vault_path"):
-    print("ERROR: vault_path not configured"); sys.exit(1)
-out = os.path.expanduser("~/.claude/obsidian-brain/emerge-corpus.json")
-
-# Cache check: reuse if exists, < 15 min old, and same window
-if os.path.isfile(out) and (time.time() - os.path.getmtime(out)) < 900:
-    with open(out) as f:
-        cached = json.load(f)
-    if cached.get("stats", {}).get("window_days") == int(sys.argv[1]):
-        s = cached["stats"]
-        print("VAULT=" + c["vault_path"])
-        print("INS=" + c.get("insights_folder", "claude-insights"))
-        print("STATUS=CACHED:" + str(s["total_notes"]) + ":0:0")
-        sys.exit(0)
-
-status = upgrade_and_collect_corpus(c["vault_path"], c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights"), int(sys.argv[1]), out)
-print("VAULT=" + c["vault_path"])
-print("INS=" + c.get("insights_folder", "claude-insights"))
-print("STATUS=" + status)
+import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from emerge_cli import run_corpus; run_corpus(int(sys.argv[1]) if len(sys.argv) > 1 else 30)
 ' "$DAYS"
 ```
 
@@ -62,18 +41,8 @@ Spawn parallel sub-agents for failed notes using /recall Path C Wave 2-3 pattern
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys, os, json, tempfile
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
-from obsidian_utils import load_config, collect_vault_corpus
-c = load_config()
-corpus_json = collect_vault_corpus(c["vault_path"], c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights"), int(sys.argv[1]))
-out = os.path.expanduser("~/.claude/obsidian-brain/emerge-corpus.json")
-os.makedirs(os.path.dirname(out), exist_ok=True)
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out), suffix=".tmp")
-with os.fdopen(fd, "w") as f:
-    f.write(corpus_json)
-os.replace(tmp, out)
-print("REFRESHED:" + str(json.loads(corpus_json).get("note_count", 0)))
+import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from emerge_cli import run_recollect; run_recollect(int(sys.argv[1]) if len(sys.argv) > 1 else 30)
 ' "$DAYS"
 ```
 
@@ -92,33 +61,8 @@ If no `WRITTEN:` response, report failure and stop. Mark task #2 `completed`.
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys, os, json, datetime, hashlib
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
-from obsidian_utils import load_config, write_vault_note
-c = load_config()
-vault, ins = c["vault_path"], c.get("insights_folder", "claude-insights")
-with open(os.path.expanduser("~/.claude/obsidian-brain/emerge-corpus.json")) as f:
-    corpus = json.load(f)
-with open(os.path.expanduser("~/.claude/obsidian-brain/emerge-analysis.md")) as f:
-    analysis = f.read()
-today = datetime.date.today().isoformat()
-projects = sorted(set(n.get("project", "") for n in corpus.get("notes", []) if n.get("project")))
-src = ["[[" + os.path.splitext(n["file"])[0] + "]]" for n in corpus.get("notes", [])]
-tags = ["claude/emerge"] + ["claude/project/" + p for p in projects]
-fm = "---\ntype: claude-emerge\ndate: " + today + "\ndate_range: \"" + corpus.get("date_range", "") + "\"\nprojects:\n" + "\n".join("  - " + p for p in projects) + "\nsource_notes:\n" + "\n".join("  - \"" + s + "\"" for s in src) + "\nnote_count: " + str(corpus.get("note_count", 0)) + "\ntags:\n" + "\n".join("  - " + t for t in tags) + "\n---"
-title = "# Emerge: Pattern Discovery (" + corpus.get("date_range", "") + ")"
-header = "**Projects:** " + ", ".join(projects) + "\n**Notes analyzed:** " + str(corpus.get("note_count", 0))
-body = fm + "\n\n" + title + "\n\n" + header + "\n\n" + analysis
-h = hashlib.md5(today.encode()).hexdigest()[-4:]
-filename = today + "-emerge-patterns-" + h + ".md"
-if write_vault_note(vault, ins, filename, body):
-    print("SAVED:" + os.path.join(vault, ins, filename))
-    print("---REPORT---")
-    print(analysis)
-else:
-    print("ERROR: write failed", file=sys.stderr); sys.exit(1)
-os.remove(os.path.expanduser("~/.claude/obsidian-brain/emerge-corpus.json"))
-os.remove(os.path.expanduser("~/.claude/obsidian-brain/emerge-analysis.md"))
+import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from emerge_cli import run_build_note; run_build_note()
 ' 2>&1
 ```
 
