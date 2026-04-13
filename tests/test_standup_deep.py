@@ -911,3 +911,65 @@ class TestRepresentativeKey:
         for group in data["items"]["groups"]:
             assert "representative" in group, f"Group missing 'representative' key: {group.keys()}"
             assert "canonical" not in group, f"Group has stale 'canonical' key"
+
+
+class TestEncodingCorruption:
+    """Vault notes with non-UTF8 bytes must not crash the pipeline."""
+
+    def test_pipeline_handles_binary_content_in_notes(self, tmp_vault):
+        """Notes with encoding corruption are read with errors='replace', not skipped."""
+        sess = tmp_vault / "claude-sessions"
+        bn = f"{_today()}-corrupt-0001"
+        note_path = sess / f"{bn}.md"
+        # Write a note with valid frontmatter but binary garbage in body
+        content = (
+            "---\ndate: " + _today() + "\nproject: p\ntype: claude-session\nstatus: summarized\n---\n\n"
+            "# Corrupt\n\n## Summary\nDone.\n\n## Open Questions / Next Steps\n- [ ] Fix the bug\n\n"
+        )
+        note_path.write_bytes(content.encode("utf-8") + b"\xff\xfe\x00\x80binary garbage")
+
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"])
+        output = tmp_vault / "deep.json"
+        with patch.object(open_item_dedup, '_resolve_project_paths', return_value={}):
+            status = open_item_dedup.deep_analysis_pipeline(
+                [bn], '["p"]', str(output),
+                str(tmp_vault), "claude-sessions", "claude-insights")
+        assert status.startswith("OK:")
+        data = json.loads(output.read_text())
+        # Should have collected the open item despite encoding corruption
+        assert data["items"]["total_raw"] >= 1
+
+    def test_collect_open_items_handles_binary_notes(self, tmp_vault):
+        """collect_open_items reads notes with errors='replace'."""
+        sess = tmp_vault / "claude-sessions"
+        note_path = sess / f"{_today()}-bin-0001.md"
+        content = (
+            "---\ndate: " + _today() + "\nproject: p\ntype: claude-session\nstatus: summarized\n---\n\n"
+            "# Bin\n\n## Open Questions / Next Steps\n- [ ] Handle encoding\n"
+        )
+        note_path.write_bytes(content.encode("utf-8") + b"\xff\xfe\x00binary")
+
+        items = open_item_dedup.collect_open_items(
+            str(tmp_vault), "claude-sessions", "p")
+        # Should find the item without crashing
+        assert len(items) >= 1
+        assert any("Handle encoding" in t for _, _, t in items)
+
+
+class TestBatchCascadeEncoding:
+    """batch_cascade_checkoff must handle encoding-corrupted vault notes."""
+
+    def test_cascade_handles_binary_notes(self, tmp_vault):
+        """Cascade reads notes with errors='replace', doesn't crash on binary."""
+        sess = tmp_vault / "claude-sessions"
+        note_path = sess / f"{_today()}-cascade-bin-0001.md"
+        content = (
+            "---\ndate: " + _today() + "\nproject: p\ntype: claude-session\nstatus: summarized\n---\n\n"
+            "# T\n\n## Open Questions / Next Steps\n- [ ] Fix encoding bug\n"
+        )
+        note_path.write_bytes(content.encode("utf-8") + b"\xff\xfe\x00")
+
+        result = open_item_dedup.batch_cascade_checkoff(
+            str(tmp_vault), "claude-sessions", "p", ["Fix encoding bug"])
+        # Should not crash — either finds the item or reports no duplicates
+        assert isinstance(result, str)
