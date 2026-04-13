@@ -144,3 +144,25 @@ def test_snippets_import_os_before_usage():
                     f"Snippet {name} uses os.* before importing os"
                 )
                 break
+
+
+def test_snippets_import_glob_before_usage():
+    """SNIP_05: Snippets using glob.* must import glob on a PRIOR or SAME line."""
+    _IMPORT_GLOB_RE = re.compile(
+        r'^\s*import\s+(?:[\w]+\s*,\s*)*glob(?:\s*[,;]|\s*$)'
+    )
+    _GLOB_USAGE_RE = re.compile(r'\bglob\.')
+    for name, code in _SNIPPETS:
+        if not _GLOB_USAGE_RE.search(code):
+            continue
+        lines = code.strip().split("\n")
+        glob_imported = False
+        for line in lines:
+            # Check import first (handles 'import glob; glob.glob(...)' on same line)
+            if _IMPORT_GLOB_RE.search(line):
+                glob_imported = True
+            elif _GLOB_USAGE_RE.search(line):
+                assert glob_imported, (
+                    f"Snippet {name} uses glob.* before importing glob"
+                )
+                break
