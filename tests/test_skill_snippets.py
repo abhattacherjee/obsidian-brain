@@ -95,21 +95,25 @@ def test_no_tail_c_in_skills():
 
 
 def test_hooks_future_annotations():
-    """Hook .py files using PEP 604/585 type hints must have 'from __future__ import annotations'.
+    """All .py files using PEP 604/585 type hints must have 'from __future__ import annotations'.
 
     Without this import, `dict | None` and `list[str]` syntax fails on
-    Python < 3.10 (macOS system Python is 3.9.6).
+    Python < 3.10 (macOS system Python is 3.9.6). Scans hooks/ and scripts/.
     """
-    hooks_dir = os.path.join(_REPO_ROOT, "hooks")
     pep604_re = re.compile(r':\s*\w+\s*\|\s*\w+|-> \w+\s*\|\s*\w+')
     pep585_re = re.compile(r':\s*(?:list|dict|set|tuple)\[')
-    for py_file in sorted(glob.glob(os.path.join(hooks_dir, "*.py"))):
+    py_files = sorted(
+        glob.glob(os.path.join(_REPO_ROOT, "hooks", "*.py"))
+        + glob.glob(os.path.join(_REPO_ROOT, "scripts", "**", "*.py"), recursive=True)
+    )
+    for py_file in py_files:
         with open(py_file, encoding="utf-8") as f:
             content = f.read()
         uses_modern = pep604_re.search(content) or pep585_re.search(content)
         if uses_modern:
+            rel_path = os.path.relpath(py_file, _REPO_ROOT)
             assert "from __future__ import annotations" in content, (
-                f"{os.path.basename(py_file)} uses PEP 604/585 type hints "
+                f"{rel_path} uses PEP 604/585 type hints "
                 "but is missing 'from __future__ import annotations'. "
                 "This breaks on Python < 3.10 (macOS system Python 3.9.6)."
             )
