@@ -462,17 +462,20 @@ If `batch_cascade_checkoff` is unavailable (import error), warn the user:
 
 Skip to Edge Cases if `IS_DEEP` is false.
 
-**Step 14b — Create deep task manifest.** You MUST create these 5 tasks using the TaskCreate tool NOW (not later, not optionally — this is how the user tracks progress):
+> **STOP. Before ANY deep analysis work, create the task manifest.**
+> The user CANNOT see your progress without tasks. Create all 5 tasks below using TaskCreate tool calls RIGHT NOW — in your NEXT tool-call message — before proceeding to Step 15.
 
-```
-TaskCreate: subject="Collect data and gather evidence", activeForm="Analyzing vault and git history"
-TaskCreate: subject="Classify open items", activeForm="Classifying items with AI"
-TaskCreate: subject="Present deep analysis", activeForm="Presenting recommendations"
-TaskCreate: subject="Execute confirmed actions", activeForm="Executing actions"
-TaskCreate: subject="Cascade checkoffs", activeForm="Cascading checkoffs"
-```
+**Step 14b — Create deep task manifest.**
 
-Set task #1 to `in_progress` via TaskUpdate immediately after creation.
+Call TaskCreate 5 times (all in one message):
+
+1. `TaskCreate: subject="Collect data and gather evidence", activeForm="Analyzing vault and git history"`
+2. `TaskCreate: subject="Classify open items", activeForm="Classifying items with AI"`
+3. `TaskCreate: subject="Present deep analysis", activeForm="Presenting recommendations"`
+4. `TaskCreate: subject="Execute confirmed actions", activeForm="Executing actions"`
+5. `TaskCreate: subject="Cascade checkoffs", activeForm="Cascading checkoffs"`
+
+Then set task #1 to `in_progress` via TaskUpdate. **Do NOT proceed to Step 15 until all 5 tasks exist.**
 
 **Step 15 — Collect data and gather evidence.** First check for a fresh cache (avoids re-running the full pipeline if `/standup deep` or `/emerge` was run recently with the same data):
 
