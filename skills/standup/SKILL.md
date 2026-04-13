@@ -503,7 +503,7 @@ Mark task #2 complete, task #3 in_progress.
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-printf '%s' '$NOTE_BASENAMES_JSON' | python3 -c '
+printf '%s' "$NOTE_BASENAMES_JSON" | python3 -c '
 import sys, os, json
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from open_item_dedup import build_deep_presentation

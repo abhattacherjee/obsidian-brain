@@ -602,15 +602,16 @@ def deep_analysis_pipeline(
             except OSError:
                 pass
 
-        # FTS5 search for each open item in this project
-        proj_items = [t for (fp, ln, t) in all_raw_items
-                      if os.path.basename(os.path.dirname(fp)) == sessions_folder]
+        # FTS5 search for each open item scoped to THIS project
+        proj_items = [g["canonical"] for g in all_groups if g["project"] == project]
         fts_mentions: dict[str, int] = {}
         for item_text in proj_items[:10]:  # cap to avoid excessive queries
             kws = vault_index.extract_keywords(item_text, limit=3)
             if kws:
+                # Pass keywords as space-separated (not "OR"-joined — search_vault
+                # handles tokenization internally; literal "OR" would be a search term)
                 hits = vault_index.search_vault(
-                    actual_db, " OR ".join(kws), project=project, limit=5,
+                    actual_db, " ".join(kws), project=project, limit=5,
                 )
                 fts_mentions[item_text[:60]] = len(hits)
         if fts_mentions:
@@ -632,8 +633,9 @@ def deep_analysis_pipeline(
         "evidence": evidence,
     }
 
-    # Atomic write: tempfile + rename
+    # Atomic write: tempfile + rename (ensure dir exists first)
     out_dir = os.path.dirname(output_path) or "."
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=".ob-pipeline-", suffix=".json", dir=out_dir)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
