@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Add `from __future__ import annotations` to `vault_index.py` and `obsidian_context_snapshot.py` — fixes PEP 604 `TypeError` on macOS system Python 3.9.6
 - Fix false "No session files found" warning in `check_hook_status()` when project directory contains underscores (Claude Code normalizes `_` to `-` in project paths)
+- Fix ambiguous hash instructions in 4 skills (error-log, decide, compress, vault-import) — replace vague `md5` with explicit `cut -c` commands to prevent `tail -c 4` newline byte bug producing 3-char hashes
 
 ### Added
 - Regression test `test_hooks_future_annotations` ensuring all hook files with PEP 604/585 syntax include the `__future__` import
