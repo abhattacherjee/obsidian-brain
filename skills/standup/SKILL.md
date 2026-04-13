@@ -539,7 +539,34 @@ print(output)
 
 Display the output to the user. Wait for user response — they may confirm actions, edit classifications, or type `skip`. Mark task #3 complete, task #4 in_progress.
 
-**Step 18 — Execute confirmed actions.** Parse user response. For each confirmed checkoff, use the Edit tool to flip `- [ ]` to `- [x]` in the relevant vault notes. For confirmed link additions, append wikilinks. If user typed `skip`, skip this step. Mark task #4 complete, task #5 in_progress.
+**Step 18 — Execute confirmed actions.** Parse user response. If user typed `skip`, skip this step.
+
+**Important:** Do NOT use the Edit tool for batch vault edits — it requires Read first for each file, which is impractical for 20+ files. Instead, use a Python script that reads, modifies, and writes files directly:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+printf '%s' "$EDITS_JSON" | python3 -c '
+import sys, os, json
+edits = json.load(sys.stdin)
+success = 0
+for filepath, old_text, new_text in edits:
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        if old_text in content:
+            content = content.replace(old_text, new_text, 1)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+            success += 1
+    except OSError as e:
+        print(f"[obsidian-brain] edit failed {filepath}: {e}", file=sys.stderr)
+print(f"Applied {success}/{len(edits)} edits")
+'
+```
+
+Where `$EDITS_JSON` is a JSON array of `[filepath, old_text, new_text]` triples constructed from the confirmed actions. Use `errors="replace"` when reading to handle vault notes with encoding corruption (binary file matches).
+
+For confirmed link additions, use the same Python pattern to append wikilinks. Mark task #4 complete, task #5 in_progress.
 
 **Step 19 — Cascade checkoffs vault-wide.** For each project with newly checked items, run `batch_cascade_checkoff()` (same as Step 14b) in parallel. Clean up temp files:
 

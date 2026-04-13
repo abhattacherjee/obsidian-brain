@@ -89,7 +89,7 @@ def collect_open_items(
         # Single-pass: read file once, check project in frontmatter,
         # then extract open items from ## Open Questions / Next Steps
         try:
-            with open(fpath, 'r', encoding='utf-8') as f:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
         except OSError as exc:
             print(f"[obsidian-brain] skipping unreadable note {fname}: {exc}", file=sys.stderr)
@@ -326,7 +326,7 @@ def batch_cascade_checkoff(
 
     for fpath, line_nums in files_to_edit.items():
         try:
-            with open(fpath, 'r', encoding='utf-8') as f:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
         except OSError as exc:
             print(f"[obsidian-brain] cascade: cannot read {os.path.basename(fpath)}: {exc}", file=sys.stderr)
@@ -465,7 +465,7 @@ def deep_analysis_pipeline(
     note_keywords: dict[str, list[str]] = {}
     for stem, fpath in stem_to_path.items():
         try:
-            with open(fpath, 'r', encoding='utf-8') as f:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
         except OSError:
             continue
@@ -597,7 +597,7 @@ def deep_analysis_pipeline(
         changelog_path = os.path.join(repo_path, "CHANGELOG.md")
         if os.path.isfile(changelog_path):
             try:
-                with open(changelog_path, 'r', encoding='utf-8') as f:
+                with open(changelog_path, 'r', encoding='utf-8', errors='replace') as f:
                     proj_evidence["changelog_excerpt"] = f.read(2000)
             except OSError:
                 pass
@@ -700,7 +700,7 @@ def build_deep_presentation(
             if not os.path.isfile(fpath):
                 continue
             try:
-                with open(fpath, 'r', encoding='utf-8') as f:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()
             except OSError:
                 continue
