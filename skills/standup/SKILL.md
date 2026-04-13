@@ -59,6 +59,8 @@ Stop here if FAIL.
 
 ### Step 3 — Parse date range from arguments
 
+Before date parsing, check if the argument string contains the word `deep` (case-insensitive). If found, set `IS_DEEP = true` and remove `deep` from the argument string before passing to date parsing. Otherwise `IS_DEEP = false`.
+
 Inspect the argument passed after `/standup`. Calculate `START_DATE` and `END_DATE` as `YYYY-MM-DD` strings using bash `date` commands.
 
 **No argument (bare `/standup`):** today only.
@@ -359,6 +361,7 @@ Where:
 - `projects` lists all unique project names found, sorted alphabetically
 - `source_notes` lists every contributing note as a wikilink (filename without `.md`)
 - `tags` includes `claude/standup` plus a `claude/project/<name>` tag for each project covered by the standup
+- If `IS_DEEP`, also append `claude/standup-deep` to the tags list
 
 ### Step 11 — Generate filename
 
@@ -454,6 +457,77 @@ Note: `batch_cascade_checkoff()` may emit warnings to stderr while still succeed
 If `batch_cascade_checkoff` is unavailable (import error), warn the user:
 
 > Could not cascade checkoffs: [error details]. The standup note is correct, but duplicate open items in other session notes were not updated. Run `/recall` to cascade manually.
+
+### Steps 14b–19 — Deep mode (only if IS_DEEP)
+
+Skip to Edge Cases if `IS_DEEP` is false.
+
+**Step 14b — Create deep task manifest.** Create 5 tasks:
+
+- TaskCreate: subject="Collect data and gather evidence", activeForm="Analyzing vault and git history"
+- TaskCreate: subject="Classify open items", activeForm="Classifying items with AI"
+- TaskCreate: subject="Present deep analysis", activeForm="Presenting recommendations"
+- TaskCreate: subject="Execute confirmed actions", activeForm="Executing actions"
+- TaskCreate: subject="Cascade checkoffs", activeForm="Cascading checkoffs"
+
+Set task #1 to in_progress.
+
+**Step 15 — Collect data and gather evidence.** Run a single Python call:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+printf '%s' '$NOTE_BASENAMES_JSON' | python3 -c '
+import sys, os, json
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from open_item_dedup import deep_analysis_pipeline
+
+basenames = json.load(sys.stdin)
+output_path = os.path.expanduser("~/.claude/obsidian-brain/deep-pipeline.json")
+status = deep_analysis_pipeline(basenames, sys.argv[1], output_path, sys.argv[2], sys.argv[3], sys.argv[4])
+print(status)
+' "$PROJECTS_JSON" "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
+```
+
+Where `$NOTE_BASENAMES_JSON` is a JSON array of note basenames from Step 7's NOTE_DATA, and `$PROJECTS_JSON` is the JSON string from Step 8's project list. Mark task #1 complete, task #2 in_progress.
+
+**Step 16 — Classify open items.** Spawn a single Agent sub-agent that:
+1. Reads `~/.claude/obsidian-brain/deep-pipeline.json`
+2. For each open item, classifies it as `done`, `stale`, `active`, or `duplicate` based on evidence
+3. Writes classifications to `~/.claude/obsidian-brain/deep-classifications.json`
+
+Mark task #2 complete, task #3 in_progress.
+
+**Step 17 — Present deep analysis.** Run:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+printf '%s' '$NOTE_BASENAMES_JSON' | python3 -c '
+import sys, os, json
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from open_item_dedup import build_deep_presentation
+
+basenames_json = sys.stdin.read(1_000_000)
+output = build_deep_presentation(
+    os.path.expanduser("~/.claude/obsidian-brain/deep-pipeline.json"),
+    os.path.expanduser("~/.claude/obsidian-brain/deep-classifications.json"),
+    basenames_json,
+    sys.argv[1], sys.argv[2], sys.argv[3]
+)
+print(output)
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
+```
+
+Display the output to the user. Wait for user response — they may confirm actions, edit classifications, or type `skip`. Mark task #3 complete, task #4 in_progress.
+
+**Step 18 — Execute confirmed actions.** Parse user response. For each confirmed checkoff, use the Edit tool to flip `- [ ]` to `- [x]` in the relevant vault notes. For confirmed link additions, append wikilinks. If user typed `skip`, skip this step. Mark task #4 complete, task #5 in_progress.
+
+**Step 19 — Cascade checkoffs vault-wide.** For each project with newly checked items, run `batch_cascade_checkoff()` (same as Step 14b) in parallel. Clean up temp files:
+
+```bash
+rm -f ~/.claude/obsidian-brain/deep-pipeline.json ~/.claude/obsidian-brain/deep-classifications.json
+```
+
+Mark task #5 complete.
 
 ## Edge Cases
 
