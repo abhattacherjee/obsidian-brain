@@ -74,6 +74,27 @@ def test_cache_glob_finds_installed_hooks():
     )
 
 
+def test_hooks_future_annotations():
+    """Hook .py files using PEP 604/585 type hints must have 'from __future__ import annotations'.
+
+    Without this import, `dict | None` and `list[str]` syntax fails on
+    Python < 3.10 (macOS system Python is 3.9.6).
+    """
+    hooks_dir = os.path.join(_REPO_ROOT, "hooks")
+    pep604_re = re.compile(r':\s*\w+\s*\|\s*\w+|-> \w+\s*\|\s*\w+')
+    pep585_re = re.compile(r':\s*(?:list|dict|set|tuple)\[')
+    for py_file in sorted(glob.glob(os.path.join(hooks_dir, "*.py"))):
+        with open(py_file, encoding="utf-8") as f:
+            content = f.read()
+        uses_modern = pep604_re.search(content) or pep585_re.search(content)
+        if uses_modern:
+            assert "from __future__ import annotations" in content, (
+                f"{os.path.basename(py_file)} uses PEP 604/585 type hints "
+                "but is missing 'from __future__ import annotations'. "
+                "This breaks on Python < 3.10 (macOS system Python 3.9.6)."
+            )
+
+
 def test_snippets_import_os_before_usage():
     """Snippets using os.* must import os on a PRIOR line.
 

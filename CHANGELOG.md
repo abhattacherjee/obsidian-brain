@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Add `from __future__ import annotations` to `vault_index.py` and `obsidian_context_snapshot.py` — fixes PEP 604 `TypeError` on macOS system Python 3.9.6
+
+### Added
+- Regression test `test_hooks_future_annotations` ensuring all hook files with PEP 604/585 syntax include the `__future__` import
+
 ## [2.0.1] - 2026-04-12
 
 ### Fixed
