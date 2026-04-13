@@ -13,7 +13,6 @@ import time
 from obsidian_utils import (
     collect_vault_corpus,
     load_config,
-    make_filename,
     upgrade_and_collect_corpus,
     write_vault_note,
 )
@@ -33,14 +32,17 @@ def run_corpus(days: int = 30) -> None:
 
     # Cache check: reuse if < 15 min old and same window
     if os.path.isfile(out) and (time.time() - os.path.getmtime(out)) < 900:
-        with open(out) as f:
-            cached = json.load(f)
-        if cached.get("stats", {}).get("window_days") == days:
-            s = cached["stats"]
-            print("VAULT=" + c["vault_path"])
-            print("INS=" + c.get("insights_folder", "claude-insights"))
-            print("STATUS=CACHED:" + str(s["total_notes"]) + ":0:0")
-            return
+        try:
+            with open(out) as f:
+                cached = json.load(f)
+            if cached.get("stats", {}).get("window_days") == days:
+                s = cached["stats"]
+                print("VAULT=" + c["vault_path"])
+                print("INS=" + c.get("insights_folder", "claude-insights"))
+                print("STATUS=CACHED:" + str(s["total_notes"]) + ":0:0")
+                return
+        except (OSError, json.JSONDecodeError, KeyError) as exc:
+            print(f"[obsidian-brain] cache read failed, collecting fresh: {exc}", file=sys.stderr)
 
     status = upgrade_and_collect_corpus(
         c["vault_path"],
@@ -73,6 +75,7 @@ def run_recollect(days: int = 30) -> None:
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out), suffix=".tmp")
     with os.fdopen(fd, "w") as f:
         f.write(corpus_json)
+    os.chmod(tmp, 0o600)
     os.replace(tmp, out)
     print("REFRESHED:" + str(json.loads(corpus_json).get("note_count", 0)))
 

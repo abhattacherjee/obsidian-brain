@@ -51,7 +51,7 @@ def run_pipeline(vault_path: str, sessions_folder: str, insights_folder: str) ->
 
     # Filter out recently acted-on items so they aren't re-recommended
     acted = _load_acted_items()
-    if acted and os.path.isfile(output_path):
+    if acted and not status.startswith("ERROR:") and os.path.isfile(output_path):
         try:
             with open(output_path, "r", encoding="utf-8") as f:
                 pipeline_data = json.load(f)
@@ -109,12 +109,15 @@ def _load_acted_items() -> set[str]:
 
 
 def _save_acted_items(items: set[str]) -> None:
-    """Persist acted-on item texts (append to existing)."""
+    """Persist acted-on item texts (append to existing). Best-effort."""
     existing = _load_acted_items()
     combined = existing | items
-    os.makedirs(os.path.dirname(_ACTED_ITEMS_PATH), exist_ok=True)
-    with open(_ACTED_ITEMS_PATH, "w", encoding="utf-8") as f:
-        json.dump(sorted(combined), f)
+    try:
+        os.makedirs(os.path.dirname(_ACTED_ITEMS_PATH), exist_ok=True)
+        with open(_ACTED_ITEMS_PATH, "w", encoding="utf-8") as f:
+            json.dump(sorted(combined), f)
+    except OSError as exc:
+        print(f"[obsidian-brain] warning: could not save acted items: {exc}", file=sys.stderr)
 
 
 def run_batch_edit() -> None:
@@ -124,17 +127,41 @@ def run_batch_edit() -> None:
     Prints ``Applied N/M edits``.
     Records acted-on items so they aren't re-recommended on next run.
     """
+    import tempfile
+
+    from obsidian_utils import load_config
+
+    c = load_config()
+    vault_root = os.path.realpath(c["vault_path"])
+
     edits = json.load(sys.stdin)
     success = 0
     acted_texts: set[str] = set()
     for filepath, old_text, new_text in edits:
         try:
-            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            real_path = os.path.realpath(filepath)
+            if not real_path.startswith(vault_root + os.sep) and real_path != vault_root:
+                print(f"[obsidian-brain] path containment violation: {filepath}", file=sys.stderr)
+                continue
+
+            with open(real_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             if old_text in content:
                 content = content.replace(old_text, new_text, 1)
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(content)
+                fd, tmp = tempfile.mkstemp(
+                    dir=os.path.dirname(real_path), suffix=".tmp"
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    os.chmod(tmp, 0o600)
+                    os.replace(tmp, real_path)
+                except BaseException:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
                 success += 1
                 # Track the item text (strip checkbox prefix for matching)
                 item_text = old_text.replace("- [ ] ", "").replace("- [x] ", "").strip()

@@ -1944,6 +1944,7 @@ def upgrade_and_collect_corpus(
         "total_notes": total,
         "upgraded": upgraded,
         "upgrade_failures": failed,
+        "window_days": days,
     }
 
     # --- Phase 3: atomic write to output_path ---

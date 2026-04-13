@@ -577,8 +577,8 @@ def deep_analysis_pipeline(
                 proj_evidence["commits"] = proc.stdout.strip().split("\n")[:20]
             else:
                 print(f"[obsidian-brain] git log failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"[obsidian-brain] git log error for {project}: {exc}", file=sys.stderr)
 
         # gh release list
         try:
@@ -590,8 +590,8 @@ def deep_analysis_pipeline(
                 proj_evidence["releases"] = proc.stdout.strip().split("\n")[:5]
             else:
                 print(f"[obsidian-brain] gh release list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"[obsidian-brain] gh release error for {project}: {exc}", file=sys.stderr)
 
         # CHANGELOG.md excerpt
         changelog_path = os.path.join(repo_path, "CHANGELOG.md")

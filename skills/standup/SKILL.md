@@ -533,10 +533,10 @@ For confirmed link additions, use the same Python pattern to append wikilinks. M
 **Always clean up temp files** (even if user skipped actions — prevents stale cache from giving the same recommendations on next run):
 
 ```bash
-rm -f ~/.claude/obsidian-brain/deep-pipeline.json ~/.claude/obsidian-brain/deep-classifications.json /tmp/standup-*.json
+rm -f ~/.claude/obsidian-brain/deep-pipeline.json ~/.claude/obsidian-brain/deep-classifications.json
 ```
 
-This invalidates the 15-min cache so the next `/standup deep` run gets fresh data reflecting any changes made. Also cleans up any `/tmp/standup-*` files that may have been created by model-generated inline Python.
+This invalidates the 15-min cache so the next `/standup deep` run gets fresh data reflecting any changes made.
 
 Mark task #5 complete.
 

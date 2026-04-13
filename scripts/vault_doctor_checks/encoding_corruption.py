@@ -45,7 +45,16 @@ def scan(
 
             try:
                 raw = md_file.read_bytes()
-            except OSError:
+            except OSError as exc:
+                issues.append(Issue(
+                    check=NAME,
+                    note_path=str(md_file),
+                    project=project or "",
+                    current_source="Unreadable file",
+                    proposed_source="Check file permissions and disk health",
+                    reason=f"OSError reading file: {exc}",
+                    extra={"error": str(exc)},
+                ))
                 continue
 
             try:
