@@ -198,7 +198,7 @@ def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:
                 file=sys.stderr,
             )
             continue
-        if fm.get("project") != project:
+        if fm.get("project", "").replace("_", "-") != project.replace("_", "-"):
             continue
         sid = fm.get("session_id", "")
         if not sid:
@@ -290,15 +290,17 @@ def scan(
             note_project = fm.get("project", "")
             if not note_project:
                 continue
-            if project and note_project != project:
+            if project and note_project.replace("_", "-") != project.replace("_", "-"):
                 continue
 
-            if note_project not in session_index_cache:
-                session_index_cache[note_project] = _list_session_notes(sessions_dir, note_project)
-                jsonl_dir_cache[note_project] = _jsonl_dir_for_project(note_project)
+            # Normalize cache key so personal_ws and personal-ws share index
+            cache_key = note_project.replace("_", "-")
+            if cache_key not in session_index_cache:
+                session_index_cache[cache_key] = _list_session_notes(sessions_dir, note_project)
+                jsonl_dir_cache[cache_key] = _jsonl_dir_for_project(note_project)
 
-            idx = session_index_cache[note_project]
-            jsonl_dir = jsonl_dir_cache[note_project]
+            idx = session_index_cache[cache_key]
+            jsonl_dir = jsonl_dir_cache[cache_key]
 
             current_sid = fm.get("source_session", "")
             raw_src_note = fm.get("source_session_note", "")

@@ -429,7 +429,7 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     if cached is not None:
         return cached
 
-    project = os.path.basename(os.getcwd()).lower().replace(' ', '-')
+    project = os.path.basename(os.getcwd()).lower().replace(' ', '-').replace('_', '-')
     if sid == "unknown":
         # Don't cache "unknown" — would pollute cache shared across projects
         return {"session_id": "unknown", "hash": "", "project": project, "session_note_name": ""}
@@ -720,7 +720,7 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
     errors, duration_minutes, commits.
     """
     meta: dict = {
-        "project": Path(cwd).name if cwd else "unknown",
+        "project": Path(cwd).name.replace("_", "-") if cwd else "unknown",
         "project_path": cwd or "",
         "git_branch": "",
         "files_touched": [],

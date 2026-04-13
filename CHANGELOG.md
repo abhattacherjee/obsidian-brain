@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `from __future__ import annotations` to `vault_index.py` and `obsidian_context_snapshot.py` — fixes PEP 604 `TypeError` on macOS system Python 3.9.6
 - Fix underscore-to-hyphen project path matching across all 3 functions that glob `~/.claude/projects/`: `_slow_path_newest_sid()`, `_get_session_id_fast()`, and `_jsonl_dir_for_project()` — extracted shared `_glob_project_jsonls()` helper
 - Fix ambiguous hash instructions in 4 skills (error-log, decide, compress, vault-import) — replace vague `md5` with explicit `cut -c` commands to prevent `tail -c 4` newline byte bug producing 3-char hashes
+- Normalize project names (underscore → hyphen) in `get_session_context()`, `extract_session_metadata()`, and vault-doctor `source_sessions.py` comparisons — prevents project name splits in frontmatter tags
 
 ### Added
 - `_glob_project_jsonls()` helper in `obsidian_utils.py` — centralizes `~/.claude/projects/` globbing with underscore-to-hyphen fallback
