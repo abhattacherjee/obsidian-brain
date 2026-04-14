@@ -942,3 +942,124 @@ class TestReranker:
         )
         results = vault_index.rerank_results([partial, full], ["alpha", "beta"])
         assert results[0]["title"] == "Full Match"
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Integration tests for search quality
+# ---------------------------------------------------------------------------
+
+
+class TestSearchQualityIntegration:
+    """End-to-end tests verifying search quality improvement."""
+
+    def _populate_realistic_vault(self, tmp_vault):
+        """Create a realistic mix of notes to test search relevance."""
+        notes = [
+            # Highly relevant: both terms in title, close together
+            (
+                "claude-insights/sentry-feasibility.md",
+                {
+                    "type": "claude-insight",
+                    "date": "2026-04-10",
+                    "project": "proj",
+                    "tags": ["claude/insight", "claude/topic/sentry"],
+                },
+                "# Sentry Feasibility Analysis\n\nDetailed feasibility study of Sentry integration.",
+            ),
+            # Relevant: both terms in body, close
+            (
+                "claude-sessions/sentry-session.md",
+                {
+                    "type": "claude-session",
+                    "date": "2026-04-09",
+                    "project": "proj",
+                    "tags": ["claude/session"],
+                },
+                "# Session: Monitoring Setup\n\nEvaluated sentry feasibility for error tracking.",
+            ),
+            # Noise: only "sentry" in body (no "feasibility")
+            (
+                "claude-sessions/sentry-only.md",
+                {
+                    "type": "claude-session",
+                    "date": "2026-04-08",
+                    "project": "proj",
+                    "tags": ["claude/session"],
+                },
+                "# Session: Alerts\n\nConfigured sentry alerting rules for prod.",
+            ),
+            # Noise: only "feasibility" in body (no "sentry")
+            (
+                "claude-sessions/feasibility-only.md",
+                {
+                    "type": "claude-session",
+                    "date": "2026-04-07",
+                    "project": "proj",
+                    "tags": ["claude/session"],
+                },
+                "# Session: Planning\n\nRan a feasibility check on the new storage backend.",
+            ),
+            # Noise: unrelated note
+            (
+                "claude-sessions/unrelated.md",
+                {
+                    "type": "claude-session",
+                    "date": "2026-04-06",
+                    "project": "proj",
+                    "tags": ["claude/session"],
+                },
+                "# Session: CSS Fixes\n\nFixed layout issues in the dashboard.",
+            ),
+        ]
+        for rel_path, fm, body in notes:
+            _write_note(tmp_vault / rel_path, fm, body)
+
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db
+        )
+        return db
+
+    def test_sentry_feasibility_top_results_relevant(self, tmp_vault):
+        """'sentry feasibility' returns insight first, both-term notes above single-term."""
+        db = self._populate_realistic_vault(tmp_vault)
+        results = vault_index.search_vault(db, "sentry feasibility")
+
+        # AND mode: only notes with BOTH terms
+        assert len(results) == 2
+        titles = [r["title"] for r in results]
+        # Insight with title match should be #1
+        assert "Sentry Feasibility" in titles[0]
+        # No noise notes
+        assert not any("CSS" in t for t in titles)
+        assert not any("Alerts" in t for t in titles)
+
+    def test_query_related_notes_still_works(self, tmp_vault):
+        """query_related_notes Layer 3 uses AND-mode FTS without breaking."""
+        _write_note(
+            tmp_vault / "claude-insights" / "related.md",
+            {
+                "type": "claude-insight",
+                "date": "2026-04-10",
+                "project": "proj",
+                "tags": ["claude/insight"],
+            },
+            body="# Authentication Patterns\n\nJWT token rotation best practices.",
+        )
+
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db
+        )
+
+        results = vault_index.query_related_notes(
+            db_path=db,
+            project="proj",
+            session_ids=[],
+            session_tags=[],
+            session_summary="JWT token rotation",
+            limit=10,
+        )
+
+        # Should still find the note via FTS Layer 3
+        assert any("Authentication" in r.get("title", "") for r in results)
