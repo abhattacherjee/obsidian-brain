@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import time
+from datetime import date, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -765,3 +766,72 @@ class TestBuildContextBriefFallback:
         )
 
         assert "Fallback Insight" in brief
+
+
+# ---------------------------------------------------------------------------
+# Task 3: BM25 column weighting + OR fallback
+# ---------------------------------------------------------------------------
+
+
+class TestBM25AndFallback:
+    def test_bm25_title_boost(self, tmp_vault):
+        """Note with query term in title ranks above note with term only in body."""
+        _write_note(
+            tmp_vault / "claude-insights" / "title-match.md",
+            {"type": "claude-insight", "date": "2026-04-10", "project": "proj",
+             "tags": ["claude/insight"]},
+            body="# Sentry Integration\n\nSetup guide for monitoring.",
+        )
+        _write_note(
+            tmp_vault / "claude-sessions" / "body-match.md",
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj",
+             "tags": ["claude/session"]},
+            body="# Session: Deployment\n\nConfigured sentry alerts for the pipeline.",
+        )
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db
+        )
+        results = vault_index.search_vault(db, "sentry")
+        assert len(results) >= 2
+        assert "Sentry" in results[0]["title"]
+
+    def test_or_fallback_when_and_returns_zero(self, tmp_vault):
+        """When AND returns 0 results, OR fallback finds partial matches."""
+        _write_note(
+            tmp_vault / "claude-insights" / "alpha-only.md",
+            {"type": "claude-insight", "date": "2026-04-10", "project": "proj",
+             "tags": ["claude/insight"]},
+            body="# Alpha Patterns\n\nAlpha channel optimization.",
+        )
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db
+        )
+        results = vault_index.search_vault(db, "alpha zygomorphic")
+        assert len(results) >= 1
+        assert "Alpha" in results[0]["title"]
+
+    def test_search_and_returns_intersection(self, tmp_vault):
+        """AND query returns only notes containing both terms."""
+        _write_note(
+            tmp_vault / "claude-insights" / "both-terms.md",
+            {"type": "claude-insight", "date": "2026-04-10", "project": "proj",
+             "tags": ["claude/insight"]},
+            body="# Sentry Feasibility\n\nFeasibility analysis for sentry integration.",
+        )
+        _write_note(
+            tmp_vault / "claude-sessions" / "one-term.md",
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj",
+             "tags": ["claude/session"]},
+            body="# Session: Logging\n\nConfigured sentry alerts.",
+        )
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db
+        )
+        results = vault_index.search_vault(db, "sentry feasibility")
+        assert len(results) == 1
+        assert "Feasibility" in results[0]["title"]
+
+

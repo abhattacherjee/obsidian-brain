@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import sys
+from datetime import date
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -415,6 +416,26 @@ def index_note(db_path: str, note_path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _sanitize_fts_query_or(query: str) -> str:
+    """Build an OR-mode FTS5 query for fallback."""
+    query = query.replace("-", " ")
+    words = re.findall(r"[a-zA-Z0-9_/]+", query)
+    if not words:
+        return ""
+    return " OR ".join(f'"{w}"' for w in words)
+
+
+def _extract_query_terms(query: str) -> list[str]:
+    """Extract individual search terms from a query string."""
+    query = query.replace("-", " ")
+    stripped = re.sub(r'"[^"]*"', " ", query)
+    terms = re.findall(r"[a-zA-Z0-9_/]+", stripped)
+    phrases = re.findall(r'"([^"]*)"', query)
+    for phrase in phrases:
+        terms.extend(re.findall(r"[a-zA-Z0-9_/]+", phrase))
+    return [t.lower() for t in terms if len(t) > 1]
+
+
 def _sanitize_fts_query(query: str) -> str:
     """Sanitize user input for FTS5 MATCH using AND-mode (implicit AND).
 
@@ -442,16 +463,23 @@ def _sanitize_fts_query(query: str) -> str:
     return " ".join(parts)
 
 
+def rerank_results(fts_results: list[dict], query_terms: list[str], limit: int = 15) -> list[dict]:
+    """Rerank FTS5 results. Stub — returns results sorted by rank, trimmed to limit."""
+    return fts_results[:limit]
+
+
 def search_vault(
     db_path: str,
     query: str,
     project: str | None = None,
     note_type: str | None = None,
-    limit: int = 20,
+    limit: int = 15,
 ) -> list[dict]:
     """Full-text search over the vault index.
 
-    Returns list of dicts with note metadata + rank.
+    Returns list of dicts with note metadata + rank (body excluded).
+    Uses BM25 column weighting (title=10x, tags=5x) and falls back to
+    OR-mode if the AND query returns no results.
     """
     if not os.path.isfile(db_path):
         return []
@@ -460,6 +488,8 @@ def search_vault(
     if not sanitized:
         return []
 
+    query_terms = _extract_query_terms(query)
+
     try:
         conn = _connect(db_path)
     except sqlite3.Error as exc:
@@ -467,29 +497,47 @@ def search_vault(
               file=sys.stderr)
         return []
 
+    candidate_limit = min(limit * 3, 50)
+
     try:
+        filter_sql = ""
+        filter_params: list = []
+        if project:
+            filter_sql += "AND n.project = ? "
+            filter_params.append(project)
+        if note_type:
+            filter_sql += "AND n.type = ? "
+            filter_params.append(note_type)
+
         sql = (
             "SELECT n.path, n.type, n.date, n.project, n.title, n.tags, n.status, "
-            "n.source_session, n.source_note, n.size, "
-            "rank "
+            "n.source_session, n.source_note, n.size, n.body, "
+            "bm25(notes_fts, 10.0, 1.0, 5.0) AS rank "
             "FROM notes_fts f "
             "JOIN notes n ON n.rowid = f.rowid "
             "WHERE notes_fts MATCH ? "
+            + filter_sql
+            + "ORDER BY rank LIMIT ?"
         )
-        params: list = [sanitized]
-
-        if project:
-            sql += "AND n.project = ? "
-            params.append(project)
-        if note_type:
-            sql += "AND n.type = ? "
-            params.append(note_type)
-
-        sql += "ORDER BY f.rank LIMIT ?"
-        params.append(limit)
+        params: list = [sanitized] + filter_params + [candidate_limit]
 
         rows = conn.execute(sql, params).fetchall()
-        return [dict(row) for row in rows]
+        candidates = [dict(row) for row in rows]
+
+        # OR fallback when AND returns nothing
+        if not candidates:
+            or_query = _sanitize_fts_query_or(query)
+            if or_query:
+                or_params: list = [or_query] + filter_params + [candidate_limit]
+                rows = conn.execute(sql, or_params).fetchall()
+                candidates = [dict(row) for row in rows]
+
+        results = rerank_results(candidates, query_terms, limit)
+        # Strip body — callers don't need it
+        for r in results:
+            r.pop("body", None)
+        return results
+
     except sqlite3.Error as exc:
         print(f"[vault-index] search_vault query failed: {exc}",
               file=sys.stderr)
