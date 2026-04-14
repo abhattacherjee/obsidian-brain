@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS notes (
     tags            TEXT,
     status          TEXT,
     mtime           REAL NOT NULL,
-    size            INTEGER
+    size            INTEGER,
+    body            TEXT DEFAULT ''
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
@@ -84,6 +85,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         if stmt:
             cur.execute(stmt)
     conn.commit()
+
+
+def _needs_body_migration(conn: sqlite3.Connection) -> bool:
+    """Return True if the notes table is missing the body column."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(notes)").fetchall()}
+    return "body" not in cols
 
 
 # ---------------------------------------------------------------------------
@@ -190,8 +197,8 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
 
     conn.execute(
         "INSERT INTO notes (path, type, date, project, title, source_session, "
-        "source_note, tags, status, mtime, size) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "source_note, tags, status, mtime, size, body) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             rel_path,
             parsed.get("type", "unknown"),
@@ -204,6 +211,7 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
             parsed.get("status"),
             mtime,
             size,
+            parsed.get("body", ""),
         ),
     )
 
@@ -301,6 +309,17 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
         conn = _connect(db_path)
         try:
             _init_schema(conn)
+            if _needs_body_migration(conn):
+                print(f"[vault-index] Missing body column; rebuilding {db_path}",
+                      file=sys.stderr)
+                conn.close()
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        os.remove(db_path + suffix)
+                    except OSError:
+                        pass
+                conn = _connect(db_path)
+                _init_schema(conn)
             _sync(conn, vault_path, folders)
         finally:
             conn.close()

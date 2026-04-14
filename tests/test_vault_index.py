@@ -635,6 +635,59 @@ class TestLayeredRankingStrong:
         assert results[0]["layer"] == "backlink"  # found in Layer 1, not duplicated
 
 
+class TestBodyColumnMigration:
+    def test_ensure_index_detects_missing_body_column(self, tmp_vault):
+        """ensure_index rebuilds DB when body column is missing."""
+        note = tmp_vault / "claude-sessions" / "2026-04-10-proj-body.md"
+        _write_note(
+            note,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# Session: Body Test\n\nSome body content here.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        # Create DB with OLD schema (no body column)
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE notes ("
+            "path TEXT PRIMARY KEY, type TEXT NOT NULL, date TEXT, "
+            "project TEXT, title TEXT, source_session TEXT, source_note TEXT, "
+            "tags TEXT, status TEXT, mtime REAL NOT NULL, size INTEGER)"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE notes_fts USING fts5("
+            "title, body, tags, content='')"
+        )
+        conn.commit()
+        conn.close()
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(notes)").fetchall()}
+        row = conn.execute("SELECT body FROM notes").fetchone()
+        conn.close()
+        assert "body" in cols
+        assert row is not None
+        assert "Some body content here" in row[0]
+
+    def test_body_stored_on_upsert(self, tmp_vault):
+        """After index, notes.body contains the note body text."""
+        note = tmp_vault / "claude-sessions" / "2026-04-10-proj-upsert.md"
+        _write_note(
+            note,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# Session: Upsert Body\n\nThe quick brown fox jumps.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT body FROM notes").fetchone()
+        conn.close()
+        assert row is not None
+        assert "quick brown fox" in row[0]
+
+
 class TestBuildContextBriefFallback:
     """build_context_brief() falls back to file scan when vault index is unavailable."""
 
