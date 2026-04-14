@@ -835,3 +835,110 @@ class TestBM25AndFallback:
         assert "Feasibility" in results[0]["title"]
 
 
+# ---------------------------------------------------------------------------
+# Task 4: Python reranker — 5-signal scoring
+# ---------------------------------------------------------------------------
+
+
+class TestReranker:
+    def _make_result(self, title="Note", body="", note_type="claude-session",
+                     note_date=None, rank=-1.0, tags="", **kwargs):
+        if note_date is None:
+            note_date = date.today().isoformat()
+        d = {
+            "path": f"/vault/{title.replace(' ', '-')}.md",
+            "type": note_type,
+            "date": note_date,
+            "project": "proj",
+            "title": title,
+            "tags": tags,
+            "status": "summarized",
+            "source_session": None,
+            "source_note": None,
+            "size": len(body),
+            "body": body,
+            "rank": rank,
+        }
+        d.update(kwargs)
+        return d
+
+    def test_proximity_boosts_close_terms(self):
+        close = self._make_result(
+            title="Note A",
+            body="The sentry feasibility analysis showed positive results.",
+            rank=-5.0,
+        )
+        far = self._make_result(
+            title="Note B",
+            body=("Sentry is a monitoring tool. " + "x " * 500 +
+                  "The feasibility of this approach is questionable."),
+            rank=-5.0,
+        )
+        results = vault_index.rerank_results([close, far], ["sentry", "feasibility"])
+        assert results[0]["title"] == "Note A"
+
+    def test_type_boost_insight_over_session(self):
+        insight = self._make_result(
+            title="Insight Note",
+            body="The sentry feasibility study.",
+            note_type="claude-insight",
+            rank=-5.0,
+        )
+        session = self._make_result(
+            title="Session Note",
+            body="The sentry feasibility study.",
+            note_type="claude-session",
+            rank=-5.0,
+        )
+        results = vault_index.rerank_results([session, insight], ["sentry", "feasibility"])
+        assert results[0]["type"] == "claude-insight"
+
+    def test_recency_boosts_newer_note(self):
+        recent = self._make_result(
+            title="Recent",
+            body="The sentry feasibility review.",
+            note_date=(date.today() - timedelta(days=1)).isoformat(),
+            rank=-5.0,
+        )
+        old = self._make_result(
+            title="Old",
+            body="The sentry feasibility review.",
+            note_date=(date.today() - timedelta(days=90)).isoformat(),
+            rank=-5.0,
+        )
+        results = vault_index.rerank_results([old, recent], ["sentry", "feasibility"])
+        assert results[0]["title"] == "Recent"
+
+    def test_single_term_proximity_is_one(self):
+        note = self._make_result(title="Test", body="Sentry monitoring.", rank=-5.0)
+        results = vault_index.rerank_results([note], ["sentry"])
+        assert len(results) == 1
+        assert results[0].get("rerank_score", 0) > 0
+
+    def test_rerank_adds_score_field(self):
+        note = self._make_result(title="Test", body="Sentry stuff.", rank=-5.0)
+        results = vault_index.rerank_results([note], ["sentry"])
+        assert "rerank_score" in results[0]
+        assert 0.0 <= results[0]["rerank_score"] <= 1.0
+
+    def test_rerank_respects_limit(self):
+        notes = [
+            self._make_result(title=f"Note {i}", body="Sentry test.", rank=-5.0 + i)
+            for i in range(10)
+        ]
+        results = vault_index.rerank_results(notes, ["sentry"], limit=3)
+        assert len(results) == 3
+
+    def test_density_differentiates_or_fallback(self):
+        full = self._make_result(
+            title="Full Match",
+            body="Both alpha and beta appear here.",
+            rank=-3.0,
+        )
+        partial = self._make_result(
+            title="Partial Match",
+            body="Only alpha appears in this note.",
+            rank=-5.0,
+        )
+        results = vault_index.rerank_results([partial, full], ["alpha", "beta"])
+        assert results[0]["title"] == "Full Match"

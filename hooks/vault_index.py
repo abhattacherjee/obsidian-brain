@@ -463,9 +463,114 @@ def _sanitize_fts_query(query: str) -> str:
     return " ".join(parts)
 
 
-def rerank_results(fts_results: list[dict], query_terms: list[str], limit: int = 15) -> list[dict]:
-    """Rerank FTS5 results. Stub — returns results sorted by rank, trimmed to limit."""
-    return fts_results[:limit]
+def _compute_proximity(body_lower: str, query_terms: list[str]) -> float:
+    """Compute proximity score between query terms in text.
+
+    Single-term: 1.0. Multi-term: 1.0 / (1.0 + min_distance / 200).
+    """
+    if len(query_terms) <= 1:
+        return 1.0
+
+    positions: dict[str, list[int]] = {}
+    for term in query_terms:
+        term_lower = term.lower()
+        pos_list: list[int] = []
+        start = 0
+        while True:
+            idx = body_lower.find(term_lower, start)
+            if idx == -1:
+                break
+            pos_list.append(idx)
+            start = idx + 1
+        if pos_list:
+            positions[term_lower] = pos_list
+
+    if len(positions) < 2:
+        return 0.0
+
+    min_dist = float("inf")
+    terms_with_pos = list(positions.keys())
+    for i in range(len(terms_with_pos)):
+        for j in range(i + 1, len(terms_with_pos)):
+            for p1 in positions[terms_with_pos[i]]:
+                for p2 in positions[terms_with_pos[j]]:
+                    dist = abs(p1 - p2)
+                    if dist < min_dist:
+                        min_dist = dist
+
+    if min_dist == float("inf"):
+        return 0.0
+
+    return 1.0 / (1.0 + min_dist / 200)
+
+
+def rerank_results(
+    fts_results: list[dict],
+    query_terms: list[str],
+    limit: int = 15,
+) -> list[dict]:
+    """Rerank FTS5 results using proximity, recency, type, and density signals.
+
+    Weights: proximity 0.35, bm25 0.25, type 0.15, recency 0.15, density 0.10.
+    """
+    if not fts_results:
+        return []
+
+    ranks = [r.get("rank", 0.0) for r in fts_results]
+    # FTS5 bm25() returns negative values; most-negative = best match.
+    # Map so that the best (most-negative) score normalises to 1.0.
+    best_rank = min(ranks)   # most negative = best FTS5 match
+    worst_rank = max(ranks)  # least negative = worst FTS5 match
+    rank_range = worst_rank - best_rank if best_rank != worst_rank else 1.0
+
+    today = date.today()
+    type_scores = {
+        "claude-insight": 1.0,
+        "claude-decision": 1.0,
+        "claude-error-fix": 0.9,
+        "claude-session": 0.5,
+        "claude-retro": 0.4,
+        "claude-standup": 0.3,
+    }
+
+    scored: list[tuple[float, dict]] = []
+    for r in fts_results:
+        body = r.get("body", "") or ""
+        full_text = f"{r.get('title', '')} {r.get('tags', '')} {body}".lower()
+
+        proximity = _compute_proximity(body.lower(), query_terms)
+
+        bm25_norm = (worst_rank - r.get("rank", worst_rank)) / rank_range
+
+        type_score = type_scores.get(r.get("type", ""), 0.5)
+
+        try:
+            note_date = date.fromisoformat(r.get("date", "") or "")
+            days_old = max((today - note_date).days, 0)
+        except (ValueError, TypeError):
+            days_old = 365
+        recency = 0.5 ** (days_old / 30)
+
+        if query_terms:
+            matched = sum(1 for t in query_terms if t in full_text)
+            density = matched / len(query_terms)
+        else:
+            density = 1.0
+
+        final = (
+            0.35 * proximity
+            + 0.25 * bm25_norm
+            + 0.15 * type_score
+            + 0.15 * recency
+            + 0.10 * density
+        )
+
+        r_copy = dict(r)
+        r_copy["rerank_score"] = round(final, 4)
+        scored.append((final, r_copy))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in scored[:limit]]
 
 
 def search_vault(
