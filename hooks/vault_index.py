@@ -458,8 +458,12 @@ def _sanitize_fts_query(query: str) -> str:
         remaining = remaining[:start] + remaining[end + 1:]
     words = re.findall(r"[a-zA-Z0-9_/]+", remaining)
     parts.extend(f'"{w}"' for w in words)
+    # Filter empty phrases (e.g. '""') that could confuse FTS5
+    parts = [p for p in parts if p != '""']
     if not parts:
         return ""
+    # Phrase order may differ from input (phrases first, then words);
+    # FTS5 implicit AND is commutative so order doesn't affect results.
     return " ".join(parts)
 
 
