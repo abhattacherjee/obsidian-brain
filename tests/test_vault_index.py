@@ -1063,3 +1063,132 @@ class TestSearchQualityIntegration:
 
         # Should still find the note via FTS Layer 3
         assert any("Authentication" in r.get("title", "") for r in results)
+
+    def test_layer3_or_mode_finds_partial_keyword_matches(self, tmp_vault):
+        """Layer 3 uses OR-mode so partial keyword matches are found."""
+        # Note has "caching" and "optimization" but NOT "frobulator" or "quantum"
+        _write_note(
+            tmp_vault / "claude-insights" / "partial-kw.md",
+            {"type": "claude-insight", "date": "2026-04-10", "project": "proj",
+             "tags": ["claude/insight"]},
+            body="# Caching Patterns\n\nOptimization strategies for distributed caching.",
+        )
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db
+        )
+        # Summary yields many keywords; only 2 of 5+ match the note
+        results = vault_index.query_related_notes(
+            db_path=db,
+            project="proj",
+            session_ids=[],
+            session_tags=[],
+            session_summary="caching optimization frobulator quantum entanglement",
+            limit=10,
+        )
+        # OR-mode: note found despite only partial keyword overlap
+        assert any("Caching" in r.get("title", "") for r in results)
+
+
+class TestEdgeCases:
+    """Edge case tests from review findings."""
+
+    def test_extract_query_terms_basic(self):
+        """_extract_query_terms extracts lowered words > 1 char."""
+        terms = vault_index._extract_query_terms("Sentry feasibility")
+        assert "sentry" in terms
+        assert "feasibility" in terms
+
+    def test_extract_query_terms_phrase(self):
+        """_extract_query_terms extracts words from inside phrases."""
+        terms = vault_index._extract_query_terms('"epic 12" sentry')
+        assert "sentry" in terms
+        assert "epic" in terms
+        assert "12" in terms
+
+    def test_extract_query_terms_single_char_filtered(self):
+        """Single-char terms are filtered out."""
+        terms = vault_index._extract_query_terms("a JWT b")
+        assert "jwt" in terms
+        assert "a" not in terms
+        assert "b" not in terms
+
+    def test_compute_proximity_empty_body(self):
+        """Empty body returns 0.0 for multi-term query."""
+        score = vault_index._compute_proximity("", ["sentry", "feasibility"])
+        assert score == 0.0
+
+    def test_compute_proximity_one_term_missing(self):
+        """Only one of two terms found returns 0.0."""
+        score = vault_index._compute_proximity("sentry monitoring", ["sentry", "feasibility"])
+        assert score == 0.0
+
+    def test_compute_proximity_duplicate_terms(self):
+        """Duplicate query terms treated as single-term (returns 1.0)."""
+        score = vault_index._compute_proximity("sentry monitoring", ["sentry", "sentry"])
+        assert score == 1.0
+
+    def test_compute_proximity_adjacent_terms(self):
+        """Adjacent terms score close to 1.0."""
+        score = vault_index._compute_proximity("sentry feasibility", ["sentry", "feasibility"])
+        assert score > 0.9
+
+    def test_rerank_empty_query_terms(self):
+        """Reranker with empty query_terms doesn't crash."""
+        note = {
+            "path": "/vault/test.md", "type": "claude-session",
+            "date": date.today().isoformat(), "project": "proj",
+            "title": "Test", "tags": "", "status": "summarized",
+            "source_session": None, "source_note": None,
+            "size": 10, "body": "Some body.", "rank": -5.0,
+        }
+        results = vault_index.rerank_results([note], [])
+        assert len(results) == 1
+        assert "rerank_score" in results[0]
+
+    def test_rerank_none_date(self):
+        """Result with date=None is scored without crashing."""
+        note = {
+            "path": "/vault/test.md", "type": "claude-session",
+            "date": None, "project": "proj",
+            "title": "Test", "tags": "", "status": "summarized",
+            "source_session": None, "source_note": None,
+            "size": 10, "body": "Sentry stuff.", "rank": -5.0,
+        }
+        results = vault_index.rerank_results([note], ["sentry"])
+        assert len(results) == 1
+        assert 0.0 <= results[0]["rerank_score"] <= 1.0
+
+    def test_rerank_none_body(self):
+        """Result with body=None is scored without crashing."""
+        note = {
+            "path": "/vault/test.md", "type": "claude-session",
+            "date": date.today().isoformat(), "project": "proj",
+            "title": "Test", "tags": "", "status": "summarized",
+            "source_session": None, "source_note": None,
+            "size": 10, "body": None, "rank": -5.0,
+        }
+        results = vault_index.rerank_results([note], ["sentry"])
+        assert len(results) == 1
+
+    def test_search_vault_body_not_in_results(self, tmp_vault):
+        """Body is stripped from search results."""
+        _write_note(
+            tmp_vault / "claude-insights" / "body-strip.md",
+            {"type": "claude-insight", "date": "2026-04-10", "project": "proj",
+             "tags": ["claude/insight"]},
+            body="# Strip Test\n\nBody should not appear in results.",
+        )
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db
+        )
+        results = vault_index.search_vault(db, "strip")
+        assert len(results) >= 1
+        assert "body" not in results[0]
+
+    def test_sanitize_fts_query_unmatched_quote(self):
+        """Unmatched quote falls back to bare word extraction."""
+        result = vault_index._sanitize_fts_query('hello "unmatched')
+        assert '"hello"' in result
+        assert '"unmatched"' in result

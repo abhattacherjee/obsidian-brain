@@ -317,8 +317,10 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
                 for suffix in ("", "-wal", "-shm"):
                     try:
                         os.remove(db_path + suffix)
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        if suffix == "":
+                            print(f"[vault-index] Failed to remove {db_path}: {exc}",
+                                  file=sys.stderr)
                 conn = _connect(db_path)
                 _init_schema(conn)
                 if _needs_body_migration(conn):
@@ -474,11 +476,13 @@ def _compute_proximity(body_lower: str, query_terms: list[str]) -> float:
 
     Single-term: 1.0. Multi-term: 1.0 / (1.0 + min_distance / 200).
     """
-    if len(query_terms) <= 1:
+    # Deduplicate terms so "sentry sentry" is treated as single-term
+    unique_terms = list(dict.fromkeys(t.lower() for t in query_terms))
+    if len(unique_terms) <= 1:
         return 1.0
 
     positions: dict[str, list[int]] = {}
-    for term in query_terms:
+    for term in unique_terms:
         term_lower = term.lower()
         pos_list: list[int] = []
         start = 0
@@ -647,6 +651,8 @@ def search_vault(
         if not candidates:
             or_query = _sanitize_fts_query_or(query)
             if or_query:
+                print(f"[vault-index] AND query returned 0 results; falling back to OR",
+                      file=sys.stderr)
                 or_params: list = [or_query] + filter_params + [candidate_limit]
                 rows = conn.execute(sql, or_params).fetchall()
                 candidates = [dict(row) for row in rows]
@@ -787,7 +793,9 @@ def query_related_notes(
         if len(results) < limit and session_summary:
             keywords = extract_keywords(session_summary)
             if keywords:
-                fts_query = _sanitize_fts_query(" ".join(keywords))
+                # Layer 3 uses OR-mode: keyword discovery benefits from
+                # recall over precision (5-8 keywords rarely all co-occur).
+                fts_query = _sanitize_fts_query_or(" ".join(keywords))
                 if fts_query:
                     remaining = limit - len(results)
                     sql = (
