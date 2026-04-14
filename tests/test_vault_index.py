@@ -308,14 +308,14 @@ class TestSearchVault:
         return db_path
 
     def test_fts_search_returns_relevant_results(self, tmp_vault):
-        """FTS search returns matching notes ranked."""
+        """FTS search returns matching notes ranked (AND-mode: both terms must appear)."""
         db_path = self._populate_vault(tmp_vault)
 
         results = vault_index.search_vault(db_path, "JWT authentication")
         assert len(results) >= 1
-        # JWT notes should be in results
-        titles = [r["title"] for r in results]
-        assert any("JWT" in t for t in titles)
+        # With AND-mode, sess1 (has both JWT and authentication in body) must be returned
+        paths = [r["path"] for r in results]
+        assert any("sess1" in p for p in paths)
 
     def test_search_vault_with_project_filter(self, tmp_vault):
         """Project filter narrows results."""
@@ -385,6 +385,7 @@ class TestSearchVault:
         assert "-" not in result
         assert '"maintain"' in result
         assert '"catalog"' in result
+        assert "OR" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +591,7 @@ class TestLayeredRankingStrong:
             project="proj",
             session_ids=["sess-X"],
             session_tags=["claude/topic/perf"],
-            session_summary="Working on caching and optimization performance",
+            session_summary="caching optimization performance patterns",
             limit=20,
         )
 
@@ -686,6 +687,38 @@ class TestBodyColumnMigration:
         conn.close()
         assert row is not None
         assert "quick brown fox" in row[0]
+
+
+class TestSanitizeAndMode:
+    def test_multi_word_produces_and(self):
+        result = vault_index._sanitize_fts_query("sentry feasibility")
+        assert result == '"sentry" "feasibility"'
+
+    def test_single_word_unchanged(self):
+        result = vault_index._sanitize_fts_query("sentry")
+        assert result == '"sentry"'
+
+    def test_phrase_match_preserved(self):
+        result = vault_index._sanitize_fts_query('"sentry feasibility"')
+        assert result == '"sentry feasibility"'
+
+    def test_hyphen_replaced_with_and(self):
+        result = vault_index._sanitize_fts_query("maintain-catalog")
+        assert result == '"maintain" "catalog"'
+
+    def test_mixed_phrase_and_words(self):
+        result = vault_index._sanitize_fts_query('"epic 12" sentry')
+        assert result == '"epic 12" "sentry"'
+
+    def test_empty_query(self):
+        result = vault_index._sanitize_fts_query("")
+        assert result == ""
+
+    def test_special_chars_stripped(self):
+        result = vault_index._sanitize_fts_query("foo@bar.com")
+        assert '"foo"' in result
+        assert '"bar"' in result
+        assert '"com"' in result
 
 
 class TestBuildContextBriefFallback:

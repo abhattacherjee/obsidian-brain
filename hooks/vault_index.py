@@ -416,19 +416,30 @@ def index_note(db_path: str, note_path: str) -> bool:
 
 
 def _sanitize_fts_query(query: str) -> str:
-    """Sanitize user input for FTS5 MATCH.
+    """Sanitize user input for FTS5 MATCH using AND-mode (implicit AND).
 
     Replaces hyphens with spaces (FTS5 unicode61 tokenizer treats hyphens
     as token separators, so "maintain-catalog" inside quotes becomes
-    "maintain" NOT "catalog"). Then wraps each word in quotes and joins
-    with OR.
+    "maintain" NOT "catalog"). Quoted phrases are preserved as-is.
+    Remaining words are each quoted individually and space-joined so
+    FTS5 applies implicit AND — all terms must appear.
     """
-    # Replace hyphens with spaces before tokenization to avoid FTS5 NOT operator
     query = query.replace("-", " ")
-    words = re.findall(r"[a-zA-Z0-9_/]+", query)
-    if not words:
+    parts: list[str] = []
+    remaining = query
+    while '"' in remaining:
+        start = remaining.index('"')
+        end = remaining.index('"', start + 1) if '"' in remaining[start + 1:] else -1
+        if end == -1:
+            break
+        phrase = remaining[start:end + 1]
+        parts.append(phrase)
+        remaining = remaining[:start] + remaining[end + 1:]
+    words = re.findall(r"[a-zA-Z0-9_/]+", remaining)
+    parts.extend(f'"{w}"' for w in words)
+    if not parts:
         return ""
-    return " OR ".join(f'"{w}"' for w in words)
+    return " ".join(parts)
 
 
 def search_vault(
