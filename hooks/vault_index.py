@@ -321,6 +321,8 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
                         pass
                 conn = _connect(db_path)
                 _init_schema(conn)
+                if _needs_body_migration(conn):
+                    raise sqlite3.DatabaseError("body column missing after rebuild")
             _sync(conn, vault_path, folders)
         finally:
             conn.close()
@@ -556,7 +558,10 @@ def rerank_results(
         recency = 0.5 ** (days_old / 30)
 
         if query_terms:
-            matched = sum(1 for t in query_terms if t in full_text)
+            matched = sum(
+                1 for t in query_terms
+                if re.search(r'\b' + re.escape(t) + r'\b', full_text)
+            )
             density = matched / len(query_terms)
         else:
             density = 1.0
@@ -586,9 +591,14 @@ def search_vault(
 ) -> list[dict]:
     """Full-text search over the vault index.
 
-    Returns list of dicts with note metadata + rank (body excluded).
-    Uses BM25 column weighting (title=10x, tags=5x) and falls back to
-    OR-mode if the AND query returns no results.
+    Returns up to ``limit`` results (default 15) as a list of dicts
+    containing note metadata plus the initial FTS ``rank`` and reranked
+    ``rerank_score``. The note ``body`` is used internally for reranking
+    but is removed before results are returned.
+
+    Candidates are retrieved with BM25 column weighting (title=10x,
+    tags=5x), then reranked for context relevance. Falls back to OR-mode
+    if the AND query returns no results.
     """
     if not os.path.isfile(db_path):
         return []
