@@ -178,3 +178,49 @@ class TestBatchActivations:
         db_path = str(tmp_path / "nonexistent.db")
         result = vault_index.batch_activations(db_path, ["/vault/note.md"])
         assert result == {"/vault/note.md": 0.0}
+
+
+class TestAccessLoggingIntegration:
+    def test_search_vault_logs_access_for_results(self, tmp_vault):
+        """search_vault() logs access for each returned result."""
+        note = tmp_vault / "claude-sessions" / "2026-04-15-test-abcd.md"
+        _write_note(note, {
+            "type": "claude-session",
+            "date": "2026-04-15",
+            "project": "test",
+            "status": "summarized",
+        }, body="authentication login bug fix")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+        results = vault_index.search_vault(db_path, "authentication login")
+        assert len(results) >= 1
+        conn = sqlite3.connect(db_path)
+        access_rows = conn.execute("SELECT note_path, context_type FROM access_log").fetchall()
+        conn.close()
+        accessed_paths = {row[0] for row in access_rows}
+        assert str(note) in accessed_paths
+        assert all(row[1] == "search" for row in access_rows)
+
+    def test_query_related_notes_logs_access(self, tmp_vault):
+        """query_related_notes() logs access for returned results."""
+        note = tmp_vault / "claude-insights" / "2026-04-15-test-insight-1234.md"
+        _write_note(note, {
+            "type": "claude-insight",
+            "date": "2026-04-15",
+            "project": "test",
+            "source_session": "session-abc",
+            "status": "active",
+        }, body="Important insight about testing")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db_path)
+        results = vault_index.query_related_notes(
+            db_path, "test", session_ids=["session-abc"],
+            session_tags=[], session_summary=""
+        )
+        assert len(results) >= 1
+        conn = sqlite3.connect(db_path)
+        access_rows = conn.execute("SELECT note_path, context_type FROM access_log").fetchall()
+        conn.close()
+        accessed_paths = {row[0] for row in access_rows}
+        assert str(note) in accessed_paths
+        assert all(row[1] == "related" for row in access_rows)

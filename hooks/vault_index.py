@@ -878,6 +878,9 @@ def search_vault(
             candidates, query_terms, limit,
             db_path=db_path, task_context=task_context,
         )
+        # Log access for returned results
+        for r in results:
+            log_access(db_path, r["path"], "search")
         # Strip body — callers don't need it
         for r in results:
             r.pop("body", None)
@@ -1041,6 +1044,9 @@ def query_related_notes(
                         print(f"[vault-index] Layer 3 (FTS) query failed: {exc}",
                               file=sys.stderr)
 
+        # Log access for returned results
+        for r in results[:limit]:
+            log_access(db_path, r["path"], "related")
         return results[:limit]
     finally:
         conn.close()
