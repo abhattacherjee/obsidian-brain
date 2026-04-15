@@ -213,6 +213,36 @@ class TestActivationNormalization:
         new_score = next(r["rerank_score"] for r in results if r["path"] == "/vault/new.md")
         assert old_score > new_score  # old access still better than no access
 
+    def test_min_activation_note_above_no_history(self, tmp_vault):
+        """Note with minimum activation (oldest access) still scores above a no-history note."""
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        now = time.time()
+        # Two notes with different access histories
+        conn.execute(
+            "INSERT INTO access_log (note_path, timestamp, context_type) VALUES (?, ?, ?)",
+            ("/vault/recent.md", now - 60, "recall"),  # recent access
+        )
+        conn.execute(
+            "INSERT INTO access_log (note_path, timestamp, context_type) VALUES (?, ?, ?)",
+            ("/vault/old.md", now - 86400 * 60, "recall"),  # 60 days ago
+        )
+        conn.commit()
+        conn.close()
+
+        candidates = [
+            _make_fts_result(path="/vault/recent.md", rank=-5.0, body="test content"),
+            _make_fts_result(path="/vault/old.md", rank=-5.0, body="test content"),
+            _make_fts_result(path="/vault/none.md", rank=-5.0, body="test content"),
+        ]
+        results = vault_index.rerank_results(candidates, ["test"], db_path=db_path)
+        recent = next(r["rerank_score"] for r in results if r["path"] == "/vault/recent.md")
+        old = next(r["rerank_score"] for r in results if r["path"] == "/vault/old.md")
+        none_score = next(r["rerank_score"] for r in results if r["path"] == "/vault/none.md")
+        assert recent > old > none_score  # recent > old > no-history
+
 
 def _write_note(path, frontmatter: dict, body: str = ""):
     """Helper to write a markdown note with frontmatter."""

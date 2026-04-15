@@ -743,7 +743,7 @@ def rerank_results(
     if nonzero_acts:
         act_min = min(nonzero_acts)
         act_max = max(nonzero_acts)
-        act_range = act_max - act_min if act_max != act_min else 1.0
+        act_range = act_max - act_min
     else:
         act_min = 0.0
         act_range = 1.0
@@ -779,10 +779,11 @@ def rerank_results(
         raw_act = raw_activations.get(r.get("path", ""), 0.0)
         if raw_act == 0.0:
             activation_norm = 0.0
-        elif act_range == 1.0 and len(nonzero_acts) == 1:
-            activation_norm = 1.0  # single accessed note gets max score
+        elif act_range == 0.0:
+            activation_norm = 1.0  # all accessed notes share same score
         else:
-            activation_norm = (raw_act - act_min) / act_range
+            # Reserve 0.0 for "no history"; accessed notes map to (0, 1]
+            activation_norm = 0.01 + ((raw_act - act_min) / act_range) * 0.99
 
         # Importance (0-1 scale from frontmatter 1-10)
         importance_norm = r.get("importance", 5) / 10.0

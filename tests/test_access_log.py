@@ -106,7 +106,7 @@ class TestLogAccess:
         assert count == 3
         assert note_count == 2
 
-    def test_log_access_silently_fails_on_bad_db(self, tmp_path):
+    def test_log_access_does_not_raise_on_bad_db(self, tmp_path):
         db_path = str(tmp_path / "nonexistent.db")
         vault_index.log_access(db_path, "/vault/note.md", "recall")
 

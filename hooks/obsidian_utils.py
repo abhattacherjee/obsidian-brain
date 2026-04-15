@@ -2647,22 +2647,6 @@ def upgrade_note_with_summary(
         return f"Failed: malformed summary (empty or heading-only Summary body) from {source} for {os.path.basename(note_path)}"
 
     importance = parse_importance(summary_text)
-    try:
-        if _vault_index is not None:
-            _db = _vault_index._default_db_path()
-            if os.path.isfile(_db):
-                _conn = _vault_index._connect(_db)
-                try:
-                    _conn.execute(
-                        "UPDATE notes SET importance = ? WHERE path = ?",
-                        (importance, note_path),
-                    )
-                    _conn.commit()
-                finally:
-                    _conn.close()
-    except Exception as exc:
-        print(f"[obsidian-brain] importance write-back failed for "
-              f"{os.path.basename(note_path)}: {exc}", file=sys.stderr)
 
     # Atomic write with fsync + post-write verification.
     # Guarantees the summary actually landed on disk before returning success.
@@ -2758,6 +2742,25 @@ def upgrade_note_with_summary(
     summary_block_lines = {line.strip() for line in summary_block.split('\n')}
     if summary_signature not in summary_block_lines:
         return f"Failed: post-write verification — summary body missing from {os.path.basename(note_path)}"
+
+    # Write importance to DB only after file write + verification succeeded,
+    # so the DB stays in sync with the on-disk note state.
+    try:
+        if _vault_index is not None:
+            _db = _vault_index._default_db_path()
+            if os.path.isfile(_db):
+                _conn = _vault_index._connect(_db)
+                try:
+                    _conn.execute(
+                        "UPDATE notes SET importance = ? WHERE path = ?",
+                        (importance, note_path),
+                    )
+                    _conn.commit()
+                finally:
+                    _conn.close()
+    except Exception as exc:
+        print(f"[obsidian-brain] importance write-back failed for "
+              f"{os.path.basename(note_path)}: {exc}", file=sys.stderr)
 
     # Run dedup pass (non-fatal — note is already upgraded)
     removed = []
