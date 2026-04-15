@@ -12,6 +12,7 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -523,6 +524,78 @@ def index_note(db_path: str, note_path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Task-context detection
+# ---------------------------------------------------------------------------
+
+
+def _get_git_branch() -> str | None:
+    """Return the current git branch name, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def detect_task_context(caller_skill: str | None = None) -> str:
+    """Detect the current task context from git branch and caller skill.
+
+    Returns one of: 'debugging', 'standup', 'emerge', 'search', 'general'.
+    Branch-based detection (fix/bug/hotfix) takes precedence over caller.
+    """
+    branch = _get_git_branch()
+    if branch:
+        branch_lower = branch.lower()
+        for keyword in ("fix", "bug", "hotfix"):
+            if keyword in branch_lower:
+                return "debugging"
+
+    if caller_skill in ("standup", "emerge"):
+        return caller_skill
+    if caller_skill in ("vault-ask", "vault-search"):
+        return "search"
+
+    return "general"
+
+
+_TYPE_SCORES_BY_CONTEXT = {
+    "debugging": {
+        "claude-error-fix": 1.0, "claude-session": 0.8, "claude-insight": 0.6,
+        "claude-decision": 0.5, "claude-retro": 0.3, "claude-standup": 0.3,
+    },
+    "standup": {
+        "claude-session": 1.0, "claude-decision": 0.8, "claude-insight": 0.7,
+        "claude-retro": 0.6, "claude-error-fix": 0.5, "claude-standup": 0.3,
+    },
+    "search": {
+        "claude-insight": 1.0, "claude-decision": 0.9, "claude-error-fix": 0.8,
+        "claude-session": 0.5, "claude-retro": 0.4, "claude-standup": 0.3,
+    },
+    "emerge": {
+        "claude-insight": 1.0, "claude-decision": 0.9, "claude-error-fix": 0.8,
+        "claude-session": 0.5, "claude-retro": 0.4, "claude-standup": 0.3,
+    },
+    "general": {
+        "claude-insight": 1.0, "claude-decision": 1.0, "claude-error-fix": 0.9,
+        "claude-session": 0.5, "claude-retro": 0.4, "claude-standup": 0.3,
+    },
+}
+
+
+def get_type_scores(context: str) -> dict[str, float]:
+    """Return type score mapping for the given task context.
+
+    Falls back to 'general' for unknown contexts.
+    """
+    return _TYPE_SCORES_BY_CONTEXT.get(context, _TYPE_SCORES_BY_CONTEXT["general"])
+
+
+# ---------------------------------------------------------------------------
 # FTS search
 # ---------------------------------------------------------------------------
 
@@ -625,10 +698,22 @@ def rerank_results(
     fts_results: list[dict],
     query_terms: list[str],
     limit: int = 15,
+    db_path: str | None = None,
+    task_context: str | None = None,
 ) -> list[dict]:
-    """Rerank FTS5 results using proximity, recency, type, and density signals.
+    """Rerank FTS5 results using 7 signals for context-relevant ordering.
 
-    Weights: proximity 0.35, bm25 0.25, type 0.15, recency 0.15, density 0.10.
+    Signals and weights:
+        proximity  0.25 — how close query terms appear in the note body
+        bm25       0.20 — FTS5 BM25 relevance score (normalized)
+        activation 0.20 — ACT-R base-level activation from access history
+        type       0.10 — note type score adapted to task context
+        recency    0.10 — exponential decay based on note age
+        importance 0.10 — editorial importance (frontmatter, 1-10 scale)
+        density    0.05 — fraction of query terms matched in full text
+
+    When ``db_path`` is None, the activation signal is 0 for all candidates.
+    When ``task_context`` is None, the 'general' type scores are used.
     """
     if not fts_results:
         return []
@@ -641,14 +726,25 @@ def rerank_results(
     rank_range = worst_rank - best_rank if best_rank != worst_rank else 1.0
 
     today = date.today()
-    type_scores = {
-        "claude-insight": 1.0,
-        "claude-decision": 1.0,
-        "claude-error-fix": 0.9,
-        "claude-session": 0.5,
-        "claude-retro": 0.4,
-        "claude-standup": 0.3,
-    }
+    type_scores = get_type_scores(task_context or "general")
+
+    # --- Activation signal (batch lookup) ---
+    note_paths = [r.get("path", "") for r in fts_results]
+    if db_path:
+        raw_activations = batch_activations(db_path, note_paths)
+    else:
+        raw_activations = {p: 0.0 for p in note_paths}
+
+    # Normalize activations to [0, 1]
+    pos_vals = [v for v in raw_activations.values() if v > 0]
+    if len(pos_vals) >= 2:
+        act_min = min(pos_vals)
+        act_max = max(pos_vals)
+        act_range = act_max - act_min if act_max != act_min else 1.0
+    else:
+        # 0 or 1 positive values: normalize the single value to 1.0
+        act_min = 0.0
+        act_range = max(pos_vals) if pos_vals else 1.0
 
     scored: list[tuple[float, dict]] = []
     for r in fts_results:
@@ -677,12 +773,21 @@ def rerank_results(
         else:
             density = 1.0
 
+        # Activation (normalized)
+        raw_act = raw_activations.get(r.get("path", ""), 0.0)
+        activation_norm = (raw_act - act_min) / act_range if raw_act > 0 else 0.0
+
+        # Importance (0-1 scale from frontmatter 1-10)
+        importance_norm = r.get("importance", 5) / 10.0
+
         final = (
-            0.35 * proximity
-            + 0.25 * bm25_norm
-            + 0.15 * type_score
-            + 0.15 * recency
-            + 0.10 * density
+            0.25 * proximity
+            + 0.20 * bm25_norm
+            + 0.20 * activation_norm
+            + 0.10 * type_score
+            + 0.10 * recency
+            + 0.10 * importance_norm
+            + 0.05 * density
         )
 
         r_copy = dict(r)
@@ -699,6 +804,7 @@ def search_vault(
     project: str | None = None,
     note_type: str | None = None,
     limit: int = 15,
+    caller: str | None = None,
 ) -> list[dict]:
     """Full-text search over the vault index.
 
@@ -708,8 +814,11 @@ def search_vault(
     but is removed before results are returned.
 
     Candidates are retrieved with BM25 column weighting (title=10x,
-    tags=5x), then reranked for context relevance. Falls back to OR-mode
-    if the AND query returns no results.
+    tags=5x), then reranked with a 7-signal scorer for context relevance.
+    Falls back to OR-mode if the AND query returns no results.
+
+    The optional ``caller`` parameter (e.g. 'vault-search', 'standup')
+    drives task-context detection for context-adaptive type scoring.
     """
     if not os.path.isfile(db_path):
         return []
@@ -741,7 +850,7 @@ def search_vault(
 
         sql = (
             "SELECT n.path, n.type, n.date, n.project, n.title, n.tags, n.status, "
-            "n.source_session, n.source_note, n.size, n.body, "
+            "n.source_session, n.source_note, n.size, n.body, n.importance, "
             "bm25(notes_fts, 10.0, 1.0, 5.0) AS rank "
             "FROM notes_fts f "
             "JOIN notes n ON n.rowid = f.rowid "
@@ -764,7 +873,11 @@ def search_vault(
                 rows = conn.execute(sql, or_params).fetchall()
                 candidates = [dict(row) for row in rows]
 
-        results = rerank_results(candidates, query_terms, limit)
+        task_context = detect_task_context(caller_skill=caller) if caller else None
+        results = rerank_results(
+            candidates, query_terms, limit,
+            db_path=db_path, task_context=task_context,
+        )
         # Strip body — callers don't need it
         for r in results:
             r.pop("body", None)
