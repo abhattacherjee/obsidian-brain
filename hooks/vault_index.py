@@ -8,10 +8,13 @@ DB location: ~/.claude/obsidian-brain-vault.db (outside vault, alongside config)
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import sqlite3
 import sys
+import time
+from collections import defaultdict
 from datetime import date
 from pathlib import Path
 
@@ -32,7 +35,8 @@ CREATE TABLE IF NOT EXISTS notes (
     status          TEXT,
     mtime           REAL NOT NULL,
     size            INTEGER,
-    body            TEXT DEFAULT ''
+    body            TEXT DEFAULT '',
+    importance      INTEGER DEFAULT 5
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
@@ -40,6 +44,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
     body,
     tags,
     content=''
+);
+
+CREATE TABLE IF NOT EXISTS access_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_path       TEXT NOT NULL,
+    timestamp       REAL NOT NULL,
+    context_type    TEXT NOT NULL,
+    project         TEXT
 );
 """
 
@@ -92,6 +104,29 @@ def _needs_body_migration(conn: sqlite3.Connection) -> bool:
     """Return True if the notes table is missing the body column."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(notes)").fetchall()}
     return "body" not in cols
+
+
+def _ensure_access_log_indexes(conn: sqlite3.Connection) -> None:
+    """Create indexes on access_log if they don't exist."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_access_note ON access_log (note_path)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_access_time ON access_log (timestamp)"
+    )
+    conn.commit()
+
+
+def _needs_importance_migration(conn: sqlite3.Connection) -> bool:
+    """Return True if the notes table is missing the importance column."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(notes)").fetchall()}
+    return "importance" not in cols
+
+
+def _add_importance_column(conn: sqlite3.Connection) -> None:
+    """Add importance column to existing notes table."""
+    conn.execute("ALTER TABLE notes ADD COLUMN importance INTEGER DEFAULT 5")
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -256,11 +291,13 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
         for row in conn.execute("SELECT path, mtime FROM notes").fetchall()
     }
 
-    # Delete removed files
+    # Delete removed files (only if they belong to a scanned folder)
+    scanned_roots = [str(vault / f) for f in folders]
     for abs_path_str in list(indexed.keys()):
         if abs_path_str not in disk_files:
-            _delete_note(conn, abs_path_str)
-            stats["deleted"] += 1
+            if any(abs_path_str.startswith(root) for root in scanned_roots):
+                _delete_note(conn, abs_path_str)
+                stats["deleted"] += 1
 
     # Insert/update files
     for abs_path_str, abs_path in disk_files.items():
@@ -310,6 +347,9 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
         conn = _connect(db_path)
         try:
             _init_schema(conn)
+            _ensure_access_log_indexes(conn)
+            if _needs_importance_migration(conn):
+                _add_importance_column(conn)
             if _needs_body_migration(conn):
                 print(f"[vault-index] Missing body column; rebuilding {db_path}",
                       file=sys.stderr)
@@ -323,6 +363,9 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
                                   file=sys.stderr)
                 conn = _connect(db_path)
                 _init_schema(conn)
+                _ensure_access_log_indexes(conn)
+                if _needs_importance_migration(conn):
+                    _add_importance_column(conn)
                 if _needs_body_migration(conn):
                     raise sqlite3.DatabaseError("body column missing after rebuild")
             _sync(conn, vault_path, folders)
@@ -340,6 +383,9 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
         conn = _connect(db_path)
         try:
             _init_schema(conn)
+            _ensure_access_log_indexes(conn)
+            if _needs_importance_migration(conn):
+                _add_importance_column(conn)
             _sync(conn, vault_path, folders)
         finally:
             conn.close()
@@ -351,6 +397,67 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
         pass
 
     return db_path
+
+
+def log_access(db_path: str, note_path: str, context_type: str, project: str | None = None) -> None:
+    """Insert one access-log row. Silently fails on missing/invalid DB."""
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            conn.execute(
+                "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+                "VALUES (?, ?, ?, ?)",
+                (note_path, time.time(), context_type, project),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def batch_activations(
+    db_path: str, note_paths: list[str], decay: float = 0.5
+) -> dict[str, float]:
+    """Compute ACT-R base-level activation for each note path.
+
+    Returns {path: activation} with 0.0 for notes with no access history.
+    Formula: ln(Σ t_i^(-decay)) where t_i = seconds since access.
+    """
+    if not note_paths:
+        return {}
+
+    result: dict[str, float] = {p: 0.0 for p in note_paths}
+
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            now = time.time()
+            placeholders = ",".join("?" for _ in note_paths)
+            rows = conn.execute(
+                f"SELECT note_path, timestamp FROM access_log "
+                f"WHERE note_path IN ({placeholders})",
+                note_paths,
+            ).fetchall()
+
+            # Group timestamps by note_path
+            accesses: dict[str, list[float]] = defaultdict(list)
+            for row in rows:
+                accesses[row[0]].append(row[1])
+
+            for path, timestamps in accesses.items():
+                summation = 0.0
+                for ts in timestamps:
+                    dt = max(now - ts, 0.001)  # clamp to 1ms minimum
+                    summation += dt ** (-decay)
+                if summation > 0.0:
+                    result[path] = math.log(summation)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+    return result
 
 
 def rebuild_index(vault_path: str, folders: list[str], db_path: str | None = None) -> dict:
