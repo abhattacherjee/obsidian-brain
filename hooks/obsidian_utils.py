@@ -24,6 +24,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+try:
+    import vault_index as _vault_index
+except ImportError:
+    _vault_index = None  # type: ignore[assignment]
+
 # --- Section-parsing regexes (used by collect_vault_corpus, build_context_brief) ---
 # Each captures the body between a ## heading and the next ## heading (or EOF).
 
@@ -1427,6 +1432,13 @@ def build_context_brief(
                 most_recent_open_items = m.group(1).strip()
         except OSError:
             most_recent_summary = "(could not read session note)"
+        else:
+            try:
+                if _vault_index is not None:
+                    _db = _vault_index._default_db_path()
+                    _vault_index.log_access(_db, most_recent_path, "recall", project)
+            except Exception:
+                pass
 
     if len(session_files) >= 2:
         _, second_path, meta = session_files[1]
@@ -1447,6 +1459,13 @@ def build_context_brief(
                     second_title = first_line
         except OSError:
             second_summary = "(could not read session note)"
+        else:
+            try:
+                if _vault_index is not None:
+                    _db = _vault_index._default_db_path()
+                    _vault_index.log_access(_db, second_path, "recall", project)
+            except Exception:
+                pass
 
     # History table (last 5 sessions)
     history_rows: list[str] = []
