@@ -1,6 +1,7 @@
 """Tests for importance column on notes table and importance parsing."""
 
 import sqlite3
+from unittest.mock import patch
 
 import pytest
 
@@ -117,3 +118,58 @@ class TestImportanceParsing:
     def test_parse_importance_from_subagent_line(self):
         summary = "## Summary\nDid work.\n\nIMPORTANCE: 6\n"
         assert obsidian_utils.parse_importance(summary) == 6
+
+
+class TestImportanceWriteBack:
+    def test_upgrade_note_writes_importance_to_db(self, tmp_vault, mock_config):
+        """upgrade_note_with_summary() writes parsed importance to vault index DB."""
+        note_path = str(tmp_vault / "claude-sessions" / "2026-04-15-test-wb-a1b2.md")
+        # Write a raw unsummarized note
+        (tmp_vault / "claude-sessions" / "2026-04-15-test-wb-a1b2.md").write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-15\n"
+            "session_id: wb-test-session\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "tags:\n"
+            "  - claude/session\n"
+            "---\n"
+            "\n"
+            "# Session: test-project\n"
+            "\n"
+            "## Summary\n"
+            "AI summary unavailable\n"
+            "\n"
+            "## Conversation (raw)\n"
+            "**User:** test\n",
+            encoding="utf-8",
+        )
+
+        # Index the vault so the note is in the DB
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        # Patch _default_db_path to point to our test DB
+        with patch.object(vault_index, "_default_db_path", return_value=db_path):
+            summary = (
+                "## Summary\nDid important security work.\n\n"
+                "## Key Decisions\nNone noted.\n\n"
+                "## Changes Made\nNone noted.\n\n"
+                "## Errors Encountered\nNone.\n\n"
+                "## Open Questions / Next Steps\nNone.\n\n"
+                "IMPORTANCE: 9\n"
+            )
+            result = obsidian_utils.upgrade_note_with_summary(
+                note_path, summary, str(tmp_vault), "claude-sessions", "test-project"
+            )
+            assert not result.startswith("Failed:")
+
+        # Verify importance was written to DB
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT importance FROM notes WHERE path = ?", (note_path,)
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == 9

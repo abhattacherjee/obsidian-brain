@@ -171,3 +171,91 @@ class TestRerankV2Signals:
 
     def test_empty_input(self):
         assert vault_index.rerank_results([], ["test"]) == []
+
+
+def _write_note(path, frontmatter: dict, body: str = ""):
+    """Helper to write a markdown note with frontmatter."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["---"]
+    for k, v in frontmatter.items():
+        if isinstance(v, list):
+            lines.append(f"{k}:")
+            for item in v:
+                lines.append(f"  - {item}")
+        else:
+            lines.append(f"{k}: {v}")
+    lines.append("---")
+    lines.append("")
+    if body:
+        lines.append(body)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+class TestSearchVaultCallerIntegration:
+    def test_search_vault_caller_standup_boosts_sessions(self, tmp_vault):
+        """search_vault with caller='standup' ranks sessions higher than insights."""
+        sessions_dir = tmp_vault / "claude-sessions"
+        insights_dir = tmp_vault / "claude-insights"
+
+        # Create a session note and an insight note with same content
+        session = sessions_dir / "2026-04-15-test-sess-abcd.md"
+        _write_note(session, {
+            "type": "claude-session",
+            "date": "2026-04-15",
+            "project": "test",
+            "status": "summarized",
+        }, body="authentication login implementation work")
+
+        insight = insights_dir / "2026-04-15-test-insight-ef01.md"
+        _write_note(insight, {
+            "type": "claude-insight",
+            "date": "2026-04-15",
+            "project": "test",
+            "status": "active",
+        }, body="authentication login implementation pattern")
+
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db_path)
+
+        # With caller='standup', sessions should rank higher than insights
+        results = vault_index.search_vault(db_path, "authentication login", caller="standup")
+        assert len(results) >= 2
+        session_result = next((r for r in results if r["type"] == "claude-session"), None)
+        insight_result = next((r for r in results if r["type"] == "claude-insight"), None)
+        assert session_result is not None
+        assert insight_result is not None
+        assert session_result["rerank_score"] > insight_result["rerank_score"]
+
+    def test_search_vault_caller_none_uses_general(self, tmp_vault):
+        """search_vault without caller uses general context (insights >= sessions)."""
+        sessions_dir = tmp_vault / "claude-sessions"
+        insights_dir = tmp_vault / "claude-insights"
+
+        session = sessions_dir / "2026-04-15-test-sess-1234.md"
+        _write_note(session, {
+            "type": "claude-session",
+            "date": "2026-04-15",
+            "project": "test",
+            "status": "summarized",
+        }, body="caching strategy design pattern")
+
+        insight = insights_dir / "2026-04-15-test-insight-5678.md"
+        _write_note(insight, {
+            "type": "claude-insight",
+            "date": "2026-04-15",
+            "project": "test",
+            "status": "active",
+        }, body="caching strategy design pattern")
+
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db_path)
+
+        results = vault_index.search_vault(db_path, "caching strategy")
+        assert len(results) >= 2
+        insight_result = next((r for r in results if r["type"] == "claude-insight"), None)
+        session_result = next((r for r in results if r["type"] == "claude-session"), None)
+        assert insight_result is not None
+        assert session_result is not None
+        # In general context, insight type score (1.0) >= session type score (0.5)
+        assert insight_result["rerank_score"] >= session_result["rerank_score"]

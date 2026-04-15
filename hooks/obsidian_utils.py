@@ -26,8 +26,10 @@ from pathlib import Path
 
 try:
     import vault_index as _vault_index
-except ImportError:
+except ImportError as exc:
     _vault_index = None  # type: ignore[assignment]
+    print(f"[obsidian-brain] vault_index not available, access tracking disabled: {exc}",
+          file=sys.stderr)
 
 # --- Section-parsing regexes (used by collect_vault_corpus, build_context_brief) ---
 # Each captures the body between a ## heading and the next ## heading (or EOF).
@@ -1458,9 +1460,11 @@ def build_context_brief(
             try:
                 if _vault_index is not None:
                     _db = _vault_index._default_db_path()
-                    _vault_index.log_access(_db, most_recent_path, "recall", project)
-            except Exception:
-                pass
+                    if os.path.isfile(_db):
+                        _vault_index.log_access(_db, most_recent_path, "recall", project)
+            except Exception as exc:
+                print(f"[obsidian-brain] access log for recall context failed: {exc}",
+                      file=sys.stderr)
 
     if len(session_files) >= 2:
         _, second_path, meta = session_files[1]
@@ -1485,9 +1489,11 @@ def build_context_brief(
             try:
                 if _vault_index is not None:
                     _db = _vault_index._default_db_path()
-                    _vault_index.log_access(_db, second_path, "recall", project)
-            except Exception:
-                pass
+                    if os.path.isfile(_db):
+                        _vault_index.log_access(_db, second_path, "recall", project)
+            except Exception as exc:
+                print(f"[obsidian-brain] access log for recall context failed: {exc}",
+                      file=sys.stderr)
 
     # History table (last 5 sessions)
     history_rows: list[str] = []
@@ -2654,8 +2660,9 @@ def upgrade_note_with_summary(
                     _conn.commit()
                 finally:
                     _conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[obsidian-brain] importance write-back failed for "
+              f"{os.path.basename(note_path)}: {exc}", file=sys.stderr)
 
     # Atomic write with fsync + post-write verification.
     # Guarantees the summary actually landed on disk before returning success.

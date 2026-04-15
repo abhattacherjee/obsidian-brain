@@ -413,8 +413,8 @@ def log_access(db_path: str, note_path: str, context_type: str, project: str | N
             conn.commit()
         finally:
             conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[vault-index] log_access failed for {note_path!r}: {exc}", file=sys.stderr)
 
 
 def batch_activations(
@@ -455,8 +455,10 @@ def batch_activations(
                     result[path] = math.log(summation)
         finally:
             conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[vault-index] batch_activations failed ({len(note_paths)} paths): {exc}",
+              file=sys.stderr)
+        return result
 
     return result
 
@@ -537,9 +539,11 @@ def _get_git_branch() -> str | None:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except Exception:
-        pass
-    return None
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        print(f"[vault-index] git branch detection failed: {exc}", file=sys.stderr)
+        return None
 
 
 def detect_task_context(caller_skill: str | None = None) -> str:
