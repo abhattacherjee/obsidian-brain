@@ -216,10 +216,11 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
     For contentless FTS5 (content=''), deletes require passing the old
     column values via the special 'delete' command, not DELETE FROM.
     """
-    row = conn.execute("SELECT rowid, title, tags FROM notes WHERE path = ?", (rel_path,)).fetchone()
+    row = conn.execute("SELECT rowid, title, tags, importance FROM notes WHERE path = ?", (rel_path,)).fetchone()
+    existing_importance = None
     if row:
+        existing_importance = row["importance"]
         # Contentless FTS5 delete: must pass old values
-        old_rowid = row["rowid"]
         # Read old body from the FTS shadow tables isn't possible with contentless,
         # so we need to read it from the note file or accept that we can't do
         # precise deletes. Instead, drop and recreate the entire FTS table entry
@@ -234,8 +235,8 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
 
     conn.execute(
         "INSERT INTO notes (path, type, date, project, title, source_session, "
-        "source_note, tags, status, mtime, size, body) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "source_note, tags, status, mtime, size, body, importance) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             rel_path,
             parsed.get("type", "unknown"),
@@ -249,6 +250,7 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
             mtime,
             size,
             parsed.get("body", ""),
+            existing_importance if existing_importance is not None else 5,
         ),
     )
 
@@ -401,7 +403,7 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
 
 
 def log_access(db_path: str, note_path: str, context_type: str, project: str | None = None) -> None:
-    """Insert one access-log row. Silently fails on missing/invalid DB."""
+    """Insert one access-log row. Logs a warning to stderr if the database is unavailable."""
     try:
         conn = sqlite3.connect(db_path, timeout=5.0)
         try:
@@ -553,11 +555,8 @@ def detect_task_context(caller_skill: str | None = None) -> str:
     Branch-based detection (fix/bug/hotfix) takes precedence over caller.
     """
     branch = _get_git_branch()
-    if branch:
-        branch_lower = branch.lower()
-        for keyword in ("fix", "bug", "hotfix"):
-            if keyword in branch_lower:
-                return "debugging"
+    if branch and re.match(r"^(?:refs/heads/)?(?:fix|bug|hotfix)(?:/|$)", branch.lower()):
+        return "debugging"
 
     if caller_skill in ("standup", "emerge"):
         return caller_skill
@@ -739,16 +738,15 @@ def rerank_results(
     else:
         raw_activations = {p: 0.0 for p in note_paths}
 
-    # Normalize activations to [0, 1]
-    pos_vals = [v for v in raw_activations.values() if v > 0]
-    if len(pos_vals) >= 2:
-        act_min = min(pos_vals)
-        act_max = max(pos_vals)
+    # Normalize activations to [0, 1] — non-zero values (including negatives) get mapped
+    nonzero_acts = [v for v in raw_activations.values() if v != 0.0]
+    if nonzero_acts:
+        act_min = min(nonzero_acts)
+        act_max = max(nonzero_acts)
         act_range = act_max - act_min if act_max != act_min else 1.0
     else:
-        # 0 or 1 positive values: normalize the single value to 1.0
         act_min = 0.0
-        act_range = max(pos_vals) if pos_vals else 1.0
+        act_range = 1.0
 
     scored: list[tuple[float, dict]] = []
     for r in fts_results:
@@ -779,7 +777,12 @@ def rerank_results(
 
         # Activation (normalized)
         raw_act = raw_activations.get(r.get("path", ""), 0.0)
-        activation_norm = (raw_act - act_min) / act_range if raw_act > 0 else 0.0
+        if raw_act == 0.0:
+            activation_norm = 0.0
+        elif act_range == 1.0 and len(nonzero_acts) == 1:
+            activation_norm = 1.0  # single accessed note gets max score
+        else:
+            activation_norm = (raw_act - act_min) / act_range
 
         # Importance (0-1 scale from frontmatter 1-10)
         importance_norm = r.get("importance", 5) / 10.0
@@ -884,7 +887,7 @@ def search_vault(
         )
         # Log access for returned results
         for r in results:
-            log_access(db_path, r["path"], "search")
+            log_access(db_path, r["path"], "search", project=r.get("project"))
         # Strip body — callers don't need it
         for r in results:
             r.pop("body", None)
@@ -1050,7 +1053,7 @@ def query_related_notes(
 
         # Log access for returned results
         for r in results[:limit]:
-            log_access(db_path, r["path"], "related")
+            log_access(db_path, r["path"], "related", project)
         return results[:limit]
     finally:
         conn.close()

@@ -51,6 +51,21 @@ class TestDetectTaskContext:
         with patch.object(vault_index, "_get_git_branch", return_value=None):
             assert vault_index.detect_task_context() == "general"
 
+    def test_feature_branch_with_fix_substring_not_debugging(self):
+        """'feature/prefix-cleanup' should NOT be detected as debugging."""
+        with patch.object(vault_index, "_get_git_branch", return_value="feature/prefix-cleanup"):
+            assert vault_index.detect_task_context() == "general"
+
+    def test_fix_branch_with_slash(self):
+        """'fix/something' IS debugging."""
+        with patch.object(vault_index, "_get_git_branch", return_value="fix/something"):
+            assert vault_index.detect_task_context() == "debugging"
+
+    def test_hotfix_exact(self):
+        """'hotfix' alone (no slash) IS debugging."""
+        with patch.object(vault_index, "_get_git_branch", return_value="hotfix"):
+            assert vault_index.detect_task_context() == "debugging"
+
 
 class TestContextAdaptiveTypeScores:
     def test_get_type_scores_debugging(self):
@@ -171,6 +186,32 @@ class TestRerankV2Signals:
 
     def test_empty_input(self):
         assert vault_index.rerank_results([], ["test"]) == []
+
+
+class TestActivationNormalization:
+    def test_negative_activation_still_boosts_over_no_history(self, tmp_vault):
+        """Notes with negative activation (old access) still rank above notes with no history."""
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        # Insert an old access (will produce negative activation)
+        conn = sqlite3.connect(db_path)
+        old_time = time.time() - 86400 * 30  # 30 days ago
+        conn.execute(
+            "INSERT INTO access_log (note_path, timestamp, context_type) VALUES (?, ?, ?)",
+            ("/vault/old.md", old_time, "recall"),
+        )
+        conn.commit()
+        conn.close()
+
+        candidates = [
+            _make_fts_result(path="/vault/old.md", rank=-5.0, body="test content"),
+            _make_fts_result(path="/vault/new.md", rank=-5.0, body="test content"),
+        ]
+        results = vault_index.rerank_results(candidates, ["test"], db_path=db_path)
+        old_score = next(r["rerank_score"] for r in results if r["path"] == "/vault/old.md")
+        new_score = next(r["rerank_score"] for r in results if r["path"] == "/vault/new.md")
+        assert old_score > new_score  # old access still better than no access
 
 
 def _write_note(path, frontmatter: dict, body: str = ""):

@@ -94,6 +94,36 @@ class TestImportanceColumn:
         assert row[0] == 9
 
 
+class TestImportancePreservedOnReindex:
+    def test_ensure_index_preserves_importance(self, tmp_vault):
+        """Re-indexing does not reset importance to default."""
+        note = tmp_vault / "claude-sessions" / "2026-04-15-test-preserve-a1b2.md"
+        _write_note(note, {
+            "type": "claude-session",
+            "date": "2026-04-15",
+            "project": "test",
+            "status": "summarized",
+        }, body="Important security audit work")
+
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        # Set importance to 9
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE notes SET importance = 9 WHERE path = ?", (str(note),))
+        conn.commit()
+        conn.close()
+
+        # Re-index (simulates next ensure_index call)
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        # Verify importance is still 9, not reset to 5
+        conn = sqlite3.connect(db_path)
+        row = conn.execute("SELECT importance FROM notes WHERE path = ?", (str(note),)).fetchone()
+        conn.close()
+        assert row[0] == 9
+
+
 class TestImportanceParsing:
     def test_parse_importance_from_summary(self):
         summary = "## Summary\nDid work.\n\n## Importance\n7\n"
