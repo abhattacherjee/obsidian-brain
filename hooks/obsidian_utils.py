@@ -927,6 +927,25 @@ def _dedup_summary_open_items(summary_text: str, existing_items: list) -> str:
     return summary_text[:match.start()] + section_header + new_body + summary_text[match.end():]
 
 
+def parse_importance(summary_text: str) -> int:
+    """Extract importance score (1-10) from summary text.
+
+    Looks for either '## Importance\\nN' or 'IMPORTANCE: N' format.
+    Returns 5 (default) if not found or invalid.
+    """
+    # Try ## Importance section
+    match = re.search(r'##\s*Importance\s*\n\s*(\d+)', summary_text)
+    if match:
+        score = int(match.group(1))
+        return max(1, min(10, score))
+    # Try IMPORTANCE: N format (sub-agent output)
+    match = re.search(r'IMPORTANCE:\s*(\d+)', summary_text)
+    if match:
+        score = int(match.group(1))
+        return max(1, min(10, score))
+    return 5
+
+
 def generate_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
@@ -990,6 +1009,9 @@ OUTPUT EXACTLY these markdown sections with no preamble, no commentary, no quest
 
 ## Open Questions / Next Steps
 - [ ] Checkbox list of unresolved items. Write "None." if none.
+
+## Importance
+Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 7-8: key decisions or error resolutions. 9-10: major releases or security audits. Output ONLY the number.
 """
 
     # Layer 1: Append existing open items to prevent AI duplication
@@ -2617,6 +2639,23 @@ def upgrade_note_with_summary(
 
     if summary_signature is None:
         return f"Failed: malformed summary (empty or heading-only Summary body) from {source} for {os.path.basename(note_path)}"
+
+    importance = parse_importance(summary_text)
+    try:
+        if _vault_index is not None:
+            _db = _vault_index._default_db_path()
+            if os.path.isfile(_db):
+                _conn = _vault_index._connect(_db)
+                try:
+                    _conn.execute(
+                        "UPDATE notes SET importance = ? WHERE path = ?",
+                        (importance, note_path),
+                    )
+                    _conn.commit()
+                finally:
+                    _conn.close()
+    except Exception:
+        pass
 
     # Atomic write with fsync + post-write verification.
     # Guarantees the summary actually landed on disk before returning success.

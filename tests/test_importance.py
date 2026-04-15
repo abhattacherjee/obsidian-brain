@@ -1,9 +1,10 @@
-"""Tests for importance column on notes table."""
+"""Tests for importance column on notes table and importance parsing."""
 
 import sqlite3
 
 import pytest
 
+import obsidian_utils
 import vault_index
 
 
@@ -90,3 +91,29 @@ class TestImportanceColumn:
         row = conn.execute("SELECT importance FROM notes WHERE path = ?", (str(note),)).fetchone()
         conn.close()
         assert row[0] == 9
+
+
+class TestImportanceParsing:
+    def test_parse_importance_from_summary(self):
+        summary = "## Summary\nDid work.\n\n## Importance\n7\n"
+        assert obsidian_utils.parse_importance(summary) == 7
+
+    def test_parse_importance_with_explanation(self):
+        summary = "## Importance\n8 - Major architectural decision\n"
+        assert obsidian_utils.parse_importance(summary) == 8
+
+    def test_parse_importance_missing_returns_default(self):
+        summary = "## Summary\nDid work.\n"
+        assert obsidian_utils.parse_importance(summary) == 5
+
+    def test_parse_importance_invalid_returns_default(self):
+        summary = "## Importance\nhigh\n"
+        assert obsidian_utils.parse_importance(summary) == 5
+
+    def test_parse_importance_clamps_to_range(self):
+        assert obsidian_utils.parse_importance("## Importance\n0\n") == 1
+        assert obsidian_utils.parse_importance("## Importance\n15\n") == 10
+
+    def test_parse_importance_from_subagent_line(self):
+        summary = "## Summary\nDid work.\n\nIMPORTANCE: 6\n"
+        assert obsidian_utils.parse_importance(summary) == 6
