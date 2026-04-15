@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-04-14
+
 ### Changed
 - **vault-index**: FTS5 search now uses AND-mode queries (both terms must appear) instead of OR-mode, with automatic OR fallback when AND returns zero results
 - **vault-index**: BM25 column weighting — title matches rank 10x, tag matches 5x over body matches
