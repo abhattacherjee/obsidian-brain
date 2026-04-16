@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **recall**: Replace sub-agent batch summarization (Wave 1-2-3) with parallel Haiku pipelines; sub-agents demoted to per-note fallback only
+
 ## [2.3.0] - 2026-04-16
 
 ### Added
