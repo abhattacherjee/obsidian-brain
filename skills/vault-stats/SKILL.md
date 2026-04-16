@@ -29,7 +29,7 @@ from vault_index import ensure_index
 from vault_stats import compute_stats
 c = load_config()
 if not c.get("vault_path"):
-    print(json.dumps({"error": "vault_path not configured. Run /obsidian-setup first."}))
+    print("ERROR=vault_path not configured. Run /obsidian-setup first.")
     sys.exit(0)
 vp = c["vault_path"]
 folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
@@ -44,6 +44,8 @@ print("STATS_JSON=" + result)
 ```
 
 Parse each output line as KEY=VALUE, splitting on the first `=`.
+
+If an `ERROR` key is present, display its value and stop.
 
 If `STATS_JSON` contains `"error"`, display the error message and stop.
 

@@ -90,7 +90,6 @@ def compute_stats(db_path: str, project: str) -> str:
     conn = None
     try:
         conn = sqlite3.connect(db_path, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
     except (sqlite3.Error, OSError) as exc:
         if conn is not None:
@@ -264,5 +263,6 @@ if __name__ == "__main__":
         sys.exit(1)
     result = compute_stats(sys.argv[1], sys.argv[2])
     print(result)
-    if '"error"' in result:
+    parsed = json.loads(result)
+    if "error" in parsed:
         sys.exit(1)
