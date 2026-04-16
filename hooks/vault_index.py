@@ -72,6 +72,27 @@ _STOPWORDS = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_under(child: Path, parent: Path) -> bool:
+    """True iff `child` lives inside `parent` (proper containment, not prefix match).
+
+    Uses Path.is_relative_to() on 3.9+, with a 3.8-safe fallback via relative_to.
+    """
+    try:
+        return child.is_relative_to(parent)
+    except AttributeError:
+        # Python 3.8 fallback — relative_to raises ValueError when not nested.
+        try:
+            child.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+
+# ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 
@@ -294,11 +315,17 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
         for row in conn.execute("SELECT path, mtime FROM notes").fetchall()
     }
 
-    # Delete removed files (only if they belong to a scanned folder)
-    scanned_roots = [str(vault / f) for f in folders]
+    # Delete removed files (only if they belong to a scanned folder).
+    # Use Path.is_relative_to() rather than str.startswith() so that
+    # sibling folders with a shared prefix (e.g. 'claude-sessions-archive'
+    # vs 'claude-sessions') are not treated as nested.
+    scanned_roots = [vault / f for f in folders]
     for abs_path_str in list(indexed.keys()):
         if abs_path_str not in disk_files:
-            if any(abs_path_str.startswith(root) for root in scanned_roots):
+            indexed_path = Path(abs_path_str)
+            if any(
+                _is_under(indexed_path, root) for root in scanned_roots
+            ):
                 _delete_note(conn, abs_path_str)
                 stats["deleted"] += 1
 
