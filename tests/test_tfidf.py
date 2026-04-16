@@ -96,3 +96,48 @@ class TestCosineSimilarity:
         v1 = {"a": 3.0, "b": 4.0}
         v2 = {"b": 4.0, "a": 3.0}
         assert vault_index._cosine_similarity(v1, v2) == pytest.approx(1.0)
+
+
+class TestUpdateTermDf:
+    def test_insert_increments_fresh_terms(self, tmp_vault):
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+        conn = vault_index._connect(db_path)
+        try:
+            vault_index._update_term_df(
+                conn, old_terms=set(), new_terms={"retrieval", "scoring"},
+            )
+            rows = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+        finally:
+            conn.close()
+        assert rows == {"retrieval": 1, "scoring": 1}
+
+    def test_replace_adjusts_df(self, tmp_vault):
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+        conn = vault_index._connect(db_path)
+        try:
+            vault_index._update_term_df(
+                conn, old_terms=set(), new_terms={"alpha", "beta"},
+            )
+            vault_index._update_term_df(
+                conn, old_terms={"alpha", "beta"}, new_terms={"alpha", "gamma"},
+            )
+            rows = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+        finally:
+            conn.close()
+        assert rows.get("alpha") == 1
+        assert rows.get("gamma") == 1
+        assert rows.get("beta", 0) == 0
+
+    def test_delete_purges_terms_when_df_hits_zero(self, tmp_vault):
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+        conn = vault_index._connect(db_path)
+        try:
+            vault_index._update_term_df(conn, old_terms=set(), new_terms={"solo"})
+            vault_index._update_term_df(conn, old_terms={"solo"}, new_terms=set())
+            rows = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+        finally:
+            conn.close()
+        assert "solo" not in rows

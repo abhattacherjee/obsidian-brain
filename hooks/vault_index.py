@@ -1137,6 +1137,41 @@ def _cosine_similarity(v1: dict[str, float], v2: dict[str, float]) -> float:
     return dot / (norm1 * norm2)
 
 
+def _update_term_df(
+    conn: sqlite3.Connection,
+    old_terms: set[str],
+    new_terms: set[str],
+) -> None:
+    """Adjust document-frequency counts for a note whose terms changed.
+
+    Compares the two sets and applies a +1 / -1 per term. Terms whose df
+    falls to zero are deleted from the table so the IDF denominator stays
+    clean.
+    """
+    removed = old_terms - new_terms
+    added = new_terms - old_terms
+    if not removed and not added:
+        return
+
+    cur = conn.cursor()
+
+    if added:
+        cur.executemany(
+            "INSERT INTO term_df (term, df) VALUES (?, 1) "
+            "ON CONFLICT(term) DO UPDATE SET df = df + 1",
+            [(t,) for t in added],
+        )
+
+    if removed:
+        cur.executemany(
+            "UPDATE term_df SET df = df - 1 WHERE term = ?",
+            [(t,) for t in removed],
+        )
+        cur.execute("DELETE FROM term_df WHERE df <= 0")
+
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Keyword extraction
 # ---------------------------------------------------------------------------
