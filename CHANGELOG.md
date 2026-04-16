@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **vault-index**: Phase 2 theme engine — `themes`, `theme_members`, and `term_df` tables; `tfidf_vector` JSON column on `notes` (auto-migrated on first `ensure_index()` call)
+- **vault-index**: `_tokenize_for_tfidf()`, `_compute_tfidf_vector()` (smoothed IDF), `_cosine_similarity()` for sparse dict vectors, `_update_term_df()` for incremental IDF maintenance
+- **vault-index**: `assign_to_theme()` — incremental cosine-similarity clustering after note summarization; notes joining a theme update its centroid via running average under a BEGIN IMMEDIATE transaction so concurrent callers cannot clobber each other
+- **vault-index**: `detect_surprise()` — negation-proximity contradiction score persisted on `theme_members.surprise` for Phase 4 retrieval boosting
+- **recall**: `upgrade_note_with_summary()` now re-indexes the summarized note, runs incremental theme assignment, and persists a surprise score when the note joins a theme. All theme-side errors are non-fatal — the note upgrade itself is never rolled back by a theme-pipeline failure
+- **obsidian-setup**: Step 8.7 Performance Dependencies — optional `numpy`/`scipy` install prompt with idempotent persistence (`optional_deps_prompted`, `optional_deps_declined` config fields); `/obsidian-setup --deps` re-triggers the prompt
+- **config**: `check_optional_deps()` returns import-availability for numpy and scipy
+
 ### Changed
 - **recall**: Replace sub-agent batch summarization (Wave 1-2-3) with parallel Haiku pipelines; sub-agents demoted to per-note fallback only
+- **vault-index**: `search_vault()` and `query_related_notes()` now batch their access-log writes via `executemany` on the existing connection (1 commit instead of N, Phase 1 Copilot review deferred item)
+
+### Fixed
+- **vault-index**: `_sync()` uses `Path.is_relative_to()` instead of prefix-only `startswith()` so sibling folders like `claude-sessions-archive` are no longer incorrectly treated as nested inside `claude-sessions` (Phase 1 Copilot review deferred item)
 
 ## [2.3.0] - 2026-04-16
 
