@@ -2762,6 +2762,72 @@ def upgrade_note_with_summary(
         print(f"[obsidian-brain] importance write-back failed for "
               f"{os.path.basename(note_path)}: {exc}", file=sys.stderr)
 
+    # Phase 2: Incremental theme assignment.
+    # Best-effort — runs only when vault_index is importable and the DB file
+    # exists. A failure in this block MUST NEVER mask the successful upgrade.
+    try:
+        if _vault_index is not None:
+            _db = _vault_index._default_db_path()
+            if os.path.isfile(_db):
+                # Re-index the just-written note so its tfidf_vector reflects
+                # the final summarized body, then run incremental theme assignment.
+                try:
+                    _vault_index.index_note(_db, note_path)
+                except Exception as _exc:
+                    print(f"[obsidian-brain] theme re-index failed for "
+                          f"{os.path.basename(note_path)}: {_exc}", file=sys.stderr)
+                else:
+                    try:
+                        _assignment = _vault_index.assign_to_theme(
+                            _db, note_path, project=project,
+                        )
+                    except Exception as _exc:
+                        print(f"[obsidian-brain] assign_to_theme failed for "
+                              f"{os.path.basename(note_path)}: {_exc}",
+                              file=sys.stderr)
+                        _assignment = None
+
+                    if _assignment is not None:
+                        try:
+                            with open(note_path, "r", encoding="utf-8") as _f:
+                                _body = _f.read()
+                            _conn = _vault_index._connect(_db)
+                            try:
+                                _row = _conn.execute(
+                                    "SELECT tfidf_vector FROM notes WHERE path = ?",
+                                    (note_path,),
+                                ).fetchone()
+                                _note_vec = (
+                                    json.loads(_row["tfidf_vector"])
+                                    if _row and _row["tfidf_vector"] else {}
+                                )
+                                _row2 = _conn.execute(
+                                    "SELECT centroid FROM themes WHERE id = ?",
+                                    (_assignment["theme_id"],),
+                                ).fetchone()
+                                _centroid = (
+                                    json.loads(_row2["centroid"])
+                                    if _row2 and _row2["centroid"] else {}
+                                )
+                                _surprise = _vault_index.detect_surprise(
+                                    _body, _note_vec, _centroid,
+                                )
+                                _conn.execute(
+                                    "UPDATE theme_members SET surprise = ? "
+                                    "WHERE theme_id = ? AND note_path = ?",
+                                    (_surprise, _assignment["theme_id"], note_path),
+                                )
+                                _conn.commit()
+                            finally:
+                                _conn.close()
+                        except Exception as _exc:
+                            print(f"[obsidian-brain] surprise scoring failed "
+                                  f"for {os.path.basename(note_path)}: {_exc}",
+                                  file=sys.stderr)
+    except Exception as _exc:
+        print(f"[obsidian-brain] theme pipeline unexpected error "
+              f"for {os.path.basename(note_path)}: {_exc}", file=sys.stderr)
+
     # Run dedup pass (non-fatal — note is already upgraded)
     removed = []
     dedup_failed = False

@@ -316,3 +316,148 @@ class TestAssignToTheme:
         assert result is not None, "Cross-project theme should have been matched"
         assert result["theme_id"] == theme_id
         assert result["similarity"] > 0.3
+
+
+class TestUpgradeWiresThemes:
+    def test_upgrade_triggers_theme_assignment(self, tmp_vault, mock_config):
+        """After upgrade_note_with_summary(), the note must join a seeded matching theme."""
+        import obsidian_utils
+
+        # Seed an indexed note in the same project and build a theme around its vector
+        seed_path = _indexed_note(
+            tmp_vault, "seed", "retrieval scoring",
+            "retrieval scoring activation importance proximity bm25",
+            project="test-project",
+        )
+        target_path = tmp_vault / "claude-sessions" / "2026-04-16-test-project-newnote.md"
+        target_path.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-16\n"
+            "session_id: new-session\n"
+            "project: test-project\n"
+            "duration_minutes: 10.0\n"
+            "tags:\n  - claude/session\n"
+            "status: auto-logged\n"
+            "---\n\n"
+            "# Session: test-project (develop)\n\n"
+            "## Summary\n"
+            "AI summary unavailable \u2014 raw extraction below.\n\n"
+            "## Conversation (raw)\n"
+            "**User:** retrieval scoring?\n"
+            "**Assistant:** activation plus importance plus proximity plus bm25.\n",
+            encoding="utf-8",
+        )
+
+        import vault_index
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path,
+        )
+
+        # Seed a theme centroid around the seed note's TF-IDF vector
+        conn = sqlite3.connect(db_path)
+        seed_vec = conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (seed_path,)
+        ).fetchone()[0]
+        assert seed_vec, "Seed note should have a TF-IDF vector after indexing"
+        conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("Retrieval", "", seed_vec, 1,
+             "2026-04-16", "2026-04-16", "test-project"),
+        )
+        theme_id = conn.execute("SELECT id FROM themes").fetchone()[0]
+        conn.execute(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
+            "VALUES (?, ?, 1.0, ?)",
+            (theme_id, seed_path, "2026-04-16"),
+        )
+        conn.commit()
+        conn.close()
+
+        # Point obsidian_utils at this test DB by monkey-patching _default_db_path.
+        original_default = vault_index._default_db_path
+        try:
+            vault_index._default_db_path = lambda: db_path
+            summary = (
+                "## Summary\n"
+                "Retrieval scoring activation importance.\n\n"
+                "## Key Decisions\n- None noted.\n\n"
+                "## Changes Made\n- None noted.\n\n"
+                "## Errors Encountered\nNone.\n\n"
+                "## Open Questions / Next Steps\nNone.\n\n"
+                "IMPORTANCE: 7\n"
+            )
+            status = obsidian_utils.upgrade_note_with_summary(
+                str(target_path), summary,
+                str(tmp_vault), "claude-sessions", "test-project",
+                source="test",
+            )
+        finally:
+            vault_index._default_db_path = original_default
+
+        assert not status.startswith("Failed:"), f"upgrade failed: {status}"
+
+        conn = sqlite3.connect(db_path)
+        members = {
+            r[0] for r in conn.execute(
+                "SELECT note_path FROM theme_members WHERE theme_id = ?",
+                (theme_id,),
+            ).fetchall()
+        }
+        conn.close()
+        assert str(target_path) in members, (
+            "upgrade_note_with_summary did not trigger theme assignment"
+        )
+
+    def test_upgrade_survives_missing_vault_index(self, tmp_vault, mock_config):
+        """If the DB file is missing, upgrade must still succeed (theme pipeline is best-effort)."""
+        import obsidian_utils
+        import vault_index
+
+        target_path = tmp_vault / "claude-sessions" / "2026-04-16-test-project-missing.md"
+        target_path.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-16\n"
+            "session_id: missing-db-session\n"
+            "project: test-project\n"
+            "duration_minutes: 5.0\n"
+            "tags:\n  - claude/session\n"
+            "status: auto-logged\n"
+            "---\n\n"
+            "# Session: test-project\n\n"
+            "## Summary\n"
+            "AI summary unavailable \u2014 raw extraction below.\n\n"
+            "## Conversation (raw)\n"
+            "**User:** hi\n**Assistant:** hello\n",
+            encoding="utf-8",
+        )
+
+        # Point the DB path at a file that doesn't exist.
+        nonexistent = str(tmp_vault / "nonexistent.db")
+        original_default = vault_index._default_db_path
+        try:
+            vault_index._default_db_path = lambda: nonexistent
+            summary = (
+                "## Summary\n"
+                "Short session.\n\n"
+                "## Key Decisions\n- None noted.\n\n"
+                "## Changes Made\n- None noted.\n\n"
+                "## Errors Encountered\nNone.\n\n"
+                "## Open Questions / Next Steps\nNone.\n\n"
+                "IMPORTANCE: 3\n"
+            )
+            status = obsidian_utils.upgrade_note_with_summary(
+                str(target_path), summary,
+                str(tmp_vault), "claude-sessions", "test-project",
+                source="test",
+            )
+        finally:
+            vault_index._default_db_path = original_default
+
+        assert not status.startswith("Failed:"), (
+            f"upgrade must succeed even when DB is missing, got: {status}"
+        )
