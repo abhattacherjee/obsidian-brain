@@ -122,7 +122,7 @@ When all return, parse each result:
 - Starts with `Failed:` → add to fallback list
 
 If N <= 5: update each sub-task accordingly (succeeded or `Failed: <basename>`).
-If N > 5: update task #2 subject to `Upgrade N notes: M succeeded, F failed`.
+If N > 5: update task #2 subject to `Upgrade N notes: M succeeded, F pending fallback`.
 
 ##### Phase 2 — Sub-agent fallback (only for failed notes)
 
