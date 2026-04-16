@@ -1483,3 +1483,56 @@ def assign_to_theme(
         return {"theme_id": theme_id, "similarity": sim}
     finally:
         conn.close()
+
+
+_NEGATION_TERMS = frozenset({
+    "not", "never", "failed", "broken", "wrong", "mistake",
+    "avoid", "don't", "dont", "no", "cannot", "cant", "can't",
+})
+
+
+def detect_surprise(
+    note_text: str,
+    note_vec: dict[str, float],
+    theme_centroid: dict[str, float],
+    window: int = 8,
+    top_shared: int = 10,
+) -> float:
+    """Heuristic Free-Energy surprise score for a note vs. its theme centroid.
+
+    Returns the fraction of the top_shared shared TF-IDF terms that appear
+    within ``window`` tokens of a negation word in ``note_text``. Clamped
+    to [0.0, 1.0]. Zero on missing overlap or empty input.
+    """
+    if not note_text or not note_vec or not theme_centroid:
+        return 0.0
+
+    shared = [
+        (t, min(note_vec[t], theme_centroid[t]))
+        for t in set(note_vec) & set(theme_centroid)
+    ]
+    if not shared:
+        return 0.0
+    shared.sort(key=lambda kv: (-kv[1], kv[0]))
+    shared_terms = [t for t, _ in shared[:top_shared]]
+
+    tokens = _TOKEN_RE.findall(note_text.lower())
+    if not tokens:
+        return 0.0
+
+    negation_positions = [
+        i for i, t in enumerate(tokens) if t in _NEGATION_TERMS
+    ]
+    if not negation_positions:
+        return 0.0
+
+    hits = 0
+    for term in shared_terms:
+        term_positions = [i for i, t in enumerate(tokens) if t == term]
+        for p in term_positions:
+            if any(abs(p - n) <= window for n in negation_positions):
+                hits += 1
+                break
+
+    score = hits / len(shared_terms)
+    return max(0.0, min(1.0, score))
