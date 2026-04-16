@@ -2,7 +2,7 @@
 name: recall
 description: "Loads historical context from the Obsidian vault for the current project. Summarizes any unsummarized session notes, then presents a context brief with recent sessions, open items, and curated insights. Also auto-detects open items completed in the most recent loaded session and offers to check them off. Use when: (1) /recall command, (2) /recall <project-name>, (3) resuming work on a project and wanting prior context."
 metadata:
-  version: 1.4.0
+  version: 1.5.0
 ---
 
 # Recall — Load Project Context from Obsidian Vault
