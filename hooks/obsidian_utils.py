@@ -326,6 +326,8 @@ _DEFAULTS: dict = {
     "auto_log_enabled": True,
     "snapshot_on_compact": True,
     "snapshot_on_clear": True,
+    "optional_deps_prompted": False,
+    "optional_deps_declined": [],
 }
 
 
@@ -377,6 +379,23 @@ def load_config() -> dict:
 
     cache_set(sid, "config", config)
     return config
+
+
+def check_optional_deps(packages: tuple[str, ...] = ("numpy", "scipy")) -> dict[str, bool]:
+    """Return {package: is_importable} for each optional performance dep.
+
+    Used by /obsidian-setup to decide whether to offer installation, and
+    by callers that want a stdlib fallback when a fast-path dep is missing.
+    """
+    import importlib
+    result: dict[str, bool] = {}
+    for pkg in packages:
+        try:
+            importlib.import_module(pkg)
+            result[pkg] = True
+        except ImportError:
+            result[pkg] = False
+    return result
 
 
 def check_hook_status() -> dict:

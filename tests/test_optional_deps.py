@@ -1,0 +1,55 @@
+"""Tests for check_optional_deps() and the Phase 2 optional-deps config fields."""
+
+import importlib
+import json
+
+import pytest
+
+import obsidian_utils
+
+
+class TestCheckOptionalDeps:
+    def test_reports_numpy_and_scipy_status(self):
+        result = obsidian_utils.check_optional_deps()
+        assert set(result.keys()) == {"numpy", "scipy"}
+        for v in result.values():
+            assert isinstance(v, bool)
+
+    def test_missing_package_reports_false(self, monkeypatch):
+        # Mock importlib.import_module at the source (obsidian_utils imports
+        # it lazily inside check_optional_deps). We patch the importlib
+        # module's import_module function to raise ImportError for the
+        # target packages.
+        import importlib as _importlib
+
+        real_import_module = _importlib.import_module
+
+        def fake_import_module(name, *args, **kwargs):
+            if name in {"numpy", "scipy"}:
+                raise ImportError(f"mocked ImportError for {name}")
+            return real_import_module(name, *args, **kwargs)
+
+        monkeypatch.setattr(_importlib, "import_module", fake_import_module)
+        result = obsidian_utils.check_optional_deps()
+        assert result == {"numpy": False, "scipy": False}
+
+
+class TestConfigDefaults:
+    def test_optional_deps_fields_present_in_defaults(self):
+        defaults = obsidian_utils._DEFAULTS
+        assert defaults.get("optional_deps_prompted") is False
+        assert defaults.get("optional_deps_declined") == []
+
+    def test_load_config_fills_defaults_when_missing(self, tmp_path, monkeypatch):
+        cfg = {"vault_path": "/tmp/v"}
+        cfg_path = tmp_path / "obsidian-brain-config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", cfg_path)
+        monkeypatch.setattr(
+            obsidian_utils, "_get_session_id_fast", lambda: "test-session-id",
+        )
+        obsidian_utils.cache_set("test-session-id", "config", None)
+
+        loaded = obsidian_utils.load_config()
+        assert loaded["optional_deps_prompted"] is False
+        assert loaded["optional_deps_declined"] == []
