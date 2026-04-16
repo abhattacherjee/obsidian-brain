@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `/vault-stats` skill — vault health diagnostics and usage analytics showing signal coverage, access patterns, importance distribution, and top accessed notes; saves report to vault as `claude-stats` note for trend tracking
 - **vault-index**: ACT-R access tracking — `access_log` table records every note read with context type (recall, search, ask, related) for activation-based ranking
 - **vault-index**: `batch_activations()` computes ACT-R base-level activation (`ln(Σ t_i^(-0.5))`) for combined recency+frequency scoring
 - **vault-index**: `importance` column on `notes` table — 1-10 write-time score extracted from Haiku/sub-agent summarization output
