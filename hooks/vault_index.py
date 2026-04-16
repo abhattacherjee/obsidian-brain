@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS notes (
     mtime           REAL NOT NULL,
     size            INTEGER,
     body            TEXT DEFAULT '',
-    importance      INTEGER DEFAULT 5
+    importance      INTEGER DEFAULT 5,
+    tfidf_vector    TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
@@ -53,6 +54,32 @@ CREATE TABLE IF NOT EXISTS access_log (
     timestamp       REAL NOT NULL,
     context_type    TEXT NOT NULL,
     project         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS themes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    summary         TEXT NOT NULL DEFAULT '',
+    centroid        TEXT,
+    note_count      INTEGER NOT NULL DEFAULT 0,
+    activation      REAL NOT NULL DEFAULT 0.0,
+    created_date    TEXT NOT NULL,
+    updated_date    TEXT NOT NULL,
+    project         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS theme_members (
+    theme_id        INTEGER NOT NULL,
+    note_path       TEXT NOT NULL,
+    similarity      REAL NOT NULL,
+    surprise        REAL NOT NULL DEFAULT 0.0,
+    added_date      TEXT NOT NULL,
+    PRIMARY KEY (theme_id, note_path)
+);
+
+CREATE TABLE IF NOT EXISTS term_df (
+    term            TEXT PRIMARY KEY,
+    df              INTEGER NOT NULL
 );
 """
 
@@ -141,6 +168,31 @@ def _needs_importance_migration(conn: sqlite3.Connection) -> bool:
 def _add_importance_column(conn: sqlite3.Connection) -> None:
     """Add importance column to existing notes table."""
     conn.execute("ALTER TABLE notes ADD COLUMN importance INTEGER DEFAULT 5")
+    conn.commit()
+
+
+def _needs_tfidf_vector_migration(conn: sqlite3.Connection) -> bool:
+    """Return True if the notes table is missing the tfidf_vector column."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(notes)").fetchall()}
+    return "tfidf_vector" not in cols
+
+
+def _add_tfidf_vector_column(conn: sqlite3.Connection) -> None:
+    """Add tfidf_vector column to existing notes table."""
+    conn.execute("ALTER TABLE notes ADD COLUMN tfidf_vector TEXT")
+    conn.commit()
+
+
+def _ensure_theme_indexes(conn: sqlite3.Connection) -> None:
+    """Create secondary indexes for themes + theme_members if missing."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_theme_members_note "
+        "ON theme_members (note_path)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_themes_project "
+        "ON themes (project)"
+    )
     conn.commit()
 
 
@@ -373,6 +425,9 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
             _ensure_access_log_indexes(conn)
             if _needs_importance_migration(conn):
                 _add_importance_column(conn)
+            if _needs_tfidf_vector_migration(conn):
+                _add_tfidf_vector_column(conn)
+            _ensure_theme_indexes(conn)
             if _needs_body_migration(conn):
                 print(f"[vault-index] Missing body column; rebuilding {db_path}",
                       file=sys.stderr)
@@ -389,6 +444,9 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
                 _ensure_access_log_indexes(conn)
                 if _needs_importance_migration(conn):
                     _add_importance_column(conn)
+                if _needs_tfidf_vector_migration(conn):
+                    _add_tfidf_vector_column(conn)
+                _ensure_theme_indexes(conn)
                 if _needs_body_migration(conn):
                     raise sqlite3.DatabaseError("body column missing after rebuild")
             _sync(conn, vault_path, folders)
@@ -409,6 +467,9 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
             _ensure_access_log_indexes(conn)
             if _needs_importance_migration(conn):
                 _add_importance_column(conn)
+            if _needs_tfidf_vector_migration(conn):
+                _add_tfidf_vector_column(conn)
+            _ensure_theme_indexes(conn)
             _sync(conn, vault_path, folders)
         finally:
             conn.close()
@@ -546,6 +607,7 @@ def rebuild_index(vault_path: str, folders: list[str], db_path: str | None = Non
     conn = _connect(db_path)
     try:
         _init_schema(conn)
+        _ensure_theme_indexes(conn)
         stats = _sync(conn, vault_path, folders)
     finally:
         conn.close()
