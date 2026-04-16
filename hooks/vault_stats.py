@@ -5,6 +5,7 @@ Single entry point: compute_stats(db_path, project) -> JSON string.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import sqlite3
@@ -21,16 +22,55 @@ import vault_index
 
 def _importance_bucket(importance: int) -> str:
     """Map importance score to distribution bucket."""
-    if importance is None:
-        importance = 5
     if importance <= 3:
         return "trivial"
-    elif importance <= 6:
+    if importance <= 6:
         return "standard"
-    elif importance <= 8:
+    if importance <= 8:
         return "significant"
-    else:
-        return "critical"
+    return "critical"
+
+
+def _enrich_top_accessed(
+    conn: sqlite3.Connection,
+    db_path: str,
+    rows: list,
+) -> list[dict]:
+    """Build enriched top-accessed list from ranked query rows.
+
+    Each row must have (note_path, cnt) columns.  Returns a list of dicts
+    with path, basename, accesses, activation, and importance.
+    """
+    paths = [r[0] for r in rows]
+    counts = {r[0]: r[1] for r in rows}
+    activations = vault_index.batch_activations(db_path, paths)
+
+    importance_map: dict[str, int] = {}
+    if paths:
+        placeholders = ",".join("?" for _ in paths)
+        for r in conn.execute(
+            f"SELECT path, COALESCE(importance, 5) FROM notes "
+            f"WHERE path IN ({placeholders})",
+            paths,
+        ).fetchall():
+            importance_map[r[0]] = r[1]
+
+    return [
+        {
+            "path": p,
+            "basename": os.path.basename(p),
+            "accesses": counts[p],
+            "activation": round(activations.get(p, 0.0), 4),
+            "importance": importance_map.get(p, 5),
+        }
+        for p in paths
+    ]
+
+
+def _handle_error(label: str, exc: Exception) -> str:
+    """Log error to stderr and return JSON error payload."""
+    print(f"[vault-stats] {label}: {exc}", file=sys.stderr)
+    return json.dumps({"error": f"{label}: {exc}"})
 
 
 # ---------------------------------------------------------------------------
@@ -52,25 +92,15 @@ def compute_stats(db_path: str, project: str) -> str:
         conn = sqlite3.connect(db_path, timeout=5.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError) as exc:
         if conn is not None:
             conn.close()
-        print(f"[vault-stats] DB error: {exc}", file=sys.stderr)
-        return json.dumps({"error": f"Database error: {exc}"})
-    except OSError as exc:
-        if conn is not None:
-            conn.close()
-        print(f"[vault-stats] file error: {exc}", file=sys.stderr)
-        return json.dumps({"error": f"File error: {exc}"})
+        return _handle_error("DB open error", exc)
 
     try:
         return _compute_stats_inner(conn, db_path, project)
-    except sqlite3.Error as exc:
-        print(f"[vault-stats] DB error: {exc}", file=sys.stderr)
-        return json.dumps({"error": f"Database error: {exc}"})
-    except OSError as exc:
-        print(f"[vault-stats] file error: {exc}", file=sys.stderr)
-        return json.dumps({"error": f"File error: {exc}"})
+    except (sqlite3.Error, OSError) as exc:
+        return _handle_error("DB error", exc)
     finally:
         conn.close()
 
@@ -94,8 +124,6 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
     row = conn.execute("SELECT MIN(timestamp) FROM access_log").fetchone()
     oldest_ts = row[0] if row else None
     if oldest_ts is not None:
-        import datetime
-
         oldest_access = datetime.datetime.fromtimestamp(oldest_ts).strftime("%Y-%m-%d")
     else:
         oldest_access = None
@@ -147,31 +175,7 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
         "INNER JOIN notes n ON n.path = a.note_path "
         "GROUP BY a.note_path ORDER BY cnt DESC LIMIT 10"
     ).fetchall()
-
-    top_paths = [r[0] for r in top_rows]
-    top_counts = {r[0]: r[1] for r in top_rows}
-    activations = vault_index.batch_activations(db_path, top_paths)
-
-    # Get importance for top paths
-    importance_map: dict[str, int] = {}
-    if top_paths:
-        placeholders = ",".join("?" for _ in top_paths)
-        for r in conn.execute(
-            f"SELECT path, COALESCE(importance, 5) FROM notes WHERE path IN ({placeholders})",
-            top_paths,
-        ).fetchall():
-            importance_map[r[0]] = r[1]
-
-    top_accessed = []
-    for path in top_paths:
-        basename = os.path.basename(path)
-        top_accessed.append({
-            "path": path,
-            "basename": basename,
-            "accesses": top_counts[path],
-            "activation": round(activations.get(path, 0.0), 4),
-            "importance": importance_map.get(path, 5),
-        })
+    top_accessed = _enrich_top_accessed(conn, db_path, top_rows)
 
     # Importance distribution
     dist = {"trivial": 0, "standard": 0, "significant": 0, "critical": 0}
@@ -234,29 +238,7 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
         "GROUP BY a.note_path ORDER BY cnt DESC LIMIT 5",
         (project, project),
     ).fetchall()
-
-    proj_top_paths = [r[0] for r in proj_top_rows]
-    proj_top_counts = {r[0]: r[1] for r in proj_top_rows}
-    proj_activations = vault_index.batch_activations(db_path, proj_top_paths)
-
-    proj_imp_map: dict[str, int] = {}
-    if proj_top_paths:
-        placeholders = ",".join("?" for _ in proj_top_paths)
-        for r in conn.execute(
-            f"SELECT path, COALESCE(importance, 5) FROM notes WHERE path IN ({placeholders})",
-            proj_top_paths,
-        ).fetchall():
-            proj_imp_map[r[0]] = r[1]
-
-    proj_top_accessed = []
-    for path in proj_top_paths:
-        proj_top_accessed.append({
-            "path": path,
-            "basename": os.path.basename(path),
-            "accesses": proj_top_counts[path],
-            "activation": round(proj_activations.get(path, 0.0), 4),
-            "importance": proj_imp_map.get(path, 5),
-        })
+    proj_top_accessed = _enrich_top_accessed(conn, db_path, proj_top_rows)
 
     project_data = {
         "name": project,
