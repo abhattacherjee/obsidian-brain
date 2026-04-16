@@ -1424,63 +1424,80 @@ def assign_to_theme(
         return None
 
     try:
-        row = conn.execute(
-            "SELECT tfidf_vector FROM notes WHERE path = ?", (note_path,)
-        ).fetchone()
-        if not row or not row["tfidf_vector"]:
-            return None
+        # Take the write lock BEFORE reading candidates so the
+        # read-modify-write cycle is atomic against concurrent writers.
+        # Other callers block for up to the connection's timeout (5s in
+        # _connect()) before sqlite3 raises OperationalError.
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            note_vec = json.loads(row["tfidf_vector"])
-        except json.JSONDecodeError:
-            return None
-        if not note_vec:
-            return None
-
-        candidates = conn.execute(
-            "SELECT id, centroid, note_count FROM themes "
-            "WHERE project = ? OR project IS NULL",
-            (project,),
-        ).fetchall()
-
-        best: tuple[float, int, dict, int] | None = None
-        for cand in candidates:
-            if not cand["centroid"]:
-                continue
+            row = conn.execute(
+                "SELECT tfidf_vector FROM notes WHERE path = ?", (note_path,)
+            ).fetchone()
+            if not row or not row["tfidf_vector"]:
+                conn.commit()
+                return None
             try:
-                centroid = json.loads(cand["centroid"])
+                note_vec = json.loads(row["tfidf_vector"])
             except json.JSONDecodeError:
-                continue
-            sim = _cosine_similarity(note_vec, centroid)
-            if best is None or sim > best[0]:
-                best = (sim, cand["id"], centroid, cand["note_count"])
+                conn.commit()
+                return None
+            if not note_vec:
+                conn.commit()
+                return None
 
-        if best is None or best[0] < similarity_threshold:
-            return None
+            candidates = conn.execute(
+                "SELECT id, centroid, note_count FROM themes "
+                "WHERE project = ? OR project IS NULL",
+                (project,),
+            ).fetchall()
 
-        sim, theme_id, centroid, count = best
-        new_centroid: dict[str, float] = {}
-        all_terms = set(centroid) | set(note_vec)
-        for term in all_terms:
-            c_val = centroid.get(term, 0.0)
-            v_val = note_vec.get(term, 0.0)
-            new_centroid[term] = (c_val * count + v_val) / (count + 1)
+            best: tuple[float, int, dict, int] | None = None
+            for cand in candidates:
+                if not cand["centroid"]:
+                    continue
+                try:
+                    centroid = json.loads(cand["centroid"])
+                except json.JSONDecodeError:
+                    continue
+                sim = _cosine_similarity(note_vec, centroid)
+                if best is None or sim > best[0]:
+                    best = (sim, cand["id"], centroid, cand["note_count"])
 
-        today = date.today().isoformat()
-        conn.execute(
-            "UPDATE themes "
-            "SET centroid = ?, note_count = ?, updated_date = ? "
-            "WHERE id = ?",
-            (json.dumps(new_centroid, separators=(",", ":")),
-             count + 1, today, theme_id),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO theme_members "
-            "(theme_id, note_path, similarity, surprise, added_date) "
-            "VALUES (?, ?, ?, 0.0, ?)",
-            (theme_id, note_path, sim, today),
-        )
-        conn.commit()
-        return {"theme_id": theme_id, "similarity": sim}
+            if best is None or best[0] < similarity_threshold:
+                conn.commit()
+                return None
+
+            sim, theme_id, centroid, count = best
+            new_centroid: dict[str, float] = {}
+            all_terms = set(centroid) | set(note_vec)
+            for term in all_terms:
+                c_val = centroid.get(term, 0.0)
+                v_val = note_vec.get(term, 0.0)
+                new_centroid[term] = (c_val * count + v_val) / (count + 1)
+
+            today = date.today().isoformat()
+            conn.execute(
+                "UPDATE themes "
+                "SET centroid = ?, note_count = ?, updated_date = ? "
+                "WHERE id = ?",
+                (json.dumps(new_centroid, separators=(",", ":")),
+                 count + 1, today, theme_id),
+            )
+            # Preserve surprise + added_date on reassignment — only
+            # similarity is refreshed from the latest cosine computation.
+            conn.execute(
+                "INSERT INTO theme_members "
+                "(theme_id, note_path, similarity, surprise, added_date) "
+                "VALUES (?, ?, ?, 0.0, ?) "
+                "ON CONFLICT(theme_id, note_path) DO UPDATE SET "
+                "similarity = excluded.similarity",
+                (theme_id, note_path, sim, today),
+            )
+            conn.commit()
+            return {"theme_id": theme_id, "similarity": sim}
+        except Exception:
+            conn.rollback()
+            raise
     finally:
         conn.close()
 

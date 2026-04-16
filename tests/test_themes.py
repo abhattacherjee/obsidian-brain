@@ -228,3 +228,91 @@ class TestAssignToTheme:
             b_val = vec_b.get(term, 0.0)
             expected = (a_val + b_val) / 2
             assert centroid.get(term) == pytest.approx(expected, rel=1e-6)
+
+    def test_reassignment_preserves_surprise_and_added_date(self, tmp_vault):
+        """Assigning a note twice must not reset surprise or added_date."""
+        path = _indexed_note(tmp_vault, "reassign", "retrieval scoring",
+                             "retrieval scoring activation importance")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
+        ).fetchone()[0])
+        conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("Retrieval", "", json.dumps(vec), 0,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        conn.commit()
+        conn.close()
+
+        # First assignment: joins the theme, surprise defaults to 0.0.
+        result1 = vault_index.assign_to_theme(db_path, path, project="proj")
+        assert result1 is not None
+
+        # Simulate Batch F writing a surprise score and a custom added_date.
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE theme_members SET surprise = 0.7, added_date = '2026-04-10' "
+            "WHERE note_path = ?", (path,),
+        )
+        conn.commit()
+        conn.close()
+
+        # Second assignment: similarity may update, surprise + added_date must NOT reset.
+        result2 = vault_index.assign_to_theme(db_path, path, project="proj")
+        assert result2 is not None
+
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT similarity, surprise, added_date FROM theme_members "
+            "WHERE note_path = ?", (path,),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        # similarity should reflect the fresh cosine
+        assert row[0] == pytest.approx(result2["similarity"], rel=1e-6)
+        assert row[1] == pytest.approx(0.7, rel=1e-6), (
+            f"surprise reset to {row[1]!r} — INSERT OR REPLACE bug regressed"
+        )
+        assert row[2] == "2026-04-10", (
+            f"added_date overwritten to {row[2]!r} — should be preserved"
+        )
+
+    def test_cross_project_theme_candidate(self, tmp_vault):
+        """A theme with project=NULL should be a valid candidate for any project."""
+        path = _indexed_note(tmp_vault, "cross", "retrieval scoring",
+                             "retrieval scoring activation importance")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
+        ).fetchone()[0])
+        # Cross-project theme: project IS NULL
+        conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            ("Global Retrieval", "", json.dumps(vec), 1,
+             "2026-04-16", "2026-04-16"),
+        )
+        theme_id = conn.execute("SELECT id FROM themes").fetchone()[0]
+        conn.execute(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
+            "VALUES (?, ?, 1.0, ?)",
+            (theme_id, "/some/other/path.md", "2026-04-16"),
+        )
+        conn.commit()
+        conn.close()
+
+        # Call with a specific project — the NULL-project theme should still be a candidate.
+        result = vault_index.assign_to_theme(db_path, path, project="proj")
+        assert result is not None, "Cross-project theme should have been matched"
+        assert result["theme_id"] == theme_id
+        assert result["similarity"] > 0.3
