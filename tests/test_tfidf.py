@@ -33,3 +33,40 @@ class TestTokenize:
         text = "retrieval scoring retrieval activation scoring"
         toks = vault_index._tokenize_for_tfidf(text)
         assert toks == ["retrieval", "scoring", "retrieval", "activation", "scoring"]
+
+
+class TestComputeTfidf:
+    def test_sparse_vector_top_k(self):
+        """TF×IDF keeps only the top_k heaviest terms."""
+        tokens = ["retrieval"] * 5 + ["scoring"] * 3 + ["noise"] * 1
+        df = {"retrieval": 1, "scoring": 2, "noise": 50}
+        total_docs = 100
+        vec = vault_index._compute_tfidf_vector(tokens, df, total_docs, top_k=2)
+        assert set(vec.keys()) == {"retrieval", "scoring"}
+        # retrieval has the lowest df → highest IDF AND highest TF → should win
+        assert vec["retrieval"] > vec["scoring"] > 0
+
+    def test_rare_term_outranks_common_term_at_equal_tf(self):
+        tokens = ["obsidian", "python"]
+        df = {"obsidian": 1, "python": 80}
+        total_docs = 100
+        vec = vault_index._compute_tfidf_vector(tokens, df, total_docs, top_k=2)
+        assert vec["obsidian"] > vec["python"]
+
+    def test_empty_tokens_returns_empty_dict(self):
+        assert vault_index._compute_tfidf_vector([], {}, 10) == {}
+
+    def test_missing_df_treats_term_as_brand_new(self):
+        """A term absent from term_df should score as if df=0 (max IDF)."""
+        tokens = ["mystery"]
+        vec = vault_index._compute_tfidf_vector(tokens, {}, total_docs=100, top_k=5)
+        assert "mystery" in vec
+        assert vec["mystery"] > 0
+
+    def test_single_term_single_doc_corpus(self):
+        """Smoothing must keep IDF strictly positive even when df = total_docs."""
+        tokens = ["alpha"]
+        vec = vault_index._compute_tfidf_vector(
+            tokens, {"alpha": 1}, total_docs=1, top_k=5,
+        )
+        assert vec["alpha"] > 0

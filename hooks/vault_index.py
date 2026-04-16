@@ -1073,6 +1073,42 @@ def _tokenize_for_tfidf(text: str) -> list[str]:
     ]
 
 
+def _compute_tfidf_vector(
+    tokens: list[str],
+    term_df: dict[str, int],
+    total_docs: int,
+    top_k: int = 50,
+) -> dict[str, float]:
+    """Compute a sparse TF×IDF vector keeping the top_k heaviest terms.
+
+    tokens:       output of _tokenize_for_tfidf() for the document
+    term_df:      {term: document_frequency} for the corpus
+    total_docs:   total indexed documents (including this one if it is new;
+                  callers using incremental updates should increment total_docs
+                  BEFORE calling this function for a newly-inserted note)
+    top_k:        maximum number of terms to retain in the sparse vector
+
+    Returns {} when tokens is empty. Uses smoothed IDF
+    (1 + ln((N + 1) / (df + 1))) so new / rare terms never produce 0 or NaN.
+    """
+    if not tokens:
+        return {}
+
+    tf: dict[str, int] = defaultdict(int)
+    for t in tokens:
+        tf[t] += 1
+
+    weights: dict[str, float] = {}
+    n_plus_one = total_docs + 1
+    for term, count in tf.items():
+        df = term_df.get(term, 0)
+        idf = 1.0 + math.log(n_plus_one / (df + 1))
+        weights[term] = count * idf
+
+    top = sorted(weights.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
+    return dict(top)
+
+
 # ---------------------------------------------------------------------------
 # Keyword extraction
 # ---------------------------------------------------------------------------
