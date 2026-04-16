@@ -1109,6 +1109,34 @@ def _compute_tfidf_vector(
     return dict(top)
 
 
+def _cosine_similarity(v1: dict[str, float], v2: dict[str, float]) -> float:
+    """Cosine similarity between two sparse dict vectors. Returns 0.0 on empty input.
+
+    Iterates the smaller dict to compute the dot product, which keeps the
+    inner loop bounded even when one vector is much larger than the other.
+    """
+    if not v1 or not v2:
+        return 0.0
+
+    if len(v1) > len(v2):
+        v1, v2 = v2, v1
+
+    dot = 0.0
+    for term, w in v1.items():
+        other = v2.get(term)
+        if other is not None:
+            dot += w * other
+
+    if dot == 0.0:
+        return 0.0
+
+    norm1 = math.sqrt(sum(w * w for w in v1.values()))
+    norm2 = math.sqrt(sum(w * w for w in v2.values()))
+    if norm1 == 0.0 or norm2 == 0.0:
+        return 0.0
+    return dot / (norm1 * norm2)
+
+
 # ---------------------------------------------------------------------------
 # Keyword extraction
 # ---------------------------------------------------------------------------

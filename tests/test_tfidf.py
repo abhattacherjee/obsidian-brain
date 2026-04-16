@@ -70,3 +70,29 @@ class TestComputeTfidf:
             tokens, {"alpha": 1}, total_docs=1, top_k=5,
         )
         assert vec["alpha"] > 0
+
+
+class TestCosineSimilarity:
+    def test_identical_vectors_score_one(self):
+        v = {"a": 2.0, "b": 1.0}
+        assert vault_index._cosine_similarity(v, dict(v)) == pytest.approx(1.0)
+
+    def test_orthogonal_vectors_score_zero(self):
+        v1 = {"a": 1.0, "b": 1.0}
+        v2 = {"c": 1.0, "d": 1.0}
+        assert vault_index._cosine_similarity(v1, v2) == 0.0
+
+    def test_partial_overlap(self):
+        v1 = {"a": 1.0, "b": 1.0}
+        v2 = {"a": 1.0, "c": 1.0}
+        assert vault_index._cosine_similarity(v1, v2) == pytest.approx(0.5)
+
+    def test_empty_vector_returns_zero(self):
+        assert vault_index._cosine_similarity({}, {"a": 1.0}) == 0.0
+        assert vault_index._cosine_similarity({"a": 1.0}, {}) == 0.0
+        assert vault_index._cosine_similarity({}, {}) == 0.0
+
+    def test_order_independent(self):
+        v1 = {"a": 3.0, "b": 4.0}
+        v2 = {"b": 4.0, "a": 3.0}
+        assert vault_index._cosine_similarity(v1, v2) == pytest.approx(1.0)
