@@ -79,17 +79,10 @@ _STOPWORDS = frozenset(
 def _is_under(child: Path, parent: Path) -> bool:
     """True iff `child` lives inside `parent` (proper containment, not prefix match).
 
-    Uses Path.is_relative_to() on 3.9+, with a 3.8-safe fallback via relative_to.
+    Prevents sibling-prefix folder folders (e.g. 'claude-sessions-archive')
+    from being treated as nested inside 'claude-sessions'.
     """
-    try:
-        return child.is_relative_to(parent)
-    except AttributeError:
-        # Python 3.8 fallback — relative_to raises ValueError when not nested.
-        try:
-            child.relative_to(parent)
-            return True
-        except ValueError:
-            return False
+    return child.is_relative_to(parent)
 
 
 # ---------------------------------------------------------------------------
@@ -450,22 +443,36 @@ def _batch_log_access(
     conn: sqlite3.Connection,
     note_paths: list[str],
     context_type: str,
-    project: str | None = None,
+    project: str | None | list[str | None] = None,
 ) -> None:
     """Insert N access-log rows on an existing connection in one round-trip.
 
+    ``project`` may be a single value applied to every row, or a list of the
+    same length as ``note_paths`` to preserve per-row project attribution.
     Reuses the caller's connection (no new connect/close) and commits once
-    via executemany. Falls through silently on error — access logging is
-    observability, not a blocker.
+    via executemany. Swallows exceptions but logs to stderr — access logging
+    is observability, not a blocker.
     """
     if not note_paths:
         return
+    if isinstance(project, list):
+        if len(project) != len(note_paths):
+            raise ValueError(
+                f"_batch_log_access: project list length "
+                f"{len(project)} != note_paths length {len(note_paths)}"
+            )
+        projects = project
+    else:
+        projects = [project] * len(note_paths)
     try:
         now = time.time()
         conn.executemany(
             "INSERT INTO access_log (note_path, timestamp, context_type, project) "
             "VALUES (?, ?, ?, ?)",
-            [(p, now, context_type, project) for p in note_paths],
+            [
+                (p, now, context_type, proj)
+                for p, proj in zip(note_paths, projects)
+            ],
         )
         conn.commit()
     except Exception as exc:
@@ -959,12 +966,14 @@ def search_vault(
             candidates, query_terms, limit,
             db_path=db_path, task_context=task_context,
         )
-        # Log access for returned results (single connection, one commit)
+        # Log access for returned results (single connection, one commit).
+        # Per-row project preserves each note's project attribution for
+        # per-project analytics, even when the search itself was unscoped.
         _batch_log_access(
             conn,
             [r["path"] for r in results],
             "search",
-            project=project,
+            project=[r.get("project") for r in results],
         )
         # Strip body — callers don't need it
         for r in results:
