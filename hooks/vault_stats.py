@@ -47,14 +47,19 @@ def compute_stats(db_path: str, project: str) -> str:
     if not os.path.exists(db_path):
         return json.dumps({"error": f"DB not found: {db_path}"})
 
+    conn = None
     try:
         conn = sqlite3.connect(db_path, timeout=5.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
     except sqlite3.Error as exc:
+        if conn is not None:
+            conn.close()
         print(f"[vault-stats] DB error: {exc}", file=sys.stderr)
         return json.dumps({"error": f"Database error: {exc}"})
     except OSError as exc:
+        if conn is not None:
+            conn.close()
         print(f"[vault-stats] file error: {exc}", file=sys.stderr)
         return json.dumps({"error": f"File error: {exc}"})
 
@@ -136,10 +141,11 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
     ).fetchall():
         access_by_context[r[0]] = r[1]
 
-    # Top accessed (top 10 by access count)
+    # Top accessed (top 10 by access count, restricted to notes that still exist)
     top_rows = conn.execute(
-        "SELECT note_path, COUNT(*) as cnt FROM access_log "
-        "GROUP BY note_path ORDER BY cnt DESC LIMIT 10"
+        "SELECT a.note_path, COUNT(*) as cnt FROM access_log a "
+        "INNER JOIN notes n ON n.path = a.note_path "
+        "GROUP BY a.note_path ORDER BY cnt DESC LIMIT 10"
     ).fetchall()
 
     top_paths = [r[0] for r in top_rows]
@@ -220,11 +226,13 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
     ).fetchall():
         recent_activity[r[0]] = r[1]
 
-    # Top 5 project notes by access count
+    # Top 5 project notes by access count (restricted to notes that still exist)
     proj_top_rows = conn.execute(
-        "SELECT note_path, COUNT(*) as cnt FROM access_log "
-        "WHERE project = ? GROUP BY note_path ORDER BY cnt DESC LIMIT 5",
-        (project,),
+        "SELECT a.note_path, COUNT(*) as cnt FROM access_log a "
+        "INNER JOIN notes n ON n.path = a.note_path "
+        "WHERE a.project = ? AND n.project = ? "
+        "GROUP BY a.note_path ORDER BY cnt DESC LIMIT 5",
+        (project, project),
     ).fetchall()
 
     proj_top_paths = [r[0] for r in proj_top_rows]
