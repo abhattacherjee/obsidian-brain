@@ -419,6 +419,33 @@ def log_access(db_path: str, note_path: str, context_type: str, project: str | N
         print(f"[vault-index] log_access failed for {note_path!r}: {exc}", file=sys.stderr)
 
 
+def _batch_log_access(
+    conn: sqlite3.Connection,
+    note_paths: list[str],
+    context_type: str,
+    project: str | None = None,
+) -> None:
+    """Insert N access-log rows on an existing connection in one round-trip.
+
+    Reuses the caller's connection (no new connect/close) and commits once
+    via executemany. Falls through silently on error — access logging is
+    observability, not a blocker.
+    """
+    if not note_paths:
+        return
+    try:
+        now = time.time()
+        conn.executemany(
+            "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+            "VALUES (?, ?, ?, ?)",
+            [(p, now, context_type, project) for p in note_paths],
+        )
+        conn.commit()
+    except Exception as exc:
+        print(f"[vault-index] _batch_log_access failed for "
+              f"{len(note_paths)} paths: {exc}", file=sys.stderr)
+
+
 def batch_activations(
     db_path: str, note_paths: list[str], decay: float = 0.5
 ) -> dict[str, float]:
@@ -905,9 +932,13 @@ def search_vault(
             candidates, query_terms, limit,
             db_path=db_path, task_context=task_context,
         )
-        # Log access for returned results
-        for r in results:
-            log_access(db_path, r["path"], "search", project=r.get("project"))
+        # Log access for returned results (single connection, one commit)
+        _batch_log_access(
+            conn,
+            [r["path"] for r in results],
+            "search",
+            project=project,
+        )
         # Strip body — callers don't need it
         for r in results:
             r.pop("body", None)
@@ -1071,9 +1102,13 @@ def query_related_notes(
                         print(f"[vault-index] Layer 3 (FTS) query failed: {exc}",
                               file=sys.stderr)
 
-        # Log access for returned results
-        for r in results[:limit]:
-            log_access(db_path, r["path"], "related", project)
+        # Log access for returned results (single connection, one commit)
+        _batch_log_access(
+            conn,
+            [r["path"] for r in results[:limit]],
+            "related",
+            project=project,
+        )
         return results[:limit]
     finally:
         conn.close()
