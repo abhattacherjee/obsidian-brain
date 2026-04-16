@@ -79,8 +79,8 @@ _STOPWORDS = frozenset(
 def _is_under(child: Path, parent: Path) -> bool:
     """True iff `child` lives inside `parent` (proper containment, not prefix match).
 
-    Prevents sibling-prefix folder folders (e.g. 'claude-sessions-archive')
-    from being treated as nested inside 'claude-sessions'.
+    Prevents sibling-prefix folders (e.g. 'claude-sessions-archive') from
+    being treated as nested inside 'claude-sessions'.
     """
     return child.is_relative_to(parent)
 
@@ -455,16 +455,16 @@ def _batch_log_access(
     """
     if not note_paths:
         return
-    if isinstance(project, list):
-        if len(project) != len(note_paths):
-            raise ValueError(
-                f"_batch_log_access: project list length "
-                f"{len(project)} != note_paths length {len(note_paths)}"
-            )
-        projects = project
-    else:
-        projects = [project] * len(note_paths)
     try:
+        if isinstance(project, list):
+            if len(project) != len(note_paths):
+                raise ValueError(
+                    f"_batch_log_access: project list length "
+                    f"{len(project)} != note_paths length {len(note_paths)}"
+                )
+            projects = project
+        else:
+            projects = [project] * len(note_paths)
         now = time.time()
         conn.executemany(
             "INSERT INTO access_log (note_path, timestamp, context_type, project) "
