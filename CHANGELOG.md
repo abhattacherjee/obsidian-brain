@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-04-16
+
 ### Added
 - `/vault-stats` skill — vault health diagnostics and usage analytics showing signal coverage, access patterns, importance distribution, and top accessed notes; saves report to vault as `claude-stats` note for trend tracking
 - **vault-index**: ACT-R access tracking — `access_log` table records every note read with context type (recall, search, ask, related) for activation-based ranking
