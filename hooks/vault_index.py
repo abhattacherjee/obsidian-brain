@@ -8,6 +8,7 @@ DB location: ~/.claude/obsidian-brain-vault.db (outside vault, alongside config)
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -276,33 +277,68 @@ def _parse_note(file_path: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def _prior_terms_for(conn: sqlite3.Connection, note_path: str) -> set[str]:
+    """Return the set of tokens previously stored on this note's tfidf_vector.
+
+    Returns an empty set if the note is new, the vector column is NULL, or
+    the stored JSON cannot be decoded.
+    """
+    row = conn.execute(
+        "SELECT tfidf_vector FROM notes WHERE path = ?", (note_path,)
+    ).fetchone()
+    if not row or not row[0]:
+        return set()
+    try:
+        return set(json.loads(row[0]).keys())
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return set()
+
+
 def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: float, size: int) -> None:
-    """Insert or replace a note in the index + FTS table.
+    """Insert or replace a note + FTS row + maintain term_df + tfidf_vector.
 
     For contentless FTS5 (content=''), deletes require passing the old
-    column values via the special 'delete' command, not DELETE FROM.
+    column values via the special 'delete' command, not DELETE FROM. We
+    sidestep that by deleting the notes row (freeing its rowid) and letting
+    the orphaned FTS entry be a harmless no-op (it won't join).
     """
-    row = conn.execute("SELECT rowid, title, tags, importance FROM notes WHERE path = ?", (rel_path,)).fetchone()
-    existing_importance = None
-    if row:
-        existing_importance = row["importance"]
-        # Contentless FTS5 delete: must pass old values
-        # Read old body from the FTS shadow tables isn't possible with contentless,
-        # so we need to read it from the note file or accept that we can't do
-        # precise deletes. Instead, drop and recreate the entire FTS table entry
-        # by using DELETE on the notes table first, then rebuild.
-        # Simpler approach: just delete the notes row and skip FTS delete.
-        # The stale FTS entry will be overwritten by the new INSERT with the same rowid.
-        # Actually, contentless FTS doesn't support any form of delete without old values.
-        # The cleanest approach: delete the notes row (rowid freed), insert new one
-        # (gets new rowid), insert new FTS entry. The orphaned FTS entry for the old
-        # rowid is harmless — it won't join with any notes row.
+    row = conn.execute(
+        "SELECT rowid, title, tags, importance FROM notes WHERE path = ?",
+        (rel_path,),
+    ).fetchone()
+    existing_importance = row["importance"] if row else None
+    is_new = row is None
+
+    # --- TF-IDF maintenance (before the DELETE so _prior_terms_for can read
+    # the old vector). ---
+    old_terms = _prior_terms_for(conn, rel_path)
+
+    full_text = " ".join([
+        parsed.get("title", "") or "",
+        parsed.get("tags", "") or "",
+        parsed.get("body", "") or "",
+    ])
+    tokens = _tokenize_for_tfidf(full_text)
+    new_terms = set(tokens)
+
+    # Apply df diff BEFORE computing this note's TF-IDF so its own term
+    # contribution is included in the IDF denominator.
+    _update_term_df(conn, old_terms=old_terms, new_terms=new_terms)
+
+    total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    if is_new:
+        total_docs += 1  # this note is about to be inserted
+    term_df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+    tfidf_vec = _compute_tfidf_vector(tokens, term_df, total_docs, top_k=50)
+    tfidf_json = json.dumps(tfidf_vec, separators=(",", ":")) if tfidf_vec else None
+
+    if not is_new:
         conn.execute("DELETE FROM notes WHERE path = ?", (rel_path,))
 
     conn.execute(
         "INSERT INTO notes (path, type, date, project, title, source_session, "
-        "source_note, tags, status, mtime, size, body, importance) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "source_note, tags, status, mtime, size, body, importance, tfidf_vector) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             rel_path,
             parsed.get("type", "unknown"),
@@ -317,24 +353,37 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
             size,
             parsed.get("body", ""),
             existing_importance if existing_importance is not None else 5,
+            tfidf_json,
         ),
     )
 
     # Get the rowid for FTS insert
-    rowid = conn.execute("SELECT rowid FROM notes WHERE path = ?", (rel_path,)).fetchone()["rowid"]
+    rowid = conn.execute(
+        "SELECT rowid FROM notes WHERE path = ?", (rel_path,)
+    ).fetchone()["rowid"]
     conn.execute(
         "INSERT INTO notes_fts (rowid, title, body, tags) VALUES (?, ?, ?, ?)",
-        (rowid, parsed.get("title", ""), parsed.get("body", ""), parsed.get("tags", "")),
+        (
+            rowid,
+            parsed.get("title", ""),
+            parsed.get("body", ""),
+            parsed.get("tags", ""),
+        ),
     )
 
 
 def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
-    """Remove a note from the index + FTS table.
+    """Remove a note + FTS row + its term_df contribution + theme memberships.
 
     For contentless FTS5, we can only delete the notes row. The orphaned
     FTS entry won't match any JOIN since the notes rowid is gone.
     """
+    old_terms = _prior_terms_for(conn, rel_path)
     conn.execute("DELETE FROM notes WHERE path = ?", (rel_path,))
+    # Drop any theme membership rows pointing at the deleted note.
+    conn.execute("DELETE FROM theme_members WHERE note_path = ?", (rel_path,))
+    if old_terms:
+        _update_term_df(conn, old_terms=old_terms, new_terms=set())
 
 
 def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict:

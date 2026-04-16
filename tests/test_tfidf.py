@@ -141,3 +141,136 @@ class TestUpdateTermDf:
         finally:
             conn.close()
         assert "solo" not in rows
+
+
+import sqlite3
+
+
+class TestUpsertStoresTfidf:
+    def test_first_insert_writes_tfidf_vector(self, tmp_vault):
+        """After ensure_index indexes a real note, its row carries a non-empty vector."""
+        (tmp_vault / "claude-sessions" / "2026-04-16-proj-alpha.md").write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-16\n"
+            "project: proj\n"
+            "title: Retrieval scoring research\n"
+            "tags:\n  - claude/session\n"
+            "status: summarized\n"
+            "---\n"
+            "Retrieval scoring with activation and importance signals.\n",
+            encoding="utf-8",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+        conn = sqlite3.connect(db_path)
+        row = conn.execute("SELECT tfidf_vector FROM notes").fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0], "tfidf_vector should be non-empty JSON"
+        vec = json.loads(row[0])
+        assert isinstance(vec, dict) and len(vec) > 0
+        # Corpus-wide term 'retrieval' or 'scoring' should be present
+        assert any("retriev" in k or "scor" in k for k in vec)
+
+    def test_term_df_reflects_indexed_corpus(self, tmp_vault):
+        for slug, body in [("a", "alpha beta"), ("b", "alpha gamma")]:
+            (tmp_vault / "claude-sessions" / f"2026-04-16-proj-{slug}.md").write_text(
+                "---\n"
+                "type: claude-session\n"
+                "date: 2026-04-16\n"
+                "project: proj\n"
+                f"title: Doc {slug}\n"
+                "tags:\n  - claude/session\n"
+                "status: summarized\n"
+                "---\n"
+                f"{body}\n",
+                encoding="utf-8",
+            )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+        conn = sqlite3.connect(db_path)
+        df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+        conn.close()
+        assert df.get("alpha") == 2
+        assert df.get("beta") == 1
+        assert df.get("gamma") == 1
+
+    def test_delete_removes_from_term_df(self, tmp_vault):
+        """Deleting a note decrements term_df and prunes zeros."""
+        note = tmp_vault / "claude-sessions" / "2026-04-16-proj-solo.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-16\n"
+            "project: proj\n"
+            "title: Solo\n"
+            "tags:\n  - claude/session\n"
+            "status: summarized\n"
+            "---\n"
+            "uniquewordalpha uniquewordbeta\n",
+            encoding="utf-8",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+        # Sanity: terms exist
+        conn = sqlite3.connect(db_path)
+        df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+        assert df.get("uniquewordalpha") == 1
+        conn.close()
+
+        # Remove the file and re-sync (triggers _delete_note)
+        note.unlink()
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        df_after = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+        theme_rows = conn.execute(
+            "SELECT COUNT(*) FROM theme_members WHERE note_path = ?",
+            (str(note),),
+        ).fetchone()[0]
+        conn.close()
+        assert "uniquewordalpha" not in df_after
+        assert "uniquewordbeta" not in df_after
+        assert theme_rows == 0
+
+    def test_update_adjusts_term_df_symmetric_diff(self, tmp_vault):
+        """Changing a note's body decrements removed terms and increments added ones."""
+        note = tmp_vault / "claude-sessions" / "2026-04-16-proj-evo.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-16\n"
+            "project: proj\n"
+            "title: Evolving\n"
+            "tags:\n  - claude/session\n"
+            "status: summarized\n"
+            "---\n"
+            "uniquetermone uniquetermtwo\n",
+            encoding="utf-8",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        import time
+        time.sleep(0.01)  # ensure mtime changes on fast filesystems
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-16\n"
+            "project: proj\n"
+            "title: Evolving\n"
+            "tags:\n  - claude/session\n"
+            "status: summarized\n"
+            "---\n"
+            "uniquetermone uniquetermthree\n",
+            encoding="utf-8",
+        )
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+        conn.close()
+        assert df.get("uniquetermone") == 1
+        assert df.get("uniquetermthree") == 1
+        assert df.get("uniquetermtwo", 0) == 0
