@@ -139,7 +139,7 @@ Agent({
 
 When sub-agents return, for each:
 
-1. If the sub-agent returned `WRITTEN:<path>`, extract the path after `WRITTEN:` as `SUMMARY_TEMP_PATH` (expand `~` to `$HOME`). Verify the file exists: `test -f "$SUMMARY_TEMP_PATH" && echo "EXISTS" || echo "MISSING"`.
+1. If the sub-agent returned `WRITTEN:<path>`, extract the path after `WRITTEN:` and replace the leading `~` with `$HOME` to get an absolute path. Store this as `SUMMARY_TEMP_PATH`. Verify the file exists: `test -f "$SUMMARY_TEMP_PATH" && echo "EXISTS" || echo "MISSING"`.
 2. If EXISTS, apply it via Python:
 
    ```bash
@@ -159,10 +159,10 @@ When sub-agents return, for each:
 
 3. If MISSING or sub-agent didn't return `WRITTEN:` → note stays unsummarized for next `/recall`.
 
-**Always** clean up temp files from Phase 2 after all write-backs complete, regardless of outcome (specific paths only — avoids racing with concurrent `/recall` invocations):
+**Always** clean up temp files from Phase 2 after all write-backs complete, regardless of outcome. Use the actual `SUMMARY_TEMP_PATH` values collected from each sub-agent's `WRITTEN:` response (not placeholder names):
 
 ```bash
-rm -f ~/.claude/obsidian-brain/summary-<basename_1>.md ~/.claude/obsidian-brain/summary-<basename_2>.md ...
+rm -f "$SUMMARY_TEMP_PATH_1" "$SUMMARY_TEMP_PATH_2" ...
 ```
 
 If N > 5: update task #2 subject to reflect final Phase 2 results (e.g. `Upgrade N notes: M Haiku + F fallback succeeded, K failed`).
@@ -172,7 +172,7 @@ If N > 5: update task #2 subject to reflect final Phase 2 results (e.g. `Upgrade
 Mark task #2 as completed. Report results:
 - How many upgraded via Haiku pipeline (Phase 1 successes)
 - How many upgraded via sub-agent fallback (Phase 2 write-back successes)
-- How many permanently failed (Phase 1 failed + Phase 2 failed or skipped — stay unsummarized for next `/recall`)
+- How many permanently failed (notes where both Phase 1 Haiku AND Phase 2 sub-agent fallback failed or were skipped — these stay unsummarized for next `/recall`)
 
 For failed notes: "Note `<basename>` could not be summarized. It will be retried on the next `/recall`."
 
