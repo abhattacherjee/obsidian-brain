@@ -58,6 +58,8 @@ If **upgrade**: store `MODE=upgrade`. Store `VAULT_PATH` from the existing confi
 - Step 6 (Install dashboards): only write dashboard files that do NOT already exist (`test -f` before each write)
 - Step 7 (Write config): SKIP entirely — preserve existing config
 - Step 8 (Verify vault access): runs normally
+- Step 8.5 (Build vault index): runs normally (idempotent ensure_index call)
+- Step 8.7 (Performance Dependencies): runs normally — has its own idempotency check via `optional_deps_prompted`/`optional_deps_declined` config fields; users with declined deps are NOT re-prompted unless they explicitly run `/obsidian-setup --deps`
 - Step 9 (Configure claudeception nudge): runs normally (has its own idempotency check)
 - Step 10 (Print success message): show upgrade-specific message
 
@@ -575,7 +577,7 @@ Parse each line as `KEY=VALUE`.
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys, os, json
+import sys, os, json, tempfile
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from pathlib import Path
 
@@ -593,8 +595,20 @@ for pkg in ("numpy", "scipy"):
     except ImportError:
         pass
 cfg["optional_deps_declined"] = sorted(declined)
-cfg_path.write_text(json.dumps(cfg, indent=2))
-os.chmod(cfg_path, 0o600)
+fd, tmp_path = tempfile.mkstemp(prefix=".obsidian-brain-config-", suffix=".json.tmp", dir=os.path.dirname(cfg_path))
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, cfg_path)
+except Exception:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
 print("OK")
 '
 ```
@@ -606,7 +620,7 @@ If pip itself is missing or the install fails (restricted environments, e.g. Hom
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 - <<'PY'
-import json, os
+import json, os, tempfile
 from pathlib import Path
 cfg_path = Path.home() / ".claude" / "obsidian-brain-config.json"
 try:
@@ -622,8 +636,20 @@ for pkg in ("numpy", "scipy"):
         missing.append(pkg)
 declined = sorted(set(cfg.get("optional_deps_declined", [])) | set(missing))
 cfg["optional_deps_declined"] = declined
-cfg_path.write_text(json.dumps(cfg, indent=2))
-os.chmod(cfg_path, 0o600)
+fd, tmp_path = tempfile.mkstemp(prefix=".obsidian-brain-config-", suffix=".json.tmp", dir=os.path.dirname(cfg_path))
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, cfg_path)
+except Exception:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
 print("OK")
 PY
 ```
