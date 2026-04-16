@@ -532,19 +532,31 @@ def index_note(db_path: str, note_path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_cached_git_branch: str | None = None
+_cached_git_branch_set: bool = False
+
+
 def _get_git_branch() -> str | None:
-    """Return the current git branch name, or None on failure."""
+    """Return the current git branch name, or None on failure. Cached per-process."""
+    global _cached_git_branch, _cached_git_branch_set
+    if _cached_git_branch_set:
+        return _cached_git_branch
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            branch = result.stdout.strip()
+            _cached_git_branch = branch
+            _cached_git_branch_set = True
+            return branch
     except FileNotFoundError:
+        _cached_git_branch_set = True
         return None
     except Exception as exc:
         print(f"[vault-index] git branch detection failed: {exc}", file=sys.stderr)
+        _cached_git_branch_set = True
         return None
 
 
@@ -786,7 +798,14 @@ def rerank_results(
             activation_norm = 0.01 + ((raw_act - act_min) / act_range) * 0.99
 
         # Importance (0-1 scale from frontmatter 1-10)
-        importance_norm = r.get("importance", 5) / 10.0
+        raw_importance = r.get("importance", 5)
+        if raw_importance is None:
+            raw_importance = 5
+        try:
+            raw_importance = max(1, min(10, int(raw_importance)))
+        except (TypeError, ValueError):
+            raw_importance = 5
+        importance_norm = raw_importance / 10.0
 
         final = (
             0.25 * proximity
