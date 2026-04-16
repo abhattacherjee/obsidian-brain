@@ -1063,13 +1063,19 @@ def _tokenize_for_tfidf(text: str) -> list[str]:
 
     Order is preserved (token occurrences count — duplicates are kept) so the
     caller can compute TF by counting. Returns [] for empty or all-stopword input.
+
+    Single-character tokens (both letters like "a" and digits like "3" or "9"
+    from expressions such as "Python-3.9") are dropped. Single digits appear
+    in few documents initially, which inflates their IDF and lets them
+    outrank real semantic terms in the sparse top-k — so letter and digit
+    noise are both removed uniformly.
     """
     if not text:
         return []
     lowered = text.lower()
     return [
         t for t in _TOKEN_RE.findall(lowered)
-        if t not in _STOPWORDS and (len(t) > 1 or t.isdigit())
+        if len(t) > 1 and t not in _STOPWORDS
     ]
 
 
@@ -1144,9 +1150,11 @@ def _update_term_df(
 ) -> None:
     """Adjust document-frequency counts for a note whose terms changed.
 
-    Compares the two sets and applies a +1 / -1 per term. Terms whose df
-    falls to zero are deleted from the table so the IDF denominator stays
-    clean.
+    Compares the two sets and applies a +1 / -1 per term via executemany.
+    Terms whose df falls to zero are deleted so the IDF denominator stays
+    clean. The caller is responsible for committing the transaction — this
+    helper writes through ``conn`` but does not commit, so it can be
+    batched atomically with a note upsert or delete.
     """
     removed = old_terms - new_terms
     added = new_terms - old_terms
@@ -1168,8 +1176,6 @@ def _update_term_df(
             [(t,) for t in removed],
         )
         cur.execute("DELETE FROM term_df WHERE df <= 0")
-
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------

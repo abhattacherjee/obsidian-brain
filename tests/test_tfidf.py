@@ -11,7 +11,7 @@ import vault_index
 class TestTokenize:
     def test_strips_punctuation_and_lowercases(self):
         toks = vault_index._tokenize_for_tfidf("Hello, World! Python-3.9.")
-        assert toks == ["hello", "world", "python", "3", "9"]
+        assert toks == ["hello", "world", "python"]
 
     def test_drops_stopwords(self):
         toks = vault_index._tokenize_for_tfidf("the quick brown fox is here")
