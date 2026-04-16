@@ -1051,6 +1051,29 @@ def search_vault(
 
 
 # ---------------------------------------------------------------------------
+# TF-IDF primitives (stdlib-first, numpy optional)
+# ---------------------------------------------------------------------------
+
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize_for_tfidf(text: str) -> list[str]:
+    """Tokenize text for TF-IDF: lowercase alphanumerics, drop stopwords + single chars.
+
+    Order is preserved (token occurrences count — duplicates are kept) so the
+    caller can compute TF by counting. Returns [] for empty or all-stopword input.
+    """
+    if not text:
+        return []
+    lowered = text.lower()
+    return [
+        t for t in _TOKEN_RE.findall(lowered)
+        if t not in _STOPWORDS and (len(t) > 1 or t.isdigit())
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Keyword extraction
 # ---------------------------------------------------------------------------
 
