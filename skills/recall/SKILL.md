@@ -155,9 +155,11 @@ When sub-agents return, for each:
    ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "sub-agent" "$SUMMARY_TEMP_PATH"
    ```
 
-   If the write-back status starts with `Failed:`, count this note as permanently failed — do NOT count it as upgraded.
+   If the write-back status starts with `Failed:`, count this note as permanently failed — do NOT count it as upgraded. If N <= 5, update the per-note sub-task to `Permanently failed: <basename>`.
 
-3. If MISSING or sub-agent didn't return `WRITTEN:` → note stays unsummarized for next `/recall`.
+   If the write-back succeeds, and N <= 5, update the per-note sub-task to `Fallback succeeded: <basename>`.
+
+3. If MISSING or sub-agent didn't return `WRITTEN:` → note stays unsummarized for next `/recall`. If N <= 5, update the per-note sub-task to `Permanently failed: <basename>`.
 
 **Always** clean up temp files from Phase 2 after all write-backs complete, regardless of outcome. Use the actual `SUMMARY_TEMP_PATH` values collected from each sub-agent's `WRITTEN:` response (not placeholder names):
 
