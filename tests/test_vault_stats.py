@@ -341,3 +341,107 @@ class TestComputeStatsDBSize:
         db_path = _setup_db(tmp_vault)
         result = json.loads(vault_stats.compute_stats(db_path, "p"))
         assert result["vault_wide"]["db_size_bytes"] >= 0
+
+
+class TestImportanceBucketBoundaries:
+    """Verify _importance_bucket boundary values."""
+
+    @pytest.mark.parametrize("value,expected", [
+        (1, "trivial"),
+        (2, "trivial"),
+        (3, "trivial"),
+        (4, "standard"),
+        (5, "standard"),
+        (6, "standard"),
+        (7, "significant"),
+        (8, "significant"),
+        (9, "critical"),
+        (10, "critical"),
+    ])
+    def test_bucket_boundaries(self, value, expected):
+        assert vault_stats._importance_bucket(value) == expected
+
+
+class TestOrphanedAccessLogEntries:
+    """Verify that access_log entries for deleted notes don't appear in stats."""
+
+    def test_orphaned_access_excluded_from_top_accessed(self, tmp_vault):
+        """Access events for notes deleted from vault don't appear in top_accessed."""
+        now = time.time()
+        notes = [
+            {
+                "filename": "exists.md",
+                "frontmatter": {"type": "claude-session", "date": "2026-04-01", "project": "p"},
+            },
+        ]
+        accesses = [
+            # This note exists
+            {"note_path": "claude-sessions/exists.md", "timestamp": now - 100, "context_type": "search"},
+            # This note does NOT exist in vault (orphaned access)
+            {"note_path": "/vault/deleted-note.md", "timestamp": now - 50, "context_type": "search"},
+            {"note_path": "/vault/deleted-note.md", "timestamp": now - 60, "context_type": "recall"},
+            {"note_path": "/vault/deleted-note.md", "timestamp": now - 70, "context_type": "search"},
+        ]
+        db_path = _setup_db(tmp_vault, notes=notes, accesses=accesses)
+        result = json.loads(vault_stats.compute_stats(db_path, "p"))
+        top_paths = [t["path"] for t in result["vault_wide"]["top_accessed"]]
+        assert "/vault/deleted-note.md" not in top_paths
+
+    def test_orphaned_access_excluded_from_signal_coverage(self, tmp_vault):
+        """Orphaned access events don't inflate has_activation count."""
+        now = time.time()
+        notes = [
+            {
+                "filename": "real.md",
+                "frontmatter": {"type": "claude-session", "date": "2026-04-01", "project": "p"},
+            },
+        ]
+        accesses = [
+            {"note_path": "/vault/ghost.md", "timestamp": now - 50, "context_type": "search"},
+        ]
+        db_path = _setup_db(tmp_vault, notes=notes, accesses=accesses)
+        result = json.loads(vault_stats.compute_stats(db_path, "p"))
+        # Ghost note shouldn't count as activation
+        assert result["vault_wide"]["signal_coverage"]["has_activation"] == 0
+        assert result["vault_wide"]["signal_coverage"]["has_neither"] == 1
+
+
+class TestAvgAccessesEdgeCases:
+    """Verify avg_accesses handles edge cases."""
+
+    def test_zero_accesses_returns_zero(self, tmp_vault):
+        """Project with notes but zero access events → avg_accesses = 0.0."""
+        notes = [
+            {
+                "filename": "a.md",
+                "frontmatter": {"type": "claude-session", "date": "2026-04-01", "project": "p"},
+            },
+            {
+                "filename": "b.md",
+                "frontmatter": {"type": "claude-session", "date": "2026-04-01", "project": "p"},
+            },
+        ]
+        db_path = _setup_db(tmp_vault, notes=notes)
+        result = json.loads(vault_stats.compute_stats(db_path, "p"))
+        assert result["project"]["avg_accesses"] == 0.0
+
+    def test_fractional_avg(self, tmp_vault):
+        """5 accesses / 2 notes = 2.5."""
+        now = time.time()
+        notes = [
+            {
+                "filename": "n1.md",
+                "frontmatter": {"type": "claude-session", "date": "2026-04-01", "project": "p"},
+            },
+            {
+                "filename": "n2.md",
+                "frontmatter": {"type": "claude-session", "date": "2026-04-01", "project": "p"},
+            },
+        ]
+        accesses = [
+            {"note_path": "claude-sessions/n1.md", "timestamp": now - i * 10, "context_type": "search", "project": "p"}
+            for i in range(5)
+        ]
+        db_path = _setup_db(tmp_vault, notes=notes, accesses=accesses)
+        result = json.loads(vault_stats.compute_stats(db_path, "p"))
+        assert result["project"]["avg_accesses"] == 2.5
