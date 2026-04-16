@@ -134,7 +134,7 @@ Format the JSON into markdown tables and display to the user. Use this structure
 | <for each entry in project.top_accessed, numbered 1-N> |
 ```
 
-Compute percentages as `round(count / total_notes * 100)` — show as integer with `%`. If total_notes is 0, show `0%`.
+Compute percentages: `round(count / denominator * 100)` — show as integer with `%`. For any percentage, if the denominator is 0, show `0%`. This applies to all tables (signal coverage uses total_notes, access patterns uses sum of counts).
 
 Format large numbers with commas (e.g. `1,832`).
 
@@ -169,7 +169,7 @@ Use the **Write** tool to save to `$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-vault
 Then set permissions:
 
 ```bash
-chmod 644 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-vault-stats-<hash>.md"
+chmod 600 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-vault-stats-<hash>.md"
 ```
 
 ### Step 5 — Confirm

@@ -1,18 +1,17 @@
 """Vault statistics module — compute aggregate stats from the vault index DB.
 
 Single entry point: compute_stats(db_path, project) -> JSON string.
-Standalone module — no vault_index imports. Uses only Python stdlib.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import sqlite3
 import sys
 import time
-from collections import defaultdict
+
+import vault_index
 
 
 # ---------------------------------------------------------------------------
@@ -20,45 +19,10 @@ from collections import defaultdict
 # ---------------------------------------------------------------------------
 
 
-def _compute_activations(
-    conn: sqlite3.Connection, note_paths: list[str], decay: float = 0.5
-) -> dict[str, float]:
-    """Compute ACT-R base-level activation for each note path.
-
-    Formula: ln(Σ t_i^(-decay)) where t_i = seconds since access.
-    Returns {path: activation} with 0.0 for notes with no access history.
-    Uses the existing connection (does NOT open a new one).
-    """
-    if not note_paths:
-        return {}
-
-    result: dict[str, float] = {p: 0.0 for p in note_paths}
-    now = time.time()
-
-    placeholders = ",".join("?" for _ in note_paths)
-    rows = conn.execute(
-        f"SELECT note_path, timestamp FROM access_log "
-        f"WHERE note_path IN ({placeholders})",
-        note_paths,
-    ).fetchall()
-
-    accesses: dict[str, list[float]] = defaultdict(list)
-    for row in rows:
-        accesses[row[0]].append(row[1])
-
-    for path, timestamps in accesses.items():
-        summation = 0.0
-        for ts in timestamps:
-            dt = max(now - ts, 0.001)
-            summation += dt ** (-decay)
-        if summation > 0.0:
-            result[path] = math.log(summation)
-
-    return result
-
-
 def _importance_bucket(importance: int) -> str:
     """Map importance score to distribution bucket."""
+    if importance is None:
+        importance = 5
     if importance <= 3:
         return "trivial"
     elif importance <= 6:
@@ -87,13 +51,21 @@ def compute_stats(db_path: str, project: str) -> str:
         conn = sqlite3.connect(db_path, timeout=5.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
+    except sqlite3.Error as exc:
+        print(f"[vault-stats] DB error: {exc}", file=sys.stderr)
+        return json.dumps({"error": f"Database error: {exc}"})
+    except OSError as exc:
+        print(f"[vault-stats] file error: {exc}", file=sys.stderr)
+        return json.dumps({"error": f"File error: {exc}"})
 
     try:
         return _compute_stats_inner(conn, db_path, project)
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
+    except sqlite3.Error as exc:
+        print(f"[vault-stats] DB error: {exc}", file=sys.stderr)
+        return json.dumps({"error": f"Database error: {exc}"})
+    except OSError as exc:
+        print(f"[vault-stats] file error: {exc}", file=sys.stderr)
+        return json.dumps({"error": f"File error: {exc}"})
     finally:
         conn.close()
 
@@ -107,7 +79,10 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
     # --- vault_wide ---
 
     total_notes = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
-    db_size_bytes = os.path.getsize(db_path)
+    try:
+        db_size_bytes = os.path.getsize(db_path)
+    except OSError:
+        db_size_bytes = 0
     access_log_entries = conn.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
 
     # Oldest access
@@ -136,7 +111,7 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
     has_importance_set = {
         r[0]
         for r in conn.execute(
-            "SELECT path FROM notes WHERE importance != 5"
+            "SELECT path FROM notes WHERE COALESCE(importance, 5) != 5"
         ).fetchall()
     }
 
@@ -169,14 +144,14 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
 
     top_paths = [r[0] for r in top_rows]
     top_counts = {r[0]: r[1] for r in top_rows}
-    activations = _compute_activations(conn, top_paths)
+    activations = vault_index.batch_activations(db_path, top_paths)
 
     # Get importance for top paths
     importance_map: dict[str, int] = {}
     if top_paths:
         placeholders = ",".join("?" for _ in top_paths)
         for r in conn.execute(
-            f"SELECT path, importance FROM notes WHERE path IN ({placeholders})",
+            f"SELECT path, COALESCE(importance, 5) FROM notes WHERE path IN ({placeholders})",
             top_paths,
         ).fetchall():
             importance_map[r[0]] = r[1]
@@ -194,7 +169,7 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
 
     # Importance distribution
     dist = {"trivial": 0, "standard": 0, "significant": 0, "critical": 0}
-    for r in conn.execute("SELECT importance FROM notes").fetchall():
+    for r in conn.execute("SELECT COALESCE(importance, 5) FROM notes").fetchall():
         bucket = _importance_bucket(r[0])
         dist[bucket] += 1
 
@@ -232,7 +207,7 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
         proj_activated = len(has_activation_set & set(proj_note_paths))
 
     proj_importance = conn.execute(
-        "SELECT COUNT(*) FROM notes WHERE project = ? AND importance != 5",
+        "SELECT COUNT(*) FROM notes WHERE project = ? AND COALESCE(importance, 5) != 5",
         (project,),
     ).fetchone()[0]
 
@@ -254,13 +229,13 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
 
     proj_top_paths = [r[0] for r in proj_top_rows]
     proj_top_counts = {r[0]: r[1] for r in proj_top_rows}
-    proj_activations = _compute_activations(conn, proj_top_paths)
+    proj_activations = vault_index.batch_activations(db_path, proj_top_paths)
 
     proj_imp_map: dict[str, int] = {}
     if proj_top_paths:
         placeholders = ",".join("?" for _ in proj_top_paths)
         for r in conn.execute(
-            f"SELECT path, importance FROM notes WHERE path IN ({placeholders})",
+            f"SELECT path, COALESCE(importance, 5) FROM notes WHERE path IN ({placeholders})",
             proj_top_paths,
         ).fetchall():
             proj_imp_map[r[0]] = r[1]
@@ -297,4 +272,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <db_path> <project>", file=sys.stderr)
         sys.exit(1)
-    print(compute_stats(sys.argv[1], sys.argv[2]))
+    result = compute_stats(sys.argv[1], sys.argv[2])
+    print(result)
+    if '"error"' in result:
+        sys.exit(1)
