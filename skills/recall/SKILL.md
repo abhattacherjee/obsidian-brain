@@ -118,8 +118,8 @@ print(status)
 ```
 
 When all return, parse each result:
-- Does NOT start with `"Failed:"` → mark as succeeded
-- Starts with `"Failed:"` → add to fallback list
+- Does NOT start with `Failed:` → mark as succeeded
+- Starts with `Failed:` → add to fallback list
 
 If N <= 5: update each sub-task accordingly (succeeded or `Failed: <basename>`).
 If N > 5: update task #2 subject to `Upgrade N notes: M succeeded, F failed`.
@@ -139,7 +139,7 @@ Agent({
 
 When sub-agents return, for each:
 
-1. If the sub-agent returned `WRITTEN:<path>`, verify the file exists: `test -f <expanded_path> && echo "EXISTS" || echo "MISSING"`.
+1. If the sub-agent returned `WRITTEN:<path>`, extract the path after `WRITTEN:` as `SUMMARY_TEMP_PATH` (expand `~` to `$HOME`). Verify the file exists: `test -f "$SUMMARY_TEMP_PATH" && echo "EXISTS" || echo "MISSING"`.
 2. If EXISTS, apply it via Python:
 
    ```bash
@@ -155,20 +155,24 @@ When sub-agents return, for each:
    ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "sub-agent" "$SUMMARY_TEMP_PATH"
    ```
 
+   If the write-back status starts with `Failed:`, count this note as permanently failed — do NOT count it as upgraded.
+
 3. If MISSING or sub-agent didn't return `WRITTEN:` → note stays unsummarized for next `/recall`.
 
-Clean up any temp files from Phase 2 (specific paths only — avoids racing with concurrent `/recall` invocations):
+**Always** clean up temp files from Phase 2 after all write-backs complete, regardless of outcome (specific paths only — avoids racing with concurrent `/recall` invocations):
 
 ```bash
 rm -f ~/.claude/obsidian-brain/summary-<basename_1>.md ~/.claude/obsidian-brain/summary-<basename_2>.md ...
 ```
 
+If N > 5: update task #2 subject to reflect final Phase 2 results (e.g. `Upgrade N notes: M Haiku + F fallback succeeded, K failed`).
+
 ##### Completion
 
 Mark task #2 as completed. Report results:
-- How many upgraded via Haiku pipeline
-- How many upgraded via sub-agent fallback
-- How many failed (stay unsummarized for next `/recall`)
+- How many upgraded via Haiku pipeline (Phase 1 successes)
+- How many upgraded via sub-agent fallback (Phase 2 write-back successes)
+- How many permanently failed (Phase 1 failed + Phase 2 failed or skipped — stay unsummarized for next `/recall`)
 
 For failed notes: "Note `<basename>` could not be summarized. It will be retried on the next `/recall`."
 
