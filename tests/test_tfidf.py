@@ -278,3 +278,55 @@ class TestUpsertStoresTfidf:
         assert df.get("uniquetermone") == 1
         assert df.get("uniquetermthree") == 1
         assert df.get("uniquetermtwo", 0) == 0
+
+    def test_reindex_does_not_drift_term_df(self, tmp_vault):
+        """Reindexing the same note must not bump term_df for any term.
+
+        Regression test for the top-K asymmetry bug where common-but-low-IDF
+        terms (pushed out of the stored top-50 tfidf_vector) were
+        incremented on every reindex because _prior_terms_for read the
+        truncated vector instead of the full token set.
+        """
+        import os
+
+        note = tmp_vault / "claude-sessions" / "2026-04-16-proj-reidx.md"
+        # > 50 distinct tokens so the stored vector is meaningfully truncated.
+        body_tokens = " ".join(f"ctoken{i:03d}" for i in range(80))
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-16\n"
+            "project: proj\n"
+            "title: Reindex probe\n"
+            "tags:\n  - claude/session\n"
+            "status: summarized\n"
+            "---\n"
+            f"project retrieval activation {body_tokens}\n",
+            encoding="utf-8",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        df_initial = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+        conn.close()
+
+        # Reindex the same note 3× via index_note (the hot path) with mtime bumps.
+        for bump in range(1, 4):
+            st = os.stat(note)
+            os.utime(note, (st.st_mtime + bump * 5, st.st_mtime + bump * 5))
+            ok = vault_index.index_note(db_path, str(note))
+            assert ok, f"index_note returned False on reindex #{bump}"
+
+        conn = sqlite3.connect(db_path)
+        df_final = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+        conn.close()
+
+        assert df_final == df_initial, (
+            f"term_df drifted across reindexes; "
+            f"{len(set(df_final) ^ set(df_initial))} term(s) added/removed, "
+            f"{sum(1 for k in df_final if df_final[k] != df_initial.get(k))} changed"
+        )
+        # No term can exceed the total note count.
+        for term, df in df_final.items():
+            assert df <= 1, f"term {term!r} over-counted: df={df} > note_count=1"

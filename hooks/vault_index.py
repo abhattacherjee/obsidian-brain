@@ -277,21 +277,24 @@ def _parse_note(file_path: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def _prior_terms_for(conn: sqlite3.Connection, note_path: str) -> set[str]:
-    """Return the set of tokens previously stored on this note's tfidf_vector.
+def _prior_tokens_for(conn: sqlite3.Connection, note_path: str) -> set[str]:
+    """Return the full token set of the note's currently-stored content.
 
-    Returns an empty set if the note is new, the vector column is NULL, or
-    the stored JSON cannot be decoded.
+    Re-tokenises title+tags+body (the same inputs _upsert_note uses for the
+    new document) so the set is symmetric with ``new_terms`` during a
+    reindex. Reading the stored ``tfidf_vector`` would be wrong here — it
+    is truncated to top-K=50, and any common-but-low-IDF term outside that
+    cutoff would be incremented on every reindex without ever being
+    decremented, drifting ``term_df.df`` upward. Returns an empty set if
+    the note does not exist.
     """
     row = conn.execute(
-        "SELECT tfidf_vector FROM notes WHERE path = ?", (note_path,)
+        "SELECT title, body, tags FROM notes WHERE path = ?", (note_path,)
     ).fetchone()
-    if not row or not row[0]:
+    if not row:
         return set()
-    try:
-        return set(json.loads(row[0]).keys())
-    except (json.JSONDecodeError, TypeError, AttributeError):
-        return set()
+    full_text = " ".join([row["title"] or "", row["tags"] or "", row["body"] or ""])
+    return set(_tokenize_for_tfidf(full_text))
 
 
 def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: float, size: int) -> None:
@@ -310,9 +313,9 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
     existing_importance = row["importance"] if row else None
     is_new = row is None
 
-    # --- TF-IDF maintenance (before the DELETE so _prior_terms_for can read
-    # the old vector). ---
-    old_terms = _prior_terms_for(conn, rel_path)
+    # --- TF-IDF maintenance (before the DELETE so _prior_tokens_for can read
+    # the old body). ---
+    old_terms = _prior_tokens_for(conn, rel_path)
 
     full_text = " ".join([
         parsed.get("title", "") or "",
@@ -395,7 +398,7 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
     prior column values before DROPping the notes row, so the FTS index
     doesn't accumulate orphan entries across the vault's lifetime.
     """
-    old_terms = _prior_terms_for(conn, rel_path)
+    old_terms = _prior_tokens_for(conn, rel_path)
 
     # Fetch the note's tfidf_vector AND FTS payload BEFORE deletion —
     # needed for both centroid unfolding and the FTS special delete.
@@ -802,7 +805,7 @@ def index_note(db_path: str, note_path: str) -> bool:
     try:
         try:
             # BEGIN IMMEDIATE so _upsert_note's read-modify-write
-            # (_prior_terms_for → _update_term_df → SELECT COUNT → INSERT)
+            # (_prior_tokens_for → _update_term_df → SELECT COUNT → INSERT)
             # is serialized against other writers (concurrent hooks,
             # _sync runs). Matches assign_to_theme's locking discipline.
             conn.execute("BEGIN IMMEDIATE")

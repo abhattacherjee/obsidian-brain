@@ -16,6 +16,7 @@ Checks performed:
 - _cosine_similarity: symmetric, in [0, 1], identity == 1
 - detect_surprise: edge cases return 0.0, contractions match, out-of-window doesn't
 - assign_to_theme idempotency: calling twice on same note doesn't drift count/centroid
+- reindex invariance: repeat index_note on same note does not drift term_df
 - _delete_note centroid unfold: running-average reverse is algebraically correct
 - check_optional_deps: reports numpy/scipy status
 """
@@ -348,8 +349,76 @@ def test_assign_theme_idempotent(tmpdir: Path) -> None:
         fail_(f"centroid drifted on reassign, max delta={drift:.6f}")
 
 
+def test_reindex_invariance(tmpdir: Path) -> None:
+    section("6. reindex invariance — term_df stays constant across repeated index_note")
+
+    # Seed a vault with one note containing many common-but-low-IDF tokens
+    # that would be pushed out of the top-50 tfidf_vector. If _prior_tokens_for
+    # reads the truncated stored vector, those tokens get re-incremented on
+    # every reindex and term_df.df drifts upward.
+    vault = tmpdir / "vault_reidx"
+    (vault / "claude-sessions").mkdir(parents=True)
+    note = vault / "claude-sessions" / "2026-04-17-reidx-abcd.md"
+    # Deliberately verbose body with > 50 distinct tokens so top-K truncation bites.
+    body_tokens = " ".join(f"common_term_{i:03d}" for i in range(120))
+    note.write_text(
+        "---\n"
+        "type: claude-session\n"
+        "date: 2026-04-17\n"
+        "project: reidxproj\n"
+        "title: Reindex invariance probe\n"
+        "tags:\n  - claude/session\n"
+        "status: summarized\n"
+        "---\n"
+        f"project retrieval activation {body_tokens}\n",
+        encoding="utf-8",
+    )
+    db_path = str(tmpdir / "reidx.db")
+    vault_index.ensure_index(str(vault), ["claude-sessions"], db_path=db_path)
+
+    def snapshot_df() -> dict[str, int]:
+        conn = sqlite3.connect(db_path)
+        try:
+            return dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+        finally:
+            conn.close()
+
+    df_initial = snapshot_df()
+
+    # Bump mtime so index_note does not early-exit as unchanged, and reindex 3x.
+    import os as _os
+    for bump in range(1, 4):
+        st = _os.stat(note)
+        _os.utime(note, (st.st_mtime + bump * 5, st.st_mtime + bump * 5))
+        ok = vault_index.index_note(db_path, str(note))
+        if not ok:
+            fail_(f"index_note returned False on reindex #{bump}")
+            return
+
+    df_final = snapshot_df()
+
+    drifted = {
+        term: (df_initial.get(term, 0), df_final.get(term, 0))
+        for term in set(df_initial) | set(df_final)
+        if df_initial.get(term, 0) != df_final.get(term, 0)
+    }
+
+    if not drifted:
+        pass_(f"term_df stable across 3 reindexes ({len(df_final)} terms)")
+    else:
+        sample = list(drifted.items())[:5]
+        fail_(f"term_df drifted for {len(drifted)} term(s) on reindex; sample: {sample}")
+
+    total_docs = 1
+    over = {t: d for t, d in df_final.items() if d > total_docs}
+    if not over:
+        pass_(f"max(term_df.df) ≤ note_count after reindex loop")
+    else:
+        fail_(f"over-counting after reindex: {list(over.items())[:5]}")
+
+
 def test_delete_unfolds_centroid(tmpdir: Path) -> None:
-    section("6. _delete_note reverses running-average centroid")
+    section("7. _delete_note reverses running-average centroid")
 
     # Build a theme with two members, delete one, verify centroid equals the other member's vec
     vault = tmpdir / "vault2"
@@ -504,6 +573,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         test_assign_theme_idempotent(tmpdir)
+        test_reindex_invariance(tmpdir)
         test_delete_unfolds_centroid(tmpdir)
 
     print(f"\n{'═' * 50}")
