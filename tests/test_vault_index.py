@@ -182,6 +182,64 @@ class TestInsertAndSync:
 
         assert count == 0
 
+    def test_update_does_not_orphan_fts_rows(self, tmp_vault):
+        """Repeated updates of the same note must not accumulate FTS rows.
+
+        Regression: _upsert_note previously did DELETE FROM notes + INSERT
+        but skipped the contentless-FTS5 special 'delete' command, leaving
+        the old notes_fts row behind on every rewrite. Over many updates
+        this bloats the FTS index (and historical tokens leak into
+        searches via any path that does not strictly JOIN notes_fts to
+        notes).
+        """
+        note = tmp_vault / "claude-sessions" / "2026-04-10-proj-fts.md"
+        _write_note(
+            note,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# Session: First\n\nalphaunique content.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        # Rewrite the note three times with fresh, non-overlapping body tokens,
+        # bumping mtime each time so _sync re-upserts.
+        for i, token in enumerate(("betaunique", "gammaunique", "deltaunique"), start=2):
+            prev_mtime = note.stat().st_mtime
+            _write_note(
+                note,
+                {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+                body=f"# Session: Rev{i}\n\n{token} content.",
+            )
+            os.utime(note, (prev_mtime + 2, prev_mtime + 2))
+            vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        # Exactly one notes row.
+        notes_count = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        # Exactly one FTS row (contentless FTS5 exposes rowid — orphan rows
+        # would count here even though they don't JOIN notes).
+        fts_count = conn.execute("SELECT COUNT(*) FROM notes_fts").fetchone()[0]
+        # Stale-token search must not match — the 'delete' command must have
+        # removed the old tokens from the FTS index.
+        stale_hits = conn.execute(
+            "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH 'alphaunique'"
+        ).fetchone()[0]
+        fresh_hits = conn.execute(
+            "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH 'deltaunique'"
+        ).fetchone()[0]
+        conn.close()
+
+        assert notes_count == 1
+        assert fts_count == 1, (
+            f"notes_fts has {fts_count} rows after 3 updates — "
+            "orphan FTS rows are accumulating (regression)"
+        )
+        assert stale_hits == 0, (
+            "FTS still matches a token from an earlier revision — "
+            "stale tokens are leaking (special 'delete' missing or wrong values)"
+        )
+        assert fresh_hits == 1
+
 
 # ---------------------------------------------------------------------------
 # Commit 2: rebuild_index + index_note

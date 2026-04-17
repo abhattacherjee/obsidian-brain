@@ -297,13 +297,14 @@ def _prior_terms_for(conn: sqlite3.Connection, note_path: str) -> set[str]:
 def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: float, size: int) -> None:
     """Insert or replace a note + FTS row + maintain term_df + tfidf_vector.
 
-    For contentless FTS5 (content=''), deletes require passing the old
-    column values via the special 'delete' command, not DELETE FROM. We
-    sidestep that by deleting the notes row (freeing its rowid) and letting
-    the orphaned FTS entry be a harmless no-op (it won't join).
+    For contentless FTS5 (content=''), removal requires the special
+    'delete' command with the old column values — regular DELETE FROM is
+    rejected. We fetch the prior title/body/tags + rowid here so that on
+    update we can issue the delete before inserting the new FTS row,
+    keeping the FTS index from accumulating orphan entries across rewrites.
     """
     row = conn.execute(
-        "SELECT rowid, title, tags, importance FROM notes WHERE path = ?",
+        "SELECT rowid, title, body, tags, importance FROM notes WHERE path = ?",
         (rel_path,),
     ).fetchone()
     existing_importance = row["importance"] if row else None
@@ -333,6 +334,16 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
     tfidf_json = json.dumps(tfidf_vec, separators=(",", ":")) if tfidf_vec else None
 
     if not is_new:
+        # Remove the old FTS row before the notes DELETE so the notes_fts
+        # index doesn't accumulate orphan entries on every rewrite.
+        # Contentless FTS5 only accepts the special 'delete' command with
+        # the prior column values (SQLite docs: Inserting new rows into
+        # an external-content table with content='').
+        conn.execute(
+            "INSERT INTO notes_fts(notes_fts, rowid, title, body, tags) "
+            "VALUES('delete', ?, ?, ?, ?)",
+            (row["rowid"], row["title"] or "", row["body"] or "", row["tags"] or ""),
+        )
         conn.execute("DELETE FROM notes WHERE path = ?", (rel_path,))
 
     conn.execute(
@@ -380,16 +391,18 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
     centroid stay consistent with the surviving `theme_members` rows.
     If the note was the theme's last member, the theme is dropped.
 
-    For contentless FTS5, we can only delete the notes row. The orphaned
-    FTS entry won't match any JOIN since the notes rowid is gone.
+    For contentless FTS5, we issue the special 'delete' command with the
+    prior column values before DROPping the notes row, so the FTS index
+    doesn't accumulate orphan entries across the vault's lifetime.
     """
     old_terms = _prior_terms_for(conn, rel_path)
 
-    # Fetch the note's tfidf_vector BEFORE deletion — needed to subtract
-    # its contribution from theme centroids.
+    # Fetch the note's tfidf_vector AND FTS payload BEFORE deletion —
+    # needed for both centroid unfolding and the FTS special delete.
     note_vec: dict[str, float] = {}
     vec_row = conn.execute(
-        "SELECT tfidf_vector FROM notes WHERE path = ?", (rel_path,)
+        "SELECT rowid, title, body, tags, tfidf_vector FROM notes WHERE path = ?",
+        (rel_path,),
     ).fetchone()
     if vec_row and vec_row["tfidf_vector"]:
         try:
@@ -440,6 +453,20 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
              new_count, today, theme_id),
         )
 
+    # Remove the FTS row before the notes DELETE. Contentless FTS5 rejects
+    # DELETE FROM; the special 'delete' command with the prior column
+    # values is the only supported removal path.
+    if vec_row is not None:
+        conn.execute(
+            "INSERT INTO notes_fts(notes_fts, rowid, title, body, tags) "
+            "VALUES('delete', ?, ?, ?, ?)",
+            (
+                vec_row["rowid"],
+                vec_row["title"] or "",
+                vec_row["body"] or "",
+                vec_row["tags"] or "",
+            ),
+        )
     conn.execute("DELETE FROM notes WHERE path = ?", (rel_path,))
     conn.execute("DELETE FROM theme_members WHERE note_path = ?", (rel_path,))
     if old_terms:
