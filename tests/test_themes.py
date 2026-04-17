@@ -283,6 +283,74 @@ class TestAssignToTheme:
             f"added_date overwritten to {row[2]!r} — should be preserved"
         )
 
+    def test_reassignment_does_not_double_count_or_drift_centroid(self, tmp_vault):
+        """Reassigning an already-member note must leave note_count and
+        centroid unchanged.
+
+        Regression: assign_to_theme always did +1 on note_count and folded
+        the note's vector back into the running-average centroid even when
+        the theme_members upsert was a no-op update. Calling assign twice
+        on the same note would bump count to 3 (from 1→2→3) and drift the
+        centroid toward the note's vector on every call.
+        """
+        path = _indexed_note(tmp_vault, "dupe", "retrieval scoring",
+                             "retrieval scoring activation importance")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
+        ).fetchone()[0])
+        # Seed a theme with a DIFFERENT centroid than the note, so that if
+        # folding happens we can detect drift by comparing centroid values.
+        seed_centroid = {t: 0.5 for t in vec}  # same terms, uniform weights
+        conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("Retrieval", "", json.dumps(seed_centroid), 3,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_id = conn.execute("SELECT id FROM themes").fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        # First assignment: legitimately new member → count should go 3→4.
+        result1 = vault_index.assign_to_theme(db_path, path, project="proj")
+        assert result1 is not None
+
+        conn = sqlite3.connect(db_path)
+        count_after_1, centroid_after_1_json = conn.execute(
+            "SELECT note_count, centroid FROM themes WHERE id = ?", (theme_id,)
+        ).fetchone()
+        conn.close()
+        assert count_after_1 == 4, f"first assign should bump 3→4, got {count_after_1}"
+        centroid_after_1 = json.loads(centroid_after_1_json)
+
+        # Second assignment: same note, already a member → count+centroid must NOT change.
+        result2 = vault_index.assign_to_theme(db_path, path, project="proj")
+        assert result2 is not None
+
+        conn = sqlite3.connect(db_path)
+        count_after_2, centroid_after_2_json = conn.execute(
+            "SELECT note_count, centroid FROM themes WHERE id = ?", (theme_id,)
+        ).fetchone()
+        conn.close()
+        assert count_after_2 == 4, (
+            f"reassignment bumped note_count to {count_after_2} — "
+            "already-member path should skip count update"
+        )
+        centroid_after_2 = json.loads(centroid_after_2_json)
+        for term, v in centroid_after_1.items():
+            assert centroid_after_2.get(term) == pytest.approx(v, rel=1e-9), (
+                f"centroid drifted on reassignment (term={term!r}: "
+                f"{v} → {centroid_after_2.get(term)})"
+            )
+        assert set(centroid_after_2) == set(centroid_after_1), (
+            "centroid term set changed on reassignment"
+        )
+
     def test_cross_project_theme_candidate(self, tmp_vault):
         """A theme with project=NULL should be a valid candidate for any project."""
         path = _indexed_note(tmp_vault, "cross", "retrieval scoring",

@@ -1478,21 +1478,40 @@ def assign_to_theme(
                 return None
 
             sim, theme_id, centroid, count = best
-            new_centroid: dict[str, float] = {}
-            all_terms = set(centroid) | set(note_vec)
-            for term in all_terms:
-                c_val = centroid.get(term, 0.0)
-                v_val = note_vec.get(term, 0.0)
-                new_centroid[term] = (c_val * count + v_val) / (count + 1)
-
             today = date.today().isoformat()
-            conn.execute(
-                "UPDATE themes "
-                "SET centroid = ?, note_count = ?, updated_date = ? "
-                "WHERE id = ?",
-                (json.dumps(new_centroid, separators=(",", ":")),
-                 count + 1, today, theme_id),
-            )
+
+            # Detect reassignment: if the note is already a member, the
+            # centroid already reflects its contribution — updating count
+            # and re-averaging would double-count it and drift the centroid.
+            already_member = conn.execute(
+                "SELECT 1 FROM theme_members "
+                "WHERE theme_id = ? AND note_path = ?",
+                (theme_id, note_path),
+            ).fetchone() is not None
+
+            if not already_member:
+                new_centroid: dict[str, float] = {}
+                all_terms = set(centroid) | set(note_vec)
+                for term in all_terms:
+                    c_val = centroid.get(term, 0.0)
+                    v_val = note_vec.get(term, 0.0)
+                    new_centroid[term] = (c_val * count + v_val) / (count + 1)
+
+                conn.execute(
+                    "UPDATE themes "
+                    "SET centroid = ?, note_count = ?, updated_date = ? "
+                    "WHERE id = ?",
+                    (json.dumps(new_centroid, separators=(",", ":")),
+                     count + 1, today, theme_id),
+                )
+            else:
+                # Reassignment: bump updated_date but leave count/centroid
+                # alone. The member's similarity is refreshed below.
+                conn.execute(
+                    "UPDATE themes SET updated_date = ? WHERE id = ?",
+                    (today, theme_id),
+                )
+
             # Preserve surprise + added_date on reassignment — only
             # similarity is refreshed from the latest cosine computation.
             conn.execute(
