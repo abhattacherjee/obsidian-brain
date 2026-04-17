@@ -72,3 +72,38 @@ class TestConfigDefaults:
         loaded = obsidian_utils.load_config()
         assert loaded["optional_deps_prompted"] is False
         assert loaded["optional_deps_declined"] == []
+
+    def test_mutating_list_default_does_not_leak_across_loads(
+        self, tmp_path, monkeypatch
+    ):
+        """Mutating config['optional_deps_declined'] must not leak into _DEFAULTS.
+
+        Regression: dict(_DEFAULTS) is a shallow copy, so the same list
+        object was shared across every load_config() return value and the
+        _DEFAULTS module attribute. An in-place .append() in one caller
+        would silently surface in the next caller's "default".
+        """
+        cfg = {"vault_path": "/tmp/v"}
+        cfg_path = tmp_path / "obsidian-brain-config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", cfg_path)
+        monkeypatch.setattr(
+            obsidian_utils, "_get_session_id_fast", lambda: "leak-test-session",
+        )
+        obsidian_utils.cache_set("leak-test-session", "config", None)
+
+        first = obsidian_utils.load_config()
+        first["optional_deps_declined"].append("poisoned-entry")
+
+        # Bust the cache so the second call rebuilds from _DEFAULTS + disk.
+        obsidian_utils.cache_set("leak-test-session", "config", None)
+        second = obsidian_utils.load_config()
+
+        assert second["optional_deps_declined"] == [], (
+            "list default leaked across load_config() calls — "
+            f"got {second['optional_deps_declined']!r}, _DEFAULTS "
+            "is being shared (shallow copy regressed)"
+        )
+        assert obsidian_utils._DEFAULTS["optional_deps_declined"] == [], (
+            "mutation from load_config return value leaked into _DEFAULTS"
+        )

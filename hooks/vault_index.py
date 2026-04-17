@@ -1620,7 +1620,11 @@ def assign_to_theme(
 
 _NEGATION_TERMS = frozenset({
     "not", "never", "failed", "broken", "wrong", "mistake",
-    "avoid", "don't", "dont", "no", "cannot", "cant", "can't",
+    "avoid", "dont", "no", "cannot", "cant",
+    # Note: detect_surprise() strips apostrophes from note_text before
+    # tokenizing, so "don't"/"can't" in source text collapse to "dont"
+    # /"cant" and match the bare forms above. Apostrophed variants are
+    # intentionally omitted here — they would never match post-tokenization.
 })
 
 
@@ -1649,7 +1653,18 @@ def detect_surprise(
     shared.sort(key=lambda kv: (-kv[1], kv[0]))
     shared_terms = [t for t, _ in shared[:top_shared]]
 
-    tokens = _TOKEN_RE.findall(note_text.lower())
+    # Strip apostrophes (straight + smart) before tokenizing so contractions
+    # like "don't" / "can't" collapse to "dont"/"cant" and match the
+    # negation set. Without this, _TOKEN_RE = [a-z0-9]+ would emit
+    # "don", "t" and the negation check would silently miss every
+    # apostrophed negation in the source text.
+    normalized = (
+        note_text.lower()
+        .replace("\u2019", "")  # right single quote (smart apostrophe)
+        .replace("\u2018", "")  # left single quote
+        .replace("'", "")       # straight apostrophe
+    )
+    tokens = _TOKEN_RE.findall(normalized)
     if not tokens:
         return 0.0
 

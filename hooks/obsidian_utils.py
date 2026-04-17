@@ -347,7 +347,12 @@ def load_config() -> dict:
     if cached is not None:
         return cached
 
-    config = dict(_DEFAULTS)
+    # dict(_DEFAULTS) is a shallow copy — any list/dict values in _DEFAULTS
+    # would be shared across calls, so an in-place mutation on
+    # config["optional_deps_declined"] (or a future list default) would
+    # leak back into _DEFAULTS and future callers. deepcopy severs that link.
+    import copy as _copy
+    config = _copy.deepcopy(_DEFAULTS)
     try:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as fh:
             user_cfg = json.load(fh)

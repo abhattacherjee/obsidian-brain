@@ -2,6 +2,7 @@
 
 import json
 import math
+import sqlite3
 
 import pytest
 
@@ -141,9 +142,6 @@ class TestUpdateTermDf:
         finally:
             conn.close()
         assert "solo" not in rows
-
-
-import sqlite3
 
 
 class TestUpsertStoresTfidf:

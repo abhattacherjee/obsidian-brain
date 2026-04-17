@@ -43,3 +43,32 @@ class TestDetectSurprise:
         note_vec = dict(centroid)
         score = vault_index.detect_surprise(text, note_vec, centroid)
         assert 0.0 <= score <= 1.0
+
+    def test_contractions_match_negation_terms(self):
+        """Apostrophe'd negations ("don't"/"can't") must match the negation set.
+
+        Regression: _TOKEN_RE = [a-z0-9]+ strips apostrophes, so "don't"
+        tokenized to "don" and "t" — neither of which appeared in
+        _NEGATION_TERMS. Apostrophed negations in note text were silently
+        ignored by the surprise score. detect_surprise now normalizes
+        apostrophes (including smart quotes) out before tokenization.
+        """
+        # Straight apostrophe
+        text_straight = "don't trust retrieval scoring here"
+        score_straight = vault_index.detect_surprise(
+            text_straight, {"retrieval": 1.0}, {"retrieval": 1.0},
+        )
+        assert score_straight > 0, (
+            "straight-apostrophe negation 'don't' did not register — "
+            "apostrophe normalization missing"
+        )
+
+        # Smart quote (U+2019) — common from copy/pasted prose
+        text_smart = "can\u2019t trust retrieval scoring here"
+        score_smart = vault_index.detect_surprise(
+            text_smart, {"retrieval": 1.0}, {"retrieval": 1.0},
+        )
+        assert score_smart > 0, (
+            "smart-apostrophe negation 'can\u2019t' did not register — "
+            "smart-quote normalization missing"
+        )
