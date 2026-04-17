@@ -317,6 +317,48 @@ class TestAssignToTheme:
         assert result["theme_id"] == theme_id
         assert result["similarity"] > 0.3
 
+    def test_global_recall_considers_scoped_themes(self, tmp_vault):
+        """project=None (global recall) must match scoped themes too.
+
+        Regression: `project = ? OR project IS NULL` with project=None
+        binds to `project = NULL` which is false in SQL, so only NULL-
+        project themes were ever candidates. Scoped themes were invisible
+        to global recall even when the note was semantically a perfect fit.
+        """
+        path = _indexed_note(tmp_vault, "global", "retrieval scoring",
+                             "retrieval scoring activation importance")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
+        ).fetchone()[0])
+        # A project-scoped theme (NOT null) that matches the note perfectly.
+        conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("Scoped Retrieval", "", json.dumps(vec), 1,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_id = conn.execute("SELECT id FROM themes").fetchone()[0]
+        conn.execute(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
+            "VALUES (?, ?, 1.0, ?)",
+            (theme_id, "/some/other/path.md", "2026-04-16"),
+        )
+        conn.commit()
+        conn.close()
+
+        # project=None should still see the scoped theme.
+        result = vault_index.assign_to_theme(db_path, path, project=None)
+        assert result is not None, (
+            "Global recall (project=None) failed to match a scoped theme — "
+            "SQL filter treated None as NULL (match nothing) instead of wildcard"
+        )
+        assert result["theme_id"] == theme_id
+
 
 class TestUpgradeWiresThemes:
     def test_upgrade_triggers_theme_assignment(self, tmp_vault, mock_config):

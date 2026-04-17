@@ -1445,11 +1445,21 @@ def assign_to_theme(
                 conn.commit()
                 return None
 
-            candidates = conn.execute(
-                "SELECT id, centroid, note_count FROM themes "
-                "WHERE project = ? OR project IS NULL",
-                (project,),
-            ).fetchall()
+            # When project is None (global/unscoped recall), "project = ?"
+            # binds to NULL and matches no rows because `NULL = NULL` is
+            # false in SQL — only project-scoped themes with project IS
+            # NULL would match. Branch the query so unscoped callers see
+            # every theme, and scoped callers see their own + cross-project.
+            if project is None:
+                candidates = conn.execute(
+                    "SELECT id, centroid, note_count FROM themes"
+                ).fetchall()
+            else:
+                candidates = conn.execute(
+                    "SELECT id, centroid, note_count FROM themes "
+                    "WHERE project = ? OR project IS NULL",
+                    (project,),
+                ).fetchall()
 
             best: tuple[float, int, dict, int] | None = None
             for cand in candidates:
