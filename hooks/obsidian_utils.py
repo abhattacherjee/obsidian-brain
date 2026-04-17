@@ -393,7 +393,10 @@ def check_optional_deps(packages: tuple[str, ...] = ("numpy", "scipy")) -> dict[
         try:
             importlib.import_module(pkg)
             result[pkg] = True
-        except ImportError:
+        except Exception:
+            # Compiled optional deps (numpy/scipy) can raise OSError for
+            # missing shared libs, ValueError for ABI mismatch, etc. —
+            # treat any failure as "unavailable" rather than crashing setup.
             result[pkg] = False
     return result
 

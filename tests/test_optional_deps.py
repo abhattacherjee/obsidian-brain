@@ -33,6 +33,26 @@ class TestCheckOptionalDeps:
         result = obsidian_utils.check_optional_deps()
         assert result == {"numpy": False, "scipy": False}
 
+    def test_non_import_error_reports_false(self, monkeypatch):
+        # Compiled optional deps (numpy/scipy wheels) can raise OSError when
+        # their shared libraries are missing, ValueError on ABI mismatch, or
+        # RuntimeError for other binary incompat. These must be treated as
+        # "unavailable" rather than bubbling out of setup.
+        import importlib as _importlib
+
+        real_import_module = _importlib.import_module
+
+        def fake_import_module(name, *args, **kwargs):
+            if name == "numpy":
+                raise OSError("libopenblas.0.dylib not loaded")
+            if name == "scipy":
+                raise ValueError("numpy.dtype size changed, binary incompat")
+            return real_import_module(name, *args, **kwargs)
+
+        monkeypatch.setattr(_importlib, "import_module", fake_import_module)
+        result = obsidian_utils.check_optional_deps()
+        assert result == {"numpy": False, "scipy": False}
+
 
 class TestConfigDefaults:
     def test_optional_deps_fields_present_in_defaults(self):
