@@ -44,6 +44,20 @@ class TestDetectSurprise:
         score = vault_index.detect_surprise(text, note_vec, centroid)
         assert 0.0 <= score <= 1.0
 
+    def test_expanded_contractions_registered(self):
+        """won't/isn't/wasn't/didn't/couldn't/shouldn't must all register."""
+        # Each phrase puts a distinct contraction within window of "retrieval"
+        for contraction in ("won\u2019t", "isn't", "wasn't", "didn't",
+                            "couldn't", "shouldn't", "wouldn't", "doesn't"):
+            text = f"{contraction} trust retrieval scoring here"
+            score = vault_index.detect_surprise(
+                text, {"retrieval": 1.0}, {"retrieval": 1.0},
+            )
+            assert score > 0, (
+                f"contraction {contraction!r} did not register as a "
+                "negation — _NEGATION_TERMS may be missing the bare form"
+            )
+
     def test_contractions_match_negation_terms(self):
         """Apostrophe'd negations ("don't"/"can't") must match the negation set.
 

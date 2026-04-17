@@ -494,6 +494,63 @@ class TestDeleteNoteMaintainsThemeState:
         conn.close()
         assert members == {path_b}
 
+    def test_delete_last_member_cascades_theme_members(self, tmp_vault):
+        """Dropping a theme must also clear any stale theme_members rows.
+
+        Defense-in-depth: if an earlier invariant violation left two rows
+        under a theme that claimed count=1, the last-member branch must
+        not orphan the extra rows when it drops the themes row.
+        """
+        path = _indexed_note(tmp_vault, "invariant", "retrieval scoring",
+                             "retrieval scoring activation")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
+        ).fetchone()[0])
+        # Seed a theme claiming note_count=1 but with TWO member rows
+        # (one for the note we'll delete, one stray). Simulates an
+        # earlier invariant violation the cascade must clean up.
+        conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?)",
+            ("Invariant", "", json.dumps(vec),
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_id = conn.execute("SELECT id FROM themes").fetchone()[0]
+        conn.executemany(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
+            "VALUES (?, ?, 1.0, ?)",
+            [
+                (theme_id, path, "2026-04-16"),
+                (theme_id, "/nonexistent/stray.md", "2026-04-16"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        from vault_index import _delete_note, _connect
+        conn = _connect(db_path)
+        _delete_note(conn, path)
+        conn.commit()
+
+        # Both the theme AND any stray theme_members for it must be gone.
+        theme_row = conn.execute(
+            "SELECT id FROM themes WHERE id = ?", (theme_id,)
+        ).fetchone()
+        stray_members = conn.execute(
+            "SELECT note_path FROM theme_members WHERE theme_id = ?", (theme_id,)
+        ).fetchall()
+        conn.close()
+        assert theme_row is None
+        assert stray_members == [], (
+            f"stale theme_members rows left behind after theme drop: "
+            f"{[r[0] for r in stray_members]!r}"
+        )
+
     def test_delete_last_member_drops_theme(self, tmp_vault):
         """Deleting the sole member must drop the theme rather than leave count=0."""
         path = _indexed_note(tmp_vault, "solo", "retrieval scoring",

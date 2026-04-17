@@ -426,7 +426,13 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
         count = theme_row["note_count"] or 0
         if count <= 1:
             # Last member — drop the theme entirely rather than leave it
-            # with count=0 and a stale centroid.
+            # with count=0 and a stale centroid. Cascade-delete any stray
+            # theme_members rows pointing at this theme_id as defense-in-
+            # depth (count=1 should mean only one member, but any earlier
+            # invariant violation shouldn't leave zombie rows behind).
+            conn.execute(
+                "DELETE FROM theme_members WHERE theme_id = ?", (theme_id,)
+            )
             conn.execute("DELETE FROM themes WHERE id = ?", (theme_id,))
             continue
         try:
@@ -477,6 +483,10 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
     """Incremental sync: add new/changed files, remove deleted ones.
 
     Returns {"inserted": N, "skipped": M, "deleted": D, "by_type": {...}}.
+
+    Wraps the entire pass in BEGIN IMMEDIATE + commit/rollback so a mid-
+    loop failure doesn't leave a half-applied transaction attached to
+    the connection (which would poison subsequent callers).
     """
     vault = Path(vault_path)
     stats = {"inserted": 0, "skipped": 0, "deleted": 0, "by_type": {}}
@@ -496,45 +506,53 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
         for row in conn.execute("SELECT path, mtime FROM notes").fetchall()
     }
 
-    # Delete removed files (only if they belong to a scanned folder).
-    # Use Path.is_relative_to() rather than str.startswith() so that
-    # sibling folders with a shared prefix (e.g. 'claude-sessions-archive'
-    # vs 'claude-sessions') are not treated as nested.
-    scanned_roots = [vault / f for f in folders]
-    for abs_path_str in list(indexed.keys()):
-        if abs_path_str not in disk_files:
-            indexed_path = Path(abs_path_str)
-            if any(
-                _is_under(indexed_path, root) for root in scanned_roots
-            ):
-                _delete_note(conn, abs_path_str)
-                stats["deleted"] += 1
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Delete removed files (only if they belong to a scanned folder).
+        # Use Path.is_relative_to() rather than str.startswith() so that
+        # sibling folders with a shared prefix (e.g. 'claude-sessions-archive'
+        # vs 'claude-sessions') are not treated as nested.
+        scanned_roots = [vault / f for f in folders]
+        for abs_path_str in list(indexed.keys()):
+            if abs_path_str not in disk_files:
+                indexed_path = Path(abs_path_str)
+                if any(
+                    _is_under(indexed_path, root) for root in scanned_roots
+                ):
+                    _delete_note(conn, abs_path_str)
+                    stats["deleted"] += 1
 
-    # Insert/update files
-    for abs_path_str, abs_path in disk_files.items():
+        # Insert/update files
+        for abs_path_str, abs_path in disk_files.items():
+            try:
+                st = abs_path.stat()
+            except OSError:
+                continue  # File deleted/moved between rglob and stat
+            file_mtime = st.st_mtime
+            file_size = st.st_size
+
+            # Skip if mtime unchanged (0.001 tolerance)
+            if abs_path_str in indexed and abs(file_mtime - indexed[abs_path_str]) < 0.001:
+                stats["skipped"] += 1
+                continue
+
+            parsed = _parse_note(str(abs_path))
+            if parsed is None:
+                stats["skipped"] += 1
+                continue
+
+            _upsert_note(conn, abs_path_str, parsed, file_mtime, file_size)
+            note_type = parsed.get("type", "unknown")
+            stats["by_type"][note_type] = stats["by_type"].get(note_type, 0) + 1
+            stats["inserted"] += 1
+
+        conn.commit()
+    except Exception:
         try:
-            st = abs_path.stat()
-        except OSError:
-            continue  # File deleted/moved between rglob and stat
-        file_mtime = st.st_mtime
-        file_size = st.st_size
-
-        # Skip if mtime unchanged (0.001 tolerance)
-        if abs_path_str in indexed and abs(file_mtime - indexed[abs_path_str]) < 0.001:
-            stats["skipped"] += 1
-            continue
-
-        parsed = _parse_note(str(abs_path))
-        if parsed is None:
-            stats["skipped"] += 1
-            continue
-
-        _upsert_note(conn, abs_path_str, parsed, file_mtime, file_size)
-        note_type = parsed.get("type", "unknown")
-        stats["by_type"][note_type] = stats["by_type"].get(note_type, 0) + 1
-        stats["inserted"] += 1
-
-    conn.commit()
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
     return stats
 
 
@@ -772,18 +790,35 @@ def index_note(db_path: str, note_path: str) -> bool:
 
     try:
         conn = _connect(db_path)
+    except sqlite3.Error as exc:
+        # Previously this branch silently returned False — the caller
+        # (upgrade_note_with_summary) would then skip theme assignment with
+        # no trace in stderr, leaving operators guessing. Always leave a
+        # breadcrumb so theme-pipeline declines are diagnosable.
+        print(f"[vault-index] index_note could not open {db_path}: {exc}",
+              file=sys.stderr)
+        return False
+
+    try:
         try:
+            # BEGIN IMMEDIATE so _upsert_note's read-modify-write
+            # (_prior_terms_for → _update_term_df → SELECT COUNT → INSERT)
+            # is serialized against other writers (concurrent hooks,
+            # _sync runs). Matches assign_to_theme's locking discipline.
+            conn.execute("BEGIN IMMEDIATE")
             _upsert_note(conn, note_path, parsed, st.st_mtime, st.st_size)
             conn.commit()
             return True
         except sqlite3.Error as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
             print(f"[vault-index] index_note failed for {note_path}: {exc}",
                   file=sys.stderr)
             return False
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        return False
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1619,12 +1654,17 @@ def assign_to_theme(
 
 
 _NEGATION_TERMS = frozenset({
+    # Simple negation / failure words
     "not", "never", "failed", "broken", "wrong", "mistake",
-    "avoid", "dont", "no", "cannot", "cant",
-    # Note: detect_surprise() strips apostrophes from note_text before
-    # tokenizing, so "don't"/"can't" in source text collapse to "dont"
-    # /"cant" and match the bare forms above. Apostrophed variants are
-    # intentionally omitted here — they would never match post-tokenization.
+    "avoid", "no", "cannot",
+    # Contractions — bare forms only. detect_surprise() strips apostrophes
+    # from note_text before tokenizing, so "don't"/"won't"/"isn\u2019t"
+    # in source text collapse to "dont"/"wont"/"isnt" and match here.
+    # Apostrophed variants (e.g. "don't") would never match post-
+    # tokenization and are intentionally omitted.
+    "dont", "cant", "wont", "isnt", "arent", "wasnt", "werent",
+    "didnt", "doesnt", "couldnt", "shouldnt", "wouldnt",
+    "hasnt", "havent", "hadnt",
 })
 
 
