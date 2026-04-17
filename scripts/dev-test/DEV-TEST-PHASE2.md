@@ -42,18 +42,26 @@ ls ~/.claude/plugins/cache/claude-code-skills/obsidian-brain/*/hooks/ | grep vau
 
 ---
 
-## Step 2 — Rebuild the vault index with new schema
+## Step 2 — Upgrade-mode setup (DB migration + first-pass deps prompt)
 
-The Phase 2 changes add 3 new tables (`themes`, `theme_members`, `term_df`) and 1 new column (`notes.tfidf_vector`). `ensure_index()` migrates automatically, but `/vault-reindex` is safer for a clean starting point.
+Phase 2 adds 3 new tables (`themes`, `theme_members`, `term_df`) and 1 new column (`notes.tfidf_vector`). `/obsidian-setup` in upgrade mode calls `rebuild_index()` in Step 8.5 — same path as `/vault-reindex` — **and** exercises the new Step 8.7 optional-deps prompt in one invocation.
 
 ```
-/obsidian-brain:vault-reindex
+/obsidian-brain:obsidian-setup
 ```
 
-Expected terminal output:
-- "Rebuilding vault index…"
-- "Indexed N notes across M folders"
-- No stack traces, no `[ERROR]` lines
+When prompted for mode, choose **upgrade**. Expected flow:
+
+1. Step 5: folder mkdir (idempotent)
+2. Step 6: dashboard files (existing ones skipped)
+3. Step 7: config write — **skipped** in upgrade mode (existing config preserved)
+4. Step 8: vault access check
+5. Step 8.5: `rebuild_index()` drops + recreates all tables → "Indexed N notes across M folders"
+6. Step 8.7: first-time deps prompt (skip it here — Step 5 below covers all three branches)
+7. Step 9: claudeception nudge (idempotent)
+8. Step 10: success message
+
+This single invocation replaces both `/vault-reindex` AND the first-time-deps case of the old Step 5. No separate `/vault-reindex` call needed.
 
 Verify via `sqlite3`:
 
@@ -65,6 +73,8 @@ sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('t
 sqlite3 "$DB" "PRAGMA table_info(notes)" | grep tfidf_vector
 # Expected: "X|tfidf_vector|TEXT|0||0"
 ```
+
+**Fallback:** if you only want to migrate the DB schema without re-running setup (e.g. config already known-good, just touching this branch), `/vault-reindex` does the schema work alone.
 
 ---
 
@@ -102,9 +112,11 @@ This hits the numerical paths that don't require a populated vault.
 
 ---
 
-## Step 5 — Exercise `/obsidian-setup --deps` (optional deps flow)
+## Step 5 — Exercise all three `/obsidian-setup --deps` branches
 
-This is the new Step 8.7 in `/obsidian-setup`. Two sub-paths to test — one per machine state.
+Step 2's upgrade-mode run already hit Step 8.7 once. This step uses the `--deps` flag — which jumps directly to Step 8.7 without re-running the rest of setup — to exercise **all three prompt branches** in isolation and validate idempotency.
+
+Each invocation is independent; re-running is safe.
 
 ### 5a. If numpy/scipy are NOT installed
 
@@ -348,7 +360,8 @@ ls ~/.claude/plugins/cache/claude-code-skills/obsidian-brain/
 All of the following must be true before `/finish` on PR #41:
 
 - [ ] Steps 1-11 all pass with no `❌` markers
-- [ ] `/obsidian-setup --deps` tested in at least one branch (install-yes OR skip+re-run for idempotency)
+- [ ] Step 2 `/obsidian-setup` (upgrade mode) exercised end-to-end — DB schema migrated, dashboards preserved, config untouched
+- [ ] `/obsidian-setup --deps` tested in at least one branch explicitly (install-yes OR skip+re-run for idempotency)
 - [ ] `/recall` produces theme rows in the DB
 - [ ] FTS5 orphan test shows count parity after 3x rewrite
 - [ ] Concurrency test shows no corruption
