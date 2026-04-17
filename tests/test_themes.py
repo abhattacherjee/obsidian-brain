@@ -679,3 +679,84 @@ class TestUpgradeWiresThemes:
         assert not status.startswith("Failed:"), (
             f"upgrade must succeed even when DB is missing, got: {status}"
         )
+
+    def test_upgrade_skips_theme_assignment_when_index_note_returns_false(
+        self, tmp_vault, mock_config
+    ):
+        """If index_note returns False (no exception), assign_to_theme must NOT run.
+
+        Regression: previously the pipeline used try/except/else, so a non-
+        raising False return from index_note would still fall through to
+        assign_to_theme on a stale or missing tfidf_vector.
+        """
+        import obsidian_utils
+        import vault_index
+
+        target_path = tmp_vault / "claude-sessions" / "2026-04-16-test-project-idxfail.md"
+        target_path.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-16\n"
+            "session_id: idxfail-session\n"
+            "project: test-project\n"
+            "duration_minutes: 5.0\n"
+            "tags:\n  - claude/session\n"
+            "status: auto-logged\n"
+            "---\n\n"
+            "# Session: test-project\n\n"
+            "## Summary\n"
+            "AI summary unavailable \u2014 raw extraction below.\n\n"
+            "## Conversation (raw)\n"
+            "**User:** retrieval?\n**Assistant:** scoring.\n",
+            encoding="utf-8",
+        )
+
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path,
+        )
+
+        calls: dict[str, int] = {"index_note": 0, "assign_to_theme": 0}
+        original_index = vault_index.index_note
+        original_assign = vault_index.assign_to_theme
+        original_default = vault_index._default_db_path
+
+        def fake_index_note(_db, _path):
+            calls["index_note"] += 1
+            return False  # signal failure without raising
+
+        def fake_assign_to_theme(*args, **kwargs):
+            calls["assign_to_theme"] += 1
+            return original_assign(*args, **kwargs)
+
+        try:
+            vault_index._default_db_path = lambda: db_path
+            vault_index.index_note = fake_index_note
+            vault_index.assign_to_theme = fake_assign_to_theme
+
+            summary = (
+                "## Summary\nRetrieval scoring.\n\n"
+                "## Key Decisions\n- None noted.\n\n"
+                "## Changes Made\n- None noted.\n\n"
+                "## Errors Encountered\nNone.\n\n"
+                "## Open Questions / Next Steps\nNone.\n\n"
+                "IMPORTANCE: 5\n"
+            )
+            status = obsidian_utils.upgrade_note_with_summary(
+                str(target_path), summary,
+                str(tmp_vault), "claude-sessions", "test-project",
+                source="test",
+            )
+        finally:
+            vault_index._default_db_path = original_default
+            vault_index.index_note = original_index
+            vault_index.assign_to_theme = original_assign
+
+        assert not status.startswith("Failed:"), (
+            f"upgrade must succeed even when reindex fails, got: {status}"
+        )
+        assert calls["index_note"] == 1, "index_note should have been called exactly once"
+        assert calls["assign_to_theme"] == 0, (
+            "assign_to_theme ran despite index_note returning False — "
+            "reindex-failure gating regressed"
+        )

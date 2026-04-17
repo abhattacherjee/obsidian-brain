@@ -2793,12 +2793,16 @@ def upgrade_note_with_summary(
             if os.path.isfile(_db):
                 # Re-index the just-written note so its tfidf_vector reflects
                 # the final summarized body, then run incremental theme assignment.
+                _reindex_ok = False
                 try:
-                    _vault_index.index_note(_db, note_path)
+                    # index_note() signals failure by returning False, not by
+                    # raising — swallowing the exception branch alone would
+                    # still let assign_to_theme run on a stale/missing vector.
+                    _reindex_ok = bool(_vault_index.index_note(_db, note_path))
                 except Exception as _exc:
                     print(f"[obsidian-brain] theme re-index failed for "
                           f"{os.path.basename(note_path)}: {_exc}", file=sys.stderr)
-                else:
+                if _reindex_ok:
                     try:
                         _assignment = _vault_index.assign_to_theme(
                             _db, note_path, project=project,
