@@ -252,8 +252,12 @@ class TestUpsertStoresTfidf:
         db_path = str(tmp_vault / "test.db")
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
 
-        import time
-        time.sleep(0.01)  # ensure mtime changes on fast filesystems
+        # Capture the current mtime so we can bump it deterministically.
+        # Several filesystems (e.g. HFS+, some network mounts) have 1s mtime
+        # resolution; time.sleep(0.01) can leave mtime unchanged and cause
+        # _sync() to skip the reindex, flaking the test.
+        import os
+        prev_mtime = note.stat().st_mtime
         note.write_text(
             "---\n"
             "type: claude-session\n"
@@ -266,6 +270,8 @@ class TestUpsertStoresTfidf:
             "uniquetermone uniquetermthree\n",
             encoding="utf-8",
         )
+        # Force mtime forward by 2 seconds regardless of filesystem resolution.
+        os.utime(note, (prev_mtime + 2, prev_mtime + 2))
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
 
         conn = sqlite3.connect(db_path)

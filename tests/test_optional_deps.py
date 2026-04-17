@@ -1,6 +1,5 @@
 """Tests for check_optional_deps() and the Phase 2 optional-deps config fields."""
 
-import importlib
 import json
 
 import pytest
