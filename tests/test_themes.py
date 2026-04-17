@@ -428,6 +428,114 @@ class TestAssignToTheme:
         assert result["theme_id"] == theme_id
 
 
+class TestDeleteNoteMaintainsThemeState:
+    """Deleting a note must keep themes.note_count + centroid consistent."""
+
+    def test_delete_decrements_count_and_unfolds_centroid(self, tmp_vault):
+        """Deleting one of N members must set count=N-1 and reverse the fold."""
+        path_a = _indexed_note(tmp_vault, "a", "retrieval scoring",
+                               "retrieval scoring activation importance")
+        path_b = _indexed_note(tmp_vault, "b", "more retrieval",
+                               "retrieval scoring activation importance proximity")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec_a = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path_a,)
+        ).fetchone()[0])
+        vec_b = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path_b,)
+        ).fetchone()[0])
+        # Hand-build the running-average centroid for a theme containing A+B.
+        all_terms = set(vec_a) | set(vec_b)
+        centroid = {t: (vec_a.get(t, 0.0) + vec_b.get(t, 0.0)) / 2 for t in all_terms}
+        conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, 2, ?, ?, ?)",
+            ("Retrieval", "", json.dumps(centroid),
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_id = conn.execute("SELECT id FROM themes").fetchone()[0]
+        conn.executemany(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
+            "VALUES (?, ?, 1.0, ?)",
+            [(theme_id, path_a, "2026-04-16"),
+             (theme_id, path_b, "2026-04-16")],
+        )
+        conn.commit()
+        conn.close()
+
+        # Delete path_a via internal helper (same path as _sync's deletion branch).
+        from vault_index import _delete_note, _connect
+        conn = _connect(db_path)
+        _delete_note(conn, path_a)
+        conn.commit()
+
+        # note_count must drop to 1, centroid must equal vec_b (only remaining member).
+        row = conn.execute(
+            "SELECT note_count, centroid FROM themes WHERE id = ?", (theme_id,)
+        ).fetchone()
+        assert row is not None, "theme must still exist with 1 member"
+        assert row["note_count"] == 1, (
+            f"count did not decrement: expected 1, got {row['note_count']}"
+        )
+        remaining_centroid = json.loads(row["centroid"])
+        for term in vec_b:
+            assert remaining_centroid.get(term) == pytest.approx(vec_b[term], rel=1e-6), (
+                f"centroid term {term!r} did not unfold to vec_b value"
+            )
+
+        # Membership row for path_a gone; path_b intact.
+        members = {r[0] for r in conn.execute(
+            "SELECT note_path FROM theme_members WHERE theme_id = ?", (theme_id,)
+        ).fetchall()}
+        conn.close()
+        assert members == {path_b}
+
+    def test_delete_last_member_drops_theme(self, tmp_vault):
+        """Deleting the sole member must drop the theme rather than leave count=0."""
+        path = _indexed_note(tmp_vault, "solo", "retrieval scoring",
+                             "retrieval scoring activation")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
+        ).fetchone()[0])
+        conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?)",
+            ("Solo", "", json.dumps(vec), "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_id = conn.execute("SELECT id FROM themes").fetchone()[0]
+        conn.execute(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
+            "VALUES (?, ?, 1.0, ?)",
+            (theme_id, path, "2026-04-16"),
+        )
+        conn.commit()
+        conn.close()
+
+        from vault_index import _delete_note, _connect
+        conn = _connect(db_path)
+        _delete_note(conn, path)
+        conn.commit()
+
+        theme_row = conn.execute(
+            "SELECT id FROM themes WHERE id = ?", (theme_id,)
+        ).fetchone()
+        member_row = conn.execute(
+            "SELECT note_path FROM theme_members WHERE theme_id = ?", (theme_id,)
+        ).fetchone()
+        conn.close()
+        assert theme_row is None, "theme with 0 members must be dropped"
+        assert member_row is None
+
+
 class TestUpgradeWiresThemes:
     def test_upgrade_triggers_theme_assignment(self, tmp_vault, mock_config):
         """After upgrade_note_with_summary(), the note must join a seeded matching theme."""

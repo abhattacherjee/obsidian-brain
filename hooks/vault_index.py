@@ -373,14 +373,74 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
 
 
 def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
-    """Remove a note + FTS row + its term_df contribution + theme memberships.
+    """Remove a note + FTS row + term_df contribution + theme memberships.
+
+    Also reverses the note's contribution to any theme centroid it was a
+    member of, so that `themes.note_count` and the running-average
+    centroid stay consistent with the surviving `theme_members` rows.
+    If the note was the theme's last member, the theme is dropped.
 
     For contentless FTS5, we can only delete the notes row. The orphaned
     FTS entry won't match any JOIN since the notes rowid is gone.
     """
     old_terms = _prior_terms_for(conn, rel_path)
+
+    # Fetch the note's tfidf_vector BEFORE deletion — needed to subtract
+    # its contribution from theme centroids.
+    note_vec: dict[str, float] = {}
+    vec_row = conn.execute(
+        "SELECT tfidf_vector FROM notes WHERE path = ?", (rel_path,)
+    ).fetchone()
+    if vec_row and vec_row["tfidf_vector"]:
+        try:
+            note_vec = json.loads(vec_row["tfidf_vector"]) or {}
+        except json.JSONDecodeError:
+            note_vec = {}
+
+    # Update each theme the note was a member of. Walk the memberships
+    # before deleting them so we know which themes to touch.
+    memberships = conn.execute(
+        "SELECT theme_id FROM theme_members WHERE note_path = ?", (rel_path,)
+    ).fetchall()
+    today = date.today().isoformat()
+    for m in memberships:
+        theme_id = m["theme_id"]
+        theme_row = conn.execute(
+            "SELECT centroid, note_count FROM themes WHERE id = ?", (theme_id,)
+        ).fetchone()
+        if not theme_row:
+            continue
+        count = theme_row["note_count"] or 0
+        if count <= 1:
+            # Last member — drop the theme entirely rather than leave it
+            # with count=0 and a stale centroid.
+            conn.execute("DELETE FROM themes WHERE id = ?", (theme_id,))
+            continue
+        try:
+            centroid = json.loads(theme_row["centroid"]) if theme_row["centroid"] else {}
+        except json.JSONDecodeError:
+            centroid = {}
+        new_count = count - 1
+        new_centroid: dict[str, float] = {}
+        all_terms = set(centroid) | set(note_vec)
+        for term in all_terms:
+            c_val = centroid.get(term, 0.0)
+            v_val = note_vec.get(term, 0.0)
+            # Reverse the running-average fold:
+            # old_centroid = (centroid*count - note_vec) / (count - 1)
+            new_val = (c_val * count - v_val) / new_count
+            # Prune near-zero terms to keep the centroid sparse.
+            if abs(new_val) > 1e-9:
+                new_centroid[term] = new_val
+        conn.execute(
+            "UPDATE themes "
+            "SET centroid = ?, note_count = ?, updated_date = ? "
+            "WHERE id = ?",
+            (json.dumps(new_centroid, separators=(",", ":")),
+             new_count, today, theme_id),
+        )
+
     conn.execute("DELETE FROM notes WHERE path = ?", (rel_path,))
-    # Drop any theme membership rows pointing at the deleted note.
     conn.execute("DELETE FROM theme_members WHERE note_path = ?", (rel_path,))
     if old_terms:
         _update_term_df(conn, old_terms=old_terms, new_terms=set())
