@@ -687,6 +687,64 @@ def _augment_session_input_with_snapshots(
     return prefix
 
 
+def fetch_snapshot_summaries(
+    sessions_folder_path: Path,
+    session_id: str,
+    date: str,
+    project: str,
+) -> list[dict]:
+    """Return chronologically-sorted summary dicts for a session's snapshots.
+
+    Each dict has: ``path``, ``hhmmss``, ``trigger``, ``summary`` (first
+    sentence of ``## Summary`` if upgraded; first bullet of
+    ``## What was happening`` as fallback; ``"(not yet summarized)"`` if
+    neither exists), ``key_context`` (``## Key context that may be lost
+    (summary)`` if upgraded; ``""`` otherwise).
+
+    Shared helper used by build_context_brief(), the vault-search skill,
+    and vault-ask so presentation stays consistent.
+    """
+    results: list[dict] = []
+    for link in find_snapshots_for_session(sessions_folder_path, session_id, date, project):
+        stem = link.strip("[]")
+        path = sessions_folder_path / f"{stem}.md"
+        if not path.exists():
+            continue
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        meta = read_note_metadata(str(path)) or {}
+        hh = _extract_hhmmss_from_filename(path.name)
+        summary = ""
+        key_context = ""
+
+        summary_match = re.search(r"^## Summary\s*\n(.+?)(?=\n## |\Z)", body, re.MULTILINE | re.DOTALL)
+        if summary_match:
+            summary = summary_match.group(1).strip().split("\n", 1)[0].strip()
+        else:
+            wh_match = re.search(r"^## What was happening\s*\n(.+?)(?=\n## |\Z)",
+                                 body, re.MULTILINE | re.DOTALL)
+            if wh_match:
+                summary = wh_match.group(1).strip().split("\n", 1)[0].strip()
+
+        kc_match = re.search(
+            r"^## Key context that may be lost \(summary\)\s*\n(.+?)(?=\n## |\Z)",
+            body, re.MULTILINE | re.DOTALL,
+        )
+        if kc_match:
+            key_context = kc_match.group(1).strip()
+
+        results.append({
+            "path": str(path),
+            "hhmmss": hh,
+            "trigger": meta.get("trigger", "compact"),
+            "summary": summary or "(not yet summarized)",
+            "key_context": key_context,
+        })
+    return results
+
+
 def match_items_against_evidence(
     evidence_text: str,
     open_items: list[tuple[str, int, str]],
@@ -1681,6 +1739,9 @@ def build_context_brief(
             meta = read_note_metadata(str(f))
             if not meta:
                 continue
+            # Exclude snapshot-type notes from the top-level session table.
+            if meta.get('type') == 'claude-snapshot':
+                continue
             fm_project = meta.get('project', '')
             if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
                 continue
@@ -1792,6 +1853,20 @@ def build_context_brief(
         except OSError:
             pass
         history_rows.append(f"| {i+1} | {date} | {duration} | {title} | {branch} |")
+
+        # Append indented snapshot rows beneath this session.
+        sid = meta.get("session_id", "")
+        note_date = meta.get("date", "")
+        if sid and note_date:
+            for sn in fetch_snapshot_summaries(sessions_dir, sid, note_date, project):
+                hh = sn["hhmmss"]
+                hhmmss_pretty = (
+                    f"{hh[:2]}:{hh[2:4]}:{hh[4:]}" if hh and hh != "??????" else hh
+                )
+                snap_title = sn["summary"][:80]
+                history_rows.append(
+                    f"|   | ↳ {hhmmss_pretty} |  |   {snap_title} | — |"
+                )
 
     # --- 3. Load insights via vault index (layered ranking) ---
     insight_entries: list[tuple[str, str]] = []  # (title, key_point)
@@ -1992,6 +2067,27 @@ def build_context_brief(
             print(f"[obsidian-brain] open-item detection failed (non-fatal): {exc}", file=sys.stderr)
 
     # --- 6. Compose structured output ---
+
+    # Snapshot summaries for the most-recent session (if any) — included
+    # at auto-load depth: summaries only, not raw transcripts.
+    manifest_snapshot_lines: list[str] = []
+    if most_recent_path:
+        meta_mr = read_note_metadata(most_recent_path) or {}
+        mr_sid = meta_mr.get("session_id", "")
+        mr_date = meta_mr.get("date", "")
+        if mr_sid and mr_date:
+            snaps = fetch_snapshot_summaries(sessions_dir, mr_sid, mr_date, project)
+            if snaps:
+                manifest_snapshot_lines.append(f"snapshot_count: {len(snaps)}")
+                for sn in snaps:
+                    manifest_snapshot_lines.append(
+                        f"snapshot: [{sn['hhmmss']}] ({sn['trigger']}) {sn['summary']}"
+                    )
+                    if sn["key_context"]:
+                        for bullet in sn["key_context"].splitlines():
+                            if bullet.strip():
+                                manifest_snapshot_lines.append(f"  {bullet.strip()}")
+
     manifest_lines = [
         f"full_session_title: {most_recent_title or '(none)'}",
         f"full_session_date: {most_recent_date or '(none)'}",
@@ -2000,6 +2096,7 @@ def build_context_brief(
         f"summary_session_date: {second_date or '(none)'}",
         f"insight_count: {insight_count}",
     ]
+    manifest_lines.extend(manifest_snapshot_lines)
 
     # Use unique delimiters that cannot appear in user-authored markdown content
     output_parts = [
