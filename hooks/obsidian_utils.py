@@ -677,12 +677,14 @@ def _augment_session_input_with_snapshots(
     if not blocks:
         return transcript
 
-    return (
-        "===== EARLIER IN THIS SESSION (from snapshots) =====\n\n"
-        + "\n\n".join(blocks)
-        + "\n\n===== CURRENT TAIL (post-compact transcript) =====\n\n"
-        + transcript
-    )
+    prefix = "===== EARLIER IN THIS SESSION (from snapshots) =====\n\n" + "\n\n".join(blocks)
+    if transcript:
+        return (
+            prefix
+            + "\n\n===== CURRENT TAIL (post-compact transcript) =====\n\n"
+            + transcript
+        )
+    return prefix
 
 
 def match_items_against_evidence(

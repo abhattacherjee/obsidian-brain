@@ -211,3 +211,22 @@ def test_augment_falls_back_to_raw_when_snapshot_not_yet_upgraded(tmp_path):
         "tail", sess, "s6", "2026-04-18", "demo",
     )
     assert "Raw work in progress." in result
+
+
+def test_augment_omits_current_tail_banner_when_transcript_empty(tmp_path):
+    sess = tmp_path / "claude-sessions"
+    sess.mkdir()
+    snap = sess / "2026-04-18-demo-gggg-snapshot-110000.md"
+    snap.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s7\n"
+        "project: demo\ntrigger: compact\nstatus: summarized\n---\n\n"
+        "## Summary\nSome mid-session work.\n",
+        encoding="utf-8",
+    )
+    result = _augment_session_input_with_snapshots(
+        "", sess, "s7", "2026-04-18", "demo",
+    )
+    assert "===== EARLIER IN THIS SESSION" in result
+    assert "Some mid-session work." in result
+    # No dangling tail banner when transcript is empty (preamble mode)
+    assert "CURRENT TAIL" not in result
