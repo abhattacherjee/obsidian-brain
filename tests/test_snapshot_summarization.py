@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from hooks.obsidian_utils import find_unsummarized_notes, upgrade_unsummarized_note
+from hooks.obsidian_utils import find_unsummarized_notes, upgrade_unsummarized_note, _augment_session_input_with_snapshots
 
 
 def _fixture(sess_dir: Path, name: str, type_: str, status: str, session_id: str, body: str = ""):
@@ -157,3 +157,57 @@ def test_session_routes_through_session_prompt(tmp_path):
     assert not result.startswith("Failed"), result
     types_called = [c[0] for c in calls]
     assert types_called == ["session"]
+
+
+def test_augment_prepends_upgraded_snapshot_summaries(tmp_path):
+    sess = tmp_path / "claude-sessions"
+    sess.mkdir()
+    snap = sess / "2026-04-18-demo-eeee-snapshot-143000.md"
+    snap.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s5\n"
+        "project: demo\ntrigger: compact\nstatus: summarized\n---\n\n"
+        "# Context Snapshot: demo\n\n"
+        "## Summary\nMid-session decision on approach B.\n\n"
+        "## Key context that may be lost (summary)\n- Open question about scalability.\n\n"
+        "## Last messages (raw)\n**User:** earlier stuff\n",
+        encoding="utf-8",
+    )
+    result = _augment_session_input_with_snapshots(
+        transcript="current tail messages",
+        sessions_folder_path=sess,
+        session_id="s5",
+        date="2026-04-18",
+        project="demo",
+    )
+    assert "===== EARLIER IN THIS SESSION" in result
+    assert "Mid-session decision on approach B." in result
+    assert "current tail messages" in result
+    # Summary section preferred over raw body
+    assert "earlier stuff" not in result
+    # Trigger annotation present
+    assert "trigger=compact" in result
+
+
+def test_augment_returns_transcript_unchanged_when_no_snapshots(tmp_path):
+    sess = tmp_path / "claude-sessions"
+    sess.mkdir()
+    result = _augment_session_input_with_snapshots(
+        "original", sess, "no-matches", "2026-04-18", "demo",
+    )
+    assert result == "original"
+
+
+def test_augment_falls_back_to_raw_when_snapshot_not_yet_upgraded(tmp_path):
+    sess = tmp_path / "claude-sessions"
+    sess.mkdir()
+    snap = sess / "2026-04-18-demo-ffff-snapshot-090000.md"
+    snap.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s6\n"
+        "project: demo\ntrigger: clear\nstatus: auto-logged\n---\n\n"
+        "# Context Snapshot: demo\n\n## What was happening\nRaw work in progress.\n",
+        encoding="utf-8",
+    )
+    result = _augment_session_input_with_snapshots(
+        "tail", sess, "s6", "2026-04-18", "demo",
+    )
+    assert "Raw work in progress." in result

@@ -601,6 +601,90 @@ def find_snapshots_for_session(
     return wikilinks
 
 
+_SECTION_RE_CACHE: dict[tuple[str, ...], re.Pattern] = {}
+
+
+def _extract_sections(body: str, section_headers: tuple[str, ...]) -> str:
+    """Return concatenated content of the named `## Foo` sections, or '' if none.
+
+    Header matching is literal — case-sensitive, full-line. Sections end at
+    the next `## ` heading or EOF. Empty string if no section matches.
+    """
+    key = tuple(section_headers)
+    if key not in _SECTION_RE_CACHE:
+        pattern = "|".join(re.escape(h) for h in section_headers)
+        _SECTION_RE_CACHE[key] = re.compile(
+            rf"^({pattern})\s*$\n(.*?)(?=^## |\Z)",
+            re.MULTILINE | re.DOTALL,
+        )
+    chunks = []
+    for m in _SECTION_RE_CACHE[key].finditer(body):
+        chunks.append(m.group(1) + "\n" + m.group(2).strip())
+    return "\n\n".join(chunks)
+
+
+def _extract_hhmmss_from_filename(filename: str) -> str:
+    """Return the HHMMSS suffix from a post-spec snapshot filename, or '??????'."""
+    m = re.search(r"-snapshot-(\d{6})\.md$", filename)
+    return m.group(1) if m else "??????"
+
+
+def _augment_session_input_with_snapshots(
+    transcript: str,
+    sessions_folder_path: Path,
+    session_id: str,
+    date: str,
+    project: str,
+) -> str:
+    """Prepend sibling snapshot bodies (preferring summaries) to session input.
+
+    Used by the session-note branch of upgrade_unsummarized_note to give
+    generate_summary a cohesive view of the whole arc, not just the
+    post-last-compact tail.
+
+    Returns the original transcript unchanged if no snapshots exist.
+    """
+    wikilinks = find_snapshots_for_session(sessions_folder_path, session_id, date, project)
+    if not wikilinks:
+        return transcript
+
+    blocks: list[str] = []
+    for link in wikilinks:
+        stem = link.strip("[]")
+        snap_path = sessions_folder_path / f"{stem}.md"
+        if not snap_path.exists():
+            continue
+        try:
+            body = snap_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        hh = _extract_hhmmss_from_filename(snap_path.name)
+        meta = read_note_metadata(str(snap_path)) or {}
+        trigger = meta.get("trigger", "compact")
+        summary_block = _extract_sections(
+            body, ("## Summary", "## Key context that may be lost (summary)")
+        )
+        if not summary_block.strip():
+            summary_block = _extract_sections(
+                body,
+                ("## What was happening", "## Key context that may be lost",
+                 "## Uncommitted work", "## Last messages (raw)"),
+            )
+        if not summary_block.strip():
+            continue
+        blocks.append(f"[snapshot {hh}, trigger={trigger}]\n{summary_block}")
+
+    if not blocks:
+        return transcript
+
+    return (
+        "===== EARLIER IN THIS SESSION (from snapshots) =====\n\n"
+        + "\n\n".join(blocks)
+        + "\n\n===== CURRENT TAIL (post-compact transcript) =====\n\n"
+        + transcript
+    )
+
+
 def match_items_against_evidence(
     evidence_text: str,
     open_items: list[tuple[str, int, str]],
@@ -1113,13 +1197,24 @@ def generate_summary(
     user_sample = "\n---\n".join(sampled_user)[:12000]
     assistant_sample = "\n---\n".join(sampled_asst)[:12000]
 
-    prompt = f"""You are a technical summarizer. You will be given the transcript of a Claude Code coding session. Your job is to produce a structured summary. Do NOT respond conversationally. Do NOT ask questions. Just output the summary.
+    preamble = metadata.get("snapshot_preamble", "")
+    cohesion_hint = ""
+    if preamble:
+        cohesion_hint = (
+            "\nSome earlier context may come from pre-compact snapshots — "
+            "synthesize the whole arc into a cohesive narrative rather than "
+            "three disjoint summaries.\n"
+        )
 
+    prompt = f"""You are a technical summarizer. You will be given the transcript of a Claude Code coding session. Your job is to produce a structured summary. Do NOT respond conversationally. Do NOT ask questions. Just output the summary.
+{cohesion_hint}
 SESSION METADATA:
 - Project: {metadata.get('project', 'unknown')}
 - Branch: {metadata.get('git_branch', 'unknown')}
 - Duration: {metadata.get('duration_minutes', 0)} minutes
 - Files touched: {', '.join(metadata.get('files_touched', [])[:15]) or 'none detected'}
+
+{preamble}
 
 TRANSCRIPT (user and assistant messages):
 {user_sample}
@@ -3270,6 +3365,21 @@ def upgrade_unsummarized_note(
             user_msgs, assistant_msgs, metadata, **gen_kwargs,
         )
     else:
+        # Session — augment with snapshot bodies for cohesion.
+        date_str = ""
+        for line in raw_lines[:20]:
+            if line.strip().startswith("date:"):
+                date_str = line.split(":", 1)[1].strip().strip('"').strip("'")
+                break
+        sessions_dir_path = Path(vault_path) / sessions_folder
+        preamble = _augment_session_input_with_snapshots(
+            "", sessions_dir_path, session_id, date_str, project,
+        )
+        if preamble:
+            # Stash the snapshot preamble into metadata so generate_summary can
+            # prepend it to its sampled transcript. New optional key; existing
+            # callers unaffected (absent key → no-op).
+            metadata["snapshot_preamble"] = preamble
         summary_text = generate_summary(
             user_msgs, assistant_msgs, metadata, **gen_kwargs,
         )
