@@ -158,6 +158,12 @@ Summarization: {summarized_fraction formatted as integer %}
 Integrity: {orphaned_snapshots} orphan(s), {broken_backlinks} broken backlink(s)
 ```
 
+If `read_errors > 0`, append on a new line before the auto-fix suggestion:
+
+```
+⚠ {read_errors} snapshot file(s) unreadable — check stderr for paths.
+```
+
 If `orphaned_snapshots > 0` or `broken_backlinks > 0`, append on a new line:
 
 ```

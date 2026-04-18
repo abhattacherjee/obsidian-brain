@@ -65,6 +65,40 @@ def test_snapshot_stats_zero_state(tmp_path):
     assert snap["total_snapshots"] == 0
     assert snap["summarized_fraction"] == 1.0
     assert snap["by_trigger"] == {"compact": 0, "clear": 0, "auto": 0}
+    assert snap["read_errors"] == 0
+
+
+def test_snapshot_stats_counts_unreadable_snapshots(tmp_path):
+    """OSError on snapshot read is surfaced via read_errors, not silently dropped."""
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    (sess / "2026-04-18-demo-aa.md").write_text(
+        "---\ntype: claude-session\ndate: 2026-04-18\nsession_id: s1\nproject: demo\n---\n\n# S\n",
+        encoding="utf-8",
+    )
+    snap_path = sess / "2026-04-18-demo-aa-snapshot-120000.md"
+    snap_path.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s1\nproject: demo\n"
+        'trigger: compact\nstatus: auto-logged\nsource_session_note: "[[2026-04-18-demo-aa]]"\n'
+        "---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+    db = vault_index.ensure_index(str(vault), ["claude-sessions"],
+                                  db_path=str(tmp_path / "unreadable.db"))
+    # Render the snapshot unreadable AFTER indexing (0o000 perms)
+    import os
+    os.chmod(snap_path, 0o000)
+    try:
+        payload = json.loads(vault_stats.compute_stats(db, "demo"))
+    finally:
+        os.chmod(snap_path, 0o600)
+
+    snap = payload["vault_wide"]["snapshots"]
+    assert snap["total_snapshots"] == 1
+    assert snap["read_errors"] == 1
+    # The unreadable snapshot should NOT be silently counted as a trigger
+    assert sum(snap["by_trigger"].values()) + snap["read_errors"] == snap["total_snapshots"]
 
 
 def test_snapshot_stats_unknown_trigger_folds_into_auto(tmp_path):

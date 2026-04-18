@@ -89,6 +89,34 @@ def test_log_access_with_broken_snapshot_backlink_is_tolerant(tmp_path):
     assert {r[0] for r in rows} == {str(snap)}
 
 
+def test_log_access_transient_db_error_does_not_poison_cache(tmp_path):
+    """A DB-open failure during parent resolution must not cache None permanently.
+
+    Regression guard for a silent failure where `_parent_session_for_snapshot`
+    caught all exceptions and cached None on any sqlite3 error — e.g. a
+    transient 'database is locked' during high concurrency would disable the
+    parent cascade for that snapshot for the process lifetime.
+    """
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    parent_path, snap_path = _seed(vault, sess)
+    db_path = vault_index.ensure_index(
+        str(vault), ["claude-sessions"], db_path=str(tmp_path / "test.db")
+    )
+    vault_index._PARENT_CACHE.clear()
+
+    # Simulate transient DB error by pointing at a nonexistent DB file.
+    bad_db = str(tmp_path / "does-not-exist.db")
+    result = vault_index._parent_session_for_snapshot(str(snap_path), bad_db)
+    assert result is None
+    # Critical: cache must NOT contain a poisoned None for snap_path.
+    assert str(snap_path) not in vault_index._PARENT_CACHE
+
+    # Next call with the real DB must resolve the parent.
+    result2 = vault_index._parent_session_for_snapshot(str(snap_path), db_path)
+    assert result2 == str(parent_path)
+
+
 def test_log_access_on_unindexed_snapshot_does_not_poison_cache(tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"

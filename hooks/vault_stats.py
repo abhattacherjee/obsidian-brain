@@ -99,10 +99,13 @@ def _snapshot_stats(conn: sqlite3.Connection) -> dict:
             "max_snapshots_per_session": 0,
             "orphaned_snapshots": 0,
             "broken_backlinks": 0,
+            "read_errors": 0,
             "summarized_fraction": 1.0,
         }
 
-    # Build session_id set from session note frontmatters
+    # Build session_id set from session note frontmatters.
+    # Unreadable sessions can cause false-positive orphan flags on their
+    # children, so log them loudly rather than dropping silently.
     session_ids: set[str] = set()
     for (sp,) in conn.execute(
         "SELECT path FROM notes WHERE type = 'claude-session'"
@@ -110,7 +113,9 @@ def _snapshot_stats(conn: sqlite3.Connection) -> dict:
         try:
             with open(sp, "r", encoding="utf-8", errors="replace") as fh:
                 head = fh.read(2048)
-        except OSError:
+        except OSError as exc:
+            print(f"[vault-stats] skipping unreadable session note {sp!r}: {exc}",
+                  file=sys.stderr)
             continue
         m = re.search(r"^session_id:\s*(.+)$", head, re.MULTILINE)
         if m:
@@ -122,11 +127,17 @@ def _snapshot_stats(conn: sqlite3.Connection) -> dict:
     by_trigger: dict[str, int] = {"compact": 0, "clear": 0, "auto": 0}
     summarized = 0
 
+    read_errors = 0
     for path, source_note, status in snap_rows:
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 head = fh.read(2048)
-        except OSError:
+        except OSError as exc:
+            # An unreadable snapshot is an integrity failure, not a phantom row.
+            # Log it and count so `sum(by_trigger) + read_errors == total` holds.
+            print(f"[vault-stats] skipping unreadable snapshot {path!r}: {exc}",
+                  file=sys.stderr)
+            read_errors += 1
             continue
         tm = re.search(r"^trigger:\s*(\w+)", head, re.MULTILINE)
         trigger = tm.group(1) if tm else "compact"
@@ -160,6 +171,7 @@ def _snapshot_stats(conn: sqlite3.Connection) -> dict:
         "max_snapshots_per_session": max(per_session.values()) if per_session else 0,
         "orphaned_snapshots": orphaned,
         "broken_backlinks": broken_backlinks,
+        "read_errors": read_errors,
         "summarized_fraction": round(summarized / total, 3) if total else 1.0,
     }
 

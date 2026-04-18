@@ -681,23 +681,33 @@ def _parent_session_for_snapshot(note_path: str, db_path: str) -> str | None:
                 return None
         finally:
             conn.close()
+    except sqlite3.Error as exc:
+        # Transient DB errors (locked, busy, corrupt-for-one-tx) — don't poison
+        # the cache; next call retries.
+        print(f"[vault-index] parent-resolve DB error for {note_path!r}: {exc}",
+              file=sys.stderr)
+        return None
 
+    try:
         # Extract source_session_note from the snapshot's frontmatter.
         with open(note_path, "r", encoding="utf-8", errors="replace") as fh:
             head = fh.read(2048)
-        m = re.search(r'^source_session_note:\s*"?\[\[([^\]"]+)\]\]"?',
-                      head, re.MULTILINE)
-        if not m:
-            _PARENT_CACHE[note_path] = None
-            return None
-        parent_stem = m.group(1)
-        parent_path = os.path.join(os.path.dirname(note_path), f"{parent_stem}.md")
-        if os.path.isfile(parent_path):
-            resolved = parent_path
-    except Exception as exc:  # noqa: BLE001
-        print(f"[vault-index] parent-resolve failed for {note_path!r}: {exc}",
+    except OSError as exc:
+        # File gone / unreadable — permanent miss for this process lifetime.
+        print(f"[vault-index] parent-resolve read error for {note_path!r}: {exc}",
               file=sys.stderr)
-        resolved = None
+        _PARENT_CACHE[note_path] = None
+        return None
+
+    m = re.search(r'^source_session_note:\s*"?\[\[([^\]"]+)\]\]"?',
+                  head, re.MULTILINE)
+    if not m:
+        _PARENT_CACHE[note_path] = None
+        return None
+    parent_stem = m.group(1)
+    parent_path = os.path.join(os.path.dirname(note_path), f"{parent_stem}.md")
+    if os.path.isfile(parent_path):
+        resolved = parent_path
 
     _PARENT_CACHE[note_path] = resolved
     return resolved
