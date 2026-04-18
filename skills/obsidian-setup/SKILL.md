@@ -497,6 +497,13 @@ After writing the config file, restrict permissions so only the current user can
 chmod 600 ~/.claude/obsidian-brain-config.json
 ```
 
+After writing the config, inspect the final `snapshot_on_clear` and `snapshot_on_compact` values. If either is `False` (for instance, when migrating from an older config), warn the user:
+
+> ⚠ `snapshot_on_clear` is False — /clear will not preserve pre-clear context.
+> Recommended: True. (This is on by default; only change if you have a specific reason.)
+
+Both flags ship `true` by default, so the warning only fires when a prior config, manual edit, or migration set them `false`. Ask the user whether to flip them back to `true` via `/vault-config` before continuing.
+
 ### Step 8 — Verify vault access
 
 Run:
