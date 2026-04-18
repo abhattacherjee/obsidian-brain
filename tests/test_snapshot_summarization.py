@@ -86,6 +86,71 @@ def test_find_unsummarized_keeps_legacy_notes_without_type_field(tmp_path):
     assert "2026-04-18-demo-eeee-legacy.md" in names
 
 
+def test_augment_defaults_missing_trigger_to_auto(tmp_path):
+    """Regression for Copilot PR #43 round 2 finding: a snapshot without a
+    `trigger:` frontmatter field emits `trigger=auto` in the augmented
+    input, not `trigger=compact` — so the session summarizer isn't fed a
+    misleading label.
+    """
+    sess = tmp_path / "claude-sessions"
+    sess.mkdir()
+    # No trigger field; summary is real so the block lands
+    (sess / "2026-04-18-demo-zz-snapshot-140000.md").write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: sz\n"
+        "project: demo\nstatus: summarized\n"
+        'source_session_note: "[[2026-04-18-demo-zz]]"\n'
+        "---\n\n# T\n\n## Summary\nreal summary body\n",
+        encoding="utf-8",
+    )
+    out = _augment_session_input_with_snapshots(
+        "transcript tail",
+        sessions_folder_path=sess,
+        session_id="sz",
+        date="2026-04-18",
+        project="demo",
+    )
+    assert "[snapshot 14:00:00, trigger=auto]" in out or \
+           "[snapshot 140000, trigger=auto]" in out
+    assert "trigger=compact" not in out
+
+
+def test_find_unsummarized_orders_snapshot_before_parent_with_quoted_type(tmp_path):
+    """Regression for Copilot PR #43 round 2 finding: `_bias_key` reads the
+    `type:` frontmatter value without stripping quotes. A snapshot that uses
+    valid YAML quoting (`type: "claude-snapshot"`) previously sorted AFTER
+    its parent because the raw quoted string != 'claude-snapshot'.
+    """
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    parent = sess / "2026-04-18-demo-qqqq.md"
+    parent.write_text(
+        '---\ntype: "claude-session"\ndate: 2026-04-18\nsession_id: sq\n'
+        'project: demo\nstatus: auto-logged\n---\n\n# Parent\n',
+        encoding="utf-8",
+    )
+    # Double-quoted and single-quoted snapshot type declarations
+    snap_double = sess / "2026-04-18-demo-qqqq-snapshot-100000.md"
+    snap_double.write_text(
+        '---\ntype: "claude-snapshot"\ndate: 2026-04-18\nsession_id: sq\n'
+        'project: demo\nstatus: auto-logged\n---\n\n# Snap DQ\n',
+        encoding="utf-8",
+    )
+    snap_single = sess / "2026-04-18-demo-qqqq-snapshot-110000.md"
+    snap_single.write_text(
+        "---\ntype: 'claude-snapshot'\ndate: 2026-04-18\nsession_id: sq\n"
+        "project: demo\nstatus: auto-logged\n---\n\n# Snap SQ\n",
+        encoding="utf-8",
+    )
+
+    result = json.loads(find_unsummarized_notes(str(vault), "claude-sessions", "demo"))
+    names = [Path(p).name for p in result["unsummarized"]]
+    # Both snapshots must sort before the parent (quote-stripping lets the
+    # type check see 'claude-snapshot' rather than '"claude-snapshot"').
+    assert names.index(snap_double.name) < names.index(parent.name)
+    assert names.index(snap_single.name) < names.index(parent.name)
+
+
 def test_snapshot_routes_through_snapshot_prompt(tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"

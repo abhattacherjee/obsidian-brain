@@ -62,6 +62,28 @@ def test_build_context_brief_emits_snapshot_count_in_load_manifest(tmp_path):
     assert "snapshot: [150000]" in out
 
 
+def test_fetch_snapshot_summaries_missing_trigger_defaults_to_auto(tmp_path):
+    """Regression for Copilot PR #43 round 2 finding: snapshots without a
+    `trigger:` frontmatter field must default to 'auto', not 'compact'.
+    Mislabeling in the /recall UI would misattribute legacy snapshots.
+    """
+    sess = tmp_path / "claude-sessions"
+    sess.mkdir()
+    # Snapshot without a `trigger:` field
+    (sess / "2026-04-18-demo-ccc-snapshot-120000.md").write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s3\n"
+        "project: demo\nstatus: summarized\n"
+        'source_session_note: "[[2026-04-18-demo-ccc]]"\n'
+        "---\n\n# T\n\n## Summary\nno trigger set\n",
+        encoding="utf-8",
+    )
+    items = fetch_snapshot_summaries(sess, "s3", "2026-04-18", "demo")
+    assert len(items) == 1
+    assert items[0]["trigger"] == "auto", (
+        f"missing trigger should default to 'auto', got {items[0]['trigger']!r}"
+    )
+
+
 def test_build_context_brief_no_snapshot_artifacts_when_session_has_none(tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"

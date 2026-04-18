@@ -660,7 +660,10 @@ def _augment_session_input_with_snapshots(
             continue
         hh = _extract_hhmmss_from_filename(snap_path.name)
         meta = read_note_metadata(str(snap_path)) or {}
-        trigger = meta.get("trigger", "compact")
+        # Default missing `trigger:` to "auto" (consistent with _snapshot_stats
+        # and fetch_snapshot_summaries) so legacy/malformed notes don't get
+        # mislabeled as compact. Copilot PR #43 round 2 finding.
+        trigger = meta.get("trigger", "auto")
         summary_block = _extract_sections(
             body, ("## Summary", "## Key context that may be lost (summary)")
         )
@@ -738,7 +741,9 @@ def fetch_snapshot_summaries(
         results.append({
             "path": str(path),
             "hhmmss": hh,
-            "trigger": meta.get("trigger", "compact"),
+            # Default missing `trigger:` to "auto" so /recall doesn't mislabel
+            # legacy snapshots as compact. Copilot PR #43 round 2 finding.
+            "trigger": meta.get("trigger", "auto"),
             "summary": summary or "(not yet summarized)",
             "key_context": key_context,
         })
@@ -1687,7 +1692,11 @@ def find_unsummarized_notes(
             if line.startswith("session_id:"):
                 sid = line.split(":", 1)[1].strip().strip('"').strip("'")
             elif line.startswith("type:"):
-                typ = line.split(":", 1)[1].strip()
+                # Strip both quote styles so `type: "claude-snapshot"` and
+                # `type: 'claude-snapshot'` (both valid YAML) sort correctly
+                # under the snapshot-first bias. Copilot PR #43 round 2
+                # finding — sid-line already strips; type-line didn't.
+                typ = line.split(":", 1)[1].strip().strip('"').strip("'")
         return (sid, 0 if typ == "claude-snapshot" else 1, name)
 
     unsummarized.sort(key=_bias_key)

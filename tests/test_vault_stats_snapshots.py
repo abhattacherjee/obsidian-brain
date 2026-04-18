@@ -139,6 +139,50 @@ def test_compute_stats_corrupt_db_returns_error(tmp_path):
     assert "error" in payload
 
 
+def test_snapshot_stats_counts_summarized_even_when_file_unreadable(tmp_path):
+    """Regression for Copilot PR #43 round 2 finding: a snapshot with
+    `status: summarized` in the index but unreadable on disk must still
+    contribute to summarized_fraction, since status comes from the DB row
+    (which survives file-permission issues).
+    """
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    (sess / "2026-04-18-demo-aa.md").write_text(
+        "---\ntype: claude-session\ndate: 2026-04-18\nsession_id: s1\n"
+        "project: demo\n---\n\n# S\n",
+        encoding="utf-8",
+    )
+    snap_path = sess / "2026-04-18-demo-aa-snapshot-120000.md"
+    snap_path.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s1\n"
+        "project: demo\ntrigger: compact\nstatus: summarized\n"
+        'source_session_note: "[[2026-04-18-demo-aa]]"\n'
+        "---\n\n# Snap\n\n## Summary\nindexed as summarized\n",
+        encoding="utf-8",
+    )
+    db = vault_index.ensure_index(
+        str(vault), ["claude-sessions"],
+        db_path=str(tmp_path / "summary_vs_unreadable.db"),
+    )
+    # Now render unreadable AFTER indexing so status is captured in the DB row
+    import os
+    os.chmod(snap_path, 0o000)
+    try:
+        payload = json.loads(vault_stats.compute_stats(db, "demo"))
+    finally:
+        os.chmod(snap_path, 0o600)
+
+    snap = payload["vault_wide"]["snapshots"]
+    assert snap["total_snapshots"] == 1
+    assert snap["read_errors"] == 1
+    # The key assertion: summarized_fraction reflects the indexed status,
+    # not the on-disk readability. 1 summarized / 1 total == 1.0.
+    assert snap["summarized_fraction"] == 1.0, (
+        f"summarized_fraction should use indexed status, got {snap['summarized_fraction']}"
+    )
+
+
 def test_snapshot_stats_missing_trigger_folds_into_auto(tmp_path):
     """Regression for Copilot PR #43 finding: a snapshot note with no
     `trigger:` frontmatter field must NOT default into the compact bucket

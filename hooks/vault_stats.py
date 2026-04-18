@@ -129,6 +129,14 @@ def _snapshot_stats(conn: sqlite3.Connection) -> dict:
 
     read_errors = 0
     for path, source_note, status in snap_rows:
+        # Status comes from the indexed notes row, so it is usable even when
+        # the on-disk file is unreadable at stats-compute time. Count it up
+        # front so summarized_fraction stays truthful for operators whose
+        # vaults contain transient file-permission blips. Copilot PR #43
+        # round 2 finding.
+        if status == "summarized":
+            summarized += 1
+
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 head = fh.read(2048)
@@ -162,9 +170,6 @@ def _snapshot_stats(conn: sqlite3.Connection) -> dict:
             ).fetchone()
             if not row:
                 broken_backlinks += 1
-
-        if status == "summarized":
-            summarized += 1
 
     return {
         "total_snapshots": total,
