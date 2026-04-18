@@ -563,6 +563,44 @@ def read_note_metadata(file_path: str) -> dict | None:
     return meta
 
 
+def find_snapshots_for_session(
+    sessions_folder_path: Path, session_id: str, date: str, project: str
+) -> list[str]:
+    """Return chronologically-sorted wikilinks of all snapshots whose
+    frontmatter session_id and project match the given session. Empty list
+    if none exist.
+
+    Matching rules:
+    - Filename pattern: <date>-<project-slug>-*-snapshot*.md (captures both
+      pre-spec `-snapshot.md` and post-spec `-snapshot-<HHMMSS>.md`).
+    - Requires frontmatter `session_id` AND `project` to match.
+    - Malformed snapshots are logged to stderr and skipped — one bad file
+      must not block back-reference writing.
+
+    Sorted lexicographically by filename stem; HHMMSS suffix makes this
+    chronological for post-spec snapshots. Pre-spec (no HHMMSS) sorts first.
+    """
+    if not sessions_folder_path.is_dir():
+        return []
+    slug = slugify(project)
+    wikilinks: list[str] = []
+    for p in sorted(sessions_folder_path.glob(f"{date}-{slug}-*-snapshot*.md")):
+        try:
+            meta = read_note_metadata(str(p))
+            if not meta:
+                continue
+            if meta.get("session_id") == session_id and (
+                meta.get("project", "").lower() == project.lower()
+                or slugify(meta.get("project", "")) == slug
+            ):
+                wikilinks.append(f"[[{p.stem}]]")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[obsidian-brain] skipping malformed snapshot {p.name}: {exc}",
+                  file=sys.stderr)
+            continue
+    return wikilinks
+
+
 def match_items_against_evidence(
     evidence_text: str,
     open_items: list[tuple[str, int, str]],
