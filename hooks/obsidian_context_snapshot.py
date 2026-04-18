@@ -36,6 +36,17 @@ from obsidian_utils import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
+def _short_session_hash(session_id: str) -> str:
+    """Return the 4-hex-char short hash used in vault filenames.
+
+    Mirrors make_filename(): sha256(session_id)[:4]. Lifted here to avoid
+    circular dependency when computing the parent session note's filename
+    at snapshot-write time.
+    """
+    import hashlib
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:4] if session_id else "e3b0"
+
+
 def _build_snapshot_body(user_msgs: list[str], metadata: dict, trigger: str) -> str:
     """Build the snapshot note body from raw message data."""
     sections: list[str] = []
@@ -90,10 +101,13 @@ def _build_snapshot_note(
     """Construct full snapshot note with YAML frontmatter."""
     date_str = datetime.date.today().isoformat()
     project = metadata.get("project", "unknown")
+    project_slug = slugify(project)
+    sid4 = _short_session_hash(session_id)
+    parent_stem = f"{date_str}-{project_slug}-{sid4}"
 
     tags = [
         "claude/snapshot",
-        f"claude/project/{slugify(project)}",
+        f"claude/project/{project_slug}",
         "claude/auto",
     ]
 
@@ -106,6 +120,8 @@ def _build_snapshot_note(
         f"trigger: {trigger}",
         "tags:",
         *[f"  - {t}" for t in tags],
+        "status: auto-logged",
+        f'source_session_note: "[[{parent_stem}]]"',
         "---",
     ]
 
@@ -190,10 +206,12 @@ def _run() -> None:
     body = _build_snapshot_body(user_msgs, metadata, trigger)
     content = _build_snapshot_note(session_id, metadata, body, trigger)
 
-    # 6. Write to vault with -snapshot suffix
+    # 6. Write to vault with -snapshot-<HHMMSS> suffix (seconds-resolution avoids
+    # collisions between multiple /compact invocations in the same day).
     date_str = datetime.date.today().isoformat()
     project_slug = slugify(metadata.get("project", "session"))
-    filename = make_filename(date_str, project_slug, session_id, suffix="-snapshot")
+    hhmmss = datetime.datetime.now().strftime("%H%M%S")
+    filename = make_filename(date_str, project_slug, session_id, suffix=f"-snapshot-{hhmmss}")
 
     if write_vault_note(vault_path, sessions_folder, filename, content):
         print(f"[obsidian-brain] snapshot written: {filename}", file=sys.stderr)
