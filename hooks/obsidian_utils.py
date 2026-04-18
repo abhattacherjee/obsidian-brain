@@ -326,6 +326,8 @@ _DEFAULTS: dict = {
     "auto_log_enabled": True,
     "snapshot_on_compact": True,
     "snapshot_on_clear": True,
+    "optional_deps_prompted": False,
+    "optional_deps_declined": [],
 }
 
 
@@ -345,7 +347,12 @@ def load_config() -> dict:
     if cached is not None:
         return cached
 
-    config = dict(_DEFAULTS)
+    # dict(_DEFAULTS) is a shallow copy — any list/dict values in _DEFAULTS
+    # would be shared across calls, so an in-place mutation on
+    # config["optional_deps_declined"] (or a future list default) would
+    # leak back into _DEFAULTS and future callers. deepcopy severs that link.
+    import copy as _copy
+    config = _copy.deepcopy(_DEFAULTS)
     try:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as fh:
             user_cfg = json.load(fh)
@@ -377,6 +384,26 @@ def load_config() -> dict:
 
     cache_set(sid, "config", config)
     return config
+
+
+def check_optional_deps(packages: tuple[str, ...] = ("numpy", "scipy")) -> dict[str, bool]:
+    """Return {package: is_importable} for each optional performance dep.
+
+    Used by /obsidian-setup to decide whether to offer installation, and
+    by callers that want a stdlib fallback when a fast-path dep is missing.
+    """
+    import importlib
+    result: dict[str, bool] = {}
+    for pkg in packages:
+        try:
+            importlib.import_module(pkg)
+            result[pkg] = True
+        except Exception:
+            # Compiled optional deps (numpy/scipy) can raise OSError for
+            # missing shared libs, ValueError for ABI mismatch, etc. —
+            # treat any failure as "unavailable" rather than crashing setup.
+            result[pkg] = False
+    return result
 
 
 def check_hook_status() -> dict:
@@ -2761,6 +2788,76 @@ def upgrade_note_with_summary(
     except Exception as exc:
         print(f"[obsidian-brain] importance write-back failed for "
               f"{os.path.basename(note_path)}: {exc}", file=sys.stderr)
+
+    # Phase 2: Incremental theme assignment.
+    # Best-effort — runs only when vault_index is importable and the DB file
+    # exists. A failure in this block MUST NEVER mask the successful upgrade.
+    try:
+        if _vault_index is not None:
+            _db = _vault_index._default_db_path()
+            if os.path.isfile(_db):
+                # Re-index the just-written note so its tfidf_vector reflects
+                # the final summarized body, then run incremental theme assignment.
+                _reindex_ok = False
+                try:
+                    # index_note() signals failure by returning False, not by
+                    # raising — swallowing the exception branch alone would
+                    # still let assign_to_theme run on a stale/missing vector.
+                    _reindex_ok = bool(_vault_index.index_note(_db, note_path))
+                except Exception as _exc:
+                    print(f"[obsidian-brain] theme re-index failed for "
+                          f"{os.path.basename(note_path)}: {_exc}", file=sys.stderr)
+                if _reindex_ok:
+                    try:
+                        _assignment = _vault_index.assign_to_theme(
+                            _db, note_path, project=project,
+                        )
+                    except Exception as _exc:
+                        print(f"[obsidian-brain] assign_to_theme failed for "
+                              f"{os.path.basename(note_path)}: {_exc}",
+                              file=sys.stderr)
+                        _assignment = None
+
+                    if _assignment is not None:
+                        try:
+                            with open(note_path, "r", encoding="utf-8") as _f:
+                                _body = _f.read()
+                            _conn = _vault_index._connect(_db)
+                            try:
+                                _row = _conn.execute(
+                                    "SELECT tfidf_vector FROM notes WHERE path = ?",
+                                    (note_path,),
+                                ).fetchone()
+                                _note_vec = (
+                                    json.loads(_row["tfidf_vector"])
+                                    if _row and _row["tfidf_vector"] else {}
+                                )
+                                _row2 = _conn.execute(
+                                    "SELECT centroid FROM themes WHERE id = ?",
+                                    (_assignment["theme_id"],),
+                                ).fetchone()
+                                _centroid = (
+                                    json.loads(_row2["centroid"])
+                                    if _row2 and _row2["centroid"] else {}
+                                )
+                                _surprise = _vault_index.detect_surprise(
+                                    _body, _note_vec, _centroid,
+                                )
+                                _conn.execute(
+                                    "UPDATE theme_members SET surprise = ? "
+                                    "WHERE theme_id = ? AND note_path = ?",
+                                    (_surprise, _assignment["theme_id"], note_path),
+                                )
+                                _conn.commit()
+                            finally:
+                                _conn.close()
+                        except Exception as _exc:
+                            print(f"[obsidian-brain] surprise scoring failed "
+                                  f"for {os.path.basename(note_path)}: {_exc}",
+                                  file=sys.stderr)
+    except Exception as _exc:
+        print(f"[obsidian-brain] theme pipeline unexpected error "
+              f"for {os.path.basename(note_path)}: {_exc}", file=sys.stderr)
 
     # Run dedup pass (non-fatal — note is already upgraded)
     removed = []

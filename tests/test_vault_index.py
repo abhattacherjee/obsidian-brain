@@ -182,6 +182,149 @@ class TestInsertAndSync:
 
         assert count == 0
 
+    def test_index_note_uses_begin_immediate(self, tmp_vault, monkeypatch):
+        """index_note must open a write transaction with BEGIN IMMEDIATE
+        so concurrent writers serialize cleanly instead of racing through
+        the tfidf read-modify-write. Verified via sqlite3 trace callback."""
+        note = tmp_vault / "claude-sessions" / "2026-04-10-proj-lock.md"
+        _write_note(
+            note,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# Session\n\nbody text.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        executed: list[str] = []
+        orig_connect = vault_index._connect
+
+        def recording_connect(p):
+            c = orig_connect(p)
+            c.set_trace_callback(lambda sql: executed.append(sql.strip().upper()))
+            return c
+
+        monkeypatch.setattr(vault_index, "_connect", recording_connect)
+        ok = vault_index.index_note(db_path, str(note))
+        assert ok is True
+        assert "BEGIN IMMEDIATE" in executed, (
+            f"index_note did not issue BEGIN IMMEDIATE — traced statements "
+            f"were {executed[:5]!r}... Concurrent hook runs will race the "
+            "tfidf upsert."
+        )
+
+    def test_sync_rolls_back_on_mid_loop_failure(self, tmp_vault, monkeypatch):
+        """If _upsert_note raises mid-_sync, the transaction must roll back
+        so the first note's partial insert is undone and the connection
+        doesn't carry a poisoned open transaction into its next use.
+
+        Tested at the _sync layer rather than through ensure_index because
+        ensure_index wraps _sync in a corrupt-DB auto-recovery path that
+        catches sqlite3.DatabaseError (which IntegrityError subclasses).
+        The transactional contract is on _sync itself.
+        """
+        # Seed two notes on disk that will both need indexing.
+        for slug in ("first", "second"):
+            _write_note(
+                tmp_vault / "claude-sessions" / f"2026-04-10-proj-{slug}.md",
+                {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+                body=f"# Session: {slug}\n\nbody.",
+            )
+        db_path = str(tmp_vault / "test.db")
+        # Bootstrap the schema without running a sync yet.
+        import sqlite3 as _sq
+        conn = vault_index._connect(db_path)
+        vault_index._init_schema(conn)
+        vault_index._ensure_access_log_indexes(conn)
+        if vault_index._needs_tfidf_vector_migration(conn):
+            vault_index._add_tfidf_vector_column(conn)
+        vault_index._ensure_theme_indexes(conn)
+        conn.commit()
+
+        call_count = {"n": 0}
+        real_upsert = vault_index._upsert_note
+
+        def flaky_upsert(c, path, *a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise _sq.IntegrityError("simulated mid-loop failure")
+            return real_upsert(c, path, *a, **kw)
+
+        monkeypatch.setattr(vault_index, "_upsert_note", flaky_upsert)
+
+        with pytest.raises(_sq.IntegrityError):
+            vault_index._sync(conn, str(tmp_vault), ["claude-sessions"])
+
+        # The first note's partial upsert must have been rolled back.
+        notes_n = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        assert notes_n == 0, (
+            f"partial notes rows persisted after rollback: got {notes_n} — "
+            "_sync did not roll back the open transaction on exception"
+        )
+        # The connection should not be stuck in an open transaction —
+        # a fresh BEGIN/COMMIT must work immediately after the rollback.
+        conn.execute("BEGIN")
+        conn.execute("CREATE TABLE canary_probe (x INT)")
+        conn.commit()
+        conn.close()
+
+    def test_update_does_not_orphan_fts_rows(self, tmp_vault):
+        """Repeated updates of the same note must not accumulate FTS rows.
+
+        Regression: _upsert_note previously did DELETE FROM notes + INSERT
+        but skipped the contentless-FTS5 special 'delete' command, leaving
+        the old notes_fts row behind on every rewrite. Over many updates
+        this bloats the FTS index (and historical tokens leak into
+        searches via any path that does not strictly JOIN notes_fts to
+        notes).
+        """
+        note = tmp_vault / "claude-sessions" / "2026-04-10-proj-fts.md"
+        _write_note(
+            note,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# Session: First\n\nalphaunique content.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        # Rewrite the note three times with fresh, non-overlapping body tokens,
+        # bumping mtime each time so _sync re-upserts.
+        for i, token in enumerate(("betaunique", "gammaunique", "deltaunique"), start=2):
+            prev_mtime = note.stat().st_mtime
+            _write_note(
+                note,
+                {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+                body=f"# Session: Rev{i}\n\n{token} content.",
+            )
+            os.utime(note, (prev_mtime + 2, prev_mtime + 2))
+            vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        # Exactly one notes row.
+        notes_count = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        # Exactly one FTS row (contentless FTS5 exposes rowid — orphan rows
+        # would count here even though they don't JOIN notes).
+        fts_count = conn.execute("SELECT COUNT(*) FROM notes_fts").fetchone()[0]
+        # Stale-token search must not match — the 'delete' command must have
+        # removed the old tokens from the FTS index.
+        stale_hits = conn.execute(
+            "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH 'alphaunique'"
+        ).fetchone()[0]
+        fresh_hits = conn.execute(
+            "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH 'deltaunique'"
+        ).fetchone()[0]
+        conn.close()
+
+        assert notes_count == 1
+        assert fts_count == 1, (
+            f"notes_fts has {fts_count} rows after 3 updates — "
+            "orphan FTS rows are accumulating (regression)"
+        )
+        assert stale_hits == 0, (
+            "FTS still matches a token from an earlier revision — "
+            "stale tokens are leaking (special 'delete' missing or wrong values)"
+        )
+        assert fresh_hits == 1
+
 
 # ---------------------------------------------------------------------------
 # Commit 2: rebuild_index + index_note
@@ -220,11 +363,21 @@ class TestRebuildIndex:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT path FROM notes").fetchall()
+        # rebuild_index must leave the DB in the same index-coverage state as
+        # ensure_index — including access_log secondary indexes, which are
+        # needed for activation queries and access-log sanity checks.
+        index_names = {
+            r["name"] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
         conn.close()
 
         paths = [r["path"] for r in rows]
         assert len(paths) == 1
         assert "note2.md" in paths[0]
+        assert "idx_access_note" in index_names
+        assert "idx_access_time" in index_names
 
 
 class TestIndexNote:

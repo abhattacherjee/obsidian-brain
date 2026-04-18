@@ -8,6 +8,7 @@ DB location: ~/.claude/obsidian-brain-vault.db (outside vault, alongside config)
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -37,7 +38,8 @@ CREATE TABLE IF NOT EXISTS notes (
     mtime           REAL NOT NULL,
     size            INTEGER,
     body            TEXT DEFAULT '',
-    importance      INTEGER DEFAULT 5
+    importance      INTEGER DEFAULT 5,
+    tfidf_vector    TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
@@ -53,6 +55,32 @@ CREATE TABLE IF NOT EXISTS access_log (
     timestamp       REAL NOT NULL,
     context_type    TEXT NOT NULL,
     project         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS themes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    summary         TEXT NOT NULL DEFAULT '',
+    centroid        TEXT,
+    note_count      INTEGER NOT NULL DEFAULT 0,
+    activation      REAL NOT NULL DEFAULT 0.0,
+    created_date    TEXT NOT NULL,
+    updated_date    TEXT NOT NULL,
+    project         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS theme_members (
+    theme_id        INTEGER NOT NULL,
+    note_path       TEXT NOT NULL,
+    similarity      REAL NOT NULL,
+    surprise        REAL NOT NULL DEFAULT 0.0,
+    added_date      TEXT NOT NULL,
+    PRIMARY KEY (theme_id, note_path)
+);
+
+CREATE TABLE IF NOT EXISTS term_df (
+    term            TEXT PRIMARY KEY,
+    df              INTEGER NOT NULL
 );
 """
 
@@ -70,6 +98,20 @@ _STOPWORDS = frozenset(
     "up down its they them their what which who whom he she we you i my your "
     "his her our me him us".split()
 )
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_under(child: Path, parent: Path) -> bool:
+    """True iff `child` lives inside `parent` (proper containment, not prefix match).
+
+    Prevents sibling-prefix folders (e.g. 'claude-sessions-archive') from
+    being treated as nested inside 'claude-sessions'.
+    """
+    return child.is_relative_to(parent)
+
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -127,6 +169,31 @@ def _needs_importance_migration(conn: sqlite3.Connection) -> bool:
 def _add_importance_column(conn: sqlite3.Connection) -> None:
     """Add importance column to existing notes table."""
     conn.execute("ALTER TABLE notes ADD COLUMN importance INTEGER DEFAULT 5")
+    conn.commit()
+
+
+def _needs_tfidf_vector_migration(conn: sqlite3.Connection) -> bool:
+    """Return True if the notes table is missing the tfidf_vector column."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(notes)").fetchall()}
+    return "tfidf_vector" not in cols
+
+
+def _add_tfidf_vector_column(conn: sqlite3.Connection) -> None:
+    """Add tfidf_vector column to existing notes table."""
+    conn.execute("ALTER TABLE notes ADD COLUMN tfidf_vector TEXT")
+    conn.commit()
+
+
+def _ensure_theme_indexes(conn: sqlite3.Connection) -> None:
+    """Create secondary indexes for themes + theme_members if missing."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_theme_members_note "
+        "ON theme_members (note_path)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_themes_project "
+        "ON themes (project)"
+    )
     conn.commit()
 
 
@@ -210,33 +277,82 @@ def _parse_note(file_path: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: float, size: int) -> None:
-    """Insert or replace a note in the index + FTS table.
+def _prior_tokens_for(conn: sqlite3.Connection, note_path: str) -> set[str]:
+    """Return the full token set of the note's currently-stored content.
 
-    For contentless FTS5 (content=''), deletes require passing the old
-    column values via the special 'delete' command, not DELETE FROM.
+    Re-tokenises title+tags+body (the same inputs _upsert_note uses for the
+    new document) so the set is symmetric with ``new_terms`` during a
+    reindex. Reading the stored ``tfidf_vector`` would be wrong here — it
+    is truncated to top-K=50, and any common-but-low-IDF term outside that
+    cutoff would be incremented on every reindex without ever being
+    decremented, drifting ``term_df.df`` upward. Returns an empty set if
+    the note does not exist.
     """
-    row = conn.execute("SELECT rowid, title, tags, importance FROM notes WHERE path = ?", (rel_path,)).fetchone()
-    existing_importance = None
-    if row:
-        existing_importance = row["importance"]
-        # Contentless FTS5 delete: must pass old values
-        # Read old body from the FTS shadow tables isn't possible with contentless,
-        # so we need to read it from the note file or accept that we can't do
-        # precise deletes. Instead, drop and recreate the entire FTS table entry
-        # by using DELETE on the notes table first, then rebuild.
-        # Simpler approach: just delete the notes row and skip FTS delete.
-        # The stale FTS entry will be overwritten by the new INSERT with the same rowid.
-        # Actually, contentless FTS doesn't support any form of delete without old values.
-        # The cleanest approach: delete the notes row (rowid freed), insert new one
-        # (gets new rowid), insert new FTS entry. The orphaned FTS entry for the old
-        # rowid is harmless — it won't join with any notes row.
+    row = conn.execute(
+        "SELECT title, body, tags FROM notes WHERE path = ?", (note_path,)
+    ).fetchone()
+    if not row:
+        return set()
+    full_text = " ".join([row["title"] or "", row["tags"] or "", row["body"] or ""])
+    return set(_tokenize_for_tfidf(full_text))
+
+
+def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: float, size: int) -> None:
+    """Insert or replace a note + FTS row + maintain term_df + tfidf_vector.
+
+    For contentless FTS5 (content=''), removal requires the special
+    'delete' command with the old column values — regular DELETE FROM is
+    rejected. We fetch the prior title/body/tags + rowid here so that on
+    update we can issue the delete before inserting the new FTS row,
+    keeping the FTS index from accumulating orphan entries across rewrites.
+    """
+    row = conn.execute(
+        "SELECT rowid, title, body, tags, importance FROM notes WHERE path = ?",
+        (rel_path,),
+    ).fetchone()
+    existing_importance = row["importance"] if row else None
+    is_new = row is None
+
+    # --- TF-IDF maintenance (before the DELETE so _prior_tokens_for can read
+    # the old body). ---
+    old_terms = _prior_tokens_for(conn, rel_path)
+
+    full_text = " ".join([
+        parsed.get("title", "") or "",
+        parsed.get("tags", "") or "",
+        parsed.get("body", "") or "",
+    ])
+    tokens = _tokenize_for_tfidf(full_text)
+    new_terms = set(tokens)
+
+    # Apply df diff BEFORE computing this note's TF-IDF so its own term
+    # contribution is included in the IDF denominator.
+    _update_term_df(conn, old_terms=old_terms, new_terms=new_terms)
+
+    total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    if is_new:
+        total_docs += 1  # this note is about to be inserted
+    term_df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+    tfidf_vec = _compute_tfidf_vector(tokens, term_df, total_docs, top_k=50)
+    tfidf_json = json.dumps(tfidf_vec, separators=(",", ":")) if tfidf_vec else None
+
+    if not is_new:
+        # Remove the old FTS row before the notes DELETE so the notes_fts
+        # index doesn't accumulate orphan entries on every rewrite.
+        # Contentless FTS5 only accepts the special 'delete' command with
+        # the prior column values (SQLite docs: Inserting new rows into
+        # an external-content table with content='').
+        conn.execute(
+            "INSERT INTO notes_fts(notes_fts, rowid, title, body, tags) "
+            "VALUES('delete', ?, ?, ?, ?)",
+            (row["rowid"], row["title"] or "", row["body"] or "", row["tags"] or ""),
+        )
         conn.execute("DELETE FROM notes WHERE path = ?", (rel_path,))
 
     conn.execute(
         "INSERT INTO notes (path, type, date, project, title, source_session, "
-        "source_note, tags, status, mtime, size, body, importance) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "source_note, tags, status, mtime, size, body, importance, tfidf_vector) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             rel_path,
             parsed.get("type", "unknown"),
@@ -251,30 +367,129 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
             size,
             parsed.get("body", ""),
             existing_importance if existing_importance is not None else 5,
+            tfidf_json,
         ),
     )
 
     # Get the rowid for FTS insert
-    rowid = conn.execute("SELECT rowid FROM notes WHERE path = ?", (rel_path,)).fetchone()["rowid"]
+    rowid = conn.execute(
+        "SELECT rowid FROM notes WHERE path = ?", (rel_path,)
+    ).fetchone()["rowid"]
     conn.execute(
         "INSERT INTO notes_fts (rowid, title, body, tags) VALUES (?, ?, ?, ?)",
-        (rowid, parsed.get("title", ""), parsed.get("body", ""), parsed.get("tags", "")),
+        (
+            rowid,
+            parsed.get("title", ""),
+            parsed.get("body", ""),
+            parsed.get("tags", ""),
+        ),
     )
 
 
 def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
-    """Remove a note from the index + FTS table.
+    """Remove a note + FTS row + term_df contribution + theme memberships.
 
-    For contentless FTS5, we can only delete the notes row. The orphaned
-    FTS entry won't match any JOIN since the notes rowid is gone.
+    Also reverses the note's contribution to any theme centroid it was a
+    member of, so that `themes.note_count` and the running-average
+    centroid stay consistent with the surviving `theme_members` rows.
+    If the note was the theme's last member, the theme is dropped.
+
+    For contentless FTS5, we issue the special 'delete' command with the
+    prior column values before DROPping the notes row, so the FTS index
+    doesn't accumulate orphan entries across the vault's lifetime.
     """
+    old_terms = _prior_tokens_for(conn, rel_path)
+
+    # Fetch the note's tfidf_vector AND FTS payload BEFORE deletion —
+    # needed for both centroid unfolding and the FTS special delete.
+    note_vec: dict[str, float] = {}
+    vec_row = conn.execute(
+        "SELECT rowid, title, body, tags, tfidf_vector FROM notes WHERE path = ?",
+        (rel_path,),
+    ).fetchone()
+    if vec_row and vec_row["tfidf_vector"]:
+        try:
+            note_vec = json.loads(vec_row["tfidf_vector"]) or {}
+        except json.JSONDecodeError:
+            note_vec = {}
+
+    # Update each theme the note was a member of. Walk the memberships
+    # before deleting them so we know which themes to touch.
+    memberships = conn.execute(
+        "SELECT theme_id FROM theme_members WHERE note_path = ?", (rel_path,)
+    ).fetchall()
+    today = date.today().isoformat()
+    for m in memberships:
+        theme_id = m["theme_id"]
+        theme_row = conn.execute(
+            "SELECT centroid, note_count FROM themes WHERE id = ?", (theme_id,)
+        ).fetchone()
+        if not theme_row:
+            continue
+        count = theme_row["note_count"] or 0
+        if count <= 1:
+            # Last member — drop the theme entirely rather than leave it
+            # with count=0 and a stale centroid. Cascade-delete any stray
+            # theme_members rows pointing at this theme_id as defense-in-
+            # depth (count=1 should mean only one member, but any earlier
+            # invariant violation shouldn't leave zombie rows behind).
+            conn.execute(
+                "DELETE FROM theme_members WHERE theme_id = ?", (theme_id,)
+            )
+            conn.execute("DELETE FROM themes WHERE id = ?", (theme_id,))
+            continue
+        try:
+            centroid = json.loads(theme_row["centroid"]) if theme_row["centroid"] else {}
+        except json.JSONDecodeError:
+            centroid = {}
+        new_count = count - 1
+        new_centroid: dict[str, float] = {}
+        all_terms = set(centroid) | set(note_vec)
+        for term in all_terms:
+            c_val = centroid.get(term, 0.0)
+            v_val = note_vec.get(term, 0.0)
+            # Reverse the running-average fold:
+            # old_centroid = (centroid*count - note_vec) / (count - 1)
+            new_val = (c_val * count - v_val) / new_count
+            # Prune near-zero terms to keep the centroid sparse.
+            if abs(new_val) > 1e-9:
+                new_centroid[term] = new_val
+        conn.execute(
+            "UPDATE themes "
+            "SET centroid = ?, note_count = ?, updated_date = ? "
+            "WHERE id = ?",
+            (json.dumps(new_centroid, separators=(",", ":")),
+             new_count, today, theme_id),
+        )
+
+    # Remove the FTS row before the notes DELETE. Contentless FTS5 rejects
+    # DELETE FROM; the special 'delete' command with the prior column
+    # values is the only supported removal path.
+    if vec_row is not None:
+        conn.execute(
+            "INSERT INTO notes_fts(notes_fts, rowid, title, body, tags) "
+            "VALUES('delete', ?, ?, ?, ?)",
+            (
+                vec_row["rowid"],
+                vec_row["title"] or "",
+                vec_row["body"] or "",
+                vec_row["tags"] or "",
+            ),
+        )
     conn.execute("DELETE FROM notes WHERE path = ?", (rel_path,))
+    conn.execute("DELETE FROM theme_members WHERE note_path = ?", (rel_path,))
+    if old_terms:
+        _update_term_df(conn, old_terms=old_terms, new_terms=set())
 
 
 def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict:
     """Incremental sync: add new/changed files, remove deleted ones.
 
     Returns {"inserted": N, "skipped": M, "deleted": D, "by_type": {...}}.
+
+    Wraps the entire pass in BEGIN IMMEDIATE + commit/rollback so a mid-
+    loop failure doesn't leave a half-applied transaction attached to
+    the connection (which would poison subsequent callers).
     """
     vault = Path(vault_path)
     stats = {"inserted": 0, "skipped": 0, "deleted": 0, "by_type": {}}
@@ -294,39 +509,53 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
         for row in conn.execute("SELECT path, mtime FROM notes").fetchall()
     }
 
-    # Delete removed files (only if they belong to a scanned folder)
-    scanned_roots = [str(vault / f) for f in folders]
-    for abs_path_str in list(indexed.keys()):
-        if abs_path_str not in disk_files:
-            if any(abs_path_str.startswith(root) for root in scanned_roots):
-                _delete_note(conn, abs_path_str)
-                stats["deleted"] += 1
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Delete removed files (only if they belong to a scanned folder).
+        # Use Path.is_relative_to() rather than str.startswith() so that
+        # sibling folders with a shared prefix (e.g. 'claude-sessions-archive'
+        # vs 'claude-sessions') are not treated as nested.
+        scanned_roots = [vault / f for f in folders]
+        for abs_path_str in list(indexed.keys()):
+            if abs_path_str not in disk_files:
+                indexed_path = Path(abs_path_str)
+                if any(
+                    _is_under(indexed_path, root) for root in scanned_roots
+                ):
+                    _delete_note(conn, abs_path_str)
+                    stats["deleted"] += 1
 
-    # Insert/update files
-    for abs_path_str, abs_path in disk_files.items():
+        # Insert/update files
+        for abs_path_str, abs_path in disk_files.items():
+            try:
+                st = abs_path.stat()
+            except OSError:
+                continue  # File deleted/moved between rglob and stat
+            file_mtime = st.st_mtime
+            file_size = st.st_size
+
+            # Skip if mtime unchanged (0.001 tolerance)
+            if abs_path_str in indexed and abs(file_mtime - indexed[abs_path_str]) < 0.001:
+                stats["skipped"] += 1
+                continue
+
+            parsed = _parse_note(str(abs_path))
+            if parsed is None:
+                stats["skipped"] += 1
+                continue
+
+            _upsert_note(conn, abs_path_str, parsed, file_mtime, file_size)
+            note_type = parsed.get("type", "unknown")
+            stats["by_type"][note_type] = stats["by_type"].get(note_type, 0) + 1
+            stats["inserted"] += 1
+
+        conn.commit()
+    except Exception:
         try:
-            st = abs_path.stat()
-        except OSError:
-            continue  # File deleted/moved between rglob and stat
-        file_mtime = st.st_mtime
-        file_size = st.st_size
-
-        # Skip if mtime unchanged (0.001 tolerance)
-        if abs_path_str in indexed and abs(file_mtime - indexed[abs_path_str]) < 0.001:
-            stats["skipped"] += 1
-            continue
-
-        parsed = _parse_note(str(abs_path))
-        if parsed is None:
-            stats["skipped"] += 1
-            continue
-
-        _upsert_note(conn, abs_path_str, parsed, file_mtime, file_size)
-        note_type = parsed.get("type", "unknown")
-        stats["by_type"][note_type] = stats["by_type"].get(note_type, 0) + 1
-        stats["inserted"] += 1
-
-    conn.commit()
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
     return stats
 
 
@@ -353,6 +582,9 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
             _ensure_access_log_indexes(conn)
             if _needs_importance_migration(conn):
                 _add_importance_column(conn)
+            if _needs_tfidf_vector_migration(conn):
+                _add_tfidf_vector_column(conn)
+            _ensure_theme_indexes(conn)
             if _needs_body_migration(conn):
                 print(f"[vault-index] Missing body column; rebuilding {db_path}",
                       file=sys.stderr)
@@ -369,6 +601,9 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
                 _ensure_access_log_indexes(conn)
                 if _needs_importance_migration(conn):
                     _add_importance_column(conn)
+                if _needs_tfidf_vector_migration(conn):
+                    _add_tfidf_vector_column(conn)
+                _ensure_theme_indexes(conn)
                 if _needs_body_migration(conn):
                     raise sqlite3.DatabaseError("body column missing after rebuild")
             _sync(conn, vault_path, folders)
@@ -389,6 +624,9 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
             _ensure_access_log_indexes(conn)
             if _needs_importance_migration(conn):
                 _add_importance_column(conn)
+            if _needs_tfidf_vector_migration(conn):
+                _add_tfidf_vector_column(conn)
+            _ensure_theme_indexes(conn)
             _sync(conn, vault_path, folders)
         finally:
             conn.close()
@@ -417,6 +655,47 @@ def log_access(db_path: str, note_path: str, context_type: str, project: str | N
             conn.close()
     except Exception as exc:
         print(f"[vault-index] log_access failed for {note_path!r}: {exc}", file=sys.stderr)
+
+
+def _batch_log_access(
+    conn: sqlite3.Connection,
+    note_paths: list[str],
+    context_type: str,
+    project: str | None | list[str | None] = None,
+) -> None:
+    """Insert N access-log rows on an existing connection in one round-trip.
+
+    ``project`` may be a single value applied to every row, or a list of the
+    same length as ``note_paths`` to preserve per-row project attribution.
+    Reuses the caller's connection (no new connect/close) and commits once
+    via executemany. Swallows exceptions but logs to stderr — access logging
+    is observability, not a blocker.
+    """
+    if not note_paths:
+        return
+    try:
+        if isinstance(project, list):
+            if len(project) != len(note_paths):
+                raise ValueError(
+                    f"_batch_log_access: project list length "
+                    f"{len(project)} != note_paths length {len(note_paths)}"
+                )
+            projects = project
+        else:
+            projects = [project] * len(note_paths)
+        now = time.time()
+        conn.executemany(
+            "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (p, now, context_type, proj)
+                for p, proj in zip(note_paths, projects)
+            ],
+        )
+        conn.commit()
+    except Exception as exc:
+        print(f"[vault-index] _batch_log_access failed for "
+              f"{len(note_paths)} paths: {exc}", file=sys.stderr)
 
 
 def batch_activations(
@@ -485,6 +764,8 @@ def rebuild_index(vault_path: str, folders: list[str], db_path: str | None = Non
     conn = _connect(db_path)
     try:
         _init_schema(conn)
+        _ensure_access_log_indexes(conn)
+        _ensure_theme_indexes(conn)
         stats = _sync(conn, vault_path, folders)
     finally:
         conn.close()
@@ -513,18 +794,35 @@ def index_note(db_path: str, note_path: str) -> bool:
 
     try:
         conn = _connect(db_path)
+    except sqlite3.Error as exc:
+        # Previously this branch silently returned False — the caller
+        # (upgrade_note_with_summary) would then skip theme assignment with
+        # no trace in stderr, leaving operators guessing. Always leave a
+        # breadcrumb so theme-pipeline declines are diagnosable.
+        print(f"[vault-index] index_note could not open {db_path}: {exc}",
+              file=sys.stderr)
+        return False
+
+    try:
         try:
+            # BEGIN IMMEDIATE so _upsert_note's read-modify-write
+            # (_prior_tokens_for → _update_term_df → SELECT COUNT → INSERT)
+            # is serialized against other writers (concurrent hooks,
+            # _sync runs). Matches assign_to_theme's locking discipline.
+            conn.execute("BEGIN IMMEDIATE")
             _upsert_note(conn, note_path, parsed, st.st_mtime, st.st_size)
             conn.commit()
             return True
         except sqlite3.Error as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
             print(f"[vault-index] index_note failed for {note_path}: {exc}",
                   file=sys.stderr)
             return False
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        return False
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -905,9 +1203,15 @@ def search_vault(
             candidates, query_terms, limit,
             db_path=db_path, task_context=task_context,
         )
-        # Log access for returned results
-        for r in results:
-            log_access(db_path, r["path"], "search", project=r.get("project"))
+        # Log access for returned results (single connection, one commit).
+        # Per-row project preserves each note's project attribution for
+        # per-project analytics, even when the search itself was unscoped.
+        _batch_log_access(
+            conn,
+            [r["path"] for r in results],
+            "search",
+            project=[r.get("project") for r in results],
+        )
         # Strip body — callers don't need it
         for r in results:
             r.pop("body", None)
@@ -919,6 +1223,134 @@ def search_vault(
         return []
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# TF-IDF primitives (stdlib-first, numpy optional)
+# ---------------------------------------------------------------------------
+
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize_for_tfidf(text: str) -> list[str]:
+    """Tokenize text for TF-IDF: lowercase alphanumerics, drop stopwords + single chars.
+
+    Order is preserved (token occurrences count — duplicates are kept) so the
+    caller can compute TF by counting. Returns [] for empty or all-stopword input.
+
+    Single-character tokens (both letters like "a" and digits like "3" or "9"
+    from expressions such as "Python-3.9") are dropped. Single digits appear
+    in few documents initially, which inflates their IDF and lets them
+    outrank real semantic terms in the sparse top-k — so letter and digit
+    noise are both removed uniformly.
+    """
+    if not text:
+        return []
+    lowered = text.lower()
+    return [
+        t for t in _TOKEN_RE.findall(lowered)
+        if len(t) > 1 and t not in _STOPWORDS
+    ]
+
+
+def _compute_tfidf_vector(
+    tokens: list[str],
+    term_df: dict[str, int],
+    total_docs: int,
+    top_k: int = 50,
+) -> dict[str, float]:
+    """Compute a sparse TF×IDF vector keeping the top_k heaviest terms.
+
+    tokens:       output of _tokenize_for_tfidf() for the document
+    term_df:      {term: document_frequency} for the corpus
+    total_docs:   total indexed documents (including this one if it is new;
+                  callers using incremental updates should increment total_docs
+                  BEFORE calling this function for a newly-inserted note)
+    top_k:        maximum number of terms to retain in the sparse vector
+
+    Returns {} when tokens is empty. Uses smoothed IDF
+    (1 + ln((N + 1) / (df + 1))) so new / rare terms never produce 0 or NaN.
+    """
+    if not tokens:
+        return {}
+
+    tf: dict[str, int] = defaultdict(int)
+    for t in tokens:
+        tf[t] += 1
+
+    weights: dict[str, float] = {}
+    n_plus_one = total_docs + 1
+    for term, count in tf.items():
+        df = term_df.get(term, 0)
+        idf = 1.0 + math.log(n_plus_one / (df + 1))
+        weights[term] = count * idf
+
+    top = sorted(weights.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
+    return dict(top)
+
+
+def _cosine_similarity(v1: dict[str, float], v2: dict[str, float]) -> float:
+    """Cosine similarity between two sparse dict vectors. Returns 0.0 on empty input.
+
+    Iterates the smaller dict to compute the dot product, which keeps the
+    inner loop bounded even when one vector is much larger than the other.
+    """
+    if not v1 or not v2:
+        return 0.0
+
+    if len(v1) > len(v2):
+        v1, v2 = v2, v1
+
+    dot = 0.0
+    for term, w in v1.items():
+        other = v2.get(term)
+        if other is not None:
+            dot += w * other
+
+    if dot == 0.0:
+        return 0.0
+
+    norm1 = math.sqrt(sum(w * w for w in v1.values()))
+    norm2 = math.sqrt(sum(w * w for w in v2.values()))
+    if norm1 == 0.0 or norm2 == 0.0:
+        return 0.0
+    return dot / (norm1 * norm2)
+
+
+def _update_term_df(
+    conn: sqlite3.Connection,
+    old_terms: set[str],
+    new_terms: set[str],
+) -> None:
+    """Adjust document-frequency counts for a note whose terms changed.
+
+    Compares the two sets and applies a +1 / -1 per term via executemany.
+    Terms whose df falls to zero are deleted so the IDF denominator stays
+    clean. The caller is responsible for committing the transaction — this
+    helper writes through ``conn`` but does not commit, so it can be
+    batched atomically with a note upsert or delete.
+    """
+    removed = old_terms - new_terms
+    added = new_terms - old_terms
+    if not removed and not added:
+        return
+
+    cur = conn.cursor()
+
+    if added:
+        cur.executemany(
+            "INSERT INTO term_df (term, df) VALUES (?, 1) "
+            "ON CONFLICT(term) DO UPDATE SET df = df + 1",
+            [(t,) for t in added],
+        )
+
+    if removed:
+        cur.executemany(
+            "UPDATE term_df SET df = df - 1 WHERE term = ?",
+            [(t,) for t in removed],
+        )
+        cur.execute("DELETE FROM term_df WHERE df <= 0")
 
 
 # ---------------------------------------------------------------------------
@@ -1071,9 +1503,228 @@ def query_related_notes(
                         print(f"[vault-index] Layer 3 (FTS) query failed: {exc}",
                               file=sys.stderr)
 
-        # Log access for returned results
-        for r in results[:limit]:
-            log_access(db_path, r["path"], "related", project)
+        # Log access for returned results (single connection, one commit)
+        _batch_log_access(
+            conn,
+            [r["path"] for r in results[:limit]],
+            "related",
+            project=project,
+        )
         return results[:limit]
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Theme assignment (incremental)
+# ---------------------------------------------------------------------------
+
+
+_THEME_SIMILARITY_THRESHOLD = 0.3
+
+
+def assign_to_theme(
+    db_path: str,
+    note_path: str,
+    project: str | None = None,
+    similarity_threshold: float = _THEME_SIMILARITY_THRESHOLD,
+) -> dict | None:
+    """Incrementally assign a summarized note to its nearest theme (if any).
+
+    Reads the note's tfidf_vector and compares against every project-scoped
+    theme centroid plus any cross-project themes (project IS NULL). If the
+    best similarity exceeds ``similarity_threshold``, adds a theme_members
+    row and updates the theme's centroid via running average.
+
+    Returns {"theme_id": int, "similarity": float} on assignment, or None
+    if no theme was close enough (or the note has no vector).
+    """
+    if not os.path.isfile(db_path):
+        return None
+
+    try:
+        conn = _connect(db_path)
+    except sqlite3.Error as exc:
+        print(f"[vault-index] assign_to_theme could not connect: {exc}",
+              file=sys.stderr)
+        return None
+
+    try:
+        # Take the write lock BEFORE reading candidates so the
+        # read-modify-write cycle is atomic against concurrent writers.
+        # Other callers block for up to the connection's timeout (5s in
+        # _connect()) before sqlite3 raises OperationalError.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT tfidf_vector FROM notes WHERE path = ?", (note_path,)
+            ).fetchone()
+            if not row or not row["tfidf_vector"]:
+                conn.commit()
+                return None
+            try:
+                note_vec = json.loads(row["tfidf_vector"])
+            except json.JSONDecodeError:
+                conn.commit()
+                return None
+            if not note_vec:
+                conn.commit()
+                return None
+
+            # When project is None (global/unscoped recall), "project = ?"
+            # binds to NULL and matches no rows because `NULL = NULL` is
+            # false in SQL — only project-scoped themes with project IS
+            # NULL would match. Branch the query so unscoped callers see
+            # every theme, and scoped callers see their own + cross-project.
+            if project is None:
+                candidates = conn.execute(
+                    "SELECT id, centroid, note_count FROM themes"
+                ).fetchall()
+            else:
+                candidates = conn.execute(
+                    "SELECT id, centroid, note_count FROM themes "
+                    "WHERE project = ? OR project IS NULL",
+                    (project,),
+                ).fetchall()
+
+            best: tuple[float, int, dict, int] | None = None
+            for cand in candidates:
+                if not cand["centroid"]:
+                    continue
+                try:
+                    centroid = json.loads(cand["centroid"])
+                except json.JSONDecodeError:
+                    continue
+                sim = _cosine_similarity(note_vec, centroid)
+                if best is None or sim > best[0]:
+                    best = (sim, cand["id"], centroid, cand["note_count"])
+
+            if best is None or best[0] < similarity_threshold:
+                conn.commit()
+                return None
+
+            sim, theme_id, centroid, count = best
+            today = date.today().isoformat()
+
+            # Detect reassignment: if the note is already a member, the
+            # centroid already reflects its contribution — updating count
+            # and re-averaging would double-count it and drift the centroid.
+            already_member = conn.execute(
+                "SELECT 1 FROM theme_members "
+                "WHERE theme_id = ? AND note_path = ?",
+                (theme_id, note_path),
+            ).fetchone() is not None
+
+            if not already_member:
+                new_centroid: dict[str, float] = {}
+                all_terms = set(centroid) | set(note_vec)
+                for term in all_terms:
+                    c_val = centroid.get(term, 0.0)
+                    v_val = note_vec.get(term, 0.0)
+                    new_centroid[term] = (c_val * count + v_val) / (count + 1)
+
+                conn.execute(
+                    "UPDATE themes "
+                    "SET centroid = ?, note_count = ?, updated_date = ? "
+                    "WHERE id = ?",
+                    (json.dumps(new_centroid, separators=(",", ":")),
+                     count + 1, today, theme_id),
+                )
+            else:
+                # Reassignment: bump updated_date but leave count/centroid
+                # alone. The member's similarity is refreshed below.
+                conn.execute(
+                    "UPDATE themes SET updated_date = ? WHERE id = ?",
+                    (today, theme_id),
+                )
+
+            # Preserve surprise + added_date on reassignment — only
+            # similarity is refreshed from the latest cosine computation.
+            conn.execute(
+                "INSERT INTO theme_members "
+                "(theme_id, note_path, similarity, surprise, added_date) "
+                "VALUES (?, ?, ?, 0.0, ?) "
+                "ON CONFLICT(theme_id, note_path) DO UPDATE SET "
+                "similarity = excluded.similarity",
+                (theme_id, note_path, sim, today),
+            )
+            conn.commit()
+            return {"theme_id": theme_id, "similarity": sim}
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+_NEGATION_TERMS = frozenset({
+    # Simple negation / failure words
+    "not", "never", "failed", "broken", "wrong", "mistake",
+    "avoid", "no", "cannot",
+    # Contractions — bare forms only. detect_surprise() strips apostrophes
+    # from note_text before tokenizing, so "don't"/"won't"/"isn\u2019t"
+    # in source text collapse to "dont"/"wont"/"isnt" and match here.
+    # Apostrophed variants (e.g. "don't") would never match post-
+    # tokenization and are intentionally omitted.
+    "dont", "cant", "wont", "isnt", "arent", "wasnt", "werent",
+    "didnt", "doesnt", "couldnt", "shouldnt", "wouldnt",
+    "hasnt", "havent", "hadnt",
+})
+
+
+def detect_surprise(
+    note_text: str,
+    note_vec: dict[str, float],
+    theme_centroid: dict[str, float],
+    window: int = 8,
+    top_shared: int = 10,
+) -> float:
+    """Heuristic Free-Energy surprise score for a note vs. its theme centroid.
+
+    Returns the fraction of the top_shared shared TF-IDF terms that appear
+    within ``window`` tokens of a negation word in ``note_text``. Clamped
+    to [0.0, 1.0]. Zero on missing overlap or empty input.
+    """
+    if not note_text or not note_vec or not theme_centroid:
+        return 0.0
+
+    shared = [
+        (t, min(note_vec[t], theme_centroid[t]))
+        for t in set(note_vec) & set(theme_centroid)
+    ]
+    if not shared:
+        return 0.0
+    shared.sort(key=lambda kv: (-kv[1], kv[0]))
+    shared_terms = [t for t, _ in shared[:top_shared]]
+
+    # Strip apostrophes (straight + smart) before tokenizing so contractions
+    # like "don't" / "can't" collapse to "dont"/"cant" and match the
+    # negation set. Without this, _TOKEN_RE = [a-z0-9]+ would emit
+    # "don", "t" and the negation check would silently miss every
+    # apostrophed negation in the source text.
+    normalized = (
+        note_text.lower()
+        .replace("\u2019", "")  # right single quote (smart apostrophe)
+        .replace("\u2018", "")  # left single quote
+        .replace("'", "")       # straight apostrophe
+    )
+    tokens = _TOKEN_RE.findall(normalized)
+    if not tokens:
+        return 0.0
+
+    negation_positions = [
+        i for i, t in enumerate(tokens) if t in _NEGATION_TERMS
+    ]
+    if not negation_positions:
+        return 0.0
+
+    hits = 0
+    for term in shared_terms:
+        term_positions = [i for i, t in enumerate(tokens) if t == term]
+        for p in term_positions:
+            if any(abs(p - n) <= window for n in negation_positions):
+                hits += 1
+                break
+
+    score = hits / len(shared_terms)
+    return max(0.0, min(1.0, score))
