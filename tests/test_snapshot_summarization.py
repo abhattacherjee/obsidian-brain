@@ -1,7 +1,8 @@
 import json
 from pathlib import Path
+from unittest.mock import patch
 
-from hooks.obsidian_utils import find_unsummarized_notes
+from hooks.obsidian_utils import find_unsummarized_notes, upgrade_unsummarized_note
 
 
 def _fixture(sess_dir: Path, name: str, type_: str, status: str, session_id: str, body: str = ""):
@@ -83,3 +84,40 @@ def test_find_unsummarized_keeps_legacy_notes_without_type_field(tmp_path):
     result = json.loads(find_unsummarized_notes(str(vault), "claude-sessions", "demo"))
     names = [Path(p).name for p in result["unsummarized"]]
     assert "2026-04-18-demo-eeee-legacy.md" in names
+
+
+def test_snapshot_routes_through_snapshot_prompt(tmp_path):
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    snap_path = sess / "2026-04-18-demo-dddd-snapshot-140000.md"
+    snap_path.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s4\n"
+        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n"
+        "# Context Snapshot: demo\n\n## What was happening\nWorking on X.\n\n"
+        "## Last messages (raw)\n**User:** hi\n**Assistant:** hello\n",
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    def fake_snapshot_summary(*args, **kwargs):
+        calls.append(("snapshot", args, kwargs))
+        return (
+            "## Summary\nIn-flight work on X interrupted by /compact.\n\n"
+            "## Key context that may be lost (summary)\n- Open decision: approach A vs B\n"
+        )
+
+    def fake_session_summary(*args, **kwargs):
+        calls.append(("session", args, kwargs))
+        return "## Summary\nshould-not-be-used\n"
+
+    with patch("hooks.obsidian_utils.generate_snapshot_summary", fake_snapshot_summary), \
+         patch("hooks.obsidian_utils.generate_summary", fake_session_summary):
+        result = upgrade_unsummarized_note(str(snap_path), str(vault), "claude-sessions", "demo")
+
+    assert not result.startswith("Failed"), result
+    types_called = [c[0] for c in calls]
+    assert types_called == ["snapshot"]
+    # File now contains the snapshot-shaped summary
+    assert "## Key context that may be lost (summary)" in snap_path.read_text(encoding="utf-8")

@@ -1013,6 +1013,72 @@ def parse_importance(summary_text: str) -> int:
     return 5
 
 
+SNAPSHOT_SUMMARY_PROMPT = """You are a technical summarizer. You will be given the tail of a Claude Code session, captured the moment before the user invoked /compact or /clear. Your job is to produce a SHORT pre-compact checkpoint summary. Do NOT respond conversationally. Do NOT ask questions.
+
+Context: the user is about to lose the in-context conversation. What they need from this summary later is: (1) what they were working on, (2) what progress they had just made, (3) what was in flight — unanswered questions, half-finished thoughts, assumptions not yet tested.
+
+Do NOT restate decisions that were already committed or finalized — those will be captured in the parent session's cohesive summary later. Focus on what's transient and in flight.
+
+TRANSCRIPT:
+{transcript}
+
+OUTPUT EXACTLY these two sections with no preamble, no commentary:
+
+## Summary
+2-4 sentences: what was happening, what progress mattered, why context was about to be compacted or cleared.
+
+## Key context that may be lost (summary)
+- 3-7 bullets: in-flight decisions, open questions, silent assumptions, hypotheses not yet verified.
+"""
+
+
+def generate_snapshot_summary(
+    user_msgs: list[str],
+    assistant_msgs: list[str],
+    metadata: dict,
+    model: str = "haiku",
+    timeout: int = 30,
+) -> str | None:
+    """Call ``claude -p --model <model>`` with the snapshot-specific prompt.
+
+    Returns None on failure. Reuses the retry/timeout pattern of
+    generate_summary but with a tighter scope (no open-item dedup, no
+    importance scoring — snapshots don't carry those structural fields).
+    """
+    sampled_user = user_msgs[-10:] if len(user_msgs) > 10 else user_msgs
+    sampled_asst = assistant_msgs[-10:] if len(assistant_msgs) > 10 else assistant_msgs
+    user_sample = "\n---\n".join(sampled_user)[:8000]
+    asst_sample = "\n---\n".join(sampled_asst)[:8000]
+    transcript = f"USER MESSAGES:\n{user_sample}\n\n---\n\nASSISTANT MESSAGES:\n{asst_sample}"
+
+    prompt = SNAPSHOT_SUMMARY_PROMPT.format(transcript=transcript)
+
+    attempts = (timeout, timeout * 2)
+    for i, attempt_timeout in enumerate(attempts):
+        try:
+            result = subprocess.run(
+                ["claude", "-p", "--model", model],
+                input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+            print(f"[obsidian-brain] claude -p (snapshot) failed (rc={result.returncode})",
+                  file=sys.stderr)
+            break
+        except FileNotFoundError:
+            print("[obsidian-brain] claude CLI not found", file=sys.stderr)
+            break
+        except subprocess.TimeoutExpired:
+            if i < len(attempts) - 1:
+                continue
+            print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s",
+                  file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[obsidian-brain] claude -p (snapshot) error: {exc}", file=sys.stderr)
+            break
+    return None
+
+
 def generate_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
@@ -3132,11 +3198,13 @@ def upgrade_unsummarized_note(
     else:
         # Fall back to raw note content for summarization
         source = "raw note (JSONL not found)"
-        # Extract user/assistant messages from raw note conversation section
+        # Extract user/assistant messages from raw note conversation section.
+        # Supports both session notes (## Conversation (raw)) and snapshot notes
+        # (## Last messages (raw)).
         in_conversation = False
         for line in raw_lines:
             stripped = line.strip()
-            if stripped == '## Conversation (raw)':
+            if stripped in ('## Conversation (raw)', '## Last messages (raw)'):
                 in_conversation = True
                 continue
             if in_conversation:
@@ -3153,7 +3221,7 @@ def upgrade_unsummarized_note(
         in_conversation = False
         for line in raw_lines:
             stripped = line.strip()
-            if stripped == '## Conversation (raw)':
+            if stripped in ('## Conversation (raw)', '## Last messages (raw)'):
                 in_conversation = True
                 continue
             if in_conversation:
@@ -3184,13 +3252,25 @@ def upgrade_unsummarized_note(
         metadata["files_touched"] = parsed.get("files_touched", [])
         metadata["errors"] = parsed.get("errors", [])
 
-    # Generate summary
+    # Route by note type — snapshots use a shorter, focused prompt.
+    note_type = ""
+    for line in raw_lines[:20]:
+        if line.strip().startswith("type:"):
+            note_type = line.split(":", 1)[1].strip()
+            break
+
     gen_kwargs: dict = {"model": summary_model}
     if summary_timeout is not None:
         gen_kwargs["timeout"] = summary_timeout
-    summary_text = generate_summary(
-        user_msgs, assistant_msgs, metadata, **gen_kwargs,
-    )
+
+    if note_type == "claude-snapshot":
+        summary_text = generate_snapshot_summary(
+            user_msgs, assistant_msgs, metadata, **gen_kwargs,
+        )
+    else:
+        summary_text = generate_summary(
+            user_msgs, assistant_msgs, metadata, **gen_kwargs,
+        )
 
     if not summary_text:
         return f"Failed: AI summarization returned empty for {os.path.basename(note_path)}"
