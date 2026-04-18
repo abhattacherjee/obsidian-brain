@@ -1070,6 +1070,8 @@ def generate_snapshot_summary(
             break
         except subprocess.TimeoutExpired:
             if i < len(attempts) - 1:
+                print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s, retrying...",
+                      file=sys.stderr)
                 continue
             print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s",
                   file=sys.stderr)
@@ -3256,7 +3258,7 @@ def upgrade_unsummarized_note(
     note_type = ""
     for line in raw_lines[:20]:
         if line.strip().startswith("type:"):
-            note_type = line.split(":", 1)[1].strip()
+            note_type = line.split(":", 1)[1].strip().strip('"').strip("'")
             break
 
     gen_kwargs: dict = {"model": summary_model}

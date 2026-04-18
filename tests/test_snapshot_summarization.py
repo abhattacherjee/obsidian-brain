@@ -121,3 +121,39 @@ def test_snapshot_routes_through_snapshot_prompt(tmp_path):
     assert types_called == ["snapshot"]
     # File now contains the snapshot-shaped summary
     assert "## Key context that may be lost (summary)" in snap_path.read_text(encoding="utf-8")
+
+
+def test_session_routes_through_session_prompt(tmp_path):
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    sess_path = sess / "2026-04-18-demo-eeee.md"
+    sess_path.write_text(
+        "---\ntype: claude-session\ndate: 2026-04-18\nsession_id: s5\n"
+        "project: demo\nstatus: auto-logged\n---\n\n"
+        "# Session\n\n## Conversation (raw)\n"
+        "**User:** hi\n**Assistant:** hello\n",
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    def fake_snapshot_summary(*args, **kwargs):
+        calls.append(("snapshot", args, kwargs))
+        return "## Summary\nshould-not-be-used\n"
+
+    def fake_session_summary(*args, **kwargs):
+        calls.append(("session", args, kwargs))
+        return (
+            "## Summary\nSession work.\n\n## Key Decisions\n- None noted.\n\n"
+            "## Changes Made\n- None noted.\n\n## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n## Importance\n5\n"
+        )
+
+    with patch("hooks.obsidian_utils.generate_snapshot_summary", fake_snapshot_summary), \
+         patch("hooks.obsidian_utils.generate_summary", fake_session_summary):
+        result = upgrade_unsummarized_note(str(sess_path), str(vault), "claude-sessions", "demo")
+
+    assert not result.startswith("Failed"), result
+    types_called = [c[0] for c in calls]
+    assert types_called == ["session"]
