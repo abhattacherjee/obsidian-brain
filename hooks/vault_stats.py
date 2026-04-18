@@ -8,9 +8,11 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
+from collections import Counter
 
 import vault_index
 
@@ -71,6 +73,95 @@ def _handle_error(label: str, exc: Exception) -> str:
     """Log error to stderr and return JSON error payload."""
     print(f"[vault-stats] {label}: {exc}", file=sys.stderr)
     return json.dumps({"error": f"{label}: {exc}"})
+
+
+_KNOWN_TRIGGERS = {"compact", "clear", "auto"}
+
+
+def _snapshot_stats(conn: sqlite3.Connection) -> dict:
+    """Compute snapshot trigger breakdown + integrity counters.
+
+    Returns zero-state when no snapshots exist.  Orphan detection reads
+    session frontmatter directly because session_id isn't indexed as a
+    column; broken-backlink detection uses the already-indexed source_note.
+    Unknown trigger values are counted under 'auto' rather than growing
+    the by_trigger dict with unexpected keys.
+    """
+    snap_rows = conn.execute(
+        "SELECT path, source_note, status FROM notes WHERE type = 'claude-snapshot'"
+    ).fetchall()
+    total = len(snap_rows)
+    if total == 0:
+        return {
+            "total_snapshots": 0,
+            "by_trigger": {"compact": 0, "clear": 0, "auto": 0},
+            "sessions_with_snapshots": 0,
+            "max_snapshots_per_session": 0,
+            "orphaned_snapshots": 0,
+            "broken_backlinks": 0,
+            "summarized_fraction": 1.0,
+        }
+
+    # Build session_id set from session note frontmatters
+    session_ids: set[str] = set()
+    for (sp,) in conn.execute(
+        "SELECT path FROM notes WHERE type = 'claude-session'"
+    ).fetchall():
+        try:
+            with open(sp, "r", encoding="utf-8", errors="replace") as fh:
+                head = fh.read(2048)
+        except OSError:
+            continue
+        m = re.search(r"^session_id:\s*(.+)$", head, re.MULTILINE)
+        if m:
+            session_ids.add(m.group(1).strip().strip('"').strip("'"))
+
+    per_session: Counter = Counter()
+    orphaned = 0
+    broken_backlinks = 0
+    by_trigger: dict[str, int] = {"compact": 0, "clear": 0, "auto": 0}
+    summarized = 0
+
+    for path, source_note, status in snap_rows:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                head = fh.read(2048)
+        except OSError:
+            continue
+        tm = re.search(r"^trigger:\s*(\w+)", head, re.MULTILINE)
+        trigger = tm.group(1) if tm else "compact"
+        # Fold unknown triggers into 'auto'
+        if trigger not in _KNOWN_TRIGGERS:
+            trigger = "auto"
+        by_trigger[trigger] += 1
+
+        sid_m = re.search(r"^session_id:\s*(.+)$", head, re.MULTILINE)
+        sid = sid_m.group(1).strip().strip('"').strip("'") if sid_m else ""
+        if sid:
+            per_session[sid] += 1
+            if sid not in session_ids:
+                orphaned += 1
+
+        if source_note:
+            row = conn.execute(
+                "SELECT 1 FROM notes WHERE type = 'claude-session' AND path LIKE ? LIMIT 1",
+                (f"%/{source_note}.md",),
+            ).fetchone()
+            if not row:
+                broken_backlinks += 1
+
+        if status == "summarized":
+            summarized += 1
+
+    return {
+        "total_snapshots": total,
+        "by_trigger": by_trigger,
+        "sessions_with_snapshots": len(per_session),
+        "max_snapshots_per_session": max(per_session.values()) if per_session else 0,
+        "orphaned_snapshots": orphaned,
+        "broken_backlinks": broken_backlinks,
+        "summarized_fraction": round(summarized / total, 3) if total else 1.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +282,7 @@ def _compute_stats_inner(conn: sqlite3.Connection, db_path: str, project: str) -
         "access_by_context": access_by_context,
         "top_accessed": top_accessed,
         "importance_distribution": dist,
+        "snapshots": _snapshot_stats(conn),
     }
 
     # --- project ---
