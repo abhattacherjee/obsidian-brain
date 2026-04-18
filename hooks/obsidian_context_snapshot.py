@@ -26,6 +26,7 @@ from obsidian_utils import (  # noqa: E402
     load_config,
     make_filename,
     read_transcript,
+    scrub_secrets,
     slugify,
     write_vault_note,
 )
@@ -34,17 +35,6 @@ from obsidian_utils import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Snapshot body construction
 # ---------------------------------------------------------------------------
-
-
-def _short_session_hash(session_id: str) -> str:
-    """Return the 4-hex-char short hash used in vault filenames.
-
-    Mirrors make_filename(): sha256(session_id)[:4]. Lifted here to avoid
-    circular dependency when computing the parent session note's filename
-    at snapshot-write time.
-    """
-    import hashlib
-    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:4] if session_id else "e3b0"
 
 
 def _build_snapshot_body(user_msgs: list[str], metadata: dict, trigger: str) -> str:
@@ -62,7 +52,7 @@ def _build_snapshot_body(user_msgs: list[str], metadata: dict, trigger: str) -> 
     )
     sections.append("Recent user messages:")
     for i, msg in enumerate(recent, 1):
-        snippet = msg[:300].replace("\n", " ")
+        snippet = scrub_secrets(msg[:300].replace("\n", " "))
         sections.append(f"{i}. {snippet}")
     sections.append("")
 
@@ -97,13 +87,23 @@ def _build_snapshot_note(
     metadata: dict,
     body: str,
     trigger: str,
+    date_str: str | None = None,
 ) -> str:
-    """Construct full snapshot note with YAML frontmatter."""
-    date_str = datetime.date.today().isoformat()
+    """Construct full snapshot note with YAML frontmatter.
+
+    ``date_str`` is optional; if omitted, today() is used. Callers that also
+    construct a filename should pass their pre-computed ``date_str`` so the
+    backlink stem and the actual filename can never skew across a midnight
+    clock tick inside a single _run() invocation.
+    """
+    if date_str is None:
+        date_str = datetime.date.today().isoformat()
     project = metadata.get("project", "unknown")
     project_slug = slugify(project)
-    sid4 = _short_session_hash(session_id)
-    parent_stem = f"{date_str}-{project_slug}-{sid4}"
+    # Derive the parent session note's filename stem via the same helper the
+    # session log uses, so the backlink can never drift from the real file.
+    parent_filename = make_filename(date_str, project_slug, session_id)
+    parent_stem = parent_filename[:-3] if parent_filename.endswith(".md") else parent_filename
 
     tags = [
         "claude/snapshot",
@@ -202,15 +202,20 @@ def _run() -> None:
     user_msgs = extract_user_messages(messages)
     metadata = extract_session_metadata(messages, cwd)
 
-    # 5. Build snapshot note
+    # 5. Build snapshot note.
+    # Compute date_str + hhmmss together so the frontmatter backlink stem
+    # (which embeds date_str) and the filename (which embeds both) share the
+    # same single source of truth — no midnight-rollover skew inside one run.
+    now = datetime.datetime.now()
+    date_str = now.date().isoformat()
+    hhmmss = now.strftime("%H%M%S")
+    project_slug = slugify(metadata.get("project", "session"))
+
     body = _build_snapshot_body(user_msgs, metadata, trigger)
-    content = _build_snapshot_note(session_id, metadata, body, trigger)
+    content = _build_snapshot_note(session_id, metadata, body, trigger, date_str=date_str)
 
     # 6. Write to vault with -snapshot-<HHMMSS> suffix (seconds-resolution avoids
     # collisions between multiple /compact invocations in the same day).
-    date_str = datetime.date.today().isoformat()
-    project_slug = slugify(metadata.get("project", "session"))
-    hhmmss = datetime.datetime.now().strftime("%H%M%S")
     filename = make_filename(date_str, project_slug, session_id, suffix=f"-snapshot-{hhmmss}")
 
     if write_vault_note(vault_path, sessions_folder, filename, content):
