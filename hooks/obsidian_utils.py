@@ -1821,6 +1821,7 @@ def build_context_brief(
 
     # History table (last 5 sessions)
     history_rows: list[str] = []
+    most_recent_snaps: list[dict] = []
     for i, (fname, fpath, meta) in enumerate(session_files[:5]):
         date = meta.get('date', '')
         title = meta.get('project', project)
@@ -1858,10 +1859,13 @@ def build_context_brief(
         sid = meta.get("session_id", "")
         note_date = meta.get("date", "")
         if sid and note_date:
-            for sn in fetch_snapshot_summaries(sessions_dir, sid, note_date, project):
+            _snaps = fetch_snapshot_summaries(sessions_dir, sid, note_date, project)
+            if i == 0:
+                most_recent_snaps = _snaps
+            for sn in _snaps:
                 hh = sn["hhmmss"]
                 hhmmss_pretty = (
-                    f"{hh[:2]}:{hh[2:4]}:{hh[4:]}" if hh and hh != "??????" else hh
+                    f"{hh[:2]}:{hh[2:4]}:{hh[4:]}" if hh and hh != "??????" else "--:--:--"
                 )
                 snap_title = sn["summary"][:80]
                 history_rows.append(
@@ -2071,22 +2075,16 @@ def build_context_brief(
     # Snapshot summaries for the most-recent session (if any) — included
     # at auto-load depth: summaries only, not raw transcripts.
     manifest_snapshot_lines: list[str] = []
-    if most_recent_path:
-        meta_mr = read_note_metadata(most_recent_path) or {}
-        mr_sid = meta_mr.get("session_id", "")
-        mr_date = meta_mr.get("date", "")
-        if mr_sid and mr_date:
-            snaps = fetch_snapshot_summaries(sessions_dir, mr_sid, mr_date, project)
-            if snaps:
-                manifest_snapshot_lines.append(f"snapshot_count: {len(snaps)}")
-                for sn in snaps:
-                    manifest_snapshot_lines.append(
-                        f"snapshot: [{sn['hhmmss']}] ({sn['trigger']}) {sn['summary']}"
-                    )
-                    if sn["key_context"]:
-                        for bullet in sn["key_context"].splitlines():
-                            if bullet.strip():
-                                manifest_snapshot_lines.append(f"  {bullet.strip()}")
+    if most_recent_snaps:
+        manifest_snapshot_lines.append(f"snapshot_count: {len(most_recent_snaps)}")
+        for sn in most_recent_snaps:
+            manifest_snapshot_lines.append(
+                f"snapshot: [{sn['hhmmss']}] ({sn['trigger']}) {sn['summary']}"
+            )
+            if sn["key_context"]:
+                for bullet in sn["key_context"].splitlines():
+                    if bullet.strip():
+                        manifest_snapshot_lines.append(f"  {bullet.strip()}")
 
     manifest_lines = [
         f"full_session_title: {most_recent_title or '(none)'}",

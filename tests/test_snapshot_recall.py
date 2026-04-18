@@ -42,3 +42,33 @@ def test_fetch_snapshot_summaries_returns_ordered_items(tmp_path):
     assert items[0]["hhmmss"] == "100000"
     assert items[1]["hhmmss"] == "150000"
     assert "Earlier" in items[0]["summary"]
+
+
+def test_build_context_brief_emits_snapshot_count_in_load_manifest(tmp_path):
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    ins = vault / "claude-insights"
+    sess.mkdir(parents=True); ins.mkdir()
+    _fixture(sess / "2026-04-18-demo-cccc.md", "claude-session", "s3", "2026-04-18",
+             extras="duration_minutes: 45\ngit_branch: develop\n", body="Main session.")
+    _fixture(sess / "2026-04-18-demo-cccc-snapshot-120000.md", "claude-snapshot",
+             "s3", "2026-04-18", body="Checkpoint one.")
+    _fixture(sess / "2026-04-18-demo-cccc-snapshot-150000.md", "claude-snapshot",
+             "s3", "2026-04-18", body="Checkpoint two.")
+    out = build_context_brief(str(vault), "claude-sessions", "claude-insights", "demo")
+    assert "<<<OB_LOAD_MANIFEST>>>" in out
+    assert "snapshot_count: 2" in out
+    assert "snapshot: [120000]" in out
+    assert "snapshot: [150000]" in out
+
+
+def test_build_context_brief_no_snapshot_artifacts_when_session_has_none(tmp_path):
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    ins = vault / "claude-insights"
+    sess.mkdir(parents=True); ins.mkdir()
+    _fixture(sess / "2026-04-18-demo-dddd.md", "claude-session", "s4", "2026-04-18",
+             extras="duration_minutes: 20\ngit_branch: develop\n", body="Standalone session.")
+    out = build_context_brief(str(vault), "claude-sessions", "claude-insights", "demo")
+    assert "snapshot_count" not in out
+    assert "↳" not in out
