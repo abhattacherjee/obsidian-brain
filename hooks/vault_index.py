@@ -641,7 +641,8 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
 
 
 # Per-process cache keyed by snapshot path → resolved parent path (or None).
-# Cleared when the process exits; intentionally not persisted.
+# Not invalidated on re-index — snapshot frontmatter changes take effect next
+# process lifetime. Cleared when the process exits; intentionally not persisted.
 _PARENT_CACHE: dict[str, str | None] = {}
 
 
@@ -657,6 +658,11 @@ def _parent_session_for_snapshot(note_path: str, db_path: str) -> str | None:
          and return it. If not, cache None and return None.
 
     Swallows all exceptions — logging is observability, not a blocker.
+
+    Cache entries are NOT invalidated when a snapshot is re-indexed; a
+    corrected ``source_session_note`` won't take effect until the next process
+    restart. This is a deliberate tradeoff — rename-after-first-access is rare
+    and invalidation complexity outweighs the benefit.
     """
     if note_path in _PARENT_CACHE:
         return _PARENT_CACHE[note_path]
@@ -667,7 +673,10 @@ def _parent_session_for_snapshot(note_path: str, db_path: str) -> str | None:
             row = conn.execute(
                 "SELECT type FROM notes WHERE path = ?", (note_path,),
             ).fetchone()
-            if not row or row[0] != "claude-snapshot":
+            if not row:
+                # Not indexed yet — don't cache; retry on next call.
+                return None
+            if row[0] != "claude-snapshot":
                 _PARENT_CACHE[note_path] = None
                 return None
         finally:

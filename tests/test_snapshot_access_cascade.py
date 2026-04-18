@@ -87,3 +87,30 @@ def test_log_access_with_broken_snapshot_backlink_is_tolerant(tmp_path):
     conn.close()
     # Only the snapshot is logged; parent cannot be resolved
     assert {r[0] for r in rows} == {str(snap)}
+
+
+def test_log_access_on_unindexed_snapshot_does_not_poison_cache(tmp_path):
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    parent_path, snap_path = _seed(vault, sess)
+    # Build DB but seed it with a DIFFERENT vault so snap_path is NOT indexed.
+    db_path = str(tmp_path / "test.db")
+    vault_index.ensure_index(str(tmp_path / "other-vault"), ["claude-sessions"], db_path=db_path)
+    vault_index._PARENT_CACHE.clear()
+
+    # First call: snap_path not in DB, cache should NOT record None.
+    vault_index.log_access(db_path, str(snap_path), "search", "demo")
+    assert str(snap_path) not in vault_index._PARENT_CACHE
+
+    # Re-index with the real vault — now snap_path is present.
+    vault_index.ensure_index(str(vault), ["claude-sessions"], db_path=db_path)
+
+    # Second call: cache should now resolve the parent.
+    vault_index.log_access(db_path, str(snap_path), "search", "demo")
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT note_path FROM access_log").fetchall()
+    conn.close()
+    paths = [r[0] for r in rows]
+    # Snapshot logged twice; parent logged once (only after indexing).
+    assert paths.count(str(snap_path)) == 2
+    assert paths.count(str(parent_path)) == 1
