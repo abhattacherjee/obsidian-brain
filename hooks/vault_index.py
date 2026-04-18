@@ -764,6 +764,7 @@ def rebuild_index(vault_path: str, folders: list[str], db_path: str | None = Non
     conn = _connect(db_path)
     try:
         _init_schema(conn)
+        _ensure_access_log_indexes(conn)
         _ensure_theme_indexes(conn)
         stats = _sync(conn, vault_path, folders)
     finally:

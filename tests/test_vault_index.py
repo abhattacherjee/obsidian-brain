@@ -363,11 +363,21 @@ class TestRebuildIndex:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT path FROM notes").fetchall()
+        # rebuild_index must leave the DB in the same index-coverage state as
+        # ensure_index — including access_log secondary indexes, which are
+        # needed for activation queries and access-log sanity checks.
+        index_names = {
+            r["name"] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
         conn.close()
 
         paths = [r["path"] for r in rows]
         assert len(paths) == 1
         assert "note2.md" in paths[0]
+        assert "idx_access_note" in index_names
+        assert "idx_access_time" in index_names
 
 
 class TestIndexNote:

@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **vault-index**: `_sync()` uses `Path.is_relative_to()` instead of prefix-only `startswith()` so sibling folders like `claude-sessions-archive` are no longer incorrectly treated as nested inside `claude-sessions` (Phase 1 Copilot review deferred item)
 - **vault-index**: `_prior_terms_for()` → `_prior_tokens_for()` — re-tokenises the stored note body instead of reading the top-K=50 truncated `tfidf_vector` keys, so common-but-low-IDF terms (outside the top-50 cutoff) are no longer incremented on every reindex without a matching decrement. Fixes `term_df.df` drifting upward past the total note count across repeated `index_note` calls (caught by Phase 2 dev-test Step 11 invariant checker, missed by 522 pytest + 27 validator assertions). Existing drift clears on `rebuild_index()`. Regression gates: pytest `test_reindex_does_not_drift_term_df` + validator `test_reindex_invariance`
+- **vault-index**: `rebuild_index()` now calls `_ensure_access_log_indexes()` alongside `_ensure_theme_indexes()` so `idx_access_note` / `idx_access_time` are present immediately after a full rebuild, matching `ensure_index()`'s invariants. Previously a rebuilt DB was missing access-log indexes until the next `ensure_index()` call. Regression gate: pytest `TestRebuildIndex` now asserts both indexes exist post-rebuild (Phase 2 Copilot round 4)
+- **validate_phase2**: Module-level hook resolution now short-circuits when `-h`/`--help` is present in `sys.argv`, so `--help` produces argparse usage output even when the plugin cache path cannot be located (Phase 2 Copilot round 4)
 
 ## [2.3.0] - 2026-04-16
 

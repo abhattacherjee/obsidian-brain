@@ -36,6 +36,9 @@ from pathlib import Path
 # --- Hook resolution is argv-dependent; delay import until after flag parsing ---
 _EARLY_ARGS = sys.argv[1:]
 _USE_DEV_REPO = "--dev-repo" in _EARLY_ARGS
+# Short-circuit when the user just wants --help so hook resolution errors
+# don't mask argparse's usage output.
+_HELP_REQUESTED = any(a in ("-h", "--help") for a in _EARLY_ARGS)
 
 
 def _find_dev_hooks() -> Path | None:
@@ -49,33 +52,37 @@ def _find_dev_hooks() -> Path | None:
     return None
 
 
-if _USE_DEV_REPO:
-    dev_hooks = _find_dev_hooks()
-    if dev_hooks is None:
-        print("ERROR: --dev-repo passed but no hooks/ directory found walking up from this script",
-              file=sys.stderr)
-        sys.exit(1)
-    sys.path.insert(0, str(dev_hooks))
-else:
-    CACHE_GLOB = os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")
-    cache_hits = sorted(glob.glob(CACHE_GLOB))
-    if not cache_hits:
-        dev_hooks = _find_dev_hooks()
-        if dev_hooks is not None:
-            print(f"NOTE: no plugin cache found; falling back to {dev_hooks}")
-            sys.path.insert(0, str(dev_hooks))
-        else:
-            print("ERROR: cannot locate obsidian-brain hooks/ directory", file=sys.stderr)
-            sys.exit(1)
-    else:
-        sys.path.insert(0, cache_hits[-1])
+vault_index = None  # type: ignore[assignment]
+obsidian_utils = None  # type: ignore[assignment]
 
-try:
-    import vault_index
-    import obsidian_utils
-except ImportError as e:
-    print(f"ERROR: failed to import hooks: {e}", file=sys.stderr)
-    sys.exit(1)
+if not _HELP_REQUESTED:
+    if _USE_DEV_REPO:
+        dev_hooks = _find_dev_hooks()
+        if dev_hooks is None:
+            print("ERROR: --dev-repo passed but no hooks/ directory found walking up from this script",
+                  file=sys.stderr)
+            sys.exit(1)
+        sys.path.insert(0, str(dev_hooks))
+    else:
+        CACHE_GLOB = os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")
+        cache_hits = sorted(glob.glob(CACHE_GLOB))
+        if not cache_hits:
+            dev_hooks = _find_dev_hooks()
+            if dev_hooks is not None:
+                print(f"NOTE: no plugin cache found; falling back to {dev_hooks}")
+                sys.path.insert(0, str(dev_hooks))
+            else:
+                print("ERROR: cannot locate obsidian-brain hooks/ directory", file=sys.stderr)
+                sys.exit(1)
+        else:
+            sys.path.insert(0, cache_hits[-1])
+
+    try:
+        import vault_index  # noqa: F811
+        import obsidian_utils  # noqa: F811
+    except ImportError as e:
+        print(f"ERROR: failed to import hooks: {e}", file=sys.stderr)
+        sys.exit(1)
 
 # --- Reporting helpers ---
 PASS = 0
