@@ -2142,12 +2142,25 @@ def collect_vault_corpus(
     sessions_folder: str,
     insights_folder: str,
     days: int = 7,
+    include_types: tuple[str, ...] | None = None,
+    exclude_types: tuple[str, ...] = ("claude-snapshot",),
 ) -> str:
     """Scan vault session and insight notes, date-filter, extract structured data.
 
     Returns JSON string with keys: date_range, note_count, notes[].
     Each note has: file, type, date, project, tags, summary, decisions,
     errors, open_items.
+
+    Type filtering:
+        exclude_types: note types to drop (default: ``("claude-snapshot",)``).
+            Pass ``exclude_types=()`` to include all types.
+        include_types: when not None, only notes whose type is in this tuple
+            are kept (applied after exclude_types).
+
+    By default, ``claude-snapshot`` notes are excluded because their
+    "Key context that may be lost" bullets are transient mid-session content
+    that dilutes cross-session pattern synthesis in /emerge.  Pass
+    ``exclude_types=()`` to opt in.
 
     Security: path containment via resolve() + is_relative_to().
     Note: scrub_secrets() is NOT called — content is already scrubbed at write time.
@@ -2239,6 +2252,11 @@ def collect_vault_corpus(
 
             note_type = meta.get("type", default_type)
 
+            if exclude_types and note_type in exclude_types:
+                continue
+            if include_types is not None and note_type not in include_types:
+                continue
+
             notes_out.append(
                 {
                     "file": md_file.name,
@@ -2267,13 +2285,16 @@ def upgrade_and_collect_corpus(
     insights_folder: str,
     days: int,
     output_path: str,
+    include_types: tuple[str, ...] | None = None,
+    exclude_types: tuple[str, ...] = ("claude-snapshot",),
 ) -> str:
     """Upgrade unsummarized notes then collect corpus in a single pass.
 
     1. Scan sessions folder for notes with ``status: auto-logged`` within
        the date window and attempt ``upgrade_unsummarized_note()`` on each.
     2. Call ``collect_vault_corpus()`` to build the full corpus (including
-       freshly upgraded notes).
+       freshly upgraded notes).  ``include_types`` / ``exclude_types`` are
+       forwarded verbatim — see ``collect_vault_corpus`` docstring for details.
     3. Atomically write corpus JSON to *output_path*.
     4. Return status line: ``OK:<total>:<upgraded>:<failed>`` or
        ``EMPTY:0:0:0``.
@@ -2336,7 +2357,9 @@ def upgrade_and_collect_corpus(
 
     # --- Phase 2: collect corpus (now includes freshly upgraded notes) ---
     corpus_json = collect_vault_corpus(
-        vault_path, sessions_folder, insights_folder, days
+        vault_path, sessions_folder, insights_folder, days,
+        include_types=include_types,
+        exclude_types=exclude_types,
     )
     corpus = json.loads(corpus_json)
 
