@@ -1388,6 +1388,14 @@ def find_unsummarized_notes(
         if not status_match or status_match.group(1).strip() != 'auto-logged':
             continue
 
+        # Type filter — accept both sessions and snapshots. Legacy notes
+        # without a type field are kept (current permissive behavior).
+        type_match = re.search(r'^type:\s*(.+)$', frontmatter, re.MULTILINE)
+        if type_match:
+            type_val = type_match.group(1).strip().strip('"').strip("'")
+            if type_val not in ("claude-session", "claude-snapshot"):
+                continue
+
         # Must match project
         project_match = re.search(r'^project:\s*(.+)$', frontmatter, re.MULTILINE)
         if not project_match:
@@ -1435,6 +1443,27 @@ def find_unsummarized_notes(
 
         unsummarized.append(str(f))
 
+    # Ordering bias: within a session_id group, snapshots sort first so the
+    # per-note pipeline summarizes them before the parent session's cohesion
+    # step runs. Advisory only — Section 5's cohesion helper falls back to
+    # raw bodies for snapshots not yet upgraded.
+    def _bias_key(path_str):
+        name = os.path.basename(path_str)
+        try:
+            content = Path(path_str).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ("", 1, name)
+        sid = ""
+        typ = ""
+        for line in content.splitlines()[:30]:
+            line = line.strip()
+            if line.startswith("session_id:"):
+                sid = line.split(":", 1)[1].strip().strip('"').strip("'")
+            elif line.startswith("type:"):
+                typ = line.split(":", 1)[1].strip()
+        return (sid, 0 if typ == "claude-snapshot" else 1, name)
+
+    unsummarized.sort(key=_bias_key)
     return json.dumps({"unsummarized": unsummarized, "auto_fixed": auto_fixed})
 
 

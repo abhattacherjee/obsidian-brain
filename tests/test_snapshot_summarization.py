@@ -1,0 +1,52 @@
+import json
+from pathlib import Path
+
+from hooks.obsidian_utils import find_unsummarized_notes
+
+
+def _fixture(sess_dir: Path, name: str, type_: str, status: str, session_id: str, body: str = ""):
+    p = sess_dir / name
+    p.write_text(
+        f"---\ntype: {type_}\ndate: 2026-04-18\nsession_id: {session_id}\n"
+        f"project: demo\nstatus: {status}\n---\n\n# {name}\n\n{body}",
+        encoding="utf-8",
+    )
+
+
+def test_find_unsummarized_picks_up_snapshots(tmp_path):
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    _fixture(sess, "2026-04-18-demo-aaaa-snapshot-140000.md", "claude-snapshot", "auto-logged", "s1")
+    _fixture(sess, "2026-04-18-demo-aaaa.md", "claude-session", "auto-logged", "s1")
+
+    result = json.loads(find_unsummarized_notes(str(vault), "claude-sessions", "demo"))
+    paths = result["unsummarized"]
+    names = [Path(p).name for p in paths]
+    assert any("snapshot-140000" in n for n in names)
+    assert any(n == "2026-04-18-demo-aaaa.md" for n in names)
+
+
+def test_find_unsummarized_skips_summarized_snapshots(tmp_path):
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    _fixture(sess, "2026-04-18-demo-bbbb-snapshot-100000.md", "claude-snapshot", "summarized", "s2")
+
+    result = json.loads(find_unsummarized_notes(str(vault), "claude-sessions", "demo"))
+    assert result["unsummarized"] == []
+
+
+def test_find_unsummarized_orders_snapshots_before_parent(tmp_path):
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    _fixture(sess, "2026-04-18-demo-cccc.md", "claude-session", "auto-logged", "s3")
+    _fixture(sess, "2026-04-18-demo-cccc-snapshot-120000.md", "claude-snapshot", "auto-logged", "s3")
+    _fixture(sess, "2026-04-18-demo-cccc-snapshot-090000.md", "claude-snapshot", "auto-logged", "s3")
+
+    result = json.loads(find_unsummarized_notes(str(vault), "claude-sessions", "demo"))
+    names = [Path(p).name for p in result["unsummarized"]]
+    # Snapshots before parent within the same session_id group
+    assert names.index("2026-04-18-demo-cccc-snapshot-090000.md") < names.index("2026-04-18-demo-cccc.md")
+    assert names.index("2026-04-18-demo-cccc-snapshot-120000.md") < names.index("2026-04-18-demo-cccc.md")
