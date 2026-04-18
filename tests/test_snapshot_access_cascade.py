@@ -89,6 +89,68 @@ def test_log_access_with_broken_snapshot_backlink_is_tolerant(tmp_path):
     assert {r[0] for r in rows} == {str(snap)}
 
 
+def test_parent_session_resolved_with_single_quoted_wikilink(tmp_path):
+    """Regression for Copilot PR #43 finding: `source_session_note` regex
+    must accept single-quoted and unquoted wikilinks, not just double-quoted.
+    YAML allows all three and hand-edits may use any.
+    """
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    parent = sess / "2026-04-18-demo-eeee.md"
+    parent.write_text(
+        "---\ntype: claude-session\ndate: 2026-04-18\nsession_id: sq\n"
+        "project: demo\nstatus: summarized\n---\n\n# Session\n",
+        encoding="utf-8",
+    )
+    # Single-quoted wikilink — previously NOT matched by the regex
+    snap = sess / "2026-04-18-demo-eeee-snapshot-120000.md"
+    snap.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: sq\n"
+        "project: demo\nstatus: summarized\n"
+        "source_session_note: '[[2026-04-18-demo-eeee]]'\n"
+        "---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+    db_path = vault_index.ensure_index(
+        str(vault), ["claude-sessions"], db_path=str(tmp_path / "single.db")
+    )
+    vault_index._PARENT_CACHE.clear()
+
+    result = vault_index._parent_session_for_snapshot(str(snap), db_path)
+    assert result == str(parent), (
+        f"single-quoted wikilink should resolve to parent; got {result!r}"
+    )
+
+
+def test_parent_session_resolved_with_unquoted_wikilink(tmp_path):
+    """Unquoted wikilink form is also valid YAML; must resolve."""
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    parent = sess / "2026-04-18-demo-ffff.md"
+    parent.write_text(
+        "---\ntype: claude-session\ndate: 2026-04-18\nsession_id: uq\n"
+        "project: demo\nstatus: summarized\n---\n\n# Session\n",
+        encoding="utf-8",
+    )
+    snap = sess / "2026-04-18-demo-ffff-snapshot-120000.md"
+    snap.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: uq\n"
+        "project: demo\nstatus: summarized\n"
+        "source_session_note: [[2026-04-18-demo-ffff]]\n"
+        "---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+    db_path = vault_index.ensure_index(
+        str(vault), ["claude-sessions"], db_path=str(tmp_path / "unquoted.db")
+    )
+    vault_index._PARENT_CACHE.clear()
+
+    result = vault_index._parent_session_for_snapshot(str(snap), db_path)
+    assert result == str(parent)
+
+
 def test_log_access_transient_db_error_does_not_poison_cache(tmp_path):
     """A DB-open failure during parent resolution must not cache None permanently.
 

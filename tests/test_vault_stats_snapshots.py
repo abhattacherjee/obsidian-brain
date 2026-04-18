@@ -137,3 +137,35 @@ def test_compute_stats_corrupt_db_returns_error(tmp_path):
     corrupt.write_text("not a sqlite file", encoding="utf-8")
     payload = json.loads(vault_stats.compute_stats(str(corrupt), "demo"))
     assert "error" in payload
+
+
+def test_snapshot_stats_missing_trigger_folds_into_auto(tmp_path):
+    """Regression for Copilot PR #43 finding: a snapshot note with no
+    `trigger:` frontmatter field must NOT default into the compact bucket
+    (inflates compact counts and masks legacy/malformed notes). Fold into
+    'auto' instead, consistent with the unknown-value handling.
+    """
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    (sess / "2026-04-18-demo-aa.md").write_text(
+        "---\ntype: claude-session\ndate: 2026-04-18\nsession_id: s1\n"
+        "project: demo\n---\n\n# S\n",
+        encoding="utf-8",
+    )
+    # Snapshot has NO trigger: field
+    (sess / "2026-04-18-demo-aa-snapshot-120000.md").write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s1\n"
+        "project: demo\nstatus: auto-logged\n"
+        'source_session_note: "[[2026-04-18-demo-aa]]"\n'
+        "---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+    db = vault_index.ensure_index(
+        str(vault), ["claude-sessions"],
+        db_path=str(tmp_path / "missing_trigger.db"),
+    )
+    payload = json.loads(vault_stats.compute_stats(db, "demo"))
+    snap = payload["vault_wide"]["snapshots"]
+    assert snap["total_snapshots"] == 1
+    assert snap["by_trigger"] == {"compact": 0, "clear": 0, "auto": 1}

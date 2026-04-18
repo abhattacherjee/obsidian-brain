@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from obsidian_utils import (  # noqa: E402
+    extract_assistant_messages,
     extract_session_metadata,
     extract_user_messages,
     load_config,
@@ -37,8 +38,22 @@ from obsidian_utils import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def _build_snapshot_body(user_msgs: list[str], metadata: dict, trigger: str) -> str:
-    """Build the snapshot note body from raw message data."""
+def _build_snapshot_body(
+    user_msgs: list[str],
+    metadata: dict,
+    trigger: str,
+    assistant_msgs: list[str] | None = None,
+) -> str:
+    """Build the snapshot note body from raw message data.
+
+    Emits a trailing ``## Last messages (raw)`` section with alternating
+    ``**User:**`` / ``**Assistant:**`` lines so that the shared raw-fallback
+    parser in ``upgrade_unsummarized_note()`` can summarize a snapshot even
+    when its JSONL transcript is no longer available (e.g. the session has
+    been closed and the transcript garbage-collected).
+    """
+    if assistant_msgs is None:
+        assistant_msgs = []
     sections: list[str] = []
     project = metadata.get("project", "unknown")
 
@@ -78,6 +93,26 @@ def _build_snapshot_body(user_msgs: list[str], metadata: dict, trigger: str) -> 
     else:
         sections.append("No file modifications detected.")
     sections.append("")
+
+    # Raw-fallback section: interleave last N user + assistant messages so
+    # upgrade_unsummarized_note() can summarize from this file alone when
+    # the JSONL transcript is gone. Matches the section header consumed by
+    # the shared parser in obsidian_utils.py.
+    _RAW_TAIL = 6
+    recent_users = user_msgs[-_RAW_TAIL:] if len(user_msgs) > _RAW_TAIL else user_msgs
+    recent_asst = assistant_msgs[-_RAW_TAIL:] if len(assistant_msgs) > _RAW_TAIL else assistant_msgs
+    sections.append("## Last messages (raw)")
+    # Alternate as best we can — some sessions are user-heavy or assistant-heavy.
+    max_len = max(len(recent_users), len(recent_asst))
+    for i in range(max_len):
+        if i < len(recent_users):
+            clean = scrub_secrets(recent_users[i][:800].replace("\n", " "))
+            sections.append(f"**User:** {clean}")
+            sections.append("")
+        if i < len(recent_asst):
+            clean = scrub_secrets(recent_asst[i][:800].replace("\n", " "))
+            sections.append(f"**Assistant:** {clean}")
+            sections.append("")
 
     return "\n".join(sections)
 
@@ -200,6 +235,7 @@ def _run() -> None:
         return
 
     user_msgs = extract_user_messages(messages)
+    assistant_msgs = extract_assistant_messages(messages)
     metadata = extract_session_metadata(messages, cwd)
 
     # 5. Build snapshot note.
@@ -211,7 +247,8 @@ def _run() -> None:
     hhmmss = now.strftime("%H%M%S")
     project_slug = slugify(metadata.get("project", "session"))
 
-    body = _build_snapshot_body(user_msgs, metadata, trigger)
+    body = _build_snapshot_body(user_msgs, metadata, trigger,
+                                assistant_msgs=assistant_msgs)
     content = _build_snapshot_note(session_id, metadata, body, trigger, date_str=date_str)
 
     # 6. Write to vault with -snapshot-<HHMMSS> suffix (seconds-resolution avoids

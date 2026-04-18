@@ -8,6 +8,8 @@ slow subprocess calls like `claude -p` get killed when the process tree exits).
 Always exits 0.
 """
 
+from __future__ import annotations
+
 import datetime
 import json
 import os
@@ -179,16 +181,30 @@ def _run() -> None:
 
         # 4a. Discover sibling snapshots EARLY — their presence overrides
         # every threshold skip. Runs once; reused by both skip checks below.
-        date_str_for_glob = datetime.date.today().isoformat()
+        # Scan today AND yesterday so a session that spans midnight still
+        # finds snapshots written with the previous day's date prefix (Copilot
+        # PR #43 finding). The glob is keyed by date in find_snapshots_for_session;
+        # a single-day lookup would silently miss cross-midnight snapshots
+        # and both drop the threshold bypass and the back-reference list.
+        today = datetime.date.today()
+        candidate_dates = [
+            today.isoformat(),
+            (today - datetime.timedelta(days=1)).isoformat(),
+        ]
         sessions_dir = Path(vault_path) / sessions_folder
         # Use Path(cwd).name to handle trailing-slash cwd; then slugify to match
         # what extract_session_metadata() + make_filename() do canonically.
         early_project = slugify(Path(cwd).name) if cwd else ""
-        snapshots = (
-            find_snapshots_for_session(sessions_dir, session_id,
-                                       date_str_for_glob, early_project)
-            if early_project else []
-        )
+        snapshots: list[str] = []
+        if early_project:
+            seen: set[str] = set()
+            for d in candidate_dates:
+                for link in find_snapshots_for_session(
+                    sessions_dir, session_id, d, early_project
+                ):
+                    if link not in seen:
+                        seen.add(link)
+                        snapshots.append(link)
 
         # 5. Skip check (message count only)
         if should_skip_session(user_msgs, 0, min_messages=min_messages, min_duration=min_duration):
@@ -215,9 +231,13 @@ def _run() -> None:
         # preserves the early bypass when the canonical project diverges.
         canonical_project = metadata.get("project", "")
         if canonical_project and canonical_project != early_project:
-            canonical_hits = find_snapshots_for_session(
-                sessions_dir, session_id, date_str_for_glob, canonical_project
-            )
+            canonical_hits: list[str] = []
+            for d in candidate_dates:
+                canonical_hits.extend(
+                    find_snapshots_for_session(
+                        sessions_dir, session_id, d, canonical_project
+                    )
+                )
             # Merge, de-dupe, preserve chronological order (sorted wikilinks).
             snapshots = sorted(set(snapshots) | set(canonical_hits))
         metadata["snapshots"] = snapshots

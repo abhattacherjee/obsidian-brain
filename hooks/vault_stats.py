@@ -140,8 +140,10 @@ def _snapshot_stats(conn: sqlite3.Connection) -> dict:
             read_errors += 1
             continue
         tm = re.search(r"^trigger:\s*(\w+)", head, re.MULTILINE)
-        trigger = tm.group(1) if tm else "compact"
-        # Fold unknown triggers into 'auto'
+        # Missing `trigger:` and unknown values both fold into 'auto' —
+        # previously defaulted to 'compact' which inflated that bucket with
+        # legacy/malformed snapshots (Copilot PR #43 finding).
+        trigger = tm.group(1) if tm else "auto"
         if trigger not in _KNOWN_TRIGGERS:
             trigger = "auto"
         by_trigger[trigger] += 1

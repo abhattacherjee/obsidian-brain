@@ -699,7 +699,11 @@ def _parent_session_for_snapshot(note_path: str, db_path: str) -> str | None:
         _PARENT_CACHE[note_path] = None
         return None
 
-    m = re.search(r'^source_session_note:\s*"?\[\[([^\]"]+)\]\]"?',
+    # Accept double-quoted, single-quoted, AND unquoted wikilink values —
+    # YAML frontmatter allows all three and hand-edits may use any. Copilot
+    # PR #43 finding: stricter `"?...` regex silently failed on single-quoted
+    # values and poisoned the cache with None.
+    m = re.search(r"^source_session_note:\s*['\"]?\[\[([^\]'\"]+)\]\]['\"]?",
                   head, re.MULTILINE)
     if not m:
         _PARENT_CACHE[note_path] = None

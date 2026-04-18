@@ -275,3 +275,96 @@ def test_early_skip_bypass_is_independently_exercised(tmp_path, monkeypatch):
         f"step 5 early-bypass did not fire; found: "
         f"{[p.name for p in sessions.glob('*.md')]}"
     )
+
+
+def test_session_log_finds_yesterday_snapshot_across_midnight(tmp_path, monkeypatch):
+    """Regression for Copilot PR #43 finding: SessionEnd must scan today AND
+    yesterday's date prefix so day-spanning sessions don't lose their
+    pre-midnight snapshots' back-references.
+    """
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+
+    today = datetime.date.today()
+    yesterday = today - datetime.timedelta(days=1)
+
+    # Seed a snapshot dated yesterday for this session
+    yesterday_snap = sessions / f"{yesterday.isoformat()}-demo-abcd-snapshot-235030.md"
+    yesterday_snap.write_text(
+        f"---\ntype: claude-snapshot\ndate: {yesterday.isoformat()}\n"
+        "session_id: s1\nproject: demo\ntrigger: compact\n"
+        "status: auto-logged\n---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(sesslog, "load_config", lambda: {
+        "vault_path": str(vault),
+        "sessions_folder": "claude-sessions",
+        "min_messages": 99,  # force bypass-or-skip path
+        "min_duration_minutes": 0,
+        "auto_log_enabled": True,
+    })
+    monkeypatch.setattr(sesslog, "read_transcript", lambda path: [
+        {"type": "user", "message": {"content": "cross midnight"}},
+    ])
+    monkeypatch.setattr(sesslog, "extract_user_messages", lambda msgs: ["cross midnight"])
+    monkeypatch.setattr(sesslog, "extract_assistant_messages", lambda msgs: [])
+    monkeypatch.setattr(sesslog, "extract_tool_uses", lambda msgs: [])
+    monkeypatch.setattr(sesslog, "extract_session_metadata", lambda msgs, cwd: {
+        "project": "demo", "git_branch": "develop", "duration_minutes": 0,
+        "project_path": str(tmp_path), "files_touched": [], "errors": [],
+    })
+
+    demo_cwd = tmp_path / "demo"
+    demo_cwd.mkdir()
+    projects_dir = tmp_path / ".claude" / "projects" / "demo"
+    projects_dir.mkdir(parents=True)
+    transcript = projects_dir / "sess.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    stdin_json = json.dumps({
+        "session_id": "s1",
+        "cwd": str(demo_cwd),
+        "transcript_path": str(transcript),
+    })
+    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_json))
+
+    sesslog._run()
+
+    # Session note should land (threshold bypass fired because yesterday's
+    # snapshot was discovered via the candidate-dates loop) AND its
+    # snapshots: list must include yesterday's wikilink.
+    session_notes = [p for p in sessions.glob("*.md") if "-snapshot-" not in p.name]
+    assert len(session_notes) == 1, (
+        f"expected anchor session note across midnight; got: "
+        f"{[p.name for p in sessions.glob('*.md')]}"
+    )
+    content = session_notes[0].read_text(encoding="utf-8")
+    assert "snapshots:" in content
+    assert yesterday_snap.stem in content, (
+        f"yesterday's snapshot not back-referenced in session note:\n{content}"
+    )
+
+
+def test_snapshot_body_emits_last_messages_raw_section():
+    """Regression for Copilot PR #43 finding: snapshot bodies must include a
+    `## Last messages (raw)` section so `upgrade_unsummarized_note()`'s
+    raw-fallback parser can summarize a snapshot without the JSONL transcript.
+    """
+    metadata = {"project": "demo", "git_branch": "develop", "duration_minutes": 5}
+    body = snap._build_snapshot_body(
+        user_msgs=["hello there", "does this work?"],
+        metadata=metadata,
+        trigger="compact",
+        assistant_msgs=["yes, hi", "it sure does"],
+    )
+    # Exact section header the shared fallback parser looks for
+    assert "## Last messages (raw)" in body
+    # Must contain alternating User/Assistant lines in that section
+    raw_tail = body.split("## Last messages (raw)", 1)[1]
+    assert "**User:** hello there" in raw_tail
+    assert "**Assistant:** yes, hi" in raw_tail
+    assert "**User:** does this work?" in raw_tail
+    assert "**Assistant:** it sure does" in raw_tail
