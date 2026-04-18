@@ -1354,6 +1354,10 @@ def find_unsummarized_notes(
     filters by project, and checks for false positives (notes that already
     have a real ## Summary but stale status). Auto-fixes stale status inline.
 
+    Accepts notes of type ``claude-session`` and ``claude-snapshot``; rejects
+    other typed notes (e.g. ``claude-insight``). Legacy notes without a
+    ``type:`` field are accepted for backward compatibility.
+
     Returns JSON string: {"unsummarized": [paths], "auto_fixed": N}
     """
     sessions_dir = Path(vault_path) / sessions_folder

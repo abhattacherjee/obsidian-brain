@@ -13,6 +13,15 @@ def _fixture(sess_dir: Path, name: str, type_: str, status: str, session_id: str
     )
 
 
+def _fixture_no_type(sess_dir: Path, name: str, status: str, session_id: str):
+    p = sess_dir / name
+    p.write_text(
+        f"---\ndate: 2026-04-18\nsession_id: {session_id}\n"
+        f"project: demo\nstatus: {status}\n---\n\n# {name}\n",
+        encoding="utf-8",
+    )
+
+
 def test_find_unsummarized_picks_up_snapshots(tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"
@@ -50,3 +59,27 @@ def test_find_unsummarized_orders_snapshots_before_parent(tmp_path):
     # Snapshots before parent within the same session_id group
     assert names.index("2026-04-18-demo-cccc-snapshot-090000.md") < names.index("2026-04-18-demo-cccc.md")
     assert names.index("2026-04-18-demo-cccc-snapshot-120000.md") < names.index("2026-04-18-demo-cccc.md")
+
+
+def test_find_unsummarized_rejects_non_session_non_snapshot_types(tmp_path):
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    _fixture(sess, "2026-04-18-demo-dddd.md", "claude-session", "auto-logged", "s4")
+    _fixture(sess, "2026-04-18-demo-dddd-insight.md", "claude-insight", "auto-logged", "s4")
+
+    result = json.loads(find_unsummarized_notes(str(vault), "claude-sessions", "demo"))
+    names = [Path(p).name for p in result["unsummarized"]]
+    assert "2026-04-18-demo-dddd.md" in names
+    assert "2026-04-18-demo-dddd-insight.md" not in names
+
+
+def test_find_unsummarized_keeps_legacy_notes_without_type_field(tmp_path):
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+    _fixture_no_type(sess, "2026-04-18-demo-eeee-legacy.md", "auto-logged", "s5")
+
+    result = json.loads(find_unsummarized_notes(str(vault), "claude-sessions", "demo"))
+    names = [Path(p).name for p in result["unsummarized"]]
+    assert "2026-04-18-demo-eeee-legacy.md" in names
