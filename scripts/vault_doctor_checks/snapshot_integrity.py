@@ -183,6 +183,9 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
     for sid, sess in sessions_by_id.items():
         on_disk = sorted(snaps_by_session.get(sid, []))
         in_frontmatter = sess["fm"].get("snapshots") or []
+        if not isinstance(in_frontmatter, list):
+            # Inline YAML list parsed as string; skip stale detection (treat as missing).
+            in_frontmatter = []
 
         # Missing list
         if on_disk and not in_frontmatter:
@@ -252,17 +255,42 @@ def apply(issues, backup_root: str) -> list:
                     f'source_session_note: "{issue.proposed_source}"',
                     text, count=1,
                 )
+                if new_text == text:
+                    results.append(Result(
+                        check=issue.check, note_path=issue.note_path, status="skipped",
+                    ))
+                    continue
                 _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "snapshot-summary-status-mismatch":
                 new_status = "summarized" if "status=summarized" in issue.proposed_source else "auto-logged"
                 text = _read_text(issue.note_path) or ""
                 new_text = re.sub(r"(?m)^status:\s*\S+", f"status: {new_status}", text, count=1)
+                if new_text == text:
+                    results.append(Result(
+                        check=issue.check, note_path=issue.note_path, status="skipped",
+                    ))
+                    continue
                 _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "session-snapshot-list-missing":
                 text = _read_text(issue.note_path) or ""
                 wikilinks = sorted(issue.proposed_source.splitlines())
                 block = "snapshots:\n" + "\n".join(f'  - "{s}"' for s in wikilinks) + "\n"
-                new_text = re.sub(r"(?m)^status:", block + "status:", text, count=1)
+                new_text, n = re.subn(r"(?m)^status:", block + "status:", text, count=1)
+                if n == 0:
+                    # No status: line — insert before closing frontmatter fence.
+                    # The first --- starts frontmatter; the second --- closes it.
+                    parts = text.split("---\n", 2)
+                    if len(parts) < 3:
+                        raise RuntimeError(
+                            "could not locate frontmatter to insert snapshots block"
+                        )
+                    parts[1] = parts[1] + block
+                    new_text = "---\n".join(parts)
+                if new_text == text:
+                    results.append(Result(
+                        check=issue.check, note_path=issue.note_path, status="skipped",
+                    ))
+                    continue
                 _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "session-snapshot-list-stale":
                 text = _read_text(issue.note_path) or ""
@@ -274,7 +302,13 @@ def apply(issues, backup_root: str) -> list:
                     if any(s == f'- "{v}"' or s == f"- '{v}'" for v in stale):
                         continue
                     cleaned.append(line)
-                _write_atomic(issue.note_path, "".join(cleaned), backup_root, issue.check)
+                new_text = "".join(cleaned)
+                if new_text == text:
+                    results.append(Result(
+                        check=issue.check, note_path=issue.note_path, status="skipped",
+                    ))
+                    continue
+                _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             else:
                 results.append(Result(
                     check=issue.check, note_path=issue.note_path, status="skipped",
