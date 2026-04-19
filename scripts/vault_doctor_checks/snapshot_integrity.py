@@ -379,7 +379,15 @@ def apply(issues, backup_root: str) -> list:
                 cleaned: list[str] = []
                 for line in fm_lines:
                     s = line.strip()
-                    if any(s == f'- "{v}"' or s == f"- '{v}'" for v in stale):
+                    # Match all three forms: double-quoted, single-quoted, and
+                    # unquoted YAML scalar. ``_parse_fm`` strips quotes during
+                    # scan so ``- [[stem]]`` and ``- "[[stem]]"`` both register
+                    # as stale; the apply branch must drop both forms or
+                    # idempotency is an illusion (scan re-flags, apply no-ops).
+                    if any(
+                        s == f'- "{v}"' or s == f"- '{v}'" or s == f"- {v}"
+                        for v in stale
+                    ):
                         continue
                     cleaned.append(line)
                 new_fm = "".join(cleaned)

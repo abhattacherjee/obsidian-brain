@@ -239,17 +239,43 @@ def _atomic_write(path: str, text: str) -> None:
         raise
 
 
-def _rewrite_wikilinks_in_vault(vault_path: str, old_stem: str, new_stem: str) -> int:
+def _rewrite_wikilinks_in_vault(
+    vault_path: str,
+    old_stem: str,
+    new_stem: str,
+    exclude_dirs: list[str] | None = None,
+) -> int:
     """Find and replace [[<old_stem>]] with [[<new_stem>]] across the vault.
 
     Returns the number of files modified. Uses atomic writes per file.
     Raises ``RuntimeError`` if any read or write failed so the caller can
     roll back the rename and surface the error to the user.
+
+    ``exclude_dirs`` (e.g. the per-apply ``backup_root``) are skipped so
+    the rewrite cannot poison files OUTSIDE the live vault content. Real
+    callers and tests both place backups inside the vault tree, and
+    rewriting them would leave the backup pointing at the post-migration
+    stem — defeating the rollback guarantee.
     """
     count = 0
     failed: list[str] = []
     pattern = re.compile(r"\[\[" + re.escape(old_stem) + r"\]\]")
+    excluded_resolved: list[Path] = []
+    for d in exclude_dirs or []:
+        try:
+            excluded_resolved.append(Path(d).resolve())
+        except OSError:
+            continue
     for p in Path(vault_path).rglob("*.md"):
+        try:
+            p_resolved = p.resolve()
+        except OSError:
+            continue
+        if any(
+            excl == p_resolved or excl in p_resolved.parents
+            for excl in excluded_resolved
+        ):
+            continue
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
@@ -313,7 +339,15 @@ def apply(issues, backup_root):
                 # at a non-existent dst.
                 os.rename(str(src), str(dst))
                 try:
-                    _rewrite_wikilinks_in_vault(vault_root, src.stem, dst.stem)
+                    # Exclude backup_root so the just-created backup copy
+                    # (which lives under <backup_root>/snapshot-legacy-filename/)
+                    # does NOT have its [[old-stem]] reference rewritten —
+                    # backups must reflect the pre-migration state to remain
+                    # useful for rollback.
+                    _rewrite_wikilinks_in_vault(
+                        vault_root, src.stem, dst.stem,
+                        exclude_dirs=[backup_root],
+                    )
                 except Exception:
                     # Roll back the rename so the vault stays consistent
                     try:

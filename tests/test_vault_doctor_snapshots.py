@@ -534,3 +534,43 @@ def test_apply_backup_path_points_to_backup_file_not_directory(tmp_path):
     backup_path = Path(results[0].backup_path)
     assert backup_path.is_file(), f"backup_path is not a file: {backup_path}"
     assert backup_path.name == "2026-04-18-demo-aa-snapshot-120000.md"
+
+
+def test_stale_apply_handles_unquoted_yaml_list_items(tmp_path):
+    """Copilot round-3 regression: apply must remove stale entries written
+    as unquoted YAML scalars.
+
+    ``_parse_fm`` strips surrounding quotes during scan, so ``- [[stem]]``
+    (unquoted YAML scalar) and ``- "[[stem]]"`` both register as the same
+    snapshot value. The prior apply branch only matched the quoted forms,
+    so unquoted stale entries scanned as stale but applied as no-op —
+    creating an idempotency illusion (status='skipped') while leaving the
+    stale wikilink in place.
+    """
+    vault = tmp_path; sess = vault / "claude-sessions"; sess.mkdir()
+    stale_stem = "2026-04-18-demo-uu-snapshot-999999"
+    # Note the UNQUOTED list item form: `- [[...]]` instead of `- "[[...]]"`
+    (sess / "2026-04-18-demo-uu.md").write_text(
+        f'---\ntype: claude-session\ndate: 2026-04-18\nsession_id: sU\nproject: demo\n'
+        f'snapshots:\n  - [[{stale_stem}]]\n  - [[2026-04-18-demo-uu-snapshot-100000]]\n'
+        f'status: summarized\n---\n\n# S\n',
+        encoding="utf-8",
+    )
+    _write_snapshot(sess / "2026-04-18-demo-uu-snapshot-100000.md", "sU",
+                    "2026-04-18-demo-uu")
+    issues = snapshot_integrity.scan(
+        str(vault), "claude-sessions", "claude-insights", 30
+    )
+    stale = [i for i in issues if i.check == "session-snapshot-list-stale"]
+    assert len(stale) == 1
+    results = snapshot_integrity.apply(stale, str(tmp_path / "backup"))
+    assert results[0].status == "applied", (
+        f"unquoted stale entry should be pruned, got: {results[0].status} "
+        f"({results[0].error!r})"
+    )
+    text = (sess / "2026-04-18-demo-uu.md").read_text(encoding="utf-8")
+    fm = text.split("---\n", 2)[1]
+    # Unquoted stale entry pruned from frontmatter
+    assert stale_stem not in fm
+    # Live entry preserved
+    assert "2026-04-18-demo-uu-snapshot-100000" in fm

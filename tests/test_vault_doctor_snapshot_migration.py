@@ -538,3 +538,67 @@ def test_apply_backup_path_points_to_backup_file_not_directory(tmp_path):
     backup_path = Path(results[0].backup_path)
     assert backup_path.is_file(), f"backup_path is not a file: {backup_path}"
     assert backup_path.name == "2026-04-18-demo-bb-snapshot-120000.md"
+
+
+def test_rename_does_not_rewrite_wikilinks_in_backup_dir(tmp_path):
+    """Copilot round-3 regression: backup file must retain pre-migration
+    wikilink stem.
+
+    ``_rewrite_wikilinks_in_vault`` walks ``vault_root.rglob("*.md")``.
+    If ``backup_root`` lives inside the vault (tests place it under
+    ``tmp_path``; real callers may too), the just-created backup copy
+    has its ``[[old-stem]]`` references rewritten to ``[[new-stem]]`` —
+    making the backup useless for rollback. The fix excludes
+    ``backup_root`` from the rglob walk.
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    insights = tmp_path / "claude-insights"; insights.mkdir()
+    # Snapshot whose BODY references its own stem (e.g. cross-snapshot
+    # link previously inserted by hand or by a sibling snapshot's
+    # references). After rename, the LIVE file is rewritten — but the
+    # backup copy MUST NOT be.
+    legacy_path = sess / "2026-04-18-demo-bk-snapshot.md"
+    legacy_body = (
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: sBK\n"
+        "project: demo\ntrigger: compact\n---\n\n# Snap\n\n"
+        "self-ref: [[2026-04-18-demo-bk-snapshot]]\n"
+    )
+    legacy_path.write_text(legacy_body, encoding="utf-8")
+    dt = datetime.datetime.fromisoformat("2026-04-18T14:30:27")
+    os.utime(legacy_path, (dt.timestamp(), dt.timestamp()))
+    _write_session(sess / "2026-04-18-demo-bk.md", session_id="sBK")
+    # External insight that also references the legacy stem — proves the
+    # live rewrite still works (regression guard against over-exclusion).
+    (insights / "ref.md").write_text(
+        "---\ntype: claude-insight\n---\n\nrefs [[2026-04-18-demo-bk-snapshot]]\n",
+        encoding="utf-8",
+    )
+
+    backup_root = tmp_path / "backup"  # Inside the vault — exercises the bug surface.
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650
+    )
+    legacy = [i for i in issues if i.check == "snapshot-legacy-filename"]
+    assert len(legacy) == 1
+    snapshot_migration.apply(legacy, str(backup_root))
+
+    # 1. Live insight file IS rewritten to new stem (live rewrite still works).
+    insight_text = (insights / "ref.md").read_text(encoding="utf-8")
+    assert "[[2026-04-18-demo-bk-snapshot-143027]]" in insight_text
+    assert "[[2026-04-18-demo-bk-snapshot]]" not in insight_text
+
+    # 2. Live (renamed) snapshot file IS rewritten to new stem.
+    new_path = sess / "2026-04-18-demo-bk-snapshot-143027.md"
+    assert new_path.is_file()
+    new_text = new_path.read_text(encoding="utf-8")
+    assert "self-ref: [[2026-04-18-demo-bk-snapshot-143027]]" in new_text
+
+    # 3. Backup copy MUST retain the OLD stem reference — backups are useless
+    #    for rollback if they're rewritten alongside the live vault.
+    backup_files = list((backup_root / "snapshot-legacy-filename").iterdir())
+    assert len(backup_files) == 1
+    backup_text = backup_files[0].read_text(encoding="utf-8")
+    assert "self-ref: [[2026-04-18-demo-bk-snapshot]]" in backup_text, (
+        "backup must NOT be rewritten — got: " + repr(backup_text)
+    )
+    assert "[[2026-04-18-demo-bk-snapshot-143027]]" not in backup_text
