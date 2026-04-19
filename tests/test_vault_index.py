@@ -391,7 +391,7 @@ class TestRebuildIndex:
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
 
         # Production stores absolute paths in both notes.path and access_log.note_path
-        abs_path = str(note1.resolve())
+        abs_path = str(note1)
         conn = sqlite3.connect(db_path)
         conn.execute(
             "INSERT INTO access_log (note_path, timestamp, context_type, project) "
@@ -405,7 +405,7 @@ class TestRebuildIndex:
             str(tmp_vault), ["claude-sessions"], db_path=db_path
         )
 
-        assert stats["mode"] if "mode" in stats else True  # stats.preserved present
+        assert "preserved" in stats
         assert stats["preserved"]["access_log"] == 1
         assert stats["pruned_orphans"]["access_log"] == 0
 
@@ -427,7 +427,7 @@ class TestRebuildIndex:
         db_path = str(tmp_vault / "test.db")
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
 
-        abs1, abs2 = str(note1.resolve()), str(note2.resolve())
+        abs1, abs2 = str(note1), str(note2)
         conn = sqlite3.connect(db_path)
         for p in (abs1, abs2):
             conn.execute(
@@ -464,7 +464,7 @@ class TestRebuildIndex:
         db_path = str(tmp_vault / "test.db")
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
 
-        abs_path = str(note1.resolve())
+        abs_path = str(note1)
         conn = sqlite3.connect(db_path)
         conn.execute(
             "INSERT INTO themes (name, summary, centroid, note_count, "
@@ -510,11 +510,12 @@ class TestRebuildIndex:
         db_path = str(tmp_vault / "test.db")
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
 
+        abs_keeper = str(note1)
         conn = sqlite3.connect(db_path)
         conn.execute(
             "INSERT INTO access_log (note_path, timestamp, context_type, project) "
             "VALUES (?, ?, ?, ?)",
-            ("keeper.md", 1000.0, "recall", "proj"),
+            (abs_keeper, 1000.0, "recall", "proj"),
         )
         conn.execute(
             "INSERT INTO themes (name, summary, created_date, updated_date) "
@@ -528,13 +529,21 @@ class TestRebuildIndex:
             str(tmp_vault), ["claude-sessions"], db_path=db_path, full=True
         )
 
-        # Full mode: no 'preserved' key (destructive)
+        # Full mode: no 'preserved' or 'pruned_orphans' keys (destructive)
         assert "preserved" not in stats
+        assert "pruned_orphans" not in stats
 
         conn = sqlite3.connect(db_path)
+        # Verify tables exist by name (not just that row counts are 0)
+        tables = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+            ).fetchall()
+        }
         access_count = conn.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
         themes_count = conn.execute("SELECT COUNT(*) FROM themes").fetchone()[0]
         conn.close()
+        assert {"access_log", "themes", "theme_members", "notes", "term_df"} <= tables
         assert access_count == 0
         assert themes_count == 0
 
@@ -581,6 +590,231 @@ class TestRebuildIndex:
 
         assert stats["inserted"] == 1
         assert os.path.isfile(db_path)
+
+    def test_rebuild_default_rolls_back_on_sync_failure(self, tmp_vault, monkeypatch):
+        """If _sync raises mid-rebuild, access_log survives and is not pruned."""
+        note1 = tmp_vault / "claude-sessions" / "keeper.md"
+        _write_note(
+            note1,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# K\n\nBody.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        abs_keeper = str(note1)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+            "VALUES (?, ?, ?, ?)",
+            (abs_keeper, 1000.0, "recall", "proj"),
+        )
+        conn.commit()
+        conn.close()
+
+        # Make _sync raise after the destructive phase has started. The
+        # transaction wrapper must roll the DELETE FROM notes back so
+        # access_log rows are not orphaned on the next rebuild.
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated sync failure")
+        monkeypatch.setattr(vault_index, "_sync", _boom)
+
+        with pytest.raises(RuntimeError, match="simulated sync failure"):
+            vault_index.rebuild_index(
+                str(tmp_vault), ["claude-sessions"], db_path=db_path
+            )
+
+        # access_log must survive the rollback — the original note is still
+        # indexed, so its access row must not be treated as orphan.
+        conn = sqlite3.connect(db_path)
+        access_rows = conn.execute(
+            "SELECT note_path FROM access_log"
+        ).fetchall()
+        notes_rows = conn.execute("SELECT path FROM notes").fetchall()
+        conn.close()
+        assert len(access_rows) == 1
+        assert access_rows[0][0] == abs_keeper
+        # notes must still contain the keeper — the DELETE FROM notes
+        # was rolled back alongside the _sync failure.
+        assert len(notes_rows) == 1
+
+    def test_rebuild_default_prunes_orphan_theme_members(self, tmp_vault):
+        """theme_members rows for deleted notes are pruned and reported."""
+        note1 = tmp_vault / "claude-sessions" / "keeper.md"
+        note2 = tmp_vault / "claude-sessions" / "deleted.md"
+        for n in (note1, note2):
+            _write_note(
+                n,
+                {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+                body="# N\n\nBody.",
+            )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        abs_keeper = str(note1)
+        abs_deleted = str(note2)
+        conn = sqlite3.connect(db_path)
+        # note_count=2 matches the 2 members below. Required so _delete_note's
+        # "last member" branch (count <= 1) doesn't cascade-drop the surviving
+        # keeper row when note2 is removed.
+        conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date) VALUES (?, ?, ?, ?, ?, ?)",
+            ("t", "s", '{}', 2, "2026-04-10", "2026-04-10"),
+        )
+        theme_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for p in (abs_keeper, abs_deleted):
+            conn.execute(
+                "INSERT INTO theme_members (theme_id, note_path, similarity, "
+                "surprise, added_date) VALUES (?, ?, ?, ?, ?)",
+                (theme_id, p, 0.9, 0.3, "2026-04-10"),
+            )
+        conn.commit()
+        conn.close()
+
+        note2.unlink()
+        stats = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path
+        )
+
+        assert stats["preserved"]["theme_members"] == 1
+        assert stats["pruned_orphans"]["theme_members"] == 1
+
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("SELECT note_path FROM theme_members").fetchall()
+        conn.close()
+        assert len(rows) == 1
+        assert rows[0][0] == abs_keeper
+
+    def test_rebuild_default_skips_prune_on_path_format_drift(
+        self, tmp_vault, capsys
+    ):
+        """A relative path in access_log triggers defensive skip, not silent purge."""
+        note1 = tmp_vault / "claude-sessions" / "keeper.md"
+        _write_note(
+            note1,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# K\n\nBody.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        # Insert a relative-path row — simulates a caller that violated
+        # the absolute-path invariant. The orphan JOIN would classify this
+        # as orphan and delete it if unguarded.
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+            "VALUES (?, ?, ?, ?)",
+            ("claude-sessions/keeper.md", 1000.0, "recall", "proj"),
+        )
+        conn.commit()
+        conn.close()
+
+        stats = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path
+        )
+
+        # Defensive skip fires — no rows pruned
+        assert stats["pruned_orphans"]["access_log"] == 0
+        # The relative-path row survives
+        conn = sqlite3.connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
+        conn.close()
+        assert count == 1
+
+        captured = capsys.readouterr()
+        assert "path-format drift" in captured.err
+
+    def test_rebuild_default_on_pre_body_column_db_falls_through(self, tmp_vault):
+        """Legacy DB lacking body column falls through to full rebuild."""
+        note1 = tmp_vault / "claude-sessions" / "n.md"
+        _write_note(
+            note1,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# N\n\nBody.",
+        )
+        db_path = str(tmp_vault / "legacy.db")
+
+        # Build a legacy-shaped DB manually: notes table with no body column.
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE notes (
+                rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT UNIQUE NOT NULL,
+                type TEXT,
+                date TEXT,
+                project TEXT,
+                title TEXT DEFAULT '',
+                tags TEXT DEFAULT '',
+                session_id TEXT,
+                importance INTEGER DEFAULT 5
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        # Preserve-mode call should detect the missing body column and
+        # fall through to a full rebuild instead of crashing in _sync.
+        stats = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path
+        )
+        assert stats["inserted"] == 1
+
+        conn = sqlite3.connect(db_path)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(notes)").fetchall()}
+        conn.close()
+        assert "body" in cols
+
+    def test_rebuild_stats_shape_contract(self, tmp_vault):
+        """Both modes return a stable stats dict with expected keys."""
+        note1 = tmp_vault / "claude-sessions" / "n.md"
+        _write_note(
+            note1,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# N\n\nBody.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        preserve_stats = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path
+        )
+        # Preserve mode must carry all three contract groups
+        assert set(preserve_stats) >= {
+            "inserted", "skipped", "by_type",
+            "preserved", "pruned_orphans",
+        }
+        assert set(preserve_stats["preserved"]) == {
+            "access_log", "themes", "theme_members"
+        }
+        assert set(preserve_stats["pruned_orphans"]) == {
+            "access_log", "theme_members",
+        }
+
+        full_stats = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path, full=True
+        )
+        # Full mode must carry only the base contract, not preservation keys
+        assert set(full_stats) >= {"inserted", "skipped", "by_type"}
+        assert "preserved" not in full_stats
+        assert "pruned_orphans" not in full_stats
+
+    def test_rebuild_empty_vault(self, tmp_vault):
+        """rebuild_index on a vault with zero matching notes does not raise."""
+        db_path = str(tmp_vault / "test.db")
+        # Both modes must produce a zero-row index without error.
+        stats_full = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path, full=True
+        )
+        assert stats_full["inserted"] == 0
+        assert stats_full["by_type"] == {}
+
+        stats_preserve = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path
+        )
+        assert stats_preserve["inserted"] == 0
+        assert stats_preserve["preserved"]["access_log"] == 0
 
 
 class TestIndexNote:

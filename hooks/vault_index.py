@@ -872,8 +872,11 @@ def rebuild_index(
         for suffix in ("", "-wal", "-shm"):
             try:
                 os.remove(db_path + suffix)
-            except OSError:
+            except FileNotFoundError:
                 pass
+            # Any other OSError (PermissionError, IsADirectoryError, EBUSY,
+            # read-only filesystem, etc.) must surface — a silently-failed
+            # remove would leave stale state for _init_schema to run against.
 
         conn = _connect(db_path)
         try:
@@ -894,6 +897,17 @@ def rebuild_index(
                 _add_tfidf_vector_column(conn)
             _ensure_theme_indexes(conn)
 
+            # Pre-body-column DBs require a full rebuild; _sync would crash
+            # on the missing column. Fall through to full=True path.
+            if _needs_body_migration(conn):
+                print(
+                    f"[vault-index] Preserve-mode rebuild saw legacy schema "
+                    f"(missing body column); falling through to full rebuild",
+                    file=sys.stderr,
+                )
+                conn.close()
+                return rebuild_index(vault_path, folders, db_path=db_path, full=True)
+
             before_access = conn.execute(
                 "SELECT COUNT(*) FROM access_log"
             ).fetchone()[0]
@@ -904,35 +918,99 @@ def rebuild_index(
                 "SELECT COUNT(*) FROM theme_members"
             ).fetchone()[0]
 
-            # Contentless FTS5 (content='') doesn't support DELETE FROM or
-            # the 'delete-all' command; drop the virtual table so
-            # _init_schema recreates it empty, then clear notes + term_df.
-            conn.execute("DROP TABLE IF EXISTS notes_fts")
-            conn.execute("DELETE FROM notes")
-            conn.execute("DELETE FROM term_df")
-            conn.commit()
-            _init_schema(conn)
+            # Step 1: Targeted cleanup — drop rows whose paths are OUTSIDE
+            # all scanned roots (pytest fixture pollution, stale-mounted
+            # vaults, etc.). _sync itself skips these because they're not
+            # under any folder it's responsible for. Done in a short
+            # explicit transaction so its rollback is self-contained.
+            vault_p = Path(vault_path)
+            scanned_roots = [vault_p / f for f in folders]
+            foreign = [
+                row[0]
+                for row in conn.execute("SELECT path FROM notes").fetchall()
+                if not any(
+                    _is_under(Path(row[0]), root) for root in scanned_roots
+                )
+            ]
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for abs_path in foreign:
+                    _delete_note(conn, abs_path)
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
 
+            # Step 2: Incremental re-sync from disk. _sync wraps its own
+            # pass in BEGIN IMMEDIATE with commit/rollback, so a mid-loop
+            # failure leaves access_log (which we haven't touched) and
+            # the preserved rows from Step 1 intact.
             stats = _sync(conn, vault_path, folders)
 
-            pruned_access = conn.execute(
-                "DELETE FROM access_log "
-                "WHERE note_path NOT IN (SELECT path FROM notes)"
-            ).rowcount
-            pruned_members = conn.execute(
-                "DELETE FROM theme_members "
-                "WHERE note_path NOT IN (SELECT path FROM notes)"
-            ).rowcount
-            conn.commit()
+            # Step 3: Orphan prune for access_log / theme_members. Path-
+            # format invariant: both access_log.note_path and notes.path
+            # must store absolute paths. A caller that wrote relative
+            # paths would, without this guard, have every such row
+            # classified as orphan and silently purged. Sample the
+            # about-to-be-deleted rows; if any look non-absolute, log
+            # and skip rather than bulk-delete.
+            sample = conn.execute(
+                "SELECT note_path FROM access_log "
+                "WHERE note_path NOT IN (SELECT path FROM notes) "
+                "LIMIT 5"
+            ).fetchall()
+            suspicious = [
+                row[0] for row in sample if not row[0].startswith("/")
+            ]
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if suspicious:
+                    print(
+                        f"[vault-index] rebuild_index: path-format drift — "
+                        f"{len(suspicious)} of {len(sample)} sampled "
+                        f"access_log rows use non-absolute paths "
+                        f"({suspicious!r}); skipping orphan prune to "
+                        f"avoid mass data loss",
+                        file=sys.stderr,
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM access_log "
+                        "WHERE note_path NOT IN (SELECT path FROM notes)"
+                    )
+                    conn.execute(
+                        "DELETE FROM theme_members "
+                        "WHERE note_path NOT IN (SELECT path FROM notes)"
+                    )
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
 
+            # Report preserved/pruned counts from the actual after-state
+            # rather than deleted rowcount. _sync and _delete_note also
+            # remove theme_members rows when their parent note is deleted,
+            # so a simple rowcount would undercount by missing those.
+            after_access = conn.execute(
+                "SELECT COUNT(*) FROM access_log"
+            ).fetchone()[0]
+            after_members = conn.execute(
+                "SELECT COUNT(*) FROM theme_members"
+            ).fetchone()[0]
             stats["preserved"] = {
-                "access_log": before_access - pruned_access,
+                "access_log": after_access,
                 "themes": before_themes,
-                "theme_members": before_members - pruned_members,
+                "theme_members": after_members,
             }
             stats["pruned_orphans"] = {
-                "access_log": pruned_access,
-                "theme_members": pruned_members,
+                "access_log": before_access - after_access,
+                "theme_members": before_members - after_members,
             }
         finally:
             conn.close()
