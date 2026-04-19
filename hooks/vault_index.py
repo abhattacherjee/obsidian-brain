@@ -960,19 +960,28 @@ def rebuild_index(
             stats = _sync(conn, vault_path, folders)
 
             # Step 3: Orphan prune for access_log / theme_members. Path-
-            # format invariant: both access_log.note_path and notes.path
-            # must store absolute paths. A caller that wrote relative
-            # paths would, without this guard, have every such row
-            # classified as orphan and silently purged. Sample the
-            # about-to-be-deleted rows; if any look non-absolute, log
-            # and skip rather than bulk-delete.
-            sample = conn.execute(
+            # format invariant: note_path columns and notes.path must all
+            # store absolute paths. A caller that wrote relative paths
+            # would, without this guard, have every such row classified
+            # as orphan and silently purged. Sample the about-to-be-
+            # deleted rows across BOTH tables — a drift in theme_members
+            # alone (while access_log stays clean) would still cause
+            # irreversible Friston data loss through the theme_members
+            # DELETE below. Use os.path.isabs() rather than startswith("/")
+            # so the check stays platform-correct.
+            access_sample = conn.execute(
                 "SELECT note_path FROM access_log "
                 "WHERE note_path NOT IN (SELECT path FROM notes) "
                 "LIMIT 5"
             ).fetchall()
+            member_sample = conn.execute(
+                "SELECT note_path FROM theme_members "
+                "WHERE note_path NOT IN (SELECT path FROM notes) "
+                "LIMIT 5"
+            ).fetchall()
+            sample = access_sample + member_sample
             suspicious = [
-                row[0] for row in sample if not row[0].startswith("/")
+                row[0] for row in sample if not os.path.isabs(row[0])
             ]
             try:
                 conn.execute("BEGIN IMMEDIATE")

@@ -622,8 +622,17 @@ class TestRebuildIndex:
         assert stats["inserted"] == 1
         assert os.path.isfile(db_path)
 
-    def test_rebuild_default_rolls_back_on_sync_failure(self, tmp_vault, monkeypatch):
-        """If _sync raises mid-rebuild, access_log survives and is not pruned."""
+    def test_rebuild_default_on_sync_failure_preserves_friston(self, tmp_vault, monkeypatch):
+        """When _sync raises, rebuild_index propagates without touching Friston tables.
+
+        This test covers the rebuild_index()-level contract only: access_log
+        is never touched before Step 3 (orphan prune), so a _sync failure
+        cannot orphan its rows. It does NOT exercise _sync's internal
+        transactional rollback — that is covered by the TestSync unit tests
+        (test_sync_rollback_on_partial_failure). Here we mock _sync to raise
+        immediately and verify rebuild_index() fails cleanly with Friston
+        state intact.
+        """
         note1 = tmp_vault / "claude-sessions" / "keeper.md"
         _write_note(
             note1,

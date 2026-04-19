@@ -13,8 +13,8 @@ Regenerates the `notes` and `notes_fts` tables from on-disk state. Use when the 
 
 ## Modes
 
-- **Default (`/vault-reindex`)** — non-destructive. Clears and rebuilds `notes`, `notes_fts`, and `term_df` from disk. **Preserves** `access_log` (ACT-R activation history), `themes`, and `theme_members` (cluster centroids + surprise scores). Orphaned rows referencing note paths that no longer exist are pruned.
-- **`/vault-reindex --full`** — destructive. Deletes the entire `~/.claude/obsidian-brain-vault.db` file and rebuilds from an empty schema. Every Friston field is lost. Only needed when the schema is corrupt or incompatible.
+- **Default (`/vault-reindex`)** — non-destructive. Reconciles the note index with current vault contents via an mtime-incremental sync: newly added notes get indexed, notes deleted from disk are removed, rows with paths outside the current scanned folders (pytest pollution, stale mounts) are cleaned up. **Preserves** `access_log` (ACT-R activation history), `themes`, and `theme_members` (cluster centroids + surprise scores). Orphaned rows whose note paths are no longer in scope are pruned. **Does not** re-tokenise unchanged notes or rebuild FTS/term_df for them — if an existing row is internally corrupted but its on-disk mtime hasn't changed, only `--full` will fix it.
+- **`/vault-reindex --full`** — destructive. Deletes the entire `~/.claude/obsidian-brain-vault.db` file and rebuilds from an empty schema. Every Friston field is lost. Required when the schema is corrupt/incompatible or when derivable tables need a clean-slate rebuild.
 
 ## Procedure
 
@@ -120,7 +120,7 @@ Only include rows in the table for types that appear in `by_type` (omit zero-cou
 > - `themes`: `<themes>` cluster(s)
 > - `theme_members`: `<theme_members>` assignment(s)
 >
-> Pruned `<pruned_access_log>` orphaned access-log row(s) and `<pruned_theme_members>` orphaned theme-member row(s) referencing notes no longer on disk.
+> Pruned `<pruned_access_log>` orphaned access-log row(s) and `<pruned_theme_members>` orphaned theme-member row(s) referencing notes no longer in the current index scope (either deleted from disk or outside the scanned folders).
 
 If both pruned counts are 0, replace the pruning line with `No orphan rows to prune.`.
 
