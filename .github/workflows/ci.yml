@@ -70,6 +70,18 @@ jobs:
       - name: Run tests with coverage
         run: pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90
 
+  # ── DB-pollution guard — blocks bare ensure_index() in tests (GH #46) ─
+  no-default-db-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Assert every DB-opening call in tests/ passes db_path
+        run: python3 scripts/ci-checks/no-default-db.py
+
   # ── Security tests — runs on all PRs ──────────────────────────
   security-tests:
     if: github.event_name == 'pull_request'

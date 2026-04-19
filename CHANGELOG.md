@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **tests**: Four `test_standup_deep.py` cases (`TestFtsScopingPerProject`, `TestPipelineDirCreation`, `TestRepresentativeKey`, `TestEncodingCorruption`) passed no `db_path=` to `ensure_index()`/`deep_analysis_pipeline()`, silently writing fixture rows into the user's live `~/.claude/obsidian-brain-vault.db`. Each test now routes through an isolated `tmp_vault / "test.db"` (GH #46)
+
 ### Added
+- **ci**: `scripts/ci-checks/no-default-db.py` — AST-based guard that fails CI when any call to `ensure_index()`, `rebuild_index()`, or `deep_analysis_pipeline()` inside `tests/` omits `db_path=`. Wired as the `no-default-db-check` job in `.github/workflows/ci.yml`. Supports `# noqa: no-default-db` to suppress lines where the helper is runtime-mocked (GH #46)
 - **snapshots**: First-class mid-session checkpoint support. Snapshots now carry `status: auto-logged` (or `summarized`) and `source_session_note` wikilink frontmatter, use seconds-resolution filenames (`-snapshot-HHMMSS`), and are AI-summarized lazily at `/recall` time alongside session notes via a dedicated snapshot prompt
 - **session-end**: Threshold bypass — writes the session note even when the transcript is below `min_turns`/`min_duration_minutes` if sibling snapshots exist, so every snapshot has a navigable parent anchor. Emits a `snapshots: [...]` list when siblings are present
 - **recall**: `_augment_session_input_with_snapshots()` prepends snapshot summary bodies to the session summarization input so the generated summary describes the full pre- and post-compact arc cohesively
