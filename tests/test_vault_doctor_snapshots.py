@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from scripts.vault_doctor_checks import Issue, snapshot_integrity
 
 
@@ -50,7 +51,6 @@ def test_session_missing_snapshots_list_is_fixed(tmp_path):
     missing = [i for i in issues if i.check == "session-snapshot-list-missing"]
     assert len(missing) == 1
 
-    import os
     backup = tmp_path / "backup"
     snapshot_integrity.apply(missing, str(backup))
 
@@ -517,3 +517,20 @@ def test_crlf_frontmatter_is_parsed(tmp_path):
     assert any(i.check == "session-snapshot-list-missing" for i in issues), (
         "CRLF frontmatter must be normalised and detected"
     )
+
+
+def test_apply_backup_path_points_to_backup_file_not_directory(tmp_path):
+    """Regression: Result.backup_path must be the actual backup file, not the per-check directory."""
+    vault = tmp_path; sess = vault / "claude-sessions"; sess.mkdir()
+    _write_session(sess / "2026-04-18-demo-aa.md", "s1")
+    _write_snapshot(sess / "2026-04-18-demo-aa-snapshot-120000.md", "s1", "wrong-stem")
+    issues = snapshot_integrity.scan(str(vault), "claude-sessions", "claude-insights", 30)
+    broken = [i for i in issues if i.check == "snapshot-broken-backlink"]
+    backup_root = tmp_path / "backup"
+    results = snapshot_integrity.apply(broken, str(backup_root))
+    assert len(results) == 1
+    assert results[0].status == "applied"
+    # backup_path must be a file, not a directory
+    backup_path = Path(results[0].backup_path)
+    assert backup_path.is_file(), f"backup_path is not a file: {backup_path}"
+    assert backup_path.name == "2026-04-18-demo-aa-snapshot-120000.md"

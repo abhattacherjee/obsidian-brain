@@ -299,6 +299,7 @@ def apply(issues, backup_root):
             ))
             continue
         try:
+            backup: str | None = None
             if issue.check == "snapshot-legacy-filename":
                 src = Path(issue.note_path)
                 dst = src.parent / issue.extra["new_name"]
@@ -306,7 +307,7 @@ def apply(issues, backup_root):
                 # ``src.parents[1]`` for backwards compatibility with Issue
                 # objects constructed by older code paths.
                 vault_root = issue.extra.get("vault_path") or str(src.parents[1])
-                _backup_file(str(src), backup_root, issue.check)
+                backup = _backup_file(str(src), backup_root, issue.check)
                 # Rename FIRST so a wikilink-rewrite failure can roll back
                 # the filesystem move without leaving other files pointing
                 # at a non-existent dst.
@@ -323,14 +324,16 @@ def apply(issues, backup_root):
                 renamed_paths[str(src)] = str(dst)
                 renamed_stems[src.stem] = dst.stem
             elif issue.check == "snapshot-missing-status":
-                _backup_file(issue.note_path, backup_root, issue.check)
                 text = _read_text(issue.note_path) or ""
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
                     raise RuntimeError("could not locate frontmatter")
                 # Defensive re-check: if status: already exists in the
                 # frontmatter (stale Issue replay / race with another
-                # writer), treat as an idempotent no-op.
+                # writer), treat as an idempotent no-op. Run BEFORE the
+                # backup so a stale-Issue replay does not create a useless
+                # backup file (and avoids failing the apply for what
+                # should be a no-op when backup I/O errors).
                 if re.search(r"(?m)^status:", parts[1]):
                     results.append(Result(
                         check=issue.check, note_path=issue.note_path, status="skipped",
@@ -339,13 +342,14 @@ def apply(issues, backup_root):
                     continue
                 parts[1] = parts[1] + issue.proposed_source + "\n"
                 new_text = "---\n".join(parts)
+                backup = _backup_file(issue.note_path, backup_root, issue.check)
                 _atomic_write(issue.note_path, new_text)
             elif issue.check == "snapshot-missing-backlink":
-                _backup_file(issue.note_path, backup_root, issue.check)
                 text = _read_text(issue.note_path) or ""
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
                     raise RuntimeError("could not locate frontmatter")
+                # Idempotency BEFORE backup — see snapshot-missing-status above.
                 if re.search(r"(?m)^source_session_note:", parts[1]):
                     results.append(Result(
                         check=issue.check, note_path=issue.note_path, status="skipped",
@@ -354,9 +358,9 @@ def apply(issues, backup_root):
                     continue
                 parts[1] = parts[1] + issue.proposed_source + "\n"
                 new_text = "---\n".join(parts)
+                backup = _backup_file(issue.note_path, backup_root, issue.check)
                 _atomic_write(issue.note_path, new_text)
             elif issue.check == "session-missing-snapshots-list":
-                _backup_file(issue.note_path, backup_root, issue.check)
                 text = _read_text(issue.note_path) or ""
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
@@ -367,7 +371,8 @@ def apply(issues, backup_root):
                 # writer), treat as an idempotent no-op. Parity with the
                 # snapshot_integrity module — prevents duplicate
                 # snapshots: blocks when ^status: anchor injects above an
-                # existing list.
+                # existing list. Run BEFORE backup so stale-Issue replay
+                # does not produce a useless backup file.
                 if re.search(r"(?m)^snapshots:", fm):
                     results.append(Result(
                         check=issue.check, note_path=issue.note_path, status="skipped",
@@ -391,13 +396,14 @@ def apply(issues, backup_root):
                 if n == 0:
                     new_fm = fm + block
                 new_text = parts[0] + "---\n" + new_fm + "---\n" + parts[2]
+                backup = _backup_file(issue.note_path, backup_root, issue.check)
                 _atomic_write(issue.note_path, new_text)
             else:
                 results.append(Result(check=issue.check, note_path=issue.note_path, status="skipped"))
                 continue
             results.append(Result(
                 check=issue.check, note_path=issue.note_path, status="applied",
-                backup_path=str(Path(backup_root) / issue.check),
+                backup_path=backup,
             ))
         except Exception as exc:  # noqa: BLE001
             results.append(Result(

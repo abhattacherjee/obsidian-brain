@@ -490,3 +490,51 @@ def test_session_missing_snapshots_list_not_corrupted_by_body_status(tmp_path):
     fm = text.split("---\n", 2)[1]
     assert "snapshots:" in fm
     assert "2026-04-18-demo-bs-snapshot-100000" in fm
+
+
+def test_apply_skipped_does_not_create_backup(tmp_path):
+    """Regression: idempotent skip must not create a backup file (stale-Issue replay efficiency)."""
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    # Session already has snapshots: list (stale Issue replay scenario)
+    (sess / "2026-04-18-demo-zz.md").write_text(
+        '---\ntype: claude-session\ndate: 2026-04-18\nsession_id: zzzz\nproject: demo\n'
+        'snapshots:\n  - "[[2026-04-18-demo-zz-snapshot-100000]]"\n'
+        'status: summarized\n---\n\n# S\n',
+        encoding="utf-8",
+    )
+    _write_legacy_snapshot(sess / "2026-04-18-demo-zz-snapshot-100000.md", session_id="zzzz")
+    from scripts.vault_doctor_checks import Issue
+    stale_issue = Issue(
+        check="session-missing-snapshots-list",
+        note_path=str(sess / "2026-04-18-demo-zz.md"),
+        project="demo",
+        current_source="(no snapshots field)",
+        proposed_source="[[2026-04-18-demo-zz-snapshot-100000]]",
+        reason="stale replay",
+        confidence=0.98,
+    )
+    backup_root = tmp_path / "backup"
+    results = snapshot_migration.apply([stale_issue], str(backup_root))
+    assert results[0].status == "skipped"
+    # No backup file should exist for this skipped issue
+    backup_dir = backup_root / "session-missing-snapshots-list"
+    if backup_dir.exists():
+        assert not list(backup_dir.iterdir()), (
+            f"unexpected backup files: {list(backup_dir.iterdir())}"
+        )
+
+
+def test_apply_backup_path_points_to_backup_file_not_directory(tmp_path):
+    """Regression: Result.backup_path must be the actual backup file."""
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    _write_legacy_snapshot(sess / "2026-04-18-demo-bb-snapshot-120000.md", session_id="sB")
+    issues = snapshot_migration.scan(str(tmp_path), "claude-sessions", "claude-insights", 3650)
+    miss = [i for i in issues if i.check == "snapshot-missing-status"]
+    assert len(miss) == 1
+    backup_root = tmp_path / "backup"
+    results = snapshot_migration.apply(miss, str(backup_root))
+    assert results[0].status == "applied"
+    # The backup_path must point to the backup file
+    backup_path = Path(results[0].backup_path)
+    assert backup_path.is_file(), f"backup_path is not a file: {backup_path}"
+    assert backup_path.name == "2026-04-18-demo-bb-snapshot-120000.md"

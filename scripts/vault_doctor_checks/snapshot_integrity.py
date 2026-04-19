@@ -240,14 +240,20 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
     return issues
 
 
-def _write_atomic(path: str, text: str, backup_root: str, check_name: str) -> None:
-    """Write text to path atomically, backing up the original under backup_root."""
+def _write_atomic(path: str, text: str, backup_root: str, check_name: str) -> str | None:
+    """Write text to path atomically, backing up the original under backup_root.
+
+    Returns the backup file path if a backup was created (i.e. the target
+    file existed before the write); otherwise returns ``None``.
+    """
     import shutil, tempfile
     p = Path(path)
+    backup_path: Path | None = None
     if p.exists():
         bdir = Path(backup_root) / check_name
         bdir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(p, bdir / p.name)
+        backup_path = bdir / p.name
+        shutil.copy2(p, backup_path)
     fd, tmp = tempfile.mkstemp(prefix=".ob-doctor-", suffix=".md.tmp", dir=str(p.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -259,6 +265,7 @@ def _write_atomic(path: str, text: str, backup_root: str, check_name: str) -> No
         except OSError:
             pass
         raise
+    return str(backup_path) if backup_path is not None else None
 
 
 def apply(issues, backup_root: str) -> list:
@@ -271,6 +278,7 @@ def apply(issues, backup_root: str) -> list:
             ))
             continue
         try:
+            backup: str | None = None
             if issue.check == "snapshot-broken-backlink":
                 text = _read_text(issue.note_path) or ""
                 new_text, n = _replace_in_frontmatter(
@@ -291,7 +299,7 @@ def apply(issues, backup_root: str) -> list:
                         error=reason,
                     ))
                     continue
-                _write_atomic(issue.note_path, new_text, backup_root, issue.check)
+                backup = _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "snapshot-summary-status-mismatch":
                 new_status = "summarized" if "status=summarized" in issue.proposed_source else "auto-logged"
                 text = _read_text(issue.note_path) or ""
@@ -312,7 +320,7 @@ def apply(issues, backup_root: str) -> list:
                         error=reason,
                     ))
                     continue
-                _write_atomic(issue.note_path, new_text, backup_root, issue.check)
+                backup = _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "session-snapshot-list-missing":
                 text = _read_text(issue.note_path) or ""
                 parts = text.split("---\n", 2)
@@ -353,7 +361,7 @@ def apply(issues, backup_root: str) -> list:
                         error="frontmatter already contains the proposed snapshots block",
                     ))
                     continue
-                _write_atomic(issue.note_path, new_text, backup_root, issue.check)
+                backup = _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "session-snapshot-list-stale":
                 text = _read_text(issue.note_path) or ""
                 stale = issue.extra.get("stale", [])
@@ -382,7 +390,7 @@ def apply(issues, backup_root: str) -> list:
                         error="no stale entries found in frontmatter (already pruned?)",
                     ))
                     continue
-                _write_atomic(issue.note_path, new_text, backup_root, issue.check)
+                backup = _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             else:
                 results.append(Result(
                     check=issue.check, note_path=issue.note_path, status="skipped",
@@ -390,7 +398,7 @@ def apply(issues, backup_root: str) -> list:
                 continue
             results.append(Result(
                 check=issue.check, note_path=issue.note_path, status="applied",
-                backup_path=os.path.join(backup_root, issue.check),
+                backup_path=backup,
             ))
         except Exception as exc:  # noqa: BLE001
             results.append(Result(
