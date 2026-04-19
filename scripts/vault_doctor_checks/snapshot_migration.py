@@ -244,12 +244,20 @@ def _rewrite_wikilinks_in_vault(
     old_stem: str,
     new_stem: str,
     exclude_dirs: list[str] | None = None,
-) -> int:
+) -> tuple[int, list[str]]:
     """Find and replace [[<old_stem>]] with [[<new_stem>]] across the vault.
 
-    Returns the number of files modified. Uses atomic writes per file.
+    Returns ``(count, modified_paths)`` — the number of files modified and
+    the list of file paths that were actually rewritten. Uses atomic
+    writes per file.
+
     Raises ``RuntimeError`` if any read or write failed so the caller can
-    roll back the rename and surface the error to the user.
+    decide whether to roll back the upstream rename. The raised exception
+    has a ``modified_paths`` attribute attached carrying the list of files
+    that were successfully rewritten BEFORE the failure — callers use this
+    to distinguish "zero rewrites succeeded → safe to rollback rename"
+    from "partial success → rolling back would orphan the surviving
+    rewrites".
 
     ``exclude_dirs`` (e.g. the per-apply ``backup_root``) are skipped so
     the rewrite cannot poison files OUTSIDE the live vault content. Real
@@ -258,6 +266,7 @@ def _rewrite_wikilinks_in_vault(
     stem — defeating the rollback guarantee.
     """
     count = 0
+    modified: list[str] = []
     failed: list[str] = []
     pattern = re.compile(r"\[\[" + re.escape(old_stem) + r"\]\]")
     excluded_resolved: list[Path] = []
@@ -286,13 +295,20 @@ def _rewrite_wikilinks_in_vault(
             try:
                 _atomic_write(str(p), new_text)
                 count += 1
+                modified.append(str(p))
             except Exception as exc:  # noqa: BLE001
                 failed.append(f"{p}: {exc}")
     if failed:
-        raise RuntimeError(
+        err = RuntimeError(
             f"wikilink rewrite failed for {len(failed)} file(s): {failed[:3]}"
         )
-    return count
+        # Attach the list of files we DID successfully rewrite so the
+        # caller can decide whether to roll back the rename. Rolling back
+        # AFTER any successful rewrite would orphan those rewrites
+        # (they'd point at the now-missing post-rename file).
+        err.modified_paths = modified  # type: ignore[attr-defined]
+        raise err
+    return count, modified
 
 
 def apply(issues, backup_root):
@@ -316,33 +332,50 @@ def apply(issues, backup_root):
     renamed_stems: dict[str, str] = {}
     for issue in issues_sorted:
         # Redirect any path that was renamed earlier in this apply pass.
-        if issue.note_path in renamed_paths:
-            issue.note_path = renamed_paths[issue.note_path]
+        # We do NOT mutate ``issue.note_path`` — the Issue dataclass is
+        # shared with logging/diagnostics and callers may reuse it after
+        # apply(). All downstream reads in this loop go through
+        # ``effective_note_path`` instead.
+        effective_note_path = renamed_paths.get(issue.note_path, issue.note_path)
         if issue.extra.get("unresolved"):
             results.append(Result(
-                check=issue.check, note_path=issue.note_path, status="unresolved",
+                check=issue.check, note_path=effective_note_path, status="unresolved",
                 error=issue.reason,
             ))
             continue
         try:
             backup: str | None = None
-            # Default to the issue's own path; per-branch logic (e.g. legacy
+            # Default to the effective path; per-branch logic (e.g. legacy
             # rename) may override this so the trailing Result emission
-            # references the POST-mutation path. We do NOT mutate
-            # ``issue.note_path`` itself — the Issue dataclass is shared
-            # with logging/diagnostics and must remain pre-mutation.
-            result_note_path = issue.note_path
+            # references the POST-rename path on disk.
+            result_note_path = effective_note_path
             if issue.check == "snapshot-legacy-filename":
-                src = Path(issue.note_path)
+                src = Path(effective_note_path)
                 dst = src.parent / issue.extra["new_name"]
+                # Runtime collision guard: scan() also sets
+                # ``extra["unresolved"]=True`` when the target filename is
+                # already in use, but a synthetic Issue constructed
+                # without going through scan() (or a file appearing
+                # between scan and apply) would otherwise cause
+                # ``os.rename`` to silently overwrite ``dst`` on POSIX —
+                # destroying user data. Re-check at apply time.
+                if dst.exists():
+                    results.append(Result(
+                        check=issue.check, note_path=effective_note_path, status="unresolved",
+                        error=(
+                            f"runtime collision: target filename {dst.name} "
+                            f"already exists at apply time"
+                        ),
+                    ))
+                    continue
                 # Scan() stashed the resolved vault root; fall back to
                 # ``src.parents[1]`` for backwards compatibility with Issue
                 # objects constructed by older code paths.
                 vault_root = issue.extra.get("vault_path") or str(src.parents[1])
                 backup = _backup_file(str(src), backup_root, issue.check)
-                # Rename FIRST so a wikilink-rewrite failure can roll back
-                # the filesystem move without leaving other files pointing
-                # at a non-existent dst.
+                # Rename FIRST so a wikilink-rewrite failure can — when
+                # safe — roll back the filesystem move without leaving
+                # other files pointing at a non-existent dst.
                 os.rename(str(src), str(dst))
                 try:
                     # Exclude backup_root so the just-created backup copy
@@ -354,8 +387,40 @@ def apply(issues, backup_root):
                         vault_root, src.stem, dst.stem,
                         exclude_dirs=[backup_root],
                     )
+                except RuntimeError as exc:
+                    # If we already wrote some wikilinks before the
+                    # failure, do NOT roll back the rename. Rolling back
+                    # would orphan the surviving rewrites — they would
+                    # point at a missing file. Surface the partial state
+                    # via Result.error so the user can finish the
+                    # migration manually.
+                    partial = list(getattr(exc, "modified_paths", []) or [])
+                    if partial:
+                        results.append(Result(
+                            check=issue.check, note_path=str(dst), status="error",
+                            error=(
+                                f"rename succeeded; wikilink rewrite partially "
+                                f"failed after {len(partial)} successful rewrite(s) — "
+                                f"manual review needed: {exc}"
+                            ),
+                            backup_path=backup,
+                        ))
+                        # Still record the rename so subsequent issues in
+                        # this batch resolve to the new path/stem.
+                        renamed_paths[str(src)] = str(dst)
+                        renamed_stems[src.stem] = dst.stem
+                        continue
+                    # Zero rewrites succeeded — safe to roll back the
+                    # rename so the vault stays consistent.
+                    try:
+                        os.rename(str(dst), str(src))
+                    except OSError:
+                        pass
+                    raise
                 except Exception:
-                    # Roll back the rename so the vault stays consistent
+                    # Non-RuntimeError surprises: best-effort rollback
+                    # (we have no modified_paths signal here, so we err
+                    # on the side of rolling back).
                     try:
                         os.rename(str(dst), str(src))
                     except OSError:
@@ -368,7 +433,7 @@ def apply(issues, backup_root):
                 # path no longer exists after os.rename).
                 result_note_path = str(dst)
             elif issue.check == "snapshot-missing-status":
-                text = _read_text(issue.note_path) or ""
+                text = _read_text(effective_note_path) or ""
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
                     raise RuntimeError("could not locate frontmatter")
@@ -380,32 +445,32 @@ def apply(issues, backup_root):
                 # should be a no-op when backup I/O errors).
                 if re.search(r"(?m)^status:", parts[1]):
                     results.append(Result(
-                        check=issue.check, note_path=issue.note_path, status="skipped",
+                        check=issue.check, note_path=effective_note_path, status="skipped",
                         error="status field already present (stale Issue?)",
                     ))
                     continue
                 parts[1] = parts[1] + issue.proposed_source + "\n"
                 new_text = "---\n".join(parts)
-                backup = _backup_file(issue.note_path, backup_root, issue.check)
-                _atomic_write(issue.note_path, new_text)
+                backup = _backup_file(effective_note_path, backup_root, issue.check)
+                _atomic_write(effective_note_path, new_text)
             elif issue.check == "snapshot-missing-backlink":
-                text = _read_text(issue.note_path) or ""
+                text = _read_text(effective_note_path) or ""
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
                     raise RuntimeError("could not locate frontmatter")
                 # Idempotency BEFORE backup — see snapshot-missing-status above.
                 if re.search(r"(?m)^source_session_note:", parts[1]):
                     results.append(Result(
-                        check=issue.check, note_path=issue.note_path, status="skipped",
+                        check=issue.check, note_path=effective_note_path, status="skipped",
                         error="source_session_note already present (stale Issue?)",
                     ))
                     continue
                 parts[1] = parts[1] + issue.proposed_source + "\n"
                 new_text = "---\n".join(parts)
-                backup = _backup_file(issue.note_path, backup_root, issue.check)
-                _atomic_write(issue.note_path, new_text)
+                backup = _backup_file(effective_note_path, backup_root, issue.check)
+                _atomic_write(effective_note_path, new_text)
             elif issue.check == "session-missing-snapshots-list":
-                text = _read_text(issue.note_path) or ""
+                text = _read_text(effective_note_path) or ""
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
                     raise RuntimeError("could not locate frontmatter")
@@ -419,7 +484,7 @@ def apply(issues, backup_root):
                 # does not produce a useless backup file.
                 if re.search(r"(?m)^snapshots:", fm):
                     results.append(Result(
-                        check=issue.check, note_path=issue.note_path, status="skipped",
+                        check=issue.check, note_path=effective_note_path, status="skipped",
                         error="snapshots field already present in frontmatter (stale Issue?)",
                     ))
                     continue
@@ -440,10 +505,12 @@ def apply(issues, backup_root):
                 if n == 0:
                     new_fm = fm + block
                 new_text = parts[0] + "---\n" + new_fm + "---\n" + parts[2]
-                backup = _backup_file(issue.note_path, backup_root, issue.check)
-                _atomic_write(issue.note_path, new_text)
+                backup = _backup_file(effective_note_path, backup_root, issue.check)
+                _atomic_write(effective_note_path, new_text)
             else:
-                results.append(Result(check=issue.check, note_path=issue.note_path, status="skipped"))
+                results.append(Result(
+                    check=issue.check, note_path=effective_note_path, status="skipped",
+                ))
                 continue
             results.append(Result(
                 check=issue.check, note_path=result_note_path, status="applied",
@@ -451,11 +518,11 @@ def apply(issues, backup_root):
             ))
         except Exception as exc:  # noqa: BLE001
             results.append(Result(
-                check=issue.check, note_path=issue.note_path, status="error",
+                check=issue.check, note_path=effective_note_path, status="error",
                 error=f"{type(exc).__name__}: {exc}",
             ))
             print(
-                f"[vault_doctor] apply failed for {issue.note_path}:\n"
+                f"[vault_doctor] apply failed for {effective_note_path}:\n"
                 f"{traceback.format_exc()}",
                 file=sys.stderr,
             )

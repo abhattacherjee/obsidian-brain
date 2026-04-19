@@ -410,10 +410,11 @@ def test_rewrite_wikilinks_returns_zero_when_nothing_to_replace(tmp_path):
     """_rewrite_wikilinks_in_vault covers the non-match loop path."""
     vault = tmp_path
     (vault / "unrelated.md").write_text("no wikilinks here\n", encoding="utf-8")
-    count = snapshot_migration._rewrite_wikilinks_in_vault(
+    count, modified = snapshot_migration._rewrite_wikilinks_in_vault(
         str(vault), "nonexistent-stem", "new-stem"
     )
     assert count == 0
+    assert modified == []
 
 
 def test_missing_list_apply_skipped_when_snapshots_already_present(tmp_path):
@@ -624,3 +625,124 @@ def test_legacy_rename_result_points_to_post_rename_path(tmp_path):
     # The old path must NOT exist
     old_path = sess / "2026-04-18-demo-rn-snapshot.md"
     assert not old_path.exists()
+
+
+# ----- Copilot round-5 regression tests -----
+
+
+def test_legacy_rename_runtime_collision_guard(tmp_path):
+    """Round-5 regression: synthetic Issue must trigger the runtime
+    collision guard at apply() time.
+
+    scan() flags collisions via ``extra["unresolved"]=True``, but a
+    synthetic Issue constructed without going through scan() (or a file
+    that appears between scan and apply) would otherwise let
+    ``os.rename`` silently overwrite the target on POSIX — destroying
+    user data. apply() must re-check ``dst.exists()`` before renaming.
+    """
+    from scripts.vault_doctor_checks import Issue
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    _write_legacy_snapshot(sess / "2026-04-18-demo-cg-snapshot.md", session_id="sCG")
+    # Pre-create the would-be target. scan() would mark this unresolved,
+    # but we construct a synthetic Issue WITHOUT ``unresolved=True`` to
+    # exercise the runtime guard inside apply().
+    target = sess / "2026-04-18-demo-cg-snapshot-143027.md"
+    target.write_text("--- pre-existing target content ---", encoding="utf-8")
+    synthetic = Issue(
+        check="snapshot-legacy-filename",
+        note_path=str(sess / "2026-04-18-demo-cg-snapshot.md"),
+        project="demo",
+        current_source="2026-04-18-demo-cg-snapshot.md",
+        proposed_source="2026-04-18-demo-cg-snapshot-143027.md",
+        reason="rename adds HHMMSS",
+        confidence=0.95,
+        extra={
+            "new_name": "2026-04-18-demo-cg-snapshot-143027.md",
+            "vault_path": str(tmp_path),
+            # NOTE: no "unresolved": True — simulates skipping scan's
+            # collision check (synthetic Issue / race with another writer).
+        },
+    )
+    results = snapshot_migration.apply([synthetic], str(tmp_path / "backup"))
+    assert len(results) == 1
+    assert results[0].status == "unresolved", (
+        f"expected 'unresolved' for runtime collision, got {results[0].status}: {results[0].error}"
+    )
+    assert "collision" in (results[0].error or "").lower()
+    # Pre-existing target file must be UNTOUCHED (no silent overwrite).
+    assert target.read_text(encoding="utf-8") == "--- pre-existing target content ---"
+    # Source file must still exist (rename did not happen).
+    assert (sess / "2026-04-18-demo-cg-snapshot.md").exists()
+
+
+def test_apply_does_not_mutate_issue_note_path(tmp_path):
+    """Round-5 regression: apply() must not mutate the passed-in
+    ``Issue.note_path``.
+
+    The Issue dataclass is shared with logging and may be reused by
+    callers after apply() returns. Mutating it surprises callers and
+    invalidates diagnostic snapshots.
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    _write_legacy_snapshot(sess / "2026-04-18-demo-im-snapshot.md", session_id="sIM")
+    _write_session(sess / "2026-04-18-demo-im.md", session_id="sIM")
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650
+    )
+    # Capture pre-apply note_path values (deep enough to survive apply).
+    pre_apply_paths = [i.note_path for i in issues]
+    snapshot_migration.apply(issues, str(tmp_path / "backup"))
+    post_apply_paths = [i.note_path for i in issues]
+    assert pre_apply_paths == post_apply_paths, (
+        f"Issue.note_path was mutated by apply():\n"
+        f"  pre={pre_apply_paths}\n"
+        f"  post={post_apply_paths}"
+    )
+
+
+def test_no_rollback_after_partial_wikilink_rewrite(tmp_path, monkeypatch):
+    """Round-5 regression: when ``_rewrite_wikilinks_in_vault`` raises
+    AFTER successfully rewriting at least one file, apply() must NOT
+    roll back the rename — rolling back would orphan the surviving
+    rewrites (they would reference a missing file).
+
+    The Result must surface the partial state via ``status="error"``
+    with a descriptive message, and ``renamed_paths`` must record the
+    rename so subsequent issues in the batch resolve correctly.
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    legacy_path = sess / "2026-04-18-demo-pr-snapshot.md"
+    _write_legacy_snapshot(legacy_path, session_id="sPR")
+    _write_session(sess / "2026-04-18-demo-pr.md", session_id="sPR")
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650
+    )
+    legacy = [i for i in issues if i.check == "snapshot-legacy-filename"]
+    assert len(legacy) == 1
+
+    # Simulate a partial-success failure: rewriter raises with
+    # ``modified_paths`` already populated (some files succeeded).
+    def _partial_boom(*args, **kwargs):
+        err = RuntimeError("simulated wikilink failure after partial success")
+        err.modified_paths = ["/fake/successful/insight.md"]  # type: ignore[attr-defined]
+        raise err
+
+    monkeypatch.setattr(snapshot_migration, "_rewrite_wikilinks_in_vault", _partial_boom)
+    results = snapshot_migration.apply(legacy, str(tmp_path / "backup"))
+    assert len(results) == 1
+    assert results[0].status == "error", (
+        f"expected error for partial-rewrite failure, got {results[0].status}"
+    )
+    assert "partially failed" in (results[0].error or "").lower(), results[0].error
+    assert "manual review" in (results[0].error or "").lower(), results[0].error
+    # Critical: rename was NOT rolled back. The new path exists, the old
+    # path does not — surviving wikilink rewrites can still resolve.
+    new_path = sess / "2026-04-18-demo-pr-snapshot-143027.md"
+    assert new_path.exists(), (
+        "rename must NOT be rolled back when wikilink rewrite partially succeeded "
+        "(rollback would orphan the surviving rewrites)"
+    )
+    assert not legacy_path.exists(), "old path must not be restored"
+    # Result.note_path points at the surviving (renamed) file so the user
+    # can locate it for manual review.
+    assert results[0].note_path == str(new_path)
