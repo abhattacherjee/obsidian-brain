@@ -547,31 +547,62 @@ class TestRebuildIndex:
         assert access_count == 0
         assert themes_count == 0
 
-    def test_rebuild_default_regenerates_term_df_and_fts(self, tmp_vault):
-        """Non-destructive rebuild fully regenerates notes_fts and term_df."""
-        note1 = tmp_vault / "claude-sessions" / "searchable.md"
+    def test_rebuild_default_picks_up_new_and_deleted_notes(self, tmp_vault):
+        """Preserve-mode rebuild reconciles FTS + term_df with on-disk state.
+
+        Rationale: preserve mode is not a full tear-down + rebuild — it
+        delegates to `_sync`, which is mtime-incremental. To prove the sync
+        actually ran, we add a brand-new note after ensure_index and verify
+        it lands in FTS + notes post-rebuild, and simultaneously delete an
+        existing note and verify it disappears from FTS.
+        """
+        keeper = tmp_vault / "claude-sessions" / "keeper.md"
+        goner = tmp_vault / "claude-sessions" / "goner.md"
         _write_note(
-            note1,
+            keeper,
             {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
-            body="# Title\n\nUnique body content for search.",
+            body="# K\n\nUniqueKeeperToken body content.",
+        )
+        _write_note(
+            goner,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# G\n\nUniqueGonerToken body content.",
         )
         db_path = str(tmp_vault / "test.db")
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        # Mutate disk between ensure_index and rebuild:
+        #   - add a new note (should appear in FTS post-rebuild)
+        #   - delete an existing note (should vanish from FTS post-rebuild)
+        new_note = tmp_vault / "claude-sessions" / "new.md"
+        _write_note(
+            new_note,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# N\n\nUniqueNewToken body content.",
+        )
+        goner.unlink()
 
         vault_index.rebuild_index(
             str(tmp_vault), ["claude-sessions"], db_path=db_path
         )
 
         conn = sqlite3.connect(db_path)
-        # "Unique" appears in the body; not in the filename, so FTS is the
-        # only way to hit it after rebuild (proves FTS was repopulated).
-        fts_hits = conn.execute(
-            "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH ?", ("Unique",)
-        ).fetchone()[0]
-        term_count = conn.execute("SELECT COUNT(*) FROM term_df").fetchone()[0]
+
+        def fts_count(token: str) -> int:
+            return conn.execute(
+                "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH ?",
+                (token,),
+            ).fetchone()[0]
+
+        # Kept note still indexed + searchable
+        assert fts_count("UniqueKeeperToken") == 1
+        # New on-disk note was picked up
+        assert fts_count("UniqueNewToken") == 1
+        # Deleted on-disk note is gone from FTS (proves _delete_note ran)
+        assert fts_count("UniqueGonerToken") == 0
+        # term_df remains populated
+        assert conn.execute("SELECT COUNT(*) FROM term_df").fetchone()[0] > 0
         conn.close()
-        assert fts_hits == 1
-        assert term_count > 0
 
     def test_rebuild_default_on_missing_db_falls_through_to_full(self, tmp_vault):
         """When no DB exists yet, non-destructive call still produces a working index."""
@@ -789,7 +820,7 @@ class TestRebuildIndex:
             "access_log", "themes", "theme_members"
         }
         assert set(preserve_stats["pruned_orphans"]) == {
-            "access_log", "theme_members",
+            "access_log", "themes", "theme_members",
         }
 
         full_stats = vault_index.rebuild_index(

@@ -72,7 +72,11 @@ t0 = time.time()
 full = sys.argv[4].lower() == "true"
 stats = rebuild_index(sys.argv[1], [sys.argv[2], sys.argv[3]], full=full)
 stats["elapsed"] = round(time.time() - t0, 1)
-stats["mode"] = "full" if full else "preserve"
+# Derive mode from the returned stats, not the CLI flag — rebuild_index()
+# can fall through to a full rebuild internally (missing DB, legacy schema)
+# even when the caller asked for preserve mode. Presence of "preserved"
+# in the stats dict is the single source of truth.
+stats["mode"] = "preserve" if "preserved" in stats else "full"
 print(json.dumps(stats))
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER" "$FULL_MODE"
 ```

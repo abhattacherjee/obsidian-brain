@@ -841,18 +841,25 @@ def rebuild_index(
 ) -> dict:
     """Rebuild the vault index.
 
-    Default (``full=False``): non-destructive — preserves Friston-architecture
-    state (``access_log`` activation history, ``themes``, ``theme_members``
-    surprise scores) while clearing and regenerating the derivable tables
-    (``notes``, ``notes_fts``, ``term_df``). Orphaned ``access_log`` and
-    ``theme_members`` rows whose note paths are no longer on disk are pruned
-    after the sync. This is the right mode for clearing pytest pollution,
-    bulk vault edits, or stale rows — accumulated access/activation signal
-    survives.
+    Default (``full=False``): non-destructive incremental sync. Preserves
+    Friston-architecture state (``access_log`` activation history, ``themes``,
+    ``theme_members`` surprise scores + centroids) and reconciles the index
+    with current vault contents via ``_sync`` (which is mtime-incremental —
+    unchanged notes are not re-tokenised). Rows whose paths are outside the
+    current scanned folders are removed (pytest fixture pollution cleanup).
+    After the sync, orphaned ``access_log`` / ``theme_members`` rows whose
+    note paths are no longer on disk are pruned and ``themes.note_count`` is
+    recomputed from the surviving memberships; themes that lose all members
+    are dropped. This mode is right for clearing pollution or bulk vault
+    edits, but it is **not** a guaranteed full rebuild of derivable index
+    data for unchanged notes — if an FTS row or ``term_df`` counter has
+    drifted for a note that hasn't changed on disk, only ``full=True`` will
+    fix it.
 
     Opt-in ``full=True``: legacy destructive behavior. Deletes the entire DB
     file (plus WAL/SHM) and rebuilds from an empty schema. Every Friston
-    field is lost. Required only when the schema is corrupt or incompatible.
+    field is lost. Required only when the schema is corrupt or incompatible,
+    or when the derivable tables need a clean-slate rebuild.
 
     Returns ``{"inserted": N, "skipped": M, "by_type": {...}}`` plus, in
     non-destructive mode, ``"preserved": {...}`` and ``"pruned_orphans":
@@ -861,7 +868,9 @@ def rebuild_index(
     if db_path is None:
         db_path = _default_db_path()
 
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
 
     # A fresh DB has nothing to preserve — fall through to full rebuild even
     # when full=False, so callers always get a working index.
@@ -985,6 +994,19 @@ def rebuild_index(
                         "DELETE FROM theme_members "
                         "WHERE note_path NOT IN (SELECT path FROM notes)"
                     )
+                # Theme invariant repair: after any theme_members rows have
+                # been removed (either by _delete_note during _sync or the
+                # orphan-prune above), recompute themes.note_count from the
+                # surviving membership set and drop themes that now have
+                # zero members. Keeps assign_to_theme / _delete_note's
+                # running-average centroid math self-consistent.
+                conn.execute(
+                    "UPDATE themes SET note_count = ("
+                    "  SELECT COUNT(*) FROM theme_members "
+                    "  WHERE theme_members.theme_id = themes.id"
+                    ")"
+                )
+                conn.execute("DELETE FROM themes WHERE note_count = 0")
                 conn.commit()
             except BaseException:
                 try:
@@ -995,21 +1017,26 @@ def rebuild_index(
 
             # Report preserved/pruned counts from the actual after-state
             # rather than deleted rowcount. _sync and _delete_note also
-            # remove theme_members rows when their parent note is deleted,
-            # so a simple rowcount would undercount by missing those.
+            # remove theme_members rows (and may drop last-member themes)
+            # when a parent note is deleted, so a simple rowcount would
+            # undercount by missing those.
             after_access = conn.execute(
                 "SELECT COUNT(*) FROM access_log"
+            ).fetchone()[0]
+            after_themes = conn.execute(
+                "SELECT COUNT(*) FROM themes"
             ).fetchone()[0]
             after_members = conn.execute(
                 "SELECT COUNT(*) FROM theme_members"
             ).fetchone()[0]
             stats["preserved"] = {
                 "access_log": after_access,
-                "themes": before_themes,
+                "themes": after_themes,
                 "theme_members": after_members,
             }
             stats["pruned_orphans"] = {
                 "access_log": before_access - after_access,
+                "themes": before_themes - after_themes,
                 "theme_members": before_members - after_members,
             }
         finally:
