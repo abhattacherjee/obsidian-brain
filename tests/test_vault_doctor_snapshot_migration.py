@@ -602,3 +602,25 @@ def test_rename_does_not_rewrite_wikilinks_in_backup_dir(tmp_path):
         "backup must NOT be rewritten — got: " + repr(backup_text)
     )
     assert "[[2026-04-18-demo-bk-snapshot-143027]]" not in backup_text
+
+
+def test_legacy_rename_result_points_to_post_rename_path(tmp_path):
+    """Regression: Result.note_path must reference the new filename after rename."""
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    _write_legacy_snapshot(sess / "2026-04-18-demo-rn-snapshot.md", session_id="sRN")
+    _write_session(sess / "2026-04-18-demo-rn.md", session_id="sRN")
+    issues = snapshot_migration.scan(str(tmp_path), "claude-sessions", "claude-insights", 3650)
+    legacy = [i for i in issues if i.check == "snapshot-legacy-filename"]
+    assert len(legacy) == 1
+    results = snapshot_migration.apply(legacy, str(tmp_path / "backup"))
+    assert len(results) == 1
+    assert results[0].status == "applied"
+    # Result.note_path must point at the post-rename file (which exists),
+    # not the pre-rename path (which no longer exists).
+    from pathlib import Path
+    new_path = Path(results[0].note_path)
+    assert new_path.is_file(), f"Result.note_path is not a file: {new_path}"
+    assert new_path.name.endswith("-snapshot-143027.md"), f"unexpected name: {new_path.name}"
+    # The old path must NOT exist
+    old_path = sess / "2026-04-18-demo-rn-snapshot.md"
+    assert not old_path.exists()

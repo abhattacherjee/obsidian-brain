@@ -326,6 +326,12 @@ def apply(issues, backup_root):
             continue
         try:
             backup: str | None = None
+            # Default to the issue's own path; per-branch logic (e.g. legacy
+            # rename) may override this so the trailing Result emission
+            # references the POST-mutation path. We do NOT mutate
+            # ``issue.note_path`` itself — the Issue dataclass is shared
+            # with logging/diagnostics and must remain pre-mutation.
+            result_note_path = issue.note_path
             if issue.check == "snapshot-legacy-filename":
                 src = Path(issue.note_path)
                 dst = src.parent / issue.extra["new_name"]
@@ -357,6 +363,10 @@ def apply(issues, backup_root):
                     raise
                 renamed_paths[str(src)] = str(dst)
                 renamed_stems[src.stem] = dst.stem
+                # Emit Result.note_path as the POST-rename path so consumers
+                # of the apply results can locate the file on disk (the OLD
+                # path no longer exists after os.rename).
+                result_note_path = str(dst)
             elif issue.check == "snapshot-missing-status":
                 text = _read_text(issue.note_path) or ""
                 parts = text.split("---\n", 2)
@@ -436,7 +446,7 @@ def apply(issues, backup_root):
                 results.append(Result(check=issue.check, note_path=issue.note_path, status="skipped"))
                 continue
             results.append(Result(
-                check=issue.check, note_path=issue.note_path, status="applied",
+                check=issue.check, note_path=result_note_path, status="applied",
                 backup_path=backup,
             ))
         except Exception as exc:  # noqa: BLE001
