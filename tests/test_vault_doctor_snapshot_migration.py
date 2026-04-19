@@ -245,3 +245,211 @@ def test_apply_status_raises_runtime_error_when_no_frontmatter(tmp_path):
     assert len(results) == 1
     assert results[0].status == "error"
     assert "frontmatter" in (results[0].error or "")
+
+
+# ----- PR-review regression tests -----
+
+
+def test_wikilink_rewrite_uses_vault_root_not_parent_twice(tmp_path):
+    """CRITICAL-1 regression: sessions_folder can be nested more than one
+    level below the vault root. ``_rewrite_wikilinks_in_vault`` must scan
+    from the true vault root, not from ``src.parents[1]``.
+    """
+    # Vault root is tmp_path; sessions live under notes/claude-sessions
+    # (two levels deep). An insight note lives under claude-insights at the
+    # vault root — the OLD code rooted wikilink rewrite at ``notes/`` and
+    # therefore missed the insight.
+    vault = tmp_path
+    sess = vault / "notes" / "claude-sessions"; sess.mkdir(parents=True)
+    insights = vault / "claude-insights"; insights.mkdir()
+    _write_legacy_snapshot(sess / "2026-04-18-demo-nest-snapshot.md")
+    _write_session(sess / "2026-04-18-demo-nest.md")
+    (insights / "ref.md").write_text(
+        "---\ntype: claude-insight\n---\n\n"
+        "see [[2026-04-18-demo-nest-snapshot]] for context\n",
+        encoding="utf-8",
+    )
+    issues = snapshot_migration.scan(
+        str(vault), "notes/claude-sessions", "claude-insights", 3650
+    )
+    legacy = [i for i in issues if i.check == "snapshot-legacy-filename"]
+    assert len(legacy) == 1
+    snapshot_migration.apply(legacy, str(tmp_path / "backup"))
+    ref_text = (insights / "ref.md").read_text(encoding="utf-8")
+    assert "[[2026-04-18-demo-nest-snapshot-143027]]" in ref_text
+    assert "[[2026-04-18-demo-nest-snapshot]]" not in ref_text
+
+
+def test_legacy_filename_plus_session_list_batch_translates_stems(tmp_path):
+    """CRITICAL-2 regression: when both snapshot-legacy-filename and
+    session-missing-snapshots-list fire in the same batch, the session's
+    final ``snapshots:`` list must reference the POST-rename stem.
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    _write_legacy_snapshot(sess / "2026-04-18-demo-bat-snapshot.md",
+                           session_id="sBAT")
+    _write_session(sess / "2026-04-18-demo-bat.md", session_id="sBAT")
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650
+    )
+    # Apply the full batch (both legacy-filename AND
+    # session-missing-snapshots-list, plus whatever else scan found).
+    fixable = [i for i in issues if not i.extra.get("unresolved")]
+    snapshot_migration.apply(fixable, str(tmp_path / "backup"))
+    # Session must now list the NEW stem, not the OLD one.
+    sess_text = (sess / "2026-04-18-demo-bat.md").read_text(encoding="utf-8")
+    assert "2026-04-18-demo-bat-snapshot-143027" in sess_text
+    # Old stem must not appear in the session's snapshots block
+    # (substring-match is strict: we look for [[old]] surrounded by quotes).
+    assert '"[[2026-04-18-demo-bat-snapshot]]"' not in sess_text
+
+
+def test_rename_rollback_on_wikilink_failure(tmp_path, monkeypatch):
+    """CRITICAL-3 regression: if ``_rewrite_wikilinks_in_vault`` raises,
+    the rename must be rolled back and the Issue must surface as
+    ``status="error"``.
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    legacy_path = sess / "2026-04-18-demo-rb-snapshot.md"
+    _write_legacy_snapshot(legacy_path)
+    _write_session(sess / "2026-04-18-demo-rb.md")
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650
+    )
+    legacy = [i for i in issues if i.check == "snapshot-legacy-filename"]
+    assert len(legacy) == 1
+
+    # Force the wikilink rewrite to raise so we can verify rollback.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated wikilink rewrite failure")
+
+    monkeypatch.setattr(snapshot_migration, "_rewrite_wikilinks_in_vault", _boom)
+    results = snapshot_migration.apply(legacy, str(tmp_path / "backup"))
+    assert len(results) == 1
+    assert results[0].status == "error"
+    # Rollback: the original legacy filename must still exist, the new
+    # name must NOT exist.
+    assert legacy_path.exists(), "rename must be rolled back on rewrite failure"
+    assert not (sess / "2026-04-18-demo-rb-snapshot-143027.md").exists()
+
+
+def test_crlf_frontmatter_is_parsed_migration(tmp_path):
+    """HIGH-5 regression for the migration module: CRLF + BOM must parse."""
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    # Legacy snapshot with BOM + CRLF
+    p = sess / "2026-04-18-demo-cr-snapshot.md"
+    p.write_bytes(
+        b"\xef\xbb\xbf---\r\ntype: claude-snapshot\r\ndate: 2026-04-18\r\n"
+        b"session_id: sCRLF\r\nproject: demo\r\ntrigger: compact\r\n---\r\n\r\n# Snap\r\n"
+    )
+    # Set mtime so the HHMMSS is deterministic
+    dt = datetime.datetime.fromisoformat("2026-04-18T14:30:27")
+    os.utime(p, (dt.timestamp(), dt.timestamp()))
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650
+    )
+    legacy = [i for i in issues if i.check == "snapshot-legacy-filename"]
+    miss_status = [i for i in issues if i.check == "snapshot-missing-status"]
+    # Both checks MUST fire; the BOM/CRLF must not prevent frontmatter parsing.
+    assert len(legacy) == 1, "CRLF/BOM frontmatter must be detected as legacy"
+    assert len(miss_status) == 1, "CRLF/BOM frontmatter must also register missing status"
+
+
+def test_missing_status_idempotent_when_already_present(tmp_path):
+    """HIGH-8 regression: stale Issue replay against a snapshot that
+    already has ``status:`` must be a no-op skip, not a double-write.
+    """
+    from scripts.vault_doctor_checks import Issue as _Issue
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    p = sess / "2026-04-18-demo-idem-snapshot-100000.md"
+    p.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s1\n"
+        "project: demo\ntrigger: compact\nstatus: summarized\n---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+    issue = _Issue(
+        check="snapshot-missing-status",
+        note_path=str(p),
+        project="demo",
+        current_source="(no status field)",
+        proposed_source="status: auto-logged",
+        reason="stale replay",
+    )
+    results = snapshot_migration.apply([issue], str(tmp_path / "backup"))
+    assert results[0].status == "skipped"
+    assert "already present" in (results[0].error or "")
+
+
+def test_missing_backlink_idempotent_when_already_present(tmp_path):
+    """HIGH-8 regression: stale Issue replay against a snapshot that
+    already has ``source_session_note:`` must be a no-op skip.
+    """
+    from scripts.vault_doctor_checks import Issue as _Issue
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    p = sess / "2026-04-18-demo-idem-snapshot-110000.md"
+    p.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s1\n"
+        "project: demo\ntrigger: compact\nstatus: summarized\n"
+        'source_session_note: "[[already-there]]"\n---\n\n# Snap\n',
+        encoding="utf-8",
+    )
+    issue = _Issue(
+        check="snapshot-missing-backlink",
+        note_path=str(p),
+        project="demo",
+        current_source="(no source_session_note)",
+        proposed_source='source_session_note: "[[parent]]"',
+        reason="stale replay",
+    )
+    results = snapshot_migration.apply([issue], str(tmp_path / "backup"))
+    assert results[0].status == "skipped"
+    assert "already present" in (results[0].error or "")
+
+
+def test_rewrite_wikilinks_returns_zero_when_nothing_to_replace(tmp_path):
+    """_rewrite_wikilinks_in_vault covers the non-match loop path."""
+    vault = tmp_path
+    (vault / "unrelated.md").write_text("no wikilinks here\n", encoding="utf-8")
+    count = snapshot_migration._rewrite_wikilinks_in_vault(
+        str(vault), "nonexistent-stem", "new-stem"
+    )
+    assert count == 0
+
+
+def test_session_missing_snapshots_list_not_corrupted_by_body_status(tmp_path):
+    """CRITICAL-4 regression for the migration module: a body-level
+    ``status:`` line must not be matched when injecting the snapshots
+    block.
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    # Session without status: in frontmatter, but body contains
+    # ``## Status ...`` + a ``status: active`` line.
+    (sess / "2026-04-18-demo-bs.md").write_text(
+        "---\n"
+        "type: claude-session\n"
+        "date: 2026-04-18\n"
+        "session_id: sBS\n"
+        "project: demo\n"
+        "---\n\n"
+        "# Session\n\n"
+        "## Status of things\n"
+        "status: active\n",
+        encoding="utf-8",
+    )
+    _write_legacy_snapshot(sess / "2026-04-18-demo-bs-snapshot-100000.md",
+                           session_id="sBS")
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650
+    )
+    miss = [i for i in issues if i.check == "session-missing-snapshots-list"]
+    assert len(miss) == 1
+    snapshot_migration.apply(miss, str(tmp_path / "backup"))
+    text = (sess / "2026-04-18-demo-bs.md").read_text(encoding="utf-8")
+    # Body-level ``## Status of things`` + ``status: active`` MUST still
+    # appear verbatim, unmodified — the snapshots block must NOT have been
+    # injected before the body line.
+    assert "## Status of things\nstatus: active" in text
+    # Frontmatter must now contain the snapshots block.
+    fm = text.split("---\n", 2)[1]
+    assert "snapshots:" in fm
+    assert "2026-04-18-demo-bs-snapshot-100000" in fm

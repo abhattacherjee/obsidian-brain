@@ -224,28 +224,6 @@ def test_scan_skips_session_with_blank_session_id(tmp_path):
     assert any(i.check == "snapshot-orphan" for i in issues)
 
 
-def test_session_id_mismatch_is_detected_and_unresolved(tmp_path):
-    """Snapshot session_id differs from parent's — unresolved (no auto-fix)."""
-    vault = tmp_path; sess = vault / "claude-sessions"; sess.mkdir()
-    # Parent session has session_id=sX
-    (sess / "2026-04-18-demo-mm.md").write_text(
-        "---\ntype: claude-session\ndate: 2026-04-18\nsession_id: sX\n"
-        "project: demo\nstatus: summarized\n---\n\n# S\n",
-        encoding="utf-8",
-    )
-    # Snapshot also lookups sX, but we'll force a mismatch by mutating after parse.
-    # Easier: make scan find a mismatch via a duplicate session_id index entry.
-    # Since the bug branch needs parent_sid_field != sid, and lookup is by sid,
-    # we instead patch by writing two snapshots and a session that share session_id
-    # but have a different `session_id` field after the lookup. This is artificial,
-    # so we exercise the branch via a direct Issue+apply test below instead.
-    # Here we simply verify scan still finds backlink issue cleanly.
-    _write_snapshot(sess / "2026-04-18-demo-mm-snapshot-100000.md", "sX", "wrong-stem")
-    issues = snapshot_integrity.scan(str(vault), "claude-sessions", "claude-insights", 30)
-    # Should detect broken-backlink, not session-id-mismatch (sid matches sX both ways)
-    assert any(i.check == "snapshot-broken-backlink" for i in issues)
-
-
 def test_session_with_no_snapshots_skipped(tmp_path):
     """Session that has zero snapshots on disk must not produce any issue."""
     vault = tmp_path; sess = vault / "claude-sessions"; sess.mkdir()
@@ -398,3 +376,75 @@ def test_inline_yaml_snapshots_list_is_treated_as_missing(tmp_path):
     # Should treat inline-string as "no list" → emits missing, NOT stale.
     assert any(i.check == "session-snapshot-list-missing" for i in issues)
     assert not any(i.check == "session-snapshot-list-stale" for i in issues)
+
+
+# ----- PR-review regression tests -----
+
+
+def test_status_injection_not_corrupted_by_body_status_line(tmp_path):
+    """CRITICAL-4 regression: a ``status:`` line in the BODY (e.g. inside a
+    code block or after a ``## Status`` heading) must NOT be matched by the
+    snapshots-block injection regex. The block must land inside the
+    frontmatter, and the body must be left untouched.
+    """
+    vault = tmp_path; sess = vault / "claude-sessions"; sess.mkdir()
+    # Session WITHOUT a status: line in the frontmatter, but body contains
+    # ``status: active`` starting a line inside a fenced code block.
+    (sess / "2026-04-18-demo-sb.md").write_text(
+        "---\n"
+        "type: claude-session\n"
+        "date: 2026-04-18\n"
+        "session_id: sB\n"
+        "project: demo\n"
+        "---\n\n"
+        "# Session\n\n"
+        "## Status of things\n"
+        "status: active\n"  # body line that naively matches ^status:
+        "\n"
+        "```yaml\n"
+        "status: inside-code-block\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    _write_snapshot(sess / "2026-04-18-demo-sb-snapshot-100000.md", "sB",
+                    "2026-04-18-demo-sb")
+    issues = snapshot_integrity.scan(str(vault), "claude-sessions", "claude-insights", 30)
+    missing = [i for i in issues if i.check == "session-snapshot-list-missing"]
+    assert len(missing) == 1
+    snapshot_integrity.apply(missing, str(tmp_path / "backup"))
+    text = (sess / "2026-04-18-demo-sb.md").read_text(encoding="utf-8")
+    # Body must still contain both status: lines verbatim (unmodified)
+    assert "## Status of things\nstatus: active\n" in text
+    assert "status: inside-code-block" in text
+    # Frontmatter (first ---\n … ---\n) must contain the snapshots: block.
+    fm_match = text.split("---\n", 2)
+    assert len(fm_match) >= 3
+    frontmatter = fm_match[1]
+    assert "snapshots:" in frontmatter
+    assert "2026-04-18-demo-sb-snapshot-100000" in frontmatter
+    # The body portion must NOT carry an injected snapshots: block.
+    body = fm_match[2]
+    assert "snapshots:" not in body
+
+
+def test_crlf_frontmatter_is_parsed(tmp_path):
+    """HIGH-5 regression: notes with CRLF line endings must still be picked up."""
+    vault = tmp_path; sess = vault / "claude-sessions"; sess.mkdir()
+    # Raw CRLF on disk; no BOM.
+    (sess / "2026-04-18-demo-cr.md").write_bytes(
+        b"---\r\ntype: claude-session\r\ndate: 2026-04-18\r\n"
+        b"session_id: sCR\r\nproject: demo\r\nstatus: summarized\r\n---\r\n\r\n# S\r\n"
+    )
+    (sess / "2026-04-18-demo-cr-snapshot-100000.md").write_bytes(
+        b"---\r\ntype: claude-snapshot\r\ndate: 2026-04-18\r\n"
+        b"session_id: sCR\r\nproject: demo\r\ntrigger: compact\r\n"
+        b"status: summarized\r\n"
+        b'source_session_note: "[[2026-04-18-demo-cr]]"\r\n---\r\n\r\n'
+        b"# Snap\r\n\r\n## Summary\r\nbody\r\n"
+    )
+    issues = snapshot_integrity.scan(str(vault), "claude-sessions", "claude-insights", 30)
+    # Snapshot was backed up correctly, session has no snapshots: list yet —
+    # so we expect the session-snapshot-list-missing issue to fire.
+    assert any(i.check == "session-snapshot-list-missing" for i in issues), (
+        "CRLF frontmatter must be normalised and detected"
+    )

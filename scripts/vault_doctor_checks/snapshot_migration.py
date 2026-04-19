@@ -21,6 +21,7 @@ import re
 import shutil
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 
 from . import Issue, Result
@@ -33,10 +34,16 @@ _FRONT_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 
 
 def _read_text(p):
+    """Read UTF-8 text, normalising BOM and CRLF so regex anchors match."""
     try:
-        return Path(p).read_text(encoding="utf-8", errors="replace")
+        text = Path(p).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    if "\r\n" in text:
+        text = text.replace("\r\n", "\n")
+    return text
 
 
 def _parse_fm(text):
@@ -86,6 +93,11 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
     sessions_by_id: dict[str, Path] = {}
     snapshots: list[tuple[Path, dict, str]] = []
 
+    # Stash the resolved vault root on each legacy-filename issue so
+    # ``apply()`` can rewrite wikilinks from the correct root even when
+    # ``sessions_folder`` is nested (e.g. ``notes/claude-sessions``).
+    vault_root_str = str(Path(vault_path).resolve())
+
     for p in all_md:
         text = _read_text(p) or ""
         fm = _parse_fm(text)
@@ -119,7 +131,11 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
             reason=(f"rename adds HHMMSS={hh} from file mtime"
                     + (" — COLLISION: target filename already exists" if unresolved else "")),
             confidence=0.95 if not unresolved else 0.0,
-            extra={"unresolved": unresolved, "new_name": new_name},
+            extra={
+                "unresolved": unresolved,
+                "new_name": new_name,
+                "vault_path": vault_root_str,
+            },
         ))
 
     # 2. snapshot-missing-status
@@ -182,7 +198,9 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
             continue
         sess_path = sessions_by_id[sid]
         sess_text = _read_text(sess_path) or ""
-        if re.search(r"(?m)^snapshots:", sess_text):
+        # Scope ``snapshots:`` anchor detection to the frontmatter block only
+        fm_parts = sess_text.split("---\n", 2)
+        if len(fm_parts) >= 3 and re.search(r"(?m)^snapshots:", fm_parts[1]):
             continue
         wikilinks = sorted(f"[[{stem}]]" for stem in stems)
         issues.append(Issue(
@@ -225,13 +243,17 @@ def _rewrite_wikilinks_in_vault(vault_path: str, old_stem: str, new_stem: str) -
     """Find and replace [[<old_stem>]] with [[<new_stem>]] across the vault.
 
     Returns the number of files modified. Uses atomic writes per file.
+    Raises ``RuntimeError`` if any read or write failed so the caller can
+    roll back the rename and surface the error to the user.
     """
     count = 0
+    failed: list[str] = []
     pattern = re.compile(r"\[\[" + re.escape(old_stem) + r"\]\]")
     for p in Path(vault_path).rglob("*.md"):
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except OSError as exc:
+            failed.append(f"{p}: {exc}")
             continue
         if pattern.search(text):
             new_text = pattern.sub(f"[[{new_stem}]]", text)
@@ -239,8 +261,11 @@ def _rewrite_wikilinks_in_vault(vault_path: str, old_stem: str, new_stem: str) -
                 _atomic_write(str(p), new_text)
                 count += 1
             except Exception as exc:  # noqa: BLE001
-                print(f"[vault_doctor] wikilink rewrite failed for {p}: {exc}",
-                      file=sys.stderr)
+                failed.append(f"{p}: {exc}")
+    if failed:
+        raise RuntimeError(
+            f"wikilink rewrite failed for {len(failed)} file(s): {failed[:3]}"
+        )
     return count
 
 
@@ -253,15 +278,20 @@ def apply(issues, backup_root):
         "session-missing-snapshots-list": 3,
     }
     issues_sorted = sorted(issues, key=lambda i: order.get(i.check, 9))
-    # Track renames applied during this batch so later issues targeting the
-    # old path can be redirected to the new path. Without this, snapshot-
-    # missing-status/backlink fail with FileNotFoundError when batched with
-    # a rename of the same snapshot.
-    renamed: dict[str, str] = {}
+    # Track stem renames applied during this batch so subsequent issues
+    # that reference the OLD path or OLD stem get the NEW value. Two
+    # consumers:
+    #   - path redirect: ``issue.note_path == old_path`` → ``new_path``
+    #     (so missing-status/backlink targeting the renamed file succeed)
+    #   - stem rewrite:  ``[[old_stem]]`` → ``[[new_stem]]`` inside
+    #     session-missing-snapshots-list's ``proposed_source`` (so the
+    #     session's snapshots list doesn't point at the pre-rename name)
+    renamed_paths: dict[str, str] = {}
+    renamed_stems: dict[str, str] = {}
     for issue in issues_sorted:
         # Redirect any path that was renamed earlier in this apply pass.
-        if issue.note_path in renamed:
-            issue.note_path = renamed[issue.note_path]
+        if issue.note_path in renamed_paths:
+            issue.note_path = renamed_paths[issue.note_path]
         if issue.extra.get("unresolved"):
             results.append(Result(
                 check=issue.check, note_path=issue.note_path, status="unresolved",
@@ -272,42 +302,83 @@ def apply(issues, backup_root):
             if issue.check == "snapshot-legacy-filename":
                 src = Path(issue.note_path)
                 dst = src.parent / issue.extra["new_name"]
+                # Scan() stashed the resolved vault root; fall back to
+                # ``src.parents[1]`` for backwards compatibility with Issue
+                # objects constructed by older code paths.
+                vault_root = issue.extra.get("vault_path") or str(src.parents[1])
                 _backup_file(str(src), backup_root, issue.check)
-                _rewrite_wikilinks_in_vault(str(src.parents[1]), src.stem, dst.stem)
+                # Rename FIRST so a wikilink-rewrite failure can roll back
+                # the filesystem move without leaving other files pointing
+                # at a non-existent dst.
                 os.rename(str(src), str(dst))
-                renamed[str(src)] = str(dst)
+                try:
+                    _rewrite_wikilinks_in_vault(vault_root, src.stem, dst.stem)
+                except Exception:
+                    # Roll back the rename so the vault stays consistent
+                    try:
+                        os.rename(str(dst), str(src))
+                    except OSError:
+                        pass
+                    raise
+                renamed_paths[str(src)] = str(dst)
+                renamed_stems[src.stem] = dst.stem
             elif issue.check == "snapshot-missing-status":
                 _backup_file(issue.note_path, backup_root, issue.check)
                 text = _read_text(issue.note_path) or ""
                 parts = text.split("---\n", 2)
-                if len(parts) >= 3:
-                    parts[1] = parts[1] + issue.proposed_source + "\n"
-                    new_text = "---\n".join(parts)
-                    _atomic_write(issue.note_path, new_text)
-                else:
+                if len(parts) < 3:
                     raise RuntimeError("could not locate frontmatter")
+                # Defensive re-check: if status: already exists in the
+                # frontmatter (stale Issue replay / race with another
+                # writer), treat as an idempotent no-op.
+                if re.search(r"(?m)^status:", parts[1]):
+                    results.append(Result(
+                        check=issue.check, note_path=issue.note_path, status="skipped",
+                        error="status field already present (stale Issue?)",
+                    ))
+                    continue
+                parts[1] = parts[1] + issue.proposed_source + "\n"
+                new_text = "---\n".join(parts)
+                _atomic_write(issue.note_path, new_text)
             elif issue.check == "snapshot-missing-backlink":
                 _backup_file(issue.note_path, backup_root, issue.check)
                 text = _read_text(issue.note_path) or ""
                 parts = text.split("---\n", 2)
-                if len(parts) >= 3:
-                    parts[1] = parts[1] + issue.proposed_source + "\n"
-                    new_text = "---\n".join(parts)
-                    _atomic_write(issue.note_path, new_text)
-                else:
+                if len(parts) < 3:
                     raise RuntimeError("could not locate frontmatter")
+                if re.search(r"(?m)^source_session_note:", parts[1]):
+                    results.append(Result(
+                        check=issue.check, note_path=issue.note_path, status="skipped",
+                        error="source_session_note already present (stale Issue?)",
+                    ))
+                    continue
+                parts[1] = parts[1] + issue.proposed_source + "\n"
+                new_text = "---\n".join(parts)
+                _atomic_write(issue.note_path, new_text)
             elif issue.check == "session-missing-snapshots-list":
                 _backup_file(issue.note_path, backup_root, issue.check)
                 text = _read_text(issue.note_path) or ""
-                wikilinks = sorted(issue.proposed_source.splitlines())
+                # Apply stem-rename translation so the session list points
+                # at the POST-rename filenames.
+                proposed = issue.proposed_source
+                for old_stem, new_stem in renamed_stems.items():
+                    proposed = proposed.replace(f"[[{old_stem}]]", f"[[{new_stem}]]")
+                wikilinks = sorted(proposed.splitlines())
                 block = "snapshots:\n" + "\n".join(f'  - "{s}"' for s in wikilinks) + "\n"
-                new_text, n = re.subn(r"(?m)^status:", block + "status:", text, count=1)
+                # Constrain the ``status:`` anchor lookup to the
+                # frontmatter block only — body content containing a
+                # ``status:`` line (code blocks, ``## Status`` headings)
+                # must NOT be matched.
+                parts = text.split("---\n", 2)
+                if len(parts) < 3:
+                    raise RuntimeError("could not locate frontmatter")
+                fm = parts[1]
+                new_fm, n = re.subn(
+                    r"(?m)^status:", block + "status:", fm, count=1,
+                )
                 if n == 0:
-                    parts = text.split("---\n", 2)
-                    if len(parts) < 3:
-                        raise RuntimeError("could not locate frontmatter")
-                    parts[1] = parts[1] + block
-                    new_text = "---\n".join(parts)
+                    new_fm = fm + block
+                new_text = parts[0] + "---\n" + new_fm + "---\n" + parts[2]
                 _atomic_write(issue.note_path, new_text)
             else:
                 results.append(Result(check=issue.check, note_path=issue.note_path, status="skipped"))
@@ -321,4 +392,9 @@ def apply(issues, backup_root):
                 check=issue.check, note_path=issue.note_path, status="error",
                 error=f"{type(exc).__name__}: {exc}",
             ))
+            print(
+                f"[vault_doctor] apply failed for {issue.note_path}:\n"
+                f"{traceback.format_exc()}",
+                file=sys.stderr,
+            )
     return results

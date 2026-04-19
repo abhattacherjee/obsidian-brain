@@ -1,16 +1,24 @@
 """vault_doctor check: snapshot integrity (orphans, broken backlinks,
-stale/missing session snapshot lists, session_id mismatch, status/summary
-mismatch).
+stale/missing session snapshot lists, status/summary mismatch).
 
 Module registry interface: NAME, DESCRIPTION, DEFAULT_WINDOW_DAYS, scan,
 apply. Produces Issue objects with distinct ``check`` names so the
 dispatcher can report per-check counts.
+
+Five integrity checks emitted by ``scan()``:
+
+  1. snapshot-orphan                    — no parent session note (warn/unresolved)
+  2. snapshot-broken-backlink           — source_session_note wikilink wrong (fix)
+  3. session-snapshot-list-stale        — session lists snapshot not on disk (fix)
+  4. session-snapshot-list-missing      — snapshots exist but no list on session (fix)
+  5. snapshot-summary-status-mismatch   — status disagrees with body summary (fix)
 """
 from __future__ import annotations
 
 import os
 import re
 import sys
+import traceback
 from pathlib import Path
 
 from . import Issue, Result
@@ -24,10 +32,18 @@ _WIKI_RE = re.compile(r'\[\[([^\]]+)\]\]')
 
 
 def _read_text(path: str) -> str | None:
+    """Read UTF-8 text, normalising BOM and CRLF so regex anchors match."""
     try:
-        return Path(path).read_text(encoding="utf-8", errors="replace")
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+    # Strip UTF-8 BOM if present
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    # Normalise CRLF to LF so ^---\n anchors still work
+    if "\r\n" in text:
+        text = text.replace("\r\n", "\n")
+    return text
 
 
 def _parse_fm(text: str) -> dict:
@@ -64,9 +80,26 @@ def _project_matches(meta_project: str, filter_project: str | None) -> bool:
     return meta_project.lower() == filter_project.lower()
 
 
+def _replace_in_frontmatter(text: str, pattern: str, replacement: str,
+                            count: int = 1) -> tuple[str, int]:
+    """Run ``re.subn`` against ONLY the frontmatter block.
+
+    Returns ``(new_text, n)`` where ``n`` is the number of substitutions.
+    If the text lacks frontmatter, returns ``(text, 0)``.
+    """
+    parts = text.split("---\n", 2)
+    if len(parts) < 3:
+        return text, 0
+    new_fm, n = re.subn(pattern, replacement, parts[1], count=count)
+    if n == 0:
+        return text, 0
+    new_text = parts[0] + "---\n" + new_fm + "---\n" + parts[2]
+    return new_text, n
+
+
 def scan(vault_path: str, sessions_folder: str, insights_folder: str,
          days: int, project: str | None = None) -> list:
-    """Return Issue objects for all six check kinds."""
+    """Return Issue objects for all five check kinds."""
     sess_dir = Path(vault_path) / sessions_folder
     if not sess_dir.is_dir():
         return []
@@ -99,8 +132,7 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
 
     # 1. snapshot-orphan
     # 2. snapshot-broken-backlink
-    # 5. snapshot-session-id-mismatch
-    # 6. snapshot-summary-status-mismatch
+    # 5. snapshot-summary-status-mismatch
     for snap in snapshots:
         fm = snap["fm"]
         sid = fm.get("session_id", "")
@@ -135,19 +167,10 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
                 confidence=0.95,
             ))
 
-        # session_id check
-        parent_sid_field = parent_session["fm"].get("session_id", "")
-        if parent_sid_field != sid:
-            issues.append(Issue(
-                check="snapshot-session-id-mismatch",
-                note_path=snap["path"],
-                project=project_name,
-                current_source=f"snapshot={sid}, session={parent_sid_field}",
-                proposed_source="",
-                reason="snapshot session_id and target session session_id disagree",
-                confidence=0.7,
-                extra={"unresolved": True},
-            ))
+        # NOTE: session_id mismatch is unreachable by construction — sessions
+        # are indexed BY session_id, so ``parent_session["fm"]["session_id"]``
+        # is always equal to ``sid``. The check was removed to avoid dead
+        # branches that confused dispatcher metrics.
 
         # Status vs summary
         has_real_summary = bool(re.search(r"^## Summary\s*\n\S", snap["text"], re.MULTILINE))
@@ -250,24 +273,43 @@ def apply(issues, backup_root: str) -> list:
         try:
             if issue.check == "snapshot-broken-backlink":
                 text = _read_text(issue.note_path) or ""
-                new_text = re.sub(
+                new_text, n = _replace_in_frontmatter(
+                    text,
                     r'(?m)^source_session_note:.*$',
                     f'source_session_note: "{issue.proposed_source}"',
-                    text, count=1,
+                    count=1,
                 )
                 if new_text == text:
+                    reason = (
+                        "source_session_note already matches proposed value"
+                        if n > 0
+                        else "source_session_note line not found in frontmatter "
+                             "(missing frontmatter or YAML block-scalar form)"
+                    )
                     results.append(Result(
                         check=issue.check, note_path=issue.note_path, status="skipped",
+                        error=reason,
                     ))
                     continue
                 _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "snapshot-summary-status-mismatch":
                 new_status = "summarized" if "status=summarized" in issue.proposed_source else "auto-logged"
                 text = _read_text(issue.note_path) or ""
-                new_text = re.sub(r"(?m)^status:\s*\S+", f"status: {new_status}", text, count=1)
+                new_text, n = _replace_in_frontmatter(
+                    text,
+                    r"(?m)^status:\s*\S+",
+                    f"status: {new_status}",
+                    count=1,
+                )
                 if new_text == text:
+                    reason = (
+                        "status already matches proposed value"
+                        if n > 0
+                        else "status: line not found in frontmatter"
+                    )
                     results.append(Result(
                         check=issue.check, note_path=issue.note_path, status="skipped",
+                        error=reason,
                     ))
                     continue
                 _write_atomic(issue.note_path, new_text, backup_root, issue.check)
@@ -275,20 +317,28 @@ def apply(issues, backup_root: str) -> list:
                 text = _read_text(issue.note_path) or ""
                 wikilinks = sorted(issue.proposed_source.splitlines())
                 block = "snapshots:\n" + "\n".join(f'  - "{s}"' for s in wikilinks) + "\n"
-                new_text, n = re.subn(r"(?m)^status:", block + "status:", text, count=1)
+                # Try to insert before the first ``status:`` line in the
+                # frontmatter. If that anchor isn't present, append before
+                # the closing fence. Body-level ``status:`` lines (code
+                # blocks, ``## Status`` headings) MUST NOT be matched.
+                parts = text.split("---\n", 2)
+                if len(parts) < 3:
+                    raise RuntimeError(
+                        "could not locate frontmatter to insert snapshots block"
+                    )
+                fm = parts[1]
+                new_fm, n = re.subn(
+                    r"(?m)^status:", block + "status:", fm, count=1,
+                )
                 if n == 0:
-                    # No status: line — insert before closing frontmatter fence.
-                    # The first --- starts frontmatter; the second --- closes it.
-                    parts = text.split("---\n", 2)
-                    if len(parts) < 3:
-                        raise RuntimeError(
-                            "could not locate frontmatter to insert snapshots block"
-                        )
-                    parts[1] = parts[1] + block
-                    new_text = "---\n".join(parts)
+                    # No status: line inside the frontmatter — append before
+                    # the closing fence.
+                    new_fm = fm + block
+                new_text = parts[0] + "---\n" + new_fm + "---\n" + parts[2]
                 if new_text == text:
                     results.append(Result(
                         check=issue.check, note_path=issue.note_path, status="skipped",
+                        error="frontmatter already contains the proposed snapshots block",
                     ))
                     continue
                 _write_atomic(issue.note_path, new_text, backup_root, issue.check)
@@ -306,6 +356,7 @@ def apply(issues, backup_root: str) -> list:
                 if new_text == text:
                     results.append(Result(
                         check=issue.check, note_path=issue.note_path, status="skipped",
+                        error="no stale entries found in note (already pruned?)",
                     ))
                     continue
                 _write_atomic(issue.note_path, new_text, backup_root, issue.check)
@@ -323,6 +374,9 @@ def apply(issues, backup_root: str) -> list:
                 check=issue.check, note_path=issue.note_path, status="error",
                 error=f"{type(exc).__name__}: {exc}",
             ))
-            print(f"[vault_doctor] apply failed for {issue.note_path}: {exc}",
-                  file=sys.stderr)
+            print(
+                f"[vault_doctor] apply failed for {issue.note_path}:\n"
+                f"{traceback.format_exc()}",
+                file=sys.stderr,
+            )
     return results
