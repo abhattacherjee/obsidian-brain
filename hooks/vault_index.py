@@ -640,15 +640,104 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
     return db_path
 
 
-def log_access(db_path: str, note_path: str, context_type: str, project: str | None = None) -> None:
-    """Insert one access-log row. Logs a warning to stderr if the database is unavailable."""
+# Per-process cache keyed by snapshot path → resolved parent path (or None).
+# Not invalidated on re-index — snapshot frontmatter changes take effect next
+# process lifetime. Cleared when the process exits; intentionally not persisted.
+_PARENT_CACHE: dict[str, str | None] = {}
+
+
+def _parent_session_for_snapshot(note_path: str, db_path: str) -> str | None:
+    """Return the absolute path of the parent session note for a snapshot,
+    or None if the input isn't a snapshot or the parent can't be resolved.
+
+    Strategy:
+      1. Check per-process cache.
+      2. Query notes table for the row; if type != 'claude-snapshot', return None.
+      3. Read the snapshot file's frontmatter source_session_note wikilink;
+         resolve to <sessions_folder>/<stem>.md. If the file exists, cache
+         and return it. If not, cache None and return None.
+
+    Swallows all exceptions — logging is observability, not a blocker.
+
+    Cache entries are NOT invalidated when a snapshot is re-indexed; a
+    corrected ``source_session_note`` won't take effect until the next process
+    restart. This is a deliberate tradeoff — rename-after-first-access is rare
+    and invalidation complexity outweighs the benefit.
+    """
+    if note_path in _PARENT_CACHE:
+        return _PARENT_CACHE[note_path]
+    resolved: str | None = None
     try:
         conn = sqlite3.connect(db_path, timeout=5.0)
         try:
-            conn.execute(
+            row = conn.execute(
+                "SELECT type FROM notes WHERE path = ?", (note_path,),
+            ).fetchone()
+            if not row:
+                # Not indexed yet — don't cache; retry on next call.
+                return None
+            if row[0] != "claude-snapshot":
+                _PARENT_CACHE[note_path] = None
+                return None
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        # Transient DB errors (locked, busy, corrupt-for-one-tx) — don't poison
+        # the cache; next call retries.
+        print(f"[vault-index] parent-resolve DB error for {note_path!r}: {exc}",
+              file=sys.stderr)
+        return None
+
+    try:
+        # Extract source_session_note from the snapshot's frontmatter.
+        with open(note_path, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(2048)
+    except OSError as exc:
+        # File gone / unreadable — permanent miss for this process lifetime.
+        print(f"[vault-index] parent-resolve read error for {note_path!r}: {exc}",
+              file=sys.stderr)
+        _PARENT_CACHE[note_path] = None
+        return None
+
+    # Accept double-quoted, single-quoted, AND unquoted wikilink values —
+    # YAML frontmatter allows all three and hand-edits may use any. Copilot
+    # PR #43 finding: stricter `"?...` regex silently failed on single-quoted
+    # values and poisoned the cache with None.
+    m = re.search(r"^source_session_note:\s*['\"]?\[\[([^\]'\"]+)\]\]['\"]?",
+                  head, re.MULTILINE)
+    if not m:
+        _PARENT_CACHE[note_path] = None
+        return None
+    parent_stem = m.group(1)
+    parent_path = os.path.join(os.path.dirname(note_path), f"{parent_stem}.md")
+    if os.path.isfile(parent_path):
+        resolved = parent_path
+
+    _PARENT_CACHE[note_path] = resolved
+    return resolved
+
+
+def log_access(db_path: str, note_path: str, context_type: str, project: str | None = None) -> None:
+    """Insert an access-log row for note_path, cascading to parent session
+    if note_path is a snapshot.
+
+    The cascade runs in the same connection under a single executemany, so
+    either both rows land or neither does. Broken snapshot backlinks are
+    tolerated — the parent is simply skipped, the snapshot is still logged.
+    """
+    paths = [note_path]
+    parent = _parent_session_for_snapshot(note_path, db_path)
+    if parent:
+        paths.append(parent)
+
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            now = time.time()
+            conn.executemany(
                 "INSERT INTO access_log (note_path, timestamp, context_type, project) "
                 "VALUES (?, ?, ?, ?)",
-                (note_path, time.time(), context_type, project),
+                [(p, now, context_type, project) for p in paths],
             )
             conn.commit()
         finally:

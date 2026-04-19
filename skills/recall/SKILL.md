@@ -203,7 +203,7 @@ If the command fails (non-zero exit code), print the error and stop — do not f
 **Parse the output.** Split on section labels:
 
 1. Extract `<<<OB_CONTEXT_BRIEF>>>` — everything between this delimiter and `<<<OB_LOAD_MANIFEST>>>`. This is the brief to display.
-2. Extract `<<<OB_LOAD_MANIFEST>>>` — parse `full_session_title`, `full_session_date`, `full_session_path`, `summary_session_title`, `summary_session_date`, `insight_count`.
+2. Extract `<<<OB_LOAD_MANIFEST>>>` — parse `full_session_title`, `full_session_date`, `full_session_path`, `summary_session_title`, `summary_session_date`, `insight_count`, `snapshot_count` (optional), and all `snapshot:` lines (there may be zero or more, each followed by optional 2-space-indented `key_context` bullets).
 3. Extract `<<<OB_MOST_RECENT_SESSION_PATH>>>` — the full path for checkoff edits.
 4. Extract `<<<OB_OPEN_ITEM_CANDIDATES>>>` — either `NO_CANDIDATES`, `NO_ITEMS`, or a JSON array.
 
@@ -214,6 +214,8 @@ Update task #3 to `completed`. Update task #4 to `in_progress`.
 > **Here's what I found from your Obsidian vault for `$PROJECT`:**
 
 Then output the `CONTEXT_BRIEF` section. For the session history table, paraphrase each session's Title column into a concise one-line summary (under ~80 characters) that captures the key accomplishment. Keep all other columns (date, duration, branch) verbatim.
+
+Snapshots appear in the brief as nested indented rows beneath their parent session (rows starting with `↳ HH:MM:SS`). Render them verbatim — do not paraphrase snapshot titles (they're already one-line summaries). Display the `snapshot:` lines from LOAD_MANIFEST as bullet points under the most-recent session in the "Loaded into this conversation" output.
 
 If unsummarized notes were upgraded in Step 2, also mention:
 

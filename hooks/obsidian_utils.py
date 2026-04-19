@@ -563,6 +563,193 @@ def read_note_metadata(file_path: str) -> dict | None:
     return meta
 
 
+def find_snapshots_for_session(
+    sessions_folder_path: Path, session_id: str, date: str, project: str
+) -> list[str]:
+    """Return chronologically-sorted wikilinks of all snapshots whose
+    frontmatter session_id and project match the given session. Empty list
+    if none exist.
+
+    Matching rules:
+    - Filename pattern: <date>-<project-slug>-*-snapshot*.md (captures both
+      pre-spec `-snapshot.md` and post-spec `-snapshot-<HHMMSS>.md`).
+    - Requires frontmatter `session_id` AND `project` to match.
+    - Malformed snapshots are logged to stderr and skipped — one bad file
+      must not block back-reference writing.
+
+    Sorted lexicographically by filename stem; HHMMSS suffix makes this
+    chronological for post-spec snapshots. Pre-spec (no HHMMSS) sorts first.
+    """
+    if not sessions_folder_path.is_dir():
+        return []
+    slug = slugify(project)
+    wikilinks: list[str] = []
+    for p in sorted(sessions_folder_path.glob(f"{date}-{slug}-*-snapshot*.md")):
+        try:
+            meta = read_note_metadata(str(p))
+            if not meta:
+                continue
+            if meta.get("session_id") == session_id and (
+                meta.get("project", "").lower() == project.lower()
+                or slugify(meta.get("project", "")) == slug
+            ):
+                wikilinks.append(f"[[{p.stem}]]")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[obsidian-brain] skipping malformed snapshot {p.name}: {exc}",
+                  file=sys.stderr)
+            continue
+    return wikilinks
+
+
+_SECTION_RE_CACHE: dict[tuple[str, ...], re.Pattern] = {}
+
+
+def _extract_sections(body: str, section_headers: tuple[str, ...]) -> str:
+    """Return concatenated content of the named `## Foo` sections, or '' if none.
+
+    Header matching is literal — case-sensitive, full-line. Sections end at
+    the next `## ` heading or EOF. Empty string if no section matches.
+    """
+    key = tuple(section_headers)
+    if key not in _SECTION_RE_CACHE:
+        pattern = "|".join(re.escape(h) for h in section_headers)
+        _SECTION_RE_CACHE[key] = re.compile(
+            rf"^({pattern})\s*$\n(.*?)(?=^## |\Z)",
+            re.MULTILINE | re.DOTALL,
+        )
+    chunks = []
+    for m in _SECTION_RE_CACHE[key].finditer(body):
+        chunks.append(m.group(1) + "\n" + m.group(2).strip())
+    return "\n\n".join(chunks)
+
+
+def _extract_hhmmss_from_filename(filename: str) -> str:
+    """Return the HHMMSS suffix from a post-spec snapshot filename, or '??????'."""
+    m = re.search(r"-snapshot-(\d{6})\.md$", filename)
+    return m.group(1) if m else "??????"
+
+
+def _augment_session_input_with_snapshots(
+    transcript: str,
+    sessions_folder_path: Path,
+    session_id: str,
+    date: str,
+    project: str,
+) -> str:
+    """Prepend sibling snapshot bodies (preferring summaries) to session input.
+
+    Used by the session-note branch of upgrade_unsummarized_note to give
+    generate_summary a cohesive view of the whole arc, not just the
+    post-last-compact tail.
+
+    Returns the original transcript unchanged if no snapshots exist.
+    """
+    wikilinks = find_snapshots_for_session(sessions_folder_path, session_id, date, project)
+    if not wikilinks:
+        return transcript
+
+    blocks: list[str] = []
+    for link in wikilinks:
+        stem = link.strip("[]")
+        snap_path = sessions_folder_path / f"{stem}.md"
+        if not snap_path.exists():
+            continue
+        try:
+            body = snap_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        hh = _extract_hhmmss_from_filename(snap_path.name)
+        meta = read_note_metadata(str(snap_path)) or {}
+        # Default missing `trigger:` to "auto" (consistent with _snapshot_stats
+        # and fetch_snapshot_summaries) so legacy/malformed notes don't get
+        # mislabeled as compact. Copilot PR #43 round 2 finding.
+        trigger = meta.get("trigger", "auto")
+        summary_block = _extract_sections(
+            body, ("## Summary", "## Key context that may be lost (summary)")
+        )
+        if not summary_block.strip():
+            summary_block = _extract_sections(
+                body,
+                ("## What was happening", "## Key context that may be lost",
+                 "## Uncommitted work", "## Last messages (raw)"),
+            )
+        if not summary_block.strip():
+            continue
+        blocks.append(f"[snapshot {hh}, trigger={trigger}]\n{summary_block}")
+
+    if not blocks:
+        return transcript
+
+    prefix = "===== EARLIER IN THIS SESSION (from snapshots) =====\n\n" + "\n\n".join(blocks)
+    if transcript:
+        return (
+            prefix
+            + "\n\n===== CURRENT TAIL (post-compact transcript) =====\n\n"
+            + transcript
+        )
+    return prefix
+
+
+def fetch_snapshot_summaries(
+    sessions_folder_path: Path,
+    session_id: str,
+    date: str,
+    project: str,
+) -> list[dict]:
+    """Return chronologically-sorted summary dicts for a session's snapshots.
+
+    Each dict has: ``path``, ``hhmmss``, ``trigger``, ``summary`` (first
+    sentence of ``## Summary`` if upgraded; first bullet of
+    ``## What was happening`` as fallback; ``"(not yet summarized)"`` if
+    neither exists), ``key_context`` (``## Key context that may be lost
+    (summary)`` if upgraded; ``""`` otherwise).
+
+    Shared helper used by build_context_brief(), the vault-search skill,
+    and vault-ask so presentation stays consistent.
+    """
+    results: list[dict] = []
+    for link in find_snapshots_for_session(sessions_folder_path, session_id, date, project):
+        stem = link.strip("[]")
+        path = sessions_folder_path / f"{stem}.md"
+        if not path.exists():
+            continue
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        meta = read_note_metadata(str(path)) or {}
+        hh = _extract_hhmmss_from_filename(path.name)
+        summary = ""
+        key_context = ""
+
+        summary_match = re.search(r"^## Summary\s*\n(.+?)(?=\n## |\Z)", body, re.MULTILINE | re.DOTALL)
+        if summary_match:
+            summary = summary_match.group(1).strip().split("\n", 1)[0].strip()
+        else:
+            wh_match = re.search(r"^## What was happening\s*\n(.+?)(?=\n## |\Z)",
+                                 body, re.MULTILINE | re.DOTALL)
+            if wh_match:
+                summary = wh_match.group(1).strip().split("\n", 1)[0].strip()
+
+        kc_match = re.search(
+            r"^## Key context that may be lost \(summary\)\s*\n(.+?)(?=\n## |\Z)",
+            body, re.MULTILINE | re.DOTALL,
+        )
+        if kc_match:
+            key_context = kc_match.group(1).strip()
+
+        results.append({
+            "path": str(path),
+            "hhmmss": hh,
+            # Default missing `trigger:` to "auto" so /recall doesn't mislabel
+            # legacy snapshots as compact. Copilot PR #43 round 2 finding.
+            "trigger": meta.get("trigger", "auto"),
+            "summary": summary or "(not yet summarized)",
+            "key_context": key_context,
+        })
+    return results
+
+
 def match_items_against_evidence(
     evidence_text: str,
     open_items: list[tuple[str, int, str]],
@@ -975,6 +1162,74 @@ def parse_importance(summary_text: str) -> int:
     return 5
 
 
+SNAPSHOT_SUMMARY_PROMPT = """You are a technical summarizer. You will be given the tail of a Claude Code session, captured the moment before the user invoked /compact or /clear. Your job is to produce a SHORT pre-compact checkpoint summary. Do NOT respond conversationally. Do NOT ask questions.
+
+Context: the user is about to lose the in-context conversation. What they need from this summary later is: (1) what they were working on, (2) what progress they had just made, (3) what was in flight — unanswered questions, half-finished thoughts, assumptions not yet tested.
+
+Do NOT restate decisions that were already committed or finalized — those will be captured in the parent session's cohesive summary later. Focus on what's transient and in flight.
+
+TRANSCRIPT:
+{transcript}
+
+OUTPUT EXACTLY these two sections with no preamble, no commentary:
+
+## Summary
+2-4 sentences: what was happening, what progress mattered, why context was about to be compacted or cleared.
+
+## Key context that may be lost (summary)
+- 3-7 bullets: in-flight decisions, open questions, silent assumptions, hypotheses not yet verified.
+"""
+
+
+def generate_snapshot_summary(
+    user_msgs: list[str],
+    assistant_msgs: list[str],
+    metadata: dict,
+    model: str = "haiku",
+    timeout: int = 30,
+) -> str | None:
+    """Call ``claude -p --model <model>`` with the snapshot-specific prompt.
+
+    Returns None on failure. Reuses the retry/timeout pattern of
+    generate_summary but with a tighter scope (no open-item dedup, no
+    importance scoring — snapshots don't carry those structural fields).
+    """
+    sampled_user = user_msgs[-10:] if len(user_msgs) > 10 else user_msgs
+    sampled_asst = assistant_msgs[-10:] if len(assistant_msgs) > 10 else assistant_msgs
+    user_sample = "\n---\n".join(sampled_user)[:8000]
+    asst_sample = "\n---\n".join(sampled_asst)[:8000]
+    transcript = f"USER MESSAGES:\n{user_sample}\n\n---\n\nASSISTANT MESSAGES:\n{asst_sample}"
+
+    prompt = SNAPSHOT_SUMMARY_PROMPT.format(transcript=transcript)
+
+    attempts = (timeout, timeout * 2)
+    for i, attempt_timeout in enumerate(attempts):
+        try:
+            result = subprocess.run(
+                ["claude", "-p", "--model", model],
+                input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+            print(f"[obsidian-brain] claude -p (snapshot) failed (rc={result.returncode})",
+                  file=sys.stderr)
+            break
+        except FileNotFoundError:
+            print("[obsidian-brain] claude CLI not found", file=sys.stderr)
+            break
+        except subprocess.TimeoutExpired:
+            if i < len(attempts) - 1:
+                print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s, retrying...",
+                      file=sys.stderr)
+                continue
+            print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s",
+                  file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[obsidian-brain] claude -p (snapshot) error: {exc}", file=sys.stderr)
+            break
+    return None
+
+
 def generate_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
@@ -1007,13 +1262,24 @@ def generate_summary(
     user_sample = "\n---\n".join(sampled_user)[:12000]
     assistant_sample = "\n---\n".join(sampled_asst)[:12000]
 
-    prompt = f"""You are a technical summarizer. You will be given the transcript of a Claude Code coding session. Your job is to produce a structured summary. Do NOT respond conversationally. Do NOT ask questions. Just output the summary.
+    preamble = metadata.get("snapshot_preamble", "")
+    cohesion_hint = ""
+    if preamble:
+        cohesion_hint = (
+            "\nSome earlier context may come from pre-compact snapshots — "
+            "synthesize the whole arc into a cohesive narrative rather than "
+            "three disjoint summaries.\n"
+        )
 
+    prompt = f"""You are a technical summarizer. You will be given the transcript of a Claude Code coding session. Your job is to produce a structured summary. Do NOT respond conversationally. Do NOT ask questions. Just output the summary.
+{cohesion_hint}
 SESSION METADATA:
 - Project: {metadata.get('project', 'unknown')}
 - Branch: {metadata.get('git_branch', 'unknown')}
 - Duration: {metadata.get('duration_minutes', 0)} minutes
 - Files touched: {', '.join(metadata.get('files_touched', [])[:15]) or 'none detected'}
+
+{preamble}
 
 TRANSCRIPT (user and assistant messages):
 {user_sample}
@@ -1316,6 +1582,10 @@ def find_unsummarized_notes(
     filters by project, and checks for false positives (notes that already
     have a real ## Summary but stale status). Auto-fixes stale status inline.
 
+    Accepts notes of type ``claude-session`` and ``claude-snapshot``; rejects
+    other typed notes (e.g. ``claude-insight``). Legacy notes without a
+    ``type:`` field are accepted for backward compatibility.
+
     Returns JSON string: {"unsummarized": [paths], "auto_fixed": N}
     """
     sessions_dir = Path(vault_path) / sessions_folder
@@ -1349,6 +1619,14 @@ def find_unsummarized_notes(
         status_match = re.search(r'^status:\s*(.+)$', frontmatter, re.MULTILINE)
         if not status_match or status_match.group(1).strip() != 'auto-logged':
             continue
+
+        # Type filter — accept both sessions and snapshots. Legacy notes
+        # without a type field are kept (current permissive behavior).
+        type_match = re.search(r'^type:\s*(.+)$', frontmatter, re.MULTILINE)
+        if type_match:
+            type_val = type_match.group(1).strip().strip('"').strip("'")
+            if type_val not in ("claude-session", "claude-snapshot"):
+                continue
 
         # Must match project
         project_match = re.search(r'^project:\s*(.+)$', frontmatter, re.MULTILINE)
@@ -1397,6 +1675,31 @@ def find_unsummarized_notes(
 
         unsummarized.append(str(f))
 
+    # Ordering bias: within a session_id group, snapshots sort first so the
+    # per-note pipeline summarizes them before the parent session's cohesion
+    # step runs. Advisory only — Section 5's cohesion helper falls back to
+    # raw bodies for snapshots not yet upgraded.
+    def _bias_key(path_str):
+        name = os.path.basename(path_str)
+        try:
+            content = Path(path_str).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ("", 1, name)
+        sid = ""
+        typ = ""
+        for line in content.splitlines()[:30]:
+            line = line.strip()
+            if line.startswith("session_id:"):
+                sid = line.split(":", 1)[1].strip().strip('"').strip("'")
+            elif line.startswith("type:"):
+                # Strip both quote styles so `type: "claude-snapshot"` and
+                # `type: 'claude-snapshot'` (both valid YAML) sort correctly
+                # under the snapshot-first bias. Copilot PR #43 round 2
+                # finding — sid-line already strips; type-line didn't.
+                typ = line.split(":", 1)[1].strip().strip('"').strip("'")
+        return (sid, 0 if typ == "claude-snapshot" else 1, name)
+
+    unsummarized.sort(key=_bias_key)
     return json.dumps({"unsummarized": unsummarized, "auto_fixed": auto_fixed})
 
 
@@ -1444,6 +1747,9 @@ def build_context_brief(
         for f in sorted(md_files, key=_safe_sort_key, reverse=True):
             meta = read_note_metadata(str(f))
             if not meta:
+                continue
+            # Exclude snapshot-type notes from the top-level session table.
+            if meta.get('type') == 'claude-snapshot':
                 continue
             fm_project = meta.get('project', '')
             if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
@@ -1524,6 +1830,7 @@ def build_context_brief(
 
     # History table (last 5 sessions)
     history_rows: list[str] = []
+    most_recent_snaps: list[dict] = []
     for i, (fname, fpath, meta) in enumerate(session_files[:5]):
         date = meta.get('date', '')
         title = meta.get('project', project)
@@ -1556,6 +1863,23 @@ def build_context_brief(
         except OSError:
             pass
         history_rows.append(f"| {i+1} | {date} | {duration} | {title} | {branch} |")
+
+        # Append indented snapshot rows beneath this session.
+        sid = meta.get("session_id", "")
+        note_date = meta.get("date", "")
+        if sid and note_date:
+            _snaps = fetch_snapshot_summaries(sessions_dir, sid, note_date, project)
+            if i == 0:
+                most_recent_snaps = _snaps
+            for sn in _snaps:
+                hh = sn["hhmmss"]
+                hhmmss_pretty = (
+                    f"{hh[:2]}:{hh[2:4]}:{hh[4:]}" if hh and hh != "??????" else "--:--:--"
+                )
+                snap_title = sn["summary"][:80]
+                history_rows.append(
+                    f"|   | ↳ {hhmmss_pretty} |  |   {snap_title} | — |"
+                )
 
     # --- 3. Load insights via vault index (layered ranking) ---
     insight_entries: list[tuple[str, str]] = []  # (title, key_point)
@@ -1756,6 +2080,21 @@ def build_context_brief(
             print(f"[obsidian-brain] open-item detection failed (non-fatal): {exc}", file=sys.stderr)
 
     # --- 6. Compose structured output ---
+
+    # Snapshot summaries for the most-recent session (if any) — included
+    # at auto-load depth: summaries only, not raw transcripts.
+    manifest_snapshot_lines: list[str] = []
+    if most_recent_snaps:
+        manifest_snapshot_lines.append(f"snapshot_count: {len(most_recent_snaps)}")
+        for sn in most_recent_snaps:
+            manifest_snapshot_lines.append(
+                f"snapshot: [{sn['hhmmss']}] ({sn['trigger']}) {sn['summary']}"
+            )
+            if sn["key_context"]:
+                for bullet in sn["key_context"].splitlines():
+                    if bullet.strip():
+                        manifest_snapshot_lines.append(f"  {bullet.strip()}")
+
     manifest_lines = [
         f"full_session_title: {most_recent_title or '(none)'}",
         f"full_session_date: {most_recent_date or '(none)'}",
@@ -1764,6 +2103,7 @@ def build_context_brief(
         f"summary_session_date: {second_date or '(none)'}",
         f"insight_count: {insight_count}",
     ]
+    manifest_lines.extend(manifest_snapshot_lines)
 
     # Use unique delimiters that cannot appear in user-authored markdown content
     output_parts = [
@@ -1811,12 +2151,25 @@ def collect_vault_corpus(
     sessions_folder: str,
     insights_folder: str,
     days: int = 7,
+    include_types: tuple[str, ...] | None = None,
+    exclude_types: tuple[str, ...] = ("claude-snapshot",),
 ) -> str:
     """Scan vault session and insight notes, date-filter, extract structured data.
 
     Returns JSON string with keys: date_range, note_count, notes[].
     Each note has: file, type, date, project, tags, summary, decisions,
     errors, open_items.
+
+    Type filtering:
+        exclude_types: note types to drop (default: ``("claude-snapshot",)``).
+            Pass ``exclude_types=()`` to include all types.
+        include_types: when not None, only notes whose type is in this tuple
+            are kept (applied after exclude_types).
+
+    By default, ``claude-snapshot`` notes are excluded because their
+    "Key context that may be lost" bullets are transient mid-session content
+    that dilutes cross-session pattern synthesis in /emerge.  Pass
+    ``exclude_types=()`` to opt in.
 
     Security: path containment via resolve() + is_relative_to().
     Note: scrub_secrets() is NOT called — content is already scrubbed at write time.
@@ -1908,6 +2261,11 @@ def collect_vault_corpus(
 
             note_type = meta.get("type", default_type)
 
+            if exclude_types and note_type in exclude_types:
+                continue
+            if include_types is not None and note_type not in include_types:
+                continue
+
             notes_out.append(
                 {
                     "file": md_file.name,
@@ -1936,13 +2294,16 @@ def upgrade_and_collect_corpus(
     insights_folder: str,
     days: int,
     output_path: str,
+    include_types: tuple[str, ...] | None = None,
+    exclude_types: tuple[str, ...] = ("claude-snapshot",),
 ) -> str:
     """Upgrade unsummarized notes then collect corpus in a single pass.
 
     1. Scan sessions folder for notes with ``status: auto-logged`` within
        the date window and attempt ``upgrade_unsummarized_note()`` on each.
     2. Call ``collect_vault_corpus()`` to build the full corpus (including
-       freshly upgraded notes).
+       freshly upgraded notes).  ``include_types`` / ``exclude_types`` are
+       forwarded verbatim — see ``collect_vault_corpus`` docstring for details.
     3. Atomically write corpus JSON to *output_path*.
     4. Return status line: ``OK:<total>:<upgraded>:<failed>`` or
        ``EMPTY:0:0:0``.
@@ -2005,7 +2366,9 @@ def upgrade_and_collect_corpus(
 
     # --- Phase 2: collect corpus (now includes freshly upgraded notes) ---
     corpus_json = collect_vault_corpus(
-        vault_path, sessions_folder, insights_folder, days
+        vault_path, sessions_folder, insights_folder, days,
+        include_types=include_types,
+        exclude_types=exclude_types,
     )
     corpus = json.loads(corpus_json)
 
@@ -3061,11 +3424,13 @@ def upgrade_unsummarized_note(
     else:
         # Fall back to raw note content for summarization
         source = "raw note (JSONL not found)"
-        # Extract user/assistant messages from raw note conversation section
+        # Extract user/assistant messages from raw note conversation section.
+        # Supports both session notes (## Conversation (raw)) and snapshot notes
+        # (## Last messages (raw)).
         in_conversation = False
         for line in raw_lines:
             stripped = line.strip()
-            if stripped == '## Conversation (raw)':
+            if stripped in ('## Conversation (raw)', '## Last messages (raw)'):
                 in_conversation = True
                 continue
             if in_conversation:
@@ -3082,7 +3447,7 @@ def upgrade_unsummarized_note(
         in_conversation = False
         for line in raw_lines:
             stripped = line.strip()
-            if stripped == '## Conversation (raw)':
+            if stripped in ('## Conversation (raw)', '## Last messages (raw)'):
                 in_conversation = True
                 continue
             if in_conversation:
@@ -3113,13 +3478,40 @@ def upgrade_unsummarized_note(
         metadata["files_touched"] = parsed.get("files_touched", [])
         metadata["errors"] = parsed.get("errors", [])
 
-    # Generate summary
+    # Route by note type — snapshots use a shorter, focused prompt.
+    note_type = ""
+    for line in raw_lines[:20]:
+        if line.strip().startswith("type:"):
+            note_type = line.split(":", 1)[1].strip().strip('"').strip("'")
+            break
+
     gen_kwargs: dict = {"model": summary_model}
     if summary_timeout is not None:
         gen_kwargs["timeout"] = summary_timeout
-    summary_text = generate_summary(
-        user_msgs, assistant_msgs, metadata, **gen_kwargs,
-    )
+
+    if note_type == "claude-snapshot":
+        summary_text = generate_snapshot_summary(
+            user_msgs, assistant_msgs, metadata, **gen_kwargs,
+        )
+    else:
+        # Session — augment with snapshot bodies for cohesion.
+        date_str = ""
+        for line in raw_lines[:20]:
+            if line.strip().startswith("date:"):
+                date_str = line.split(":", 1)[1].strip().strip('"').strip("'")
+                break
+        sessions_dir_path = Path(vault_path) / sessions_folder
+        preamble = _augment_session_input_with_snapshots(
+            "", sessions_dir_path, session_id, date_str, project,
+        )
+        if preamble:
+            # Stash the snapshot preamble into metadata so generate_summary can
+            # prepend it to its sampled transcript. New optional key; existing
+            # callers unaffected (absent key → no-op).
+            metadata["snapshot_preamble"] = preamble
+        summary_text = generate_summary(
+            user_msgs, assistant_msgs, metadata, **gen_kwargs,
+        )
 
     if not summary_text:
         return f"Failed: AI summarization returned empty for {os.path.basename(note_path)}"

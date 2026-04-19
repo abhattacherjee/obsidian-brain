@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **snapshots**: First-class mid-session checkpoint support. Snapshots now carry `status: auto-logged` (or `summarized`) and `source_session_note` wikilink frontmatter, use seconds-resolution filenames (`-snapshot-HHMMSS`), and are AI-summarized lazily at `/recall` time alongside session notes via a dedicated snapshot prompt
+- **session-end**: Threshold bypass — writes the session note even when the transcript is below `min_turns`/`min_duration_minutes` if sibling snapshots exist, so every snapshot has a navigable parent anchor. Emits a `snapshots: [...]` list when siblings are present
+- **recall**: `_augment_session_input_with_snapshots()` prepends snapshot summary bodies to the session summarization input so the generated summary describes the full pre- and post-compact arc cohesively
+- **recall**: Nested `↳ HH:MM:SS` snapshot rows in the session history table; `LOAD_MANIFEST` surfaces `snapshot_count` and per-snapshot summaries at auto-load depth
+- **vault-index**: `log_access()` cascades snapshot accesses to the parent session via a single `executemany`, preventing hot snapshots from outranking their own parent under activation scoring
+- **obsidian_utils**: Public helper `fetch_snapshot_summaries(sessions_folder, session_id, date, project)` returning ordered snapshot dicts for presentation reuse across skills; `find_snapshots_for_session()` promoted to public API
+- **vault-stats**: `## Snapshots` section — trigger breakdown (compact/clear/auto), sessions-with-snapshots, max snapshots per session, orphan and broken-backlink counters, summarization fraction
+- **emerge**: `--include-snapshots` opt-in flag. `collect_vault_corpus()` gains `include_types` / `exclude_types` kwargs (default excludes `claude-snapshot` so mid-session "Key context" bullets don't dilute cross-session pattern synthesis); `run_corpus` cache key includes `include_snapshots` to prevent shape-mismatch returns
+- **check-items**: `collect_open_items()` filters to `type: claude-session` (legacy notes without a `type:` field preserved as sessions); snapshot bullets no longer produce false-positive open-item proposals
+- **vault-search**: Session hits annotate with `· 📸 N` marker and list snapshots as nested `↳ HH:MM:SS` rows; snapshot hits annotate with `→ [[parent-stem]]`; loading a snapshot pick opens the parent session at session-depth (body + all snapshot summaries)
+- **vault-ask**: Synthesis pool includes parent session body for snapshot hits and snapshot summaries for session hits, so answers reflect the full session arc rather than the post-compact tail; snapshot citations accompany parent-session wikilinks
+- **config**: `/vault-config` and `/obsidian-setup` warn when `snapshot_on_clear` or `snapshot_on_compact` is set to `false`
+
 - **vault-index**: Phase 2 theme engine — `themes`, `theme_members`, and `term_df` tables; `tfidf_vector` JSON column on `notes` (auto-migrated on first `ensure_index()` call)
 - **vault-index**: `_tokenize_for_tfidf()`, `_compute_tfidf_vector()` (smoothed IDF), `_cosine_similarity()` for sparse dict vectors, `_update_term_df()` for incremental IDF maintenance
 - **vault-index**: `assign_to_theme()` — incremental cosine-similarity clustering after note summarization; notes joining a theme update its centroid via running average under a BEGIN IMMEDIATE transaction so concurrent callers cannot clobber each other
@@ -17,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **config**: `check_optional_deps()` returns import-availability for numpy and scipy
 
 ### Changed
+- **pre-compact hook**: filename pattern extends from `-snapshot.md` to `-snapshot-HHMMSS.md` so multiple `/compact` events in one session no longer collide on write
+- **obsidian_session_log**: writes `snapshots: [...]` back-reference list when sibling snapshots exist for this `session_id` (bidirectional link surface)
 - **recall**: Replace sub-agent batch summarization (Wave 1-2-3) with parallel Haiku pipelines; sub-agents demoted to per-note fallback only
 - **vault-index**: `search_vault()` and `query_related_notes()` now batch their access-log writes via `executemany` on the existing connection (1 commit instead of N, Phase 1 Copilot review deferred item)
 
