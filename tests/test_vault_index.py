@@ -379,6 +379,209 @@ class TestRebuildIndex:
         assert "idx_access_note" in index_names
         assert "idx_access_time" in index_names
 
+    def test_rebuild_default_preserves_access_log(self, tmp_vault):
+        """Non-destructive rebuild preserves access_log rows for surviving notes."""
+        note1 = tmp_vault / "claude-sessions" / "keeper.md"
+        _write_note(
+            note1,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# Keeper\n\nBody.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        # Production stores absolute paths in both notes.path and access_log.note_path
+        abs_path = str(note1.resolve())
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+            "VALUES (?, ?, ?, ?)",
+            (abs_path, 1000.0, "recall", "proj"),
+        )
+        conn.commit()
+        conn.close()
+
+        stats = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path
+        )
+
+        assert stats["mode"] if "mode" in stats else True  # stats.preserved present
+        assert stats["preserved"]["access_log"] == 1
+        assert stats["pruned_orphans"]["access_log"] == 0
+
+        conn = sqlite3.connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
+        conn.close()
+        assert count == 1
+
+    def test_rebuild_default_prunes_orphan_access_log(self, tmp_vault):
+        """Non-destructive rebuild prunes access_log rows for deleted notes."""
+        note1 = tmp_vault / "claude-sessions" / "keeper.md"
+        note2 = tmp_vault / "claude-sessions" / "deleted.md"
+        for n in (note1, note2):
+            _write_note(
+                n,
+                {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+                body="# N\n\nBody.",
+            )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        abs1, abs2 = str(note1.resolve()), str(note2.resolve())
+        conn = sqlite3.connect(db_path)
+        for p in (abs1, abs2):
+            conn.execute(
+                "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+                "VALUES (?, ?, ?, ?)",
+                (p, 1000.0, "recall", "proj"),
+            )
+        conn.commit()
+        conn.close()
+
+        # Remove the second note from disk, then rebuild
+        note2.unlink()
+        stats = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path
+        )
+
+        assert stats["preserved"]["access_log"] == 1
+        assert stats["pruned_orphans"]["access_log"] == 1
+
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("SELECT note_path FROM access_log").fetchall()
+        conn.close()
+        assert len(rows) == 1
+        assert "keeper.md" in rows[0][0]
+
+    def test_rebuild_default_preserves_themes_and_members(self, tmp_vault):
+        """Non-destructive rebuild preserves themes + theme_members for surviving notes."""
+        note1 = tmp_vault / "claude-sessions" / "themed.md"
+        _write_note(
+            note1,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# T\n\nBody.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        abs_path = str(note1.resolve())
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("test-theme", "summary", '{"x": 1.0}', 1, "2026-04-10", "2026-04-10", "proj"),
+        )
+        theme_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, "
+            "surprise, added_date) VALUES (?, ?, ?, ?, ?)",
+            (theme_id, abs_path, 0.9, 0.5, "2026-04-10"),
+        )
+        conn.commit()
+        conn.close()
+
+        stats = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path
+        )
+
+        assert stats["preserved"]["themes"] == 1
+        assert stats["preserved"]["theme_members"] == 1
+
+        conn = sqlite3.connect(db_path)
+        theme_row = conn.execute(
+            "SELECT name, centroid FROM themes WHERE id = ?", (theme_id,)
+        ).fetchone()
+        member_row = conn.execute(
+            "SELECT surprise FROM theme_members WHERE theme_id = ?", (theme_id,)
+        ).fetchone()
+        conn.close()
+        assert theme_row[0] == "test-theme"
+        assert theme_row[1] == '{"x": 1.0}'  # centroid preserved
+        assert member_row[0] == 0.5  # surprise score preserved
+
+    def test_rebuild_full_drops_friston_tables(self, tmp_vault):
+        """Opt-in full=True clears access_log/themes/theme_members."""
+        note1 = tmp_vault / "claude-sessions" / "note.md"
+        _write_note(
+            note1,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# N\n\nBody.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+            "VALUES (?, ?, ?, ?)",
+            ("keeper.md", 1000.0, "recall", "proj"),
+        )
+        conn.execute(
+            "INSERT INTO themes (name, summary, created_date, updated_date) "
+            "VALUES (?, ?, ?, ?)",
+            ("t", "s", "2026-04-10", "2026-04-10"),
+        )
+        conn.commit()
+        conn.close()
+
+        stats = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path, full=True
+        )
+
+        # Full mode: no 'preserved' key (destructive)
+        assert "preserved" not in stats
+
+        conn = sqlite3.connect(db_path)
+        access_count = conn.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
+        themes_count = conn.execute("SELECT COUNT(*) FROM themes").fetchone()[0]
+        conn.close()
+        assert access_count == 0
+        assert themes_count == 0
+
+    def test_rebuild_default_regenerates_term_df_and_fts(self, tmp_vault):
+        """Non-destructive rebuild fully regenerates notes_fts and term_df."""
+        note1 = tmp_vault / "claude-sessions" / "searchable.md"
+        _write_note(
+            note1,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# Title\n\nUnique body content for search.",
+        )
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path
+        )
+
+        conn = sqlite3.connect(db_path)
+        # "Unique" appears in the body; not in the filename, so FTS is the
+        # only way to hit it after rebuild (proves FTS was repopulated).
+        fts_hits = conn.execute(
+            "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH ?", ("Unique",)
+        ).fetchone()[0]
+        term_count = conn.execute("SELECT COUNT(*) FROM term_df").fetchone()[0]
+        conn.close()
+        assert fts_hits == 1
+        assert term_count > 0
+
+    def test_rebuild_default_on_missing_db_falls_through_to_full(self, tmp_vault):
+        """When no DB exists yet, non-destructive call still produces a working index."""
+        note1 = tmp_vault / "claude-sessions" / "fresh.md"
+        _write_note(
+            note1,
+            {"type": "claude-session", "date": "2026-04-10", "project": "proj"},
+            body="# F\n\nBody.",
+        )
+        db_path = str(tmp_vault / "nonexistent.db")
+        assert not os.path.isfile(db_path)
+
+        stats = vault_index.rebuild_index(
+            str(tmp_vault), ["claude-sessions"], db_path=db_path
+        )
+
+        assert stats["inserted"] == 1
+        assert os.path.isfile(db_path)
+
 
 class TestIndexNote:
     def test_index_note_single_file(self, tmp_vault):

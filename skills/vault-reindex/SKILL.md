@@ -1,21 +1,28 @@
 ---
 name: vault-reindex
-description: Rebuild the SQLite FTS5 vault index from scratch. Use when the index is stale, corrupt, or after bulk edits in Obsidian.
+description: Rebuild the SQLite FTS5 vault index. Non-destructive by default — preserves Friston activation data (access_log, themes, theme_members); only regenerates derivable tables. Opt into `--full` for a complete wipe.
 metadata:
-  version: 1.0.0
+  version: 2.0.0
 ---
 
 # Vault Reindex — Rebuild FTS5 Index
 
-Rebuilds the vault index from scratch by scanning all vault markdown files. Drops the existing database and re-indexes every note in the configured sessions and insights folders.
+Regenerates the `notes` and `notes_fts` tables from on-disk state. Use when the index is stale, corrupt, after bulk edits in Obsidian, or to purge leftover rows from pytest fixtures.
 
 **Tools needed:** Bash
+
+## Modes
+
+- **Default (`/vault-reindex`)** — non-destructive. Clears and rebuilds `notes`, `notes_fts`, and `term_df` from disk. **Preserves** `access_log` (ACT-R activation history), `themes`, and `theme_members` (cluster centroids + surprise scores). Orphaned rows referencing note paths that no longer exist are pruned.
+- **`/vault-reindex --full`** — destructive. Deletes the entire `~/.claude/obsidian-brain-vault.db` file and rebuilds from an empty schema. Every Friston field is lost. Only needed when the schema is corrupt or incompatible.
 
 ## Procedure
 
 Follow these steps exactly. Do not skip steps or reorder them.
 
-### Step 1 — Load config
+### Step 1 — Parse arguments and load config
+
+If the user passes `--full`, set `FULL_MODE=true`; otherwise `FULL_MODE=false`.
 
 Run:
 
@@ -42,9 +49,19 @@ If config is missing or the command fails, tell the user:
 
 Stop here if config is missing.
 
-### Step 2 — Rebuild
+### Step 2 — Confirm full mode (only if `--full`)
 
-Run, passing the config values as command-line arguments (never interpolate into Python source):
+If `FULL_MODE=true`, warn the user before proceeding:
+
+> ⚠️ **Full rebuild requested.** This will **delete** `access_log`, `themes`, and `theme_members` (activation history, cluster centroids, surprise scores). These tables do not regenerate automatically — activation signal accumulates over time as you run `/recall`, `/vault-search`, and `/vault-ask`. Themes will be empty until `/consolidate` ships.
+>
+> Continue? Reply `yes` to confirm, anything else to cancel.
+
+Wait for confirmation. Abort if the user does not reply `yes`. If cancelled, tell them they can run the default `/vault-reindex` (without `--full`) for a non-destructive rebuild.
+
+### Step 3 — Rebuild
+
+Run, passing the config values and `FULL_MODE` as command-line arguments:
 
 ```bash
 python3 -c '
@@ -52,10 +69,12 @@ import sys, os, glob, time, json
 sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from vault_index import rebuild_index
 t0 = time.time()
-stats = rebuild_index(sys.argv[1], [sys.argv[2], sys.argv[3]])
+full = sys.argv[4].lower() == "true"
+stats = rebuild_index(sys.argv[1], [sys.argv[2], sys.argv[3]], full=full)
 stats["elapsed"] = round(time.time() - t0, 1)
+stats["mode"] = "full" if full else "preserve"
 print(json.dumps(stats))
-' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER" "$FULL_MODE"
 ```
 
 If the command fails (non-zero exit or exception in output), tell the user:
@@ -64,18 +83,21 @@ If the command fails (non-zero exit or exception in output), tell the user:
 
 Stop here on failure.
 
-### Step 3 — Report
+### Step 4 — Report
 
-Parse the JSON output from Step 2. Extract:
+Parse the JSON output from Step 3. Extract:
 
 - `inserted` — total notes indexed
 - `skipped` — files without valid frontmatter
 - `elapsed` — time in seconds
-- `by_type` — dict mapping note type to count (e.g. `{"claude-session": 42, "claude-insight": 7}`)
+- `by_type` — dict mapping note type to count
+- `mode` — `"preserve"` or `"full"`
+- `preserved` — dict with `access_log`, `themes`, `theme_members` counts (non-destructive mode only)
+- `pruned_orphans` — dict with `access_log`, `theme_members` pruned counts (non-destructive mode only)
 
 Present this report:
 
-> **Rebuilt vault index:** `<inserted>` notes indexed in `<elapsed>`s
+> **Rebuilt vault index** (`<mode>` mode): `<inserted>` notes indexed in `<elapsed>`s
 >
 > | Type | Count |
 > |------|-------|
@@ -86,6 +108,21 @@ Present this report:
 > Skipped: `<skipped>` file(s) without frontmatter.
 
 Only include rows in the table for types that appear in `by_type` (omit zero-count types). Sort rows by count descending.
+
+**Additional section — non-destructive mode only:**
+
+> **Friston data preserved:**
+> - `access_log`: `<access_log>` activation event(s)
+> - `themes`: `<themes>` cluster(s)
+> - `theme_members`: `<theme_members>` assignment(s)
+>
+> Pruned `<pruned_access_log>` orphaned access-log row(s) and `<pruned_theme_members>` orphaned theme-member row(s) referencing notes no longer on disk.
+
+If both pruned counts are 0, replace the pruning line with `No orphan rows to prune.`.
+
+**Additional section — full mode only:**
+
+> ⚠️ **Friston data cleared:** `access_log`, `themes`, and `theme_members` are now empty. Activation signal will rebuild as you use the vault.
 
 If `inserted` is 0 and `skipped` is 0, also tell the user:
 

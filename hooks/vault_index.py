@@ -833,31 +833,109 @@ def batch_activations(
     return result
 
 
-def rebuild_index(vault_path: str, folders: list[str], db_path: str | None = None) -> dict:
-    """Drop and rebuild the entire index from scratch.
+def rebuild_index(
+    vault_path: str,
+    folders: list[str],
+    db_path: str | None = None,
+    full: bool = False,
+) -> dict:
+    """Rebuild the vault index.
 
-    Returns {"inserted": N, "skipped": M, "by_type": {...}}.
+    Default (``full=False``): non-destructive — preserves Friston-architecture
+    state (``access_log`` activation history, ``themes``, ``theme_members``
+    surprise scores) while clearing and regenerating the derivable tables
+    (``notes``, ``notes_fts``, ``term_df``). Orphaned ``access_log`` and
+    ``theme_members`` rows whose note paths are no longer on disk are pruned
+    after the sync. This is the right mode for clearing pytest pollution,
+    bulk vault edits, or stale rows — accumulated access/activation signal
+    survives.
+
+    Opt-in ``full=True``: legacy destructive behavior. Deletes the entire DB
+    file (plus WAL/SHM) and rebuilds from an empty schema. Every Friston
+    field is lost. Required only when the schema is corrupt or incompatible.
+
+    Returns ``{"inserted": N, "skipped": M, "by_type": {...}}`` plus, in
+    non-destructive mode, ``"preserved": {...}`` and ``"pruned_orphans":
+    {...}`` reporting the Friston-table delta.
     """
     if db_path is None:
         db_path = _default_db_path()
 
-    # Delete existing DB and WAL/SHM sidecars
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            os.remove(db_path + suffix)
-        except OSError:
-            pass
-
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-    conn = _connect(db_path)
-    try:
-        _init_schema(conn)
-        _ensure_access_log_indexes(conn)
-        _ensure_theme_indexes(conn)
-        stats = _sync(conn, vault_path, folders)
-    finally:
-        conn.close()
+    # A fresh DB has nothing to preserve — fall through to full rebuild even
+    # when full=False, so callers always get a working index.
+    if not os.path.isfile(db_path):
+        full = True
+
+    if full:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(db_path + suffix)
+            except OSError:
+                pass
+
+        conn = _connect(db_path)
+        try:
+            _init_schema(conn)
+            _ensure_access_log_indexes(conn)
+            _ensure_theme_indexes(conn)
+            stats = _sync(conn, vault_path, folders)
+        finally:
+            conn.close()
+    else:
+        conn = _connect(db_path)
+        try:
+            _init_schema(conn)
+            _ensure_access_log_indexes(conn)
+            if _needs_importance_migration(conn):
+                _add_importance_column(conn)
+            if _needs_tfidf_vector_migration(conn):
+                _add_tfidf_vector_column(conn)
+            _ensure_theme_indexes(conn)
+
+            before_access = conn.execute(
+                "SELECT COUNT(*) FROM access_log"
+            ).fetchone()[0]
+            before_themes = conn.execute(
+                "SELECT COUNT(*) FROM themes"
+            ).fetchone()[0]
+            before_members = conn.execute(
+                "SELECT COUNT(*) FROM theme_members"
+            ).fetchone()[0]
+
+            # Contentless FTS5 (content='') doesn't support DELETE FROM or
+            # the 'delete-all' command; drop the virtual table so
+            # _init_schema recreates it empty, then clear notes + term_df.
+            conn.execute("DROP TABLE IF EXISTS notes_fts")
+            conn.execute("DELETE FROM notes")
+            conn.execute("DELETE FROM term_df")
+            conn.commit()
+            _init_schema(conn)
+
+            stats = _sync(conn, vault_path, folders)
+
+            pruned_access = conn.execute(
+                "DELETE FROM access_log "
+                "WHERE note_path NOT IN (SELECT path FROM notes)"
+            ).rowcount
+            pruned_members = conn.execute(
+                "DELETE FROM theme_members "
+                "WHERE note_path NOT IN (SELECT path FROM notes)"
+            ).rowcount
+            conn.commit()
+
+            stats["preserved"] = {
+                "access_log": before_access - pruned_access,
+                "themes": before_themes,
+                "theme_members": before_members - pruned_members,
+            }
+            stats["pruned_orphans"] = {
+                "access_log": pruned_access,
+                "theme_members": pruned_members,
+            }
+        finally:
+            conn.close()
 
     try:
         os.chmod(db_path, 0o600)

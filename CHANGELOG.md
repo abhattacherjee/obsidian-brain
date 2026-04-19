@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **recall**: Replace sub-agent batch summarization (Wave 1-2-3) with parallel Haiku pipelines; sub-agents demoted to per-note fallback only
 - **vault-index**: `search_vault()` and `query_related_notes()` now batch their access-log writes via `executemany` on the existing connection (1 commit instead of N, Phase 1 Copilot review deferred item)
 
+### Changed
+- **vault-reindex**: Now **non-destructive by default** — preserves `access_log` (ACT-R activation history), `themes`, and `theme_members` (cluster centroids + surprise scores) while clearing and regenerating `notes`, `notes_fts`, and `term_df`. Orphaned access-log and theme-member rows referencing notes no longer on disk are pruned and reported. Opt into `/vault-reindex --full` for the previous destructive behavior (full DB delete + rebuild from empty schema). `rebuild_index()` gains a `full: bool = False` kwarg and emits `preserved` / `pruned_orphans` fields in its stats dict. Skill version 1.0.0 → 2.0.0
+
 ### Fixed
 - **vault-index**: `_sync()` uses `Path.is_relative_to()` instead of prefix-only `startswith()` so sibling folders like `claude-sessions-archive` are no longer incorrectly treated as nested inside `claude-sessions` (Phase 1 Copilot review deferred item)
 - **vault-index**: `_prior_terms_for()` → `_prior_tokens_for()` — re-tokenises the stored note body instead of reading the top-K=50 truncated `tfidf_vector` keys, so common-but-low-IDF terms (outside the top-50 cutoff) are no longer incremented on every reindex without a matching decrement. Fixes `term_df.df` drifting upward past the total note count across repeated `index_note` calls (caught by Phase 2 dev-test Step 11 invariant checker, missed by 522 pytest + 27 validator assertions). Existing drift clears on `rebuild_index()`. Regression gates: pytest `test_reindex_does_not_drift_term_df` + validator `test_reindex_invariance`
