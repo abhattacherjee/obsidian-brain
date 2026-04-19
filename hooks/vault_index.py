@@ -833,31 +833,223 @@ def batch_activations(
     return result
 
 
-def rebuild_index(vault_path: str, folders: list[str], db_path: str | None = None) -> dict:
-    """Drop and rebuild the entire index from scratch.
+def rebuild_index(
+    vault_path: str,
+    folders: list[str],
+    db_path: str | None = None,
+    full: bool = False,
+) -> dict:
+    """Rebuild the vault index.
 
-    Returns {"inserted": N, "skipped": M, "by_type": {...}}.
+    Default (``full=False``): non-destructive incremental sync. Preserves
+    Friston-architecture state (``access_log`` activation history, ``themes``,
+    ``theme_members`` surprise scores + centroids) and reconciles the index
+    with current vault contents via ``_sync`` (which is mtime-incremental —
+    unchanged notes are not re-tokenised). Rows whose paths are outside the
+    current scanned folders are removed (pytest fixture pollution cleanup).
+    After the sync, orphaned ``access_log`` / ``theme_members`` rows whose
+    note paths are no longer on disk are pruned and ``themes.note_count`` is
+    recomputed from the surviving memberships; themes that lose all members
+    are dropped. This mode is right for clearing pollution or bulk vault
+    edits, but it is **not** a guaranteed full rebuild of derivable index
+    data for unchanged notes — if an FTS row or ``term_df`` counter has
+    drifted for a note that hasn't changed on disk, only ``full=True`` will
+    fix it.
+
+    Opt-in ``full=True``: legacy destructive behavior. Deletes the entire DB
+    file (plus WAL/SHM) and rebuilds from an empty schema. Every Friston
+    field is lost. Required only when the schema is corrupt or incompatible,
+    or when the derivable tables need a clean-slate rebuild.
+
+    Returns ``{"inserted": N, "skipped": M, "by_type": {...}}`` plus, in
+    non-destructive mode, ``"preserved": {...}`` and ``"pruned_orphans":
+    {...}`` reporting the Friston-table delta.
     """
     if db_path is None:
         db_path = _default_db_path()
 
-    # Delete existing DB and WAL/SHM sidecars
-    for suffix in ("", "-wal", "-shm"):
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    # A fresh DB has nothing to preserve — fall through to full rebuild even
+    # when full=False, so callers always get a working index.
+    if not os.path.isfile(db_path):
+        full = True
+
+    if full:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(db_path + suffix)
+            except FileNotFoundError:
+                pass
+            # Any other OSError (PermissionError, IsADirectoryError, EBUSY,
+            # read-only filesystem, etc.) must surface — a silently-failed
+            # remove would leave stale state for _init_schema to run against.
+
+        conn = _connect(db_path)
         try:
-            os.remove(db_path + suffix)
-        except OSError:
-            pass
+            _init_schema(conn)
+            _ensure_access_log_indexes(conn)
+            _ensure_theme_indexes(conn)
+            stats = _sync(conn, vault_path, folders)
+        finally:
+            conn.close()
+    else:
+        conn = _connect(db_path)
+        try:
+            _init_schema(conn)
+            _ensure_access_log_indexes(conn)
+            if _needs_importance_migration(conn):
+                _add_importance_column(conn)
+            if _needs_tfidf_vector_migration(conn):
+                _add_tfidf_vector_column(conn)
+            _ensure_theme_indexes(conn)
 
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            # Pre-body-column DBs require a full rebuild; _sync would crash
+            # on the missing column. Fall through to full=True path.
+            if _needs_body_migration(conn):
+                print(
+                    f"[vault-index] Preserve-mode rebuild saw legacy schema "
+                    f"(missing body column); falling through to full rebuild",
+                    file=sys.stderr,
+                )
+                conn.close()
+                return rebuild_index(vault_path, folders, db_path=db_path, full=True)
 
-    conn = _connect(db_path)
-    try:
-        _init_schema(conn)
-        _ensure_access_log_indexes(conn)
-        _ensure_theme_indexes(conn)
-        stats = _sync(conn, vault_path, folders)
-    finally:
-        conn.close()
+            before_access = conn.execute(
+                "SELECT COUNT(*) FROM access_log"
+            ).fetchone()[0]
+            before_themes = conn.execute(
+                "SELECT COUNT(*) FROM themes"
+            ).fetchone()[0]
+            before_members = conn.execute(
+                "SELECT COUNT(*) FROM theme_members"
+            ).fetchone()[0]
+
+            # Step 1: Targeted cleanup — drop rows whose paths are OUTSIDE
+            # all scanned roots (pytest fixture pollution, stale-mounted
+            # vaults, etc.). _sync itself skips these because they're not
+            # under any folder it's responsible for. Done in a short
+            # explicit transaction so its rollback is self-contained.
+            vault_p = Path(vault_path)
+            scanned_roots = [vault_p / f for f in folders]
+            foreign = [
+                row[0]
+                for row in conn.execute("SELECT path FROM notes").fetchall()
+                if not any(
+                    _is_under(Path(row[0]), root) for root in scanned_roots
+                )
+            ]
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for abs_path in foreign:
+                    _delete_note(conn, abs_path)
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+            # Step 2: Incremental re-sync from disk. _sync wraps its own
+            # pass in BEGIN IMMEDIATE with commit/rollback, so a mid-loop
+            # failure leaves access_log (which we haven't touched) and
+            # the preserved rows from Step 1 intact.
+            stats = _sync(conn, vault_path, folders)
+
+            # Step 3: Orphan prune for access_log / theme_members. Path-
+            # format invariant: note_path columns and notes.path must all
+            # store absolute paths. A caller that wrote relative paths
+            # would, without this guard, have every such row classified
+            # as orphan and silently purged. Sample the about-to-be-
+            # deleted rows across BOTH tables — a drift in theme_members
+            # alone (while access_log stays clean) would still cause
+            # irreversible Friston data loss through the theme_members
+            # DELETE below. Use os.path.isabs() rather than startswith("/")
+            # so the check stays platform-correct.
+            access_sample = conn.execute(
+                "SELECT note_path FROM access_log "
+                "WHERE note_path NOT IN (SELECT path FROM notes) "
+                "LIMIT 5"
+            ).fetchall()
+            member_sample = conn.execute(
+                "SELECT note_path FROM theme_members "
+                "WHERE note_path NOT IN (SELECT path FROM notes) "
+                "LIMIT 5"
+            ).fetchall()
+            sample = access_sample + member_sample
+            suspicious = [
+                row[0] for row in sample if not os.path.isabs(row[0])
+            ]
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if suspicious:
+                    print(
+                        f"[vault-index] rebuild_index: path-format drift — "
+                        f"{len(suspicious)} of {len(sample)} sampled "
+                        f"access_log rows use non-absolute paths "
+                        f"({suspicious!r}); skipping orphan prune to "
+                        f"avoid mass data loss",
+                        file=sys.stderr,
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM access_log "
+                        "WHERE note_path NOT IN (SELECT path FROM notes)"
+                    )
+                    conn.execute(
+                        "DELETE FROM theme_members "
+                        "WHERE note_path NOT IN (SELECT path FROM notes)"
+                    )
+                # Theme invariant repair: after any theme_members rows have
+                # been removed (either by _delete_note during _sync or the
+                # orphan-prune above), recompute themes.note_count from the
+                # surviving membership set and drop themes that now have
+                # zero members. Keeps assign_to_theme / _delete_note's
+                # running-average centroid math self-consistent.
+                conn.execute(
+                    "UPDATE themes SET note_count = ("
+                    "  SELECT COUNT(*) FROM theme_members "
+                    "  WHERE theme_members.theme_id = themes.id"
+                    ")"
+                )
+                conn.execute("DELETE FROM themes WHERE note_count = 0")
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+            # Report preserved/pruned counts from the actual after-state
+            # rather than deleted rowcount. _sync and _delete_note also
+            # remove theme_members rows (and may drop last-member themes)
+            # when a parent note is deleted, so a simple rowcount would
+            # undercount by missing those.
+            after_access = conn.execute(
+                "SELECT COUNT(*) FROM access_log"
+            ).fetchone()[0]
+            after_themes = conn.execute(
+                "SELECT COUNT(*) FROM themes"
+            ).fetchone()[0]
+            after_members = conn.execute(
+                "SELECT COUNT(*) FROM theme_members"
+            ).fetchone()[0]
+            stats["preserved"] = {
+                "access_log": after_access,
+                "themes": after_themes,
+                "theme_members": after_members,
+            }
+            stats["pruned_orphans"] = {
+                "access_log": before_access - after_access,
+                "themes": before_themes - after_themes,
+                "theme_members": before_members - after_members,
+            }
+        finally:
+            conn.close()
 
     try:
         os.chmod(db_path, 0o600)
