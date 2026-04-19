@@ -315,18 +315,30 @@ def apply(issues, backup_root: str) -> list:
                 _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "session-snapshot-list-missing":
                 text = _read_text(issue.note_path) or ""
-                wikilinks = sorted(issue.proposed_source.splitlines())
-                block = "snapshots:\n" + "\n".join(f'  - "{s}"' for s in wikilinks) + "\n"
-                # Try to insert before the first ``status:`` line in the
-                # frontmatter. If that anchor isn't present, append before
-                # the closing fence. Body-level ``status:`` lines (code
-                # blocks, ``## Status`` headings) MUST NOT be matched.
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
                     raise RuntimeError(
                         "could not locate frontmatter to insert snapshots block"
                     )
                 fm = parts[1]
+                # Defensive re-check: if snapshots: already exists in the
+                # frontmatter (stale Issue replay / race with another
+                # writer), treat as an idempotent no-op. Without this
+                # guard, the ``^status:`` anchor would inject a DUPLICATE
+                # snapshots: block above status:, which the byte-identity
+                # short-circuit below cannot detect.
+                if re.search(r"(?m)^snapshots:", fm):
+                    results.append(Result(
+                        check=issue.check, note_path=issue.note_path, status="skipped",
+                        error="snapshots field already present in frontmatter (stale Issue?)",
+                    ))
+                    continue
+                wikilinks = sorted(issue.proposed_source.splitlines())
+                block = "snapshots:\n" + "\n".join(f'  - "{s}"' for s in wikilinks) + "\n"
+                # Try to insert before the first ``status:`` line in the
+                # frontmatter. If that anchor isn't present, append before
+                # the closing fence. Body-level ``status:`` lines (code
+                # blocks, ``## Status`` headings) MUST NOT be matched.
                 new_fm, n = re.subn(
                     r"(?m)^status:", block + "status:", fm, count=1,
                 )
@@ -345,18 +357,29 @@ def apply(issues, backup_root: str) -> list:
             elif issue.check == "session-snapshot-list-stale":
                 text = _read_text(issue.note_path) or ""
                 stale = issue.extra.get("stale", [])
-                lines = text.splitlines(keepends=True)
+                # Restrict stale-entry pruning to the frontmatter block.
+                # A body bullet list matching ``- "[[stale-stem]]"`` (e.g.
+                # user-authored References section quoting historical
+                # wikilinks) MUST NOT be mutated — the PR guarantee is
+                # that vault-doctor only touches frontmatter.
+                parts = text.split("---\n", 2)
+                if len(parts) < 3:
+                    raise RuntimeError(
+                        "could not locate frontmatter to prune stale entries"
+                    )
+                fm_lines = parts[1].splitlines(keepends=True)
                 cleaned: list[str] = []
-                for line in lines:
+                for line in fm_lines:
                     s = line.strip()
                     if any(s == f'- "{v}"' or s == f"- '{v}'" for v in stale):
                         continue
                     cleaned.append(line)
-                new_text = "".join(cleaned)
+                new_fm = "".join(cleaned)
+                new_text = parts[0] + "---\n" + new_fm + "---\n" + parts[2]
                 if new_text == text:
                     results.append(Result(
                         check=issue.check, note_path=issue.note_path, status="skipped",
-                        error="no stale entries found in note (already pruned?)",
+                        error="no stale entries found in frontmatter (already pruned?)",
                     ))
                     continue
                 _write_atomic(issue.note_path, new_text, backup_root, issue.check)

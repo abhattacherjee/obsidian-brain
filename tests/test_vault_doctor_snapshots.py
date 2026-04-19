@@ -427,6 +427,75 @@ def test_status_injection_not_corrupted_by_body_status_line(tmp_path):
     assert "snapshots:" not in body
 
 
+def test_missing_list_apply_skipped_when_snapshots_already_present(tmp_path):
+    """Regression: defensive re-check prevents duplicate snapshots: blocks.
+
+    If a stale Issue from an earlier scan is replayed against a session
+    whose frontmatter already contains ``snapshots:``, the apply path
+    must short-circuit with status='skipped' rather than inject a
+    duplicate block above ``status:``.
+    """
+    vault = tmp_path; sess = vault / "claude-sessions"; sess.mkdir()
+    # Session already has a snapshots: block in frontmatter
+    _write_session(sess / "2026-04-18-demo-xx.md", "sX", snapshots=[
+        "[[2026-04-18-demo-xx-snapshot-100000]]",
+    ])
+    _write_snapshot(sess / "2026-04-18-demo-xx-snapshot-100000.md", "sX", "2026-04-18-demo-xx")
+    _write_snapshot(sess / "2026-04-18-demo-xx-snapshot-150000.md", "sX", "2026-04-18-demo-xx")
+    # Build a stale/replayed Issue: scan() wouldn't emit this since snapshots:
+    # is present, but we construct one directly to simulate stale-Issue replay.
+    from scripts.vault_doctor_checks import Issue
+    stale_issue = Issue(
+        check="session-snapshot-list-missing",
+        note_path=str(sess / "2026-04-18-demo-xx.md"),
+        project="demo",
+        current_source="snapshots field absent",
+        proposed_source="[[2026-04-18-demo-xx-snapshot-150000]]",
+        reason="stale replay",
+        confidence=0.98,
+    )
+    results = snapshot_integrity.apply([stale_issue], str(tmp_path / "backup"))
+    assert len(results) == 1
+    assert results[0].status == "skipped"
+    assert "already present" in (results[0].error or "")
+    text = (sess / "2026-04-18-demo-xx.md").read_text(encoding="utf-8")
+    # Exactly one snapshots: block
+    assert text.count("snapshots:") == 1
+
+
+def test_stale_apply_does_not_mutate_body_bullet_lists(tmp_path):
+    """Regression: stale-entry removal must ONLY touch frontmatter, not body.
+
+    The prior implementation used ``text.splitlines(keepends=True)``
+    which scanned the entire file — so a body bullet list quoting a
+    historical wikilink (e.g. in a ``## References`` section) was
+    silently deleted. The PR guarantees mutations land inside
+    frontmatter only.
+    """
+    vault = tmp_path; sess = vault / "claude-sessions"; sess.mkdir()
+    # Session frontmatter lists a stale snapshot; body has a bullet list
+    # with the SAME pattern (user quoting a historical wikilink).
+    stale_stem = "2026-04-18-demo-yy-snapshot-999999"
+    (sess / "2026-04-18-demo-yy.md").write_text(
+        f'---\ntype: claude-session\ndate: 2026-04-18\nsession_id: sY\nproject: demo\n'
+        f'snapshots:\n  - "[[{stale_stem}]]"\n  - "[[2026-04-18-demo-yy-snapshot-100000]]"\n'
+        f'status: summarized\n---\n\n# S\n\n## References\n\n'
+        f'- "[[{stale_stem}]]"\n'
+        "- Important body bullet that happens to match the pattern\n",
+        encoding="utf-8",
+    )
+    _write_snapshot(sess / "2026-04-18-demo-yy-snapshot-100000.md", "sY", "2026-04-18-demo-yy")
+    issues = snapshot_integrity.scan(str(vault), "claude-sessions", "claude-insights", 30)
+    stale = [i for i in issues if i.check == "session-snapshot-list-stale"]
+    assert len(stale) == 1
+    snapshot_integrity.apply(stale, str(tmp_path / "backup"))
+    text = (sess / "2026-04-18-demo-yy.md").read_text(encoding="utf-8")
+    # Stale entry removed from frontmatter
+    assert f'[[{stale_stem}]]' not in text.split("---\n", 2)[1]
+    # Body bullet NOT deleted
+    assert f'- "[[{stale_stem}]]"' in text.split("---\n", 2)[2]
+
+
 def test_crlf_frontmatter_is_parsed(tmp_path):
     """HIGH-5 regression: notes with CRLF line endings must still be picked up."""
     vault = tmp_path; sess = vault / "claude-sessions"; sess.mkdir()

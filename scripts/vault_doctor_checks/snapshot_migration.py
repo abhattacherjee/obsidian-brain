@@ -358,6 +358,22 @@ def apply(issues, backup_root):
             elif issue.check == "session-missing-snapshots-list":
                 _backup_file(issue.note_path, backup_root, issue.check)
                 text = _read_text(issue.note_path) or ""
+                parts = text.split("---\n", 2)
+                if len(parts) < 3:
+                    raise RuntimeError("could not locate frontmatter")
+                fm = parts[1]
+                # Defensive re-check: if snapshots: already exists in the
+                # frontmatter (stale Issue replay / race with another
+                # writer), treat as an idempotent no-op. Parity with the
+                # snapshot_integrity module — prevents duplicate
+                # snapshots: blocks when ^status: anchor injects above an
+                # existing list.
+                if re.search(r"(?m)^snapshots:", fm):
+                    results.append(Result(
+                        check=issue.check, note_path=issue.note_path, status="skipped",
+                        error="snapshots field already present in frontmatter (stale Issue?)",
+                    ))
+                    continue
                 # Apply stem-rename translation so the session list points
                 # at the POST-rename filenames.
                 proposed = issue.proposed_source
@@ -369,10 +385,6 @@ def apply(issues, backup_root):
                 # frontmatter block only — body content containing a
                 # ``status:`` line (code blocks, ``## Status`` headings)
                 # must NOT be matched.
-                parts = text.split("---\n", 2)
-                if len(parts) < 3:
-                    raise RuntimeError("could not locate frontmatter")
-                fm = parts[1]
                 new_fm, n = re.subn(
                     r"(?m)^status:", block + "status:", fm, count=1,
                 )

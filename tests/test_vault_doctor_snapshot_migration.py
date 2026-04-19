@@ -416,6 +416,43 @@ def test_rewrite_wikilinks_returns_zero_when_nothing_to_replace(tmp_path):
     assert count == 0
 
 
+def test_missing_list_apply_skipped_when_snapshots_already_present(tmp_path):
+    """Regression: defensive re-check prevents duplicate snapshots: blocks in migration.
+
+    Parity with snapshot_integrity: if a stale Issue from an earlier
+    scan is replayed against a session whose frontmatter already has a
+    snapshots: block, apply must short-circuit with status='skipped'
+    rather than inject a duplicate block above ``status:``.
+    """
+    from scripts.vault_doctor_checks import Issue as _Issue
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    # Session already has a snapshots: block
+    (sess / "2026-04-18-demo-zz.md").write_text(
+        '---\ntype: claude-session\ndate: 2026-04-18\nsession_id: zzzz\nproject: demo\n'
+        'snapshots:\n  - "[[2026-04-18-demo-zz-snapshot-100000]]"\n'
+        'status: summarized\n---\n\n# S\n',
+        encoding="utf-8",
+    )
+    _write_legacy_snapshot(sess / "2026-04-18-demo-zz-snapshot-100000.md", session_id="zzzz")
+    # Build a stale/replayed Issue for session-missing-snapshots-list
+    stale_issue = _Issue(
+        check="session-missing-snapshots-list",
+        note_path=str(sess / "2026-04-18-demo-zz.md"),
+        project="demo",
+        current_source="(no snapshots field)",
+        proposed_source="[[2026-04-18-demo-zz-snapshot-100000]]",
+        reason="stale replay",
+        confidence=0.98,
+    )
+    results = snapshot_migration.apply([stale_issue], str(tmp_path / "backup"))
+    assert len(results) == 1
+    assert results[0].status == "skipped"
+    assert "already present" in (results[0].error or "")
+    text = (sess / "2026-04-18-demo-zz.md").read_text(encoding="utf-8")
+    # Exactly one snapshots: block
+    assert text.count("snapshots:") == 1
+
+
 def test_session_missing_snapshots_list_not_corrupted_by_body_status(tmp_path):
     """CRITICAL-4 regression for the migration module: a body-level
     ``status:`` line must not be matched when injecting the snapshots
