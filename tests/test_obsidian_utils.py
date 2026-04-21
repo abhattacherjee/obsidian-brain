@@ -1767,3 +1767,145 @@ def test_get_session_id_fast_slow_path_returns_without_writing(tmp_path, monkeyp
     assert not bootstrap.exists(), (
         "slow path should be read-only and not create the bootstrap file"
     )
+
+
+# ===========================================================================
+# Section: upgrade_batch — concurrent wrapper around upgrade_unsummarized_note
+# ===========================================================================
+
+
+class TestUpgradeBatch:
+    """Tests for upgrade_batch() — GH #69.
+
+    `upgrade_unsummarized_note` is monkeypatched with fast fakes so none of
+    these tests touch the filesystem, load a vault config, or shell out to
+    `claude -p`. That isolation also means the `vault_path`/`sessions_folder`
+    args are inert placeholder strings.
+    """
+
+    def test_upgrade_batch_empty_list_returns_empty(self, monkeypatch):
+        """Empty input: return [] immediately and never invoke the wrapped fn."""
+        calls = []
+
+        def fake_impl(*args, **kwargs):
+            calls.append(args)
+            return "ok"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
+
+        result = obsidian_utils.upgrade_batch(
+            [], "/vault", "sessions", "proj",
+        )
+        assert result == []
+        assert calls == []
+
+    def test_upgrade_batch_n1(self, monkeypatch):
+        """Single path: single (path, status) tuple returned."""
+        def fake_impl(note_path, *args, **kwargs):
+            return f"Summarized: {os.path.basename(note_path)}"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
+
+        result = obsidian_utils.upgrade_batch(
+            ["/vault/sessions/one.md"], "/vault", "sessions", "proj",
+        )
+        assert result == [("/vault/sessions/one.md", "Summarized: one.md")]
+
+    def test_upgrade_batch_n5_preserves_input_order(self, monkeypatch):
+        """5 paths with variable sleeps: return order matches input, not completion order."""
+        import time as _time
+
+        # Force inverted completion order: last input completes first.
+        sleeps = {
+            "a.md": 0.15,
+            "b.md": 0.12,
+            "c.md": 0.09,
+            "d.md": 0.06,
+            "e.md": 0.03,
+        }
+
+        def fake_impl(note_path, *args, **kwargs):
+            _time.sleep(sleeps[os.path.basename(note_path)])
+            return f"done:{os.path.basename(note_path)}"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
+
+        paths = [f"/vault/sessions/{name}" for name in ("a.md", "b.md", "c.md", "d.md", "e.md")]
+        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
+
+        assert len(result) == 5
+        assert [p for p, _ in result] == paths, "input order must be preserved"
+        assert [status for _, status in result] == [
+            "done:a.md", "done:b.md", "done:c.md", "done:d.md", "done:e.md",
+        ]
+
+    def test_upgrade_batch_n10_runs_in_parallel(self, monkeypatch):
+        """N=10 with 0.3s fake work each: wall time should be well under the 3.0s sequential sum."""
+        import time as _time
+
+        def fake_impl(note_path, *args, **kwargs):
+            _time.sleep(0.3)
+            return "ok"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
+
+        paths = [f"/vault/sessions/n{i}.md" for i in range(10)]
+
+        t0 = _time.monotonic()
+        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
+        elapsed = _time.monotonic() - t0
+
+        assert len(result) == 10
+        assert all(status == "ok" for _, status in result)
+        # Sequential would be 3.0s; parallel with 10 workers should be ~0.3s.
+        # Give comfortable headroom for CI jitter (5x the ideal).
+        assert elapsed < 1.5, (
+            f"upgrade_batch(N=10) took {elapsed:.2f}s; expected <1.5s "
+            f"(sequential would be ~3.0s). Fan-out may not be parallel."
+        )
+
+    def test_upgrade_batch_captures_exceptions_per_note(self, monkeypatch):
+        """One raising impl does not kill the batch; failure becomes a status string."""
+        def fake_impl(note_path, *args, **kwargs):
+            if os.path.basename(note_path) == "three.md":
+                raise RuntimeError("boom")
+            return f"ok:{os.path.basename(note_path)}"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
+
+        paths = [f"/vault/sessions/{n}" for n in
+                 ("one.md", "two.md", "three.md", "four.md", "five.md")]
+        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
+
+        assert len(result) == 5
+        assert [p for p, _ in result] == paths
+        assert result[0][1] == "ok:one.md"
+        assert result[1][1] == "ok:two.md"
+        assert result[2] == ("/vault/sessions/three.md", "Failed: RuntimeError: boom")
+        assert result[3][1] == "ok:four.md"
+        assert result[4][1] == "ok:five.md"
+
+    def test_upgrade_batch_max_workers_caps_at_input_size(self, monkeypatch):
+        """N=3 < max_workers=10: min() guard still yields real parallelism."""
+        import time as _time
+
+        def fake_impl(note_path, *args, **kwargs):
+            _time.sleep(0.3)
+            return "ok"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
+
+        paths = [f"/vault/sessions/a{i}.md" for i in range(3)]
+
+        t0 = _time.monotonic()
+        result = obsidian_utils.upgrade_batch(
+            paths, "/vault", "sessions", "proj", max_workers=10,
+        )
+        elapsed = _time.monotonic() - t0
+
+        assert len(result) == 3
+        # Sequential would be 0.9s; parallel with min(10, 3)=3 workers should be ~0.3s.
+        # Headroom for CI jitter.
+        assert elapsed < 0.75, (
+            f"upgrade_batch(N=3, max_workers=10) took {elapsed:.2f}s; expected <0.75s"
+        )
