@@ -119,8 +119,8 @@ print(json.dumps([{"path": p, "status": s} for p, s in results]))
 ```
 
 Parse the returned JSON array. For each entry:
-- `status` does NOT start with `Failed:` → mark as succeeded
-- `status` starts with `Failed:` → add to the Phase 2 fallback list
+- `status` starts with `Upgraded ` → mark as succeeded
+- anything else (including `Failed: ...`, empty, or unexpected prefix) → add to the Phase 2 fallback list
 
 If N <= 5: update each sub-task accordingly (succeeded or `Failed: <basename>`).
 If N > 5: update task #2 subject to `Upgrade N notes: M succeeded, F pending fallback`.

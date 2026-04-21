@@ -1930,3 +1930,15 @@ class TestUpgradeBatch:
         )
         assert results == [("/vault/sessions/a.md", "ok:a.md")]
         assert received == {"model": "claude-3-5-haiku", "timeout": 30}
+
+    def test_upgrade_batch_rejects_invalid_max_workers(self, monkeypatch):
+        monkeypatch.setattr(
+            obsidian_utils, "upgrade_unsummarized_note",
+            lambda *a, **k: "Upgraded test.md (source: ...)",
+        )
+        for bad in (0, -1, -100):
+            with pytest.raises(ValueError, match="max_workers must be >= 1"):
+                obsidian_utils.upgrade_batch(
+                    ["/vault/sessions/a.md"], "/vault", "sessions", "proj",
+                    max_workers=bad,
+                )

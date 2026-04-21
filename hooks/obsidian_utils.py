@@ -2914,6 +2914,13 @@ def upgrade_note_with_summary(
     summary sections, audit trail), run dedup, atomic write.
 
     Returns a one-line status string.
+
+    Return contract: success strings begin with ``"Upgraded "``; all other
+    return values (including ``"Failed: ..."``, empty, or any unexpected
+    prefix) indicate failure. Callers routing on return value — notably
+    ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the ``"Upgraded "``
+    prefix as the positive path. Adding any new return prefix to this
+    function requires an audit of routing call sites.
     """
     if warnings is None:
         warnings = []
@@ -3378,6 +3385,13 @@ def upgrade_unsummarized_note(
     generate summary → dedup open items → atomic write.
 
     Returns a one-line status string for the model to relay.
+
+    Return contract: success strings begin with ``"Upgraded "``; all other
+    return values (including ``"Failed: ..."``, empty, or any unexpected
+    prefix) indicate failure. Callers routing on return value — notably
+    ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the ``"Upgraded "``
+    prefix as the positive path. Adding any new return prefix to this
+    function requires an audit of routing call sites.
     """
     # Read the raw note
     try:
@@ -3539,6 +3553,14 @@ def upgrade_batch(
     "Failed: <exc_type>: <exc_msg>" status strings so one bad note never kills
     the batch.
 
+    Raises ``ValueError`` if ``max_workers < 1`` — surface caller config bugs
+    at the boundary rather than silently normalizing to a single worker.
+
+    Return contract: each ``(path, status)`` tuple carries the same per-entry
+    contract as ``upgrade_unsummarized_note`` — success statuses begin with
+    ``"Upgraded "``; anything else (including ``"Failed: ..."`` or unexpected
+    prefixes) indicates failure. See that function's docstring for details.
+
     `claude -p --model haiku` is subprocess-bound, so threads release the GIL
     during the wait and achieve real parallelism. This lets a single Bash tool
     call fan out N summaries without the Claude Code shell-pool serialization
@@ -3547,14 +3569,15 @@ def upgrade_batch(
     if not paths:
         return []
 
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be >= 1, got {max_workers}")
+
     # Lazy-import so the module stays importable in environments where
     # concurrent.futures might be stubbed (it's stdlib, so this should always
     # succeed in CPython, but the lazy import also keeps hook startup cost low).
     from concurrent.futures import ThreadPoolExecutor
 
-    # or 1: guard against max_workers=0, which ThreadPoolExecutor rejects.
-    # Empty `paths` is already filtered at line ~3547, so len(paths) is >= 1.
-    workers = min(max_workers, len(paths)) or 1
+    workers = min(max_workers, len(paths))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [
             ex.submit(
