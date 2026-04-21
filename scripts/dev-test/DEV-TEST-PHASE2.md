@@ -184,7 +184,7 @@ Expected: `OK — deepcopy isolation holds`
 
 This is the main Phase 2 integration point. `/recall` should:
 1. Find unsummarized notes via `find_unsummarized_notes()` (now includes the widened type filter).
-2. Summarize them via the sub-agent-first Wave 2 pipeline.
+2. Summarize them via `upgrade_batch()` (Phase 1 parallel-Haiku fan-out) with sub-agent fallback for failures (Phase 2).
 3. On write-back, call `index_note()` → `assign_to_theme()` → write surprise via `detect_surprise()`.
 
 ```

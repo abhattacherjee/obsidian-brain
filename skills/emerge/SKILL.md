@@ -42,7 +42,7 @@ If STATUS starts with `CACHED:`, report "Using cached corpus (< 15 min old, same
 
 Parse STATUS (`OK:<total>:<upgraded>:<failed>` or `EMPTY:0:0:0`). EMPTY -> tell user to widen window, stop. Report upgrades. If `failed > 0` -> Step 1f, else Step 2. Mark task #1 `completed`.
 ### Step 1f — Sub-agent fallback (skip if no failures)
-Spawn parallel sub-agents for failed notes using /recall Path C Wave 2-3 pattern (read note, write summary to temp, write back via `upgrade_note_with_summary`). Re-collect:
+Spawn parallel sub-agents for failed notes (read note, write summary to temp, write back via `upgrade_note_with_summary`) — mirrors `/recall` Phase 2 fallback. Re-collect:
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
