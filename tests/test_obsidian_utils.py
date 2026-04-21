@@ -1909,3 +1909,24 @@ class TestUpgradeBatch:
         assert elapsed < 0.75, (
             f"upgrade_batch(N=3, max_workers=10) took {elapsed:.2f}s; expected <0.75s"
         )
+
+    def test_upgrade_batch_forwards_model_and_timeout(self, monkeypatch):
+        received = {}
+
+        def fake_impl(note_path, vault_path, sessions_folder, project,
+                      summary_model, summary_timeout):
+            received["model"] = summary_model
+            received["timeout"] = summary_timeout
+            return f"ok:{os.path.basename(note_path)}"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
+        results = obsidian_utils.upgrade_batch(
+            ["/vault/sessions/a.md"],
+            "/vault",
+            "sessions",
+            "proj",
+            summary_model="claude-3-5-haiku",
+            summary_timeout=30,
+        )
+        assert results == [("/vault/sessions/a.md", "ok:a.md")]
+        assert received == {"model": "claude-3-5-haiku", "timeout": 30}

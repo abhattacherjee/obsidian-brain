@@ -3552,6 +3552,8 @@ def upgrade_batch(
     # succeed in CPython, but the lazy import also keeps hook startup cost low).
     from concurrent.futures import ThreadPoolExecutor
 
+    # or 1: guard against max_workers=0, which ThreadPoolExecutor rejects.
+    # Empty `paths` is already filtered at line ~3547, so len(paths) is >= 1.
     workers = min(max_workers, len(paths)) or 1
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [
