@@ -155,9 +155,13 @@ def test_session_log_writes_anchor_when_snapshots_exist_despite_low_messages(tmp
     vault = tmp_path / "vault"
     sessions = vault / "claude-sessions"
     sessions.mkdir(parents=True)
-    # Pre-create a snapshot for session s1
-    (sessions / "2026-04-18-demo-abcd-snapshot-143027.md").write_text(
-        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s1\n"
+    # Pre-create a snapshot for session s1. Date must be today's (or yesterday's)
+    # because the hook's early-snapshot glob only scans those two date prefixes
+    # to handle midnight-spanning sessions. Hardcoded dates drift out of the
+    # window and silently break this test (feedback_time_dependent_test_seeds).
+    today = datetime.date.today().isoformat()
+    (sessions / f"{today}-demo-abcd-snapshot-143027.md").write_text(
+        f"---\ntype: claude-snapshot\ndate: {today}\nsession_id: s1\n"
         "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# Snap\n",
         encoding="utf-8",
     )
@@ -207,7 +211,7 @@ def test_session_log_writes_anchor_when_snapshots_exist_despite_low_messages(tmp
     assert len(session_notes) == 1, f"expected anchor session note; found: {[p.name for p in sessions.glob('*.md')]}"
     content = session_notes[0].read_text(encoding="utf-8")
     assert "snapshots:" in content
-    assert "2026-04-18-demo-abcd-snapshot-143027" in content
+    assert f"{today}-demo-abcd-snapshot-143027" in content
 
 
 def test_early_skip_bypass_is_independently_exercised(tmp_path, monkeypatch):
@@ -223,8 +227,11 @@ def test_early_skip_bypass_is_independently_exercised(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
     sessions = vault / "claude-sessions"
     sessions.mkdir(parents=True)
-    (sessions / "2026-04-18-demo-abcd-snapshot-143027.md").write_text(
-        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s1\n"
+    # Date must be today's so the hook's today/yesterday-only snapshot glob
+    # can find it (see feedback_time_dependent_test_seeds).
+    today = datetime.date.today().isoformat()
+    (sessions / f"{today}-demo-abcd-snapshot-143027.md").write_text(
+        f"---\ntype: claude-snapshot\ndate: {today}\nsession_id: s1\n"
         "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# Snap\n",
         encoding="utf-8",
     )
