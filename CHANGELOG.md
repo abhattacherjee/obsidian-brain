@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-04-21
+
 ### Added
 - **ci**: `scripts/ci-checks/no-default-db.py` — AST-based guard that fails CI when any call to `ensure_index()`, `rebuild_index()`, or `deep_analysis_pipeline()` inside `tests/` omits `db_path=`. Wired as the `no-default-db-check` job in `.github/workflows/ci.yml` with a 2-minute timeout. Exit 1 on violations, exit 2 on script malfunction (missing dir, unreadable file, syntax error) so CI logs can distinguish the two. `# noqa: no-default-db` marker on any line of a multi-line call span suppresses. `**kwargs` expansion emits a stderr warning so reviewers can verify forwarding callers (GH #46)
 - **snapshots**: First-class mid-session checkpoint support. Snapshots now carry `status: auto-logged` (or `summarized`) and `source_session_note` wikilink frontmatter, use seconds-resolution filenames (`-snapshot-HHMMSS`), and are AI-summarized lazily at `/recall` time alongside session notes via a dedicated snapshot prompt
