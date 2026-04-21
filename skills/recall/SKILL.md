@@ -108,14 +108,14 @@ TaskCreate: subject="Upgrade: <basename>", activeForm="Upgrading <basename> via 
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
+printf '%s' "$UNSUMMARIZED_PATHS_JSON" | python3 -c '
 import sys, os, json
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import upgrade_batch
 paths = json.loads(sys.stdin.read())
 results = upgrade_batch(paths, sys.argv[1], sys.argv[2], sys.argv[3])
 print(json.dumps([{"path": p, "status": s} for p, s in results]))
-' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" <<<"$UNSUMMARIZED_PATHS_JSON"
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
 Parse the returned JSON array. For each entry:
