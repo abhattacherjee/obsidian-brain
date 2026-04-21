@@ -96,7 +96,7 @@ Update task #2 subject to `No unsummarized notes found` and set to `completed`. 
 
 **Task management threshold:** If N <= 5, create a sub-task per note. If N > 5, skip per-note sub-tasks — use a single progress update on task #2 instead. This saves ~15-20s of parent round-trip overhead at large N.
 
-##### Phase 1 — Parallel Haiku upgrades
+##### Phase 1 — Parallel Haiku upgrades (single batch call)
 
 If N <= 5, create a sub-task for each note:
 
@@ -104,25 +104,28 @@ If N <= 5, create a sub-task for each note:
 TaskCreate: subject="Upgrade: <basename>", activeForm="Upgrading <basename> via Haiku"
 ```
 
-Launch N parallel Bash calls in a **single message turn** so they run concurrently:
+**Single Bash tool call** — `upgrade_batch()` fans out N Haiku invocations in parallel inside one Python process via `concurrent.futures.ThreadPoolExecutor`. This sidesteps the Claude Code harness's serialization of parallel Bash tool calls for subprocess-blocking work:
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
+printf '%s' "$UNSUMMARIZED_PATHS_JSON" | python3 -c '
+import sys, os, json
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
-from obsidian_utils import upgrade_unsummarized_note
-status = upgrade_unsummarized_note(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
-print(status)
-' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
+from obsidian_utils import upgrade_batch
+paths = json.loads(sys.stdin.read())
+results = upgrade_batch(paths, sys.argv[1], sys.argv[2], sys.argv[3])
+print(json.dumps([{"path": p, "status": s} for p, s in results]))
+' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-When all return, parse each result:
-- Does NOT start with `Failed:` → mark as succeeded
-- Starts with `Failed:` → add to fallback list
+Parse the returned JSON array. For each entry:
+- `status` starts with `Upgraded ` → mark as succeeded
+- anything else (including `Failed: ...`, empty, or unexpected prefix) → add to the Phase 2 fallback list
 
 If N <= 5: update each sub-task accordingly (succeeded or `Failed: <basename>`).
 If N > 5: update task #2 subject to `Upgrade N notes: M succeeded, F pending fallback`.
+
+> **Why a single Bash call, not N parallel calls?** The Claude Code harness serializes parallel Bash tool calls through a limited shell pool when each subprocess blocks on I/O (e.g., `claude -p --model haiku` taking 5-30s). Dispatching 10 Bash calls in one message still executes them one at a time — wall time ≈ Σ per-call. Pushing fan-out into a single Python process with `ThreadPoolExecutor` gives true concurrency (the GIL releases during subprocess waits), so wall time ≈ max per-call. See `claude-insights/2026-04-21-recall-parallel-bash-dispatch-runs-sequentially-fbee-error.md` and GH #69.
 
 ##### Phase 2 — Sub-agent fallback (only for failed notes)
 

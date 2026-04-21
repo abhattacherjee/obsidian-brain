@@ -2914,6 +2914,13 @@ def upgrade_note_with_summary(
     summary sections, audit trail), run dedup, atomic write.
 
     Returns a one-line status string.
+
+    Return contract: success strings begin with ``"Upgraded "``; all other
+    return values (including ``"Failed: ..."``, empty, or any unexpected
+    prefix) indicate failure. Callers routing on return value — notably
+    ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the ``"Upgraded "``
+    prefix as the positive path. Adding any new return prefix to this
+    function requires an audit of routing call sites.
     """
     if warnings is None:
         warnings = []
@@ -3378,6 +3385,13 @@ def upgrade_unsummarized_note(
     generate summary → dedup open items → atomic write.
 
     Returns a one-line status string for the model to relay.
+
+    Return contract: success strings begin with ``"Upgraded "``; all other
+    return values (including ``"Failed: ..."``, empty, or any unexpected
+    prefix) indicate failure. Callers routing on return value — notably
+    ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the ``"Upgraded "``
+    prefix as the positive path. Adding any new return prefix to this
+    function requires an audit of routing call sites.
     """
     # Read the raw note
     try:
@@ -3520,3 +3534,67 @@ def upgrade_unsummarized_note(
         note_path, summary_text, vault_path, sessions_folder, project,
         source=source, warnings=warnings,
     )
+
+
+def upgrade_batch(
+    paths: list[str],
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+    max_workers: int = 10,
+    summary_model: str = "haiku",
+    summary_timeout: int | None = None,
+) -> list[tuple[str, str]]:
+    """Fan out upgrade_unsummarized_note() concurrently.
+
+    Returns a list of (path, status_string) tuples IN THE SAME ORDER AS `paths`
+    (not completion order), so callers that zipped inputs with outputs still work.
+    Individual-call exceptions are caught and converted to
+    "Failed: <exc_type>: <exc_msg>" status strings so one bad note never kills
+    the batch.
+
+    Raises ``ValueError`` if ``max_workers < 1`` — surface caller config bugs
+    at the boundary rather than silently normalizing to a single worker.
+
+    Return contract: each ``(path, status)`` tuple carries the same per-entry
+    contract as ``upgrade_unsummarized_note`` — success statuses begin with
+    ``"Upgraded "``; anything else (including ``"Failed: ..."`` or unexpected
+    prefixes) indicates failure. See that function's docstring for details.
+
+    `claude -p --model haiku` is subprocess-bound, so threads release the GIL
+    during the wait and achieve real parallelism. This lets a single Bash tool
+    call fan out N summaries without the Claude Code shell-pool serialization
+    that would otherwise linearize the work.
+    """
+    if not paths:
+        return []
+
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be >= 1, got {max_workers}")
+
+    # Lazy-import so the module stays importable in environments where
+    # concurrent.futures might be stubbed (it's stdlib, so this should always
+    # succeed in CPython, but the lazy import also keeps hook startup cost low).
+    from concurrent.futures import ThreadPoolExecutor
+
+    workers = min(max_workers, len(paths))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [
+            ex.submit(
+                upgrade_unsummarized_note,
+                p,
+                vault_path,
+                sessions_folder,
+                project,
+                summary_model,
+                summary_timeout,
+            )
+            for p in paths
+        ]
+        results: list[tuple[str, str]] = []
+        for p, fut in zip(paths, futs):
+            try:
+                results.append((p, fut.result()))
+            except Exception as exc:  # noqa: BLE001 — per-note isolation
+                results.append((p, f"Failed: {type(exc).__name__}: {exc}"))
+        return results
