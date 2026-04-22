@@ -228,7 +228,7 @@ If unsummarized notes were upgraded in Step 2, also mention:
 
 Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
-1. **Skip if no candidates.** If the value is `NO_ITEMS` or `NO_CANDIDATES`, skip to Step 5 silently.
+1. **Skip if no candidates.** If the value is `NO_ITEMS` or `NO_CANDIDATES`, skip the rest of Step 4's checkoff sub-steps and proceed directly to the "Show load manifest" block at the end of Step 4 silently.
 
 2. **Parse candidates.** The JSON array contains objects with `file`, `line`, `text`, `evidence`, `confidence`, `has_completion_phrase`.
 
@@ -287,7 +287,7 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
 5. **For each confirmed checkoff, Read-verify then Edit.** Maintain a `successfully_edited` list (starts empty), a `skipped_drift` counter (starts 0), and a `skipped_other` counter (starts 0).
 
-   **5-pre. Within-batch dedup:** if the confirmed candidate list contains two entries with the same `(file, line)`, keep only the first and silently drop the rest — they are scan duplicates, not drift. Report: `De-duplicated K within-batch candidate(s).` if K > 0.
+   **5-pre. Within-batch dedup:** if the confirmed candidate list contains two entries with the same `(file, line)`, keep only the first and drop the rest automatically — they are scan duplicates, not drift. Do not emit per-duplicate warnings or treat them as skips. If any duplicates were removed, print this one-line informational message: `De-duplicated K within-batch candidate(s).`
 
    For each confirmed candidate:
 
