@@ -321,6 +321,14 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 ✅ Checked off N item(s) across <list of files>.
 ```
 
+If `skipped_drift > 0`, append on a new line:
+
+```
+⚠️  Skipped M item(s) due to source drift (see warnings above).
+```
+
+Where `N = len(successfully_edited)` and `M = skipped_drift`.
+
 7. **Cascade check-offs to duplicate items in older notes.** Run:
 
     ```bash
@@ -335,7 +343,7 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
     ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
     ```
 
-    Construct `$CHECKED_ITEMS_JSON` as a JSON array of the confirmed item texts (passed via stdin to avoid shell quoting issues). Report the cascade summary.
+    Construct `$CHECKED_ITEMS_JSON` as a JSON array of the `successfully_edited` item texts (the ones where the Read-verify matched AND the Edit succeeded — NOT the originally-confirmed set). Items skipped due to drift or non-unique matches are excluded so we don't cascade a closed state the primary-edit step could not confirm. Pass via stdin to avoid shell quoting issues. Report the cascade summary.
 
 **Show load manifest** (same step — saves one parent round):
 
