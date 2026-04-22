@@ -285,34 +285,53 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
    - `all` → check off all candidates
    - Comma-separated numbers (e.g. `1,3`) → check off only those
 
-5. **For each confirmed checkoff, Read-verify then Edit.** Maintain a `successfully_edited` list (starts empty) and a `skipped_drift` counter (starts 0).
+5. **For each confirmed checkoff, Read-verify then Edit.** Maintain a `successfully_edited` list (starts empty), a `skipped_drift` counter (starts 0), and a `skipped_other` counter (starts 0).
+
+   **5-pre. Within-batch dedup:** if the confirmed candidate list contains two entries with the same `(file, line)`, keep only the first and silently drop the rest — they are scan duplicates, not drift. Report: `De-duplicated K within-batch candidate(s).` if K > 0.
 
    For each confirmed candidate:
 
    a. **Read** the source file at `offset = max(1, candidate.line - 3), limit = 7` (±3 lines context, clamped at file start). This also satisfies the Edit tool's "must Read before Edit" requirement.
 
-   b. **Match check.** Scan the read region for any line that, after stripping optional leading whitespace and the `- [ ] ` prefix, equals `candidate.text` byte-for-byte. The candidate text itself is used verbatim — no trimming. The bullet prefix is exactly `- [ ] ` (hyphen, space, open-bracket, space, close-bracket, single trailing space) — the candidate producer in `obsidian_utils.collect_open_items` emits only this form, so `- [ ]` with other spacing or `*`/`+` bullets will correctly fail to match and trigger the drift-skip branch.
+   a'. **If Read fails** (file missing, permission denied, or the read region returns empty content): skip this candidate, increment `skipped_other`, and emit:
+
+   ```
+   ⚠️  Skipped checkoff "<candidate.text>" — cannot read <basename(file)>:<line>
+   (<error class from Read tool>). File may have been moved, deleted, or
+   permissions changed. Edit manually in Obsidian.
+   ```
+
+   Do NOT append to `successfully_edited`. Continue with next candidate.
+
+   b. **Match check.** Scan the read region for any line that, after stripping leading whitespace, the `- [ ] ` prefix, AND trailing whitespace/newline, equals `candidate.text` byte-for-byte. The candidate text was already rstripped by `open_item_dedup.collect_open_items`, so the comparison is symmetric. The bullet prefix is exactly `- [ ] ` (hyphen, space, open-bracket, space, close-bracket, single trailing space) — the candidate producer in `obsidian_utils.collect_open_items` emits only this form, so `- [ ]` with other spacing or `*`/`+` bullets will correctly fail to match and trigger the drift-skip branch.
 
    c. **If match found:** use `Edit` with `replace_all: false` to change that specific line from `- [ ] <candidate.text>` to `- [x] <candidate.text>`. Include enough surrounding text in the Edit call to ensure uniqueness. Append `candidate.text` to `successfully_edited`.
 
-   d. **If no match:** skip this candidate, increment `skipped_drift`, and emit:
+   d. **If no match found in the read region:** skip this candidate, increment `skipped_drift`, and emit:
 
    ```
-   ⚠️  Skipped checkoff "<candidate.text>" — source line at <basename(file)>:<line> reads
-   "<raw text of the line at candidate.line, verbatim including leading whitespace — or
-   "(line is no longer a checkbox)" if the line does not start with `- [` after stripping
-   leading whitespace>" which does not match candidate text. File may have changed since
-   /recall started. Edit manually in Obsidian.
+   ⚠️  Skipped checkoff at <basename(file)>:<line>
+       expected: "- [ ] <candidate.text>"
+       found:    "<raw text of the line at the position in the read buffer
+                  corresponding to candidate.line — or "(line is past EOF)"
+                  if the read region is shorter than expected, or
+                  "(line is no longer a checkbox)" if the line doesn't start
+                  with `- [` after stripping leading whitespace>"
+   File changed since /recall Step 3. Edit manually in Obsidian.
    ```
 
-   e. **If the Edit itself fails** (non-unique match despite the Read context), skip and emit:
+   The position within the read buffer is `min(3, candidate.line - 1)` because Read clamped `offset = max(1, candidate.line - 3)` — when `candidate.line ≥ 4`, the target line sits at buffer index 3; when `candidate.line ∈ {1,2,3}`, it sits at buffer index `candidate.line - 1`. Do NOT append to `successfully_edited`.
+
+   e. **If the Edit call itself fails** (string not found, ambiguous match, or file-modified-since-read): skip, increment `skipped_other`, and emit the Edit tool's error message verbatim:
 
    ```
-   ⚠️  Could not check off item "<candidate.text>" — line is not unique in
-   <basename(file)>. Edit manually in Obsidian.
+   ⚠️  Could not check off "<candidate.text>" in <basename(file)>:<line> —
+   Edit failed: <verbatim Edit error message>. The line may have been edited
+   externally since /recall started, or the same text appears multiple times.
+   Edit manually in Obsidian.
    ```
 
-   Do NOT append to `successfully_edited` in cases (d) and (e).
+   Do NOT append to `successfully_edited`.
 
    Continue with remaining confirmed candidates regardless of any individual skip.
 
@@ -322,13 +341,13 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 ✅ Checked off N item(s) across <list of files>.
 ```
 
-If `skipped_drift > 0`, append on a new line:
+If `skipped_drift > 0` or `skipped_other > 0`, append:
 
 ```
-⚠️  Skipped M item(s) due to source drift (see warnings above).
+⚠️  Skipped M item(s) total (drift: <skipped_drift>, other: <skipped_other>) — see warnings above.
 ```
 
-Where `N = len(successfully_edited)` and `M = skipped_drift`.
+Where `N = len(successfully_edited)` and `M = skipped_drift + skipped_other`.
 
 7. **Cascade check-offs to duplicate items in older notes.** Run:
 
