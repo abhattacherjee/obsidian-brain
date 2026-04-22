@@ -278,7 +278,7 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
    Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
    ```
 
-   The `- [ ] <verbatim candidate.text>` line MUST be shown in a code block exactly as it will be matched on disk. Do not paraphrase. Do not add ellipsis.
+   The `- [ ] <verbatim candidate.text>` line MUST be shown in a code block using the exact `candidate.text` content (no paraphrase, no ellipsis). Step 5's match rule then compares this text against the file line after normalizing the file side (strip leading whitespace, `- [ ] ` prefix, and trailing whitespace/newline) — so the presented text is what matches after normalization, not byte-for-byte against raw file bytes.
 
 4. **Wait for user response** (N > 4 branch only — the N ≤ 4 branch returns from `AskUserQuestion`). Parse the response:
    - `none` or empty → skip checkoff entirely, proceed to Step 5
@@ -303,7 +303,7 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
    Do NOT append to `successfully_edited`. Continue with next candidate.
 
-   b. **Match check.** Scan the read region for any line that, after stripping leading whitespace, the `- [ ] ` prefix, AND trailing whitespace/newline, equals `candidate.text` byte-for-byte. The candidate text was already rstripped by `open_item_dedup.collect_open_items`, so the comparison is symmetric. The bullet prefix is exactly `- [ ] ` (hyphen, space, open-bracket, space, close-bracket, single trailing space) — the candidate producer in `obsidian_utils.collect_open_items` emits only this form, so `- [ ]` with other spacing or `*`/`+` bullets will correctly fail to match and trigger the drift-skip branch.
+   b. **Match check.** Scan the read region for any line that, after stripping leading whitespace, the `- [ ] ` prefix, AND trailing whitespace/newline, equals `candidate.text` byte-for-byte. The candidate text was already normalized by `open_item_dedup.collect_open_items` via `line.strip()` (leading+trailing whitespace removed) followed by `[6:]` (prefix removed), so both sides of the comparison end up as the same fully-stripped item text. The bullet prefix is exactly `- [ ] ` (hyphen, space, open-bracket, space, close-bracket, single trailing space) — `open_item_dedup.collect_open_items` emits only this form, so `- [ ]` with other spacing or `*`/`+` bullets will correctly fail to match and trigger the drift-skip branch.
 
    c. **If match found:** use `Edit` with `replace_all: false` to change that specific line from `- [ ] <candidate.text>` to `- [x] <candidate.text>`. Include enough surrounding text in the Edit call to ensure uniqueness. Append `candidate.text` to `successfully_edited`.
 
