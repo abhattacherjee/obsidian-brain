@@ -335,17 +335,17 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
 6. **Confirm checkoffs to user.** Print:
 
-```
-✅ Checked off N item(s) across <list of files>.
-```
+   ```
+   ✅ Checked off N item(s) across <list of files>.
+   ```
 
-If `skipped_drift > 0` or `skipped_other > 0`, append:
+   If `skipped_drift > 0` or `skipped_other > 0`, append:
 
-```
-⚠️  Skipped M item(s) total (drift: <skipped_drift>, other: <skipped_other>) — see warnings above.
-```
+   ```
+   ⚠️  Skipped M item(s) total (drift: <skipped_drift>, other: <skipped_other>) — see warnings above.
+   ```
 
-Where `N = len(successfully_edited)` and `M = skipped_drift + skipped_other`.
+   Where `N = len(successfully_edited)` and `M = skipped_drift + skipped_other`.
 
 7. **Cascade check-offs to duplicate items in older notes.** Run:
 
