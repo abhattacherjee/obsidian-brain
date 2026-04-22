@@ -291,17 +291,18 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
    a. **Read** the source file at `offset = max(1, candidate.line - 3), limit = 7` (±3 lines context, clamped at file start). This also satisfies the Edit tool's "must Read before Edit" requirement.
 
-   b. **Match check.** Scan the read region for any line that, after stripping optional leading whitespace and the `- [ ] ` prefix, equals `candidate.text` byte-for-byte. The candidate text itself is used verbatim — no trimming.
+   b. **Match check.** Scan the read region for any line that, after stripping optional leading whitespace and the `- [ ] ` prefix, equals `candidate.text` byte-for-byte. The candidate text itself is used verbatim — no trimming. The bullet prefix is exactly `- [ ] ` (hyphen, space, open-bracket, space, close-bracket, single trailing space) — the candidate producer in `obsidian_utils.collect_open_items` emits only this form, so `- [ ]` with other spacing or `*`/`+` bullets will correctly fail to match and trigger the drift-skip branch.
 
    c. **If match found:** use `Edit` with `replace_all: false` to change that specific line from `- [ ] <candidate.text>` to `- [x] <candidate.text>`. Include enough surrounding text in the Edit call to ensure uniqueness. Append `candidate.text` to `successfully_edited`.
 
    d. **If no match:** skip this candidate, increment `skipped_drift`, and emit:
 
    ```
-   ⚠️  Skipped checkoff "<candidate.text>" — source line at <basename(file)>:<line>
-   reads "<actual line with leading whitespace and bullet stripped>" which does
-   not match candidate text. File may have changed since /recall started.
-   Edit manually in Obsidian.
+   ⚠️  Skipped checkoff "<candidate.text>" — source line at <basename(file)>:<line> reads
+   "<raw text of the line at candidate.line, verbatim including leading whitespace — or
+   "(line is no longer a checkbox)" if the line does not start with `- [` after stripping
+   leading whitespace>" which does not match candidate text. File may have changed since
+   /recall started. Edit manually in Obsidian.
    ```
 
    e. **If the Edit itself fails** (non-unique match despite the Read context), skip and emit:
