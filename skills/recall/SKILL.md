@@ -307,7 +307,7 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
    b. **Match check.** Scan the read region for any line that, after stripping leading whitespace, the `- [ ] ` prefix, AND trailing whitespace/newline, equals `candidate.text` byte-for-byte. The candidate text was already normalized by `open_item_dedup.collect_open_items` via `line.strip()` (leading+trailing whitespace removed) followed by `[6:]` (prefix removed), so both sides of the comparison end up as the same fully-stripped item text. The bullet prefix is exactly `- [ ] ` (hyphen, space, open-bracket, space, close-bracket, single trailing space) — `open_item_dedup.collect_open_items` emits only this form, so `- [ ]` with other spacing or `*`/`+` bullets will correctly fail to match and trigger the drift-skip branch.
 
-   c. **If match found:** use `Edit` with `replace_all: false` to change that specific line from `- [ ] <candidate.text>` to `- [x] <candidate.text>`. Include enough surrounding text in the Edit call to ensure uniqueness. Append `candidate.text` to `successfully_edited`.
+   c. **If match found:** use `Edit` with `replace_all: false` to update the already-matched raw line in place, preserving any leading whitespace/indentation and changing only its checkbox marker from `[ ]` to `[x]`. Do not reconstruct the line from `candidate.text` — use the raw line as seen in the Read output. Include enough surrounding text in the Edit call to ensure uniqueness. Append `candidate.text` to `successfully_edited`.
 
    d. **If no match found in the read region:** skip this candidate, increment `skipped_drift`, and emit:
 
