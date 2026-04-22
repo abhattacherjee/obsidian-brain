@@ -270,7 +270,7 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
    I noticed these open items may now be done:
 
    1. <basename(file)>:<line>
-      `- [ ] <verbatim candidate.text>`
+      - [ ] <verbatim candidate.text>
       Evidence: "<short evidence snippet>"
 
    2. ...
@@ -311,16 +311,12 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
    ```
    ⚠️  Skipped checkoff at <basename(file)>:<line>
-       expected: "- [ ] <candidate.text>"
-       found:    "<raw text of the line at the position in the read buffer
-                  corresponding to candidate.line — or "(line is past EOF)"
-                  if the read region is shorter than expected, or
-                  "(line is no longer a checkbox)" if the line doesn't start
-                  with `- [` after stripping leading whitespace>"
+       expected: - [ ] <candidate.text>
+       found:    <RAW_LINE>
    File changed since /recall Step 3. Edit manually in Obsidian.
    ```
 
-   The position within the read buffer is `min(3, candidate.line - 1)` because Read clamped `offset = max(1, candidate.line - 3)` — when `candidate.line ≥ 4`, the target line sits at buffer index 3; when `candidate.line ∈ {1,2,3}`, it sits at buffer index `candidate.line - 1`. Do NOT append to `successfully_edited`.
+   `<RAW_LINE>` is the raw text (verbatim, leading whitespace preserved) of the line at buffer index `min(3, candidate.line - 1)` in the read region. Use the literal substitute `(line is past EOF)` if the read region is shorter than expected, or `(line is no longer a checkbox)` if the line's content (after stripping leading whitespace) does not start with `- [`. The buffer-index formula follows from Read's clamp `offset = max(1, candidate.line - 3)` — when `candidate.line ≥ 4`, the target line sits at buffer index 3; when `candidate.line ∈ {1,2,3}`, it sits at buffer index `candidate.line - 1`. Do NOT append to `successfully_edited`.
 
    e. **If the Edit call itself fails** (string not found, ambiguous match, or file-modified-since-read): skip, increment `skipped_other`, and emit the Edit tool's error message verbatim:
 
