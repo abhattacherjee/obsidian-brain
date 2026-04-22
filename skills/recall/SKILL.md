@@ -285,11 +285,35 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
    - `all` → check off all candidates
    - Comma-separated numbers (e.g. `1,3`) → check off only those
 
-5. **For each confirmed checkoff, edit the source file.** Use Read to load the full source file. Find the exact line containing `- [ ] <item text>`. Replace it with `- [x] <item text>`. Use the Edit tool with `replace_all: false` and provide enough context to ensure uniqueness. If the line is ambiguous, skip and warn:
+5. **For each confirmed checkoff, Read-verify then Edit.** Maintain a `successfully_edited` list (starts empty) and a `skipped_drift` counter (starts 0).
 
-```
-⚠️  Could not check off item "<item text>" — line is not unique in <file>. Edit manually in Obsidian.
-```
+   For each confirmed candidate:
+
+   a. **Read** the source file at `offset = max(1, candidate.line - 3), limit = 7` (±3 lines context, clamped at file start). This also satisfies the Edit tool's "must Read before Edit" requirement.
+
+   b. **Match check.** Scan the read region for any line that, after stripping optional leading whitespace and the `- [ ] ` prefix, equals `candidate.text` byte-for-byte. The candidate text itself is used verbatim — no trimming.
+
+   c. **If match found:** use `Edit` with `replace_all: false` to change that specific line from `- [ ] <candidate.text>` to `- [x] <candidate.text>`. Include enough surrounding text in the Edit call to ensure uniqueness. Append `candidate.text` to `successfully_edited`.
+
+   d. **If no match:** skip this candidate, increment `skipped_drift`, and emit:
+
+   ```
+   ⚠️  Skipped checkoff "<candidate.text>" — source line at <basename(file)>:<line>
+   reads "<actual line with leading whitespace and bullet stripped>" which does
+   not match candidate text. File may have changed since /recall started.
+   Edit manually in Obsidian.
+   ```
+
+   e. **If the Edit itself fails** (non-unique match despite the Read context), skip and emit:
+
+   ```
+   ⚠️  Could not check off item "<candidate.text>" — line is not unique in
+   <basename(file)>. Edit manually in Obsidian.
+   ```
+
+   Do NOT append to `successfully_edited` in cases (d) and (e).
+
+   Continue with remaining confirmed candidates regardless of any individual skip.
 
 6. **Confirm checkoffs to user.** Print:
 
