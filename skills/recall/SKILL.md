@@ -232,22 +232,55 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
 2. **Parse candidates.** The JSON array contains objects with `file`, `line`, `text`, `evidence`, `confidence`, `has_completion_phrase`.
 
-3. **Present candidates to user.** Print:
+3. **Present candidates to user.** Branch by N (number of candidates):
 
-```
-I noticed these open items may now be done:
+   **N ≤ 4 — native multi-select picker:**
 
-1. [x] <item text>
-     From: <basename of source file>
-     Evidence: "<short snippet from evidence showing the match>"
+   Call `AskUserQuestion` with `multiSelect: true`. Build one `option` per candidate:
 
-2. [x] <item text>
-     ...
+   - `label`: first ~40 characters of the candidate's `text` field, ellipsized with `…` if truncated. No paraphrase — take a prefix of the verbatim text.
+   - `description`: `<basename(file)>:<line> — "<full verbatim candidate.text>" — Evidence: <short evidence snippet>`
 
-Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
-```
+   Example shape:
 
-4. **Wait for user response.** Parse the response:
+   ```
+   AskUserQuestion({
+     questions: [{
+       question: "Which open items should I check off?",
+       header: "Checkoff",
+       multiSelect: true,
+       options: [
+         {
+           label: "File #69: Investigate /recall parallel subpro…",
+           description: "2026-04-20-obsidian-brain-7769.md:42 — \"File #69: Investigate /recall parallel subprocess dispatch sequentiality in Claude Code harness\" — Evidence: \"...shipped v2.4.0 ...completing issue #69...\""
+         },
+         ...
+       ]
+     }]
+   })
+   ```
+
+   Record the user's selected options. Empty selection → treat as `none`.
+
+   **N > 4 — verbatim text fallback:**
+
+   Print:
+
+   ```
+   I noticed these open items may now be done:
+
+   1. <basename(file)>:<line>
+      `- [ ] <verbatim candidate.text>`
+      Evidence: "<short evidence snippet>"
+
+   2. ...
+
+   Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
+   ```
+
+   The `- [ ] <verbatim candidate.text>` line MUST be shown in a code block exactly as it will be matched on disk. Do not paraphrase. Do not add ellipsis.
+
+4. **Wait for user response** (N > 4 branch only — the N ≤ 4 branch returns from `AskUserQuestion`). Parse the response:
    - `none` or empty → skip checkoff entirely, proceed to Step 5
    - `all` → check off all candidates
    - Comma-separated numbers (e.g. `1,3`) → check off only those
