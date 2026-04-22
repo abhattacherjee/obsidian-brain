@@ -281,9 +281,11 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
    The `- [ ] <verbatim candidate.text>` line MUST be shown in a code block using the exact `candidate.text` content (no paraphrase, no ellipsis). Step 5's match rule then compares this text against the file line after normalizing the file side (strip leading whitespace, `- [ ] ` prefix, and trailing whitespace/newline) — so the presented text is what matches after normalization, not byte-for-byte against raw file bytes.
 
 4. **Wait for user response** (N > 4 branch only — the N ≤ 4 branch returns from `AskUserQuestion`). Parse the response:
-   - `none` or empty → skip checkoff entirely, proceed to Step 5
+   - `none` or empty → skip the remaining checkoff sub-steps (5–7) and proceed directly to the "Show load manifest" block at the end of Step 4
    - `all` → check off all candidates
    - Comma-separated numbers (e.g. `1,3`) → check off only those
+
+   **N ≤ 4 branch:** if the user's `AskUserQuestion` selection is empty, treat it the same way — skip sub-steps 5–7 and proceed to the "Show load manifest" block at the end of Step 4.
 
 5. **For each confirmed checkoff, Read-verify then Edit.** Maintain a `successfully_edited` list (starts empty), a `skipped_drift` counter (starts 0), and a `skipped_other` counter (starts 0).
 
