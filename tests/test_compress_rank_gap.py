@@ -60,19 +60,19 @@ def test_weak_top_rank_rejects_even_with_large_delta():
 
 
 def test_custom_thresholds_respected():
-    # Default accepts (rank -8 <= -5), custom min_strength=-10 rejects
-    results = [{"rank": -8.0}, {"rank": -6.0}]
-    assert is_high_confidence_match(results) is True
+    # Sub-test 1: strength gate only (single result, delta gate bypassed)
+    results_single = [{"rank": -8.0}]
+    assert is_high_confidence_match(results_single) is True  # -8 <= default -5.0
     assert (
-        is_high_confidence_match(results, min_strength=-10.0, min_delta=1.0)
-        is False
-    )
-    # Default rejects (delta 2 < 5), custom min_delta=1 accepts
-    results2 = [{"rank": -8.0}, {"rank": -6.0}]
-    assert is_high_confidence_match(results2) is False
+        is_high_confidence_match(results_single, min_strength=-10.0) is False
+    )  # -8 > -10 fails custom strength gate
+
+    # Sub-test 2: delta gate (two results; strength gate passes for both calls)
+    results_pair = [{"rank": -8.0}, {"rank": -6.0}]
+    assert is_high_confidence_match(results_pair) is False  # delta 2 below default
     assert (
-        is_high_confidence_match(results2, min_delta=1.0) is True
-    )
+        is_high_confidence_match(results_pair, min_delta=1.0) is True
+    )  # delta 2 above custom min_delta=1
 
 
 def test_constants_are_exposed():
