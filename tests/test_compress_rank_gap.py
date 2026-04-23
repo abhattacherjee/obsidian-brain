@@ -69,7 +69,10 @@ def test_delta_at_threshold_boundary_rejects():
     value still correctly rejects the at-threshold case.
     Guards against an off-by-one drift toward `>=`.
     """
-    # delta = |−29| − |−28.75| = 0.25, exactly equals default MIN_RANK_DELTA (0.25) → reject
+    # delta = |−29| − |−28.75| = 0.25, exactly equals default MIN_RANK_DELTA (0.25) → reject.
+    # Input values are multiples of 0.25, so they're exact binary fractions (no IEEE 754
+    # rounding); this makes the at-threshold equality check reliable. Future boundary tests
+    # should pick similarly-exact inputs rather than (say) 0.1, which is not exactly representable.
     results = [{"rank": -29.0}, {"rank": -28.75}]
     assert is_high_confidence_match(results) is False
     # With a custom min_delta=0.15, same input has delta 0.25 > 0.15 → accept
