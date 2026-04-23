@@ -185,7 +185,7 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
                 project=proj,
                 current_source="(no source_session_note)",
                 proposed_source="",
-                reason=f"parent session not found — no session_note with session_id={sid!r} in sessions folder",
+                reason=f"parent session not found — no session note with session_id={sid!r} in sessions folder",
                 confidence=0.0,
                 extra={"unresolved": True},
             ))
