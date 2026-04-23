@@ -132,7 +132,7 @@ def main():
         else:
             repro_pass = "skipped"
         print(
-            f"| {t:.1f} | {score['tp']} | {score['tn']} | {score['fp']} | {score['fn']} | "
+            f"| {t:.2f} | {score['tp']} | {score['tn']} | {score['fp']} | {score['fn']} | "
             f"{ratio:.2f} | {repro_pass} |"
         )
 
