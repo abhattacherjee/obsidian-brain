@@ -75,6 +75,9 @@ import sys, os, json
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from vault_index import ensure_index, search_vault
 from obsidian_utils import load_config
+# Pure predicate: top rank must pass absolute-strength gate AND |top|-|#2| delta gate.
+# MIN_RANK_DELTA tuned against scripts/compress_rank_gap_corpus.json (issue #45).
+from compress_guard import is_high_confidence_match
 try:
     c = load_config()
     vp = c["vault_path"]
@@ -84,15 +87,9 @@ try:
     results += search_vault(db, sys.argv[1], note_type="claude-decision", limit=3)
     # Sort combined results by rank (most negative = best match)
     results.sort(key=lambda r: r["rank"])
-    # Apply high-confidence threshold: top result must have rank <= -5.0
-    # AND must be significantly ahead of #2 (at least 1.5x better rank)
-    if results:
+    if is_high_confidence_match(results):
         top = results[0]
-        rank_gap_ok = len(results) < 2 or abs(top["rank"]) > abs(results[1]["rank"]) * 1.5
-        if top["rank"] <= -5.0 and rank_gap_ok:
-            print(json.dumps({"match": True, "path": top["path"], "title": top["title"], "date": top["date"], "tags": top["tags"], "rank": top["rank"]}))
-        else:
-            print(json.dumps({"match": False}))
+        print(json.dumps({"match": True, "path": top["path"], "title": top["title"], "date": top["date"], "tags": top["tags"], "rank": top["rank"]}))
     else:
         print(json.dumps({"match": False}))
 except Exception as e:
