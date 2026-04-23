@@ -75,8 +75,11 @@ def test_missing_status_summarized_when_summary_exists(tmp_path):
 
 def test_missing_backlink_populates_source_session_note(tmp_path):
     sess = tmp_path / "claude-sessions"; sess.mkdir()
-    # Parent filename must match the computed stem: <date>-<slug(project)>-<sha256(sid)[:4]>
-    # For session_id="s4" the hash prefix is computed deterministically.
+    # After #68, the resolver uses sessions_by_id keyed by session_id, so
+    # the parent filename shape is irrelevant — the test sets up a parent
+    # file with matching session_id in frontmatter, which is what matters.
+    # The explicit hash prefix here preserves the pre-#68 filename scheme
+    # for consistency with the test fixture helpers.
     import hashlib as _h
     sid = "s4"
     hash4 = _h.sha256(sid.encode()).hexdigest()[:4]

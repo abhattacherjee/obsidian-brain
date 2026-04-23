@@ -15,7 +15,6 @@ filenames still resolve after migration.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import os
 import re
 import shutil
@@ -71,10 +70,6 @@ def _legacy_filename(p: Path) -> bool:
 def _hhmmss_from_mtime(p: Path) -> str:
     ts = p.stat().st_mtime
     return datetime.datetime.fromtimestamp(ts).strftime("%H%M%S")
-
-
-def _short_session_hash(session_id: str) -> str:
-    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:4] if session_id else "e3b0"
 
 
 def _slugify(text: str) -> str:
