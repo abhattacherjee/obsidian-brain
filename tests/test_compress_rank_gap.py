@@ -59,6 +59,21 @@ def test_weak_top_rank_rejects_even_with_large_delta():
     assert is_high_confidence_match(results) is False
 
 
+def test_delta_at_threshold_boundary_rejects():
+    """Strict > comparison: delta exactly at threshold must reject.
+
+    Predicate uses `delta > min_delta`, not `>=`. This test locks that
+    semantic so a future tuning change to a different MIN_RANK_DELTA
+    value (say, 3.0) still correctly rejects the at-threshold case.
+    Guards against an off-by-one drift toward `>=`.
+    """
+    # delta = |−29| − |−25| = 4.0, exactly equals default MIN_RANK_DELTA (4.0) → reject
+    results = [{"rank": -29.0}, {"rank": -25.0}]
+    assert is_high_confidence_match(results) is False
+    # With a custom min_delta=3.0, same input has delta 4.0 > 3.0 → accept
+    assert is_high_confidence_match(results, min_delta=3.0) is True
+
+
 def test_custom_thresholds_respected():
     # Sub-test 1: strength gate only (single result, delta gate bypassed)
     results_single = [{"rank": -8.0}]
