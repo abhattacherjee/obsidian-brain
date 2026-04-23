@@ -132,8 +132,35 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     # (e.g. default ensure_index db path) resolves into the sandbox.
     monkeypatch.setenv("HOME", str(home))
 
-    # Sanity: skeleton proves fixtures land in the right places.
-    assert (home / ".claude" / "obsidian-brain-config.json").is_file()
-    assert transcript.is_file()
-    assert (tmp_path / "bin" / "claude").is_file()
-    assert sessions_dir.is_dir()
+    # --- Stage 1: fire the snapshot hook ---
+    snapshot_payload = {
+        "session_id": SID,
+        "cwd": str(tmp_path / "fake-cwd"),
+        "transcript_path": str(transcript),
+        "source": "compact",
+    }
+    proc = subprocess.run(
+        [sys.executable, str(HOOK_SNAPSHOT)],
+        input=json.dumps(snapshot_payload),
+        env=_hook_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"snapshot hook exit={proc.returncode}\nstderr:\n{proc.stderr}")
+
+    snapshot_files = sorted(sessions_dir.glob("*-snapshot-*.md"))
+    assert len(snapshot_files) == 1, (
+        f"expected exactly 1 snapshot file, got {len(snapshot_files)}: "
+        f"{[f.name for f in snapshot_files]}\nhook stderr:\n{proc.stderr}"
+    )
+    snapshot_path = snapshot_files[0]
+
+    snapshot_text = snapshot_path.read_text(encoding="utf-8")
+    assert "type: claude-snapshot" in snapshot_text
+    assert f"session_id: {SID}" in snapshot_text
+    assert f"project: {PROJECT}" in snapshot_text or PROJECT in snapshot_text
+    assert "status: auto-logged" in snapshot_text
+    assert "trigger: compact" in snapshot_text
+    assert "# Context Snapshot:" in snapshot_text
