@@ -65,11 +65,12 @@ def test_issue_45_repro_case():
 
 
 def test_weak_top_rank_rejects():
-    # Top rank -3 fails the strength gate. The second element is also weak,
-    # so the list is properly sorted most-negative first. The strength gate
-    # fires before the delta gate is evaluated — no strong #2 is needed to
-    # prove the point.
-    results = [{"rank": -3.0}, {"rank": -4.0}]
+    # List is sorted most-negative first (predicate's documented contract):
+    # -4.0 is the "top" at index 0, -3.0 is the runner-up at index 1. Top
+    # rank -4 still fails the strength gate (-4 > -5). The strength gate
+    # fires before the delta gate is evaluated — no strong #2 is needed
+    # to prove the point.
+    results = [{"rank": -4.0}, {"rank": -3.0}]
     assert is_high_confidence_match(results) is False
 
 
