@@ -156,21 +156,27 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
         sid = fm.get("session_id", "")
         proj = fm.get("project", "")
         if not sid or not proj:
+            missing = []
+            if not sid:
+                missing.append("session_id")
+            if not proj:
+                missing.append("project")
             issues.append(Issue(
                 check="snapshot-missing-backlink",
                 note_path=str(p),
                 project=proj,
                 current_source="(no source_session_note)",
                 proposed_source="",
-                reason="cannot resolve parent (missing session_id/project)",
+                reason=f"cannot resolve parent (missing frontmatter: {', '.join(missing)})",
                 confidence=0.0,
                 extra={"unresolved": True},
             ))
             continue
         parent_path = sessions_by_id.get(sid)
         if parent_path is None:
-            # Orphan — no session note with matching session_id anywhere
-            # in the vault. Let a future snapshot-orphan check own this
+            # Orphan — no session note with matching session_id in the
+            # sessions folder (sessions_by_id is built from sess_dir only,
+            # non-recursive). Let a future snapshot-orphan check own this
             # case; do NOT fabricate a wikilink from (date, slug,
             # sid_hash) — that is exactly the bug #68 fixed.
             issues.append(Issue(
@@ -179,7 +185,7 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
                 project=proj,
                 current_source="(no source_session_note)",
                 proposed_source="",
-                reason="parent session not found — no session_note with matching session_id",
+                reason=f"parent session not found — no session_note with session_id={sid!r} in sessions folder",
                 confidence=0.0,
                 extra={"unresolved": True},
             ))

@@ -74,18 +74,28 @@ def test_missing_status_summarized_when_summary_exists(tmp_path):
 
 
 def test_missing_backlink_populates_source_session_note(tmp_path):
+    """Normal same-date case — parent resolves via sessions_by_id.
+
+    Uses an arbitrary (non-hash-based) parent filename to prove the
+    resolver is truly keyed on session_id frontmatter, not on a
+    filename shape that happens to match the old (date, slug, sid_hash)
+    composer. Under pre-#68 code, the fabricated stem
+    "2026-04-18-demo-<sha256('s4')[:4]>" would NOT match the actual
+    filename here — pre-#68 would emit unresolved=True, this test
+    would fail.
+    """
     sess = tmp_path / "claude-sessions"; sess.mkdir()
-    # After #68, the resolver uses sessions_by_id keyed by session_id, so
-    # the parent filename shape is irrelevant — the test sets up a parent
-    # file with matching session_id in frontmatter, which is what matters.
-    # The explicit hash prefix here preserves the pre-#68 filename scheme
-    # for consistency with the test fixture helpers.
-    import hashlib as _h
     sid = "s4"
-    hash4 = _h.sha256(sid.encode()).hexdigest()[:4]
-    parent_stem = f"2026-04-18-demo-{hash4}"
-    _write_session(sess / f"{parent_stem}.md", session_id=sid)
-    p = sess / f"{parent_stem}-snapshot-110000.md"
+    # Non-hash filename — deliberately does not match the old
+    # (date, slug, sid_hash) composer output.
+    parent_stem = "2026-04-18-demo-parent"
+    (sess / f"{parent_stem}.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-18\nsession_id: {sid}\n"
+        "project: demo\nstatus: summarized\n---\n\n# S\n",
+        encoding="utf-8",
+    )
+    # Snapshot filename also does not need to follow any specific scheme.
+    p = sess / "2026-04-18-demo-snap-110000.md"
     p.write_text(
         f"---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: {sid}\nproject: demo\n"
         "trigger: compact\nstatus: auto-logged\n---\n\n# Snap\n",
@@ -94,7 +104,8 @@ def test_missing_backlink_populates_source_session_note(tmp_path):
     issues = snapshot_migration.scan(str(tmp_path), "claude-sessions", "claude-insights", 3650)
     miss = [i for i in issues if i.check == "snapshot-missing-backlink"]
     assert len(miss) == 1
-    assert not miss[0].extra.get("unresolved")  # parent exists
+    assert not miss[0].extra.get("unresolved")  # parent resolved via session_id
+    assert miss[0].extra["parent_stem"] == parent_stem
     snapshot_migration.apply(miss, str(tmp_path / "backup"))
     text = p.read_text(encoding="utf-8")
     assert f'source_session_note: "[[{parent_stem}]]"' in text
@@ -103,11 +114,11 @@ def test_missing_backlink_populates_source_session_note(tmp_path):
 def test_missing_backlink_unresolved_when_parent_absent(tmp_path):
     """Orphan snapshot (no session note matches session_id) -> unresolved.
 
-    Post-#68, the orphan branch emits confidence=0.0 with empty
-    proposed_source — no speculative wikilink fabricated from
-    (date, slug, sid_hash). The assertion set here (len==1 and
-    unresolved=True) holds for both the old and new behavior; this
-    docstring documents the tighter post-fix semantics.
+    Only the first two assertions (len==1, unresolved=True) held under
+    pre-#68 behavior; the three new assertions below (proposed_source=="",
+    confidence==0.0, reason contains "parent session not found") encode
+    tighter post-fix semantics that the old code — which fabricated a
+    speculative wikilink with confidence=0.3 — did not satisfy.
     """
     sess = tmp_path / "claude-sessions"; sess.mkdir()
     p = sess / "2026-04-18-demo-zz-snapshot-110000.md"
@@ -162,7 +173,10 @@ def test_wikilink_rewrite_across_vault_on_rename(tmp_path):
 def test_migration_is_idempotent(tmp_path):
     sess = tmp_path / "claude-sessions"; sess.mkdir()
     _write_legacy_snapshot(sess / "2026-04-18-demo-ee-snapshot.md", session_id="eeee")
-    # Parent stem must match hash of "eeee" since _write_legacy_snapshot hardcodes project="demo"
+    # The hash-based parent stem is vestigial — post-#68 the resolver
+    # matches on session_id in frontmatter, not on filename shape. Any
+    # filename carrying session_id="eeee" in frontmatter would work;
+    # this form preserves the pre-#68 fixture for minimal churn.
     import hashlib as _h
     hash4 = _h.sha256(b"eeee").hexdigest()[:4]
     _write_session(sess / f"2026-04-18-demo-{hash4}.md", session_id="eeee")
@@ -192,6 +206,27 @@ def test_missing_backlink_unresolved_when_sid_missing(tmp_path):
     # Apply should record unresolved status
     results = snapshot_migration.apply(miss, str(tmp_path / "backup"))
     assert results[0].status == "unresolved"
+
+
+def test_missing_backlink_unresolved_when_project_missing(tmp_path):
+    """No project in snapshot frontmatter -> unresolved.
+
+    Covers the second half of the `not sid or not proj` guard (the
+    sid-missing half is covered by test_missing_backlink_unresolved_when_sid_missing).
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    p = sess / "2026-04-18-demo-ff-snapshot-100000.md"
+    p.write_text(
+        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: sid-abc\n"
+        "trigger: compact\nstatus: auto-logged\n---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+    issues = snapshot_migration.scan(str(tmp_path), "claude-sessions", "claude-insights", 3650)
+    miss = [i for i in issues if i.check == "snapshot-missing-backlink"]
+    assert len(miss) == 1
+    assert miss[0].extra.get("unresolved")
+    assert "project" in miss[0].reason
+    assert "session_id" not in miss[0].reason
 
 
 def test_scan_returns_empty_when_sessions_folder_missing(tmp_path):
