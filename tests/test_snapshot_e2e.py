@@ -164,3 +164,46 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     assert "status: auto-logged" in snapshot_text
     assert "trigger: compact" in snapshot_text
     assert "# Context Snapshot:" in snapshot_text
+
+    # --- Stage 2: fire the session-log hook ---
+    session_payload = {
+        "session_id": SID,
+        "cwd": str(tmp_path / "fake-cwd"),
+        "transcript_path": str(transcript),
+    }
+    proc = subprocess.run(
+        [sys.executable, str(HOOK_SESSION_LOG)],
+        input=json.dumps(session_payload),
+        env=_hook_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"session-log hook exit={proc.returncode}\nstderr:\n{proc.stderr}")
+
+    session_files = [
+        f for f in sessions_dir.glob("*.md")
+        if "-snapshot-" not in f.name
+    ]
+    assert len(session_files) == 1, (
+        f"expected exactly 1 session file, got {len(session_files)}: "
+        f"{[f.name for f in session_files]}\nhook stderr:\n{proc.stderr}"
+    )
+    session_path = session_files[0]
+
+    session_text = session_path.read_text(encoding="utf-8")
+    assert "type: claude-session" in session_text
+    assert f"session_id: {SID}" in session_text
+    assert "status: auto-logged" in session_text
+
+    # Back-reference check: the session note's frontmatter must list the
+    # snapshot via a wikilink under `snapshots:`.
+    snapshot_stem = snapshot_path.stem
+    assert f"[[{snapshot_stem}]]" in session_text, (
+        f"session note missing snapshot back-ref [[{snapshot_stem}]]:\n{session_text[:2000]}"
+    )
+    # Look for the YAML key itself.
+    assert re.search(r"^snapshots:", session_text, re.MULTILINE), (
+        "session note frontmatter missing `snapshots:` YAML key"
+    )
