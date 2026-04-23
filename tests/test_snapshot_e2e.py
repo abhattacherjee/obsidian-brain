@@ -275,3 +275,55 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     assert summary_match and summary_match.group(1).strip(), (
         "expected non-empty `## Summary` section after upgrade"
     )
+
+    # --- Stage 5: build_context_brief nested row + snapshot_count ---
+    brief = obsidian_utils.build_context_brief(
+        str(vault), "claude-sessions", "claude-insights", PROJECT,
+        hook_status_line="[OK] test",
+    )
+
+    # Parse delimited sections.
+    def _section(label: str) -> str:
+        m = re.search(
+            rf"<<<{label}>>>\n(.*?)(?=\n<<<[A-Z_]+>>>|\Z)",
+            brief,
+            re.DOTALL,
+        )
+        assert m, f"missing section <<<{label}>>> in brief:\n{brief[:2000]}"
+        return m.group(1)
+
+    context_brief_section = _section("OB_CONTEXT_BRIEF")
+    load_manifest_section = _section("OB_LOAD_MANIFEST")
+    most_recent_path = _section("OB_MOST_RECENT_SESSION_PATH").strip()
+
+    # Nested snapshot row: `↳ HH:MM:SS` (currently rendered inside a table cell).
+    assert re.search(r"↳ \d{2}:\d{2}:\d{2}\b", context_brief_section), (
+        f"expected nested snapshot row `↳ HH:MM:SS` in context brief:\n"
+        f"{context_brief_section[:2000]}"
+    )
+
+    assert re.search(r"^snapshot_count:\s*1\b", load_manifest_section, re.MULTILINE), (
+        f"expected `snapshot_count: 1` in LOAD_MANIFEST:\n{load_manifest_section}"
+    )
+
+    # At least one `snapshot:` line. The line format is
+    # `snapshot: [HHMMSS] (<trigger>) <summary>` — so match on the HHMMSS
+    # tail of the snapshot stem (the only part of the stem guaranteed to
+    # appear on the line).
+    stem_hhmmss_match = re.search(r"-snapshot-(\d{6})$", snapshot_path.stem)
+    assert stem_hhmmss_match, (
+        f"snapshot stem missing trailing -snapshot-HHMMSS: {snapshot_path.stem}"
+    )
+    hhmmss = stem_hhmmss_match.group(1)
+    assert re.search(
+        rf"^snapshot:\s*\[{hhmmss}\]",
+        load_manifest_section,
+        re.MULTILINE,
+    ), (
+        f"expected `snapshot: [{hhmmss}]` line in LOAD_MANIFEST "
+        f"(stem={snapshot_path.stem}):\n{load_manifest_section}"
+    )
+
+    assert most_recent_path == str(session_path), (
+        f"expected MOST_RECENT_SESSION_PATH={session_path}, got={most_recent_path}"
+    )
