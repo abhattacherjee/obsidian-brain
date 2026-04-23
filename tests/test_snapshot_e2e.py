@@ -222,3 +222,56 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     assert set(result["unsummarized"]) == {str(session_path), str(snapshot_path)}, (
         f"unexpected unsummarized set: {result['unsummarized']}"
     )
+
+    # --- Stage 4: upgrade_unsummarized_note (Haiku monkeypatched) ---
+    CANNED_SUMMARY = (
+        "## Summary\n"
+        "E2E test session exercising the snapshot integration pipeline.\n"
+        "\n"
+        "## Key Decisions\n"
+        "- None noted.\n"
+        "\n"
+        "## Changes Made\n"
+        "- None noted.\n"
+        "\n"
+        "## Errors Encountered\n"
+        "- None.\n"
+        "\n"
+        "## Open Questions / Next Steps\n"
+        "- None.\n"
+        "\n"
+        "IMPORTANCE: 5\n"
+    )
+    _real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        # Intercept `claude -p ...`; delegate everything else.
+        if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 \
+                and cmd[0] == "claude" and cmd[1] == "-p":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=CANNED_SUMMARY, stderr=""
+            )
+        return _real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr("obsidian_utils.subprocess.run", fake_run)
+
+    status = obsidian_utils.upgrade_unsummarized_note(
+        str(session_path), str(vault), "claude-sessions", PROJECT
+    )
+    assert status.startswith("Upgraded "), (
+        f"upgrade_unsummarized_note did not succeed: {status!r}"
+    )
+
+    session_text_after = session_path.read_text(encoding="utf-8")
+    assert "status: summarized" in session_text_after, (
+        f"expected status: summarized after upgrade, got:\n{session_text_after[:2000]}"
+    )
+    # Summary body present (find the section header and at least one char of content).
+    summary_match = re.search(
+        r"^## Summary\n(.+?)(?=\n^## |\Z)",
+        session_text_after,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert summary_match and summary_match.group(1).strip(), (
+        "expected non-empty `## Summary` section after upgrade"
+    )
