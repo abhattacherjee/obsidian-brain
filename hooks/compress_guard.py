@@ -12,7 +12,7 @@ for the full tuning protocol.
 """
 
 MIN_RANK_STRENGTH = -5.0  # top result's FTS5 rank must be <= this (stronger = more negative)
-MIN_RANK_DELTA = 4.0      # placeholder within feasible band; finalized in Task 5 tuning
+MIN_RANK_DELTA = 0.25     # tuned against scripts/compress_rank_gap_corpus.json on 2026-04-23
 
 
 def is_high_confidence_match(results, min_strength=None, min_delta=None):

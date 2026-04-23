@@ -31,7 +31,7 @@ from obsidian_utils import load_config  # noqa: E402
 from vault_index import ensure_index, search_vault  # noqa: E402
 
 
-THRESHOLD_GRID = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]
+THRESHOLD_GRID = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]
 CORPUS_PATH = REPO_ROOT / "scripts" / "compress_rank_gap_corpus.json"
 
 

@@ -36,8 +36,8 @@ def test_delta_above_threshold_matches():
 
 
 def test_delta_below_threshold_rejects():
-    # delta = |−29| − |−26| = 3, below default MIN_RANK_DELTA
-    results = [{"rank": -29.0}, {"rank": -26.0}]
+    # delta = |−29| − |−28.9| = 0.1, below any viable MIN_RANK_DELTA regardless of tuning
+    results = [{"rank": -29.0}, {"rank": -28.9}]
     assert is_high_confidence_match(results) is False
 
 
@@ -64,14 +64,14 @@ def test_delta_at_threshold_boundary_rejects():
 
     Predicate uses `delta > min_delta`, not `>=`. This test locks that
     semantic so a future tuning change to a different MIN_RANK_DELTA
-    value (say, 3.0) still correctly rejects the at-threshold case.
+    value still correctly rejects the at-threshold case.
     Guards against an off-by-one drift toward `>=`.
     """
-    # delta = |−29| − |−25| = 4.0, exactly equals default MIN_RANK_DELTA (4.0) → reject
-    results = [{"rank": -29.0}, {"rank": -25.0}]
+    # delta = |−29| − |−28.75| = 0.25, exactly equals default MIN_RANK_DELTA (0.25) → reject
+    results = [{"rank": -29.0}, {"rank": -28.75}]
     assert is_high_confidence_match(results) is False
-    # With a custom min_delta=3.0, same input has delta 4.0 > 3.0 → accept
-    assert is_high_confidence_match(results, min_delta=3.0) is True
+    # With a custom min_delta=0.15, same input has delta 0.25 > 0.15 → accept
+    assert is_high_confidence_match(results, min_delta=0.15) is True
 
 
 def test_custom_thresholds_respected():
@@ -83,11 +83,11 @@ def test_custom_thresholds_respected():
     )  # -8 > -10 fails custom strength gate
 
     # Sub-test 2: delta gate (two results; strength gate passes for both calls)
-    results_pair = [{"rank": -8.0}, {"rank": -6.0}]
-    assert is_high_confidence_match(results_pair) is False  # delta 2 below default
+    results_pair = [{"rank": -8.0}, {"rank": -7.9}]
+    assert is_high_confidence_match(results_pair) is False  # delta 0.1 below default 0.25
     assert (
-        is_high_confidence_match(results_pair, min_delta=1.0) is True
-    )  # delta 2 above custom min_delta=1
+        is_high_confidence_match(results_pair, min_delta=0.05) is True
+    )  # delta 0.1 above custom min_delta=0.05
 
 
 def test_constants_are_exposed():
