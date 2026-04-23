@@ -746,3 +746,44 @@ def test_no_rollback_after_partial_wikilink_rewrite(tmp_path, monkeypatch):
     # Result.note_path points at the surviving (renamed) file so the user
     # can locate it for manual review.
     assert results[0].note_path == str(new_path)
+
+
+def test_missing_backlink_cross_midnight_uses_session_id_index(tmp_path):
+    """Snapshot from before-midnight must backlink to after-midnight parent.
+
+    Regression for #68: §3 previously composed the parent stem from the
+    snapshot's own `date` field, which breaks when PreCompact fires on
+    day N and SessionEnd on day N+1. The parent is now resolved via
+    sessions_by_id keyed by session_id, which is stable across midnight.
+    """
+    import hashlib as _h
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    sid = "cross-midnight-sid"
+    hash4 = _h.sha256(sid.encode()).hexdigest()[:4]
+
+    # Parent session — dated the day AFTER the snapshot
+    parent_stem = f"2026-04-10-demo-{hash4}"
+    _write_session(sess / f"{parent_stem}.md", session_id=sid)
+
+    # Snapshot — dated the day BEFORE its parent session (cross-midnight)
+    snap = sess / f"2026-04-09-demo-{hash4}-snapshot-235959.md"
+    snap.write_text(
+        f"---\ntype: claude-snapshot\ndate: 2026-04-09\nsession_id: {sid}\n"
+        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650,
+    )
+    miss = [i for i in issues if i.check == "snapshot-missing-backlink"]
+    assert len(miss) == 1
+    assert not miss[0].extra.get("unresolved")
+    assert miss[0].extra["parent_stem"] == parent_stem
+    # Proposal must reference the AFTER-midnight parent, not the snapshot's own date
+    assert f'source_session_note: "[[{parent_stem}]]"' in miss[0].proposed_source
+    assert "2026-04-09-demo-" not in miss[0].proposed_source
+
+    snapshot_migration.apply(miss, str(tmp_path / "backup"))
+    text = snap.read_text(encoding="utf-8")
+    assert f'source_session_note: "[[{parent_stem}]]"' in text
