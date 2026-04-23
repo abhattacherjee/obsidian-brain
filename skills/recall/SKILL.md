@@ -234,9 +234,9 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
 3. **Present candidates to user.** Branch by N (number of candidates):
 
-   **2 ≤ N ≤ 4 — native multi-select picker:**
+   **2 ≤ N ≤ 3 — native multi-select picker:**
 
-   Call `AskUserQuestion` with `multiSelect: true`. Build one `option` per candidate, then append exactly one sentinel option (described below). `AskUserQuestion` enforces `options: { minItems: 2, maxItems: 4 }` — that is why N=1 routes to the text fallback below instead of this branch.
+   Call `AskUserQuestion` with `multiSelect: true`. Build one `option` per candidate, then append exactly one sentinel option (described below). `AskUserQuestion` enforces `options: { minItems: 2, maxItems: 4 }`, so this branch covers N ∈ {2, 3} real candidates (plus the sentinel = 3 or 4 total options). N=1 routes to the text fallback below because minItems=2 would be violated; N=4+ routes to the text fallback because N=4 real + 1 sentinel = 5 options, which exceeds maxItems=4.
 
    Per-candidate option:
 
@@ -245,10 +245,10 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
    Sentinel option (always appended last):
 
-   - `label`: `Skip all — don't check off anything`
+   - `label` (exact string, treat as the sentinel identity key): `Skip all — don't check off anything`
    - `description`: `Leave all open items as-is`
 
-   The sentinel makes "defer everything" a visible, selectable choice rather than an empty-submit convention. Tag it internally (e.g., store under a known constant like `SKIP_ALL_SENTINEL_LABEL`) so Step 5 can filter it out before Read-verify.
+   The sentinel makes "defer everything" a visible, selectable choice rather than an empty-submit convention. Step 5 will compare each selected option's `label` against the exact sentinel string above and drop any match before Read-verify.
 
    Example shape (N=2 real candidates + sentinel = 3 options, within the `maxItems: 4` cap):
 
@@ -276,11 +276,18 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
    })
    ```
 
-   Record the user's selected options. Filter out the sentinel before passing to Step 5. Empty selection, or a selection that contained **only** the sentinel, → treat as `none`. Note the `maxItems: 4` cap means this branch covers N ∈ {2, 3, 4} real candidates (plus the sentinel); N=5+ falls through to the text fallback below, so no truncation is possible here.
+   Record the user's selected options, then normalize in this exact order:
 
-   **N == 1 or N > 4 — verbatim text fallback:**
+   1. **Filter out the sentinel** by dropping any selected option whose `label` equals the exact string `Skip all — don't check off anything`.
+   2. **If the filtered list is empty** (whether the pre-filter selection was empty *or* contained only the sentinel), treat as `none` → skip sub-steps 5–7 and proceed to the "Show load manifest" block at the end of Step 4.
+   3. **Otherwise** pass the filtered list (real candidates only) to Step 5.
 
-   Print one numbered entry per candidate. The `Confirm` line's example syntax adapts to N: at N=1 show `(e.g. `1` or `none`)`; at N>4 show `(e.g. `1` or `1,2` or `all` or `none`)`.
+   **N == 1 or N ≥ 4 — verbatim text fallback:**
+
+   Print one numbered entry per candidate using the template below, with the `<CONFIRM_EXAMPLE>` placeholder replaced per N:
+
+   - N == 1 → `(e.g. `1` or `none`)`
+   - N ≥ 4 → `(e.g. `1` or `1,2` or `all` or `none`)`
 
    Template (repeat the numbered block for each candidate):
 
@@ -293,19 +300,20 @@ Parse the `OPEN_ITEM_CANDIDATES` section from the Step 3 Python output.
 
    2. ...
 
-   Confirm checkoff? (e.g. `1` or `1,2` or `all` or `none`)
+   Confirm checkoff? <CONFIRM_EXAMPLE>
    ```
 
    The `- [ ] <verbatim candidate.text>` line MUST be shown in a code block using the exact `candidate.text` content (no paraphrase, no ellipsis). Step 5's match rule then compares this text against the file line after normalizing the file side (strip leading whitespace, `- [ ] ` prefix, and trailing whitespace/newline) — so the presented text is what matches after normalization, not byte-for-byte against raw file bytes.
 
-4. **Wait for user response** (text-fallback branch only — the `2 ≤ N ≤ 4` picker branch returns from `AskUserQuestion`). Parse the response:
+4. **Wait for user response** (text-fallback branch only — the `2 ≤ N ≤ 3` picker branch already returned a filtered list from the normalization steps above). Parse the response:
    - `none` or empty → skip the remaining checkoff sub-steps (5–7) and proceed directly to the "Show load manifest" block at the end of Step 4
    - `all` → check off all candidates
-   - Comma-separated numbers (e.g. `1,3`) → check off only those (for N=1, `1` checks off the single candidate)
-
-   **Picker branch (`2 ≤ N ≤ 4`):** if the user's `AskUserQuestion` selection is empty, or contains only the Skip-all sentinel, treat it the same way — skip sub-steps 5–7 and proceed to the "Show load manifest" block at the end of Step 4.
+   - Comma-separated numbers (e.g. `1,3`) → check off the candidates at those 1-indexed positions (for N=1, `1` checks off the single candidate)
+   - **Ambiguous or invalid input** — any index outside `1..N`, non-numeric tokens (e.g. `yes`, `y`), or mixed garbage: re-prompt exactly once with `I didn't understand "<input>". Reply with \`none\`, \`all\`, or a comma-separated list of numbers in 1..<N>.` On the second ambiguous reply, treat as `none` and print `Treating "<input>" as none — no items checked off.` so the fallback surfaces explicitly rather than silently defaulting.
 
 5. **For each confirmed checkoff, Read-verify then Edit.** Maintain a `successfully_edited` list (starts empty), a `skipped_drift` counter (starts 0), and a `skipped_other` counter (starts 0).
+
+   **5-pre-sentinel. Sentinel-leak guard:** before the per-candidate loop, assert that no entry's `text` equals the exact sentinel string `Skip all — don't check off anything`. If one slipped through the Step 4 normalization, abort Step 5 entirely, emit `⚠️  Internal: Skip-all sentinel leaked into checkoff list — deferring all items.`, and proceed to the "Show load manifest" block. This surfaces filter bugs as diagnostic output instead of trying to Read a label-string as a file path.
 
    **5-pre. Within-batch dedup:** if the confirmed candidate list contains two entries with the same `(file, line)`, keep only the first and drop the rest automatically — they are scan duplicates, not drift. Do not emit per-duplicate warnings or treat them as skips. If any duplicates were removed, print this one-line informational message: `De-duplicated K within-batch candidate(s).`
 
