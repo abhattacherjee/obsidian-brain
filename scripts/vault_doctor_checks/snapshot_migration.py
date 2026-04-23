@@ -72,11 +72,6 @@ def _hhmmss_from_mtime(p: Path) -> str:
     return datetime.datetime.fromtimestamp(ts).strftime("%H%M%S")
 
 
-def _slugify(text: str) -> str:
-    """Minimal inline copy; avoids import cycles with hooks/ module."""
-    return re.sub(r"[^a-zA-Z0-9]+", "-", text.strip()).strip("-").lower() or "project"
-
-
 def scan(vault_path, sessions_folder, insights_folder, days, project=None):
     sess_dir = Path(vault_path) / sessions_folder
     if not sess_dir.is_dir():
