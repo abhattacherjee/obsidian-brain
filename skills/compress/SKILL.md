@@ -93,7 +93,7 @@ try:
     else:
         print(json.dumps({"match": False}))
 except ImportError as e:
-    print(f"Warning: plugin module missing ({e}) — run /dev-test install to apply the rank-gap fix", file=sys.stderr)
+    print(f"Warning: plugin hooks are out of date or missing ({e}) — run /dev-test install", file=sys.stderr)
     print(json.dumps({"match": False}))
 except Exception as e:
     print(f"Warning: could not search vault index: {e}", file=sys.stderr)

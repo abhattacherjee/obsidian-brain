@@ -21,7 +21,7 @@ def test_equal_ranks_rejects():
     """Delta = 0 when top and runner-up have identical ranks.
 
     FTS5 can produce identical rank values for near-identical notes. The
-    strict-> delta gate rejects (0 is never > any positive MIN_RANK_DELTA),
+    strict '>' delta gate rejects (0 is never > any positive MIN_RANK_DELTA),
     so the guard correctly asks the user to choose rather than auto-picking.
     """
     results = [{"rank": -10.0}, {"rank": -10.0}]
