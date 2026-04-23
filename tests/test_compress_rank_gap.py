@@ -19,6 +19,17 @@ def test_empty_results_rejects():
     assert is_high_confidence_match([]) is False
 
 
+def test_equal_ranks_rejects():
+    """Delta = 0 when top and runner-up have identical ranks.
+
+    FTS5 can produce identical rank values for near-identical notes. The
+    strict-> delta gate rejects (0 is never > any positive MIN_RANK_DELTA),
+    so the guard correctly asks the user to choose rather than auto-picking.
+    """
+    results = [{"rank": -10.0}, {"rank": -10.0}]
+    assert is_high_confidence_match(results) is False
+
+
 def test_single_result_matches_when_rank_strong():
     # rank -10 is stronger than min_strength -5.0
     assert is_high_confidence_match([{"rank": -10.0}]) is True
@@ -55,9 +66,12 @@ def test_issue_45_repro_case():
     assert is_high_confidence_match(results) is True
 
 
-def test_weak_top_rank_rejects_even_with_large_delta():
-    # Top rank -3 fails strength gate despite enormous delta to -30
-    results = [{"rank": -3.0}, {"rank": -30.0}]
+def test_weak_top_rank_rejects():
+    # Top rank -3 fails the strength gate. The second element is also weak,
+    # so the list is properly sorted most-negative first. The strength gate
+    # fires before the delta gate is evaluated — no strong #2 is needed to
+    # prove the point.
+    results = [{"rank": -3.0}, {"rank": -4.0}]
     assert is_high_confidence_match(results) is False
 
 

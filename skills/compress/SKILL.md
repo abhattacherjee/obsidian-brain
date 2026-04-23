@@ -73,12 +73,12 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os, json
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
-from vault_index import ensure_index, search_vault
-from obsidian_utils import load_config
-# Pure predicate: top rank must pass absolute-strength gate AND |top|-|#2| delta gate.
-# MIN_RANK_DELTA tuned against scripts/compress_rank_gap_corpus.json (issue #45).
-from compress_guard import is_high_confidence_match
 try:
+    from vault_index import ensure_index, search_vault
+    from obsidian_utils import load_config
+    # Pure predicate: top rank must pass absolute-strength gate AND |top|-|#2| delta gate.
+    # MIN_RANK_DELTA tuned against scripts/compress_rank_gap_corpus.json (issue #45).
+    from compress_guard import is_high_confidence_match
     c = load_config()
     vp = c["vault_path"]
     folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
@@ -92,6 +92,9 @@ try:
         print(json.dumps({"match": True, "path": top["path"], "title": top["title"], "date": top["date"], "tags": top["tags"], "rank": top["rank"]}))
     else:
         print(json.dumps({"match": False}))
+except ImportError as e:
+    print(f"Warning: plugin module missing ({e}) — run /dev-test install to apply the rank-gap fix", file=sys.stderr)
+    print(json.dumps({"match": False}))
 except Exception as e:
     print(f"Warning: could not search vault index: {e}", file=sys.stderr)
     print(json.dumps({"match": False}))

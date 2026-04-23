@@ -115,10 +115,17 @@ def main():
         else:
             print(f"| {entry['id']} | `{entry['query']}` | {top_rank:.2f} | — | — | {entry['expected_match']} |")
 
+    # All-empty diagnostic (before sweep so the user sees it)
+    total_skipped = sum(1 for r in results_by_id.values() if not r)
+    if total_skipped == len(entries):
+        print("\nWARN: All corpus queries returned no results from the vault.")
+        print("      Check that vault_path is correct and the index is populated.")
+        print("      Run /vault-reindex if the index needs a rebuild.\n")
+
     # Sweep thresholds
     print("\n## Threshold sweep\n")
-    print("| MIN_RANK_DELTA | TP | TN | FP | FN | score (TP+TN)/total | repro #45 |")
-    print("|---|---|---|---|---|---|---|")
+    print("| MIN_RANK_DELTA | TP | TN | FP | FN | skipped | score (TP+TN)/total | repro #45 |")
+    print("|---|---|---|---|---|---|---|---|")
     repro_results = results_by_id.get("replay-pr43-snapshot", [])
     for t in THRESHOLD_GRID:
         score = _score_corpus(entries, results_by_id, min_delta=t)
@@ -133,7 +140,7 @@ def main():
             repro_pass = "skipped"
         print(
             f"| {t:.2f} | {score['tp']} | {score['tn']} | {score['fp']} | {score['fn']} | "
-            f"{ratio:.2f} | {repro_pass} |"
+            f"{score['skipped']} | {ratio:.2f} | {repro_pass} |"
         )
 
     print("\n## Selection guidance\n")
