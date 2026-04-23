@@ -761,9 +761,16 @@ def test_missing_backlink_cross_midnight_uses_session_id_index(tmp_path):
     sid = "cross-midnight-sid"
     hash4 = _h.sha256(sid.encode()).hexdigest()[:4]
 
-    # Parent session — dated the day AFTER the snapshot
+    # Parent session — dated the day AFTER the snapshot. Written inline
+    # (not via _write_session helper) so the frontmatter date matches
+    # the filename date — keeps this cross-midnight fixture internally
+    # consistent and self-documenting.
     parent_stem = f"2026-04-10-demo-{hash4}"
-    _write_session(sess / f"{parent_stem}.md", session_id=sid)
+    (sess / f"{parent_stem}.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-10\nsession_id: {sid}\n"
+        "project: demo\nstatus: summarized\n---\n\n# S\n",
+        encoding="utf-8",
+    )
 
     # Snapshot — dated the day BEFORE its parent session (cross-midnight)
     snap = sess / f"2026-04-09-demo-{hash4}-snapshot-235959.md"
