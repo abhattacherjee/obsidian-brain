@@ -296,7 +296,9 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     load_manifest_section = _section("OB_LOAD_MANIFEST")
     most_recent_path = _section("OB_MOST_RECENT_SESSION_PATH").strip()
 
-    # Nested snapshot row: `↳ HH:MM:SS` (currently rendered inside a table cell).
+    # Nested snapshot row: `↳ HH:MM:SS`. Rendered inside a markdown table
+    # cell by obsidian_utils.build_context_brief (`|   | ↳ {hhmmss} | ...`),
+    # so no `^` line anchor — the glyph sits mid-cell after `|   | `.
     assert re.search(r"↳ \d{2}:\d{2}:\d{2}\b", context_brief_section), (
         f"expected nested snapshot row `↳ HH:MM:SS` in context brief:\n"
         f"{context_brief_section[:2000]}"
@@ -306,10 +308,10 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
         f"expected `snapshot_count: 1` in LOAD_MANIFEST:\n{load_manifest_section}"
     )
 
-    # At least one `snapshot:` line. The line format is
-    # `snapshot: [HHMMSS] (<trigger>) <summary>` — so match on the HHMMSS
-    # tail of the snapshot stem (the only part of the stem guaranteed to
-    # appear on the line).
+    # At least one `snapshot:` line. Producer emits
+    # `snapshot: [{hhmmss}] ({trigger}) {summary}` in build_context_brief's
+    # LOAD_MANIFEST composition — the full filename stem never appears on
+    # the line, only the HHMMSS tail. Match on that unique substring.
     stem_hhmmss_match = re.search(r"-snapshot-(\d{6})$", snapshot_path.stem)
     assert stem_hhmmss_match, (
         f"snapshot stem missing trailing -snapshot-HHMMSS: {snapshot_path.stem}"
