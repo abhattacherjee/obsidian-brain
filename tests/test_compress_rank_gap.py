@@ -36,7 +36,9 @@ def test_delta_above_threshold_matches():
 
 
 def test_delta_below_threshold_rejects():
-    # delta = |−29| − |−28.9| = 0.1, below any viable MIN_RANK_DELTA regardless of tuning
+    # delta ≈ 0.1 (|-29| - |-28.9| = 0.1000...142 due to IEEE 754);
+    # below the current THRESHOLD_GRID minimum of 0.25, so this case
+    # rejects at every grid-selectable MIN_RANK_DELTA.
     results = [{"rank": -29.0}, {"rank": -28.9}]
     assert is_high_confidence_match(results) is False
 
