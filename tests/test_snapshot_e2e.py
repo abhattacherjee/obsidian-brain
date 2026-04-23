@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+import obsidian_utils  # conftest.py inserts hooks/ onto sys.path
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOK_SNAPSHOT = REPO_ROOT / "hooks" / "obsidian_context_snapshot.py"
 HOOK_SESSION_LOG = REPO_ROOT / "hooks" / "obsidian_session_log.py"
@@ -206,4 +208,17 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     # Look for the YAML key itself.
     assert re.search(r"^snapshots:", session_text, re.MULTILINE), (
         "session note frontmatter missing `snapshots:` YAML key"
+    )
+
+    # --- Stage 3: find_unsummarized_notes returns both session + snapshot ---
+    result = json.loads(
+        obsidian_utils.find_unsummarized_notes(
+            str(vault), "claude-sessions", PROJECT
+        )
+    )
+    assert result["auto_fixed"] == 0, (
+        f"unexpected auto-fix on fresh notes: {result}"
+    )
+    assert set(result["unsummarized"]) == {str(session_path), str(snapshot_path)}, (
+        f"unexpected unsummarized set: {result['unsummarized']}"
     )
