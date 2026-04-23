@@ -6,8 +6,6 @@ directly — no FTS5 fixture needed since the predicate takes a pre-sorted
 results list.
 """
 
-import pytest
-
 from compress_guard import (
     MIN_RANK_DELTA,
     MIN_RANK_STRENGTH,

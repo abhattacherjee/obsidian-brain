@@ -6,9 +6,10 @@ than shelling out through the SKILL.md embedded block.
 
 MIN_RANK_DELTA is empirically tuned against scripts/compress_rank_gap_corpus.json.
 Hard constraint: must be < 4.75 so the issue #45 repro case (top -29.46,
-runner-up -24.71) resolves to match: True. See the spec at
-docs/superpowers/specs/2026-04-23-compress-rank-gap-delta-guard-design.md
-for the full tuning protocol.
+runner-up -24.71) resolves to match: True. The full tuning protocol lives
+in the external spec-docs repository at
+superpowers/specs/2026-04-23-compress-rank-gap-delta-guard-design.md
+(github.com/abhattacherjee/spec-docs).
 """
 
 MIN_RANK_STRENGTH = -5.0  # top result's FTS5 rank must be <= this (stronger = more negative)
