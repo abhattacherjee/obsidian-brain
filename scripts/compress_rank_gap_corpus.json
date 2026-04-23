@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "created": "2026-04-23",
+  "description": "Tuning corpus for /compress Step 3.5 rank-gap guard (issue #45). Seeded with the original repro case and a wide-gap synthetic; expanded by scripts/tune_compress_rank_gap.py consumers and via replay mining (see spec tuning protocol).",
+  "queries": [
+    {
+      "id": "replay-pr43-snapshot",
+      "query": "PR 43 snapshot dev-test smoke results",
+      "source": "replay",
+      "expected_match": true,
+      "note": "Original issue #45 repro case — top -29.46, runner-up -24.71, delta 4.75. Threshold >= 4.75 fails to fix the bug."
+    },
+    {
+      "id": "synthetic-single-strong",
+      "query": "snapshot summary integration PR 43",
+      "source": "synthetic",
+      "expected_match": true,
+      "note": "Narrow query with a single strong match. Serves as sanity check that the strength gate alone (no runner-up) still admits obvious matches."
+    }
+  ]
+}
