@@ -1,13 +1,15 @@
 """End-to-end integration test for the snapshot → /recall pipeline (issue #50).
 
 Exercises the full 5-step cycle with real hook subprocess invocations and
-in-process obsidian_utils calls. Under 1s wall time. CI-required.
+in-process obsidian_utils calls. CI-required.
 
 Pipeline:
     1. obsidian_context_snapshot.py (subprocess) → snapshot note on disk
     2. obsidian_session_log.py     (subprocess) → session note with `snapshots:` back-ref
-    3. find_unsummarized_notes()   (in-proc)   → both session + snapshot returned
+    3. find_unsummarized_notes()   (in-proc)   → [snapshot, session] in bias-sorted order
     4. upgrade_unsummarized_note() (in-proc, Haiku monkeypatched) → status: summarized
+       (exercised for BOTH session and snapshot to cover the generate_summary
+       vs generate_snapshot_summary dispatch in upgrade_unsummarized_note)
     5. build_context_brief()       (in-proc)   → nested `↳ HH:MM:SS` row + snapshot_count: 1
 """
 
@@ -65,7 +67,7 @@ def _write_transcript(home_dir: Path, slug: str) -> Path:
         {"type": "user", "message": {"content": "Looks good — ship it."}},
     ]
     transcript.write_text(
-        "\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8"
+        "\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8"
     )
     return transcript
 
@@ -73,9 +75,13 @@ def _write_transcript(home_dir: Path, slug: str) -> Path:
 def _write_path_shim(bin_dir: Path) -> Path:
     """Write a `claude` PATH shim emitting a canned summary on any call.
 
-    Defense-in-depth only: neither production hook calls `claude -p`
-    (summarization is deferred to /recall). If that ever regresses, this
-    keeps the test hermetic.
+    Defense-in-depth for **hook subprocesses**: neither production hook calls
+    `claude -p` (summarization is deferred to /recall), so this shim is never
+    hit in the hot path — but if a hook ever regresses to shelling out, this
+    keeps the subprocess leg hermetic. In-process `claude -p` calls made by
+    obsidian_utils (e.g. inside `upgrade_unsummarized_note`) are intercepted
+    separately by the monkeypatch on `obsidian_utils.subprocess.run` installed
+    in Stage 4 — not by this shim.
     """
     bin_dir.mkdir(parents=True, exist_ok=True)
     shim = bin_dir / "claude"
@@ -106,7 +112,13 @@ def _write_path_shim(bin_dir: Path) -> Path:
 
 
 def _hook_env(tmp_path: Path) -> dict:
-    """Env dict for subprocess hook invocations — HOME + PATH sandboxed."""
+    """Env dict for subprocess hook invocations.
+
+    Sandboxes HOME (config lookups, `~/.claude/projects/` transcript search,
+    default vault DB path all route into `tmp_path/home`), prepends the
+    `tmp_path/bin` PATH shim, and sets PYTHONPATH so the hook can import the
+    in-tree `obsidian_utils`.
+    """
     env = os.environ.copy()
     env["HOME"] = str(tmp_path / "home")
     env["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{env.get('PATH', '')}"
@@ -162,7 +174,7 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     snapshot_text = snapshot_path.read_text(encoding="utf-8")
     assert "type: claude-snapshot" in snapshot_text
     assert f"session_id: {SID}" in snapshot_text
-    assert f"project: {PROJECT}" in snapshot_text or PROJECT in snapshot_text
+    assert f"project: {PROJECT}" in snapshot_text
     assert "status: auto-logged" in snapshot_text
     assert "trigger: compact" in snapshot_text
     assert "# Context Snapshot:" in snapshot_text
@@ -199,15 +211,21 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     assert f"session_id: {SID}" in session_text
     assert "status: auto-logged" in session_text
 
-    # Back-reference check: the session note's frontmatter must list the
-    # snapshot via a wikilink under `snapshots:`.
+    # Back-reference check: the snapshot wikilink must live INSIDE the
+    # session note's frontmatter `snapshots:` YAML list — not merely somewhere
+    # in the body (which would slip past if, e.g., the wikilink leaked into a
+    # rendered summary while the YAML list was silently emptied).
+    fm_end = session_text.index("\n---", 3)
+    frontmatter = session_text[:fm_end]
     snapshot_stem = snapshot_path.stem
-    assert f"[[{snapshot_stem}]]" in session_text, (
-        f"session note missing snapshot back-ref [[{snapshot_stem}]]:\n{session_text[:2000]}"
-    )
-    # Look for the YAML key itself.
-    assert re.search(r"^snapshots:", session_text, re.MULTILINE), (
+    assert re.search(r"^snapshots:", frontmatter, re.MULTILINE), (
         "session note frontmatter missing `snapshots:` YAML key"
+    )
+    # Producer format at hooks/obsidian_session_log.py:97-98 is
+    # `  - "[[<stem>]]"` (two-space indent, hyphen, quoted wikilink).
+    assert f'  - "[[{snapshot_stem}]]"' in frontmatter, (
+        f'expected `  - "[[{snapshot_stem}]]"` under `snapshots:` in '
+        f"frontmatter:\n{frontmatter}"
     )
 
     # --- Stage 3: find_unsummarized_notes returns both session + snapshot ---
@@ -219,8 +237,13 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     assert result["auto_fixed"] == 0, (
         f"unexpected auto-fix on fresh notes: {result}"
     )
-    assert set(result["unsummarized"]) == {str(session_path), str(snapshot_path)}, (
-        f"unexpected unsummarized set: {result['unsummarized']}"
+    # Order is load-bearing for /recall cohesion: snapshots sort before their
+    # parent session in a session_id group so /recall presents chronologically
+    # correct context. The reverse alphabetical sort in find_unsummarized_notes
+    # achieves this because `-snapshot-HHMMSS.md` sorts LATER than `.md` and
+    # reverse=True flips them to snapshot-first.
+    assert result["unsummarized"] == [str(snapshot_path), str(session_path)], (
+        f"expected [snapshot, session] order, got: {result['unsummarized']}"
     )
 
     # --- Stage 4: upgrade_unsummarized_note (Haiku monkeypatched) ---
@@ -276,6 +299,22 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
         "expected non-empty `## Summary` section after upgrade"
     )
 
+    # Also upgrade the SNAPSHOT note. upgrade_unsummarized_note dispatches
+    # snapshots through generate_snapshot_summary (a distinct code path from
+    # the generate_summary used for sessions above). Without this, the
+    # snapshot-type routing branch is never exercised by the E2E test.
+    snap_status = obsidian_utils.upgrade_unsummarized_note(
+        str(snapshot_path), str(vault), "claude-sessions", PROJECT
+    )
+    assert snap_status.startswith("Upgraded "), (
+        f"upgrade_unsummarized_note on snapshot did not succeed: {snap_status!r}"
+    )
+    snapshot_text_after = snapshot_path.read_text(encoding="utf-8")
+    assert "status: summarized" in snapshot_text_after, (
+        f"expected snapshot `status: summarized` after upgrade, got:\n"
+        f"{snapshot_text_after[:2000]}"
+    )
+
     # --- Stage 5: build_context_brief nested row + snapshot_count ---
     brief = obsidian_utils.build_context_brief(
         str(vault), "claude-sessions", "claude-insights", PROJECT,
@@ -296,11 +335,24 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     load_manifest_section = _section("OB_LOAD_MANIFEST")
     most_recent_path = _section("OB_MOST_RECENT_SESSION_PATH").strip()
 
-    # Nested snapshot row: `↳ HH:MM:SS`. Rendered inside a markdown table
-    # cell by obsidian_utils.build_context_brief (`|   | ↳ {hhmmss} | ...`),
-    # so no `^` line anchor — the glyph sits mid-cell after `|   | `.
-    assert re.search(r"↳ \d{2}:\d{2}:\d{2}\b", context_brief_section), (
-        f"expected nested snapshot row `↳ HH:MM:SS` in context brief:\n"
+    # Extract the 6-digit HHMMSS tail from our snapshot's stem. The same
+    # value is used both (a) to match the nested `↳ HH:MM:SS` row in the
+    # context-brief table and (b) to match the `snapshot: [HHMMSS]` line in
+    # LOAD_MANIFEST. Tying both assertions to the SAME stem-derived value
+    # catches cross-session contamination that a shape-only regex would miss.
+    stem_hhmmss_match = re.search(r"-snapshot-(\d{6})$", snapshot_path.stem)
+    assert stem_hhmmss_match, (
+        f"snapshot stem missing trailing -snapshot-HHMMSS: {snapshot_path.stem}"
+    )
+    hhmmss = stem_hhmmss_match.group(1)  # e.g. "075610"
+    hhmmss_pretty = f"{hhmmss[:2]}:{hhmmss[2:4]}:{hhmmss[4:6]}"  # "07:56:10"
+
+    # Nested snapshot row: exact `↳ HH:MM:SS` match against OUR snapshot's
+    # timestamp. Rendered inside a markdown table cell at
+    # obsidian_utils.py:1881 (`|   | ↳ {hhmmss_pretty} | ...`), so the glyph
+    # sits mid-cell after `|   | ` — no `^` line anchor.
+    assert f"↳ {hhmmss_pretty}" in context_brief_section, (
+        f"expected nested snapshot row `↳ {hhmmss_pretty}` in context brief:\n"
         f"{context_brief_section[:2000]}"
     )
 
@@ -308,15 +360,10 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
         f"expected `snapshot_count: 1` in LOAD_MANIFEST:\n{load_manifest_section}"
     )
 
-    # At least one `snapshot:` line. Producer emits
+    # Producer at obsidian_utils.py:2091 emits
     # `snapshot: [{hhmmss}] ({trigger}) {summary}` in build_context_brief's
     # LOAD_MANIFEST composition — the full filename stem never appears on
     # the line, only the HHMMSS tail. Match on that unique substring.
-    stem_hhmmss_match = re.search(r"-snapshot-(\d{6})$", snapshot_path.stem)
-    assert stem_hhmmss_match, (
-        f"snapshot stem missing trailing -snapshot-HHMMSS: {snapshot_path.stem}"
-    )
-    hhmmss = stem_hhmmss_match.group(1)
     assert re.search(
         rf"^snapshot:\s*\[{hhmmss}\]",
         load_manifest_section,
