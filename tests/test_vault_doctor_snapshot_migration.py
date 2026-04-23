@@ -101,6 +101,14 @@ def test_missing_backlink_populates_source_session_note(tmp_path):
 
 
 def test_missing_backlink_unresolved_when_parent_absent(tmp_path):
+    """Orphan snapshot (no session note matches session_id) -> unresolved.
+
+    Post-#68, the orphan branch emits confidence=0.0 with empty
+    proposed_source — no speculative wikilink fabricated from
+    (date, slug, sid_hash). The assertion set here (len==1 and
+    unresolved=True) holds for both the old and new behavior; this
+    docstring documents the tighter post-fix semantics.
+    """
     sess = tmp_path / "claude-sessions"; sess.mkdir()
     p = sess / "2026-04-18-demo-zz-snapshot-110000.md"
     p.write_text(
@@ -112,6 +120,9 @@ def test_missing_backlink_unresolved_when_parent_absent(tmp_path):
     miss = [i for i in issues if i.check == "snapshot-missing-backlink"]
     assert len(miss) == 1
     assert miss[0].extra.get("unresolved")
+    assert miss[0].proposed_source == ""
+    assert miss[0].confidence == 0.0
+    assert "parent session not found" in miss[0].reason
 
 
 def test_session_missing_snapshots_list_is_backfilled(tmp_path):
