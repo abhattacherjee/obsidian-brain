@@ -156,6 +156,11 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
         # confidently-wrong fix would be proposed. The sid is included in
         # the reason verbatim so operators can grep the vault.
         if sid in _sid_collisions:
+            # confidence=0.0 (vs 0.9 for the missing-parent branch below):
+            # collision means we have *more* candidate parents than we can
+            # choose between, so classifier confidence is strictly lower
+            # than when zero candidates exist. Consumers switch on
+            # extra["unresolved"], so this is operator-facing signal only.
             issues.append(Issue(
                 check="snapshot-orphan",
                 note_path=snap["path"],
