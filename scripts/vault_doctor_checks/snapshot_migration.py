@@ -15,7 +15,6 @@ filenames still resolve after migration.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import os
 import re
 import shutil
@@ -71,15 +70,6 @@ def _legacy_filename(p: Path) -> bool:
 def _hhmmss_from_mtime(p: Path) -> str:
     ts = p.stat().st_mtime
     return datetime.datetime.fromtimestamp(ts).strftime("%H%M%S")
-
-
-def _short_session_hash(session_id: str) -> str:
-    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:4] if session_id else "e3b0"
-
-
-def _slugify(text: str) -> str:
-    """Minimal inline copy; avoids import cycles with hooks/ module."""
-    return re.sub(r"[^a-zA-Z0-9]+", "-", text.strip()).strip("-").lower() or "project"
 
 
 def scan(vault_path, sessions_folder, insights_folder, days, project=None):
@@ -159,32 +149,52 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
         if "source_session_note" in fm and fm["source_session_note"]:
             continue
         sid = fm.get("session_id", "")
-        date = fm.get("date", "")
         proj = fm.get("project", "")
-        if not sid or not date or not proj:
+        if not sid or not proj:
+            missing = []
+            if not sid:
+                missing.append("session_id")
+            if not proj:
+                missing.append("project")
             issues.append(Issue(
                 check="snapshot-missing-backlink",
                 note_path=str(p),
                 project=proj,
                 current_source="(no source_session_note)",
                 proposed_source="",
-                reason="cannot compute parent stem (missing session_id/date/project)",
+                reason=f"cannot resolve parent (missing frontmatter: {', '.join(missing)})",
                 confidence=0.0,
                 extra={"unresolved": True},
             ))
             continue
-        parent_stem = f"{date}-{_slugify(proj)}-{_short_session_hash(sid)}"
-        parent_exists = (sess_dir / f"{parent_stem}.md").exists()
+        parent_path = sessions_by_id.get(sid)
+        if parent_path is None:
+            # Orphan — no session note with matching session_id in the
+            # sessions folder (sessions_by_id is built from sess_dir only,
+            # non-recursive). Let a future snapshot-orphan check own this
+            # case; do NOT fabricate a wikilink from (date, slug,
+            # sid_hash) — that is exactly the bug #68 fixed.
+            issues.append(Issue(
+                check="snapshot-missing-backlink",
+                note_path=str(p),
+                project=proj,
+                current_source="(no source_session_note)",
+                proposed_source="",
+                reason=f"parent session not found — no session note with session_id={sid!r} in sessions folder",
+                confidence=0.0,
+                extra={"unresolved": True},
+            ))
+            continue
+        parent_stem = parent_path.stem
         issues.append(Issue(
             check="snapshot-missing-backlink",
             note_path=str(p),
             project=proj,
             current_source="(no source_session_note)",
             proposed_source=f'source_session_note: "[[{parent_stem}]]"',
-            reason=("parent session found" if parent_exists else
-                    "parent session not found — will warn only"),
-            confidence=0.95 if parent_exists else 0.3,
-            extra={"unresolved": not parent_exists, "parent_stem": parent_stem},
+            reason="parent session resolved via session_id index",
+            confidence=0.95,
+            extra={"unresolved": False, "parent_stem": parent_stem},
         ))
 
     # 4. session-missing-snapshots-list
