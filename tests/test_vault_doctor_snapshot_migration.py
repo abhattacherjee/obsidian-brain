@@ -843,3 +843,127 @@ def test_missing_backlink_cross_midnight_uses_session_id_index(tmp_path):
     snapshot_migration.apply(miss, str(tmp_path / "backup"))
     text = snap.read_text(encoding="utf-8")
     assert f'source_session_note: "[[{parent_stem}]]"' in text
+
+
+# ----- Issue #81: duplicate-sid collision tests (TDD-red for Task 2) -----
+
+
+def test_missing_backlink_ambiguous_when_duplicate_session_ids(tmp_path):
+    """Issue #81: two sessions share the same session_id -> snapshot backlink is ambiguous.
+
+    Post-#68, §3 resolves the parent via ``sessions_by_id`` (a plain
+    last-write-wins dict). When two session notes carry the same sid,
+    the dict silently picks one and the §3 writer produces a
+    confidently-wrong ``source_session_note`` wikilink.
+
+    The fix: scan() must detect sid collisions at index-build time and
+    emit an UNRESOLVED Issue for snapshots whose sid lives in the
+    collision set — never a speculative wikilink. Reason string must
+    contain both "ambiguous" (human-readable marker) and the full sid
+    (greppable by operators).
+
+    This test is TDD-RED on current develop — it drives the Task 2 fix.
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    sid = "11111111-2222-3333-4444-555555555555"
+    # Two sessions sharing the same session_id on different dates.
+    # Write them directly (not via _write_session) so filename date
+    # matches frontmatter date per PR #80 review guidance.
+    (sess / "2026-04-15-demo-first.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-15\nsession_id: {sid}\n"
+        "project: demo\nstatus: summarized\n---\n\n# S1\n",
+        encoding="utf-8",
+    )
+    (sess / "2026-04-18-demo-second.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-18\nsession_id: {sid}\n"
+        "project: demo\nstatus: summarized\n---\n\n# S2\n",
+        encoding="utf-8",
+    )
+    # Snapshot missing source_session_note (the §3 trigger) with the colliding sid.
+    snap = sess / "2026-04-18-demo-snap-120000.md"
+    snap.write_text(
+        f"---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: {sid}\n"
+        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650,
+    )
+    miss = [i for i in issues if i.check == "snapshot-missing-backlink"]
+    assert len(miss) == 1, f"expected exactly one snapshot-missing-backlink, got {miss}"
+    assert miss[0].extra.get("unresolved") is True, (
+        f"duplicate-sid snapshot must be unresolved, got extra={miss[0].extra}"
+    )
+    assert miss[0].proposed_source == "", (
+        f"must not fabricate a wikilink for ambiguous parent, got proposed_source={miss[0].proposed_source!r}"
+    )
+    assert miss[0].confidence == 0.0, (
+        f"ambiguous parent must have confidence=0.0, got {miss[0].confidence}"
+    )
+    assert "ambiguous" in miss[0].reason, (
+        f"reason must contain 'ambiguous', got: {miss[0].reason!r}"
+    )
+    assert sid in miss[0].reason, (
+        f"reason must contain the full sid {sid!r} for grep, got: {miss[0].reason!r}"
+    )
+
+    # §4 must NOT emit a session-missing-snapshots-list for the colliding sid
+    # (neither session can be declared the authoritative parent).
+    sess_miss = [i for i in issues if i.check == "session-missing-snapshots-list"]
+    for issue in sess_miss:
+        # If §4 fires, it must not be for either of the two colliding sessions.
+        assert not issue.note_path.endswith("2026-04-15-demo-first.md"), (
+            f"§4 must not emit for a colliding-sid session, got: {issue}"
+        )
+        assert not issue.note_path.endswith("2026-04-18-demo-second.md"), (
+            f"§4 must not emit for a colliding-sid session, got: {issue}"
+        )
+
+
+def test_missing_backlink_two_snapshots_sharing_session_id_both_resolve(tmp_path):
+    """Regression guard: two snapshots for ONE session (non-colliding) both backlink.
+
+    Simulates two PreCompact fires within a single session. The sid
+    points at a UNIQUE session (no collision) and both snapshots must
+    resolve via ``sessions_by_id`` with confidence 0.95.
+
+    This test must PASS on current develop — the Task 2 fix must not
+    regress it.
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    sid = "unique-session-id-xyz"
+    parent_stem = "2026-04-18-demo-multi"
+    (sess / f"{parent_stem}.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-18\nsession_id: {sid}\n"
+        "project: demo\nstatus: summarized\n---\n\n# S\n",
+        encoding="utf-8",
+    )
+    snap_a = sess / "2026-04-18-demo-multi-snap-100000.md"
+    snap_a.write_text(
+        f"---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: {sid}\n"
+        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# Snap A\n",
+        encoding="utf-8",
+    )
+    snap_b = sess / "2026-04-18-demo-multi-snap-140000.md"
+    snap_b.write_text(
+        f"---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: {sid}\n"
+        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# Snap B\n",
+        encoding="utf-8",
+    )
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650,
+    )
+    miss = [i for i in issues if i.check == "snapshot-missing-backlink"]
+    assert len(miss) == 2, (
+        f"expected two snapshot-missing-backlink (one per snapshot), got {len(miss)}: {miss}"
+    )
+    for issue in miss:
+        assert issue.extra.get("unresolved") is False, (
+            f"non-colliding sid must resolve, got extra={issue.extra}"
+        )
+        assert issue.extra.get("parent_stem") == parent_stem, (
+            f"parent_stem must be {parent_stem!r}, got {issue.extra.get('parent_stem')!r}"
+        )
+        assert issue.confidence == 0.95, (
+            f"non-colliding resolution must have confidence=0.95, got {issue.confidence}"
+        )

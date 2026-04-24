@@ -574,3 +574,73 @@ def test_stale_apply_handles_unquoted_yaml_list_items(tmp_path):
     assert stale_stem not in fm
     # Live entry preserved
     assert "2026-04-18-demo-uu-snapshot-100000" in fm
+
+
+# ----- Issue #81: duplicate-sid collision tests (TDD-red for Task 2) -----
+
+
+def test_snapshot_broken_backlink_ambiguous_when_duplicate_session_ids(tmp_path):
+    """Issue #81: colliding session_ids must route the snapshot to
+    snapshot-orphan (unresolved), not snapshot-broken-backlink.
+
+    ``sessions_by_id`` in snapshot_integrity.scan is a plain
+    last-write-wins dict (lines ~108-127). When two sessions share a
+    sid, the dict silently picks one — so a snapshot's existing
+    ``source_session_note`` gets compared against an arbitrary winner
+    and may be declared "broken" with a confident fix suggestion that
+    is wrong. The Task 2 fix must treat colliding sids as ambiguous
+    orphans and never emit a snapshot-broken-backlink for them.
+
+    This test is TDD-RED on current develop — it drives the fix.
+    """
+    vault = tmp_path
+    sess = vault / "claude-sessions"; sess.mkdir()
+    sid = "11111111-2222-3333-4444-555555555555"
+    # Two sessions sharing the same session_id on different dates.
+    (sess / "2026-04-15-demo-first.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-15\nsession_id: {sid}\n"
+        "project: demo\nstatus: summarized\n---\n\n# S1\n",
+        encoding="utf-8",
+    )
+    (sess / "2026-04-18-demo-second.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-18\nsession_id: {sid}\n"
+        "project: demo\nstatus: summarized\n---\n\n# S2\n",
+        encoding="utf-8",
+    )
+    # Snapshot with source_session_note pointing at "something-that-could-match-either".
+    snap = sess / "2026-04-18-demo-snap-120000.md"
+    snap.write_text(
+        f"---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: {sid}\n"
+        f'project: demo\ntrigger: compact\nstatus: summarized\n'
+        f'source_session_note: "[[something-that-could-match-either]]"\n---\n\n# Snap\n\n'
+        "## Summary\nbody\n",
+        encoding="utf-8",
+    )
+    issues = snapshot_integrity.scan(
+        str(vault), "claude-sessions", "claude-insights", 30,
+    )
+    # Filter to issues for THIS snapshot (ignore session-list issues etc.)
+    snap_issues = [i for i in issues if i.note_path == str(snap)]
+    assert len(snap_issues) == 1, (
+        f"expected exactly one issue for the colliding snapshot, got {snap_issues}"
+    )
+    issue = snap_issues[0]
+    assert issue.check == "snapshot-orphan", (
+        f"colliding-sid snapshot must route to snapshot-orphan, got check={issue.check!r}"
+    )
+    assert issue.extra.get("unresolved") is True, (
+        f"ambiguous parent must be unresolved, got extra={issue.extra}"
+    )
+    assert "ambiguous" in issue.reason, (
+        f"reason must contain 'ambiguous', got: {issue.reason!r}"
+    )
+    assert sid in issue.reason, (
+        f"reason must contain the full sid {sid!r} for grep, got: {issue.reason!r}"
+    )
+    # Absolutely no snapshot-broken-backlink for this snapshot (would suggest
+    # a confidently-wrong parent).
+    broken = [i for i in issues
+              if i.check == "snapshot-broken-backlink" and i.note_path == str(snap)]
+    assert broken == [], (
+        f"colliding sid must NOT produce snapshot-broken-backlink, got: {broken}"
+    )
