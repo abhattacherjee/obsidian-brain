@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `/compress` Step 3.5 rank-gap guard no longer rejects legitimate same-topic peer matches. Replaced the 1.5× ratio test with a delta-score test (`|top.rank| - |#2.rank| > MIN_RANK_DELTA`) that scales with rank magnitude, so multi-phase PRs and iterative features no longer silently duplicate instead of prompting for an update. `MIN_RANK_DELTA` tuned empirically against `scripts/compress_rank_gap_corpus.json`; chosen value lives in `hooks/compress_guard.py`. Closes #45.
 - `/recall` Step 4 N=1 checkoff branch no longer hits `AskUserQuestion` `minItems=2` validation errors. Single candidates now route to the verbatim text fallback; the `2 ≤ N ≤ 4` picker branch gains an explicit "Skip all — don't check off anything" sentinel option so deferral is a visible selectable choice. Closes #78.
+- `vault-doctor` `snapshot-migration` §3 (`snapshot-missing-backlink`) now resolves the parent session note via the `session_id` index built in the same scan, instead of composing a filename from `(snapshot.date, project, sha256(session_id)[:4])`. The old date-heuristic wrote wrong `source_session_note` wikilinks for cross-midnight sessions (PreCompact on day N, SessionEnd on day N+1). Orphan snapshots now emit `unresolved=True` with no speculative wikilink. Closes #68.
 
 ## [2.4.1] - 2026-04-22
 
