@@ -56,11 +56,17 @@ def _write_config(home_dir: Path, vault_path: Path) -> Path:
     return cfg_path
 
 
-def _write_transcript(home_dir: Path, slug: str) -> Path:
-    """Write a 3-line JSONL transcript fixture under ~/.claude/projects/<slug>/."""
+def _write_transcript(home_dir: Path, slug: str, session_id: str) -> Path:
+    """Write a 3-line JSONL transcript fixture under ~/.claude/projects/<slug>/.
+
+    Filename is `{session_id}.jsonl` so that `find_transcript_jsonl()` (which
+    globs for `{session_id}.jsonl` under `~/.claude/projects/**/`) discovers
+    the fixture and `upgrade_unsummarized_note()` exercises the JSONL source
+    branch instead of falling through to the raw-note fallback.
+    """
     proj_dir = home_dir / ".claude" / "projects" / slug
     proj_dir.mkdir(parents=True, exist_ok=True)
-    transcript = proj_dir / "t.jsonl"
+    transcript = proj_dir / f"{session_id}.jsonl"
     lines = [
         {"type": "user", "message": {"content": "Fix the snapshot pipeline."}},
         {"type": "assistant", "message": {"content": "Writing the test now."}},
@@ -139,7 +145,7 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
 
     home = tmp_path / "home"
     _write_config(home, vault)
-    transcript = _write_transcript(home, SLUG)
+    transcript = _write_transcript(home, SLUG, SID)
     _write_path_shim(tmp_path / "bin")
 
     # Redirect HOME for in-process calls so any indirect Path.home() lookup
@@ -237,11 +243,13 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     assert result["auto_fixed"] == 0, (
         f"unexpected auto-fix on fresh notes: {result}"
     )
-    # Order is load-bearing for /recall cohesion: snapshots sort before their
-    # parent session in a session_id group so /recall presents chronologically
-    # correct context. The reverse alphabetical sort in find_unsummarized_notes
-    # achieves this because `-snapshot-HHMMSS.md` sorts LATER than `.md` and
-    # reverse=True flips them to snapshot-first.
+    # Order is load-bearing for /recall cohesion: snapshots must sort before
+    # their parent session within the same session_id group so /recall
+    # presents chronologically correct context. find_unsummarized_notes
+    # enforces that via an explicit type-bias key (see obsidian_utils.py
+    # `_bias_key` at lines 1682-1699 — snapshots get rank 0, sessions rank 1
+    # within a session_id group), NOT via a reverse-lexicographic filename
+    # trick on the outer sort.
     assert result["unsummarized"] == [str(snapshot_path), str(session_path)], (
         f"expected [snapshot, session] order, got: {result['unsummarized']}"
     )
@@ -347,31 +355,53 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     hhmmss = stem_hhmmss_match.group(1)  # e.g. "075610"
     hhmmss_pretty = f"{hhmmss[:2]}:{hhmmss[2:4]}:{hhmmss[4:6]}"  # "07:56:10"
 
-    # Nested snapshot row: exact `↳ HH:MM:SS` match against OUR snapshot's
-    # timestamp. Rendered inside a markdown table cell at
-    # obsidian_utils.py:1881 (`|   | ↳ {hhmmss_pretty} | ...`), so the glyph
-    # sits mid-cell after `|   | ` — no `^` line anchor.
-    assert f"↳ {hhmmss_pretty}" in context_brief_section, (
-        f"expected nested snapshot row `↳ {hhmmss_pretty}` in context brief:\n"
-        f"{context_brief_section[:2000]}"
-    )
+    # Cross-midnight guard: build_context_brief() looks up snapshots via
+    # fetch_snapshot_summaries(note_date), which in turn calls
+    # find_snapshots_for_session() to glob `{date}-{slug}-*-snapshot*.md`.
+    # If Stage 1 (snapshot hook) and Stage 2 (session-log hook) straddle a
+    # calendar day boundary, the two files get different date prefixes and
+    # the snapshot is legitimately excluded from the session's lookup. Keep
+    # the strong assertions for the (overwhelmingly common) same-date case
+    # and avoid a wall-clock flake in the ~100ms-per-year straddle window.
+    snapshot_date_prefix = snapshot_path.stem.split("-snapshot-", 1)[0][:10]
+    session_date_prefix = session_path.stem[:10]
+    if snapshot_date_prefix == session_date_prefix:
+        # Nested snapshot row: exact `↳ HH:MM:SS` match against OUR snapshot's
+        # timestamp. Rendered inside a markdown table cell at
+        # obsidian_utils.py:1881 (`|   | ↳ {hhmmss_pretty} | ...`), so the
+        # glyph sits mid-cell after `|   | ` — no `^` line anchor.
+        assert f"↳ {hhmmss_pretty}" in context_brief_section, (
+            f"expected nested snapshot row `↳ {hhmmss_pretty}` in context brief:\n"
+            f"{context_brief_section[:2000]}"
+        )
 
-    assert re.search(r"^snapshot_count:\s*1\b", load_manifest_section, re.MULTILINE), (
-        f"expected `snapshot_count: 1` in LOAD_MANIFEST:\n{load_manifest_section}"
-    )
+        assert re.search(
+            r"^snapshot_count:\s*1\b", load_manifest_section, re.MULTILINE
+        ), (
+            f"expected `snapshot_count: 1` in LOAD_MANIFEST:\n{load_manifest_section}"
+        )
 
-    # Producer at obsidian_utils.py:2091 emits
-    # `snapshot: [{hhmmss}] ({trigger}) {summary}` in build_context_brief's
-    # LOAD_MANIFEST composition — the full filename stem never appears on
-    # the line, only the HHMMSS tail. Match on that unique substring.
-    assert re.search(
-        rf"^snapshot:\s*\[{hhmmss}\]",
-        load_manifest_section,
-        re.MULTILINE,
-    ), (
-        f"expected `snapshot: [{hhmmss}]` line in LOAD_MANIFEST "
-        f"(stem={snapshot_path.stem}):\n{load_manifest_section}"
-    )
+        # Producer at obsidian_utils.py:2091 emits
+        # `snapshot: [{hhmmss}] ({trigger}) {summary}` in build_context_brief's
+        # LOAD_MANIFEST composition — the full filename stem never appears on
+        # the line, only the HHMMSS tail. Match on that unique substring.
+        assert re.search(
+            rf"^snapshot:\s*\[{hhmmss}\]",
+            load_manifest_section,
+            re.MULTILINE,
+        ), (
+            f"expected `snapshot: [{hhmmss}]` line in LOAD_MANIFEST "
+            f"(stem={snapshot_path.stem}):\n{load_manifest_section}"
+        )
+    else:
+        # Straddled midnight — degraded assertion: just verify the snapshot
+        # still exists on disk (the production code path for cross-midnight
+        # is tracked as follow-up #68/#70 and is out of scope for this test).
+        assert snapshot_path.exists(), (
+            "snapshot note missing after cross-midnight straddle: "
+            f"snapshot_date={snapshot_date_prefix}, "
+            f"session_date={session_date_prefix}"
+        )
 
     assert most_recent_path == str(session_path), (
         f"expected MOST_RECENT_SESSION_PATH={session_path}, got={most_recent_path}"
