@@ -644,3 +644,21 @@ def test_snapshot_broken_backlink_ambiguous_when_duplicate_session_ids(tmp_path)
     assert broken == [], (
         f"colliding sid must NOT produce snapshot-broken-backlink, got: {broken}"
     )
+    # Forward-consistency loop (scripts/vault_doctor_checks/snapshot_integrity.py:206)
+    # iterates sessions_by_id.items() and can emit session-snapshot-list-missing /
+    # session-snapshot-list-stale against either of the colliding session notes.
+    # Under the Task 2 fix, colliding sids must be excluded from that loop so
+    # neither session note receives a list-consistency issue triggered by this
+    # snapshot.
+    sess_paths = {
+        str(sess / "2026-04-15-demo-first.md"),
+        str(sess / "2026-04-18-demo-second.md"),
+    }
+    forward = [
+        i for i in issues
+        if i.check in ("session-snapshot-list-missing", "session-snapshot-list-stale")
+        and i.note_path in sess_paths
+    ]
+    assert forward == [], (
+        f"colliding-sid sessions must be skipped in forward-consistency loop, got: {forward}"
+    )
