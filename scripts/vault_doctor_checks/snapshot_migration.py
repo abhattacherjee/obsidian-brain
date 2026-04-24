@@ -86,7 +86,16 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
     # and downstream §3/§4 consumers would emit confidently-wrong fixes.
     # Consumers guard on this set to route colliding sids to unresolved
     # "ambiguous" Issues instead.
+    #
+    # Collision detection is PROJECT-BLIND: two session notes sharing a
+    # sid across different projects (re-imports, project-rename
+    # migrations) would otherwise have one collider filtered out by
+    # ``--project=foo`` and resurrect last-write-wins inside the
+    # filtered scan. ``_all_sids_seen`` therefore indexes every session
+    # note regardless of project; emission indices
+    # (``sessions_by_id`` / ``snapshots``) remain project-filtered.
     _sid_collisions: set[str] = set()
+    _all_sids_seen: set[str] = set()
     snapshots: list[tuple[Path, dict, str]] = []
 
     # Stash the resolved vault root on each legacy-filename issue so
@@ -99,20 +108,23 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
         fm = _parse_fm(text)
         if not fm:
             continue
+        type_ = fm.get("type", "")
+        sid = fm.get("session_id", "") if type_ == "claude-session" else ""
+        # Project-blind collision detection (see block comment above).
+        if sid:
+            if sid in _all_sids_seen:
+                _sid_collisions.add(sid)
+            else:
+                _all_sids_seen.add(sid)
+        # Project-filtered emission indices.
         if project and fm.get("project", "").lower() != project.lower():
             continue
-        type_ = fm.get("type", "")
         if type_ == "claude-session":
-            sid = fm.get("session_id", "")
-            if sid:
-                if sid in sessions_by_id:
-                    # Second+ occurrence — record collision. Leave the
-                    # existing winner in place; any consumer that cares
-                    # about correctness MUST check ``_sid_collisions``
-                    # before using ``sessions_by_id[sid]``.
-                    _sid_collisions.add(sid)
-                else:
-                    sessions_by_id[sid] = p
+            # First-writer-wins: the winner is retained as the
+            # (unreliable) lookup target; consumers short-circuit via
+            # ``_sid_collisions`` before trusting it.
+            if sid and sid not in sessions_by_id:
+                sessions_by_id[sid] = p
         elif type_ == "claude-snapshot":
             snapshots.append((p, fm, text))
 
@@ -192,7 +204,11 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
                 project=proj,
                 current_source="(no source_session_note)",
                 proposed_source="",
-                reason=f"ambiguous parent — multiple session notes share session_id={sid!r}",
+                reason=(
+                    f"ambiguous parent — multiple session notes share "
+                    f"session_id={sid!r}; resolve by deduping the colliding "
+                    f"session notes in the sessions folder"
+                ),
                 confidence=0.0,
                 extra={"unresolved": True},
             ))

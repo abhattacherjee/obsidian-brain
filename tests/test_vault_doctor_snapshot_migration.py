@@ -967,3 +967,144 @@ def test_missing_backlink_two_snapshots_sharing_session_id_both_resolve(tmp_path
         assert issue.confidence == 0.95, (
             f"non-colliding resolution must have confidence=0.95, got {issue.confidence}"
         )
+
+
+# ----- Issue #81 follow-ups from PR #85 review -----
+
+
+def test_missing_backlink_cross_project_collision_detected_with_project_filter(tmp_path):
+    """Issue #81 second-order: --project=foo must NOT silently disarm
+    collision detection when colliding sessions span projects.
+
+    Scenario: one session in project ``demo`` and one in project
+    ``other`` share a session_id. The user runs ``scan(project="demo")``
+    expecting project-scoped issues. Without project-blind collision
+    detection, the ``other`` session gets filtered out at ingest, the
+    collision goes unregistered, and the demo snapshot's backlink falls
+    back to last-write-wins — resurrecting exactly the bug this PR
+    fixes, inside the filtered scan.
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    sid = "cross-proj-2222-3333-4444-555555555555"
+    (sess / "2026-04-15-demo-collide.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-15\nsession_id: {sid}\n"
+        "project: demo\nstatus: summarized\n---\n\n# Demo session\n",
+        encoding="utf-8",
+    )
+    (sess / "2026-04-18-other-collide.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-18\nsession_id: {sid}\n"
+        "project: other\nstatus: summarized\n---\n\n# Other session\n",
+        encoding="utf-8",
+    )
+    snap = sess / "2026-04-18-demo-snap-120000.md"
+    snap.write_text(
+        f"---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: {sid}\n"
+        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650, project="demo",
+    )
+    miss = [i for i in issues if i.check == "snapshot-missing-backlink"]
+    assert len(miss) == 1, f"expected one snapshot-missing-backlink, got {miss}"
+    assert miss[0].extra.get("unresolved") is True, (
+        f"cross-project collision must still be ambiguous under --project filter, "
+        f"got extra={miss[0].extra}"
+    )
+    assert "ambiguous" in miss[0].reason, (
+        f"reason must contain 'ambiguous', got: {miss[0].reason!r}"
+    )
+    assert sid in miss[0].reason, (
+        f"reason must contain the full sid for grep, got: {miss[0].reason!r}"
+    )
+
+
+def test_missing_backlink_three_way_sid_collision(tmp_path):
+    """Issue #81: three session notes sharing one sid all trigger the
+    ambiguous branch (guards against a future refactor that branches on
+    "first duplicate vs. nth duplicate").
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    sid = "three-way-aaaa-bbbb-cccc-dddddddddddd"
+    for n, date in enumerate(("2026-04-15", "2026-04-16", "2026-04-17"), start=1):
+        (sess / f"{date}-demo-s{n}.md").write_text(
+            f"---\ntype: claude-session\ndate: {date}\nsession_id: {sid}\n"
+            f"project: demo\nstatus: summarized\n---\n\n# S{n}\n",
+            encoding="utf-8",
+        )
+    snap = sess / "2026-04-18-demo-snap-120000.md"
+    snap.write_text(
+        f"---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: {sid}\n"
+        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# Snap\n",
+        encoding="utf-8",
+    )
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650,
+    )
+    miss = [i for i in issues if i.check == "snapshot-missing-backlink"]
+    assert len(miss) == 1, f"expected one snapshot-missing-backlink, got {miss}"
+    assert miss[0].extra.get("unresolved") is True
+    assert "ambiguous" in miss[0].reason
+    assert sid in miss[0].reason
+
+
+def test_missing_backlink_mixed_collision_and_unique_sids(tmp_path):
+    """Issue #81: collision filter is per-sid, not global. A scan with
+    both a colliding sid and a unique sid must flag the colliding
+    snapshot as ambiguous AND resolve the unique snapshot normally.
+    """
+    sess = tmp_path / "claude-sessions"; sess.mkdir()
+    sid_collide = "mix-collide-aaaa-bbbb-cccc-dddddddddddd"
+    sid_unique = "mix-unique-1111-2222-3333-444444444444"
+    # Two sessions sharing sid_collide
+    (sess / "2026-04-15-demo-dup1.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-15\nsession_id: {sid_collide}\n"
+        "project: demo\nstatus: summarized\n---\n\n# Dup1\n",
+        encoding="utf-8",
+    )
+    (sess / "2026-04-16-demo-dup2.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-16\nsession_id: {sid_collide}\n"
+        "project: demo\nstatus: summarized\n---\n\n# Dup2\n",
+        encoding="utf-8",
+    )
+    # One session with sid_unique
+    unique_stem = "2026-04-17-demo-unique"
+    (sess / f"{unique_stem}.md").write_text(
+        f"---\ntype: claude-session\ndate: 2026-04-17\nsession_id: {sid_unique}\n"
+        "project: demo\nstatus: summarized\n---\n\n# Unique\n",
+        encoding="utf-8",
+    )
+    # Snapshot for the colliding sid
+    snap_c = sess / "2026-04-18-demo-collide-snap-120000.md"
+    snap_c.write_text(
+        f"---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: {sid_collide}\n"
+        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# SnapC\n",
+        encoding="utf-8",
+    )
+    # Snapshot for the unique sid
+    snap_u = sess / "2026-04-18-demo-unique-snap-120000.md"
+    snap_u.write_text(
+        f"---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: {sid_unique}\n"
+        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# SnapU\n",
+        encoding="utf-8",
+    )
+    issues = snapshot_migration.scan(
+        str(tmp_path), "claude-sessions", "claude-insights", 3650,
+    )
+    miss = [i for i in issues if i.check == "snapshot-missing-backlink"]
+    by_path = {i.note_path: i for i in miss}
+    assert str(snap_c) in by_path and str(snap_u) in by_path, (
+        f"expected issues for both snapshots, got paths={list(by_path)}"
+    )
+    # Colliding snapshot → ambiguous/unresolved
+    ic = by_path[str(snap_c)]
+    assert ic.extra.get("unresolved") is True
+    assert "ambiguous" in ic.reason
+    assert sid_collide in ic.reason
+    # Unique snapshot → resolved with parent_stem
+    iu = by_path[str(snap_u)]
+    assert iu.extra.get("unresolved") is False, (
+        f"unique sid must resolve, got extra={iu.extra}"
+    )
+    assert iu.extra.get("parent_stem") == unique_stem
+    assert iu.confidence == 0.95

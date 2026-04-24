@@ -111,7 +111,16 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
     # backlink against an arbitrary winner would produce a confidently
     # wrong snapshot-broken-backlink fix. Consumers guard on this set to
     # route colliding sids to an unresolved snapshot-orphan instead.
+    #
+    # Collision detection is PROJECT-BLIND: two session notes sharing a
+    # sid across different projects (re-imports, project-rename
+    # migrations) would otherwise have one collider filtered out by
+    # ``--project=foo`` and resurrect last-write-wins inside the
+    # filtered scan. ``_all_sids_seen`` therefore indexes every session
+    # note regardless of project; emission indices
+    # (``sessions_by_id`` / ``snapshots``) remain project-filtered.
     _sid_collisions: set[str] = set()
+    _all_sids_seen: set[str] = set()
     snapshots: list[dict] = []
     for p in sess_dir.iterdir():
         if p.suffix != ".md":
@@ -122,21 +131,25 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
         fm = _parse_fm(text)
         if not fm:
             continue
+        type_ = fm.get("type", "")
+        sid = fm.get("session_id", "") if type_ == "claude-session" else ""
+        # Project-blind collision detection (see block comment above).
+        if sid:
+            if sid in _all_sids_seen:
+                _sid_collisions.add(sid)
+            else:
+                _all_sids_seen.add(sid)
+        # Project-filtered emission indices.
         if not _project_matches(fm.get("project", ""), project):
             continue
-        type_ = fm.get("type", "")
         if type_ == "claude-session":
-            sid = fm.get("session_id", "")
-            if sid:
-                if sid in sessions_by_id:
-                    # Second+ occurrence — record collision. Leave the
-                    # existing winner; consumers check ``_sid_collisions``
-                    # before trusting the lookup.
-                    _sid_collisions.add(sid)
-                else:
-                    sessions_by_id[sid] = {
-                        "path": str(p), "fm": fm, "stem": p.stem, "text": text,
-                    }
+            # First-writer-wins: the winner is retained as the
+            # (unreliable) lookup target; consumers short-circuit via
+            # ``_sid_collisions`` before trusting it.
+            if sid and sid not in sessions_by_id:
+                sessions_by_id[sid] = {
+                    "path": str(p), "fm": fm, "stem": p.stem, "text": text,
+                }
         elif type_ == "claude-snapshot":
             snapshots.append({"path": str(p), "fm": fm, "stem": p.stem, "text": text})
 
@@ -149,25 +162,46 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
         fm = snap["fm"]
         sid = fm.get("session_id", "")
         project_name = fm.get("project", "")
+        # Empty-sid guard (parity with snapshot_migration.py §3): a
+        # snapshot with no session_id in frontmatter can't be resolved
+        # at all. Emit a specific unresolved reason so operators aren't
+        # told "no session note matches session_id=''" (misleading).
+        if not sid:
+            issues.append(Issue(
+                check="snapshot-orphan",
+                note_path=snap["path"],
+                project=project_name,
+                current_source="session_id=(empty)",
+                proposed_source="",
+                reason="snapshot has no session_id in frontmatter",
+                confidence=0.0,
+                extra={"unresolved": True},
+            ))
+            continue
         # Issue #81: colliding sids must be routed to an unresolved
-        # "ambiguous" snapshot-orphan BEFORE the broken-backlink check —
+        # "ambiguous parent" snapshot-orphan BEFORE any parent-based
+        # check (missing-parent below, broken-backlink further down) —
         # otherwise the snapshot's ``source_session_note`` would be
         # compared against an arbitrary ``sessions_by_id`` winner and a
-        # confidently-wrong fix would be proposed. The sid is included in
-        # the reason verbatim so operators can grep the vault.
+        # confidently-wrong fix would be proposed. The sid is included
+        # in the reason verbatim so operators can grep the vault.
         if sid in _sid_collisions:
-            # confidence=0.0 (vs 0.9 for the missing-parent branch below):
-            # collision means we have *more* candidate parents than we can
-            # choose between, so classifier confidence is strictly lower
-            # than when zero candidates exist. Consumers switch on
-            # extra["unresolved"], so this is operator-facing signal only.
+            # Both collision and missing-parent set ``extra["unresolved"]
+            # = True``, so neither auto-applies. The numeric confidence
+            # is operator-facing signal only: 0.0 for collisions (more
+            # candidates than we can choose between) vs 0.9 for
+            # missing-parent (high confidence in the orphan classification).
             issues.append(Issue(
                 check="snapshot-orphan",
                 note_path=snap["path"],
                 project=project_name,
                 current_source=f"session_id={sid}",
                 proposed_source="",
-                reason=f"ambiguous — multiple session notes share session_id={sid!r}",
+                reason=(
+                    f"ambiguous parent — multiple session notes share "
+                    f"session_id={sid!r}; resolve by deduping the colliding "
+                    f"session notes in the sessions folder"
+                ),
                 confidence=0.0,
                 extra={"unresolved": True},
             ))
