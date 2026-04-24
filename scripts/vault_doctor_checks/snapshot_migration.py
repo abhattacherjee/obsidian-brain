@@ -81,6 +81,12 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
 
     all_md = [p for p in sess_dir.iterdir() if p.suffix == ".md"]
     sessions_by_id: dict[str, Path] = {}
+    # Issue #81: track sids that appear on more than one session note. A
+    # last-write-wins ``sessions_by_id`` silently picks an arbitrary parent
+    # and downstream §3/§4 consumers would emit confidently-wrong fixes.
+    # Consumers guard on this set to route colliding sids to unresolved
+    # "ambiguous" Issues instead.
+    _sid_collisions: set[str] = set()
     snapshots: list[tuple[Path, dict, str]] = []
 
     # Stash the resolved vault root on each legacy-filename issue so
@@ -99,7 +105,14 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
         if type_ == "claude-session":
             sid = fm.get("session_id", "")
             if sid:
-                sessions_by_id[sid] = p
+                if sid in sessions_by_id:
+                    # Second+ occurrence — record collision. Leave the
+                    # existing winner in place; any consumer that cares
+                    # about correctness MUST check ``_sid_collisions``
+                    # before using ``sessions_by_id[sid]``.
+                    _sid_collisions.add(sid)
+                else:
+                    sessions_by_id[sid] = p
         elif type_ == "claude-snapshot":
             snapshots.append((p, fm, text))
 
@@ -167,6 +180,23 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
                 extra={"unresolved": True},
             ))
             continue
+        # Issue #81: if two session notes share this sid, we cannot name
+        # the authoritative parent. Emit an unresolved "ambiguous" Issue
+        # and skip the last-write-wins lookup. The sid is included in the
+        # reason verbatim so operators can grep their vault for the
+        # offending session notes.
+        if sid in _sid_collisions:
+            issues.append(Issue(
+                check="snapshot-missing-backlink",
+                note_path=str(p),
+                project=proj,
+                current_source="(no source_session_note)",
+                proposed_source="",
+                reason=f"ambiguous parent — multiple session notes share session_id={sid!r}",
+                confidence=0.0,
+                extra={"unresolved": True},
+            ))
+            continue
         parent_path = sessions_by_id.get(sid)
         if parent_path is None:
             # Orphan — no session note with matching session_id in the
@@ -204,6 +234,11 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
         if sid:
             snaps_by_sid.setdefault(sid, []).append(p.stem)
     for sid, stems in snaps_by_sid.items():
+        # Issue #81: colliding sids have no authoritative parent, so we
+        # cannot propose a snapshots: list against one of the two session
+        # notes without a 50/50 chance of being wrong.
+        if sid in _sid_collisions:
+            continue
         if sid not in sessions_by_id:
             continue
         sess_path = sessions_by_id[sid]

@@ -106,6 +106,12 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
 
     # Index all session/snapshot files once to avoid O(N^2) scans
     sessions_by_id: dict[str, dict] = {}
+    # Issue #81: track sids that appear on more than one session note.
+    # ``sessions_by_id`` is last-write-wins; comparing a snapshot's
+    # backlink against an arbitrary winner would produce a confidently
+    # wrong snapshot-broken-backlink fix. Consumers guard on this set to
+    # route colliding sids to an unresolved snapshot-orphan instead.
+    _sid_collisions: set[str] = set()
     snapshots: list[dict] = []
     for p in sess_dir.iterdir():
         if p.suffix != ".md":
@@ -122,9 +128,15 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
         if type_ == "claude-session":
             sid = fm.get("session_id", "")
             if sid:
-                sessions_by_id[sid] = {
-                    "path": str(p), "fm": fm, "stem": p.stem, "text": text,
-                }
+                if sid in sessions_by_id:
+                    # Second+ occurrence — record collision. Leave the
+                    # existing winner; consumers check ``_sid_collisions``
+                    # before trusting the lookup.
+                    _sid_collisions.add(sid)
+                else:
+                    sessions_by_id[sid] = {
+                        "path": str(p), "fm": fm, "stem": p.stem, "text": text,
+                    }
         elif type_ == "claude-snapshot":
             snapshots.append({"path": str(p), "fm": fm, "stem": p.stem, "text": text})
 
@@ -137,6 +149,24 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
         fm = snap["fm"]
         sid = fm.get("session_id", "")
         project_name = fm.get("project", "")
+        # Issue #81: colliding sids must be routed to an unresolved
+        # "ambiguous" snapshot-orphan BEFORE the broken-backlink check —
+        # otherwise the snapshot's ``source_session_note`` would be
+        # compared against an arbitrary ``sessions_by_id`` winner and a
+        # confidently-wrong fix would be proposed. The sid is included in
+        # the reason verbatim so operators can grep the vault.
+        if sid in _sid_collisions:
+            issues.append(Issue(
+                check="snapshot-orphan",
+                note_path=snap["path"],
+                project=project_name,
+                current_source=f"session_id={sid}",
+                proposed_source="",
+                reason=f"ambiguous — multiple session notes share session_id={sid!r}",
+                confidence=0.0,
+                extra={"unresolved": True},
+            ))
+            continue
         parent_session = sessions_by_id.get(sid)
 
         if not parent_session:
@@ -204,6 +234,11 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
             snaps_by_session.setdefault(sid, []).append(f"[[{snap['stem']}]]")
 
     for sid, sess in sessions_by_id.items():
+        # Issue #81: skip colliding sids — we cannot declare either
+        # session the authoritative parent, so proposing a snapshots:
+        # list edit would be a 50/50 guess.
+        if sid in _sid_collisions:
+            continue
         on_disk = sorted(snaps_by_session.get(sid, []))
         in_frontmatter = sess["fm"].get("snapshots") or []
         if not isinstance(in_frontmatter, list):
