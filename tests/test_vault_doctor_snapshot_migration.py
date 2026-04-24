@@ -845,24 +845,20 @@ def test_missing_backlink_cross_midnight_uses_session_id_index(tmp_path):
     assert f'source_session_note: "[[{parent_stem}]]"' in text
 
 
-# ----- Issue #81: duplicate-sid collision tests (TDD-red for Task 2) -----
+# ----- Issue #81 regression tests: duplicate-sid collision handling -----
 
 
 def test_missing_backlink_ambiguous_when_duplicate_session_ids(tmp_path):
-    """Issue #81: two sessions share the same session_id -> snapshot backlink is ambiguous.
+    """When multiple session notes carry the same sid, ``sessions_by_id``
+    must not pick an arbitrary winner for backlink resolution. Instead,
+    scan() detects sid collisions while building the index and treats
+    snapshots with that sid as unresolved.
 
-    Post-#68, §3 resolves the parent via ``sessions_by_id`` (a plain
-    last-write-wins dict). When two session notes carry the same sid,
-    the dict silently picks one and the §3 writer produces a
-    confidently-wrong ``source_session_note`` wikilink.
-
-    The fix: scan() must detect sid collisions at index-build time and
-    emit an UNRESOLVED Issue for snapshots whose sid lives in the
-    collision set — never a speculative wikilink. Reason string must
-    contain both "ambiguous" (human-readable marker) and the full sid
-    (greppable by operators).
-
-    This test is TDD-RED on current develop — it drives the Task 2 fix.
+    Expected behavior: emit an UNRESOLVED Issue for snapshots whose sid
+    is in the collision set — never a speculative
+    ``source_session_note`` wikilink. The reason string contains both
+    "ambiguous" (human-readable marker) and the full sid (greppable by
+    operators).
     """
     sess = tmp_path / "claude-sessions"; sess.mkdir()
     sid = "11111111-2222-3333-4444-555555555555"
@@ -925,10 +921,9 @@ def test_missing_backlink_two_snapshots_sharing_session_id_both_resolve(tmp_path
 
     Simulates two PreCompact fires within a single session. The sid
     points at a UNIQUE session (no collision) and both snapshots must
-    resolve via ``sessions_by_id`` with confidence 0.95.
-
-    This test must PASS on current develop — the Task 2 fix must not
-    regress it.
+    resolve via ``sessions_by_id`` with confidence 0.95 — the
+    collision-detection path must not over-trigger on the legitimate
+    "multiple snapshots per session" case.
     """
     sess = tmp_path / "claude-sessions"; sess.mkdir()
     sid = "unique-session-id-xyz"
@@ -981,8 +976,8 @@ def test_missing_backlink_cross_project_collision_detected_with_project_filter(t
     expecting project-scoped issues. Without project-blind collision
     detection, the ``other`` session gets filtered out at ingest, the
     collision goes unregistered, and the demo snapshot's backlink falls
-    back to last-write-wins — resurrecting exactly the bug this PR
-    fixes, inside the filtered scan.
+    back to an arbitrary filesystem-order-dependent winner — resurrecting
+    exactly the bug this PR fixes, inside the filtered scan.
     """
     sess = tmp_path / "claude-sessions"; sess.mkdir()
     sid = "cross-proj-2222-3333-4444-555555555555"

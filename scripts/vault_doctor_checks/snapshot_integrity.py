@@ -107,15 +107,16 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
     # Index all session/snapshot files once to avoid O(N^2) scans
     sessions_by_id: dict[str, dict] = {}
     # Issue #81: track sids that appear on more than one session note.
-    # ``sessions_by_id`` is last-write-wins; comparing a snapshot's
-    # backlink against an arbitrary winner would produce a confidently
-    # wrong snapshot-broken-backlink fix. Consumers guard on this set to
+    # ``sessions_by_id`` picks a filesystem-order-dependent winner when
+    # two notes share a sid; comparing a snapshot's backlink against an
+    # arbitrary winner would produce a confidently wrong
+    # snapshot-broken-backlink fix. Consumers guard on this set to
     # route colliding sids to an unresolved snapshot-orphan instead.
     #
     # Collision detection is PROJECT-BLIND: two session notes sharing a
     # sid across different projects (re-imports, project-rename
     # migrations) would otherwise have one collider filtered out by
-    # ``--project=foo`` and resurrect last-write-wins inside the
+    # ``--project=foo`` and resurrect an arbitrary winner inside the
     # filtered scan. ``_all_sids_seen`` therefore indexes every session
     # note regardless of project; emission indices
     # (``sessions_by_id`` / ``snapshots``) remain project-filtered.

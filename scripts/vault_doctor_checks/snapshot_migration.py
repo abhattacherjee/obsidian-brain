@@ -82,15 +82,15 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
     all_md = [p for p in sess_dir.iterdir() if p.suffix == ".md"]
     sessions_by_id: dict[str, Path] = {}
     # Issue #81: track sids that appear on more than one session note. A
-    # last-write-wins ``sessions_by_id`` silently picks an arbitrary parent
-    # and downstream §3/§4 consumers would emit confidently-wrong fixes.
-    # Consumers guard on this set to route colliding sids to unresolved
-    # "ambiguous" Issues instead.
+    # filesystem-order-dependent ``sessions_by_id`` winner silently picks
+    # an arbitrary parent and downstream §3/§4 consumers would emit
+    # confidently-wrong fixes. Consumers guard on this set to route
+    # colliding sids to unresolved "ambiguous" Issues instead.
     #
     # Collision detection is PROJECT-BLIND: two session notes sharing a
     # sid across different projects (re-imports, project-rename
     # migrations) would otherwise have one collider filtered out by
-    # ``--project=foo`` and resurrect last-write-wins inside the
+    # ``--project=foo`` and resurrect an arbitrary winner inside the
     # filtered scan. ``_all_sids_seen`` therefore indexes every session
     # note regardless of project; emission indices
     # (``sessions_by_id`` / ``snapshots``) remain project-filtered.
@@ -194,7 +194,7 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
             continue
         # Issue #81: if two session notes share this sid, we cannot name
         # the authoritative parent. Emit an unresolved "ambiguous" Issue
-        # and skip the last-write-wins lookup. The sid is included in the
+        # and skip the arbitrary winner lookup. The sid is included in the
         # reason verbatim so operators can grep their vault for the
         # offending session notes.
         if sid in _sid_collisions:

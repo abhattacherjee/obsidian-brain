@@ -576,22 +576,19 @@ def test_stale_apply_handles_unquoted_yaml_list_items(tmp_path):
     assert "2026-04-18-demo-uu-snapshot-100000" in fm
 
 
-# ----- Issue #81: duplicate-sid collision tests (TDD-red for Task 2) -----
+# ----- Issue #81 regression tests: duplicate-sid collision handling -----
 
 
 def test_snapshot_broken_backlink_ambiguous_when_duplicate_session_ids(tmp_path):
-    """Issue #81: colliding session_ids must route the snapshot to
-    snapshot-orphan (unresolved), not snapshot-broken-backlink.
+    """Snapshots with duplicate candidate sessions for the same
+    ``session_id`` must be treated as unresolved rather than as having
+    a confidently broken backlink.
 
-    ``sessions_by_id`` in snapshot_integrity.scan is a plain
-    last-write-wins dict (lines ~108-127). When two sessions share a
-    sid, the dict silently picks one — so a snapshot's existing
-    ``source_session_note`` gets compared against an arbitrary winner
-    and may be declared "broken" with a confident fix suggestion that
-    is wrong. The Task 2 fix must treat colliding sids as ambiguous
-    orphans and never emit a snapshot-broken-backlink for them.
-
-    This test is TDD-RED on current develop — it drives the fix.
+    When multiple session notes share the same ``session_id``, the
+    checker cannot reliably determine which note a
+    ``source_session_note`` should reference. In that ambiguous case,
+    the snapshot is classified as a snapshot-orphan (unresolved), and
+    no ``snapshot-broken-backlink`` issue is emitted.
     """
     vault = tmp_path
     sess = vault / "claude-sessions"; sess.mkdir()
@@ -644,12 +641,11 @@ def test_snapshot_broken_backlink_ambiguous_when_duplicate_session_ids(tmp_path)
     assert broken == [], (
         f"colliding sid must NOT produce snapshot-broken-backlink, got: {broken}"
     )
-    # Forward-consistency loop (scripts/vault_doctor_checks/snapshot_integrity.py:206)
-    # iterates sessions_by_id.items() and can emit session-snapshot-list-missing /
-    # session-snapshot-list-stale against either of the colliding session notes.
-    # Under the Task 2 fix, colliding sids must be excluded from that loop so
-    # neither session note receives a list-consistency issue triggered by this
-    # snapshot.
+    # Forward-consistency loop iterates sessions_by_id.items() and can
+    # emit session-snapshot-list-missing / session-snapshot-list-stale
+    # against either of the colliding session notes. Colliding sids
+    # must be excluded from that loop so neither session note receives
+    # a list-consistency issue triggered by this snapshot.
     sess_paths = {
         str(sess / "2026-04-15-demo-first.md"),
         str(sess / "2026-04-18-demo-second.md"),
