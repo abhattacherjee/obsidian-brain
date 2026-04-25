@@ -1417,16 +1417,16 @@ def test_scan_trusts_uuid_when_jsonl_exists_but_note_missing(doctor_vault, monke
         days=10000,
         project=project,
     )
-    flagged_paths = [i.note_path for i in issues if i.note_path == str(insight)]
-    if flagged_paths:
-        # Acceptable behavior: emit unresolved (UUID is real but note is missing).
-        # Unacceptable: propose sid_distractor as a rewrite target.
-        flagged = [i for i in issues if i.note_path == str(insight)][0]
-        if not flagged.extra.get("unresolved"):
-            assert flagged.extra.get("proposed_sid") != sid_distractor, (
-                "regression: matcher proposed a different session when "
-                "source UUID had a real JSONL (just missing session note)"
-            )
+    flagged = [i for i in issues if i.note_path == str(insight)]
+    assert len(flagged) == 1, (
+        f"expected exactly 1 issue for orphan-UUID insight, got {len(flagged)}"
+    )
+    assert flagged[0].extra.get("unresolved") is True
+    assert flagged[0].extra.get("missing_session_note") is True
+    assert flagged[0].extra.get("proposed_sid") != sid_distractor, (
+        "regression: must not propose a different session when source UUID "
+        "had a real JSONL (just missing session note)"
+    )
 
 
 # ---------------------------------------------------------------------------
