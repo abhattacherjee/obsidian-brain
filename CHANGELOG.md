@@ -23,6 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and trusts an existing `source_session` whose JSONL window overlaps the
   note's calendar day. Issue payloads surface `capture_signal` and
   `capture_confidence` so operators can spot heuristic falls. Closes #93.
+- **vault-doctor source-sessions further hardening** (issue #93 follow-ups
+  surfaced via dev-test verification):
+  - Snapshot notes are now filtered out of the session-note SID index.
+    PreCompact snapshots inherit the parent session's UUID; without the
+    filter they could clobber the parent in the index, causing T5c's
+    basename-only repairs to propose snapshot basenames as 'correct'.
+  - Notes whose `source_session` UUID has a real JSONL but no session
+    note are no longer routed to the date-window matcher. The UUID is
+    authoritative; the missing session note is tracked separately
+    (issue #98).
+  - Day-precision signals (`date`, `filename`) now use a day-overlap
+    matcher (greatest overlap with the UTC calendar day) instead of a
+    noon-UTC point match. Morning-only and evening-only sessions are
+    no longer silently excluded from candidacy.
 - **vault-doctor source-sessions multi-session-day convergence**: when a
   worktree-launched insight records `project: <main>` but its source
   session has `project: <main>--<worktree-slug>`, the UUID lookup
