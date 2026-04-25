@@ -38,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/recall` Step 4 N=1 checkoff branch no longer hits `AskUserQuestion` `minItems=2` validation errors. Single candidates now route to the verbatim text fallback; the `2 ≤ N ≤ 4` picker branch gains an explicit "Skip all — don't check off anything" sentinel option so deferral is a visible selectable choice. Closes #78.
 - `vault-doctor` `snapshot-migration` §3 (`snapshot-missing-backlink`) now resolves the parent session note via the `session_id` index built in the same scan, instead of composing a filename from `(snapshot.date, project, sha256(session_id)[:4])`. The old date-heuristic wrote wrong `source_session_note` wikilinks for cross-midnight sessions (PreCompact on day N, SessionEnd on day N+1). Orphan snapshots now emit `unresolved=True` with no speculative wikilink. Closes #68.
 - `vault-doctor` `sessions_by_id` in both `snapshot_migration.py` and `snapshot_integrity.py` no longer silently relies on an arbitrary filesystem-order-dependent winner when two session notes share a `session_id`. Colliding sids are tracked in a `_sid_collisions` set at build time, and the four consumers (migration §3 / §4 and integrity §1 / §4) now treat those collisions as ambiguous: the §1/§3 emission paths surface unresolved `"ambiguous parent — multiple session notes share session_id=<sid>; resolve by deduping the colliding session notes in the sessions folder"` Issues, while the §4 fix-proposal loops skip proposing a confidently-wrong backlink or snapshots-list fix. Collision detection is project-blind so `--project=foo` can't silently filter out a cross-project collider and resurrect arbitrary-winner selection inside the filtered scan; emission indices remain project-filtered. `snapshot_integrity.py` also gains an empty-`session_id` pre-guard with a specific reason (parity with `snapshot_migration.py` §3). Surfaced during PR #80 review as a pre-existing weakness made consequential by the #68 fix. Closes #81.
+- **Project-name divergence across worktrees**: session notes and insights
+  written from a worktree previously recorded the worktree's basename as
+  their `project:` field (e.g., `obsidian-brain--issue-81-...`), causing
+  vault-doctor's source-sessions check to mis-resolve UUID lookups when
+  the same insight referenced a session run in a different worktree.
+  All vault notes now record the canonical main-repo basename (e.g.,
+  `obsidian-brain`), derived via `git rev-parse --git-common-dir`. CC's
+  internal path-encoded JSONL/bootstrap lookups are unaffected. Existing
+  notes with worktree-derived project names continue to work via the
+  UUID-first cross-project fallback in source-sessions.
 
 ## [2.4.1] - 2026-04-22
 
