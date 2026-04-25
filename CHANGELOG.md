@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Source-session basename divergence between `get_session_context()` and SessionEnd that broke insight wikilinks across cross-midnight, worktree, and resumed sessions ([#101](https://github.com/abhattacherjee/obsidian-brain/issues/101))
 - Snapshot/session hash collision in the resolver could pick a snapshot when an insight saver intended to link to a session ([#101](https://github.com/abhattacherjee/obsidian-brain/issues/101) Fix C)
-- `is_resumed_session` first-match-wins glob now filters by `type: claude-session` and `project_path`, eliminating false positives from cross-project hash collisions ([#86](https://github.com/abhattacherjee/obsidian-brain/issues/86), subsumed by [#101](https://github.com/abhattacherjee/obsidian-brain/issues/101))
+- `is_resumed_session` now returns True only when a session-type note for the current project (matched by `project_path` against `cwd`) exists for this session_id's hash — eliminating false positives from cross-project hash collisions and snapshot-only matches ([#86](https://github.com/abhattacherjee/obsidian-brain/issues/86), subsumed by [#101](https://github.com/abhattacherjee/obsidian-brain/issues/101))
 - **vault-doctor source-sessions silently corrupted backlinks** when a note's
   mtime drifted past the originating session's JSONL window (any later edit
   by `/check-items`, `/link`, `/compress`, sync clients, or another vault-doctor
