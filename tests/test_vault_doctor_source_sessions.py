@@ -1011,3 +1011,62 @@ def test_scan_created_at_bypasses_early_exit(doctor_vault, monkeypatch):
     assert iss.extra.get("proposed_sid") == sid_y, (
         f"matcher should propose Y (where created_at falls), got {iss.extra.get('proposed_sid')!r}"
     )
+
+
+def test_scan_trusts_cross_midnight_source(doctor_vault, monkeypatch):
+    """Phase 1b extension (issue #93): a session that started the night before
+    note.date and ran into note.date is the legitimate cross-midnight case.
+    The current source must be trusted even though session_note.date != note.date."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+
+    monkeypatch.setenv("HOME", str(home))
+
+    # Cross-midnight session: started 2026-04-20 22:00, ended 2026-04-21 03:00
+    sid_x = "55555555-5555-5555-5555-555555555555"
+    x_first = datetime(2026, 4, 20, 22, 0, tzinfo=timezone.utc).timestamp()
+    x_last = datetime(2026, 4, 21, 3, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_x}.jsonl",
+                 datetime.fromtimestamp(x_first, tz=timezone.utc).isoformat(),
+                 x_last)
+
+    # Another session, same project, fully within 2026-04-21 daytime
+    sid_y = "66666666-6666-6666-6666-666666666666"
+    y_first = datetime(2026, 4, 21, 10, 0, tzinfo=timezone.utc).timestamp()
+    y_last = datetime(2026, 4, 21, 14, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_y}.jsonl",
+                 datetime.fromtimestamp(y_first, tz=timezone.utc).isoformat(),
+                 y_last)
+
+    # Session note for X has date 2026-04-20 (its first-entry day)
+    sess_x = _write_session_note(vault / "claude-sessions", "2026-04-20", project, sid_x, "5555")
+    sess_y = _write_session_note(vault / "claude-sessions", "2026-04-21", project, sid_y, "6666")
+
+    # Insight dated 2026-04-21 (calendar day of capture), source_session = X
+    # (the session that crossed midnight). Without the JSONL-overlap extension,
+    # session.date "2026-04-20" != note.date "2026-04-21" → Phase 1b doesn't fire,
+    # matcher proposes Y → false positive.
+    insight = _write_insight(
+        vault / "claude-insights",
+        date="2026-04-21",
+        slug="cross-midnight-trust",
+        project=project,
+        src_sid=sid_x,
+        src_note_basename=sess_x.stem,
+        mtime=y_first + 1800,
+    )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    paths = [i.note_path for i in issues]
+    assert str(insight) not in paths, (
+        "regression: cross-midnight session_note.date=note.date-1 not trusted "
+        "(session window overlaps note's calendar day → should be trusted)"
+    )

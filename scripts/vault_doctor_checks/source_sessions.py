@@ -117,6 +117,17 @@ def _parse_date_midpoint(date_str: str) -> float | None:
         return None
 
 
+def _parse_date_start(date_str: str) -> float | None:
+    """Parse YYYY-MM-DD to POSIX timestamp at 00:00 UTC of that day, or None."""
+    if not date_str:
+        return None
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return d.timestamp()
+    except ValueError:
+        return None
+
+
 # Filename prefix YYYY-MM-DD-...
 _FILENAME_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-")
 
@@ -379,24 +390,39 @@ def scan(
             else:
                 current_source_display = ""
 
-            # Phase 1b — early-exit (issue #93): if current source resolves
-            # to a same-day session note in the project's index, trust it.
-            # Avoids paying for a heuristic match when nothing has changed
-            # and prevents matcher boundary-tie misclassifications on
-            # cross-midnight or multi-session days.
+            # Phase 1b — early-exit (issue #93): if the current source's JSONL
+            # window overlaps the note's calendar day, trust it. The JSONL
+            # window is the ground-truth signal for when a session was active;
+            # session-note `date:` fields can drift due to migrations, renames,
+            # or sibling vault-doctor checks. Window-overlap correctly handles
+            # strict same-day sessions, cross-midnight (started prev day, ran
+            # into note's day), early-morning captures from previous-night
+            # sessions, and multi-day sessions.
             #
             # Only applies for day-precision signals (date, filename, mtime).
             # When created_at provides a precise sub-day timestamp we trust
             # the matcher — it has enough resolution to detect intra-day
             # session boundaries even on multi-session days.
-            if current_sid and current_sid in idx and capture_signal != "created_at":
-                current_session_date = idx[current_sid].get("date", "")
+            if (
+                current_sid
+                and current_sid in idx
+                and capture_signal != "created_at"
+                and jsonl_dir is not None
+            ):
                 note_date = fm.get("date", "")
                 if not note_date:
                     fn_match = _FILENAME_DATE_RE.match(note.name)
                     note_date = fn_match.group(1) if fn_match else ""
-                if note_date and current_session_date == note_date:
-                    continue  # current source already correct
+                day_start = _parse_date_start(note_date) if note_date else None
+                if day_start is not None:
+                    day_end = day_start + 86400  # next midnight UTC
+                    current_jsonl = jsonl_dir / f"{current_sid}.jsonl"
+                    if current_jsonl.exists():
+                        window = _jsonl_window(str(current_jsonl))
+                        if window is not None:
+                            first_ts, last_ts = window
+                            if first_ts < day_end and last_ts > day_start:
+                                continue  # session active during note's day — trust
 
             match = _find_matching_session(capture_time, jsonl_dir, idx)
             if match is None:
