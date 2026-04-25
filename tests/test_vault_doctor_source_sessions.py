@@ -1557,3 +1557,55 @@ def test_scan_caps_mtime_signal_confidence_below_convergence_floor(doctor_vault,
     assert flagged[0].confidence <= 0.3, (
         f"mtime-signal confidence must be <=0.3, got {flagged[0].confidence}"
     )
+
+
+def test_scan_emits_unresolved_when_jsonl_exists_but_session_note_missing(
+    doctor_vault, monkeypatch
+):
+    """When source_session UUID has a real JSONL but no vault session note,
+    emit an unresolved diagnostic Issue surfacing the coverage gap. UUID
+    remains authoritative — never propose a different-session rewrite
+    (review C3)."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    sid_orphan = "55555555-5555-5555-5555-555555555555"
+    o_first = datetime(2026, 4, 22, 11, 0, tzinfo=timezone.utc).timestamp()
+    o_last = datetime(2026, 4, 22, 22, 0, tzinfo=timezone.utc).timestamp()
+    orphan_jsonl = jsonl_dir / f"{sid_orphan}.jsonl"
+    _write_jsonl(
+        orphan_jsonl,
+        datetime.fromtimestamp(o_first, tz=timezone.utc).isoformat(),
+        o_last,
+    )
+    # NOTE: deliberately NO session note for sid_orphan — coverage gap.
+
+    insight = _write_insight(
+        vault / "claude-insights",
+        date="2026-04-22",
+        slug="orphan-uuid-c3",
+        project=project,
+        src_sid=sid_orphan,
+        src_note_basename="2026-04-22-proj1-orph",
+        mtime=o_first + 1800,
+    )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(insight)]
+    assert len(flagged) == 1, (
+        f"expected exactly 1 issue for orphan-UUID insight, got {len(flagged)}"
+    )
+    issue = flagged[0]
+    assert issue.extra.get("unresolved") is True
+    assert issue.extra.get("missing_session_note") is True
+    assert issue.extra.get("jsonl_path") == str(orphan_jsonl)
+    assert issue.confidence == 0.0

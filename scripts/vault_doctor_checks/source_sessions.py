@@ -556,10 +556,34 @@ def scan(
                 else:
                     # UUID not in session-note index — but a real JSONL may
                     # still exist (SessionEnd hook missed; see issue #98).
-                    # In that case, the UUID is authoritative; refuse to
-                    # propose a different-session rewrite.
-                    if _find_jsonl_anywhere(current_sid) is not None:
-                        continue  # trust UUID, skip matcher
+                    # Emit an unresolved diagnostic Issue so operators can see
+                    # the coverage gap; UUID is authoritative, so don't propose
+                    # a different-session rewrite.
+                    jsonl_path = _find_jsonl_anywhere(current_sid)
+                    if jsonl_path is not None:
+                        issues.append(
+                            Issue(
+                                check=NAME,
+                                note_path=str(note),
+                                project=note_project,
+                                current_source=current_source_display,
+                                proposed_source="",
+                                reason=(
+                                    f"source UUID {current_sid[:8]} has a JSONL "
+                                    f"but no session note in the vault "
+                                    f"(see issue #98 for coverage-gap detector)"
+                                ),
+                                confidence=0.0,
+                                extra={
+                                    "unresolved": True,
+                                    "missing_session_note": True,
+                                    "jsonl_path": str(jsonl_path),
+                                    "capture_signal": capture_signal,
+                                    "capture_confidence": capture_conf,
+                                },
+                            )
+                        )
+                        continue  # UUID is authoritative; skip matcher
 
             # Day-precision signals: match by greatest overlap with UTC calendar day.
             # Sub-day precision (created_at): match by point-in-window.
