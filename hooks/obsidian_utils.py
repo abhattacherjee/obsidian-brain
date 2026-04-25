@@ -58,9 +58,16 @@ _SID_FILENAME_SAFE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
 def _first_seen_date(sid: str) -> str:
     """Return the canonical first-seen calendar date for a session_id.
 
-    Atomic, idempotent, lazy: marker is written on first call and never
-    modified — every subsequent call (across days, worktrees, processes)
-    returns the same date. Used by get_session_context() and SessionEnd
+    Atomic, idempotent, lazy: marker is written on first call and read
+    verbatim on subsequent calls — every subsequent call (across days,
+    worktrees, processes) returns the same date. If the marker becomes
+    corrupt or unreadable (e.g., truncated by an external process), the
+    function self-heals by rewriting it with today's date — note that
+    this resets the lockstep guarantee for that session_id.
+
+    Silent-failure paths (all log to stderr): unsafe sid shape, mkdir
+    failure, marker write failure — fall back to today's date and lockstep
+    is voided for that call. Used by get_session_context() and SessionEnd
     so that source_session_note wikilinks and on-disk filenames stay in
     lockstep even when sessions cross midnight.
 
@@ -112,8 +119,12 @@ def _first_seen_date(sid: str) -> str:
         if tmp_path is not None:
             try:
                 os.unlink(tmp_path)
-            except OSError:
-                pass
+            except OSError as cleanup_exc:
+                print(
+                    f"[obsidian-brain] _first_seen_date: failed to clean up temp file "
+                    f"{tmp_path}: {cleanup_exc}",
+                    file=sys.stderr,
+                )
     return today
 
 
@@ -146,8 +157,20 @@ def _peek_frontmatter_field(path: Path, field: str) -> str | None:
                     if (value.startswith('"') and value.endswith('"')) or \
                        (value.startswith("'") and value.endswith("'")):
                         value = value[1:-1]
-                    return value or None
-    except OSError:
+                    if not value:
+                        print(
+                            f"[obsidian-brain] _peek_frontmatter_field: {path.name} has empty "
+                            f"{field!r} field — possible mid-write or corruption",
+                            file=sys.stderr,
+                        )
+                        return None
+                    return value
+    except (OSError, UnicodeDecodeError) as exc:
+        print(
+            f"[obsidian-brain] _peek_frontmatter_field: cannot read {path.name} "
+            f"for field={field!r}: {exc}; this file will be excluded from filtering",
+            file=sys.stderr,
+        )
         return None
     return None
 
@@ -174,6 +197,10 @@ def _resolve_session_note_by_hash(
       3. genuine same-session_id duplicates (subsumes #86)
 
     Returns ``(basename_without_ext, collisions)``:
+      - basename_without_ext: file stem (no ``.md``) when resolved
+      - collisions: list of full filenames *with* ``.md`` so stderr
+        warnings are unambiguous when shown to the operator
+
       - exactly one session-type match              → (basename, [])
       - 2+ session matches but exactly one cwd match → (basename, [other names])
       - 0 session-type matches                       → (None, [])
@@ -185,24 +212,34 @@ def _resolve_session_note_by_hash(
     """
     sessions_dir = Path(sessions_dir)
     if not sessions_dir.is_dir():
+        print(
+            f"[obsidian-brain] _resolve_session_note_by_hash: sessions_dir "
+            f"{sessions_dir} does not exist or is not readable; treating as no-match",
+            file=sys.stderr,
+        )
         return None, []
 
     matches = sorted(sessions_dir.glob(f"*-{h}.md"))
     session_matches = [m for m in matches if _peek_frontmatter_type(m) == "claude-session"]
     if not session_matches:
         return None, []
-    if len(session_matches) == 1:
-        return session_matches[0].stem, []
 
-    # 2+ session-type matches — try cwd disambiguation
+    # Apply cwd filter when provided — covers single-match cross-project collision
     if cwd:
         cwd_matches = [m for m in session_matches
                        if _peek_frontmatter_project_path(m) == cwd]
         if len(cwd_matches) == 1:
             others = [m.name for m in session_matches if m != cwd_matches[0]]
             return cwd_matches[0].stem, others
+        if len(cwd_matches) == 0:
+            # No cwd match — surface ALL the cross-project matches as collisions
+            # so caller can warn, then fall back to composed name.
+            return None, [m.name for m in session_matches]
+        # Multiple cwd matches — fall through to ambiguous return below
 
-    # Still ambiguous — caller falls back
+    # No cwd OR multiple cwd matches — leniently return single-match basename
+    if len(session_matches) == 1:
+        return session_matches[0].stem, []
     return None, [m.name for m in session_matches]
 
 
@@ -760,8 +797,11 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
         resolved, collisions = _resolve_session_note_by_hash(
             sessions_dir, h, cwd=os.getcwd()
         )
-        # WARN fires once per process per (vault, folder) — the cache_set
-        # below short-circuits subsequent calls. Don't spam stderr.
+        # WARN fires once per (session, vault, folder) — cache_set below
+        # persists the result to ~/.claude/obsidian-brain/cache-<sid>.json,
+        # suppressing repeats across this hook process and any subsequent
+        # skill invocations within the same session until SessionEnd cleans
+        # up the cache. Don't spam stderr.
         if collisions:
             print(
                 f"[obsidian-brain] WARN: hash {h} matches {len(collisions) + (1 if resolved else 0)} "
@@ -3190,7 +3230,7 @@ def is_resumed_session(
             f"across {len(collisions) + (1 if resolved else 0)} session note(s)",
             file=sys.stderr,
         )
-    return resolved is not None or bool(collisions)
+    return resolved is not None
 
 
 def upgrade_note_with_summary(

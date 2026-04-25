@@ -439,9 +439,10 @@ def test_is_resumed_session_returns_true_for_real_session(tmp_path, monkeypatch)
 
 
 def test_is_resumed_session_handles_collision_pair(tmp_path, monkeypatch, capsys):
-    """Same-project two-session collision (the original #86 scope):
-    function returns True (a session does exist), warns, and does not
-    crash."""
+    """Same-project two-session ambiguity (the original #86 scope):
+    is_resumed_session returns False (no unambiguous prior session for
+    THIS sid in THIS project), warns, and does not crash. Operator should
+    investigate the duplicates manually."""
     sid = "fresh-session-id"
     h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
     vault = tmp_path / "vault"
@@ -458,6 +459,63 @@ def test_is_resumed_session_handles_collision_pair(tmp_path, monkeypatch, capsys
                  "project_path": f'"{cwd}"'})
 
     result = obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid)
-    assert result is True
+    assert result is False  # ← changed from True
     captured = capsys.readouterr()
-    assert "WARN" in captured.err or "collision" in captured.err.lower()
+    assert "WARN" in captured.err or "collide" in captured.err.lower()  # 'collide' (singular)
+
+
+def test_peek_frontmatter_field_handles_invalid_utf8(tmp_path, capsys):
+    """A file with invalid UTF-8 bytes returns None and logs to stderr,
+    rather than raising and breaking the resolver chain."""
+    note = tmp_path / "n.md"
+    note.write_bytes(b"---\ntype: claude-session\nbad: \xff\xfe\n---\n")
+    result = obsidian_utils._peek_frontmatter_type(note)
+    assert result is None
+    captured = capsys.readouterr()
+    assert "cannot read" in captured.err.lower() or "decode" in captured.err.lower()
+
+
+def test_peek_frontmatter_field_logs_empty_value(tmp_path, capsys):
+    """Empty-but-present field is logged as a possible corruption signal."""
+    note = tmp_path / "n.md"
+    _write_note(note, {"type": "", "session_id": "abc"})
+    result = obsidian_utils._peek_frontmatter_type(note)
+    assert result is None
+    captured = capsys.readouterr()
+    assert "empty" in captured.err.lower()
+
+
+def test_resolve_logs_when_sessions_dir_missing(tmp_path, capsys):
+    """When sessions_dir doesn't exist, resolver logs to stderr (so a
+    misconfigured vault path is observable), then returns no-match."""
+    missing = tmp_path / "nonexistent"
+    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+        missing, "abcd", cwd="/cwd/x"
+    )
+    assert basename is None
+    assert collisions == []
+    captured = capsys.readouterr()
+    assert "does not exist" in captured.err.lower() or "no-match" in captured.err.lower()
+
+
+def test_is_resumed_session_returns_false_on_cross_project_collision(tmp_path, monkeypatch, capsys):
+    """Cross-project hash collision: a session-type note exists with the
+    matching hash but project_path != cwd. Function returns False (this
+    is NOT our resumed session) and warns."""
+    sid = "fresh-session-id"
+    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    # Single session-type note belonging to a DIFFERENT project
+    _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                {"type": "claude-session", "session_id": "other-project-sid",
+                 "project_path": '"/some/other/project"'})
+
+    result = obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid)
+    assert result is False, (
+        "Cross-project hash collision should NOT mark this session as resumed; "
+        "the colliding note belongs to a different project."
+    )
