@@ -521,6 +521,13 @@ def scan(
                         jsonl_path = sess_jsonl_dir / f"{current_sid}.jsonl"
                         if jsonl_path.exists():
                             window = _jsonl_window(str(jsonl_path))
+                    if window is None:
+                        # I4 fix: when project-dir lookup misses (e.g., worktree-
+                        # suffixed project name in the session note), try global
+                        # JSONL search by UUID.
+                        fallback_path = _find_jsonl_anywhere(current_sid)
+                        if fallback_path is not None:
+                            window = _jsonl_window(str(fallback_path))
                     if day_start is not None and window is not None:
                         day_end = day_start + 86400
                         first_ts, last_ts = window

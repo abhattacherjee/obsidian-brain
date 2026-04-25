@@ -1628,3 +1628,107 @@ def test_list_all_session_notes_warns_on_malformed_frontmatter(tmp_path, capsys)
     assert out == {}, f"expected empty dict for malformed-only dir, got {out}"
     assert "[vault_doctor] malformed frontmatter, skipped:" in captured.err
     assert "2026-04-22-malformed.md" in captured.err
+
+
+def test_phase_1b_fallback_via_find_jsonl_anywhere(tmp_path, monkeypatch):
+    """Phase 1b's session-window lookup must fall back to _find_jsonl_anywhere
+    when the session-note's worktree-suffixed `project:` does not resolve via
+    `_jsonl_dir_for_project`. Without the fix, the date matcher proposes a
+    different (canonical-project) session as a stale rewrite (review I4)."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    (vault / "claude-insights").mkdir(parents=True)
+
+    # Single canonical project dir under HOME=tmp_path. Both JSONLs live here
+    # (worktrees share parent-repo CC project dir), but the session-NOTE for
+    # sid_correct claims a worktree-suffixed `project:` value that won't
+    # resolve via _jsonl_dir_for_project.
+    canonical_dir = tmp_path / ".claude" / "projects" / "-Users-foo-obsidian-brain"
+    canonical_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # Day used for note + sessions
+    day_start = calendar.timegm(time.strptime("2026-04-20 00:00", "%Y-%m-%d %H:%M"))
+
+    # sid_correct: window covers most of the day; session note claims
+    # worktree-suffixed project name
+    sid_correct = "11111111-1111-1111-1111-111111111111"
+    correct_first = day_start + 9 * 3600
+    correct_last = day_start + 18 * 3600
+    _write_jsonl(
+        canonical_dir / f"{sid_correct}.jsonl",
+        datetime.fromtimestamp(correct_first, tz=timezone.utc).isoformat(),
+        correct_last,
+    )
+    correct_note = vault / "claude-sessions" / "2026-04-20-obsidian-brain-corr.md"
+    correct_note.write_text(
+        "---\n"
+        "type: claude-session\n"
+        "date: 2026-04-20\n"
+        f"session_id: {sid_correct}\n"
+        # Worktree-suffixed project — _jsonl_dir_for_project misses this.
+        "project: obsidian-brain--issue-81-slug\n"
+        "status: summarized\n"
+        "---\n# s\n",
+        encoding="utf-8",
+    )
+
+    # sid_wrong: also on 2026-04-20; session note claims canonical project.
+    # Without the fix, the date matcher (operating in canonical project's idx)
+    # picks this as the "correct" target, producing a stale-flag false positive.
+    sid_wrong = "22222222-2222-2222-2222-222222222222"
+    wrong_first = day_start + 8 * 3600
+    wrong_last = day_start + 19 * 3600
+    _write_jsonl(
+        canonical_dir / f"{sid_wrong}.jsonl",
+        datetime.fromtimestamp(wrong_first, tz=timezone.utc).isoformat(),
+        wrong_last,
+    )
+    (vault / "claude-sessions" / "2026-04-20-obsidian-brain-wrng.md").write_text(
+        "---\n"
+        "type: claude-session\n"
+        "date: 2026-04-20\n"
+        f"session_id: {sid_wrong}\n"
+        "project: obsidian-brain\n"
+        "status: summarized\n"
+        "---\n# s\n",
+        encoding="utf-8",
+    )
+
+    # Insight: project=obsidian-brain (canonical), source_session=sid_correct,
+    # source_session_note=basename of sid_correct's note.
+    insight = vault / "claude-insights" / "2026-04-20-i4-fallback.md"
+    insight.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-04-20\n"
+        f"source_session: {sid_correct}\n"
+        'source_session_note: "[[2026-04-20-obsidian-brain-corr]]"\n'
+        "project: obsidian-brain\n"
+        "tags:\n"
+        "  - claude/insight\n"
+        "  - claude/project/obsidian-brain\n"
+        "---\n# body\n",
+        encoding="utf-8",
+    )
+    insight_mtime = day_start + 12 * 3600
+    os.utime(insight, (insight_mtime, insight_mtime))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project="obsidian-brain",
+    )
+    flagged_stale = [
+        i for i in issues
+        if i.note_path == str(insight)
+        and not i.extra.get("unresolved")
+        and not i.extra.get("basename_only")
+    ]
+    assert flagged_stale == [], (
+        f"Phase 1b fallback failed: matcher proposed a wrong-session rewrite "
+        f"despite sid_correct having a real JSONL. Flagged: "
+        f"{[(i.proposed_source, i.extra) for i in flagged_stale]}"
+    )
