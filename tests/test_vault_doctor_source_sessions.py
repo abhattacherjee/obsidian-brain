@@ -1903,3 +1903,136 @@ def test_scan_reason_text_branches_by_signal(doctor_vault, monkeypatch):
         f"created_at-signal reason should describe capture_time, got: {ca_issue.reason}"
     )
     assert "matches session" in ca_issue.reason and "window" in ca_issue.reason
+
+
+def test_scan_reason_text_for_mtime_fallback_uses_point_in_window(
+    doctor_vault, monkeypatch
+):
+    """Copilot R4-1: when capture_signal is 'mtime' AND there's no fm.date
+    AND no YYYY-MM-DD filename prefix, scan() falls through to the point-in-
+    window matcher (not day-overlap). Reason text must say 'capture_time
+    matches session window' not 'calendar day overlaps session window'.
+    """
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    sid_target = "55555555-5555-5555-5555-555555555555"
+    t_first = datetime(2026, 4, 24, 10, 0, tzinfo=timezone.utc).timestamp()
+    t_last = datetime(2026, 4, 24, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(
+        jsonl_dir / f"{sid_target}.jsonl",
+        datetime.fromtimestamp(t_first, tz=timezone.utc).isoformat(),
+        t_last,
+    )
+    _write_session_note(
+        vault / "claude-sessions", "2026-04-24", project, sid_target, "tgt5"
+    )
+
+    # Note with NO created_at, NO date frontmatter, NO YYYY-MM-DD filename prefix.
+    # Filename is intentionally non-date-prefixed.
+    note = vault / "claude-insights" / "mtime-only-no-date-no-filename.md"
+    note.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        "source_session: 00000000-0000-0000-0000-000000000055\n"
+        'source_session_note: "[[bogus]]"\n'
+        f"project: {project}\n"
+        "tags:\n"
+        f"  - claude/insight\n"
+        "---\n# m\n",
+        encoding="utf-8",
+    )
+    os.utime(note, (t_first + 1800, t_first + 1800))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(note)]
+    assert flagged, "mtime-only note should flag (mtime falls inside window)"
+    issue = flagged[0]
+    assert issue.extra.get("capture_signal") == "mtime"
+    assert "capture_time" in issue.reason, (
+        f"mtime fallback uses point-in-window matcher; reason should say "
+        f"'capture_time' not 'calendar day'. Got: {issue.reason}"
+    )
+    assert "calendar day" not in issue.reason, (
+        f"mtime-fallback reason must not claim calendar-day overlap. Got: {issue.reason}"
+    )
+
+
+def test_convergence_guard_excludes_created_at_signal(doctor_vault, monkeypatch):
+    """Copilot R4-2: created_at signal uses point-in-window matching with
+    sub-day precision. Two legitimate stale insights from the same session
+    sharing a proposal target is normal — not heuristic collapse — so they
+    must NOT be capped to 0.4 by the convergence guard.
+    """
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    sid_target = "66666666-6666-6666-6666-666666666666"
+    t_first = datetime(2026, 4, 25, 9, 0, tzinfo=timezone.utc).timestamp()
+    t_last = datetime(2026, 4, 25, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(
+        jsonl_dir / f"{sid_target}.jsonl",
+        datetime.fromtimestamp(t_first, tz=timezone.utc).isoformat(),
+        t_last,
+    )
+    _write_session_note(
+        vault / "claude-sessions", "2026-04-25", project, sid_target, "tgt6"
+    )
+
+    # Two insights with created_at signal both stale-pointing at a missing UUID.
+    # Both will be matched to sid_target (point-in-window). Without the R4-2
+    # fix, the convergence guard would cap both to 0.4 — a false positive.
+    for slug, ts in (("alpha", "2026-04-25T10:00:00+00:00"),
+                     ("beta", "2026-04-25T11:30:00+00:00")):
+        n = vault / "claude-insights" / f"created-at-conv-{slug}.md"
+        n.write_text(
+            "---\n"
+            "type: claude-insight\n"
+            f"created_at: {ts}\n"
+            "source_session: 00000000-0000-0000-0000-000000000066\n"
+            'source_session_note: "[[bogus]]"\n'
+            f"project: {project}\n"
+            "tags:\n"
+            f"  - claude/insight\n"
+            "---\n# x\n",
+            encoding="utf-8",
+        )
+        os.utime(n, (t_first + 3600, t_first + 3600))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    created_at_flags = [
+        i for i in issues
+        if i.extra.get("capture_signal") == "created_at"
+        and i.extra.get("proposed_sid") == sid_target
+    ]
+    assert len(created_at_flags) == 2, (
+        f"expected exactly 2 created_at flags converging on {sid_target}, "
+        f"got {len(created_at_flags)}"
+    )
+    for issue in created_at_flags:
+        assert issue.confidence == 0.95, (
+            f"created_at-signal flag must keep its 0.95 confidence — "
+            f"convergence guard should not cap created_at. Got: {issue.confidence}"
+        )
+        assert not issue.extra.get("convergence_warning"), (
+            f"convergence_warning must be False for created_at flags. "
+            f"Got: {issue.extra}"
+        )

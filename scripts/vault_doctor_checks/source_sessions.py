@@ -682,10 +682,14 @@ def scan(
 
             # Day-precision signals: match by greatest overlap with UTC calendar day.
             # Sub-day precision (created_at): match by point-in-window.
+            # Track which matcher actually ran so the reason text below
+            # describes the right contract (Copilot R4: mtime with no date or
+            # filename prefix falls through to point-in-window matching).
+            note_date_for_match = ""
+            used_day_overlap = False
             if capture_signal == "created_at":
                 match = _find_matching_session(capture_time, jsonl_dir, idx)
             else:
-                # Derive note's date from frontmatter or filename prefix
                 note_date_for_match = fm.get("date", "")
                 if not note_date_for_match:
                     fn_match = _FILENAME_DATE_RE.match(note.name)
@@ -694,6 +698,7 @@ def scan(
                     match = _find_matching_session_by_day_overlap(
                         note_date_for_match, jsonl_dir, idx
                     )
+                    used_day_overlap = True
                 else:
                     match = _find_matching_session(capture_time, jsonl_dir, idx)
             if match is None:
@@ -736,27 +741,23 @@ def scan(
                 proposed_conf = 0.3  # below convergence floor; never auto-apply
             else:
                 proposed_conf = 0.6
-            # Build reason text matching the matcher used: point-in-window
-            # for created_at (timestamp inside session window) vs day-overlap
-            # for date/filename (calendar day overlaps session window).
-            if capture_signal == "created_at":
+            # Build reason text matching the matcher actually used (Copilot R4):
+            # day-overlap → describe calendar-day match; point-in-window →
+            # describe capture_time match. mtime with no date/filename takes
+            # the point-in-window branch even though signal != created_at.
+            if used_day_overlap:
+                reason = (
+                    f"note calendar day {note_date_for_match}"
+                    f" (signal={capture_signal}, conf={capture_conf})"
+                    f" overlaps session {match['sid'][:8]} window most, "
+                    f"not current source {current_sid[:8]}"
+                )
+            else:
                 reason = (
                     f"note capture_time "
                     f"{datetime.fromtimestamp(capture_time, timezone.utc).isoformat(timespec='seconds')}"
                     f" (signal={capture_signal}, conf={capture_conf})"
                     f" matches session {match['sid'][:8]} window, "
-                    f"not current source {current_sid[:8]}"
-                )
-            else:
-                # day-overlap matcher: synthetic capture_time may NOT be inside
-                # the winning session's window — describe the calendar-day match.
-                note_day = datetime.fromtimestamp(
-                    capture_time, timezone.utc
-                ).strftime("%Y-%m-%d")
-                reason = (
-                    f"note calendar day {note_day}"
-                    f" (signal={capture_signal}, conf={capture_conf})"
-                    f" overlaps session {match['sid'][:8]} window most, "
                     f"not current source {current_sid[:8]}"
                 )
             issues.append(
@@ -776,15 +777,24 @@ def scan(
                 )
             )
 
-    # Convergence guard: if multiple flags in a project propose
-    # the same target session, the date-window heuristic has structurally
-    # collapsed across a multi-session day. Lower confidence and tag for
-    # operator review.
+    # Convergence guard: if multiple flags in a project propose the same
+    # target session, the date-window heuristic has structurally collapsed
+    # across a multi-session day. Lower confidence and tag for operator review.
+    #
+    # Restrict the guard to day-precision signals (date/filename/mtime) —
+    # `created_at` matches use point-in-window with sub-day precision, so two
+    # legitimate stale notes from the same session sharing a proposal target
+    # is just normal cluster behavior, not heuristic collapse (Copilot R4-2).
     from collections import Counter
+    _DAY_PRECISION_SIGNALS = {"date", "filename", "mtime"}
     targets = Counter(
         (i.project, i.extra.get("proposed_sid", ""))
         for i in issues
-        if i.extra.get("proposed_sid") and not i.extra.get("basename_only")
+        if (
+            i.extra.get("proposed_sid")
+            and not i.extra.get("basename_only")
+            and i.extra.get("capture_signal") in _DAY_PRECISION_SIGNALS
+        )
     )
     issues = [
         dataclasses.replace(
@@ -799,6 +809,7 @@ def scan(
         if (
             not i.extra.get("basename_only")
             and i.extra.get("proposed_sid")
+            and i.extra.get("capture_signal") in _DAY_PRECISION_SIGNALS
             and targets[(i.project, i.extra.get("proposed_sid", ""))] >= 2
         )
         else i
