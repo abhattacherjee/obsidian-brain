@@ -117,6 +117,47 @@ def _first_seen_date(sid: str) -> str:
     return today
 
 
+def _peek_frontmatter_field(path: Path, field: str) -> str | None:
+    """Return the unquoted YAML scalar for ``field:`` from a vault note's
+    frontmatter, or None. Reads at most 30 lines to keep the cost negligible
+    even when called on hash-collision (which is rare).
+
+    Stops at the closing ``---`` marker. Quote-stripping handles the common
+    cases ``"value"`` and ``'value'``; unquoted scalars are returned verbatim.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            in_frontmatter = False
+            for i, line in enumerate(fh):
+                if i >= 30:
+                    break
+                stripped = line.strip()
+                if stripped == "---":
+                    if not in_frontmatter:
+                        in_frontmatter = True
+                        continue
+                    break  # closing marker
+                if not in_frontmatter:
+                    continue
+                if stripped.startswith(f"{field}:"):
+                    value = stripped[len(field) + 1:].strip()
+                    if (value.startswith('"') and value.endswith('"')) or \
+                       (value.startswith("'") and value.endswith("'")):
+                        value = value[1:-1]
+                    return value
+    except OSError:
+        return None
+    return None
+
+
+def _peek_frontmatter_type(path: Path) -> str | None:
+    return _peek_frontmatter_field(path, "type")
+
+
+def _peek_frontmatter_project_path(path: Path) -> str | None:
+    return _peek_frontmatter_field(path, "project_path")
+
+
 # --- Secure working directory ---
 # All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
 # This prevents symlink attacks and cache poisoning on multi-user systems.

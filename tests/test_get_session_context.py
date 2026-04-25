@@ -227,3 +227,40 @@ def test_session_end_filename_uses_marker_date(isolated_home, monkeypatch):
     filename = obsidian_utils.make_filename(date_str, project_slug, sid)
     assert filename.startswith("2026-04-25-obsidian-brain-")
     assert filename.endswith(".md")
+
+
+def _write_note(path: Path, frontmatter: dict, body: str = "body\n") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["---"]
+    for k, v in frontmatter.items():
+        lines.append(f"{k}: {v}")
+    lines.append("---")
+    lines.append(body)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def test_peek_frontmatter_type_reads_session(tmp_path):
+    note = tmp_path / "n.md"
+    _write_note(note, {"type": "claude-session", "session_id": "abc"})
+    assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
+
+
+def test_peek_frontmatter_type_reads_snapshot(tmp_path):
+    note = tmp_path / "n.md"
+    _write_note(note, {"type": "claude-snapshot", "session_id": "abc"})
+    assert obsidian_utils._peek_frontmatter_type(note) == "claude-snapshot"
+
+
+def test_peek_frontmatter_type_returns_none_when_missing(tmp_path):
+    note = tmp_path / "n.md"
+    _write_note(note, {"session_id": "abc"})
+    assert obsidian_utils._peek_frontmatter_type(note) is None
+
+
+def test_peek_frontmatter_project_path_strips_quotes(tmp_path):
+    note = tmp_path / "n.md"
+    _write_note(note, {
+        "type": "claude-session",
+        "project_path": '"/Users/a/dev/obsidian-brain"',
+    })
+    assert obsidian_utils._peek_frontmatter_project_path(note) == "/Users/a/dev/obsidian-brain"
