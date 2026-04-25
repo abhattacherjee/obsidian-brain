@@ -183,6 +183,8 @@ def main() -> int:
                     "unresolved": i.extra.get("unresolved", False),
                     "capture_signal": i.extra.get("capture_signal", ""),
                     "capture_confidence": i.extra.get("capture_confidence", 0.0),
+                    "convergence_warning": i.extra.get("convergence_warning", False),
+                    "convergence_count": i.extra.get("convergence_count", 0),
                 }
                 for issues in issues_by_check.values() for i in issues
             ],

@@ -85,12 +85,14 @@ Parse the JSON and present a grouped-by-project table.
 
 For each issue, after the `proposed:` line (when present), render a
 `signal: <capture_signal> (conf <capture_confidence>)` line. The values
-come from `extra.capture_signal` and `extra.capture_confidence` in the
-JSON payload. This makes heuristic-fall cases visible to the operator
-before they decide whether to apply (e.g., `signal=mtime conf=0.5`
-indicates no immutable signal was available — the operator should
-sample a few flagged notes before running `fix`). For unresolved
-issues with no `proposed:` line, render `signal:` after `reason:`.
+come from the top-level `capture_signal` and `capture_confidence` fields
+in the JSON payload (not from `extra.*`). This makes heuristic-fall cases
+visible to the operator before they decide whether to apply (e.g.,
+`signal=mtime conf=0.3` indicates no immutable signal was available — the
+operator should sample a few flagged notes before running `fix`). For
+unresolved issues with no `proposed:` line, render `signal:` after `reason:`.
+When `convergence_warning` is `true` in the issue, prefix the issue line
+with `[CONVERGED <N> flags]` where `N` is `convergence_count`.
 
 Example:
 
