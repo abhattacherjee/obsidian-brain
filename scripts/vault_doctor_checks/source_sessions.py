@@ -78,9 +78,11 @@ def _parse_frontmatter(text: str, source: str | None = None) -> dict:
     Flat-only by design — multiline scalars, folded YAML (``key:\\n  value``),
     block sequences nested under a key, and other non-flat YAML constructs are
     silently skipped. When a key without a same-line value is followed by an
-    indented continuation line that looks like folded YAML, a one-shot stderr
-    warning is emitted (review SF5) so operators can spot high-confidence
-    signals being silently degraded to mtime fallbacks.
+    indented continuation line that looks like folded YAML, a stderr warning
+    is emitted once per ``(file, key)`` within this parse (review SF5) so
+    operators can spot high-confidence signals being silently degraded to
+    mtime fallbacks. Note: dedup is per-call — the same folded key in two
+    different files (or two re-parses of the same file) will each warn.
 
     Args:
         text: full file contents (frontmatter must start at byte 0).
@@ -312,7 +314,9 @@ def _jsonl_dir_for_project(project: str) -> Path | None:
     return winner
 
 
-def _find_jsonl_anywhere(sid: str) -> Path | None:
+def _find_jsonl_anywhere(
+    sid: str, cache: dict[str, Path | None] | None = None
+) -> Path | None:
     """Locate ~/.claude/projects/*/<sid>.jsonl across all CC project dirs.
 
     UUIDs are globally unique, so this is safe even though it ignores the
@@ -323,10 +327,15 @@ def _find_jsonl_anywhere(sid: str) -> Path | None:
     normalization is irrelevant here — there's no need to normalize the
     input project name (the SID alone is sufficient to disambiguate).
     """
+    if cache is not None and sid in cache:
+        return cache[sid]
     home = os.environ.get("HOME", os.path.expanduser("~"))
     pattern = os.path.join(home, ".claude", "projects", "*", f"{sid}.jsonl")
     matches = sorted(glob.glob(pattern))
-    return Path(matches[0]) if matches else None
+    result = Path(matches[0]) if matches else None
+    if cache is not None:
+        cache[sid] = result
+    return result
 
 
 def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
@@ -501,6 +510,9 @@ def scan(
     session_index_cache: dict[str, dict[str, dict]] = {}
     jsonl_dir_cache: dict[str, Path | None] = {}
     global_sid_index: dict[str, dict] | None = None  # built lazily on first need
+    # Per-scan memoization for _find_jsonl_anywhere — avoids O(N_notes * N_projects)
+    # filesystem walks when many notes hit the worktree-suffixed project fallback.
+    jsonl_anywhere_cache: dict[str, Path | None] = {}
 
     for folder in scan_folders:
         folder_path = vault / folder
@@ -592,7 +604,9 @@ def scan(
                         # I4 fix: when project-dir lookup misses (e.g., worktree-
                         # suffixed project name in the session note), try global
                         # JSONL search by UUID.
-                        fallback_path = _find_jsonl_anywhere(current_sid)
+                        fallback_path = _find_jsonl_anywhere(
+                            current_sid, cache=jsonl_anywhere_cache
+                        )
                         if fallback_path is not None:
                             window = _jsonl_window(str(fallback_path))
                     if day_start is not None and window is not None:
@@ -638,7 +652,9 @@ def scan(
                     # Emit an unresolved diagnostic Issue so operators can see
                     # the coverage gap; UUID is authoritative, so don't propose
                     # a different-session rewrite.
-                    jsonl_path = _find_jsonl_anywhere(current_sid)
+                    jsonl_path = _find_jsonl_anywhere(
+                        current_sid, cache=jsonl_anywhere_cache
+                    )
                     if jsonl_path is not None:
                         issues.append(
                             Issue(
@@ -710,15 +726,39 @@ def scan(
             if match["sid"] == current_sid:
                 continue  # correct
 
-            # Cap confidence on date-only signals: multi-session days collapse
-            # onto a single noon-UTC bucket and produce uniform proposals.
-            # `created_at` is the only signal precise enough for high confidence.
+            # Cap confidence on date-only signals: day-precision matching can still
+            # be ambiguous on multi-session days because multiple windows may overlap
+            # the same UTC calendar day. `created_at` is the only signal precise
+            # enough for high confidence.
             if capture_signal == "created_at":
                 proposed_conf = 0.95
             elif capture_signal == "mtime":
                 proposed_conf = 0.3  # below convergence floor; never auto-apply
             else:
                 proposed_conf = 0.6
+            # Build reason text matching the matcher used: point-in-window
+            # for created_at (timestamp inside session window) vs day-overlap
+            # for date/filename (calendar day overlaps session window).
+            if capture_signal == "created_at":
+                reason = (
+                    f"note capture_time "
+                    f"{datetime.fromtimestamp(capture_time, timezone.utc).isoformat(timespec='seconds')}"
+                    f" (signal={capture_signal}, conf={capture_conf})"
+                    f" matches session {match['sid'][:8]} window, "
+                    f"not current source {current_sid[:8]}"
+                )
+            else:
+                # day-overlap matcher: synthetic capture_time may NOT be inside
+                # the winning session's window — describe the calendar-day match.
+                note_day = datetime.fromtimestamp(
+                    capture_time, timezone.utc
+                ).strftime("%Y-%m-%d")
+                reason = (
+                    f"note calendar day {note_day}"
+                    f" (signal={capture_signal}, conf={capture_conf})"
+                    f" overlaps session {match['sid'][:8]} window most, "
+                    f"not current source {current_sid[:8]}"
+                )
             issues.append(
                 Issue(
                     check=NAME,
@@ -726,13 +766,7 @@ def scan(
                     project=note_project,
                     current_source=current_source_display,
                     proposed_source=f"[[{match['basename']}]]",
-                    reason=(
-                        f"note capture_time "
-                        f"{datetime.fromtimestamp(capture_time, timezone.utc).isoformat(timespec='seconds')}"
-                        f" (signal={capture_signal}, conf={capture_conf})"
-                        f" matches session {match['sid'][:8]} window, "
-                        f"not current source {current_sid[:8]}"
-                    ),
+                    reason=reason,
                     confidence=proposed_conf,
                     extra={
                         "proposed_sid": match["sid"],

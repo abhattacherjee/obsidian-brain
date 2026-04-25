@@ -1789,3 +1789,117 @@ def test_find_jsonl_anywhere_returns_none_when_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".claude" / "projects" / "-Users-foo-projX").mkdir(parents=True)
     assert ss._find_jsonl_anywhere("99999999-9999-9999-9999-999999999999") is None
+
+
+def test_find_jsonl_anywhere_uses_cache(tmp_path, monkeypatch):
+    """Copilot R3: per-scan cache amortizes glob cost when scan() looks up the
+    same UUID multiple times across notes (or both Phase 1b paths)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sid = "deadbeef-dead-beef-dead-deadbeefdead"
+    cc = tmp_path / ".claude" / "projects" / "-Users-foo-projC"
+    cc.mkdir(parents=True)
+    (cc / f"{sid}.jsonl").write_text("{}\n")
+
+    cache: dict[str, ss.Path | None] = {}
+    first = ss._find_jsonl_anywhere(sid, cache=cache)
+    assert first is not None
+    assert sid in cache and cache[sid] == first
+
+    # Now break globbing — if cache works, lookup still succeeds.
+    monkeypatch.setattr(ss.glob, "glob", lambda pattern: [])
+    second = ss._find_jsonl_anywhere(sid, cache=cache)
+    assert second == first, "cache hit must short-circuit the glob"
+
+    # Negative cache: a missing SID is also memoized.
+    miss_sid = "11111111-1111-1111-1111-111111111111"
+    missed = ss._find_jsonl_anywhere(miss_sid, cache=cache)
+    assert missed is None
+    assert miss_sid in cache and cache[miss_sid] is None
+
+
+def test_scan_reason_text_branches_by_signal(doctor_vault, monkeypatch):
+    """Copilot R3: day-precision matches (date/filename signal) describe a
+    calendar-day overlap; created_at matches describe a point-in-window match.
+    Reason strings must reflect the actual matcher used.
+    """
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # date-signal: insight has frontmatter `date:` only. Day-overlap matcher fires.
+    sid_date_target = "33333333-3333-3333-3333-333333333333"
+    d_first = datetime(2026, 4, 22, 8, 0, tzinfo=timezone.utc).timestamp()
+    d_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(
+        jsonl_dir / f"{sid_date_target}.jsonl",
+        datetime.fromtimestamp(d_first, tz=timezone.utc).isoformat(),
+        d_last,
+    )
+    _write_session_note(
+        vault / "claude-sessions", "2026-04-22", project, sid_date_target, "dtgt"
+    )
+
+    insight_date = vault / "claude-insights" / "2026-04-22-date-signal.md"
+    insight_date.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-04-22\n"
+        "source_session: 00000000-0000-0000-0000-000000000088\n"
+        'source_session_note: "[[bogus]]"\n'
+        f"project: {project}\n"
+        "tags:\n"
+        f"  - claude/insight\n"
+        "---\n# d\n",
+        encoding="utf-8",
+    )
+    os.utime(insight_date, (d_first + 3600, d_first + 3600))
+
+    # created_at-signal: insight has frontmatter `created_at:`. Point matcher fires.
+    sid_ca_target = "44444444-4444-4444-4444-444444444444"
+    c_first = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc).timestamp()
+    c_last = datetime(2026, 4, 23, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(
+        jsonl_dir / f"{sid_ca_target}.jsonl",
+        datetime.fromtimestamp(c_first, tz=timezone.utc).isoformat(),
+        c_last,
+    )
+    _write_session_note(
+        vault / "claude-sessions", "2026-04-23", project, sid_ca_target, "ctgt"
+    )
+
+    insight_ca = vault / "claude-insights" / "2026-04-23-ca-signal.md"
+    insight_ca.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        "created_at: 2026-04-23T10:30:00+00:00\n"
+        "source_session: 00000000-0000-0000-0000-000000000077\n"
+        'source_session_note: "[[bogus]]"\n'
+        f"project: {project}\n"
+        "tags:\n"
+        f"  - claude/insight\n"
+        "---\n# c\n",
+        encoding="utf-8",
+    )
+    os.utime(insight_ca, (c_first + 1800, c_first + 1800))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+
+    date_issue = next(i for i in issues if i.note_path == str(insight_date))
+    assert "calendar day" in date_issue.reason, (
+        f"date-signal reason should describe calendar-day overlap, got: {date_issue.reason}"
+    )
+    assert "overlaps session" in date_issue.reason
+
+    ca_issue = next(i for i in issues if i.note_path == str(insight_ca))
+    assert "capture_time" in ca_issue.reason, (
+        f"created_at-signal reason should describe capture_time, got: {ca_issue.reason}"
+    )
+    assert "matches session" in ca_issue.reason and "window" in ca_issue.reason

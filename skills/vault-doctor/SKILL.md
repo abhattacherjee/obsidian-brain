@@ -86,10 +86,15 @@ Parse the JSON and present a grouped-by-project table.
 For each issue, after the `proposed:` line (when present), render a
 `signal: <capture_signal> (conf <capture_confidence>)` line. The values
 come from the top-level `capture_signal` and `capture_confidence` fields
-in the JSON payload (not from `extra.*`). This makes heuristic-fall cases
-visible to the operator before they decide whether to apply (e.g.,
-`signal=mtime conf=0.3` indicates no immutable signal was available — the
-operator should sample a few flagged notes before running `fix`). For
+in the JSON payload (not from `extra.*`). `capture_confidence` reports
+how reliable the capture-time *signal* is (created_at=1.0, date=0.9,
+filename=0.85, mtime=0.5); the issue's top-level `confidence` field
+reports the *rewrite-proposal* confidence (created_at=0.95, mtime=0.3,
+otherwise 0.6) that gates `--apply --min-confidence`. The two are
+distinct — render `capture_confidence` here so heuristic-fall cases
+are visible (e.g., `signal=mtime conf=0.5` indicates no immutable
+signal was available — the operator should sample a few flagged
+notes before running `fix`). For
 unresolved issues with no `proposed:` line, render `signal:` after `reason:`.
 When `convergence_warning` is `true` in the issue, prefix the issue line
 with `[CONVERGED <N> flags]` where `N` is `convergence_count`.
@@ -105,15 +110,15 @@ vault_doctor report — 3 issue(s) across 1 check(s)
 [FAIL] 2026-04-10-recall-profiling.md
   current:  [[2026-04-09-obsidian-brain-abcd]]
   proposed: [[2026-04-10-obsidian-brain-ef01]]
-  signal:   date (conf 0.6)
-  reason:   note date 2026-04-10 (signal=date, conf=0.6) matches session ef010000 window, not current source abcd0000
+  signal:   date (conf 0.9)
+  reason:   note calendar day 2026-04-10 (signal=date, conf=0.9) overlaps session ef010000 window most, not current source abcd0000
 
 ### Project: tiny-vacation-agent (1 issue)
 [FAIL] 2026-04-11-enrichment-scope.md
   current:  [[2026-04-10-tiny-vacation-agent-aaaa]]
   proposed: [[2026-04-11-tiny-vacation-agent-bbbb]]
-  signal:   created_at (conf 0.95)
-  reason:   note created_at 2026-04-11T09:15 (signal=created_at, conf=0.95) matches session bbbb0000 window, not current source aaaa0000
+  signal:   created_at (conf 1.0)
+  reason:   note capture_time 2026-04-11T09:15:00+00:00 (signal=created_at, conf=1.0) matches session bbbb0000 window, not current source aaaa0000
 ```
 
 Use `[FAIL]` for actionable issues (those with a proposed fix) and `[WARN]` for unresolved ones (those the check could not auto-repair). Always include a one-line summary at the top with the total count.
