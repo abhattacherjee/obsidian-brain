@@ -264,3 +264,11 @@ def test_peek_frontmatter_project_path_strips_quotes(tmp_path):
         "project_path": '"/Users/a/dev/obsidian-brain"',
     })
     assert obsidian_utils._peek_frontmatter_project_path(note) == "/Users/a/dev/obsidian-brain"
+
+
+def test_peek_frontmatter_field_empty_value_returns_none(tmp_path):
+    """An empty scalar (`field:` with no value) returns None, not ''.
+    Lets resolver call sites use truthy checks safely."""
+    note = tmp_path / "n.md"
+    _write_note(note, {"type": "", "session_id": "abc"})
+    assert obsidian_utils._peek_frontmatter_type(note) is None

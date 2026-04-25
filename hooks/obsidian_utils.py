@@ -124,6 +124,8 @@ def _peek_frontmatter_field(path: Path, field: str) -> str | None:
 
     Stops at the closing ``---`` marker. Quote-stripping handles the common
     cases ``"value"`` and ``'value'``; unquoted scalars are returned verbatim.
+    Empty values (``field:`` with no scalar) are normalized to None for clean
+    truthy-checks at call sites.
     """
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -144,7 +146,7 @@ def _peek_frontmatter_field(path: Path, field: str) -> str | None:
                     if (value.startswith('"') and value.endswith('"')) or \
                        (value.startswith("'") and value.endswith("'")):
                         value = value[1:-1]
-                    return value
+                    return value or None
     except OSError:
         return None
     return None
