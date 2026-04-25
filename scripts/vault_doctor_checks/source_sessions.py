@@ -114,6 +114,41 @@ def _parse_date_midpoint(date_str: str) -> float | None:
         return None
 
 
+# Filename prefix YYYY-MM-DD-...
+_FILENAME_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-")
+
+
+def _capture_time(note_path: Path, fm: dict) -> tuple[float, float, str]:
+    """Return (POSIX_ts, confidence, signal_name) using immutable signals first.
+
+    Preference order:
+      1. fm['created_at'] ISO-8601                 → conf 1.0,  signal 'created_at'
+      2. fm['date'] YYYY-MM-DD (interpreted as     → conf 0.9,  signal 'date'
+         midpoint of UTC day)
+      3. filename prefix YYYY-MM-DD-...            → conf 0.85, signal 'filename'
+      4. os.path.getmtime() (last resort)          → conf 0.5,  signal 'mtime'
+      5. unreadable file                           → conf 0.0,  signal 'none'
+
+    Confidence is surfaced in the issue payload so the report can
+    distinguish high-signal matches from low-signal fallbacks.
+    """
+    # 1. created_at
+    if (ts := _parse_iso_ts(fm.get("created_at", ""))) is not None:
+        return (ts, 1.0, "created_at")
+    # 2. date (day-precision)
+    if (ts := _parse_date_midpoint(fm.get("date", ""))) is not None:
+        return (ts, 0.9, "date")
+    # 3. filename prefix
+    if (m := _FILENAME_DATE_RE.match(note_path.name)):
+        if (ts := _parse_date_midpoint(m.group(1))) is not None:
+            return (ts, 0.85, "filename")
+    # 4. mtime (last resort)
+    try:
+        return (os.path.getmtime(note_path), 0.5, "mtime")
+    except OSError:
+        return (0.0, 0.0, "none")
+
+
 def _jsonl_window(jsonl_path: str) -> tuple[float, float] | None:
     """Return (first_entry_ts, mtime) for a JSONL session file, or None.
 

@@ -648,3 +648,53 @@ def test_safe_project_slug_sanitizes_dots_and_separators():
     assert check._safe_project_slug("") == "unknown"
     assert check._safe_project_slug("...") == "unknown"
     assert check._safe_project_slug("valid-name_1") == "valid-name_1"
+
+
+def test_capture_time_prefers_created_at(tmp_path):
+    note = tmp_path / "2026-01-01-foo.md"
+    note.write_text("body")
+    fm = {"created_at": "2026-04-21T14:33:02+00:00", "date": "2026-03-15"}
+    ts, conf, signal = ss._capture_time(note, fm)
+    assert (conf, signal) == (1.0, "created_at")
+    expected = datetime.fromisoformat("2026-04-21T14:33:02+00:00").timestamp()
+    assert abs(ts - expected) < 0.001
+
+
+def test_capture_time_falls_back_to_date(tmp_path):
+    note = tmp_path / "1999-12-31-foo.md"
+    note.write_text("body")
+    fm = {"date": "2026-04-21"}
+    ts, conf, signal = ss._capture_time(note, fm)
+    assert (conf, signal) == (0.9, "date")
+    expected = datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert abs(ts - expected) < 0.001
+
+
+def test_capture_time_falls_back_to_filename(tmp_path):
+    note = tmp_path / "2026-04-21-foo-bar.md"
+    note.write_text("body")
+    fm = {}
+    ts, conf, signal = ss._capture_time(note, fm)
+    assert (conf, signal) == (0.85, "filename")
+    expected = datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert abs(ts - expected) < 0.001
+
+
+def test_capture_time_falls_back_to_mtime(tmp_path):
+    note = tmp_path / "no-date-prefix.md"
+    note.write_text("body")
+    fixed_mtime = 1_700_000_000.0
+    os.utime(note, (fixed_mtime, fixed_mtime))
+    fm = {}
+    ts, conf, signal = ss._capture_time(note, fm)
+    assert (conf, signal) == (0.5, "mtime")
+    assert abs(ts - fixed_mtime) < 0.001
+
+
+def test_capture_time_malformed_date_falls_through(tmp_path):
+    """Malformed date in frontmatter must not block the chain."""
+    note = tmp_path / "2026-04-21-foo.md"
+    note.write_text("body")
+    fm = {"date": "garbage"}
+    ts, conf, signal = ss._capture_time(note, fm)
+    assert (conf, signal) == (0.85, "filename")
