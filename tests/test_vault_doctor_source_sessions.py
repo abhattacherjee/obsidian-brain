@@ -1488,3 +1488,72 @@ def test_scan_day_overlap_picks_morning_session(doctor_vault, monkeypatch):
             f"day-overlap matcher should prefer morning session ({sid_morning}) "
             f"over noon session ({sid_noon}); got {flagged[0].extra.get('proposed_sid')}"
         )
+
+
+def test_scan_caps_mtime_signal_confidence_below_convergence_floor(doctor_vault, monkeypatch):
+    """When capture_signal falls all the way to mtime (no created_at, no date
+    frontmatter, no YYYY-MM-DD filename prefix), the proposed-rewrite confidence
+    must be capped at <=0.3 — below the convergence floor of 0.4 — so an
+    operator never auto-applies an mtime-only proposal (review C2)."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # Two sessions on different days so the date-overlap matcher returns a
+    # different session than the one currently referenced.
+    a_start = calendar.timegm(time.strptime("2026-04-15 10:00", "%Y-%m-%d %H:%M"))
+    a_end = a_start + 3600
+    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-15T10:00:00Z", a_end)
+    _write_session_note(vault / "claude-sessions", "2026-04-15", project, "sid-a", "aaaa")
+
+    b_start = calendar.timegm(time.strptime("2026-04-16 10:00", "%Y-%m-%d %H:%M"))
+    b_end = b_start + 4 * 3600
+    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-16T10:00:00Z", b_end)
+    _write_session_note(vault / "claude-sessions", "2026-04-16", project, "sid-b", "bbbb")
+
+    # Insight with NO created_at, NO date frontmatter, NO YYYY-MM-DD filename
+    # prefix → mtime is the only available signal. Filename intentionally
+    # avoids the date prefix.
+    insight = vault / "claude-insights" / "no-date-prefix-mtime-only.md"
+    insight.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        f"source_session: sid-a\n"
+        f'source_session_note: "[[2026-04-15-{project}-aaaa]]"\n'
+        f"project: {project}\n"
+        "tags:\n"
+        "  - claude/insight\n"
+        f"  - claude/project/{project}\n"
+        "---\n"
+        "# body\n",
+        encoding="utf-8",
+    )
+    # Set mtime inside session B's window so the matcher proposes sid-b.
+    insight_mtime = b_start + 1800
+    os.utime(insight, (insight_mtime, insight_mtime))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [
+        i for i in issues
+        if i.note_path == str(insight)
+        and not i.extra.get("unresolved")
+        and not i.extra.get("basename_only")
+    ]
+    assert len(flagged) == 1, (
+        f"expected 1 stale flag for mtime-signal insight, got {len(flagged)}: "
+        f"{[(i.confidence, i.extra) for i in flagged]}"
+    )
+    assert flagged[0].extra.get("capture_signal") == "mtime", (
+        f"test setup error: expected mtime signal, got {flagged[0].extra.get('capture_signal')}"
+    )
+    assert flagged[0].confidence <= 0.3, (
+        f"mtime-signal confidence must be <=0.3, got {flagged[0].confidence}"
+    )

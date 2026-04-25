@@ -612,6 +612,8 @@ def scan(
             # `created_at` is the only signal precise enough for high confidence.
             if capture_signal == "created_at":
                 proposed_conf = 0.95
+            elif capture_signal == "mtime":
+                proposed_conf = 0.3  # below convergence floor; never auto-apply
             else:
                 proposed_conf = 0.6
             issues.append(
