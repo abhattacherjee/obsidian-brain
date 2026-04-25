@@ -519,3 +519,95 @@ def test_is_resumed_session_returns_false_on_cross_project_collision(tmp_path, m
         "Cross-project hash collision should NOT mark this session as resumed; "
         "the colliding note belongs to a different project."
     )
+
+
+def test_safe_getcwd_returns_empty_on_cwd_gone(monkeypatch):
+    """When os.getcwd() raises (cwd deleted/unmounted — issue #105 territory),
+    _safe_getcwd returns empty string so callers fall back gracefully instead
+    of crashing SessionEnd."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    assert obsidian_utils._safe_getcwd() == ""
+
+
+def test_safe_getcwd_returns_empty_on_oserror(monkeypatch):
+    """OSError (permission, EIO) on os.getcwd() must also degrade gracefully."""
+    def _raise(*a, **kw):
+        raise OSError("EIO on cwd")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    assert obsidian_utils._safe_getcwd() == ""
+
+
+def test_resolver_glob_oserror_returns_none(tmp_path, monkeypatch, capsys):
+    """If glob raises OSError (transient I/O, permission), resolver returns
+    (None, []) and logs to stderr — does not propagate.
+
+    Patches Path.glob globally because the resolver does ``Path(sessions_dir)``
+    internally, which produces a fresh Path object whose `glob` method is
+    bound at call time.
+    """
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+
+    def _raising_glob(self, pattern):
+        raise OSError("simulated I/O error")
+    monkeypatch.setattr(Path, "glob", _raising_glob)
+
+    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+        sessions, "abcd", cwd="/cwd/x"
+    )
+    assert basename is None
+    assert collisions == []
+    captured = capsys.readouterr()
+    assert "glob failed" in captured.err.lower()
+
+
+def test_resolve_treats_type_missing_as_session(tmp_path):
+    """Legacy notes without an explicit `type:` frontmatter field still count
+    as session notes so resumed-session detection doesn't regress on
+    pre-existing vaults — matches the convention used by collect_open_items()
+    in hooks/open_item_dedup.py.
+    """
+    sessions = tmp_path
+    h = "abcd"
+    _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                {"session_id": "abc", "project_path": '"/cwd/foo"'})  # NO type
+    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+        sessions, h, cwd="/cwd/foo"
+    )
+    assert basename == f"2026-04-20-foo-{h}"
+    assert collisions == []
+
+
+def test_is_resumed_session_uses_provided_cwd_over_getcwd(tmp_path, monkeypatch):
+    """When ``cwd`` is passed explicitly, is_resumed_session uses it instead
+    of os.getcwd(). SessionEnd passes hook_input["cwd"] (Claude Code's
+    authoritative project path) so a hook process that chdir'd elsewhere
+    still classifies the session against the right project.
+    """
+    sid = "real-session-id"
+    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+
+    project_a = tmp_path / "real-project"
+    project_a.mkdir()
+    cwd_a = str(project_a)
+    _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                {"type": "claude-session", "session_id": sid,
+                 "project_path": f'"{cwd_a}"'})
+
+    # Force os.getcwd() into a DIFFERENT directory; the provided cwd must win.
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.chdir(other)
+
+    # Without cwd param: returns False (os.getcwd() doesn't match note).
+    assert obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid) is False
+
+    # With cwd param: returns True (provided cwd matches note).
+    assert obsidian_utils.is_resumed_session(
+        str(vault), "claude-sessions", sid, cwd=cwd_a
+    ) is True

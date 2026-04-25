@@ -219,8 +219,22 @@ def _resolve_session_note_by_hash(
         )
         return None, []
 
-    matches = sorted(sessions_dir.glob(f"*-{h}.md"))
-    session_matches = [m for m in matches if _peek_frontmatter_type(m) == "claude-session"]
+    try:
+        matches = sorted(sessions_dir.glob(f"*-{h}.md"))
+    except OSError as exc:
+        # Permission errors / transient I/O on the sessions dir must not crash
+        # SessionEnd. Fall back to (None, []) so callers compose a fresh name.
+        print(
+            f"[obsidian-brain] _resolve_session_note_by_hash: glob failed on "
+            f"{sessions_dir}: {exc}",
+            file=sys.stderr,
+        )
+        return None, []
+    # Treat type=None as claude-session for backward-compat with legacy notes
+    # that pre-date the explicit type frontmatter field — matches the same
+    # convention used by collect_open_items() in hooks/open_item_dedup.py.
+    session_matches = [m for m in matches
+                       if (_peek_frontmatter_type(m) or "claude-session") == "claude-session"]
     if not session_matches:
         return None, []
 
@@ -241,6 +255,19 @@ def _resolve_session_note_by_hash(
     if len(session_matches) == 1:
         return session_matches[0].stem, []
     return None, [m.name for m in session_matches]
+
+
+def _safe_getcwd() -> str:
+    """Return os.getcwd() or empty string if cwd is deleted/unmounted.
+
+    Hook paths must not crash on cwd-gone (issue #105 territory) — callers
+    that pass this to _resolve_session_note_by_hash get the (None, []) /
+    (None, [...]) lenient fallback when cwd resolution fails.
+    """
+    try:
+        return os.getcwd()
+    except (OSError, FileNotFoundError):
+        return ""
 
 
 # --- Secure working directory ---
@@ -795,7 +822,7 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     if vault_path and sessions_folder:
         sessions_dir = Path(vault_path) / sessions_folder
         resolved, collisions = _resolve_session_note_by_hash(
-            sessions_dir, h, cwd=os.getcwd()
+            sessions_dir, h, cwd=_safe_getcwd()
         )
         # WARN fires once per (session, vault, folder) — cache_set below
         # persists the result to ~/.claude/obsidian-brain/cache-<sid>.json,
@@ -3209,19 +3236,27 @@ def build_raw_fallback(
 
 
 def is_resumed_session(
-    vault_path: str, sessions_folder: str, session_id: str
+    vault_path: str, sessions_folder: str, session_id: str,
+    cwd: str | None = None,
 ) -> bool:
     """Return True iff a session-type note matching this session_id's hash
     exists for the current project. Snapshot-type notes are intentionally
     ignored (#101 Fix C), and cross-project hash collisions are skipped via
     project_path filtering. Subsumes #86.
+
+    ``cwd`` overrides ``os.getcwd()`` for the project_path filter. SessionEnd
+    callers should pass ``hook_input["cwd"]`` (the authoritative project
+    path from Claude Code) so that hook processes that have chdir'd
+    elsewhere still classify the session against the right project.
+    Falls back to ``_safe_getcwd()`` when ``cwd`` is None.
     """
     sessions_dir = Path(vault_path) / sessions_folder
     if not sessions_dir.exists():
         return False
     h = hashlib.sha256(session_id.encode()).hexdigest()[:4]
+    effective_cwd = cwd if cwd is not None else _safe_getcwd()
     resolved, collisions = _resolve_session_note_by_hash(
-        sessions_dir, h, cwd=os.getcwd()
+        sessions_dir, h, cwd=effective_cwd
     )
     if collisions:
         # Caller contract is bool-only; warn so the operator can investigate.

@@ -257,7 +257,10 @@ def _run() -> None:
             )
 
         # 7. Detect resumed session
-        resumed = is_resumed_session(vault_path, sessions_folder, session_id)
+        # Pass the authoritative cwd from hook_input so the project_path filter
+        # uses Claude Code's truth-of-record rather than os.getcwd(), which can
+        # drift if anything chdir'd inside the hook process.
+        resumed = is_resumed_session(vault_path, sessions_folder, session_id, cwd=cwd)
         if resumed:
             print(f"[obsidian-brain] resumed session detected", file=sys.stderr)
 
