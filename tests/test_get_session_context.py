@@ -364,3 +364,42 @@ def test_get_session_context_uses_type_aware_resolver(isolated_home, tmp_path, m
     assert ctx["session_note_name"] == f"2026-04-20-obsidian-brain-{h}"
     # Should NOT be the snapshot
     assert "snapshot" not in ctx["session_note_name"]
+
+
+def test_get_session_context_disambiguates_cross_project_hash_collision(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """When two session-type notes share the 4-char hash across projects,
+    get_session_context returns the cwd-matching one and emits a WARN
+    listing the other (#101 Fix C)."""
+    sid = "real-session-id"
+    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid)
+    monkeypatch.setattr(obsidian_utils, "canonical_project_name",
+                        lambda *a, **kw: "obsidian-brain")
+
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+
+    cwd_a = str(tmp_path / "obsidian-brain")
+    (tmp_path / "obsidian-brain").mkdir()
+    monkeypatch.chdir(tmp_path / "obsidian-brain")
+
+    # Two session-type notes with the SAME hash but DIFFERENT project_path —
+    # this is the cross-project hash collision the resolver disambiguates.
+    _write_note(sessions / f"2026-04-20-obsidian-brain-{h}.md",
+                {"type": "claude-session", "session_id": "sid-a",
+                 "project_path": f'"{cwd_a}"'})
+    _write_note(sessions / f"2026-04-21-other-project-{h}.md",
+                {"type": "claude-session", "session_id": "sid-b",
+                 "project_path": '"/some/other/project"'})
+
+    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+    assert ctx["session_note_name"] == f"2026-04-20-obsidian-brain-{h}", (
+        f"expected cwd-matching basename, got {ctx['session_note_name']}"
+    )
+    captured = capsys.readouterr()
+    assert "WARN" in captured.err
+    assert f"hash {h}" in captured.err
+    assert "other-project" in captured.err  # the OTHER session is named in the warning

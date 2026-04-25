@@ -760,6 +760,8 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
         resolved, collisions = _resolve_session_note_by_hash(
             sessions_dir, h, cwd=os.getcwd()
         )
+        # WARN fires once per process per (vault, folder) — the cache_set
+        # below short-circuits subsequent calls. Don't spam stderr.
         if collisions:
             print(
                 f"[obsidian-brain] WARN: hash {h} matches {len(collisions) + (1 if resolved else 0)} "
