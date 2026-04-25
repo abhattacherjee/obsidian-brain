@@ -382,6 +382,24 @@ def test_parse_date_midpoint_malformed_returns_none():
     assert ss._parse_date_midpoint("2026-13-99") is None
 
 
+@pytest.mark.parametrize(
+    "bad_date",
+    [
+        "2025-02-29",  # not a leap year
+        "2026-13-01",  # invalid month
+        "2026-04-31",  # April has 30 days
+        "",            # empty
+        "not-a-date",  # garbage
+        "2026/04/21",  # wrong separator
+        "20260421",    # no separators
+    ],
+)
+def test_parse_date_midpoint_negative_edges_return_none(bad_date):
+    """T5: invalid date strings must return None so capture-time signal
+    falls back to the next preference rather than fabricating a timestamp."""
+    assert ss._parse_date_midpoint(bad_date) is None
+
+
 def test_scan_latest_start_wins_on_boundary_tie(doctor_vault, monkeypatch):
     """When two session windows both contain capture_time, latest first_ts wins."""
     import vault_doctor_checks.source_sessions as check
@@ -1187,9 +1205,11 @@ def test_scan_caps_date_signal_confidence(doctor_vault, monkeypatch):
     assert flagged[0].confidence <= 0.6
 
 
-def test_scan_convergence_guard_lowers_confidence(doctor_vault, monkeypatch):
-    """When 2+ flags in a project converge on the same proposed session,
-    confidence drops to <= 0.4 and convergence_warning is set."""
+@pytest.mark.parametrize("n_flags", [2, 3, 5])
+def test_scan_convergence_guard_lowers_confidence(doctor_vault, monkeypatch, n_flags):
+    """When N>=2 flags in a project converge on the same proposed session,
+    confidence drops to <= 0.4 and convergence_warning is set, with
+    convergence_count == N (review T3)."""
     vault = doctor_vault["vault"]
     home = doctor_vault["home"]
     jsonl_dir = doctor_vault["jsonl_dir"]
@@ -1205,11 +1225,12 @@ def test_scan_convergence_guard_lowers_confidence(doctor_vault, monkeypatch):
                  r_last)
     _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid_real, "real")
 
-    # Two insights with bogus UUIDs that don't resolve -> matcher proposes sid_real for both
-    for slug, bogus in [
-        ("converge-1", "11111111-1111-1111-1111-111111111199"),
-        ("converge-2", "22222222-2222-2222-2222-222222222299"),
-    ]:
+    # N insights with bogus UUIDs that don't resolve -> matcher proposes sid_real for all
+    for n in range(n_flags):
+        slug = f"converge-{n+1}"
+        # Distinct bogus UUIDs ensure the global SID index doesn't resolve them,
+        # which forces the day-overlap matcher to propose sid_real for each.
+        bogus = f"{n+1:08d}-1111-1111-1111-{n+1:012d}"
         _write_insight(
             vault / "claude-insights",
             date="2026-04-22",
@@ -1228,12 +1249,12 @@ def test_scan_convergence_guard_lowers_confidence(doctor_vault, monkeypatch):
         project=project,
     )
     flagged = [i for i in issues if "converge" in i.note_path and i.extra.get("proposed_sid") == sid_real]
-    assert len(flagged) == 2, f"expected 2 convergence flags, got {len(flagged)}"
+    assert len(flagged) == n_flags, f"expected {n_flags} convergence flags, got {len(flagged)}"
     for i in flagged:
         assert i.extra.get("convergence_warning") is True, (
             f"expected convergence_warning on {i.note_path}"
         )
-        assert i.extra.get("convergence_count") == 2
+        assert i.extra.get("convergence_count") == n_flags
         assert i.confidence <= 0.4
 
 
@@ -1732,3 +1753,37 @@ def test_phase_1b_fallback_via_find_jsonl_anywhere(tmp_path, monkeypatch):
         f"despite sid_correct having a real JSONL. Flagged: "
         f"{[(i.proposed_source, i.extra) for i in flagged_stale]}"
     )
+
+
+def test_find_jsonl_anywhere_returns_first_lexicographic_match(tmp_path, monkeypatch):
+    """T1: _find_jsonl_anywhere globs across all CC project dirs and returns
+    the first match by sorted order. UUIDs are globally unique, but if the
+    same SID file appears under two project dirs (e.g., a worktree that was
+    later moved or test fixtures), the result must be deterministic across
+    runs — sorted() ensures identical-input → identical-output."""
+    proj_a = tmp_path / ".claude" / "projects" / "-Users-foo-projA"
+    proj_b = tmp_path / ".claude" / "projects" / "-Users-foo-projB"
+    proj_a.mkdir(parents=True)
+    proj_b.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    sid = "11111111-1111-1111-1111-111111111111"
+    (proj_a / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+    (proj_b / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    found = ss._find_jsonl_anywhere(sid)
+    assert found is not None
+    # sorted() returns lexicographically-first match — projA before projB
+    assert "projA" in str(found), f"expected projA winner, got {found}"
+
+    # Stability across repeated calls: sorted() is a total order on str
+    found2 = ss._find_jsonl_anywhere(sid)
+    assert found == found2
+
+
+def test_find_jsonl_anywhere_returns_none_when_missing(tmp_path, monkeypatch):
+    """T1: _find_jsonl_anywhere returns None when no project dir contains
+    a JSONL with the given SID."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude" / "projects" / "-Users-foo-projX").mkdir(parents=True)
+    assert ss._find_jsonl_anywhere("99999999-9999-9999-9999-999999999999") is None
