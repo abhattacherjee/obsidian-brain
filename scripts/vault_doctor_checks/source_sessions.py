@@ -381,10 +381,10 @@ def scan(
 
             match = _find_matching_session(capture_time, jsonl_dir, idx)
             if match is None:
-                # No JSONL window contains this mtime. Flag as unresolved ONLY if
-                # the current source doesn't resolve to any known session note — that
-                # way we don't get false positives on notes whose current source is
-                # correct but just doesn't have a matching JSONL window locally.
+                # No JSONL window contains the note's capture_time. Flag as unresolved
+                # ONLY if the current source doesn't resolve to any known session note
+                # — that way we don't get false positives on notes whose current source
+                # is correct but just doesn't have a matching JSONL window locally.
                 if current_sid not in idx:
                     issues.append(
                         Issue(
@@ -393,9 +393,16 @@ def scan(
                             project=note_project,
                             current_source=current_source_display,
                             proposed_source="",
-                            reason="no session window contains note mtime",
+                            reason=(
+                                f"no session window contains note capture_time"
+                                f" (signal={capture_signal}, conf={capture_conf})"
+                            ),
                             confidence=0.0,
-                            extra={"unresolved": True},
+                            extra={
+                                "unresolved": True,
+                                "capture_signal": capture_signal,
+                                "capture_confidence": capture_conf,
+                            },
                         )
                     )
                 continue
@@ -418,7 +425,11 @@ def scan(
                         f"not current source {current_sid[:8]}"
                     ),
                     confidence=0.95,
-                    extra={"proposed_sid": match["sid"]},
+                    extra={
+                        "proposed_sid": match["sid"],
+                        "capture_signal": capture_signal,
+                        "capture_confidence": capture_conf,
+                    },
                 )
             )
 

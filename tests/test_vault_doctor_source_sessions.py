@@ -767,3 +767,105 @@ def test_scan_ignores_mtime_when_date_present(doctor_vault, monkeypatch):
     assert str(insight) not in paths, (
         "regression: drifted mtime caused false-positive flag despite date: pointing to session A"
     )
+
+
+def test_scan_emits_capture_signal_and_confidence(doctor_vault, monkeypatch):
+    """Issue.extra must include capture_signal and capture_confidence so the
+    skill report can flag low-confidence matches to the operator."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+
+    monkeypatch.setenv("HOME", str(home))
+
+    day = "2026-04-22"
+    sid_correct = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    sid_wrong = "wwwwwwww-wwww-wwww-wwww-wwwwwwwwwwww"
+
+    ts_start = datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc).timestamp()
+    ts_end = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_correct}.jsonl",
+                 datetime.fromtimestamp(ts_start, tz=timezone.utc).isoformat(),
+                 ts_end)
+    # A different session whose window will be the *current* (wrong) source
+    other_start = datetime(2026, 4, 20, 10, 0, tzinfo=timezone.utc).timestamp()
+    other_end = datetime(2026, 4, 20, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_wrong}.jsonl",
+                 datetime.fromtimestamp(other_start, tz=timezone.utc).isoformat(),
+                 other_end)
+
+    sess_correct = _write_session_note(vault / "claude-sessions", day, project, sid_correct, "1234")
+    _write_session_note(vault / "claude-sessions", "2026-04-20", project, sid_wrong, "5678")
+
+    insight = _write_insight(
+        vault / "claude-insights",
+        date=day,
+        slug="signal-test",
+        project=project,
+        src_sid=sid_wrong,
+        src_note_basename=f"2026-04-20-{project}-5678",
+        mtime=ts_start + 1800,
+    )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(insight)]
+    assert len(flagged) == 1, "expected the wrong-source note to be flagged"
+    assert flagged[0].extra.get("capture_signal") == "date"
+    assert flagged[0].extra.get("capture_confidence") == 0.9
+    assert flagged[0].extra.get("proposed_sid") == sid_correct
+
+
+def test_scan_unresolved_reason_uses_capture_time(doctor_vault, monkeypatch):
+    """Unresolved-branch reason string must mention capture_time (not mtime)
+    and surface signal/conf in extra. (issue #93)"""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+
+    monkeypatch.setenv("HOME", str(home))
+
+    # One session, but its window is far from any plausible capture-time of the
+    # insight. Insight's source_session does not match any session in the index,
+    # so the unresolved branch fires.
+    sid_only = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    s_start = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc).timestamp()
+    s_end = datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_only}.jsonl",
+                 datetime.fromtimestamp(s_start, tz=timezone.utc).isoformat(),
+                 s_end)
+    _write_session_note(vault / "claude-sessions", "2026-01-01", project, sid_only, "ffff")
+
+    # Note dated far from any session, source_session not in idx
+    insight_mtime = datetime(2026, 4, 22, 12, 0, tzinfo=timezone.utc).timestamp()
+    _write_insight(
+        vault / "claude-insights",
+        date="2026-04-22",
+        slug="unresolved-signal",
+        project=project,
+        src_sid="not-a-real-sid",
+        src_note_basename="2026-04-22-bogus",
+        mtime=insight_mtime,
+    )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    unresolved = [i for i in issues if i.extra.get("unresolved") is True]
+    assert len(unresolved) == 1, f"expected 1 unresolved issue, got {len(unresolved)}"
+    iss = unresolved[0]
+    assert "capture_time" in iss.reason, f"reason should mention capture_time: {iss.reason!r}"
+    assert "mtime" not in iss.reason, f"reason should not mention mtime: {iss.reason!r}"
+    assert iss.extra.get("capture_signal") == "date"
+    assert iss.extra.get("capture_confidence") == 0.9
