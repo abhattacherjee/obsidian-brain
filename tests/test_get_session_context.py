@@ -7,7 +7,6 @@ from __future__ import annotations
 import datetime
 import json
 import os
-import shutil
 import uuid
 from pathlib import Path
 from unittest.mock import patch
@@ -117,6 +116,23 @@ def test_first_seen_date_chmods_existing_loose_mode_dir(isolated_home):
     sid = _unique_sid()
     obsidian_utils._first_seen_date(sid)
     assert oct(sessions.stat().st_mode)[-3:] == "700"
+
+
+def test_first_seen_date_chmods_existing_loose_mode_marker(isolated_home):
+    """If a marker file exists with overly-permissive mode (e.g., from a
+    previous bug or manual edit), the helper must self-heal it to 0o600."""
+    sessions = isolated_home / ".claude" / "obsidian-brain" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True, mode=0o700)
+    sid = _unique_sid()
+    marker = sessions / f"{sid}.json"
+    marker.write_text(
+        json.dumps({"first_seen_date": "2026-04-20", "first_seen_iso": "x"}),
+        encoding="utf-8",
+    )
+    os.chmod(marker, 0o644)  # simulate a previously-buggy permission
+
+    obsidian_utils._first_seen_date(sid)
+    assert oct(marker.stat().st_mode)[-3:] == "600"
 
 
 def test_get_session_context_fallback_uses_marker_date(isolated_home, tmp_path, monkeypatch):
@@ -275,12 +291,16 @@ def test_peek_frontmatter_field_empty_value_returns_none(tmp_path):
 
 
 def test_resolve_filters_snapshot_type(tmp_path):
+    """Defense-in-depth: even if a snapshot ever ends up with a session-shaped
+    filename (matching the resolver glob ``*-{h}.md``), the type filter must
+    exclude it. We deliberately give the snapshot a session-shaped name here
+    so the glob matches and the type filter is the only thing keeping it out."""
     sessions_dir = tmp_path
     h = "abcd"
     _write_note(sessions_dir / f"2026-04-20-foo-{h}.md",
                 {"type": "claude-session", "session_id": "real",
                  "project_path": '"/cwd/foo"'})
-    _write_note(sessions_dir / f"2026-04-20-foo-{h}-snapshot-101010.md",
+    _write_note(sessions_dir / f"2026-04-20-snap-{h}.md",
                 {"type": "claude-snapshot", "session_id": "real"})
 
     basename, collisions = obsidian_utils._resolve_session_note_by_hash(
@@ -407,7 +427,8 @@ def test_get_session_context_disambiguates_cross_project_hash_collision(
 
 def test_is_resumed_session_filters_snapshot_type(tmp_path, monkeypatch):
     """is_resumed_session must NOT return True when only a snapshot
-    exists with this hash (subsumes #86)."""
+    exists with this hash (subsumes #86). Snapshot is given a session-shaped
+    filename so the resolver glob matches and the type filter is exercised."""
     sid = "fresh-session-id"
     h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
     vault = tmp_path / "vault"
@@ -415,8 +436,8 @@ def test_is_resumed_session_filters_snapshot_type(tmp_path, monkeypatch):
     sessions.mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
 
-    # Only a snapshot exists with this hash — not a resumed session
-    _write_note(sessions / f"2026-04-20-foo-{h}-snapshot-101010.md",
+    # Snapshot with a session-shaped filename — only the type filter excludes it
+    _write_note(sessions / f"2026-04-20-foo-{h}.md",
                 {"type": "claude-snapshot", "session_id": "different"})
 
     assert obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid) is False

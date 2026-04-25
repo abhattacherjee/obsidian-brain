@@ -93,7 +93,14 @@ def _first_seen_date(sid: str) -> str:
 
     marker = marker_dir / f"{sid}.json"
     try:
-        return json.loads(marker.read_text(encoding="utf-8"))["first_seen_date"]
+        date = json.loads(marker.read_text(encoding="utf-8"))["first_seen_date"]
+        # Self-heal mode if a previous bug or manual edit left it permissive.
+        try:
+            if marker.stat().st_mode & 0o077:
+                os.chmod(marker, 0o600)
+        except OSError:
+            pass  # mode-tightening is best-effort; readback already succeeded
+        return date
     except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError):
         pass  # fall through and (re)write
 
