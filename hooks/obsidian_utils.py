@@ -50,6 +50,48 @@ _RE_RAW_CONVERSATION = re.compile(
     r"^## Conversation \(raw\)\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
 )
 
+
+def _first_seen_date(sid: str) -> str:
+    """Return the canonical first-seen calendar date for a session_id.
+
+    Atomic, idempotent, lazy: marker is written on first call and never
+    modified — every subsequent call (across days, worktrees, processes)
+    returns the same date. Used by get_session_context() and SessionEnd
+    so that source_session_note wikilinks and on-disk filenames stay in
+    lockstep even when sessions cross midnight.
+
+    Marker location: ~/.claude/obsidian-brain/sessions/<sid>.json (0o600).
+    """
+    marker_dir = Path.home() / ".claude" / "obsidian-brain" / "sessions"
+    try:
+        marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        print(f"[obsidian-brain] _first_seen_date: cannot create marker dir: {exc}",
+              file=sys.stderr)
+        return datetime.date.today().isoformat()  # graceful fallback
+
+    marker = marker_dir / f"{sid}.json"
+    try:
+        return json.loads(marker.read_text(encoding="utf-8"))["first_seen_date"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError):
+        pass  # fall through and (re)write
+
+    today = datetime.date.today().isoformat()
+    payload = {
+        "first_seen_date": today,
+        "first_seen_iso": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    tmp = marker.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(marker)  # atomic on POSIX
+    except OSError as exc:
+        print(f"[obsidian-brain] _first_seen_date: marker write failed: {exc}",
+              file=sys.stderr)
+    return today
+
+
 # --- Secure working directory ---
 # All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
 # This prevents symlink attacks and cache poisoning on multi-user systems.
