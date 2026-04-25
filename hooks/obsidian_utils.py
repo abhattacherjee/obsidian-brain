@@ -50,6 +50,10 @@ _RE_RAW_CONVERSATION = re.compile(
     r"^## Conversation \(raw\)\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
 )
 
+# Session IDs are CC UUIDs (or test fixtures). Restrict to safe filename chars
+# so the marker path never escapes ~/.claude/obsidian-brain/sessions/.
+_SID_FILENAME_SAFE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
+
 
 def _first_seen_date(sid: str) -> str:
     """Return the canonical first-seen calendar date for a session_id.
@@ -62,9 +66,19 @@ def _first_seen_date(sid: str) -> str:
 
     Marker location: ~/.claude/obsidian-brain/sessions/<sid>.json (0o600).
     """
+    if not _SID_FILENAME_SAFE.fullmatch(sid):
+        print(
+            f"[obsidian-brain] _first_seen_date: refusing unsafe sid shape; "
+            f"falling back to today's date",
+            file=sys.stderr,
+        )
+        return datetime.date.today().isoformat()
+
     marker_dir = Path.home() / ".claude" / "obsidian-brain" / "sessions"
     try:
         marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if marker_dir.stat().st_mode & 0o077:
+            os.chmod(marker_dir, 0o700)
     except OSError as exc:
         print(f"[obsidian-brain] _first_seen_date: cannot create marker dir: {exc}",
               file=sys.stderr)
@@ -81,14 +95,25 @@ def _first_seen_date(sid: str) -> str:
         "first_seen_date": today,
         "first_seen_iso": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
-    tmp = marker.with_suffix(".json.tmp")
+    tmp_path = None
     try:
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        tmp.replace(marker)  # atomic on POSIX
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{sid}.", suffix=".json.tmp", dir=str(marker_dir)
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, marker)  # atomic on POSIX
+        tmp_path = None  # rename succeeded; nothing to clean up
     except OSError as exc:
         print(f"[obsidian-brain] _first_seen_date: marker write failed: {exc}",
               file=sys.stderr)
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     return today
 
 

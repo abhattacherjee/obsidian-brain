@@ -92,3 +92,28 @@ def test_first_seen_date_corruption_self_heals(isolated_home):
     # Subsequent call returns the rewritten value, no further mutation
     result2 = obsidian_utils._first_seen_date(sid)
     assert result2 == today
+
+
+def test_first_seen_date_rejects_path_traversal_sid(isolated_home, capsys):
+    """A sid shaped like a path-traversal attempt must NOT escape the
+    marker directory; helper falls back to today's date and warns."""
+    today = datetime.date.today().isoformat()
+    result = obsidian_utils._first_seen_date("../../../etc/passwd")
+    assert result == today
+    # No marker file should have been created anywhere outside sessions/
+    sessions_dir = isolated_home / ".claude" / "obsidian-brain" / "sessions"
+    if sessions_dir.exists():
+        assert list(sessions_dir.glob("*passwd*")) == []
+    captured = capsys.readouterr()
+    assert "unsafe sid" in captured.err.lower() or "refusing" in captured.err.lower()
+
+
+def test_first_seen_date_chmods_existing_loose_mode_dir(isolated_home):
+    """mkdir(mode=0o700, exist_ok=True) is a no-op on a pre-existing dir;
+    helper must explicitly chmod 0o700 if mode is too permissive."""
+    sessions = isolated_home / ".claude" / "obsidian-brain" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    os.chmod(sessions, 0o755)  # simulate a previously-buggy permission
+    sid = _unique_sid()
+    obsidian_utils._first_seen_date(sid)
+    assert oct(sessions.stat().st_mode)[-3:] == "700"
