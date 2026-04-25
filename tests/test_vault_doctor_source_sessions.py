@@ -1013,6 +1013,222 @@ def test_scan_created_at_bypasses_early_exit(doctor_vault, monkeypatch):
     )
 
 
+def test_scan_uuid_first_lookup_across_projects(doctor_vault, monkeypatch):
+    """Phase 1b looks up source_session UUID across all projects, not just
+    the note's declared project. Insight notes from a worktree-launched skill
+    may have project=A while their actual source session has project=A--worktree-slug.
+    The UUID is globally unique; the cross-project lookup must trust it."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    project = doctor_vault["project"]  # "proj1"
+    monkeypatch.setenv("HOME", str(home))
+
+    # Create a worktree-style adjacent project's JSONL dir
+    worktree_jsonl_dir = home / ".claude" / "projects" / "-Users-foo-proj1--worktree"
+    worktree_jsonl_dir.mkdir(parents=True)
+
+    sid_w = "77777777-7777-7777-7777-777777777777"
+    w_first = datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc).timestamp()
+    w_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(worktree_jsonl_dir / f"{sid_w}.jsonl",
+                 datetime.fromtimestamp(w_first, tz=timezone.utc).isoformat(),
+                 w_last)
+
+    # Session note records project=proj1--worktree (the worktree's name)
+    sess = vault / "claude-sessions" / "2026-04-22-proj1-worktree-7777.md"
+    sess.write_text(
+        "---\n"
+        "type: claude-session\n"
+        "date: 2026-04-22\n"
+        f"session_id: {sid_w}\n"
+        "project: proj1--worktree\n"
+        "status: summarized\n"
+        "---\n"
+        "# Session\n## Summary\nstub\n",
+        encoding="utf-8",
+    )
+
+    # Insight has project=proj1 (declared from main-repo cwd) but its source
+    # session was in a worktree (project=proj1--worktree). Without UUID-first
+    # cross-project lookup, this would be flagged as stale.
+    insight = _write_insight(
+        vault / "claude-insights",
+        date="2026-04-22",
+        slug="cross-project-uuid",
+        project=project,  # "proj1"
+        src_sid=sid_w,
+        src_note_basename=sess.stem,
+        mtime=w_first + 1800,
+    )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    paths = [i.note_path for i in issues]
+    assert str(insight) not in paths, (
+        "regression: cross-project UUID resolution failed; insight flagged "
+        "despite source UUID resolving to a real session note"
+    )
+
+
+def test_scan_basename_only_repair_when_uuid_resolves(doctor_vault, monkeypatch):
+    """When the source_session UUID resolves correctly but the basename in
+    source_session_note is stale (e.g., un-truncated worktree slug vs
+    truncated actual filename), propose a basename-only repair. UUID stays."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    sid = "88888888-8888-8888-8888-888888888888"
+    s_first = datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc).timestamp()
+    s_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid}.jsonl",
+                 datetime.fromtimestamp(s_first, tz=timezone.utc).isoformat(),
+                 s_last)
+
+    # Session note exists with truncated basename
+    sess = _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid, "8888")
+
+    # Insight records a STALE (un-truncated) basename in source_session_note
+    insight_path = vault / "claude-insights" / "2026-04-22-basename-repair.md"
+    stale_basename = "2026-04-22-proj1-some-very-long-original-name-that-was-truncated-8888"
+    insight_path.write_text(
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: 2026-04-22\n"
+        f"source_session: {sid}\n"
+        f'source_session_note: "[[{stale_basename}]]"\n'
+        f"project: {project}\n"
+        f"---\n# stub\n",
+        encoding="utf-8",
+    )
+    import os as _os
+    _os.utime(insight_path, (s_first + 1800, s_first + 1800))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(insight_path)]
+    assert len(flagged) == 1, "expected basename-mismatch flag"
+    iss = flagged[0]
+    assert iss.extra.get("basename_only") is True
+    assert iss.extra.get("proposed_sid") == sid  # UUID unchanged
+    assert sess.stem in iss.proposed_source  # actual basename in proposal
+    assert iss.confidence >= 0.95
+
+
+def test_scan_caps_date_signal_confidence(doctor_vault, monkeypatch):
+    """Matcher-proposed flags using only date/filename signals must be capped
+    at confidence <= 0.6 -- multi-session days collapse onto noon-UTC and
+    produce uniform-but-wrong proposals."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    sid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa11"
+    sid_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb11"
+
+    a_first = datetime(2026, 4, 21, 10, 0, tzinfo=timezone.utc).timestamp()
+    a_last = datetime(2026, 4, 21, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_a}.jsonl",
+                 datetime.fromtimestamp(a_first, tz=timezone.utc).isoformat(),
+                 a_last)
+    b_first = datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc).timestamp()
+    b_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_b}.jsonl",
+                 datetime.fromtimestamp(b_first, tz=timezone.utc).isoformat(),
+                 b_last)
+
+    _write_session_note(vault / "claude-sessions", "2026-04-21", project, sid_a, "1111")
+    _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid_b, "2222")
+
+    # Insight on day B (sole same-day session) but source_session points to
+    # day-A session whose UUID does NOT resolve (no entry in idx for proj1)
+    bogus_sid = "00000000-0000-0000-0000-000000000000"
+    _write_insight(
+        vault / "claude-insights",
+        date="2026-04-22",
+        slug="conf-cap",
+        project=project,
+        src_sid=bogus_sid,
+        src_note_basename="2026-04-22-bogus",
+        mtime=b_first + 1800,
+    )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if "conf-cap" in i.note_path and not i.extra.get("unresolved")]
+    assert len(flagged) == 1
+    assert flagged[0].confidence <= 0.6
+
+
+def test_scan_convergence_guard_lowers_confidence(doctor_vault, monkeypatch):
+    """When 2+ flags in a project converge on the same proposed session,
+    confidence drops to <= 0.4 and convergence_warning is set."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # One real session whose window contains noon on the day notes claim
+    sid_real = "cccccccc-cccc-cccc-cccc-cccccccccc11"
+    r_first = datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc).timestamp()
+    r_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_real}.jsonl",
+                 datetime.fromtimestamp(r_first, tz=timezone.utc).isoformat(),
+                 r_last)
+    _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid_real, "real")
+
+    # Two insights with bogus UUIDs that don't resolve -> matcher proposes sid_real for both
+    for slug, bogus in [
+        ("converge-1", "11111111-1111-1111-1111-111111111199"),
+        ("converge-2", "22222222-2222-2222-2222-222222222299"),
+    ]:
+        _write_insight(
+            vault / "claude-insights",
+            date="2026-04-22",
+            slug=slug,
+            project=project,
+            src_sid=bogus,
+            src_note_basename="2026-04-22-bogus",
+            mtime=r_first + 1800,
+        )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if "converge" in i.note_path and i.extra.get("proposed_sid") == sid_real]
+    assert len(flagged) == 2, f"expected 2 convergence flags, got {len(flagged)}"
+    for i in flagged:
+        assert i.extra.get("convergence_warning") is True, (
+            f"expected convergence_warning on {i.note_path}"
+        )
+        assert i.extra.get("convergence_count") == 2
+        assert i.confidence <= 0.4
+
+
 def test_scan_trusts_cross_midnight_source(doctor_vault, monkeypatch):
     """Phase 1b extension (issue #93): a session that started the night before
     note.date and ran into note.date is the legitimate cross-midnight case.

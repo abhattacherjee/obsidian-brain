@@ -14,6 +14,7 @@ Detection strategy:
 
 from __future__ import annotations
 
+import dataclasses
 import glob
 import json
 import os
@@ -248,6 +249,40 @@ def _jsonl_dir_for_project(project: str) -> Path | None:
     return Path(max(viable, key=lambda pair: (pair[1], pair[0]))[0])
 
 
+def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
+    """Map session_id → {path, basename, date, project} across ALL projects.
+
+    Used by Phase 1b's UUID-first lookup to handle the case where a note's
+    declared `project:` doesn't match its actual source session note's
+    `project:` (e.g., insight written from main repo's cwd while the
+    session ran in a worktree). The session_id is globally unique, so
+    cross-project lookup is safe.
+    """
+    out: dict[str, dict] = {}
+    if not sessions_dir.is_dir():
+        return out
+    for entry in sessions_dir.iterdir():
+        if not entry.name.endswith(".md"):
+            continue
+        try:
+            text = entry.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        fm = _parse_frontmatter(text)
+        if not fm:
+            continue
+        sid = fm.get("session_id", "")
+        if not sid:
+            continue
+        out[sid] = {
+            "path": entry,
+            "basename": entry.name[:-3],
+            "date": fm.get("date", ""),
+            "project": fm.get("project", ""),
+        }
+    return out
+
+
 def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:
     """Map session_id → {path, basename, date} for a project's session notes."""
     out: dict[str, dict] = {}
@@ -335,6 +370,7 @@ def scan(
     issues: list[Issue] = []
     session_index_cache: dict[str, dict[str, dict]] = {}
     jsonl_dir_cache: dict[str, Path | None] = {}
+    global_sid_index: dict[str, dict] | None = None  # built lazily on first need
 
     for folder in scan_folders:
         folder_path = vault / folder
@@ -392,39 +428,73 @@ def scan(
             else:
                 current_source_display = ""
 
-            # Phase 1b — early-exit (issue #93): if the current source's JSONL
-            # window overlaps the note's calendar day, trust it. The JSONL
-            # window is the ground-truth signal for when a session was active;
-            # session-note `date:` fields can drift due to migrations, renames,
-            # or sibling vault-doctor checks. Window-overlap correctly handles
-            # strict same-day sessions, cross-midnight (started prev day, ran
-            # into note's day), early-morning captures from previous-night
-            # sessions, and multi-day sessions.
+            # Phase 1b — UUID-first authoritative signal (issue #93):
+            # if current source's UUID resolves to ANY session note in the
+            # vault (cross-project, since worktree-launched skills may write
+            # `project:` from main-repo cwd while their source session ran
+            # in a worktree), check whether the JSONL window overlaps the
+            # note's calendar day. If yes, the UUID is correct; only the
+            # basename in source_session_note may need updating.
             #
             # Only applies for day-precision signals (date, filename, mtime).
-            # When created_at provides a precise sub-day timestamp we trust
-            # the matcher — it has enough resolution to detect intra-day
-            # session boundaries even on multi-session days.
-            if (
-                current_sid
-                and current_sid in idx
-                and capture_signal != "created_at"
-                and jsonl_dir is not None
-            ):
-                note_date = fm.get("date", "")
-                if not note_date:
-                    fn_match = _FILENAME_DATE_RE.match(note.name)
-                    note_date = fn_match.group(1) if fn_match else ""
-                day_start = _parse_date_start(note_date) if note_date else None
-                if day_start is not None:
-                    day_end = day_start + 86400  # next midnight UTC
-                    current_jsonl = jsonl_dir / f"{current_sid}.jsonl"
-                    if current_jsonl.exists():
-                        window = _jsonl_window(str(current_jsonl))
-                        if window is not None:
-                            first_ts, last_ts = window
-                            if first_ts < day_end and last_ts > day_start:
-                                continue  # session active during note's day — trust
+            # When created_at provides a precise sub-day timestamp the matcher
+            # has enough resolution; let it run.
+            if current_sid and capture_signal != "created_at":
+                if global_sid_index is None:
+                    global_sid_index = _list_all_session_notes(sessions_dir)
+                if current_sid in global_sid_index:
+                    sess = global_sid_index[current_sid]
+                    sess_project = sess.get("project", "")
+                    sess_jsonl_dir = (
+                        _jsonl_dir_for_project(sess_project) if sess_project else None
+                    )
+                    note_date = fm.get("date", "")
+                    if not note_date:
+                        fn_match = _FILENAME_DATE_RE.match(note.name)
+                        note_date = fn_match.group(1) if fn_match else ""
+                    day_start = _parse_date_ts(note_date, hour=0) if note_date else None
+                    window = None
+                    if sess_jsonl_dir is not None:
+                        jsonl_path = sess_jsonl_dir / f"{current_sid}.jsonl"
+                        if jsonl_path.exists():
+                            window = _jsonl_window(str(jsonl_path))
+                    if day_start is not None and window is not None:
+                        day_end = day_start + 86400
+                        first_ts, last_ts = window
+                        if first_ts < day_end and last_ts > day_start:
+                            # UUID resolves AND window overlaps note's day → UUID is correct.
+                            # Now check if source_session_note basename is stale.
+                            actual_basename = sess["basename"]
+                            if (
+                                current_src_basename
+                                and current_src_basename != actual_basename
+                            ):
+                                # Basename mismatch (e.g., un-truncated worktree slug
+                                # vs truncated actual filename). Propose basename-only
+                                # repair; UUID stays the same.
+                                issues.append(
+                                    Issue(
+                                        check=NAME,
+                                        note_path=str(note),
+                                        project=note_project,
+                                        current_source=current_source_display,
+                                        proposed_source=f"[[{actual_basename}]]",
+                                        reason=(
+                                            f"source_session UUID {current_sid[:8]} resolves "
+                                            f"correctly but source_session_note basename is "
+                                            f"stale (expected '{actual_basename}', got "
+                                            f"'{current_src_basename}')"
+                                        ),
+                                        confidence=0.99,
+                                        extra={
+                                            "proposed_sid": current_sid,
+                                            "basename_only": True,
+                                            "capture_signal": capture_signal,
+                                            "capture_confidence": capture_conf,
+                                        },
+                                    )
+                                )
+                            continue  # UUID is authoritative either way; skip matcher
 
             match = _find_matching_session(capture_time, jsonl_dir, idx)
             if match is None:
@@ -457,6 +527,13 @@ def scan(
             if match["sid"] == current_sid:
                 continue  # correct
 
+            # Cap confidence on date-only signals: multi-session days collapse
+            # onto a single noon-UTC bucket and produce uniform proposals.
+            # `created_at` is the only signal precise enough for high confidence.
+            if capture_signal == "created_at":
+                proposed_conf = 0.95
+            else:
+                proposed_conf = 0.6
             issues.append(
                 Issue(
                     check=NAME,
@@ -471,7 +548,7 @@ def scan(
                         f" matches session {match['sid'][:8]} window, "
                         f"not current source {current_sid[:8]}"
                     ),
-                    confidence=0.95,
+                    confidence=proposed_conf,
                     extra={
                         "proposed_sid": match["sid"],
                         "capture_signal": capture_signal,
@@ -479,6 +556,35 @@ def scan(
                     },
                 )
             )
+
+    # Convergence guard (issue #93): if multiple flags in a project propose
+    # the same target session, the date-window heuristic has structurally
+    # collapsed across a multi-session day. Lower confidence and tag for
+    # operator review.
+    from collections import Counter
+    targets = Counter(
+        (i.project, i.extra.get("proposed_sid", ""))
+        for i in issues
+        if i.extra.get("proposed_sid") and not i.extra.get("basename_only")
+    )
+    issues = [
+        dataclasses.replace(
+            i,
+            confidence=min(i.confidence, 0.4),
+            extra={
+                **i.extra,
+                "convergence_warning": True,
+                "convergence_count": targets[(i.project, i.extra.get("proposed_sid", ""))],
+            },
+        )
+        if (
+            not i.extra.get("basename_only")
+            and i.extra.get("proposed_sid")
+            and targets[(i.project, i.extra.get("proposed_sid", ""))] >= 2
+        )
+        else i
+        for i in issues
+    ]
 
     return issues
 
