@@ -160,6 +160,52 @@ def _peek_frontmatter_project_path(path: Path) -> str | None:
     return _peek_frontmatter_field(path, "project_path")
 
 
+def _resolve_session_note_by_hash(
+    sessions_dir: Path | str,
+    h: str,
+    cwd: str | None = None,
+) -> tuple[str | None, list[str]]:
+    """Resolve ``*-{h}.md`` to a session-type note matching this project.
+
+    Replaces first-match-wins glob discipline with a type+project filter
+    that handles the three known collision modes:
+      1. session_id sharing with snapshot notes (#101 Fix C)
+      2. cross-project 4-char hash collision (#101 Fix C)
+      3. genuine same-session_id duplicates (subsumes #86)
+
+    Returns ``(basename_without_ext, collisions)``:
+      - exactly one session-type match              → (basename, [])
+      - 2+ session matches but exactly one cwd match → (basename, [other names])
+      - 0 session-type matches                       → (None, [])
+      - 2+ matches and ambiguous after cwd filter    → (None, [all session names])
+
+    Caller pattern: warn on non-empty ``collisions`` and fall back to a
+    composed name (via ``make_filename(_first_seen_date(sid), project, sid)``)
+    when ``basename is None``.
+    """
+    sessions_dir = Path(sessions_dir)
+    if not sessions_dir.is_dir():
+        return None, []
+
+    matches = sorted(sessions_dir.glob(f"*-{h}.md"))
+    session_matches = [m for m in matches if _peek_frontmatter_type(m) == "claude-session"]
+    if not session_matches:
+        return None, []
+    if len(session_matches) == 1:
+        return session_matches[0].stem, []
+
+    # 2+ session-type matches — try cwd disambiguation
+    if cwd:
+        cwd_matches = [m for m in session_matches
+                       if _peek_frontmatter_project_path(m) == cwd]
+        if len(cwd_matches) == 1:
+            others = [m.name for m in session_matches if m != cwd_matches[0]]
+            return cwd_matches[0].stem, others
+
+    # Still ambiguous — caller falls back
+    return None, [m.name for m in session_matches]
+
+
 # --- Secure working directory ---
 # All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
 # This prevents symlink attacks and cache poisoning on multi-user systems.

@@ -272,3 +272,67 @@ def test_peek_frontmatter_field_empty_value_returns_none(tmp_path):
     note = tmp_path / "n.md"
     _write_note(note, {"type": "", "session_id": "abc"})
     assert obsidian_utils._peek_frontmatter_type(note) is None
+
+
+def test_resolve_filters_snapshot_type(tmp_path):
+    sessions_dir = tmp_path
+    h = "abcd"
+    _write_note(sessions_dir / f"2026-04-20-foo-{h}.md",
+                {"type": "claude-session", "session_id": "real",
+                 "project_path": '"/cwd/foo"'})
+    _write_note(sessions_dir / f"2026-04-20-foo-{h}-snapshot-101010.md",
+                {"type": "claude-snapshot", "session_id": "real"})
+
+    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+        sessions_dir, h, cwd="/cwd/foo"
+    )
+    assert basename == f"2026-04-20-foo-{h}"
+    assert collisions == []
+
+
+def test_resolve_disambiguates_by_project_path(tmp_path):
+    sessions_dir = tmp_path
+    h = "abcd"
+    _write_note(sessions_dir / f"2026-04-20-proj-a-{h}.md",
+                {"type": "claude-session", "session_id": "a",
+                 "project_path": '"/cwd/a"'})
+    _write_note(sessions_dir / f"2026-04-20-proj-b-{h}.md",
+                {"type": "claude-session", "session_id": "b",
+                 "project_path": '"/cwd/b"'})
+
+    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+        sessions_dir, h, cwd="/cwd/a"
+    )
+    assert basename == f"2026-04-20-proj-a-{h}"
+    assert collisions == [f"2026-04-20-proj-b-{h}.md"]
+
+
+def test_resolve_double_collision_returns_none(tmp_path):
+    """Two session-type notes with same hash AND same project_path → ambiguous,
+    caller falls back to composed name."""
+    sessions_dir = tmp_path
+    h = "abcd"
+    _write_note(sessions_dir / f"2026-04-20-proj-a-{h}.md",
+                {"type": "claude-session", "session_id": "a1",
+                 "project_path": '"/cwd/a"'})
+    _write_note(sessions_dir / f"2026-04-21-proj-a-{h}.md",
+                {"type": "claude-session", "session_id": "a2",
+                 "project_path": '"/cwd/a"'})
+
+    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+        sessions_dir, h, cwd="/cwd/a"
+    )
+    assert basename is None
+    assert sorted(collisions) == sorted([
+        f"2026-04-20-proj-a-{h}.md",
+        f"2026-04-21-proj-a-{h}.md",
+    ])
+
+
+def test_resolve_no_match_returns_empty(tmp_path):
+    """Sanity: empty directory → (None, [])."""
+    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+        tmp_path, "abcd", cwd="/cwd/x"
+    )
+    assert basename is None
+    assert collisions == []
