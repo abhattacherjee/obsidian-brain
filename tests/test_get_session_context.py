@@ -161,3 +161,69 @@ def test_get_session_context_fallback_uses_marker_date(isolated_home, tmp_path, 
     # Must be byte-equal to make_filename(marker_date, ...)
     expected = obsidian_utils.make_filename(marker_date, "obsidian-brain", sid)[:-3]
     assert ctx["session_note_name"] == expected
+
+
+def test_helper_and_session_end_produce_byte_identical_basename(isolated_home, monkeypatch):
+    """Project-slug invariant: across many (project, sid) combinations,
+    get_session_context()'s fallback basename and the basename SessionEnd
+    would build via make_filename(_first_seen_date(sid), slugify(project), sid)
+    are byte-for-byte identical. Catches any future regression that
+    reintroduces a hand-composed slug or a different date source."""
+    projects = [
+        "obsidian-brain",
+        "tiny-vacation-agent",
+        "personal-ws",
+        "claude-code-skills",
+        "very-long-project-name-that-might-trip-truncation-logic",
+        "abc",
+        "name with spaces",
+        "name_with_underscores",
+        "obsidian-brain--issue-101-source-session-basename-stability",
+        "Mixed-Case-Project",
+    ]
+    for project in projects:
+        for _ in range(3):
+            sid = _unique_sid()
+            monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda s=sid: s)
+            monkeypatch.setattr(obsidian_utils, "canonical_project_name",
+                                lambda *a, project=project, **kw: project)
+
+            # Helper side
+            ctx = obsidian_utils.get_session_context()
+            helper_basename = ctx["session_note_name"]
+
+            # SessionEnd side — replicate the exact call shape
+            date_str = obsidian_utils._first_seen_date(sid)
+            session_end_filename = obsidian_utils.make_filename(
+                date_str,
+                obsidian_utils.slugify(project),
+                sid,
+            )
+            session_end_basename = session_end_filename[:-3]  # strip .md
+
+            assert helper_basename == session_end_basename, (
+                f"divergence for project={project!r}, sid={sid}:\n"
+                f"  helper:      {helper_basename}\n"
+                f"  session_end: {session_end_basename}"
+            )
+
+
+def test_session_end_filename_uses_marker_date(isolated_home, monkeypatch):
+    """SessionEnd reads _first_seen_date(sid), not date.today()."""
+    sid = _unique_sid()
+    # Pre-write a marker pointing at day-N (yesterday relative to "today")
+    marker_dir = isolated_home / ".claude" / "obsidian-brain" / "sessions"
+    marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (marker_dir / f"{sid}.json").write_text(
+        json.dumps({"first_seen_date": "2026-04-25", "first_seen_iso": "x"}),
+        encoding="utf-8",
+    )
+
+    # Direct exercise of the helper SessionEnd uses
+    date_str = obsidian_utils._first_seen_date(sid)
+    assert date_str == "2026-04-25"
+
+    project_slug = obsidian_utils.slugify("obsidian-brain")
+    filename = obsidian_utils.make_filename(date_str, project_slug, sid)
+    assert filename.startswith("2026-04-25-obsidian-brain-")
+    assert filename.endswith(".md")

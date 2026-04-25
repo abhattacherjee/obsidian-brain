@@ -679,7 +679,9 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     # and session-note filenames stay in lockstep across cross-midnight,
     # worktree, and resumed-session conditions. (#101 Fix A + Fix B.)
     if not session_note_name:
-        session_note_name = make_filename(_first_seen_date(sid), project, sid)[:-3]
+        session_note_name = make_filename(
+            _first_seen_date(sid), slugify(project), sid
+        )[:-3]
 
     ctx = {"session_id": sid, "hash": h, "project": project, "session_note_name": session_note_name}
     cache_set(sid, cache_key, ctx)
