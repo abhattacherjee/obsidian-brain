@@ -1609,3 +1609,22 @@ def test_scan_emits_unresolved_when_jsonl_exists_but_session_note_missing(
     assert issue.extra.get("missing_session_note") is True
     assert issue.extra.get("jsonl_path") == str(orphan_jsonl)
     assert issue.confidence == 0.0
+
+
+def test_list_all_session_notes_warns_on_malformed_frontmatter(tmp_path, capsys):
+    """A `.md` file that opens with `---` but whose frontmatter fails to parse
+    should be skipped AND warned about on stderr — operators need a signal
+    that something is wrong with that note (review C5)."""
+    sessions_dir = tmp_path / "claude-sessions"
+    sessions_dir.mkdir()
+    bad = sessions_dir / "2026-04-22-malformed.md"
+    # Frontmatter block opens with --- but has no closing --- on its own line:
+    # _parse_frontmatter regex returns {} (no match), and the file starts with
+    # "---", so the malformed-warning branch fires.
+    bad.write_text("---\nfoo: bar\nno closing block here\n", encoding="utf-8")
+
+    out = ss._list_all_session_notes(sessions_dir)
+    captured = capsys.readouterr()
+    assert out == {}, f"expected empty dict for malformed-only dir, got {out}"
+    assert "[vault_doctor] malformed frontmatter, skipped:" in captured.err
+    assert "2026-04-22-malformed.md" in captured.err

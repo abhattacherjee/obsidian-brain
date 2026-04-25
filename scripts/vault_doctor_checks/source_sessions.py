@@ -283,6 +283,11 @@ def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
             continue
         fm = _parse_frontmatter(text)
         if not fm:
+            if text.startswith("---"):
+                print(
+                    f"[vault_doctor] malformed frontmatter, skipped: {entry}",
+                    file=sys.stderr,
+                )
             continue
         sid = fm.get("session_id", "")
         if not sid:
