@@ -922,7 +922,12 @@ def apply(issues, backup_root) -> list[Result]:
                     backup_path=str(backup_path),
                 )
             )
-        except Exception as exc:  # per-issue isolation; don't abort the loop
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            # SF9: narrowed from bare `except Exception` so MemoryError,
+            # RecursionError, and other non-I/O failures propagate instead
+            # of being misreported as ordinary per-issue rewrite failures.
+            # KeyboardInterrupt and SystemExit are BaseException, not Exception,
+            # and were never caught by the original handler.
             results.append(
                 Result(
                     check=NAME,
