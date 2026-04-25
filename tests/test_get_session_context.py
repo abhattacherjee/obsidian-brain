@@ -336,3 +336,31 @@ def test_resolve_no_match_returns_empty(tmp_path):
     )
     assert basename is None
     assert collisions == []
+
+
+def test_get_session_context_uses_type_aware_resolver(isolated_home, tmp_path, monkeypatch, capsys):
+    """get_session_context with a snapshot+session sharing the hash returns
+    the session, not the snapshot (#101 Fix C)."""
+    sid = "real-session-id"
+    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid)
+    monkeypatch.setattr(obsidian_utils, "canonical_project_name",
+                        lambda *a, **kw: "obsidian-brain")
+
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    cwd = str(tmp_path / "obsidian-brain")
+    (tmp_path / "obsidian-brain").mkdir()
+    monkeypatch.chdir(tmp_path / "obsidian-brain")
+
+    _write_note(sessions / f"2026-04-20-obsidian-brain-{h}.md",
+                {"type": "claude-session", "session_id": sid,
+                 "project_path": f'"{cwd}"'})
+    _write_note(sessions / f"2026-04-20-obsidian-brain-{h}-snapshot-101010.md",
+                {"type": "claude-snapshot", "session_id": sid})
+
+    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+    assert ctx["session_note_name"] == f"2026-04-20-obsidian-brain-{h}"
+    # Should NOT be the snapshot
+    assert "snapshot" not in ctx["session_note_name"]

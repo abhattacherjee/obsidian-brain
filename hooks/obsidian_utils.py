@@ -756,12 +756,19 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
 
     session_note_name = ""
     if vault_path and sessions_folder:
-        sessions_dir = os.path.join(vault_path, sessions_folder)
-        if os.path.isdir(sessions_dir):
-            for fname in os.listdir(sessions_dir):
-                if fname.endswith(f'-{h}.md'):
-                    session_note_name = fname[:-3]  # strip .md
-                    break
+        sessions_dir = Path(vault_path) / sessions_folder
+        resolved, collisions = _resolve_session_note_by_hash(
+            sessions_dir, h, cwd=os.getcwd()
+        )
+        if collisions:
+            print(
+                f"[obsidian-brain] WARN: hash {h} matches {len(collisions) + (1 if resolved else 0)} "
+                f"session note(s); chose {resolved or '<none — fell back to composed name>'} "
+                f"(others: {collisions})",
+                file=sys.stderr,
+            )
+        if resolved:
+            session_note_name = resolved
 
     # If not found, compose the canonical basename. Both _first_seen_date()
     # and make_filename() are also called by SessionEnd, so insight wikilinks
