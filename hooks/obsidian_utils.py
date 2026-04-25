@@ -674,10 +674,12 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
                     session_note_name = fname[:-3]  # strip .md
                     break
 
-    # If not found, construct expected name
+    # If not found, compose the canonical basename. Both _first_seen_date()
+    # and make_filename() are also called by SessionEnd, so insight wikilinks
+    # and session-note filenames stay in lockstep across cross-midnight,
+    # worktree, and resumed-session conditions. (#101 Fix A + Fix B.)
     if not session_note_name:
-        from datetime import date
-        session_note_name = f"{date.today().isoformat()}-{project}-{h}"
+        session_note_name = make_filename(_first_seen_date(sid), project, sid)[:-3]
 
     ctx = {"session_id": sid, "hash": h, "project": project, "session_note_name": session_note_name}
     cache_set(sid, cache_key, ctx)
