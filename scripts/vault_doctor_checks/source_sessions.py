@@ -249,6 +249,19 @@ def _jsonl_dir_for_project(project: str) -> Path | None:
     return Path(max(viable, key=lambda pair: (pair[1], pair[0]))[0])
 
 
+def _find_jsonl_anywhere(sid: str) -> Path | None:
+    """Locate ~/.claude/projects/*/<sid>.jsonl across all CC project dirs.
+
+    UUIDs are globally unique, so this is safe even though it ignores the
+    project-name index. Returns the first match (deterministic via sorted)
+    or None.
+    """
+    home = os.environ.get("HOME", os.path.expanduser("~"))
+    pattern = os.path.join(home, ".claude", "projects", "*", f"{sid}.jsonl")
+    matches = sorted(glob.glob(pattern))
+    return Path(matches[0]) if matches else None
+
+
 def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
     """Map session_id → {path, basename, date, project} across ALL projects.
 
@@ -499,6 +512,13 @@ def scan(
                                     )
                                 )
                             continue  # UUID is authoritative either way; skip matcher
+                else:
+                    # UUID not in session-note index — but a real JSONL may
+                    # still exist (SessionEnd hook missed; see issue #98).
+                    # In that case, the UUID is authoritative; refuse to
+                    # propose a different-session rewrite.
+                    if _find_jsonl_anywhere(current_sid) is not None:
+                        continue  # trust UUID, skip matcher
 
             match = _find_matching_session(capture_time, jsonl_dir, idx)
             if match is None:
