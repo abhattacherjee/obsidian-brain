@@ -346,11 +346,16 @@ def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
     `project:` (e.g., insight written from main repo's cwd while the
     session ran in a worktree). The session_id is globally unique, so
     cross-project lookup is safe.
+
+    Iterates entries in sorted order so the winner is deterministic across
+    runs (Copilot R5). When two session notes share the same session_id
+    (a known possible vault state — typically a vault-import collision or
+    a rename gone wrong), warn to stderr instead of silently overwriting.
     """
     out: dict[str, dict] = {}
     if not sessions_dir.is_dir():
         return out
-    for entry in sessions_dir.iterdir():
+    for entry in sorted(sessions_dir.iterdir()):
         if not entry.name.endswith(".md"):
             continue
         try:
@@ -370,6 +375,14 @@ def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
             continue
         if fm.get("type") != "claude-session":
             continue  # skip claude-snapshot — same UUID, not the canonical session
+        if sid in out:
+            print(
+                f"[vault_doctor] duplicate session_id {sid[:8]} across "
+                f"{out[sid]['path'].name} and {entry.name} — keeping first "
+                f"(sorted-order winner); rename one to disambiguate",
+                file=sys.stderr,
+            )
+            continue
         out[sid] = {
             "path": entry,
             "basename": entry.name[:-3],
@@ -380,11 +393,15 @@ def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
 
 
 def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:
-    """Map session_id → {path, basename, date} for a project's session notes."""
+    """Map session_id → {path, basename, date} for a project's session notes.
+
+    Iterates in sorted order for a deterministic duplicate-SID winner; warns
+    on collisions (Copilot R5; mirrors _list_all_session_notes).
+    """
     out: dict[str, dict] = {}
     if not sessions_dir.is_dir():
         return out
-    for entry in sessions_dir.iterdir():
+    for entry in sorted(sessions_dir.iterdir()):
         if not entry.name.endswith(".md"):
             continue
         try:
@@ -405,6 +422,14 @@ def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:
             continue
         if fm.get("type") != "claude-session":
             continue  # skip claude-snapshot — same UUID, not the canonical session
+        if sid in out:
+            print(
+                f"[vault_doctor] duplicate session_id {sid[:8]} across "
+                f"{out[sid]['path'].name} and {entry.name} — keeping first "
+                f"(sorted-order winner); rename one to disambiguate",
+                file=sys.stderr,
+            )
+            continue
         out[sid] = {
             "path": entry,
             "basename": entry.name[:-3],

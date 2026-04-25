@@ -1388,6 +1388,65 @@ def test_list_session_notes_filters_out_snapshots(doctor_vault):
     assert idx[sid]["basename"] == "2026-04-21-proj1-2222"
 
 
+def test_list_all_session_notes_warns_and_keeps_first_on_duplicate_sid(
+    tmp_path, capsys
+):
+    """Copilot R5: when two session notes share the same session_id (a known
+    possible vault state — vault-import collision, rename gone wrong, etc.),
+    the helper iterates in sorted order so the winner is deterministic and
+    emits a stderr warning instead of silently overwriting.
+    """
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    sid = "deadbeef-dead-beef-dead-deadbeefdead"
+    # Note A sorts before Note B lexically — A should win.
+    (sessions / "2026-04-26-aaa-proj1-collide.md").write_text(
+        "---\ntype: claude-session\ndate: 2026-04-26\n"
+        f"session_id: {sid}\nproject: proj1\nstatus: summarized\n---\n# A\n",
+        encoding="utf-8",
+    )
+    (sessions / "2026-04-26-bbb-proj1-collide.md").write_text(
+        "---\ntype: claude-session\ndate: 2026-04-26\n"
+        f"session_id: {sid}\nproject: proj1\nstatus: summarized\n---\n# B\n",
+        encoding="utf-8",
+    )
+    capsys.readouterr()  # drain
+    idx = ss._list_all_session_notes(sessions)
+    assert sid in idx
+    assert idx[sid]["basename"] == "2026-04-26-aaa-proj1-collide", (
+        f"sorted-order winner should be the lexically-first file, got {idx[sid]['basename']}"
+    )
+    captured = capsys.readouterr()
+    assert "duplicate session_id" in captured.err
+    assert "deadbeef" in captured.err  # short SID prefix
+    assert "rename one to disambiguate" in captured.err
+
+
+def test_list_session_notes_warns_and_keeps_first_on_duplicate_sid(
+    tmp_path, capsys
+):
+    """Copilot R5: parity-symmetry — _list_session_notes must also iterate
+    deterministically and warn on duplicate SIDs."""
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    sid = "feedface-feed-face-feed-feedfacefeed"
+    (sessions / "2026-04-26-bbb-projP-collide.md").write_text(
+        "---\ntype: claude-session\ndate: 2026-04-26\n"
+        f"session_id: {sid}\nproject: projP\nstatus: summarized\n---\n# B\n",
+        encoding="utf-8",
+    )
+    (sessions / "2026-04-26-aaa-projP-collide.md").write_text(
+        "---\ntype: claude-session\ndate: 2026-04-26\n"
+        f"session_id: {sid}\nproject: projP\nstatus: summarized\n---\n# A\n",
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    idx = ss._list_session_notes(sessions, "projP")
+    assert idx[sid]["basename"] == "2026-04-26-aaa-projP-collide"
+    captured = capsys.readouterr()
+    assert "duplicate session_id" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # T5e Fix 2 — trust UUID when JSONL exists but session note is missing
 # ---------------------------------------------------------------------------

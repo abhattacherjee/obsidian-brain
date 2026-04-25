@@ -4,11 +4,19 @@
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
 
 import pytest
+
+# Tests that shell out to `git` need it on PATH; skip cleanly otherwise so
+# CI/dev environments without git don't hard-fail (Copilot R5).
+_GIT_AVAILABLE = shutil.which("git") is not None
+_REQUIRES_GIT = pytest.mark.skipif(
+    not _GIT_AVAILABLE, reason="git binary not available on PATH"
+)
 
 import obsidian_utils
 
@@ -2046,8 +2054,13 @@ class TestUpgradeBatch:
 
 
 def _init_git_repo(path: Path) -> None:
-    """Create a minimal git repo at `path` for testing."""
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+    """Create a minimal git repo at `path` for testing.
+
+    Uses `git init` without `-b <branch>` so the helper works on older git
+    versions that predate that flag (Copilot R5). The default branch name
+    isn't asserted on by any caller — only the repo basename matters.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.name", "test"], cwd=path, check=True)
     (path / "README.md").write_text("init")
@@ -2055,6 +2068,7 @@ def _init_git_repo(path: Path) -> None:
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
 
 
+@_REQUIRES_GIT
 def test_canonical_project_name_main_repo(tmp_path, monkeypatch):
     """In the main repo, canonical name = repo basename."""
     repo = tmp_path / "my-project"
@@ -2064,6 +2078,7 @@ def test_canonical_project_name_main_repo(tmp_path, monkeypatch):
     assert obsidian_utils.canonical_project_name() == "my-project"
 
 
+@_REQUIRES_GIT
 def test_canonical_project_name_in_worktree(tmp_path, monkeypatch):
     """In a worktree, canonical name = main repo basename, not worktree basename."""
     repo = tmp_path / "my-project"
@@ -2082,6 +2097,7 @@ def test_canonical_project_name_in_worktree(tmp_path, monkeypatch):
     assert obsidian_utils.canonical_project_name() == "my-project"
 
 
+@_REQUIRES_GIT
 def test_canonical_project_name_falls_back_outside_git(tmp_path, monkeypatch):
     """Outside a git repo, fall back to cwd basename."""
     nongit = tmp_path / "Plain Folder"
@@ -2091,6 +2107,7 @@ def test_canonical_project_name_falls_back_outside_git(tmp_path, monkeypatch):
     assert obsidian_utils.canonical_project_name() == "plain-folder"
 
 
+@_REQUIRES_GIT
 def test_canonical_project_name_explicit_cwd_arg(tmp_path):
     """Explicit cwd= arg used instead of process cwd."""
     repo = tmp_path / "sample-repo"
@@ -2100,6 +2117,7 @@ def test_canonical_project_name_explicit_cwd_arg(tmp_path):
     assert obsidian_utils.canonical_project_name(cwd=str(repo)) == "sample-repo"
 
 
+@_REQUIRES_GIT
 def test_canonical_project_name_normalizes_underscores(tmp_path, monkeypatch):
     """Underscores and spaces normalize to hyphens, lowercase."""
     repo = tmp_path / "Snake_Case_Repo"
@@ -2125,6 +2143,7 @@ def test_canonical_project_name_handles_deleted_cwd(monkeypatch):
     assert obsidian_utils.canonical_project_name(None) == "unknown"
 
 
+@_REQUIRES_GIT
 def test_canonical_project_name_no_warn_when_not_a_repo(tmp_path, monkeypatch, capsys):
     """Copilot R2: the SF7 warning must NOT fire for the normal 'cwd is not
     inside a git repo' case (returncode != 0). That's an expected operating
@@ -2171,6 +2190,7 @@ def test_canonical_project_name_warns_once_when_git_unavailable(monkeypatch, cap
     assert "git-unavailable" in captured.err
 
 
+@_REQUIRES_GIT
 def test_git_canonical_project_name_with_reason_distinguishes_failure_modes(
     tmp_path, monkeypatch
 ):
@@ -2194,6 +2214,7 @@ def test_git_canonical_project_name_with_reason_distinguishes_failure_modes(
     assert reason == "git-unavailable"
 
 
+@_REQUIRES_GIT
 def test_get_session_context_returns_canonical_project(tmp_path, monkeypatch):
     """get_session_context's `project` field uses canonical naming."""
     repo = tmp_path / "obsidian-brain"
@@ -2212,6 +2233,7 @@ def test_get_session_context_returns_canonical_project(tmp_path, monkeypatch):
     assert ctx["project"] == "obsidian-brain"
 
 
+@_REQUIRES_GIT
 def test_extract_session_metadata_returns_canonical_project(tmp_path):
     """extract_session_metadata's `project` field uses canonical naming."""
     repo = tmp_path / "obsidian-brain"
@@ -2231,6 +2253,7 @@ def test_extract_session_metadata_returns_canonical_project(tmp_path):
     assert meta["project_path"] == str(worktree)
 
 
+@_REQUIRES_GIT
 def test_get_session_context_cache_key_isolates_distinct_worktrees(tmp_path, monkeypatch):
     """T7: get_session_context's cache must isolate distinct worktrees of
     the same repo so a call from one worktree doesn't return cached state
