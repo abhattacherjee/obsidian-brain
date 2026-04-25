@@ -2,11 +2,14 @@
 
 Detection strategy:
   For each insight-type note with a `source_session` frontmatter field,
-  read the note's file mtime as the "capture time." For each JSONL file
-  under ~/.claude/projects/*<project>/*.jsonl, determine its activity
-  window (first entry timestamp → file mtime). The correct source session
-  is the JSONL whose window contains the note's capture time. Flag as
-  stale whenever the note's current source_session does not match.
+  determine capture-time via an immutable-signal preference chain
+  (`created_at` ISO-8601 → `date` YYYY-MM-DD midday UTC → filename prefix
+  YYYY-MM-DD-... midday UTC → mtime as low-confidence last resort).
+  For each JSONL file under ~/.claude/projects/*<project>/*.jsonl,
+  determine its activity window (first entry timestamp → file mtime).
+  The correct source session is the JSONL whose window contains the
+  note's capture-time. Flag as stale whenever the note's current
+  source_session does not match.
 """
 
 from __future__ import annotations
@@ -346,6 +349,12 @@ def scan(
             if project and note_project.replace("_", "-") != project.replace("_", "-"):
                 continue
 
+            # Capture-time for JSONL-window matching uses immutable signals (issue #93).
+            # mtime above is only the --days cutoff, not the matcher input.
+            capture_time, capture_conf, capture_signal = _capture_time(note, fm)
+            if capture_conf == 0.0:
+                continue  # corrupt note — no usable signal
+
             # Normalize cache key so personal_ws and personal-ws share index
             cache_key = note_project.replace("_", "-")
             if cache_key not in session_index_cache:
@@ -370,7 +379,7 @@ def scan(
             else:
                 current_source_display = ""
 
-            match = _find_matching_session(mtime, jsonl_dir, idx)
+            match = _find_matching_session(capture_time, jsonl_dir, idx)
             if match is None:
                 # No JSONL window contains this mtime. Flag as unresolved ONLY if
                 # the current source doesn't resolve to any known session note — that
@@ -402,8 +411,11 @@ def scan(
                     current_source=current_source_display,
                     proposed_source=f"[[{match['basename']}]]",
                     reason=(
-                        f"note mtime {datetime.fromtimestamp(mtime, timezone.utc).isoformat(timespec='seconds')}"
-                        f" matches session {match['sid'][:8]} window, not current source {current_sid[:8]}"
+                        f"note capture_time "
+                        f"{datetime.fromtimestamp(capture_time, timezone.utc).isoformat(timespec='seconds')}"
+                        f" (signal={capture_signal}, conf={capture_conf})"
+                        f" matches session {match['sid'][:8]} window, "
+                        f"not current source {current_sid[:8]}"
                     ),
                     confidence=0.95,
                     extra={"proposed_sid": match["sid"]},
@@ -521,8 +533,8 @@ def apply(issues, backup_root) -> list[Result]:
             continue
 
         # Capture original stat so we can preserve mtime across the rewrite.
-        # scan() uses note mtime as capture_time for JSONL window matching —
-        # updating mtime on apply would cause re-runs to re-flag fixed notes.
+        # scan() may fall back to mtime for the --days cutoff filter; preserving
+        # mtime prevents the cutoff from silently excluding recently-fixed notes.
         try:
             original_stat = os.stat(issue.note_path)
         except OSError as exc:

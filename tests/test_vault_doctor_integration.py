@@ -23,7 +23,9 @@ def test_end_to_end_scan_apply_verify(tmp_path):
 
     # Two sessions on different days
     a_start = calendar.timegm(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
-    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    # Session B widened to include 2026-04-10 midday (12:00) so the new
+    # date-based capture_time matches it. (issue #93)
+    b_start = calendar.timegm(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
 
     (cc_projects / "sid-a.jsonl").write_text(
         json.dumps({"type": "user", "timestamp": "2026-04-09T10:00:00Z"}) + "\n",
@@ -31,10 +33,10 @@ def test_end_to_end_scan_apply_verify(tmp_path):
     )
     os.utime(cc_projects / "sid-a.jsonl", (a_start + 3600, a_start + 3600))
     (cc_projects / "sid-b.jsonl").write_text(
-        json.dumps({"type": "user", "timestamp": "2026-04-10T14:00:00Z"}) + "\n",
+        json.dumps({"type": "user", "timestamp": "2026-04-10T10:00:00Z"}) + "\n",
         encoding="utf-8",
     )
-    os.utime(cc_projects / "sid-b.jsonl", (b_start + 3600, b_start + 3600))
+    os.utime(cc_projects / "sid-b.jsonl", (b_start + 4 * 3600, b_start + 4 * 3600))
 
     # Session notes
     (vault / "claude-sessions" / "2026-04-09-proj1-aaaa.md").write_text(

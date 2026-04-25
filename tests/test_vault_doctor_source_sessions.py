@@ -97,13 +97,14 @@ def test_scan_flags_insight_stamped_to_wrong_session(doctor_vault, monkeypatch):
     _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-09T10:00:00Z", a_end)
     _write_session_note(v / "claude-sessions", "2026-04-09", "proj1", "sid-a", "aaaa")
 
-    # Session B: 2026-04-10 14:00–15:00
-    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
-    b_end = b_start + 3600
-    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_end)
+    # Session B: 2026-04-10 10:00–14:00 (window must contain midday for the
+    # date-based capture_time match under the fix for issue #93)
+    b_start = calendar.timegm(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
+    b_end = b_start + 4 * 3600
+    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T10:00:00Z", b_end)
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
 
-    # Insight captured 2026-04-10 14:30 but wrongly stamped with sid-a
+    # Insight captured 2026-04-10 10:30 but wrongly stamped with sid-a
     insight_mtime = b_start + 1800
     _write_insight(
         v / "claude-insights",
@@ -225,9 +226,11 @@ def test_apply_rewrites_only_source_session_fields(doctor_vault, tmp_path, monke
     monkeypatch.setenv("HOME", str(home))
 
     a_start = calendar.timegm(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
-    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    # Session B widened to include 2026-04-10 midday (12:00) so the new
+    # date-based capture_time matches it. (issue #93)
+    b_start = calendar.timegm(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
     _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-09T10:00:00Z", a_start + 3600)
-    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_start + 3600)
+    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T10:00:00Z", b_start + 4 * 3600)
     _write_session_note(v / "claude-sessions", "2026-04-09", "proj1", "sid-a", "aaaa")
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
 
@@ -392,9 +395,11 @@ def test_scan_latest_start_wins_on_boundary_tie(doctor_vault, monkeypatch):
     _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_mtime)
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
 
-    # Insight captured at 14:02 — inside BOTH windows
+    # Insight captured at 14:02 — inside BOTH windows.
+    # We inject created_at so _capture_time uses the precise sub-day timestamp
+    # (date: midday = 12:00, which only falls in A; we need 14:02 in both).
     insight_mtime = calendar.timegm(time.strptime("2026-04-10 14:02", "%Y-%m-%d %H:%M"))
-    _write_insight(
+    insight_path = _write_insight(
         v / "claude-insights",
         "2026-04-10",
         "boundary-tie-insight",
@@ -403,6 +408,13 @@ def test_scan_latest_start_wins_on_boundary_tie(doctor_vault, monkeypatch):
         "2026-04-10-proj1-aaaa",
         insight_mtime,
     )
+    # Inject created_at so _capture_time resolves to 14:02 (inside both windows)
+    # rather than midday-12:00 (which only falls in session A). (issue #93)
+    text = insight_path.read_text(encoding="utf-8")
+    text = text.replace("type: claude-insight\n",
+                        "type: claude-insight\ncreated_at: 2026-04-10T14:02:00Z\n")
+    insight_path.write_text(text, encoding="utf-8")
+    os.utime(insight_path, (insight_mtime, insight_mtime))  # restore mtime after write
 
     issues = check.scan(
         str(v), "claude-sessions", "claude-insights", days=60, project="proj1"
@@ -469,10 +481,9 @@ def test_jsonl_dir_for_project_picks_newest_worktree(tmp_path, monkeypatch):
 def test_apply_preserves_note_mtime(doctor_vault, tmp_path, monkeypatch):
     """After apply, the patched note's mtime equals its pre-apply mtime.
 
-    This is load-bearing: scan() uses note mtime as capture_time. If apply
-    updated mtime to 'now', a subsequent scan would match the note's new
-    mtime against the current session's window, not the original capture
-    session — re-flagging every fixed note on every run.
+    scan() uses mtime for the --days cutoff filter. If apply updated mtime
+    to 'now', notes written long ago could accidentally re-enter the scan
+    window after being fixed. Preserving mtime prevents that drift.
     """
     import vault_doctor_checks.source_sessions as check
     import os
@@ -484,13 +495,15 @@ def test_apply_preserves_note_mtime(doctor_vault, tmp_path, monkeypatch):
 
     import calendar, time
     a_start = calendar.timegm(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
-    b_start = calendar.timegm(time.strptime("2026-04-10 14:00", "%Y-%m-%d %H:%M"))
+    # Session B widened to include 2026-04-10 midday (12:00) so the new
+    # date-based capture_time matches it. (issue #93)
+    b_start = calendar.timegm(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
     _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-09T10:00:00Z", a_start + 3600)
-    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_start + 3600)
+    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T10:00:00Z", b_start + 4 * 3600)
     _write_session_note(v / "claude-sessions", "2026-04-09", "proj1", "sid-a", "aaaa")
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
 
-    original_mtime = b_start + 1800  # 2026-04-10 14:30
+    original_mtime = b_start + 1800  # 2026-04-10 10:30
     _write_insight(
         v / "claude-insights",
         "2026-04-10",
@@ -698,3 +711,59 @@ def test_capture_time_malformed_date_falls_through(tmp_path):
     fm = {"date": "garbage"}
     ts, conf, signal = ss._capture_time(note, fm)
     assert (conf, signal) == (0.85, "filename")
+
+
+def test_scan_ignores_mtime_when_date_present(doctor_vault, monkeypatch):
+    """A note whose mtime drifted into a later session's window must NOT be flagged
+    when its frontmatter date and filename prefix point to the original session's day."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+
+    monkeypatch.setenv("HOME", str(home))
+
+    day_a = "2026-04-21"
+    day_b = "2026-04-22"
+    sid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    sid_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    # Session A: 2026-04-21, 10:00–18:00 UTC
+    ts_a_start = datetime(2026, 4, 21, 10, 0, tzinfo=timezone.utc).timestamp()
+    ts_a_end = datetime(2026, 4, 21, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_a}.jsonl",
+                 datetime.fromtimestamp(ts_a_start, tz=timezone.utc).isoformat(),
+                 ts_a_end)
+
+    # Session B: 2026-04-22, 09:00–17:00 UTC
+    ts_b_start = datetime(2026, 4, 22, 9, 0, tzinfo=timezone.utc).timestamp()
+    ts_b_end = datetime(2026, 4, 22, 17, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_b}.jsonl",
+                 datetime.fromtimestamp(ts_b_start, tz=timezone.utc).isoformat(),
+                 ts_b_end)
+
+    sess_a = _write_session_note(vault / "claude-sessions", day_a, project, sid_a, "1111")
+    sess_b = _write_session_note(vault / "claude-sessions", day_b, project, sid_b, "2222")
+
+    # Insight written on day A but mtime drifted to day B (e.g., /check-items touched it)
+    insight = _write_insight(
+        vault / "claude-insights",
+        day_a,
+        "real-capture-day-a",
+        project,
+        sid_a,
+        sess_a.stem,
+        ts_b_start + 3600,  # mtime fell into session B's window
+    )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,  # large window so test stays valid as wall-clock advances
+        project=project,
+    )
+    paths = [i.note_path for i in issues]
+    assert str(insight) not in paths, (
+        "regression: drifted mtime caused false-positive flag despite date: pointing to session A"
+    )
