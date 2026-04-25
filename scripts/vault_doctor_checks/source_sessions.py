@@ -882,8 +882,11 @@ def apply(issues, backup_root) -> list[Result]:
             continue
 
         # Capture original stat so we can preserve mtime across the rewrite.
-        # scan() may fall back to mtime for the --days cutoff filter; preserving
-        # mtime prevents the cutoff from silently excluding recently-fixed notes.
+        # scan() uses mtime for the --days cutoff filter. If apply() let the
+        # rewrite bump mtime to now, repaired notes would re-enter the scan
+        # window every run (and could be re-flagged via mtime-fallback signal
+        # if their immutable signals are ever lost). Preserving the original
+        # mtime keeps the rewrite invisible to the cutoff filter.
         try:
             original_stat = os.stat(issue.note_path)
         except OSError as exc:

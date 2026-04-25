@@ -105,15 +105,15 @@ vault_doctor report — 3 issue(s) across 1 check(s)
 [FAIL] 2026-04-10-recall-profiling.md
   current:  [[2026-04-09-obsidian-brain-abcd]]
   proposed: [[2026-04-10-obsidian-brain-ef01]]
-  signal:   date (conf 0.9)
-  reason:   note capture_time 2026-04-10T12:00 (signal=date, conf=0.9) matches session ef010000 window, not current source abcd0000
+  signal:   date (conf 0.6)
+  reason:   note date 2026-04-10 (signal=date, conf=0.6) matches session ef010000 window, not current source abcd0000
 
 ### Project: tiny-vacation-agent (1 issue)
 [FAIL] 2026-04-11-enrichment-scope.md
   current:  [[2026-04-10-tiny-vacation-agent-aaaa]]
   proposed: [[2026-04-11-tiny-vacation-agent-bbbb]]
-  signal:   date (conf 0.9)
-  reason:   note capture_time 2026-04-11T09:15 (signal=date, conf=0.9) matches session bbbb0000 window, not current source aaaa0000
+  signal:   created_at (conf 0.95)
+  reason:   note created_at 2026-04-11T09:15 (signal=created_at, conf=0.95) matches session bbbb0000 window, not current source aaaa0000
 ```
 
 Use `[FAIL]` for actionable issues (those with a proposed fix) and `[WARN]` for unresolved ones (those the check could not auto-repair). Always include a one-line summary at the top with the total count.
