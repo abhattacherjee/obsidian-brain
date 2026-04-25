@@ -181,6 +181,8 @@ def main() -> int:
                     "reason": i.reason,
                     "confidence": i.confidence,
                     "unresolved": i.extra.get("unresolved", False),
+                    "capture_signal": i.extra.get("capture_signal", ""),
+                    "capture_confidence": i.extra.get("capture_confidence", 0.0),
                 }
                 for issues in issues_by_check.values() for i in issues
             ],
