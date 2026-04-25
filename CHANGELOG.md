@@ -13,8 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decide`, `retro`, and `compress` (new-note flow) for sub-day-precision
   capture-time matching by vault-doctor. Net-additive — older notes continue
   to fall back to `date:` (day precision).
+- `_first_seen_date(sid)` marker (atomic, idempotent JSON at `~/.claude/obsidian-brain/sessions/<sid>.json`) consulted by both `get_session_context()` and SessionEnd to keep insight wikilinks and on-disk filenames in lockstep ([#101](https://github.com/abhattacherjee/obsidian-brain/issues/101) Fix A)
+- `_resolve_session_note_by_hash()` shared helper with type+project filter and collision detection ([#101](https://github.com/abhattacherjee/obsidian-brain/issues/101) Fix C)
+- `tests/test_get_session_context.py` — 21 tests covering markers, peek helpers, resolver, and the project-slug invariant
 
 ### Fixed
+- Source-session basename divergence between `get_session_context()` and SessionEnd that broke insight wikilinks across cross-midnight, worktree, and resumed sessions ([#101](https://github.com/abhattacherjee/obsidian-brain/issues/101))
+- Snapshot/session hash collision in the resolver could pick a snapshot when an insight saver intended to link to a session ([#101](https://github.com/abhattacherjee/obsidian-brain/issues/101) Fix C)
+- `is_resumed_session` first-match-wins glob now filters by `type: claude-session` and `project_path`, eliminating false positives from cross-project hash collisions ([#86](https://github.com/abhattacherjee/obsidian-brain/issues/86), subsumed by [#101](https://github.com/abhattacherjee/obsidian-brain/issues/101))
 - **vault-doctor source-sessions silently corrupted backlinks** when a note's
   mtime drifted past the originating session's JSONL window (any later edit
   by `/check-items`, `/link`, `/compress`, sync clients, or another vault-doctor
