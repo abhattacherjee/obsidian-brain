@@ -96,6 +96,24 @@ def _parse_iso_ts(ts: str) -> float | None:
         return None
 
 
+def _parse_date_midpoint(date_str: str) -> float | None:
+    """Parse a YYYY-MM-DD date string to the POSIX timestamp at 12:00 UTC.
+
+    Day-precision input cannot tell us _when_ during the day a note was
+    captured; using midday makes the JSONL-window matcher symmetric across
+    both ends of a multi-session day.
+    """
+    if not date_str:
+        return None
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").replace(
+            hour=12, minute=0, second=0, tzinfo=timezone.utc
+        )
+        return d.timestamp()
+    except ValueError:
+        return None
+
+
 def _jsonl_window(jsonl_path: str) -> tuple[float, float] | None:
     """Return (first_entry_ts, mtime) for a JSONL session file, or None.
 

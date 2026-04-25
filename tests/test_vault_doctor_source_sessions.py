@@ -5,12 +5,15 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 _SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
+
+import vault_doctor_checks.source_sessions as ss  # noqa: E402 (must follow sys.path setup)
 
 
 @pytest.fixture
@@ -348,6 +351,24 @@ def test_apply_errors_on_missing_proposed_sid(doctor_vault, tmp_path):
     assert results[0].status == "error"
     assert "proposed_sid" in (results[0].error or "")
     assert note.read_text(encoding="utf-8") == original
+
+
+def test_parse_date_midpoint_valid_date_returns_noon_utc():
+    ts = ss._parse_date_midpoint("2026-04-21")
+    assert ts is not None
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    assert (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second) == (
+        2026, 4, 21, 12, 0, 0,
+    )
+
+
+def test_parse_date_midpoint_empty_returns_none():
+    assert ss._parse_date_midpoint("") is None
+
+
+def test_parse_date_midpoint_malformed_returns_none():
+    assert ss._parse_date_midpoint("not-a-date") is None
+    assert ss._parse_date_midpoint("2026-13-99") is None
 
 
 def test_scan_latest_start_wins_on_boundary_tie(doctor_vault, monkeypatch):
