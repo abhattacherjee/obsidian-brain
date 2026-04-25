@@ -122,16 +122,21 @@ def test_first_seen_date_chmods_existing_loose_mode_dir(isolated_home):
 def test_get_session_context_fallback_uses_marker_date(isolated_home, tmp_path, monkeypatch):
     """get_session_context() fallback must compose its basename from
     _first_seen_date(sid), not date.today() — so cross-midnight insights
-    and SessionEnd writes agree on the filename."""
+    and SessionEnd writes agree on the filename. Mock date.today() to a
+    different day than the marker so the test actually exercises the
+    divergence the helper prevents."""
     sid = _unique_sid()
     monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid)
     monkeypatch.setattr(obsidian_utils, "canonical_project_name", lambda *a, **kw: "obsidian-brain")
+
+    marker_date = "2026-04-20"  # day-N
+    other_day = datetime.date(2026, 4, 22)  # day-N+2 — different from marker
 
     # Pre-write a marker pointing at day-N
     marker_dir = isolated_home / ".claude" / "obsidian-brain" / "sessions"
     marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     (marker_dir / f"{sid}.json").write_text(
-        json.dumps({"first_seen_date": "2026-04-25", "first_seen_iso": "x"}),
+        json.dumps({"first_seen_date": marker_date, "first_seen_iso": "x"}),
         encoding="utf-8",
     )
 
@@ -139,8 +144,20 @@ def test_get_session_context_fallback_uses_marker_date(isolated_home, tmp_path, 
     sessions = vault / "claude-sessions"
     sessions.mkdir(parents=True)
 
-    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-    assert ctx["session_note_name"].startswith("2026-04-25-obsidian-brain-")
-    # Must be byte-equal to make_filename(...)[:-3]
-    expected = obsidian_utils.make_filename("2026-04-25", "obsidian-brain", sid)[:-3]
+    class _FrozenDate:
+        @staticmethod
+        def today():
+            return other_day
+
+    # With date.today() mocked to day-N+2, the fallback must STILL produce
+    # the day-N basename via the marker. If the fallback ignored the marker
+    # and used date.today(), the basename would start with 2026-04-22.
+    with patch.object(obsidian_utils.datetime, "date", _FrozenDate):
+        ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+
+    assert ctx["session_note_name"].startswith(f"{marker_date}-obsidian-brain-"), (
+        f"expected basename pinned to marker date {marker_date}, got {ctx['session_note_name']}"
+    )
+    # Must be byte-equal to make_filename(marker_date, ...)
+    expected = obsidian_utils.make_filename(marker_date, "obsidian-brain", sid)[:-3]
     assert ctx["session_note_name"] == expected
