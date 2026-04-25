@@ -134,12 +134,18 @@ def canonical_project_name(cwd: str | None = None) -> str:
     is what should be written to vault-note frontmatter `project:` fields
     so cross-worktree work groups under one logical project.
 
-    Falls back to cwd basename if not in a git repo. Result is lowercased
-    and underscores/spaces normalized to hyphens (matching existing convention).
+    Falls back to cwd basename if not in a git repo. Returns 'unknown' when
+    the working directory cannot be determined (e.g., the directory was
+    deleted mid-session via `gh pr merge --delete-branch`); hooks must exit
+    0, so raising would violate the contract. Result is lowercased and
+    underscores/spaces normalized to hyphens.
     """
     name = _git_canonical_project_name(cwd)
     if name is None:
-        base = cwd if cwd else os.getcwd()
+        try:
+            base = cwd if cwd else os.getcwd()
+        except (OSError, FileNotFoundError):
+            return "unknown"
         name = os.path.basename(base)
     return name.lower().replace(" ", "-").replace("_", "-")
 

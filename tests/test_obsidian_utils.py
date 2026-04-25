@@ -2109,6 +2109,20 @@ def test_canonical_project_name_normalizes_underscores(tmp_path, monkeypatch):
     assert obsidian_utils.canonical_project_name() == "snake-case-repo"
 
 
+def test_canonical_project_name_handles_deleted_cwd(monkeypatch):
+    """When the current working directory has been deleted (e.g., a worktree
+    removed mid-session via `gh pr merge --delete-branch`), os.getcwd() raises
+    FileNotFoundError. Hooks must exit 0, so canonical_project_name returns
+    'unknown' rather than propagating the exception (review C4)."""
+    def _raise_fnf(*args, **kwargs):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(obsidian_utils.os, "getcwd", _raise_fnf)
+    monkeypatch.setattr(
+        obsidian_utils, "_git_canonical_project_name", lambda cwd=None: None
+    )
+    assert obsidian_utils.canonical_project_name(None) == "unknown"
+
+
 def test_get_session_context_returns_canonical_project(tmp_path, monkeypatch):
     """get_session_context's `project` field uses canonical naming."""
     repo = tmp_path / "obsidian-brain"
