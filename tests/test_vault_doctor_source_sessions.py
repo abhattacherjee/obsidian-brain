@@ -931,3 +931,83 @@ def test_scan_trusts_current_source_when_same_day(doctor_vault, monkeypatch):
     assert str(insight) not in paths, (
         "regression: same-day source was second-guessed by the matcher"
     )
+
+
+def test_scan_created_at_bypasses_early_exit(doctor_vault, monkeypatch):
+    """Pin test for the capture_signal != 'created_at' carve-out in Phase 1b
+    early-exit (issue #93). A note with created_at AND a same-day current
+    source MUST still be validated by the matcher; the early-exit must NOT
+    short-circuit just because date strings agree.
+
+    If this test goes silent (passes when it shouldn't), the carve-out has
+    been removed and high-precision created_at notes are being trusted on
+    same-day SID match alone — masking actual corruption."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+
+    monkeypatch.setenv("HOME", str(home))
+
+    day = "2026-04-22"
+    sid_x = "33333333-3333-3333-3333-333333333333"
+    sid_y = "44444444-4444-4444-4444-444444444444"
+
+    # Two same-day sessions, NON-overlapping.
+    # Session X: 09:00–11:00 (current source — INCORRECT for the note).
+    # Session Y: 14:00–16:00 (the note's actual created_at falls here).
+    x_start = datetime(2026, 4, 22, 9, 0, tzinfo=timezone.utc).timestamp()
+    x_end = datetime(2026, 4, 22, 11, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_x}.jsonl",
+                 datetime.fromtimestamp(x_start, tz=timezone.utc).isoformat(),
+                 x_end)
+
+    y_start = datetime(2026, 4, 22, 14, 0, tzinfo=timezone.utc).timestamp()
+    y_end = datetime(2026, 4, 22, 16, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_y}.jsonl",
+                 datetime.fromtimestamp(y_start, tz=timezone.utc).isoformat(),
+                 y_end)
+
+    sess_x = _write_session_note(vault / "claude-sessions", day, project, sid_x, "3333")
+    sess_y = _write_session_note(vault / "claude-sessions", day, project, sid_y, "4444")
+
+    # Insight: source_session is X (same day, would satisfy date-equality early-exit
+    # if signal were date/filename), but created_at = 14:30 falls in Y's window.
+    # The matcher MUST be allowed to run and propose Y. Early-exit must NOT fire.
+    insight_path = vault / "claude-insights" / f"{day}-pin-carveout.md"
+    insight_path.write_text(
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: {day}\n"
+        f"created_at: 2026-04-22T14:30:00+00:00\n"
+        f"source_session: {sid_x}\n"
+        f'source_session_note: "[[{sess_x.stem}]]"\n'
+        f"project: {project}\n"
+        f"tags:\n"
+        f"  - claude/insight\n"
+        f"  - claude/project/{project}\n"
+        f"---\n"
+        f"# pin\n",
+        encoding="utf-8",
+    )
+    # Set mtime to a known stable value (irrelevant for matching now)
+    import os as _os
+    _os.utime(insight_path, (y_start + 1800, y_start + 1800))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(insight_path)]
+    assert len(flagged) == 1, (
+        "carve-out regression: created_at note with same-day current source "
+        "was not re-validated by matcher (early-exit fired when it should not)"
+    )
+    iss = flagged[0]
+    assert iss.extra.get("capture_signal") == "created_at"
+    assert iss.extra.get("proposed_sid") == sid_y, (
+        f"matcher should propose Y (where created_at falls), got {iss.extra.get('proposed_sid')!r}"
+    )
