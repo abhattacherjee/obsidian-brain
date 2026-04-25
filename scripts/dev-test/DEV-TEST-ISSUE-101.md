@@ -38,7 +38,18 @@ Walk through the following in a **fresh CC session**. Check each box only
 after visually confirming the described behavior. Notes section at the
 bottom for any deviations.
 
-### Phase 1 — Baseline: marker file appears for the new session
+### Phase 1 — Baseline: marker file is lazily written on first invocation
+
+> **Design note (per spec §Fix A):** the marker is **pure-lazy**. No SessionStart
+> hook calls `_first_seen_date()` directly. The marker file is created on the
+> first invocation of the helper — typically at SessionEnd when the vault note
+> basename is composed, or earlier if a helper that uses `get_session_context()`
+> falls through to its compose fallback (e.g. via /recall, /vault-search,
+> /compress when the session note doesn't already exist in vault).
+>
+> Mid-session, **it is normal for the marker file to be absent** until something
+> triggers the helper. This is by design — the spec calls out that pre-PR
+> sessions also "get markers lazily on first helper call after upgrade."
 
 - [ ] **Capture this session's ID.** In the new CC session, run:
       ```bash
@@ -46,16 +57,25 @@ bottom for any deviations.
       ```
       Note the basename minus `.jsonl` — that's `$SID`.
 
-- [ ] **Marker file exists for $SID.**
+- [ ] **Force the lazy write, then verify the marker.** Trigger any helper
+      that exercises the resolver — `/recall`, `/vault-search anything`, or
+      a direct Bash call — then check:
       ```bash
+      python3 -c '
+      import sys, glob, os
+      sys.path.insert(0, glob.glob(os.path.expanduser("~/.claude/plugins/cache/claude-code-skills/obsidian-brain/2.4.1/hooks"))[0])
+      import obsidian_utils; obsidian_utils._first_seen_date("'"$SID"'")'
+
       ls -la ~/.claude/obsidian-brain/sessions/$SID.json
       cat ~/.claude/obsidian-brain/sessions/$SID.json
       ```
       File should exist with mode `-rw-------` (0o600), and JSON should
       contain `first_seen_date` (today, ISO) and `first_seen_iso` (UTC ISO).
 
-      *If missing:* SessionStart did not run, or `_first_seen_date` was
-      never invoked. Check `~/.claude/obsidian-brain-hook.log`.
+      *If still missing after a forced helper call:* the install didn't pick
+      up the new code, or `_first_seen_date` itself failed. Check
+      `~/.claude/obsidian-brain-hook.log` and `diff -q hooks/obsidian_utils.py
+      ~/.claude/plugins/cache/claude-code-skills/obsidian-brain/2.4.1/hooks/obsidian_utils.py`.
 
 ### Phase 2 — Marker is idempotent under live use
 
@@ -218,7 +238,7 @@ bottom for any deviations.
 
 | Phase | Coverage gap pytest can't fill |
 |-------|-------------------------------|
-| 1, 2  | Marker is written by the *real* SessionStart entry point in the running CC session, not by direct helper call from a unit test |
+| 1, 2  | Lazy marker is created+stable when `_first_seen_date()` is invoked from inside a *real* running CC session against the installed cache, not by direct helper call from a unit test (per spec §Fix A: pure-lazy, no dedicated hook) |
 | 3     | SessionEnd hook integration — full write path under real config + transcript flow, including AI summarization fallback |
 | 4     | SessionStart hint render correctness — `is_resumed_session` plumbed through the user-visible "Last session" line |
 | 5     | A genuine cross-project hash collision against your live vault, not a synthetic 4-char fixture |
