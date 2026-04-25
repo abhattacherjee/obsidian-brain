@@ -91,6 +91,11 @@ def _safe_mtime(path: str) -> float:
         return -1.0
 
 
+# Module-level flag for SF7 one-shot warning. Avoids spamming stderr on every
+# canonical_project_name() call when git is unavailable for the whole process.
+_git_fallback_warned: bool = False
+
+
 def _git_canonical_project_name(cwd: str | None = None) -> str | None:
     """Return the main-repo basename via `git rev-parse --git-common-dir`.
 
@@ -139,9 +144,22 @@ def canonical_project_name(cwd: str | None = None) -> str:
     deleted mid-session via `gh pr merge --delete-branch`); hooks must exit
     0, so raising would violate the contract. Result is lowercased and
     underscores/spaces normalized to hyphens.
+
+    Emits a one-shot stderr warning per process when git is unavailable
+    and the cwd-basename fallback engages. Inside a worktree this fallback
+    re-creates the worktree-divergent `project:` write that the canonical
+    helper exists to prevent (review SF7).
     """
     name = _git_canonical_project_name(cwd)
     if name is None:
+        global _git_fallback_warned
+        if not _git_fallback_warned:
+            _git_fallback_warned = True
+            print(
+                "[obsidian_utils] canonical_project_name: git unavailable, "
+                "using cwd basename — verify project: frontmatter writes",
+                file=sys.stderr,
+            )
         try:
             base = cwd if cwd else os.getcwd()
         except (OSError, FileNotFoundError):

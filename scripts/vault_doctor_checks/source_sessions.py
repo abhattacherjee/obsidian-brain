@@ -72,19 +72,52 @@ def _safe_project_slug(project: str) -> str:
     return slug or "unknown"
 
 
-def _parse_frontmatter(text: str) -> dict:
-    """Parse a flat key: value YAML frontmatter block. Nested blocks ignored."""
+def _parse_frontmatter(text: str, source: str | None = None) -> dict:
+    """Parse a flat key: value YAML frontmatter block. Nested blocks ignored.
+
+    Flat-only by design — multiline scalars, folded YAML (``key:\\n  value``),
+    block sequences nested under a key, and other non-flat YAML constructs are
+    silently skipped. When a key without a same-line value is followed by an
+    indented continuation line that looks like folded YAML, a one-shot stderr
+    warning is emitted (review SF5) so operators can spot high-confidence
+    signals being silently degraded to mtime fallbacks.
+
+    Args:
+        text: full file contents (frontmatter must start at byte 0).
+        source: optional path/identifier surfaced in the SF5 warning so the
+            offending file is locatable in operator logs.
+    """
     m = _FRONT_RE.match(text)
     if not m:
         return {}
     out: dict = {}
-    for line in m.group(1).splitlines():
+    lines = m.group(1).splitlines()
+    folded_warned: set[str] = set()
+    for i, line in enumerate(lines):
         if not line or line.startswith(" ") or line.startswith("-"):
             continue  # skip list items and nested keys
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
-        out[key.strip()] = value.strip().strip('"').strip("'")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if not value:
+            # Key with no same-line value. If the next line is indented,
+            # it's folded/multiline YAML — log once per (file, key) so the
+            # silent degradation is visible. Skip the key as before.
+            nxt = lines[i + 1] if (i + 1) < len(lines) else ""
+            if nxt and (nxt.startswith(" ") or nxt.startswith("\t")):
+                tag = f"{source or '?'}::{key}"
+                if tag not in folded_warned:
+                    folded_warned.add(tag)
+                    print(
+                        f"[vault_doctor] folded-YAML key skipped "
+                        f"(parser is flat-only): {key} "
+                        f"(file: {source or 'unknown'})",
+                        file=sys.stderr,
+                    )
+                continue
+        out[key] = value
     return out
 
 
@@ -203,6 +236,14 @@ def _jsonl_window(jsonl_path: str) -> tuple[float, float] | None:
                 file=sys.stderr,
             )
             return None
+        # SF6: parseable lines but no `timestamp` field — log the synthesized
+        # 1-hour window so a future schema variant can't silently produce
+        # confidently-wrong matches.
+        print(
+            f"[vault_doctor] JSONL has no timestamp fields; "
+            f"using synthetic 1h window: {jsonl_path}",
+            file=sys.stderr,
+        )
         first_ts = mtime - 3600
     return (first_ts, mtime)
 
@@ -246,7 +287,17 @@ def _jsonl_dir_for_project(project: str) -> Path | None:
     # same-mtime dirs pick the same winner across runs instead of depending
     # on glob order. Matches the (mtime, path) pattern used for JSONL
     # selection elsewhere in the fast path.
-    return Path(max(viable, key=lambda pair: (pair[1], pair[0]))[0])
+    winner = Path(max(viable, key=lambda pair: (pair[1], pair[0]))[0])
+    if len(viable) > 1:
+        # SF8: silent picker on collision is invisible to operators when a
+        # path-encoding variant masks a real cross-project ambiguity. Log the
+        # candidates + winner so it's auditable.
+        print(
+            f"[vault_doctor] multiple project dirs matched {project}: "
+            f"{[m for m, _ in viable]}; using {winner}",
+            file=sys.stderr,
+        )
+    return winner
 
 
 def _find_jsonl_anywhere(sid: str) -> Path | None:
@@ -281,7 +332,7 @@ def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
             text = entry.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        fm = _parse_frontmatter(text)
+        fm = _parse_frontmatter(text, source=str(entry))
         if not fm:
             if text.startswith("---"):
                 print(
@@ -315,7 +366,7 @@ def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:
             text = entry.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        fm = _parse_frontmatter(text)
+        fm = _parse_frontmatter(text, source=str(entry))
         if not fm and text.startswith("---"):
             print(
                 f"[vault_doctor] malformed frontmatter, skipped: {entry}",
@@ -452,7 +503,7 @@ def scan(
                 text = note.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            fm = _parse_frontmatter(text)
+            fm = _parse_frontmatter(text, source=str(note))
             if "source_session" not in fm:
                 continue  # non-source-session note type (e.g., standups with source_notes[])
             note_project = fm.get("project", "")
