@@ -1503,12 +1503,14 @@ def test_scan_day_overlap_picks_morning_session(doctor_vault, monkeypatch):
         project=project,
     )
     flagged = [i for i in issues if i.note_path == str(insight) and not i.extra.get("unresolved")]
-    if flagged:
-        # Day-overlap matcher should pick the morning session (larger overlap)
-        assert flagged[0].extra.get("proposed_sid") == sid_morning, (
-            f"day-overlap matcher should prefer morning session ({sid_morning}) "
-            f"over noon session ({sid_noon}); got {flagged[0].extra.get('proposed_sid')}"
-        )
+    assert len(flagged) == 1, (
+        f"expected exactly one non-unresolved issue for {insight}, got {len(flagged)}: {flagged}"
+    )
+    # Day-overlap matcher should pick the morning session (larger overlap)
+    assert flagged[0].extra.get("proposed_sid") == sid_morning, (
+        f"day-overlap matcher should prefer morning session ({sid_morning}) "
+        f"over noon session ({sid_noon}); got {flagged[0].extra.get('proposed_sid')}"
+    )
 
 
 def test_scan_caps_mtime_signal_confidence_below_convergence_floor(doctor_vault, monkeypatch):

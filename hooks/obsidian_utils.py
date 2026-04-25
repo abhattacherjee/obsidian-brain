@@ -96,15 +96,19 @@ def _safe_mtime(path: str) -> float:
 _git_fallback_warned: bool = False
 
 
-def _git_canonical_project_name(cwd: str | None = None) -> str | None:
-    """Return the main-repo basename via `git rev-parse --git-common-dir`.
+def _git_canonical_project_name_with_reason(
+    cwd: str | None = None,
+) -> tuple[str | None, str]:
+    """Return (canonical_name_or_None, reason).
 
-    For a worktree, `--git-common-dir` returns the path to the SHARED .git
-    of the main repo (e.g., `/path/main-repo/.git`). The parent's basename
-    is the canonical project name across all worktrees.
-
-    Returns None if not in a git repository or git is unavailable. Caller
-    should fall back to cwd basename in that case.
+    reason is one of:
+      - "ok" — name resolved successfully
+      - "not-a-repo" — git ran but cwd is not inside a git work-tree (returncode != 0).
+        This is a NORMAL operating condition; callers should NOT warn.
+      - "git-unavailable" — git binary missing or subprocess raised OSError.
+        Genuine error; callers SHOULD warn.
+      - "empty-output" — git ran clean but returned no path. Should not happen.
+      - "resolve-failed" — relative-path resolve raised OSError.
     """
     try:
         result = subprocess.run(
@@ -115,21 +119,37 @@ def _git_canonical_project_name(cwd: str | None = None) -> str | None:
             cwd=cwd or None,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return (None, "git-unavailable")
     if result.returncode != 0:
-        return None
+        return (None, "not-a-repo")
     common_dir = result.stdout.strip()
     if not common_dir:
-        return None
+        return (None, "empty-output")
     common_dir_path = Path(common_dir)
     if not common_dir_path.is_absolute():
         base = Path(cwd) if cwd else Path.cwd()
         try:
             common_dir_path = (base / common_dir).resolve()
         except OSError:
-            return None
+            return (None, "resolve-failed")
     name = common_dir_path.parent.name
-    return name or None
+    if not name:
+        return (None, "empty-output")
+    return (name, "ok")
+
+
+def _git_canonical_project_name(cwd: str | None = None) -> str | None:
+    """Return the main-repo basename via `git rev-parse --git-common-dir`.
+
+    For a worktree, `--git-common-dir` returns the path to the SHARED .git
+    of the main repo (e.g., `/path/main-repo/.git`). The parent's basename
+    is the canonical project name across all worktrees.
+
+    Returns None if not in a git repository or git is unavailable. Caller
+    should fall back to cwd basename in that case.
+    """
+    name, _reason = _git_canonical_project_name_with_reason(cwd)
+    return name
 
 
 def canonical_project_name(cwd: str | None = None) -> str:
@@ -145,21 +165,24 @@ def canonical_project_name(cwd: str | None = None) -> str:
     0, so raising would violate the contract. Result is lowercased and
     underscores/spaces normalized to hyphens.
 
-    Emits a one-shot stderr warning per process when git is unavailable
-    and the cwd-basename fallback engages. Inside a worktree this fallback
-    re-creates the worktree-divergent `project:` write that the canonical
-    helper exists to prevent (review SF7).
+    Emits a one-shot stderr warning per process ONLY when git is genuinely
+    unavailable or errors out (binary missing, empty output, resolve failure).
+    Does NOT warn for the normal "cwd is not in a git repo" case — that's a
+    common, expected operating condition and warning would be noise (review
+    Copilot R2).
     """
-    name = _git_canonical_project_name(cwd)
+    name, reason = _git_canonical_project_name_with_reason(cwd)
     if name is None:
-        global _git_fallback_warned
-        if not _git_fallback_warned:
-            _git_fallback_warned = True
-            print(
-                "[obsidian_utils] canonical_project_name: git unavailable, "
-                "using cwd basename — verify project: frontmatter writes",
-                file=sys.stderr,
-            )
+        if reason in ("git-unavailable", "empty-output", "resolve-failed"):
+            global _git_fallback_warned
+            if not _git_fallback_warned:
+                _git_fallback_warned = True
+                print(
+                    f"[obsidian_utils] canonical_project_name: git error "
+                    f"({reason}), using cwd basename — verify project: "
+                    f"frontmatter writes",
+                    file=sys.stderr,
+                )
         try:
             base = cwd if cwd else os.getcwd()
         except (OSError, FileNotFoundError):

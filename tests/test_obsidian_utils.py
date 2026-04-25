@@ -2118,9 +2118,80 @@ def test_canonical_project_name_handles_deleted_cwd(monkeypatch):
         raise FileNotFoundError("cwd deleted")
     monkeypatch.setattr(obsidian_utils.os, "getcwd", _raise_fnf)
     monkeypatch.setattr(
-        obsidian_utils, "_git_canonical_project_name", lambda cwd=None: None
+        obsidian_utils,
+        "_git_canonical_project_name_with_reason",
+        lambda cwd=None: (None, "not-a-repo"),
     )
     assert obsidian_utils.canonical_project_name(None) == "unknown"
+
+
+def test_canonical_project_name_no_warn_when_not_a_repo(tmp_path, monkeypatch, capsys):
+    """Copilot R2: the SF7 warning must NOT fire for the normal 'cwd is not
+    inside a git repo' case (returncode != 0). That's an expected operating
+    condition; warning would be noise.
+    """
+    monkeypatch.setattr(obsidian_utils, "_git_fallback_warned", False)
+    nongit = tmp_path / "Plain Folder"
+    nongit.mkdir()
+    monkeypatch.chdir(nongit)
+    capsys.readouterr()  # drain
+    assert obsidian_utils.canonical_project_name() == "plain-folder"
+    captured = capsys.readouterr()
+    assert "[obsidian_utils]" not in captured.err, (
+        f"warning should not fire for not-a-repo case, got stderr: {captured.err!r}"
+    )
+
+
+def test_canonical_project_name_warns_once_when_git_unavailable(monkeypatch, capsys):
+    """Copilot R2: the SF7 warning fires for genuine git errors
+    (git-unavailable / empty-output / resolve-failed) and is one-shot per
+    process. Multiple calls produce exactly one stderr line.
+    """
+    monkeypatch.setattr(obsidian_utils, "_git_fallback_warned", False)
+    monkeypatch.setattr(
+        obsidian_utils,
+        "_git_canonical_project_name_with_reason",
+        lambda cwd=None: (None, "git-unavailable"),
+    )
+    monkeypatch.setattr(obsidian_utils.os, "getcwd", lambda: "/tmp/some-dir")
+    capsys.readouterr()  # drain
+
+    obsidian_utils.canonical_project_name()
+    obsidian_utils.canonical_project_name()
+    obsidian_utils.canonical_project_name()
+
+    captured = capsys.readouterr()
+    occurrences = captured.err.count(
+        "[obsidian_utils] canonical_project_name: git error"
+    )
+    assert occurrences == 1, (
+        f"warning should fire exactly once across 3 calls, got {occurrences} "
+        f"in stderr: {captured.err!r}"
+    )
+    assert "git-unavailable" in captured.err
+
+
+def test_git_canonical_project_name_with_reason_distinguishes_failure_modes(
+    tmp_path, monkeypatch
+):
+    """The new (name, reason) helper distinguishes: ok / not-a-repo /
+    git-unavailable / empty-output / resolve-failed. Used by canonical_project_name
+    to suppress noise for the common 'not-a-repo' case (Copilot R2).
+    """
+    # not-a-repo: real fs, no .git
+    nongit = tmp_path / "no-repo"
+    nongit.mkdir()
+    name, reason = obsidian_utils._git_canonical_project_name_with_reason(str(nongit))
+    assert name is None
+    assert reason == "not-a-repo"
+
+    # git-unavailable: subprocess.run raises OSError
+    def _raise(*args, **kwargs):
+        raise OSError("git binary missing")
+    monkeypatch.setattr(obsidian_utils.subprocess, "run", _raise)
+    name, reason = obsidian_utils._git_canonical_project_name_with_reason(str(nongit))
+    assert name is None
+    assert reason == "git-unavailable"
 
 
 def test_get_session_context_returns_canonical_project(tmp_path, monkeypatch):
