@@ -364,6 +364,47 @@ def _find_matching_session(
     return {**session_note_index[best_sid], "sid": best_sid}
 
 
+def _find_matching_session_by_day_overlap(
+    date_str: str,
+    jsonl_dir: Path | None,
+    session_note_index: dict[str, dict],
+) -> dict | None:
+    """Return the session note dict whose JSONL window has the largest
+    overlap with the UTC calendar day of date_str.
+
+    Used for day-precision signals (`date`, `filename`) where a single
+    capture_time anchor (e.g., noon UTC) excludes morning-only or
+    evening-only sessions. Tie-break: largest overlap, then latest
+    first_ts (mirrors point-match behavior).
+    """
+    if not jsonl_dir or not jsonl_dir.is_dir():
+        return None
+    day_start = _parse_date_ts(date_str, hour=0)
+    if day_start is None:
+        return None
+    day_end = day_start + 86400
+    best_sid: str | None = None
+    best_overlap: float = 0
+    best_first_ts: float = 0
+    for jsonl in sorted(jsonl_dir.glob("*.jsonl")):
+        sid = jsonl.stem
+        if sid not in session_note_index:
+            continue
+        window = _jsonl_window(str(jsonl))
+        if window is None:
+            continue
+        first_ts, last_ts = window
+        overlap = max(0.0, min(day_end, last_ts) - max(day_start, first_ts))
+        if overlap <= 0:
+            continue
+        # Pick largest overlap; tie-break by latest first_ts
+        if (overlap > best_overlap) or (overlap == best_overlap and first_ts > best_first_ts):
+            best_sid, best_overlap, best_first_ts = sid, overlap, first_ts
+    if best_sid is None:
+        return None
+    return {**session_note_index[best_sid], "sid": best_sid}
+
+
 def scan(
     vault_path: str,
     sessions_folder: str,
@@ -520,7 +561,22 @@ def scan(
                     if _find_jsonl_anywhere(current_sid) is not None:
                         continue  # trust UUID, skip matcher
 
-            match = _find_matching_session(capture_time, jsonl_dir, idx)
+            # Day-precision signals: match by greatest overlap with UTC calendar day.
+            # Sub-day precision (created_at): match by point-in-window.
+            if capture_signal == "created_at":
+                match = _find_matching_session(capture_time, jsonl_dir, idx)
+            else:
+                # Derive note's date from frontmatter or filename prefix
+                note_date_for_match = fm.get("date", "")
+                if not note_date_for_match:
+                    fn_match = _FILENAME_DATE_RE.match(note.name)
+                    note_date_for_match = fn_match.group(1) if fn_match else ""
+                if note_date_for_match:
+                    match = _find_matching_session_by_day_overlap(
+                        note_date_for_match, jsonl_dir, idx
+                    )
+                else:
+                    match = _find_matching_session(capture_time, jsonl_dir, idx)
             if match is None:
                 # No JSONL window contains the note's capture_time. Flag as unresolved
                 # ONLY if the current source doesn't resolve to any known session note

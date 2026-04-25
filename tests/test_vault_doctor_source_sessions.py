@@ -183,7 +183,13 @@ def test_scan_honors_days_window(doctor_vault, monkeypatch):
 
 
 def test_scan_marks_unresolved_when_no_window_matches(doctor_vault, monkeypatch):
-    """Insight whose mtime does not fall inside any session window → UNRESOLVED (or not flagged)."""
+    """Insight whose date has no overlapping session window → UNRESOLVED.
+
+    Under day-overlap matching, the matcher finds any session whose JSONL
+    window touches the note's calendar day. To produce an unresolved case we
+    need the only session to be on a *different* calendar day so no overlap
+    exists at all.
+    """
     import vault_doctor_checks.source_sessions as check
 
     v = doctor_vault["vault"]
@@ -191,11 +197,13 @@ def test_scan_marks_unresolved_when_no_window_matches(doctor_vault, monkeypatch)
     jsonl_dir = doctor_vault["jsonl_dir"]
     monkeypatch.setenv("HOME", str(home))
 
-    a_start = calendar.timegm(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
-    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-10T10:00:00Z", a_start + 3600)
-    _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-a", "aaaa")
+    # Session on 2026-04-09 only — no session on 2026-04-10
+    a_start = calendar.timegm(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
+    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-09T10:00:00Z", a_start + 3600)
+    _write_session_note(v / "claude-sessions", "2026-04-09", "proj1", "sid-a", "aaaa")
 
-    # Insight captured at 20:00 — no session window covers it, and current source 'wrong-sid' isn't a real session
+    # Insight dated 2026-04-10 — day-overlap finds no session whose window
+    # touches 2026-04-10, so the result is unresolved.
     gap_mtime = calendar.timegm(time.strptime("2026-04-10 20:00", "%Y-%m-%d %H:%M"))
     _write_insight(
         v / "claude-insights",
