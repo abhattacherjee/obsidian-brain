@@ -91,6 +91,106 @@ def _safe_mtime(path: str) -> float:
         return -1.0
 
 
+# Module-level flag for SF7 one-shot warning. Avoids spamming stderr on every
+# canonical_project_name() call when git is unavailable for the whole process.
+_git_fallback_warned: bool = False
+
+
+def _git_canonical_project_name_with_reason(
+    cwd: str | None = None,
+) -> tuple[str | None, str]:
+    """Return (canonical_name_or_None, reason).
+
+    reason is one of:
+      - "ok" — name resolved successfully
+      - "not-a-repo" — git ran but cwd is not inside a git work-tree (returncode != 0).
+        This is a NORMAL operating condition; callers should NOT warn.
+      - "git-unavailable" — git binary missing or subprocess raised OSError.
+        Genuine error; callers SHOULD warn.
+      - "empty-output" — git ran clean but returned no path. Should not happen.
+      - "resolve-failed" — relative-path resolve raised OSError.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=cwd or None,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return (None, "git-unavailable")
+    if result.returncode != 0:
+        return (None, "not-a-repo")
+    common_dir = result.stdout.strip()
+    if not common_dir:
+        return (None, "empty-output")
+    common_dir_path = Path(common_dir)
+    if not common_dir_path.is_absolute():
+        base = Path(cwd) if cwd else Path.cwd()
+        try:
+            common_dir_path = (base / common_dir).resolve()
+        except OSError:
+            return (None, "resolve-failed")
+    name = common_dir_path.parent.name
+    if not name:
+        return (None, "empty-output")
+    return (name, "ok")
+
+
+def _git_canonical_project_name(cwd: str | None = None) -> str | None:
+    """Return the main-repo basename via `git rev-parse --git-common-dir`.
+
+    For a worktree, `--git-common-dir` returns the path to the SHARED .git
+    of the main repo (e.g., `/path/main-repo/.git`). The parent's basename
+    is the canonical project name across all worktrees.
+
+    Returns None if not in a git repository or git is unavailable. Caller
+    should fall back to cwd basename in that case.
+    """
+    name, _reason = _git_canonical_project_name_with_reason(cwd)
+    return name
+
+
+def canonical_project_name(cwd: str | None = None) -> str:
+    """Return the canonical (main-repo) project name for cwd.
+
+    Worktrees of the same repo all return the same canonical name. This
+    is what should be written to vault-note frontmatter `project:` fields
+    so cross-worktree work groups under one logical project.
+
+    Falls back to cwd basename if not in a git repo. Returns 'unknown' when
+    the working directory cannot be determined (e.g., the directory was
+    deleted mid-session via `gh pr merge --delete-branch`); hooks must exit
+    0, so raising would violate the contract. Result is lowercased and
+    underscores/spaces normalized to hyphens.
+
+    Emits a one-shot stderr warning per process ONLY when git is genuinely
+    unavailable or errors out (binary missing, empty output, resolve failure).
+    Does NOT warn for the normal "cwd is not in a git repo" case — that's a
+    common, expected operating condition and warning would be noise (review
+    Copilot R2).
+    """
+    name, reason = _git_canonical_project_name_with_reason(cwd)
+    if name is None:
+        if reason in ("git-unavailable", "empty-output", "resolve-failed"):
+            global _git_fallback_warned
+            if not _git_fallback_warned:
+                _git_fallback_warned = True
+                print(
+                    f"[obsidian_utils] canonical_project_name: git error "
+                    f"({reason}), using cwd basename — verify project: "
+                    f"frontmatter writes",
+                    file=sys.stderr,
+                )
+        try:
+            base = cwd if cwd else os.getcwd()
+        except (OSError, FileNotFoundError):
+            return "unknown"
+        name = os.path.basename(base)
+    return name.lower().replace(" ", "-").replace("_", "-")
+
+
 def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str]:
     """Glob ~/.claude/projects/*<project>/<suffix>, with underscore-to-hyphen fallback.
 
@@ -117,6 +217,9 @@ def _slow_path_newest_sid() -> str:
     entries. Returns 'unknown' if no JSONLs are found for the current cwd.
     """
     import glob as _glob
+    # Cwd-based project name (NOT canonical) — used for CC's path-encoded
+    # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
+    # see canonical_project_name().
     project = os.path.basename(os.getcwd())
     safe_project = _glob.escape(project)
     matches = _glob_project_jsonls(safe_project)
@@ -159,6 +262,9 @@ def _get_session_id_fast() -> str:
     this, before CC has flushed the new session's JSONL to disk).
     """
     import glob as _glob
+    # Cwd-based project name (NOT canonical) — used for CC's path-encoded
+    # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
+    # see canonical_project_name().
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
     safe_project = _glob.escape(project)
@@ -418,6 +524,9 @@ def check_hook_status() -> dict:
     "ok" is False only when the bootstrap file is missing entirely or no
     session files can be found.
     """
+    # Cwd-based project name (NOT canonical) — used for CC's path-encoded
+    # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
+    # see canonical_project_name().
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
 
@@ -473,7 +582,7 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     """Get session ID, hash, project, and session note name. Cached.
 
     Returns {session_id, hash, project, session_note_name} or
-    {session_id: 'unknown', hash: '', project: <cwd basename>, session_note_name: ''}.
+    {session_id: 'unknown', hash: '', project: <canonical-project>, session_note_name: ''}.
     """
     sid = _get_session_id_fast()
     # Include args in cache key so different call signatures don't collide
@@ -482,7 +591,7 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     if cached is not None:
         return cached
 
-    project = os.path.basename(os.getcwd()).lower().replace(' ', '-').replace('_', '-')
+    project = canonical_project_name()
     if sid == "unknown":
         # Don't cache "unknown" — would pollute cache shared across projects
         return {"session_id": "unknown", "hash": "", "project": project, "session_note_name": ""}
@@ -960,7 +1069,7 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
     errors, duration_minutes, commits.
     """
     meta: dict = {
-        "project": Path(cwd).name.lower().replace(" ", "-").replace("_", "-") if cwd else "unknown",
+        "project": canonical_project_name(cwd) if cwd else "unknown",
         "project_path": cwd or "",
         "git_branch": "",
         "files_touched": [],
@@ -2499,7 +2608,12 @@ def extract_tool_uses(messages: list[dict]) -> list[dict]:
 
 
 def get_project_name(cwd: str) -> str:
-    """Return the basename of the working directory as the project name."""
+    """Return the basename of the working directory as the project name.
+
+    Used for CC's path-encoded bootstrap/JSONL lookups; for vault frontmatter
+    use ``canonical_project_name()`` instead so worktrees of the same repo
+    share one logical project value.
+    """
     return Path(cwd).name if cwd else "unknown"
 
 
