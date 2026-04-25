@@ -50,6 +50,233 @@ _RE_RAW_CONVERSATION = re.compile(
     r"^## Conversation \(raw\)\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
 )
 
+# Session IDs are CC UUIDs (or test fixtures). Restrict to safe filename chars
+# so the marker path never escapes ~/.claude/obsidian-brain/sessions/.
+_SID_FILENAME_SAFE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
+
+
+def _first_seen_date(sid: str) -> str:
+    """Return the canonical first-seen calendar date for a session_id.
+
+    Atomic, idempotent, lazy: marker is written on first call and read
+    verbatim on subsequent calls — every subsequent call (across days,
+    worktrees, processes) returns the same date. If the marker becomes
+    corrupt or unreadable (e.g., truncated by an external process), the
+    function self-heals by rewriting it with today's date — note that
+    this resets the lockstep guarantee for that session_id.
+
+    Silent-failure paths (all log to stderr): unsafe sid shape, mkdir
+    failure, marker write failure — fall back to today's date and lockstep
+    is voided for that call. Used by get_session_context() and SessionEnd
+    so that source_session_note wikilinks and on-disk filenames stay in
+    lockstep even when sessions cross midnight.
+
+    Marker location: ~/.claude/obsidian-brain/sessions/<sid>.json (0o600).
+    """
+    if not _SID_FILENAME_SAFE.fullmatch(sid):
+        print(
+            f"[obsidian-brain] _first_seen_date: refusing unsafe sid shape; "
+            f"falling back to today's date",
+            file=sys.stderr,
+        )
+        return datetime.date.today().isoformat()
+
+    marker_dir = Path.home() / ".claude" / "obsidian-brain" / "sessions"
+    try:
+        marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if marker_dir.stat().st_mode & 0o077:
+            os.chmod(marker_dir, 0o700)
+    except OSError as exc:
+        print(f"[obsidian-brain] _first_seen_date: cannot create marker dir: {exc}",
+              file=sys.stderr)
+        return datetime.date.today().isoformat()  # graceful fallback
+
+    marker = marker_dir / f"{sid}.json"
+    try:
+        date = json.loads(marker.read_text(encoding="utf-8"))["first_seen_date"]
+        # Self-heal mode if a previous bug or manual edit left it permissive.
+        try:
+            if marker.stat().st_mode & 0o077:
+                os.chmod(marker, 0o600)
+        except OSError:
+            pass  # mode-tightening is best-effort; readback already succeeded
+        return date
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError):
+        pass  # fall through and (re)write
+
+    today = datetime.date.today().isoformat()
+    payload = {
+        "first_seen_date": today,
+        "first_seen_iso": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{sid}.", suffix=".json.tmp", dir=str(marker_dir)
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, marker)  # atomic on POSIX
+        tmp_path = None  # rename succeeded; nothing to clean up
+    except OSError as exc:
+        print(f"[obsidian-brain] _first_seen_date: marker write failed: {exc}",
+              file=sys.stderr)
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError as cleanup_exc:
+                print(
+                    f"[obsidian-brain] _first_seen_date: failed to clean up temp file "
+                    f"{tmp_path}: {cleanup_exc}",
+                    file=sys.stderr,
+                )
+    return today
+
+
+def _peek_frontmatter_field(path: Path, field: str) -> str | None:
+    """Return the unquoted YAML scalar for ``field:`` from a vault note's
+    frontmatter, or None. Reads at most 30 lines to keep the cost negligible
+    even when called on hash-collision (which is rare).
+
+    Stops at the closing ``---`` marker. Quote-stripping handles the common
+    cases ``"value"`` and ``'value'``; unquoted scalars are returned verbatim.
+    Empty values (``field:`` with no scalar) are normalized to None for clean
+    truthy-checks at call sites.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            in_frontmatter = False
+            for i, line in enumerate(fh):
+                if i >= 30:
+                    break
+                stripped = line.strip()
+                if stripped == "---":
+                    if not in_frontmatter:
+                        in_frontmatter = True
+                        continue
+                    break  # closing marker
+                if not in_frontmatter:
+                    continue
+                if stripped.startswith(f"{field}:"):
+                    value = stripped[len(field) + 1:].strip()
+                    if (value.startswith('"') and value.endswith('"')) or \
+                       (value.startswith("'") and value.endswith("'")):
+                        value = value[1:-1]
+                    if not value:
+                        print(
+                            f"[obsidian-brain] _peek_frontmatter_field: {path.name} has empty "
+                            f"{field!r} field — possible mid-write or corruption",
+                            file=sys.stderr,
+                        )
+                        return None
+                    return value
+    except (OSError, UnicodeDecodeError) as exc:
+        print(
+            f"[obsidian-brain] _peek_frontmatter_field: cannot read {path.name} "
+            f"for field={field!r}: {exc}; this file will be excluded from filtering",
+            file=sys.stderr,
+        )
+        return None
+    return None
+
+
+def _peek_frontmatter_type(path: Path) -> str | None:
+    return _peek_frontmatter_field(path, "type")
+
+
+def _peek_frontmatter_project_path(path: Path) -> str | None:
+    return _peek_frontmatter_field(path, "project_path")
+
+
+def _resolve_session_note_by_hash(
+    sessions_dir: Path | str,
+    h: str,
+    cwd: str | None = None,
+) -> tuple[str | None, list[str]]:
+    """Resolve ``*-{h}.md`` to a session-type note matching this project.
+
+    Replaces first-match-wins glob discipline with a type+project filter
+    that handles the three known collision modes:
+      1. session_id sharing with snapshot notes (#101 Fix C)
+      2. cross-project 4-char hash collision (#101 Fix C)
+      3. genuine same-session_id duplicates (subsumes #86)
+
+    Returns ``(basename_without_ext, collisions)``:
+      - basename_without_ext: file stem (no ``.md``) when resolved
+      - collisions: list of full filenames *with* ``.md`` so stderr
+        warnings are unambiguous when shown to the operator
+
+      - exactly one session-type match              → (basename, [])
+      - 2+ session matches but exactly one cwd match → (basename, [other names])
+      - 0 session-type matches                       → (None, [])
+      - 2+ matches and ambiguous after cwd filter    → (None, [all session names])
+
+    Caller pattern: warn on non-empty ``collisions`` and fall back to a
+    composed name (via ``make_filename(_first_seen_date(sid), project, sid)``)
+    when ``basename is None``.
+    """
+    sessions_dir = Path(sessions_dir)
+    if not sessions_dir.is_dir():
+        print(
+            f"[obsidian-brain] _resolve_session_note_by_hash: sessions_dir "
+            f"{sessions_dir} does not exist or is not readable; treating as no-match",
+            file=sys.stderr,
+        )
+        return None, []
+
+    try:
+        matches = sorted(sessions_dir.glob(f"*-{h}.md"))
+    except OSError as exc:
+        # Permission errors / transient I/O on the sessions dir must not crash
+        # SessionEnd. Fall back to (None, []) so callers compose a fresh name.
+        print(
+            f"[obsidian-brain] _resolve_session_note_by_hash: glob failed on "
+            f"{sessions_dir}: {exc}",
+            file=sys.stderr,
+        )
+        return None, []
+    # Treat type=None as claude-session for backward-compat with legacy notes
+    # that pre-date the explicit type frontmatter field — matches the same
+    # convention used by collect_open_items() in hooks/open_item_dedup.py.
+    session_matches = [m for m in matches
+                       if (_peek_frontmatter_type(m) or "claude-session") == "claude-session"]
+    if not session_matches:
+        return None, []
+
+    # Apply cwd filter when provided — covers single-match cross-project collision
+    if cwd:
+        cwd_matches = [m for m in session_matches
+                       if _peek_frontmatter_project_path(m) == cwd]
+        if len(cwd_matches) == 1:
+            others = [m.name for m in session_matches if m != cwd_matches[0]]
+            return cwd_matches[0].stem, others
+        if len(cwd_matches) == 0:
+            # No cwd match — surface ALL the cross-project matches as collisions
+            # so caller can warn, then fall back to composed name.
+            return None, [m.name for m in session_matches]
+        # Multiple cwd matches — fall through to ambiguous return below
+
+    # No cwd OR multiple cwd matches — leniently return single-match basename
+    if len(session_matches) == 1:
+        return session_matches[0].stem, []
+    return None, [m.name for m in session_matches]
+
+
+def _safe_getcwd() -> str:
+    """Return os.getcwd() or empty string if cwd is deleted/unmounted.
+
+    Hook paths must not crash on cwd-gone (issue #105 territory) — callers
+    that pass this to _resolve_session_note_by_hash get the (None, []) /
+    (None, [...]) lenient fallback when cwd resolution fails.
+    """
+    try:
+        return os.getcwd()
+    except (OSError, FileNotFoundError):
+        return ""
+
+
 # --- Secure working directory ---
 # All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
 # This prevents symlink attacks and cache poisoning on multi-user systems.
@@ -600,17 +827,33 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
 
     session_note_name = ""
     if vault_path and sessions_folder:
-        sessions_dir = os.path.join(vault_path, sessions_folder)
-        if os.path.isdir(sessions_dir):
-            for fname in os.listdir(sessions_dir):
-                if fname.endswith(f'-{h}.md'):
-                    session_note_name = fname[:-3]  # strip .md
-                    break
+        sessions_dir = Path(vault_path) / sessions_folder
+        resolved, collisions = _resolve_session_note_by_hash(
+            sessions_dir, h, cwd=_safe_getcwd()
+        )
+        # WARN fires once per (session, vault, folder) — cache_set below
+        # persists the result to ~/.claude/obsidian-brain/cache-<sid>.json,
+        # suppressing repeats across this hook process and any subsequent
+        # skill invocations within the same session until SessionEnd cleans
+        # up the cache. Don't spam stderr.
+        if collisions:
+            print(
+                f"[obsidian-brain] WARN: hash {h} matches {len(collisions) + (1 if resolved else 0)} "
+                f"session note(s); chose {resolved or '<none — fell back to composed name>'} "
+                f"(others: {collisions})",
+                file=sys.stderr,
+            )
+        if resolved:
+            session_note_name = resolved
 
-    # If not found, construct expected name
+    # If not found, compose the canonical basename. Both _first_seen_date()
+    # and make_filename() are also called by SessionEnd, so insight wikilinks
+    # and session-note filenames stay in lockstep across cross-midnight,
+    # worktree, and resumed-session conditions. (#101 Fix A + Fix B.)
     if not session_note_name:
-        from datetime import date
-        session_note_name = f"{date.today().isoformat()}-{project}-{h}"
+        session_note_name = make_filename(
+            _first_seen_date(sid), slugify(project), sid
+        )[:-3]
 
     ctx = {"session_id": sid, "hash": h, "project": project, "session_note_name": session_note_name}
     cache_set(sid, cache_key, ctx)
@@ -3000,16 +3243,36 @@ def build_raw_fallback(
 
 
 def is_resumed_session(
-    vault_path: str, sessions_folder: str, session_id: str
+    vault_path: str, sessions_folder: str, session_id: str,
+    cwd: str | None = None,
 ) -> bool:
-    """Check if a note with the same session_id hash already exists in the vault."""
+    """Return True iff a session-type note matching this session_id's hash
+    exists for the current project. Snapshot-type notes are intentionally
+    ignored (#101 Fix C), and cross-project hash collisions are skipped via
+    project_path filtering. Subsumes #86.
+
+    ``cwd`` overrides ``os.getcwd()`` for the project_path filter. SessionEnd
+    callers should pass ``hook_input["cwd"]`` (the authoritative project
+    path from Claude Code) so that hook processes that have chdir'd
+    elsewhere still classify the session against the right project.
+    Falls back to ``_safe_getcwd()`` when ``cwd`` is None.
+    """
     sessions_dir = Path(vault_path) / sessions_folder
     if not sessions_dir.exists():
         return False
     h = hashlib.sha256(session_id.encode()).hexdigest()[:4]
-    for _ in sessions_dir.glob(f"*-{h}.md"):
-        return True
-    return False
+    effective_cwd = cwd if cwd is not None else _safe_getcwd()
+    resolved, collisions = _resolve_session_note_by_hash(
+        sessions_dir, h, cwd=effective_cwd
+    )
+    if collisions:
+        # Caller contract is bool-only; warn so the operator can investigate.
+        print(
+            f"[obsidian-brain] WARN: is_resumed_session: hash {h} collides "
+            f"across {len(collisions) + (1 if resolved else 0)} session note(s)",
+            file=sys.stderr,
+        )
+    return resolved is not None
 
 
 def upgrade_note_with_summary(

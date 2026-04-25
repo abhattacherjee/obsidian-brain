@@ -2298,10 +2298,10 @@ def test_get_session_context_cache_key_isolates_distinct_worktrees(tmp_path, mon
     h1 = hashlib.sha256(sid1.encode()).hexdigest()[:4]
     h2 = hashlib.sha256(sid2.encode()).hexdigest()[:4]
     (sessions_dir / f"2026-04-25-obsidian-brain-{h1}.md").write_text(
-        "---\nsession_id: " + sid1 + "\n---\n", encoding="utf-8"
+        "---\ntype: claude-session\nsession_id: " + sid1 + "\n---\n", encoding="utf-8"
     )
     (sessions_dir / f"2026-04-25-obsidian-brain-{h2}.md").write_text(
-        "---\nsession_id: " + sid2 + "\n---\n", encoding="utf-8"
+        "---\ntype: claude-session\nsession_id: " + sid2 + "\n---\n", encoding="utf-8"
     )
 
     # Call 1: from main repo with SID1
