@@ -81,7 +81,18 @@ If exit code is `3`, surface the stderr message directly to the user and stop.
 
 ### Step 3 — Present the report to the user
 
-Parse the JSON and present a grouped-by-project table. Example:
+Parse the JSON and present a grouped-by-project table.
+
+For each issue, after the `proposed:` line (when present), render a
+`signal: <capture_signal> (conf <capture_confidence>)` line. The values
+come from `extra.capture_signal` and `extra.capture_confidence` in the
+JSON payload. This makes heuristic-fall cases visible to the operator
+before they decide whether to apply (e.g., `signal=mtime conf=0.5`
+indicates no immutable signal was available — the operator should
+sample a few flagged notes before running `fix`). For unresolved
+issues with no `proposed:` line, render `signal:` after `reason:`.
+
+Example:
 
 ```
 vault_doctor report — 3 issue(s) across 1 check(s)
@@ -92,13 +103,15 @@ vault_doctor report — 3 issue(s) across 1 check(s)
 [FAIL] 2026-04-10-recall-profiling.md
   current:  [[2026-04-09-obsidian-brain-abcd]]
   proposed: [[2026-04-10-obsidian-brain-ef01]]
-  reason:   note mtime 2026-04-10T14:22 matches session ef010000 window...
+  signal:   date (conf 0.9)
+  reason:   note capture_time 2026-04-10T12:00 (signal=date, conf=0.9) matches session ef010000 window, not current source abcd0000
 
 ### Project: tiny-vacation-agent (1 issue)
 [FAIL] 2026-04-11-enrichment-scope.md
   current:  [[2026-04-10-tiny-vacation-agent-aaaa]]
   proposed: [[2026-04-11-tiny-vacation-agent-bbbb]]
-  reason:   note mtime 2026-04-11T09:15 matches session bbbb0000 window...
+  signal:   date (conf 0.9)
+  reason:   note capture_time 2026-04-11T09:15 (signal=date, conf=0.9) matches session bbbb0000 window, not current source aaaa0000
 ```
 
 Use `[FAIL]` for actionable issues (those with a proposed fix) and `[WARN]` for unresolved ones (those the check could not auto-repair). Always include a one-line summary at the top with the total count.
