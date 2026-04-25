@@ -3171,14 +3171,26 @@ def build_raw_fallback(
 def is_resumed_session(
     vault_path: str, sessions_folder: str, session_id: str
 ) -> bool:
-    """Check if a note with the same session_id hash already exists in the vault."""
+    """Return True iff a session-type note matching this session_id's hash
+    exists for the current project. Snapshot-type notes are intentionally
+    ignored (#101 Fix C), and cross-project hash collisions are skipped via
+    project_path filtering. Subsumes #86.
+    """
     sessions_dir = Path(vault_path) / sessions_folder
     if not sessions_dir.exists():
         return False
     h = hashlib.sha256(session_id.encode()).hexdigest()[:4]
-    for _ in sessions_dir.glob(f"*-{h}.md"):
-        return True
-    return False
+    resolved, collisions = _resolve_session_note_by_hash(
+        sessions_dir, h, cwd=os.getcwd()
+    )
+    if collisions:
+        # Caller contract is bool-only; warn so the operator can investigate.
+        print(
+            f"[obsidian-brain] WARN: is_resumed_session: hash {h} collides "
+            f"across {len(collisions) + (1 if resolved else 0)} session note(s)",
+            file=sys.stderr,
+        )
+    return resolved is not None or bool(collisions)
 
 
 def upgrade_note_with_summary(

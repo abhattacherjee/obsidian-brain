@@ -403,3 +403,61 @@ def test_get_session_context_disambiguates_cross_project_hash_collision(
     assert "WARN" in captured.err
     assert f"hash {h}" in captured.err
     assert "other-project" in captured.err  # the OTHER session is named in the warning
+
+
+def test_is_resumed_session_filters_snapshot_type(tmp_path, monkeypatch):
+    """is_resumed_session must NOT return True when only a snapshot
+    exists with this hash (subsumes #86)."""
+    sid = "fresh-session-id"
+    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    # Only a snapshot exists with this hash — not a resumed session
+    _write_note(sessions / f"2026-04-20-foo-{h}-snapshot-101010.md",
+                {"type": "claude-snapshot", "session_id": "different"})
+
+    assert obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid) is False
+
+
+def test_is_resumed_session_returns_true_for_real_session(tmp_path, monkeypatch):
+    sid = "fresh-session-id"
+    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    cwd = str(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                {"type": "claude-session", "session_id": sid,
+                 "project_path": f'"{cwd}"'})
+
+    assert obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid) is True
+
+
+def test_is_resumed_session_handles_collision_pair(tmp_path, monkeypatch, capsys):
+    """Same-project two-session collision (the original #86 scope):
+    function returns True (a session does exist), warns, and does not
+    crash."""
+    sid = "fresh-session-id"
+    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    cwd = str(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                {"type": "claude-session", "session_id": "old",
+                 "project_path": f'"{cwd}"'})
+    _write_note(sessions / f"2026-04-21-foo-{h}.md",
+                {"type": "claude-session", "session_id": "newer",
+                 "project_path": f'"{cwd}"'})
+
+    result = obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid)
+    assert result is True
+    captured = capsys.readouterr()
+    assert "WARN" in captured.err or "collision" in captured.err.lower()
