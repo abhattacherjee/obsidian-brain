@@ -2158,3 +2158,75 @@ def test_extract_session_metadata_returns_canonical_project(tmp_path):
     # project_path should still be the WORKTREE path, since that's where
     # the session actually ran.
     assert meta["project_path"] == str(worktree)
+
+
+def test_get_session_context_cache_key_isolates_distinct_worktrees(tmp_path, monkeypatch):
+    """T7: get_session_context's cache must isolate distinct worktrees of
+    the same repo so a call from one worktree doesn't return cached state
+    from a sibling worktree.
+
+    Distinct worktrees have distinct CC session_ids (each owns its own
+    JSONL), so the per-session cache file (~/.claude/obsidian-brain/cache-<sid>.json)
+    is naturally partitioned by session. The cache_key within that file
+    includes (vault_path, sessions_folder) — anything else that varies
+    across worktrees (e.g., note basenames in vault_path) would still
+    collide because vault_path is shared across worktrees.
+
+    This test verifies the realistic case: two sessions with different
+    SIDs from two worktrees produce different cache files, so call 2
+    cannot inherit call 1's value. If a future change moves the cache
+    file to be SID-independent without adding a worktree-discriminator
+    to cache_key, this test will fail.
+    """
+    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / "cache-"))
+
+    repo = tmp_path / "obsidian-brain"
+    repo.mkdir()
+    _init_git_repo(repo)
+    worktree = tmp_path / "obsidian-brain--issue-93"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/issue-93", str(worktree)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    vault = tmp_path / "vault"
+    sessions_dir = vault / "claude-sessions"
+    sessions_dir.mkdir(parents=True)
+
+    # Simulate two distinct CC sessions: SID1 (from main repo) and SID2 (from worktree)
+    sid1 = "11111111-1111-1111-1111-111111111111"
+    sid2 = "22222222-2222-2222-2222-222222222222"
+
+    # Place a session note matching SID1's hash so the basename lookup
+    # produces a non-default value worth caching/comparing.
+    h1 = hashlib.sha256(sid1.encode()).hexdigest()[:4]
+    h2 = hashlib.sha256(sid2.encode()).hexdigest()[:4]
+    (sessions_dir / f"2026-04-25-obsidian-brain-{h1}.md").write_text(
+        "---\nsession_id: " + sid1 + "\n---\n", encoding="utf-8"
+    )
+    (sessions_dir / f"2026-04-25-obsidian-brain-{h2}.md").write_text(
+        "---\nsession_id: " + sid2 + "\n---\n", encoding="utf-8"
+    )
+
+    # Call 1: from main repo with SID1
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid1)
+    ctx1 = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+    assert ctx1["session_id"] == sid1
+    assert ctx1["hash"] == h1
+
+    # Call 2: from worktree with SID2 — must NOT return ctx1's hash
+    monkeypatch.chdir(worktree)
+    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid2)
+    ctx2 = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+    assert ctx2["session_id"] == sid2, (
+        f"cache leaked across worktrees: expected SID2 ({sid2}), got "
+        f"{ctx2['session_id']}"
+    )
+    assert ctx2["hash"] == h2, (
+        f"cache leaked across worktrees: expected hash {h2}, got {ctx2['hash']}"
+    )
+    # And canonical project naming must agree on both calls
+    assert ctx1["project"] == ctx2["project"] == "obsidian-brain"
