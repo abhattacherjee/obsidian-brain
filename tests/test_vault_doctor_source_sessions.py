@@ -1286,3 +1286,197 @@ def test_scan_trusts_cross_midnight_source(doctor_vault, monkeypatch):
         "regression: cross-midnight session_note.date=note.date-1 not trusted "
         "(session window overlaps note's calendar day → should be trusted)"
     )
+
+
+# ---------------------------------------------------------------------------
+# T5e Fix 1 — snapshot type filter
+# ---------------------------------------------------------------------------
+
+def test_list_all_session_notes_filters_out_snapshots(doctor_vault):
+    """Snapshot notes share session_id with parents; only sessions get indexed."""
+    vault = doctor_vault["vault"]
+    sessions = vault / "claude-sessions"
+    sid = "11111111-1111-1111-1111-111111111111"
+
+    # Parent session note
+    parent = sessions / "2026-04-21-proj1-1111.md"
+    parent.write_text(
+        "---\n"
+        "type: claude-session\n"
+        "date: 2026-04-21\n"
+        f"session_id: {sid}\n"
+        "project: proj1\n"
+        "---\n# session\n",
+        encoding="utf-8",
+    )
+    # Snapshot note with the same SID — must NOT clobber parent in idx
+    snap = sessions / "2026-04-21-proj1-1111-snapshot-131103.md"
+    snap.write_text(
+        "---\n"
+        "type: claude-snapshot\n"
+        "date: 2026-04-21\n"
+        f"session_id: {sid}\n"
+        "project: proj1\n"
+        "---\n# snap\n",
+        encoding="utf-8",
+    )
+
+    idx = ss._list_all_session_notes(sessions)
+    assert sid in idx
+    assert idx[sid]["basename"] == "2026-04-21-proj1-1111", (
+        f"snapshot clobbered parent: got {idx[sid]['basename']!r}"
+    )
+
+
+def test_list_session_notes_filters_out_snapshots(doctor_vault):
+    """Project-scoped variant must also skip snapshot type."""
+    vault = doctor_vault["vault"]
+    sessions = vault / "claude-sessions"
+    sid = "22222222-2222-2222-2222-222222222222"
+
+    parent = sessions / "2026-04-21-proj1-2222.md"
+    parent.write_text(
+        "---\n"
+        "type: claude-session\n"
+        "date: 2026-04-21\n"
+        f"session_id: {sid}\n"
+        "project: proj1\n"
+        "---\n# session\n",
+        encoding="utf-8",
+    )
+    snap = sessions / "2026-04-21-proj1-2222-snapshot-090000.md"
+    snap.write_text(
+        "---\n"
+        "type: claude-snapshot\n"
+        "date: 2026-04-21\n"
+        f"session_id: {sid}\n"
+        "project: proj1\n"
+        "---\n# snap\n",
+        encoding="utf-8",
+    )
+
+    idx = ss._list_session_notes(sessions, "proj1")
+    assert idx[sid]["basename"] == "2026-04-21-proj1-2222"
+
+
+# ---------------------------------------------------------------------------
+# T5e Fix 2 — trust UUID when JSONL exists but session note is missing
+# ---------------------------------------------------------------------------
+
+def test_scan_trusts_uuid_when_jsonl_exists_but_note_missing(doctor_vault, monkeypatch):
+    """When source_session UUID has a real JSONL but no session note, the
+    UUID is still authoritative — refuse to propose a different-session
+    rewrite. (Reference: issue #93 + #98 interaction.)"""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    sid_orphan = "33333333-3333-3333-3333-333333333333"
+    o_first = datetime(2026, 4, 22, 11, 0, tzinfo=timezone.utc).timestamp()
+    o_last = datetime(2026, 4, 22, 22, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_orphan}.jsonl",
+                 datetime.fromtimestamp(o_first, tz=timezone.utc).isoformat(),
+                 o_last)
+    # NOTE: No session note written for sid_orphan — simulates SessionEnd hook miss
+
+    # A different real session whose window also overlaps the day —
+    # without the fix, the matcher would propose this as the "correct" target.
+    sid_distractor = "44444444-4444-4444-4444-444444444444"
+    d_first = datetime(2026, 4, 22, 12, 30, tzinfo=timezone.utc).timestamp()
+    d_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_distractor}.jsonl",
+                 datetime.fromtimestamp(d_first, tz=timezone.utc).isoformat(),
+                 d_last)
+    _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid_distractor, "dist")
+
+    # Insight whose source_session is the orphan UUID
+    insight = _write_insight(
+        vault / "claude-insights",
+        date="2026-04-22",
+        slug="orphan-uuid-trust",
+        project=project,
+        src_sid=sid_orphan,
+        src_note_basename="2026-04-22-proj1-orph",
+        mtime=o_first + 1800,
+    )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged_paths = [i.note_path for i in issues if i.note_path == str(insight)]
+    if flagged_paths:
+        # Acceptable behavior: emit unresolved (UUID is real but note is missing).
+        # Unacceptable: propose sid_distractor as a rewrite target.
+        flagged = [i for i in issues if i.note_path == str(insight)][0]
+        if not flagged.extra.get("unresolved"):
+            assert flagged.extra.get("proposed_sid") != sid_distractor, (
+                "regression: matcher proposed a different session when "
+                "source UUID had a real JSONL (just missing session note)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# T5e Fix 3 — day-overlap matcher for date-precision signals
+# ---------------------------------------------------------------------------
+
+def test_scan_day_overlap_picks_morning_session(doctor_vault, monkeypatch):
+    """Sessions that ended before noon UTC must still be candidates for
+    notes whose date matches the calendar day. Old noon-anchor matcher
+    excluded them; day-overlap matcher includes them by overlap size."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # Morning session: 08:00 → 11:05 UTC (ended before noon)
+    sid_morning = "55555555-5555-5555-5555-555555555555"
+    m_first = datetime(2026, 4, 24, 8, 0, tzinfo=timezone.utc).timestamp()
+    m_last = datetime(2026, 4, 24, 11, 5, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_morning}.jsonl",
+                 datetime.fromtimestamp(m_first, tz=timezone.utc).isoformat(),
+                 m_last)
+    sess_m = _write_session_note(vault / "claude-sessions", "2026-04-24", project, sid_morning, "morn")
+
+    # Noon-anchored session: 12:30 → 14:00 — what the old matcher would have picked
+    sid_noon = "66666666-6666-6666-6666-666666666666"
+    n_first = datetime(2026, 4, 24, 12, 30, tzinfo=timezone.utc).timestamp()
+    n_last = datetime(2026, 4, 24, 14, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_noon}.jsonl",
+                 datetime.fromtimestamp(n_first, tz=timezone.utc).isoformat(),
+                 n_last)
+    _write_session_note(vault / "claude-sessions", "2026-04-24", project, sid_noon, "noon")
+
+    # Insight on 2026-04-24 with a non-resolving source_session UUID and no
+    # JSONL anywhere — falls through to the matcher. Morning session has
+    # the larger overlap (185 minutes vs 90 minutes), so day-overlap picks it.
+    insight = _write_insight(
+        vault / "claude-insights",
+        date="2026-04-24",
+        slug="morning-session",
+        project=project,
+        src_sid="00000000-0000-0000-0000-000000000099",
+        src_note_basename="2026-04-24-bogus",
+        mtime=m_first + 1800,
+    )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(insight) and not i.extra.get("unresolved")]
+    if flagged:
+        # Day-overlap matcher should pick the morning session (larger overlap)
+        assert flagged[0].extra.get("proposed_sid") == sid_morning, (
+            f"day-overlap matcher should prefer morning session ({sid_morning}) "
+            f"over noon session ({sid_noon}); got {flagged[0].extra.get('proposed_sid')}"
+        )

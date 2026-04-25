@@ -274,6 +274,8 @@ def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
         sid = fm.get("session_id", "")
         if not sid:
             continue
+        if fm.get("type") != "claude-session":
+            continue  # skip claude-snapshot — same UUID, not the canonical session
         out[sid] = {
             "path": entry,
             "basename": entry.name[:-3],
@@ -307,6 +309,8 @@ def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:
         sid = fm.get("session_id", "")
         if not sid:
             continue
+        if fm.get("type") != "claude-session":
+            continue  # skip claude-snapshot — same UUID, not the canonical session
         out[sid] = {
             "path": entry,
             "basename": entry.name[:-3],
