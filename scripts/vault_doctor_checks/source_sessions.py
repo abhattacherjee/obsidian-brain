@@ -99,33 +99,35 @@ def _parse_iso_ts(ts: str) -> float | None:
         return None
 
 
-def _parse_date_midpoint(date_str: str) -> float | None:
-    """Parse a YYYY-MM-DD date string to the POSIX timestamp at 12:00 UTC.
+def _parse_date_ts(date_str: str, hour: int = 0) -> float | None:
+    """Parse a YYYY-MM-DD date string to a POSIX timestamp at `hour`:00 UTC.
 
-    Day-precision input cannot tell us _when_ during the day a note was
-    captured; using midday makes the JSONL-window matcher symmetric across
-    both ends of a multi-session day.
+    `hour=12` (midday) is used for capture-time matching: day-precision input
+    cannot tell us _when_ during the day a note was captured, so midday makes
+    the JSONL-window matcher symmetric across both ends of a multi-session day.
+
+    `hour=0` (midnight) is used for calendar-day-overlap checks against a
+    JSONL window in Phase 1b.
     """
     if not date_str:
         return None
     try:
         d = datetime.strptime(date_str, "%Y-%m-%d").replace(
-            hour=12, minute=0, second=0, tzinfo=timezone.utc
+            hour=hour, tzinfo=timezone.utc
         )
         return d.timestamp()
     except ValueError:
         return None
 
 
+def _parse_date_midpoint(date_str: str) -> float | None:
+    """Compatibility shim: return the POSIX timestamp at 12:00 UTC of date_str."""
+    return _parse_date_ts(date_str, hour=12)
+
+
 def _parse_date_start(date_str: str) -> float | None:
-    """Parse YYYY-MM-DD to POSIX timestamp at 00:00 UTC of that day, or None."""
-    if not date_str:
-        return None
-    try:
-        d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        return d.timestamp()
-    except ValueError:
-        return None
+    """Compatibility shim: return the POSIX timestamp at 00:00 UTC of date_str."""
+    return _parse_date_ts(date_str, hour=0)
 
 
 # Filename prefix YYYY-MM-DD-...
