@@ -91,6 +91,59 @@ def _safe_mtime(path: str) -> float:
         return -1.0
 
 
+def _git_canonical_project_name(cwd: str | None = None) -> str | None:
+    """Return the main-repo basename via `git rev-parse --git-common-dir`.
+
+    For a worktree, `--git-common-dir` returns the path to the SHARED .git
+    of the main repo (e.g., `/path/main-repo/.git`). The parent's basename
+    is the canonical project name across all worktrees.
+
+    Returns None if not in a git repository or git is unavailable. Caller
+    should fall back to cwd basename in that case.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=cwd or None,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    common_dir = result.stdout.strip()
+    if not common_dir:
+        return None
+    common_dir_path = Path(common_dir)
+    if not common_dir_path.is_absolute():
+        base = Path(cwd) if cwd else Path.cwd()
+        try:
+            common_dir_path = (base / common_dir).resolve()
+        except OSError:
+            return None
+    name = common_dir_path.parent.name
+    return name or None
+
+
+def canonical_project_name(cwd: str | None = None) -> str:
+    """Return the canonical (main-repo) project name for cwd.
+
+    Worktrees of the same repo all return the same canonical name. This
+    is what should be written to vault-note frontmatter `project:` fields
+    so cross-worktree work groups under one logical project.
+
+    Falls back to cwd basename if not in a git repo. Result is lowercased
+    and underscores/spaces normalized to hyphens (matching existing convention).
+    """
+    name = _git_canonical_project_name(cwd)
+    if name is None:
+        base = cwd if cwd else os.getcwd()
+        name = os.path.basename(base)
+    return name.lower().replace(" ", "-").replace("_", "-")
+
+
 def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str]:
     """Glob ~/.claude/projects/*<project>/<suffix>, with underscore-to-hyphen fallback.
 
@@ -117,6 +170,9 @@ def _slow_path_newest_sid() -> str:
     entries. Returns 'unknown' if no JSONLs are found for the current cwd.
     """
     import glob as _glob
+    # Cwd-based project name (NOT canonical) — used for CC's path-encoded
+    # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
+    # see canonical_project_name().
     project = os.path.basename(os.getcwd())
     safe_project = _glob.escape(project)
     matches = _glob_project_jsonls(safe_project)
@@ -159,6 +215,9 @@ def _get_session_id_fast() -> str:
     this, before CC has flushed the new session's JSONL to disk).
     """
     import glob as _glob
+    # Cwd-based project name (NOT canonical) — used for CC's path-encoded
+    # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
+    # see canonical_project_name().
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
     safe_project = _glob.escape(project)
@@ -418,6 +477,9 @@ def check_hook_status() -> dict:
     "ok" is False only when the bootstrap file is missing entirely or no
     session files can be found.
     """
+    # Cwd-based project name (NOT canonical) — used for CC's path-encoded
+    # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
+    # see canonical_project_name().
     project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
 
@@ -473,7 +535,7 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     """Get session ID, hash, project, and session note name. Cached.
 
     Returns {session_id, hash, project, session_note_name} or
-    {session_id: 'unknown', hash: '', project: <cwd basename>, session_note_name: ''}.
+    {session_id: 'unknown', hash: '', project: <canonical-project>, session_note_name: ''}.
     """
     sid = _get_session_id_fast()
     # Include args in cache key so different call signatures don't collide
@@ -482,7 +544,7 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     if cached is not None:
         return cached
 
-    project = os.path.basename(os.getcwd()).lower().replace(' ', '-').replace('_', '-')
+    project = canonical_project_name()
     if sid == "unknown":
         # Don't cache "unknown" — would pollute cache shared across projects
         return {"session_id": "unknown", "hash": "", "project": project, "session_note_name": ""}
@@ -960,7 +1022,7 @@ def extract_session_metadata(messages: list[dict], cwd: str) -> dict:
     errors, duration_minutes, commits.
     """
     meta: dict = {
-        "project": Path(cwd).name.lower().replace(" ", "-").replace("_", "-") if cwd else "unknown",
+        "project": canonical_project_name(cwd) if cwd else "unknown",
         "project_path": cwd or "",
         "git_branch": "",
         "files_touched": [],

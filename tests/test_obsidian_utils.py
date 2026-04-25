@@ -4,7 +4,9 @@
 import hashlib
 import json
 import os
+import subprocess
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -2036,3 +2038,109 @@ class TestUpgradeBatch:
         assert "status: summarized" in updated
         assert "## Summary" in updated
         assert "Did a thing." in updated
+
+
+# ===========================================================================
+# Section N: canonical_project_name — worktree-aware project name derivation
+# ===========================================================================
+
+
+def _init_git_repo(path: Path) -> None:
+    """Create a minimal git repo at `path` for testing."""
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=path, check=True)
+    (path / "README.md").write_text("init")
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+
+
+def test_canonical_project_name_main_repo(tmp_path, monkeypatch):
+    """In the main repo, canonical name = repo basename."""
+    repo = tmp_path / "my-project"
+    repo.mkdir()
+    _init_git_repo(repo)
+    monkeypatch.chdir(repo)
+    assert obsidian_utils.canonical_project_name() == "my-project"
+
+
+def test_canonical_project_name_in_worktree(tmp_path, monkeypatch):
+    """In a worktree, canonical name = main repo basename, not worktree basename."""
+    repo = tmp_path / "my-project"
+    repo.mkdir()
+    _init_git_repo(repo)
+    worktree = tmp_path / "my-project--feature-branch"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/x", str(worktree)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.chdir(worktree)
+    # Despite the worktree's directory basename being "my-project--feature-branch",
+    # canonical_project_name returns the main-repo's basename.
+    assert obsidian_utils.canonical_project_name() == "my-project"
+
+
+def test_canonical_project_name_falls_back_outside_git(tmp_path, monkeypatch):
+    """Outside a git repo, fall back to cwd basename."""
+    nongit = tmp_path / "Plain Folder"
+    nongit.mkdir()
+    monkeypatch.chdir(nongit)
+    # The fallback applies normalization (spaces → hyphens, lowercase).
+    assert obsidian_utils.canonical_project_name() == "plain-folder"
+
+
+def test_canonical_project_name_explicit_cwd_arg(tmp_path):
+    """Explicit cwd= arg used instead of process cwd."""
+    repo = tmp_path / "sample-repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    # Note: NOT chdir-ing — using cwd= arg explicitly.
+    assert obsidian_utils.canonical_project_name(cwd=str(repo)) == "sample-repo"
+
+
+def test_canonical_project_name_normalizes_underscores(tmp_path, monkeypatch):
+    """Underscores and spaces normalize to hyphens, lowercase."""
+    repo = tmp_path / "Snake_Case_Repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    monkeypatch.chdir(repo)
+    assert obsidian_utils.canonical_project_name() == "snake-case-repo"
+
+
+def test_get_session_context_returns_canonical_project(tmp_path, monkeypatch):
+    """get_session_context's `project` field uses canonical naming."""
+    repo = tmp_path / "obsidian-brain"
+    repo.mkdir()
+    _init_git_repo(repo)
+    worktree = tmp_path / "obsidian-brain--issue-93"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/issue-93", str(worktree)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.chdir(worktree)
+    # session_id may be 'unknown' in test env — that's fine; we only check project.
+    ctx = obsidian_utils.get_session_context()
+    assert ctx["project"] == "obsidian-brain"
+
+
+def test_extract_session_metadata_returns_canonical_project(tmp_path):
+    """extract_session_metadata's `project` field uses canonical naming."""
+    repo = tmp_path / "obsidian-brain"
+    repo.mkdir()
+    _init_git_repo(repo)
+    worktree = tmp_path / "obsidian-brain--issue-93"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/issue-93", str(worktree)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    meta = obsidian_utils.extract_session_metadata([], cwd=str(worktree))
+    assert meta["project"] == "obsidian-brain"
+    # project_path should still be the WORKTREE path, since that's where
+    # the session actually ran.
+    assert meta["project_path"] == str(worktree)
