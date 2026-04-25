@@ -62,6 +62,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   internal path-encoded JSONL/bootstrap lookups are unaffected. Existing
   notes with worktree-derived project names continue to work via the
   UUID-first cross-project fallback in source-sessions.
+- **PR #97 reviewer findings (issue #93)**: 8 follow-up fixes applied:
+  C1+I6 surface `convergence_warning` and `convergence_count` at the
+  top level of the JSON payload (not under `extra.*`) and document the
+  `[CONVERGED <N> flags]` rendering in vault-doctor SKILL.md;
+  C2 cap `mtime`-signal proposed confidence at 0.3 (below the 0.4
+  convergence floor) so an mtime-only proposal is never auto-applied;
+  C3 emit an unresolved diagnostic Issue (with `missing_session_note`
+  and `jsonl_path`) when the source UUID has a real JSONL but no vault
+  session note, instead of silently skipping; C4 `canonical_project_name`
+  returns `"unknown"` when `os.getcwd()` raises (deleted-cwd safety so
+  hooks honor their must-exit-0 contract); C5 log a stderr warning when
+  `_list_all_session_notes` skips a `.md` file with malformed
+  frontmatter (parity with `_list_session_notes`); I4 Phase 1b now falls
+  back to `_find_jsonl_anywhere` when `_jsonl_dir_for_project` misses
+  on worktree-suffixed project names, preventing date-matcher false
+  positives; I7 tighten the UUID-trust regression test to assert the
+  C3 unresolved-Issue contract unconditionally.
 
 ## [2.4.1] - 2026-04-22
 
