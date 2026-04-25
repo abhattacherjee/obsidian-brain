@@ -379,6 +379,25 @@ def scan(
             else:
                 current_source_display = ""
 
+            # Phase 1b — early-exit (issue #93): if current source resolves
+            # to a same-day session note in the project's index, trust it.
+            # Avoids paying for a heuristic match when nothing has changed
+            # and prevents matcher boundary-tie misclassifications on
+            # cross-midnight or multi-session days.
+            #
+            # Only applies for day-precision signals (date, filename, mtime).
+            # When created_at provides a precise sub-day timestamp we trust
+            # the matcher — it has enough resolution to detect intra-day
+            # session boundaries even on multi-session days.
+            if current_sid and current_sid in idx and capture_signal != "created_at":
+                current_session_date = idx[current_sid].get("date", "")
+                note_date = fm.get("date", "")
+                if not note_date:
+                    fn_match = _FILENAME_DATE_RE.match(note.name)
+                    note_date = fn_match.group(1) if fn_match else ""
+                if note_date and current_session_date == note_date:
+                    continue  # current source already correct
+
             match = _find_matching_session(capture_time, jsonl_dir, idx)
             if match is None:
                 # No JSONL window contains the note's capture_time. Flag as unresolved

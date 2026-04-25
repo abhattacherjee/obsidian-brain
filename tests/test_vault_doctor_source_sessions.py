@@ -869,3 +869,65 @@ def test_scan_unresolved_reason_uses_capture_time(doctor_vault, monkeypatch):
     assert "mtime" not in iss.reason, f"reason should not mention mtime: {iss.reason!r}"
     assert iss.extra.get("capture_signal") == "date"
     assert iss.extra.get("capture_confidence") == 0.9
+
+
+def test_scan_trusts_current_source_when_same_day(doctor_vault, monkeypatch):
+    """If the existing source_session resolves to a same-day session note in
+    the index, the check must NOT re-match — even when the matcher would
+    otherwise propose a different same-day session."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+
+    monkeypatch.setenv("HOME", str(home))
+
+    day = "2026-04-22"
+    # Two same-day sessions, arranged so capture_time at 12:00 UTC (date midday)
+    # falls only inside Y. Without early-exit the matcher would propose Y;
+    # with early-exit, current source X is trusted.
+    sid_x = "11111111-1111-1111-1111-111111111111"
+    sid_y = "22222222-2222-2222-2222-222222222222"
+
+    # Session X: 2026-04-22 09:00–11:00 (current source — does NOT contain 12:00)
+    x_start = datetime(2026, 4, 22, 9, 0, tzinfo=timezone.utc).timestamp()
+    x_end = datetime(2026, 4, 22, 11, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_x}.jsonl",
+                 datetime.fromtimestamp(x_start, tz=timezone.utc).isoformat(),
+                 x_end)
+
+    # Session Y: 2026-04-22 12:00–18:00 (contains 12:00 — matcher would pick this)
+    y_start = datetime(2026, 4, 22, 12, 0, tzinfo=timezone.utc).timestamp()
+    y_end = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_y}.jsonl",
+                 datetime.fromtimestamp(y_start, tz=timezone.utc).isoformat(),
+                 y_end)
+
+    sess_x = _write_session_note(vault / "claude-sessions", day, project, sid_x, "xxxx")
+    _write_session_note(vault / "claude-sessions", day, project, sid_y, "yyyy")
+
+    # Insight whose date: is day; source_session points at X (correct). With
+    # capture_time at 12:00 UTC the matcher would otherwise propose Y. mtime
+    # is irrelevant for this test (the new check no longer uses it for
+    # matching) but we set it to a known value for stability.
+    insight = _write_insight(
+        vault / "claude-insights",
+        date=day,
+        slug="trust-x",
+        project=project,
+        src_sid=sid_x,
+        src_note_basename=sess_x.stem,
+        mtime=y_start + 1800,
+    )
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    paths = [i.note_path for i in issues]
+    assert str(insight) not in paths, (
+        "regression: same-day source was second-guessed by the matcher"
+    )
