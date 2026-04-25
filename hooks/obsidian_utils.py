@@ -2585,7 +2585,12 @@ def extract_tool_uses(messages: list[dict]) -> list[dict]:
 
 
 def get_project_name(cwd: str) -> str:
-    """Return the basename of the working directory as the project name."""
+    """Return the basename of the working directory as the project name.
+
+    Used for CC's path-encoded bootstrap/JSONL lookups; for vault frontmatter
+    use ``canonical_project_name()`` instead so worktrees of the same repo
+    share one logical project value.
+    """
     return Path(cwd).name if cwd else "unknown"
 
 

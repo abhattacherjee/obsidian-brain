@@ -136,12 +136,14 @@ def _parse_iso_ts(ts: str) -> float | None:
 def _parse_date_ts(date_str: str, hour: int = 0) -> float | None:
     """Parse a YYYY-MM-DD date string to a POSIX timestamp at `hour`:00 UTC.
 
-    `hour=12` (midday) is used for capture-time matching: day-precision input
-    cannot tell us _when_ during the day a note was captured, so midday makes
-    the JSONL-window matcher symmetric across both ends of a multi-session day.
+    `hour=12` (midday) is used for the diagnostic reason text (the
+    capture_time printed in Issue.reason) and for created_at-style
+    point-in-window matching as a degraded fallback. It is NOT used by the
+    primary day-overlap matcher — that path calls _parse_date_ts(date, hour=0)
+    directly to compute day_start, and derives day_end as day_start + 86400.
 
     `hour=0` (midnight) is used for calendar-day-overlap checks against a
-    JSONL window in Phase 1b.
+    JSONL window in Phase 1b and in _find_matching_session_by_day_overlap.
     """
     if not date_str:
         return None
@@ -155,12 +157,22 @@ def _parse_date_ts(date_str: str, hour: int = 0) -> float | None:
 
 
 def _parse_date_midpoint(date_str: str) -> float | None:
-    """Compatibility shim: return the POSIX timestamp at 12:00 UTC of date_str."""
+    """Return the POSIX timestamp at 12:00 UTC of a YYYY-MM-DD date_str.
+
+    Used by _capture_time to convert day-precision signals (frontmatter
+    `date`, filename prefix) into a single capture-time anchor for the
+    diagnostic reason field. The day-overlap matcher uses _parse_date_ts
+    directly with hour=0; this helper is for point-anchor consumers.
+    """
     return _parse_date_ts(date_str, hour=12)
 
 
 def _parse_date_start(date_str: str) -> float | None:
-    """Compatibility shim: return the POSIX timestamp at 00:00 UTC of date_str."""
+    """Return the POSIX timestamp at 00:00 UTC of a YYYY-MM-DD date_str.
+
+    Currently unused in the production code path; retained as a
+    symmetric public helper in case future checks need a midnight anchor.
+    """
     return _parse_date_ts(date_str, hour=0)
 
 
@@ -306,6 +318,10 @@ def _find_jsonl_anywhere(sid: str) -> Path | None:
     UUIDs are globally unique, so this is safe even though it ignores the
     project-name index. Returns the first match (deterministic via sorted)
     or None.
+
+    The project segment uses ``*`` so CC's underscore-to-hyphen slug
+    normalization is irrelevant here — there's no need to normalize the
+    input project name (the SID alone is sufficient to disambiguate).
     """
     home = os.environ.get("HOME", os.path.expanduser("~"))
     pattern = os.path.join(home, ".claude", "projects", "*", f"{sid}.jsonl")
@@ -512,7 +528,7 @@ def scan(
             if project and note_project.replace("_", "-") != project.replace("_", "-"):
                 continue
 
-            # Capture-time for JSONL-window matching uses immutable signals (issue #93).
+            # Capture-time for JSONL-window matching uses immutable signals.
             # mtime above is only the --days cutoff, not the matcher input.
             capture_time, capture_conf, capture_signal = _capture_time(note, fm)
             if capture_conf == 0.0:
@@ -542,7 +558,7 @@ def scan(
             else:
                 current_source_display = ""
 
-            # Phase 1b — UUID-first authoritative signal (issue #93):
+            # Phase 1b — UUID-first authoritative signal:
             # if current source's UUID resolves to ANY session note in the
             # vault (cross-project, since worktree-launched skills may write
             # `project:` from main-repo cwd while their source session ran
@@ -726,7 +742,7 @@ def scan(
                 )
             )
 
-    # Convergence guard (issue #93): if multiple flags in a project propose
+    # Convergence guard: if multiple flags in a project propose
     # the same target session, the date-window heuristic has structurally
     # collapsed across a multi-session day. Lower confidence and tag for
     # operator review.
