@@ -723,3 +723,81 @@ def test_recent_bootstrap_sid_skips_empty_content(isolated_home):
     bdir.chmod(0o700)
     (bdir / "sid-myproj").write_text("   \n  ")
     assert obsidian_utils._recent_bootstrap_sid() is None
+
+
+# ─── Issue #105: _resolve_session_id integration ──────────────────────
+
+def test_resolve_session_id_cwd_gone_uses_recent_bootstrap(isolated_home, monkeypatch):
+    """Headline regression: cwd-gone + valid recent bootstrap → returns the SID
+    via layer 4. This is the scenario from 2026-04-24 retros that motivated #105."""
+    sid = _unique_sid()
+    _seed_bootstrap(isolated_home, "myworktree", sid)
+
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+
+    assert obsidian_utils._resolve_session_id() == sid
+
+
+def test_resolve_session_id_cwd_gone_no_bootstrap_returns_unknown(isolated_home, monkeypatch):
+    """Cwd-gone + no recent bootstrap → 'unknown' sentinel (graceful, never raises)."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+
+    assert obsidian_utils._resolve_session_id() == "unknown"
+
+
+def test_resolve_session_id_happy_path_uses_existing_layers(isolated_home, monkeypatch, tmp_path):
+    """Cwd valid + bootstrap valid → resolves via layer 2 (no behavior change)."""
+    sid = _unique_sid()
+    project = "happypath-proj"
+
+    # Seed the existing bootstrap fast path machinery: write sid-<project> AND
+    # a JSONL the fast path can stat.
+    _seed_bootstrap(isolated_home, project, sid)
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    # _bootstrap_prefix() reads the module-level _BOOTSTRAP_PREFIX which is
+    # frozen at import time to the real $HOME. Redirect it for this test so
+    # the fast path actually finds the seeded bootstrap.
+    bdir = isolated_home / ".claude" / "obsidian-brain"
+    monkeypatch.setattr(
+        obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-"
+    )
+
+    assert obsidian_utils._resolve_session_id(allow_bootstrap_cache=True) == sid
+
+
+def test_resolve_session_id_slow_path_skips_layer_2(isolated_home, monkeypatch, tmp_path):
+    """allow_bootstrap_cache=False (used by _slow_path_newest_sid) skips layer 2
+    even when bootstrap exists. Preserves the existing 'health-check is
+    bootstrap-blind' contract."""
+    project = "slowpath-proj"
+    bootstrap_sid = _unique_sid()
+    jsonl_sid = _unique_sid()
+
+    # Seed bootstrap with one SID, JSONL with a different one — slow path must
+    # return the JSONL's SID, ignoring the bootstrap file entirely.
+    _seed_bootstrap(isolated_home, project, bootstrap_sid)
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{jsonl_sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    # Layer 2 is skipped here, so _BOOTSTRAP_PREFIX redirect is unnecessary;
+    # but the slow-path uses _glob_project_jsonls which uses expanduser at
+    # call time → HOME monkeypatch (already done by isolated_home) is enough.
+    assert obsidian_utils._resolve_session_id(allow_bootstrap_cache=False) == jsonl_sid
