@@ -83,8 +83,9 @@ def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool) -> 
             pass  # no existing log; nothing to rotate
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         short_sid = (session_id or "unknown")[:8]
+        safe_project = (project or "unknown").replace(" ", "_").replace("\n", " ")
         line = (
-            f"{timestamp} SessionStart project={project} sid={short_sid} "
+            f"{timestamp} SessionStart project={safe_project} sid={short_sid} "
             f"bootstrap_updated={'true' if bootstrap_updated else 'false'}\n"
         )
         with open(log_path, "a", encoding="utf-8") as f:

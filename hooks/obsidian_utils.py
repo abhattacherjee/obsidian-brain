@@ -420,10 +420,11 @@ def _append_sessionend_log(
         short_sid = (session_id or "unknown")[:8]
         # Sanitize fields that could contain spaces/newlines — keep one-line-per-event.
         safe_project = (project or "unknown").replace(" ", "_").replace("\n", " ")
+        safe_outcome = (outcome or "UNKNOWN").replace(" ", "_").replace("\n", " ")
         safe_detail = (detail or "").replace("\n", " ").replace("\r", " ")
         line = (
             f"{timestamp} SessionEnd project={safe_project} sid={short_sid} "
-            f"outcome={outcome} msgs={int(msgs)} dur={float(dur_min):.1f} "
+            f"outcome={safe_outcome} msgs={int(msgs)} dur={float(dur_min):.1f} "
             f"detail={safe_detail}\n"
         )
         with open(log_path, "a", encoding="utf-8") as f:
