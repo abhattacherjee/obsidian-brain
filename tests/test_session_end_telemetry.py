@@ -112,3 +112,74 @@ class TestAppendSessionEndLog:
         assert "outcome=EXCEPTION" in content
         assert "msgs=0" in content
         assert "dur=0.0" in content
+
+
+# ---------------------------------------------------------------------------
+# Outcome wrapping — subprocess-driven (drives the real hook entry point)
+# ---------------------------------------------------------------------------
+
+
+def _read_log_lines(tmp_path):
+    """Helper: return the SessionEnd lines from the hook log, or [] if missing."""
+    log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+    if not log_path.exists():
+        return []
+    return [
+        ln for ln in log_path.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and "SessionEnd" in ln
+    ]
+
+
+def _run_session_end(tmp_path, payload):
+    """Spawn the SessionEnd hook with HOME redirected to tmp_path."""
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path)
+    return subprocess.run(
+        [sys.executable, _hook_script_path()],
+        input=json.dumps(payload) if payload is not None else "",
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+class TestInvalidInputOutcomes:
+    def test_empty_stdin_logs_skipped_invalid_input(self, tmp_path):
+        result = _run_session_end(tmp_path, payload=None)
+        assert result.returncode == 0
+        lines = _read_log_lines(tmp_path)
+        assert len(lines) == 1, f"expected one SessionEnd line, got {lines!r}"
+        assert "outcome=SKIPPED_INVALID_INPUT" in lines[0]
+
+    def test_missing_session_id_logs_skipped_invalid_input(self, tmp_path):
+        # cwd present, transcript_path present (inside projects dir), no session_id
+        projects_dir = tmp_path / ".claude" / "projects" / "-myproj"
+        projects_dir.mkdir(parents=True, exist_ok=True)
+        fake_transcript = projects_dir / "fake.jsonl"
+        fake_transcript.write_text("{}\n", encoding="utf-8")
+        payload = {
+            "cwd": str(tmp_path),
+            "transcript_path": str(fake_transcript),
+        }
+        result = _run_session_end(tmp_path, payload=payload)
+        assert result.returncode == 0
+        lines = _read_log_lines(tmp_path)
+        assert len(lines) == 1
+        assert "outcome=SKIPPED_INVALID_INPUT" in lines[0]
+
+    def test_transcript_outside_projects_logs_outside_projects_outcome(self, tmp_path):
+        # transcript_path that does NOT live under ~/.claude/projects
+        bogus_transcript = tmp_path / "evil" / "transcript.jsonl"
+        bogus_transcript.parent.mkdir(parents=True, exist_ok=True)
+        bogus_transcript.write_text("{}\n", encoding="utf-8")
+
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": "sid-outside-1234",
+            "transcript_path": str(bogus_transcript),
+        }
+        result = _run_session_end(tmp_path, payload=payload)
+        assert result.returncode == 0
+        lines = _read_log_lines(tmp_path)
+        assert len(lines) == 1, f"expected one SessionEnd line, got {lines!r}"
+        assert "outcome=SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS" in lines[0]

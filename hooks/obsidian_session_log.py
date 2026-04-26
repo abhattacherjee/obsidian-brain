@@ -159,6 +159,12 @@ def _run() -> None:
 
     try:
         if not hook_input:
+            _append_sessionend_log(
+                project="unknown",
+                session_id=session_id,
+                outcome=_Outcome.SKIPPED_INVALID_INPUT,
+                detail="empty or unparseable stdin",
+            )
             return
 
         cwd = hook_input.get("cwd", "")
@@ -169,10 +175,25 @@ def _run() -> None:
             allowed_root = os.path.realpath(os.path.expanduser("~/.claude/projects"))
             if not os.path.realpath(transcript_path).startswith(allowed_root + os.sep):
                 print("[obsidian-brain] transcript_path outside ~/.claude/projects, skipping", file=sys.stderr)
+                _append_sessionend_log(
+                    project=slugify(Path(cwd).name) if cwd else "unknown",
+                    session_id=session_id,
+                    outcome=_Outcome.SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS,
+                    detail=os.path.realpath(transcript_path),
+                )
                 return
 
         if not session_id or not transcript_path:
             print("[obsidian-brain] missing session_id or transcript_path, skipping", file=sys.stderr)
+            _append_sessionend_log(
+                project=slugify(Path(cwd).name) if cwd else "unknown",
+                session_id=session_id,
+                outcome=_Outcome.SKIPPED_INVALID_INPUT,
+                detail=(
+                    "missing session_id" if not session_id
+                    else "missing transcript_path"
+                ),
+            )
             return
 
         # 2. Load config
