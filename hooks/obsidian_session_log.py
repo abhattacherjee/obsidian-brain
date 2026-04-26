@@ -200,11 +200,21 @@ def _run() -> None:
         config = load_config()
         if not config.get("auto_log_enabled", True):
             print("[obsidian-brain] auto_log_enabled is False, skipping", file=sys.stderr)
+            _append_sessionend_log(
+                project=slugify(Path(cwd).name) if cwd else "unknown",
+                session_id=session_id,
+                outcome=_Outcome.SKIPPED_AUTO_LOG_OFF,
+            )
             return
 
         vault_path = config.get("vault_path", "")
         if not vault_path:
             print("[obsidian-brain] no vault_path configured, skipping", file=sys.stderr)
+            _append_sessionend_log(
+                project=slugify(Path(cwd).name) if cwd else "unknown",
+                session_id=session_id,
+                outcome=_Outcome.SKIPPED_NO_VAULT,
+            )
             return
 
         sessions_folder = config.get("sessions_folder", "claude-sessions")
@@ -215,6 +225,12 @@ def _run() -> None:
         messages = read_transcript(transcript_path)
         if not messages:
             print("[obsidian-brain] empty transcript, skipping", file=sys.stderr)
+            _append_sessionend_log(
+                project=slugify(Path(cwd).name) if cwd else "unknown",
+                session_id=session_id,
+                outcome=_Outcome.SKIPPED_NO_TRANSCRIPT,
+                detail=transcript_path,
+            )
             return
 
         # 4. Extract user and assistant messages

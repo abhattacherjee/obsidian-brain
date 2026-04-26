@@ -183,3 +183,83 @@ class TestInvalidInputOutcomes:
         lines = _read_log_lines(tmp_path)
         assert len(lines) == 1, f"expected one SessionEnd line, got {lines!r}"
         assert "outcome=SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS" in lines[0]
+
+
+class TestConfigStateOutcomes:
+    @staticmethod
+    def _projects_dir(tmp_path, project_slug):
+        """Create a fake CC projects dir for a given project so transcript_path passes validation."""
+        # Claude Code's path-encoded slug: leading dash, underscores->hyphens
+        cc_slug = "-" + project_slug.replace("_", "-")
+        d = tmp_path / ".claude" / "projects" / cc_slug
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _write_config(tmp_path, **overrides):
+        cfg = {
+            "vault_path": str(tmp_path / "vault"),
+            "sessions_folder": "claude-sessions",
+            "auto_log_enabled": True,
+            "min_messages": 3,
+            "min_duration_minutes": 2,
+        }
+        cfg.update(overrides)
+        cfg_path = tmp_path / ".claude" / "obsidian-brain-config.json"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        # Make sure the vault exists if vault_path is set so write attempts don't fail elsewhere.
+        if cfg.get("vault_path"):
+            (Path(cfg["vault_path"]) / cfg["sessions_folder"]).mkdir(parents=True, exist_ok=True)
+        return cfg_path
+
+    def test_auto_log_disabled_logs_skipped_auto_log_off(self, tmp_path):
+        proj = self._projects_dir(tmp_path, "myproj")
+        transcript = proj / "sid-auto-off-12345.jsonl"
+        transcript.write_text("{}\n", encoding="utf-8")
+        self._write_config(tmp_path, auto_log_enabled=False)
+
+        payload = {
+            "cwd": str(tmp_path),  # cwd's basename derives the project slug
+            "session_id": "sid-auto-off-12345",
+            "transcript_path": str(transcript),
+        }
+        result = _run_session_end(tmp_path, payload=payload)
+        assert result.returncode == 0
+        lines = _read_log_lines(tmp_path)
+        assert len(lines) == 1
+        assert "outcome=SKIPPED_AUTO_LOG_OFF" in lines[0]
+
+    def test_no_vault_path_logs_skipped_no_vault(self, tmp_path):
+        proj = self._projects_dir(tmp_path, "myproj")
+        transcript = proj / "sid-no-vault-12345.jsonl"
+        transcript.write_text("{}\n", encoding="utf-8")
+        self._write_config(tmp_path, vault_path="")
+
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": "sid-no-vault-12345",
+            "transcript_path": str(transcript),
+        }
+        result = _run_session_end(tmp_path, payload=payload)
+        assert result.returncode == 0
+        lines = _read_log_lines(tmp_path)
+        assert len(lines) == 1
+        assert "outcome=SKIPPED_NO_VAULT" in lines[0]
+
+    def test_empty_transcript_logs_skipped_no_transcript(self, tmp_path):
+        proj = self._projects_dir(tmp_path, "myproj")
+        transcript = proj / "sid-empty-12345678.jsonl"
+        transcript.write_text("", encoding="utf-8")  # truly empty
+        self._write_config(tmp_path)
+
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": "sid-empty-12345678",
+            "transcript_path": str(transcript),
+        }
+        result = _run_session_end(tmp_path, payload=payload)
+        assert result.returncode == 0
+        lines = _read_log_lines(tmp_path)
+        assert len(lines) == 1
+        assert "outcome=SKIPPED_NO_TRANSCRIPT" in lines[0]
