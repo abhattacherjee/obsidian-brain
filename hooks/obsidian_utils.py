@@ -287,8 +287,8 @@ def _resolve_project_basename() -> str | None:
       3. None — caller should treat as 'cannot determine project' and
          fall through to project-agnostic fallbacks
 
-    Never raises. Mirrors the env-fallback contract that obsidian_session_hint.py
-    line 117 already uses for hook input (cwd ← hook payload, getcwd second).
+    Never raises. Preserves a lazy fallback order: consult CLAUDE_PROJECT_DIR
+    only after cwd resolution fails.
 
     Falsy basenames (empty string from cwd='/' or env var with trailing slash)
     are normalized to None so callers fall through to safer fallback layers

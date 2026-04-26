@@ -871,17 +871,12 @@ def test_try_bootstrap_fast_path_rejects_unsafe_cached_sid(isolated_home, monkey
     bdir = isolated_home / ".claude" / "obsidian-brain"
     bdir.mkdir(parents=True, exist_ok=True)
     bdir.chmod(0o700)
-    # Write an unsafe (path-traversal) value into the bootstrap
+    # Write an unsafe (path-traversal) value into the bootstrap.
     (bdir / f"sid-{project}").write_text("../../../tmp/escape")
     monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-")
 
-    # Seed a JSONL named with the unsafe value too — without validation,
-    # the fast path would otherwise return the unsafe SID.
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / "../../../tmp/escape.jsonl").parent.mkdir(parents=True, exist_ok=True)
-
-    # Fast path must reject the unsafe content and return None
+    # No JSONL setup is needed here: this test asserts that the fast path
+    # rejects unsafe bootstrap content before trusting or composing with it.
     assert obsidian_utils._try_bootstrap_fast_path(project) is None
 
 

@@ -303,7 +303,11 @@ E1=$(
         cd "$TMP"
         rmdir "$TMP"
         unset CLAUDE_PROJECT_DIR
-        # Exact prelude from insight-saver SKILL.md scripts
+        # Defensive variant of the SKILL.md prelude (the SKILL.md form is
+        # `cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`; here we
+        # add `|| echo /` so the cd lands at / instead of no-op'ing under
+        # `set -euo pipefail` + wedged-cwd, allowing python3 to launch and
+        # exercise the resolver chain — that's what we're actually testing).
         cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd 2>/dev/null || echo /)" 2>/dev/null
         HOME="$FIXTURE/home" PYTHONPATH="$HOOK_DIR" python3 -c \
             'import obsidian_utils; print(obsidian_utils._get_session_id_fast())' 2>/dev/null || true
