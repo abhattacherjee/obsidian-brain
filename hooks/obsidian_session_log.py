@@ -48,7 +48,7 @@ from obsidian_utils import (  # noqa: E402
 
 class _Outcome:
     """String constants for SessionEnd hook outcomes written to the rotated audit log."""
-    OK = "OK"
+    OK = "OK"  # Reserved for Phase 2 (#124/#125) — async summarization success path
     OK_RAW_NOTE_ONLY = "OK_RAW_NOTE_ONLY"
     SKIPPED_BELOW_THRESHOLD = "SKIPPED_BELOW_THRESHOLD"
     SKIPPED_NO_TRANSCRIPT = "SKIPPED_NO_TRANSCRIPT"
