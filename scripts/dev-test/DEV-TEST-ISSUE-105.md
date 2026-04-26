@@ -45,7 +45,12 @@ instead of stamping `source_session: unknown`.
   branch and create a PR (no real review required — this is throwaway):
 
   ```bash
-  git commit --allow-empty -m "test: throwaway for #105 dev-test"
+  # NOTE: --allow-empty does not work — commit-preflight.sh:58 refuses
+  # commits with no staged files. Stage a tiny throwaway file instead:
+  echo "throwaway" > THROWAWAY.md
+  git add THROWAWAY.md
+  ./scripts/commit-preflight.sh --auto   # auto path = docs-only, skips tests
+  git commit -m "test: throwaway for #105 dev-test"
   git push -u origin feature/test-105-cwd-gone-throwaway
   gh pr create --base develop --title "DO NOT MERGE — #105 dev-test throwaway" \
       --body "Throwaway PR for #105 dev-test. Will be closed."
@@ -55,8 +60,18 @@ instead of stamping `source_session: unknown`.
 
   ```bash
   gh pr close --delete-branch <PR_NUMBER>
-  git worktree remove --force /tmp/ob-105-test
   ```
+
+  > **Note:** On macOS gh ≥ 2.x, `gh pr close --delete-branch` automatically
+  > runs the equivalent of `git worktree remove` when the deleted branch is
+  > checked out in a worktree, AND switches the worktree to the default
+  > branch. So the explicit `git worktree remove` step below is usually
+  > unnecessary. Only run it if `git worktree list` still shows the
+  > throwaway worktree:
+  >
+  > ```bash
+  > git worktree remove --force /tmp/ob-105-test  # only if still listed
+  > ```
 
   (Or, if your workflow uses `gh pr merge --delete-branch`, do that — the
   worktree-deletion outcome is identical.)
@@ -73,6 +88,26 @@ instead of stamping `source_session: unknown`.
 ---
 
 ## Phase 3: Trigger the fix path
+
+> **⏱ 10-minute window — IMPORTANT.** Layer 4 (`_recent_bootstrap_sid`) is
+> strict-by-design and only considers bootstrap files with mtime within the
+> last 600 seconds, to prevent silent cross-project mis-attribution (same
+> bug class as #101). Run Phase 3 within **10 minutes of the parent
+> SessionStart** that wrote `~/.claude/obsidian-brain/sid-<slug>`. If you
+> exceed the window, either: (a) restart the wedged CC session to write a
+> fresh bootstrap, or (b) `touch ~/.claude/obsidian-brain/sid-<slug>` just
+> before running step 3a.
+
+> **🚧 Known macOS harness blocker.** On macOS, the CC Bash tool
+> pre-checks cwd existence and refuses dispatch with `Path X does not exist`
+> the moment the cwd is gone — upstream of every SKILL bash step. This means
+> `/retro` and `/compress` cannot reach the resolver helper subprocess from
+> a wedged session at all. Verified empirically 2026-04-26 in PR #113
+> dev-test (see [[2026-04-26-test-steps-for-issue-105-cwd-gone-session-i-639d]]).
+> Tier 2 live-CC verification of Phase 3 is therefore BLOCKED on macOS until
+> the harness pre-dispatch check is relaxed (filed as follow-up). The
+> resolver fix itself is verified by `test-issue-105-manual.sh` Phase C
+> (real OS-level cwd deletion + helper invocation, 4/4 passing).
 
 - [ ] **3a.** Without leaving the wedged session, run `/retro`. Let it complete.
 
