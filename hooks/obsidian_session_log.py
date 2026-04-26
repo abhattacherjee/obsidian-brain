@@ -335,8 +335,11 @@ def _run() -> None:
 
         # Re-check with actual duration — BUT if snapshots exist, bypass
         # thresholds so the session note always anchors the snapshots.
-        if should_skip_session(user_msgs, metadata["duration_minutes"],
-                               min_messages=min_messages, min_duration=min_duration):
+        was_threshold_skipped = should_skip_session(
+            user_msgs, metadata["duration_minutes"],
+            min_messages=min_messages, min_duration=min_duration,
+        )
+        if was_threshold_skipped:
             if not snapshots:
                 print("[obsidian-brain] session below thresholds, skipping", file=sys.stderr)
                 _append_sessionend_log(
@@ -392,12 +395,7 @@ def _run() -> None:
             outcome=_Outcome.OK_RAW_NOTE_ONLY,
             msgs=len(user_msgs),
             dur_min=float(metadata.get("duration_minutes", 0.0)),
-            detail="snapshot-bypass" if (
-                should_skip_session(
-                    user_msgs, metadata.get("duration_minutes", 0.0),
-                    min_messages=min_messages, min_duration=min_duration,
-                ) and snapshots
-            ) else "",
+            detail="snapshot-bypass" if (was_threshold_skipped and snapshots) else "",
         )
     finally:
         # Run cache cleanup regardless of how _run() exits so /tmp does not
