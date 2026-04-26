@@ -663,6 +663,34 @@ def test_resolve_project_basename_returns_none_when_both_unavailable(monkeypatch
     assert obsidian_utils._resolve_project_basename() is None
 
 
+def test_resolve_project_basename_normalizes_root_cwd_to_none(monkeypatch):
+    """cwd='/' has basename '' which would unsafely become a cross-project
+    glob ('~/.claude/projects/*/*.jsonl') downstream. Normalize to None per
+    Copilot R2 PR #113 so caller falls through to the strict layer-4 scan."""
+    monkeypatch.setattr(os, "getcwd", lambda: "/")
+    assert obsidian_utils._resolve_project_basename() is None
+
+
+def test_resolve_project_basename_normalizes_env_trailing_slash(monkeypatch):
+    """CLAUDE_PROJECT_DIR ending with '/' has basename '' which would unsafely
+    become a cross-project glob downstream. Strip trailing slash before
+    basename, then normalize empty to None per Copilot R2 PR #113."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/path/to/myproj/")
+    assert obsidian_utils._resolve_project_basename() == "myproj"
+
+
+def test_resolve_project_basename_env_root_normalizes_to_none(monkeypatch):
+    """CLAUDE_PROJECT_DIR='/' normalizes to None (root path is not a project)."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/")
+    assert obsidian_utils._resolve_project_basename() is None
+
+
 # ─── Issue #105: _recent_bootstrap_sid ────────────────────────────────
 
 def _seed_bootstrap(home: Path, project: str, sid: str, mtime_offset: float = 0.0) -> Path:
@@ -831,6 +859,30 @@ def test_resolve_session_id_slow_path_skips_layer_2(isolated_home, monkeypatch, 
     # but the slow-path uses _glob_project_jsonls which uses expanduser at
     # call time → HOME monkeypatch (already done by isolated_home) is enough.
     assert obsidian_utils._resolve_session_id(allow_bootstrap=False) == jsonl_sid
+
+
+def test_try_bootstrap_fast_path_rejects_unsafe_cached_sid(isolated_home, monkeypatch):
+    """_try_bootstrap_fast_path validates cached_sid against _SID_FILENAME_SAFE
+    before trusting it. Symmetric to the validation in _recent_bootstrap_sid.
+    Without this, a corrupted sid-<project> file with content like '../foo'
+    could propagate path-traversal strings into cache_get/cache_set composition.
+    Per Copilot R2 PR #113."""
+    project = "fastpath-proj"
+    bdir = isolated_home / ".claude" / "obsidian-brain"
+    bdir.mkdir(parents=True, exist_ok=True)
+    bdir.chmod(0o700)
+    # Write an unsafe (path-traversal) value into the bootstrap
+    (bdir / f"sid-{project}").write_text("../../../tmp/escape")
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-")
+
+    # Seed a JSONL named with the unsafe value too — without validation,
+    # the fast path would otherwise return the unsafe SID.
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / "../../../tmp/escape.jsonl").parent.mkdir(parents=True, exist_ok=True)
+
+    # Fast path must reject the unsafe content and return None
+    assert obsidian_utils._try_bootstrap_fast_path(project) is None
 
 
 def test_resolve_session_id_slow_path_skips_layer_4_recent_bootstrap(isolated_home, monkeypatch):

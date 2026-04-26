@@ -289,12 +289,21 @@ def _resolve_project_basename() -> str | None:
 
     Never raises. Mirrors the env-fallback contract that obsidian_session_hint.py
     line 117 already uses for hook input (cwd ← hook payload, getcwd second).
+
+    Falsy basenames (empty string from cwd='/' or env var with trailing slash)
+    are normalized to None so callers fall through to safer fallback layers
+    instead of triggering an unscoped cross-project glob (which would
+    silently mis-attribute the active session).
     """
     try:
-        return os.path.basename(os.getcwd())
+        cwd_base = os.path.basename(os.getcwd())
+        return cwd_base if cwd_base else None
     except OSError:
         env = os.environ.get("CLAUDE_PROJECT_DIR")
-        return os.path.basename(env) if env else None
+        if not env:
+            return None
+        env_base = os.path.basename(env.rstrip("/"))
+        return env_base if env_base else None
 
 
 def _recent_bootstrap_sid(window_seconds: int = 600) -> str | None:
@@ -568,6 +577,13 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
     except OSError:
         return None
     if not cached_sid:
+        return None
+    # Validate SID format before trusting the bootstrap file content. Without
+    # this, a corrupted or attacker-controlled sid-<project> file with content
+    # like "../../../tmp/foo" could propagate path-traversal strings into
+    # cache_get/cache_set composition. Mirrors the validation in
+    # _recent_bootstrap_sid() and _first_seen_date().
+    if not _SID_FILENAME_SAFE.fullmatch(cached_sid):
         return None
 
     safe_cached = _glob.escape(cached_sid)
