@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.2] - 2026-04-26
+
 ### Added
 - E2E integration test for snapshot → summarize → /recall pipeline (`tests/test_snapshot_e2e.py`). Closes #50.
 - **`created_at:` ISO-8601 frontmatter** is now written by `error-log`,
