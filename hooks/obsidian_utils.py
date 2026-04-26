@@ -524,11 +524,14 @@ def _try_slow_jsonl_glob(project: str) -> str:
 def _slow_path_newest_sid() -> str:
     """Determine the current session id by scanning JSONL files directly.
 
-    Bootstrap-independent — does NOT read, write, or trust the bootstrap
-    cache. Used by health checks that must not be fooled by stale cache
-    entries. Returns 'unknown' if no JSONLs are found for the current cwd.
+    Bootstrap-independent — does NOT read, write, or trust ANY bootstrap
+    file (neither the per-project sid-<project> cache nor the cross-project
+    recent-bootstrap directory scan). Used by health checks (e.g.,
+    check_hook_status) that must not be fooled by stale bootstraps.
+
+    Returns 'unknown' if no JSONLs are found for the current cwd.
     """
-    return _resolve_session_id(allow_bootstrap_cache=False)
+    return _resolve_session_id(allow_bootstrap=False)
 
 
 def _try_bootstrap_fast_path(project: str) -> str | None:
@@ -589,27 +592,35 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
     return None  # different session is strictly newer — fall through
 
 
-def _resolve_session_id(allow_bootstrap_cache: bool = True) -> str:
+def _resolve_session_id(allow_bootstrap: bool = True) -> str:
     """Single source of truth for current-session SID resolution. Never raises.
 
     Resolution layers (each failure → next):
       1. Project basename via _resolve_project_basename (cwd → env → None)
-      2. Bootstrap fast path (skipped if allow_bootstrap_cache=False)
+      2. Bootstrap fast path (skipped if allow_bootstrap=False)
       3. Slow-path JSONL glob
-      4. Recent-bootstrap best-effort scan (issue #105 fallback for cwd-gone)
+      4. Recent-bootstrap best-effort scan (skipped if allow_bootstrap=False)
+         — issue #105 fallback for cwd-gone
       5. 'unknown' sentinel
+
+    The `allow_bootstrap` flag gates BOTH bootstrap-reading layers (2 and 4),
+    so callers that need a bootstrap-blind result (e.g., health checks via
+    _slow_path_newest_sid) get a JSONL-only resolution.
     """
     project = _resolve_project_basename()
     if project is not None:
-        if allow_bootstrap_cache:
+        if allow_bootstrap:
             sid = _try_bootstrap_fast_path(project)
             if sid:
                 return sid
         sid = _try_slow_jsonl_glob(project)
         if sid != "unknown":
             return sid
-    sid = _recent_bootstrap_sid()
-    return sid if sid else "unknown"
+    if allow_bootstrap:
+        sid = _recent_bootstrap_sid()
+        if sid:
+            return sid
+    return "unknown"
 
 
 def _get_session_id_fast() -> str:
@@ -618,7 +629,7 @@ def _get_session_id_fast() -> str:
     See _try_bootstrap_fast_path for the validation strategy and
     _resolve_session_id for the full layered fallback chain (issue #105).
     """
-    return _resolve_session_id(allow_bootstrap_cache=True)
+    return _resolve_session_id(allow_bootstrap=True)
 
 
 def cache_get(session_id: str, key: str):

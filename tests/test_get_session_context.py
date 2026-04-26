@@ -775,11 +775,11 @@ def test_resolve_session_id_happy_path_uses_existing_layers(isolated_home, monke
         obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-"
     )
 
-    assert obsidian_utils._resolve_session_id(allow_bootstrap_cache=True) == sid
+    assert obsidian_utils._resolve_session_id(allow_bootstrap=True) == sid
 
 
 def test_resolve_session_id_slow_path_skips_layer_2(isolated_home, monkeypatch, tmp_path):
-    """allow_bootstrap_cache=False (used by _slow_path_newest_sid) skips layer 2
+    """allow_bootstrap=False (used by _slow_path_newest_sid) skips layer 2
     even when bootstrap exists. Preserves the existing 'health-check is
     bootstrap-blind' contract."""
     project = "slowpath-proj"
@@ -800,4 +800,25 @@ def test_resolve_session_id_slow_path_skips_layer_2(isolated_home, monkeypatch, 
     # Layer 2 is skipped here, so _BOOTSTRAP_PREFIX redirect is unnecessary;
     # but the slow-path uses _glob_project_jsonls which uses expanduser at
     # call time → HOME monkeypatch (already done by isolated_home) is enough.
-    assert obsidian_utils._resolve_session_id(allow_bootstrap_cache=False) == jsonl_sid
+    assert obsidian_utils._resolve_session_id(allow_bootstrap=False) == jsonl_sid
+
+
+def test_resolve_session_id_slow_path_skips_layer_4_recent_bootstrap(isolated_home, monkeypatch):
+    """allow_bootstrap=False (used by _slow_path_newest_sid) skips BOTH layer 2
+    AND layer 4 — does not trust the cross-project recent-bootstrap scan either.
+    Preserves the bootstrap-blind health-check contract that check_hook_status
+    relies on at obsidian_utils.py:827."""
+    project = "healthcheck-proj"
+    bootstrap_sid = _unique_sid()
+
+    # Seed a recent bootstrap (would normally be picked up by layer 4)
+    _seed_bootstrap(isolated_home, project, bootstrap_sid)
+
+    # cwd valid, but NO matching JSONL exists for this project — slow path
+    # returns "unknown" → without the fix, layer 4 would find bootstrap_sid
+    # and return it. With the fix, layer 4 is gated off → returns "unknown".
+    target = isolated_home / project
+    target.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(target)
+
+    assert obsidian_utils._resolve_session_id(allow_bootstrap=False) == "unknown"
