@@ -170,6 +170,28 @@ def _write_config(tmp_path, **overrides):
     return cfg_path
 
 
+def _make_jsonl(path, n_user_msgs, duration_sec):
+    """Create a minimal JSONL with N user messages spanning duration_sec seconds."""
+    import datetime as _dt
+    start = _dt.datetime(2026, 1, 1, 0, 0, 0, tzinfo=_dt.timezone.utc)
+    entries = []
+    for i in range(n_user_msgs):
+        ts = start + _dt.timedelta(seconds=i * (duration_sec / max(n_user_msgs, 1)))
+        entries.append({
+            "type": "user",
+            "timestamp": ts.isoformat().replace("+00:00", "Z"),
+            "message": {"role": "user", "content": f"msg {i}"},
+        })
+    # Final assistant message at the end so duration metadata reflects duration_sec.
+    end = start + _dt.timedelta(seconds=duration_sec)
+    entries.append({
+        "type": "assistant",
+        "timestamp": end.isoformat().replace("+00:00", "Z"),
+        "message": {"role": "assistant", "content": "ok"},
+    })
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+
+
 class TestInvalidInputOutcomes:
     def test_empty_stdin_logs_skipped_invalid_input(self, tmp_path):
         result = _run_session_end(tmp_path, payload=None)
@@ -266,33 +288,11 @@ class TestConfigStateOutcomes:
 
 
 class TestThresholdOutcomes:
-    @staticmethod
-    def _make_jsonl(path, n_user_msgs, duration_sec):
-        """Create a minimal JSONL with N user messages spanning duration_sec seconds."""
-        import datetime as _dt
-        start = _dt.datetime(2026, 1, 1, 0, 0, 0, tzinfo=_dt.timezone.utc)
-        entries = []
-        for i in range(n_user_msgs):
-            ts = start + _dt.timedelta(seconds=i * (duration_sec / max(n_user_msgs, 1)))
-            entries.append({
-                "type": "user",
-                "timestamp": ts.isoformat().replace("+00:00", "Z"),
-                "message": {"role": "user", "content": f"msg {i}"},
-            })
-        # Final assistant message at the end so duration metadata reflects duration_sec.
-        end = start + _dt.timedelta(seconds=duration_sec)
-        entries.append({
-            "type": "assistant",
-            "timestamp": end.isoformat().replace("+00:00", "Z"),
-            "message": {"role": "assistant", "content": "ok"},
-        })
-        path.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
-
     def test_too_few_messages_logs_skipped_below_threshold(self, tmp_path):
         # min_messages=3 in config; provide only 2 user messages
         proj = _projects_dir(tmp_path, "myproj")
         transcript = proj / "sid-fewmsg-12345.jsonl"
-        self._make_jsonl(transcript, n_user_msgs=2, duration_sec=600)
+        _make_jsonl(transcript, n_user_msgs=2, duration_sec=600)
         _write_config(tmp_path)
 
         payload = {
@@ -312,7 +312,7 @@ class TestThresholdOutcomes:
         # min_duration_minutes=2 in config; provide 5 messages over 10 seconds
         proj = _projects_dir(tmp_path, "myproj")
         transcript = proj / "sid-shortdur-1234.jsonl"
-        self._make_jsonl(transcript, n_user_msgs=5, duration_sec=10)
+        _make_jsonl(transcript, n_user_msgs=5, duration_sec=10)
         _write_config(tmp_path)
 
         payload = {
@@ -336,7 +336,7 @@ class TestWriteFailedOutcome:
         proj = tmp_path / ".claude" / "projects" / cc_slug
         proj.mkdir(parents=True)
         transcript = proj / "sid-writefail-12.jsonl"
-        TestThresholdOutcomes._make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
+        _make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
 
         # Vault path points at a directory we can read but cannot write to.
         vault = tmp_path / "vault"
