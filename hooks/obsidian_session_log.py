@@ -282,6 +282,14 @@ def _run() -> None:
             if not snapshots:
                 print(f"[obsidian-brain] too few user messages ({len(user_msgs)}), skipping",
                       file=sys.stderr)
+                _append_sessionend_log(
+                    project=_project_slug_for_log(cwd),
+                    session_id=session_id,
+                    outcome=_Outcome.SKIPPED_BELOW_THRESHOLD,
+                    msgs=len(user_msgs),
+                    dur_min=0.0,
+                    detail="message-count check",
+                )
                 return
             print(
                 f"[obsidian-brain] below message threshold but {len(snapshots)} snapshot(s) "
@@ -319,6 +327,14 @@ def _run() -> None:
                                min_messages=min_messages, min_duration=min_duration):
             if not snapshots:
                 print("[obsidian-brain] session below thresholds, skipping", file=sys.stderr)
+                _append_sessionend_log(
+                    project=metadata.get("project") or _project_slug_for_log(cwd),
+                    session_id=session_id,
+                    outcome=_Outcome.SKIPPED_BELOW_THRESHOLD,
+                    msgs=len(user_msgs),
+                    dur_min=float(metadata.get("duration_minutes", 0.0)),
+                    detail="duration check",
+                )
                 return
             print(
                 f"[obsidian-brain] below thresholds but {len(snapshots)} snapshot(s) exist — "
