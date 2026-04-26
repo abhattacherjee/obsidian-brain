@@ -364,6 +364,14 @@ def _run() -> None:
         raw_content = _build_note(session_id, metadata, raw_body, resumed=resumed)
         if not write_vault_note(vault_path, sessions_folder, filename, raw_content):
             print("[obsidian-brain] failed to write raw note, aborting", file=sys.stderr)
+            _append_sessionend_log(
+                project=metadata.get("project") or _project_slug_for_log(cwd),
+                session_id=session_id,
+                outcome=_Outcome.WRITE_FAILED,
+                msgs=len(user_msgs),
+                dur_min=float(metadata.get("duration_minutes", 0.0)),
+                detail=f"write_vault_note returned False; target={Path(vault_path) / sessions_folder / filename}",
+            )
             return
         print("[obsidian-brain] raw note written (summarization deferred to /recall)", file=sys.stderr)
     finally:

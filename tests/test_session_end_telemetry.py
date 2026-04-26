@@ -326,3 +326,47 @@ class TestThresholdOutcomes:
         assert len(lines) == 1
         assert "outcome=SKIPPED_BELOW_THRESHOLD" in lines[0]
         assert "msgs=5" in lines[0]
+
+
+class TestWriteFailedOutcome:
+    def test_write_failure_logs_write_failed(self, tmp_path):
+        """When the vault sessions folder is unwritable, _run logs WRITE_FAILED."""
+        # Set up a valid above-threshold session
+        cc_slug = "-myproj"
+        proj = tmp_path / ".claude" / "projects" / cc_slug
+        proj.mkdir(parents=True)
+        transcript = proj / "sid-writefail-12.jsonl"
+        TestThresholdOutcomes._make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
+
+        # Vault path points at a directory we can read but cannot write to.
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        sessions = vault / "claude-sessions"
+        sessions.mkdir()
+        # Make the sessions folder read-only so write_vault_note() fails.
+        os.chmod(sessions, 0o500)
+
+        cfg = {
+            "vault_path": str(vault),
+            "sessions_folder": "claude-sessions",
+            "auto_log_enabled": True,
+            "min_messages": 3,
+            "min_duration_minutes": 2,
+        }
+        cfg_path = tmp_path / ".claude" / "obsidian-brain-config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": "sid-writefail-12",
+            "transcript_path": str(transcript),
+        }
+        try:
+            result = _run_session_end(tmp_path, payload=payload)
+            assert result.returncode == 0
+            lines = _read_log_lines(tmp_path)
+            assert len(lines) == 1, f"expected one line, got {lines!r}"
+            assert "outcome=WRITE_FAILED" in lines[0]
+        finally:
+            # Restore permissions so pytest's tmp_path cleanup can rm it.
+            os.chmod(sessions, 0o700)
