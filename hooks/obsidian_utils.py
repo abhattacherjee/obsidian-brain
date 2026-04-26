@@ -386,6 +386,52 @@ def _bootstrap_prefix() -> str:
     return _BOOTSTRAP_PREFIX
 
 
+# ---------------------------------------------------------------------------
+# SessionEnd telemetry log
+# ---------------------------------------------------------------------------
+
+_SESSIONEND_LOG_NAME = "obsidian-brain-hook.log"
+_SESSIONEND_LOG_MAX_BYTES = 100 * 1024  # 100 KB — same cap as SessionStart log
+
+
+def _append_sessionend_log(
+    project: str,
+    session_id: str,
+    outcome: str,
+    msgs: int = 0,
+    dur_min: float = 0.0,
+    detail: str = "",
+) -> None:
+    """Append a one-line SessionEnd outcome record; rotate when oversized.
+
+    Writes to ~/.claude/obsidian-brain-hook.log alongside SessionStart and Reaped
+    entries. Never raises — failure to log must not block the SessionEnd hook.
+    """
+    log_dir = os.path.join(os.path.expanduser("~"), ".claude")
+    log_path = os.path.join(log_dir, _SESSIONEND_LOG_NAME)
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        try:
+            if os.path.getsize(log_path) > _SESSIONEND_LOG_MAX_BYTES:
+                os.replace(log_path, log_path + ".1")
+        except OSError:
+            pass  # no existing log; nothing to rotate
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        short_sid = (session_id or "unknown")[:8]
+        # Sanitize fields that could contain spaces/newlines — keep one-line-per-event.
+        safe_project = (project or "unknown").replace(" ", "_").replace("\n", " ")
+        safe_detail = (detail or "").replace("\n", " ").replace("\r", " ")
+        line = (
+            f"{timestamp} SessionEnd project={safe_project} sid={short_sid} "
+            f"outcome={outcome} msgs={int(msgs)} dur={float(dur_min):.1f} "
+            f"detail={safe_detail}\n"
+        )
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError as exc:
+        print(f"[obsidian-brain] sessionend log append failed: {exc}", file=sys.stderr)
+
+
 def _safe_mtime(path: str) -> float:
     """Return file mtime, or -1.0 if the path is missing/unstatable.
 
