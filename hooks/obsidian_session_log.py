@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import obsidian_utils  # noqa: E402  — used for _first_seen_date qualified call
 from obsidian_utils import (  # noqa: E402
+    _append_sessionend_log,
     build_raw_fallback,
     extract_assistant_messages,
     extract_session_metadata,
@@ -38,6 +39,25 @@ from obsidian_utils import (  # noqa: E402
     slugify,
     write_vault_note,
 )
+
+
+# ---------------------------------------------------------------------------
+# SessionEnd outcome enum (telemetry — issue #100 Phase 1)
+# ---------------------------------------------------------------------------
+
+
+class _Outcome:
+    """String constants for SessionEnd hook outcomes written to the rotated audit log."""
+    OK = "OK"
+    OK_RAW_NOTE_ONLY = "OK_RAW_NOTE_ONLY"
+    SKIPPED_BELOW_THRESHOLD = "SKIPPED_BELOW_THRESHOLD"
+    SKIPPED_NO_TRANSCRIPT = "SKIPPED_NO_TRANSCRIPT"
+    SKIPPED_NO_VAULT = "SKIPPED_NO_VAULT"
+    SKIPPED_AUTO_LOG_OFF = "SKIPPED_AUTO_LOG_OFF"
+    SKIPPED_INVALID_INPUT = "SKIPPED_INVALID_INPUT"
+    SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS = "SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS"
+    WRITE_FAILED = "WRITE_FAILED"
+    EXCEPTION = "EXCEPTION"
 
 
 # ---------------------------------------------------------------------------
