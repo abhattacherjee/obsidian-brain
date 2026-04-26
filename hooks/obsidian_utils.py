@@ -277,6 +277,87 @@ def _safe_getcwd() -> str:
         return ""
 
 
+def _resolve_project_basename() -> str | None:
+    """Project basename for CC-path lookups (~/.claude/projects/, sid-* bootstraps).
+
+    Resolution order:
+      1. os.getcwd() — normal case
+      2. CLAUDE_PROJECT_DIR env var — when cwd is gone (worktree deleted
+         mid-session via `gh pr merge --delete-branch`); see issue #105
+      3. None — caller should treat as 'cannot determine project' and
+         fall through to project-agnostic fallbacks
+
+    Never raises. Preserves a lazy fallback order: consult CLAUDE_PROJECT_DIR
+    only after cwd resolution fails.
+
+    Falsy basenames (empty string from cwd='/' or env var with trailing slash)
+    are normalized to None so callers fall through to safer fallback layers
+    instead of triggering an unscoped cross-project glob (which would
+    silently mis-attribute the active session).
+    """
+    try:
+        cwd_base = os.path.basename(os.getcwd())
+        return cwd_base if cwd_base else None
+    except OSError:
+        env = os.environ.get("CLAUDE_PROJECT_DIR")
+        if not env:
+            return None
+        env_base = os.path.basename(env.rstrip("/"))
+        return env_base if env_base else None
+
+
+def _recent_bootstrap_sid(window_seconds: int = 600) -> str | None:
+    """Final-fallback session-id resolver for issue #105 (cwd-gone scenario).
+
+    Scans ~/.claude/obsidian-brain/sid-* for files with mtime within the recency
+    window (default 10 min — covers any normal SessionStart-to-/retro interaction
+    window). Returns the SID iff exactly ONE recent file is found. Strict by
+    design: zero or 2+ matches return None to prevent silent mis-attribution
+    across projects (the same bug class as issue #101).
+
+    NOTE: bootstrap files are written exactly once by SessionStart and immutable
+    thereafter — so mtime IS capture time for them. This is the opposite of the
+    `technical_mtime_not_capture_time` warning, which applies to vault notes
+    edited by /check-items, /link, etc.
+
+    Reads the bootstrap dir via os.path.expanduser at call time (not the
+    module-level _SECURE_DIR constant) so HOME-redirecting test fixtures work.
+    """
+    import time
+    bdir = os.path.expanduser("~/.claude/obsidian-brain")
+    cutoff = time.time() - window_seconds
+    try:
+        entries = os.listdir(bdir)
+    except OSError:
+        return None
+
+    candidates: list[str] = []
+    for name in entries:
+        if not name.startswith("sid-") or name.endswith(".tmp"):
+            continue
+        path = os.path.join(bdir, name)
+        if _safe_mtime(path) < cutoff:
+            continue
+        try:
+            with open(path, "r") as f:
+                content = f.read().strip()
+        except OSError:
+            continue
+        if not content:
+            continue
+        # Validate SID format before trusting the file content. Without this,
+        # a corrupted or attacker-controlled bootstrap file could propagate
+        # path-traversal-style strings (e.g., "../foo") into cache_get/cache_set
+        # path composition. _SID_FILENAME_SAFE is [A-Za-z0-9._-]{1,128}.
+        if not _SID_FILENAME_SAFE.fullmatch(content):
+            continue
+        candidates.append(content)
+        if len(candidates) > 1:
+            return None  # short-circuit — strict exactly-one
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
 # --- Secure working directory ---
 # All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
 # This prevents symlink attacks and cache poisoning on multi-user systems.
@@ -436,18 +517,15 @@ def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str
     return matches
 
 
-def _slow_path_newest_sid() -> str:
-    """Determine the current session id by scanning JSONL files directly.
+def _try_slow_jsonl_glob(project: str) -> str:
+    """Slow path: glob all JSONLs under ~/.claude/projects/*<project>/, return
+    SID of the newest. Used by both _resolve_session_id (when bootstrap is
+    skipped or empty) and as the existing health-check entry point.
 
-    Bootstrap-independent — does NOT read, write, or trust the bootstrap
-    cache. Used by health checks that must not be fooled by stale cache
-    entries. Returns 'unknown' if no JSONLs are found for the current cwd.
+    Returns 'unknown' if no JSONLs match. Bootstrap-blind by contract — never
+    reads or trusts the sid-<project> bootstrap file.
     """
     import glob as _glob
-    # Cwd-based project name (NOT canonical) — used for CC's path-encoded
-    # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
-    # see canonical_project_name().
-    project = os.path.basename(os.getcwd())
     safe_project = _glob.escape(project)
     matches = _glob_project_jsonls(safe_project)
     entries = [(_safe_mtime(p), p) for p in matches]
@@ -458,8 +536,22 @@ def _slow_path_newest_sid() -> str:
     return os.path.splitext(os.path.basename(newest))[0]
 
 
-def _get_session_id_fast() -> str:
-    """Derive session ID, using bootstrap file for speed on repeat calls.
+def _slow_path_newest_sid() -> str:
+    """Determine the current session id by scanning JSONL files directly.
+
+    Bootstrap-independent — does NOT read, write, or trust ANY bootstrap
+    file (neither the per-project sid-<project> cache nor the cross-project
+    recent-bootstrap directory scan). Used by health checks (e.g.,
+    check_hook_status) that must not be fooled by stale bootstraps.
+
+    Returns 'unknown' if no JSONLs are found for the current cwd.
+    """
+    return _resolve_session_id(allow_bootstrap=False)
+
+
+def _try_bootstrap_fast_path(project: str) -> str | None:
+    """Bootstrap fast path: read sid-<project>, validate against JSONL existence
+    and newest-mtime tiebreaker. Returns cached SID on hit, None on miss/stale.
 
     Validation strategy:
       1. Read bootstrap file (~0.1 ms)
@@ -469,100 +561,97 @@ def _get_session_id_fast() -> str:
          reproducible on filesystems with 1-second mtime resolution.
       4. If the newest JSONL's basename equals the cached sid, trust the
          cache. If the cached JSONL shares the newest mtime (same-second
-         race), also trust the cache — the SessionStart hook has already
-         authoritatively written the current sid and same-mtime ties
-         effectively mean "these happened simultaneously."
-      5. Otherwise fall through to the slow path (full glob + deterministic
-         max) which is the authoritative answer.
+         race), also trust the cache.
+      5. Otherwise return None (let caller fall through to slow path).
 
-    Comparing basenames rather than mtime values directly is important
-    because the active session's JSONL is appended throughout the session,
-    so its mtime increases continuously. A naive mtime comparison would
-    invalidate the bootstrap on every call after a few seconds, defeating
-    the optimization.
-
-    The slow path is strictly READ-ONLY — it never writes the bootstrap
-    file. The SessionStart hook is the sole authoritative writer of the
-    bootstrap. Writing from the slow path would clobber the hook's correct
-    write if the slow path ran during the hook's own invocation (which
-    happens whenever downstream hook code calls a function that triggers
-    this, before CC has flushed the new session's JSONL to disk).
+    READ-ONLY — never writes the bootstrap file. SessionStart hook is the sole
+    authoritative writer.
     """
     import glob as _glob
-    # Cwd-based project name (NOT canonical) — used for CC's path-encoded
-    # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
-    # see canonical_project_name().
-    project = os.path.basename(os.getcwd())
     bootstrap = f"{_bootstrap_prefix()}{project}"
     safe_project = _glob.escape(project)
 
-    # Fast path: bootstrap file
     try:
         with open(bootstrap, 'r') as f:
             cached_sid = f.read().strip()
-        if cached_sid:
-            safe_cached = _glob.escape(cached_sid)
-            cached_matches = _glob_project_jsonls(
-                safe_project, f"{safe_cached}.jsonl"
-            )
-            if cached_matches:
-                # Determine the newest JSONL deterministically: order by
-                # (mtime, path). Ties broken by path string so results are
-                # reproducible across filesystems that report 1-second mtime
-                # resolution.
-                all_matches = _glob_project_jsonls(safe_project)
-                if all_matches:
-                    # Determine the newest JSONL deterministically via (mtime, path).
-                    # _safe_mtime returns -1.0 for files that disappear between glob
-                    # and stat, so transient races never crash the caller.
-                    entries = [(_safe_mtime(p), p) for p in all_matches]
-                    viable = [(m, p) for m, p in entries if m >= 0]
-                    if viable:
-                        newest_mtime, newest_path = max(viable)
-                        newest_sid = os.path.splitext(os.path.basename(newest_path))[0]
-                        if newest_sid == cached_sid:
-                            return cached_sid
-                        # Tie-breaker: if ANY cached JSONL matches the newest
-                        # mtime (across all worktree/project-dir matches), trust
-                        # the cache. When multiple project-dir variants exist
-                        # (e.g. worktrees), the cached sid's JSONL may appear in
-                        # several of them; comparing only cached_matches[0]
-                        # could miss the tie and cause an unnecessary
-                        # fall-through. This handles the same-second race where
-                        # the previous session's JSONL and the current
-                        # session's JSONL report identical mtimes on
-                        # coarse-resolution filesystems, and the SessionStart
-                        # hook has already authoritatively written the current
-                        # sid.
-                        cached_mtimes = [_safe_mtime(p) for p in cached_matches]
-                        cached_newest = max(
-                            (m for m in cached_mtimes if m >= 0), default=-1.0
-                        )
-                        if cached_newest == newest_mtime:
-                            return cached_sid
-                        # Otherwise a different session is strictly newer; fall through.
-                    else:
-                        return cached_sid  # no viable JSONLs; trust cache
-                else:
-                    return cached_sid  # no other JSONLs; trust cache
     except OSError:
-        pass
+        return None
+    if not cached_sid:
+        return None
+    # Validate SID format before trusting the bootstrap file content. Without
+    # this, a corrupted or attacker-controlled sid-<project> file with content
+    # like "../../../tmp/foo" could propagate path-traversal strings into
+    # cache_get/cache_set composition. Mirrors the validation in
+    # _recent_bootstrap_sid() and _first_seen_date().
+    if not _SID_FILENAME_SAFE.fullmatch(cached_sid):
+        return None
 
-    # Slow path: full glob + mtime sort with deterministic tiebreaker.
-    # This path is READ-ONLY — never writes the bootstrap file. The
-    # SessionStart hook is the sole authoritative writer. Writing here
-    # would clobber the hook's correct write if the slow path ran
-    # during the hook's own invocation (which happens whenever the
-    # hook's downstream code calls a function that triggers this).
-    # Use _safe_mtime so a JSONL deleted or rotated between glob and
-    # stat cannot crash the caller (e.g. load_config).
-    matches = _glob_project_jsonls(safe_project)
-    entries = [(_safe_mtime(p), p) for p in matches]
+    safe_cached = _glob.escape(cached_sid)
+    cached_matches = _glob_project_jsonls(safe_project, f"{safe_cached}.jsonl")
+    if not cached_matches:
+        return None
+
+    all_matches = _glob_project_jsonls(safe_project)
+    if not all_matches:
+        return cached_sid  # no other JSONLs; trust cache
+
+    entries = [(_safe_mtime(p), p) for p in all_matches]
     viable = [(m, p) for m, p in entries if m >= 0]
     if not viable:
-        return "unknown"
-    _, newest = max(viable)
-    return os.path.splitext(os.path.basename(newest))[0]
+        return cached_sid  # no viable JSONLs; trust cache
+
+    newest_mtime, newest_path = max(viable)
+    newest_sid = os.path.splitext(os.path.basename(newest_path))[0]
+    if newest_sid == cached_sid:
+        return cached_sid
+
+    # Tie-breaker: same-second race across worktrees → trust cache
+    cached_mtimes = [_safe_mtime(p) for p in cached_matches]
+    cached_newest = max((m for m in cached_mtimes if m >= 0), default=-1.0)
+    if cached_newest == newest_mtime:
+        return cached_sid
+
+    return None  # different session is strictly newer — fall through
+
+
+def _resolve_session_id(allow_bootstrap: bool = True) -> str:
+    """Single source of truth for current-session SID resolution. Never raises.
+
+    Resolution layers (each failure → next):
+      1. Project basename via _resolve_project_basename (cwd → env → None)
+      2. Bootstrap fast path (skipped if allow_bootstrap=False)
+      3. Slow-path JSONL glob
+      4. Recent-bootstrap best-effort scan (skipped if allow_bootstrap=False)
+         — issue #105 fallback for cwd-gone
+      5. 'unknown' sentinel
+
+    The `allow_bootstrap` flag gates BOTH bootstrap-reading layers (2 and 4),
+    so callers that need a bootstrap-blind result (e.g., health checks via
+    _slow_path_newest_sid) get a JSONL-only resolution.
+    """
+    project = _resolve_project_basename()
+    if project is not None:
+        if allow_bootstrap:
+            sid = _try_bootstrap_fast_path(project)
+            if sid:
+                return sid
+        sid = _try_slow_jsonl_glob(project)
+        if sid != "unknown":
+            return sid
+    if allow_bootstrap:
+        sid = _recent_bootstrap_sid()
+        if sid:
+            return sid
+    return "unknown"
+
+
+def _get_session_id_fast() -> str:
+    """Derive session ID, using bootstrap file for speed on repeat calls.
+
+    See _try_bootstrap_fast_path for the validation strategy and
+    _resolve_session_id for the full layered fallback chain (issue #105).
+    """
+    return _resolve_session_id(allow_bootstrap=True)
 
 
 def cache_get(session_id: str, key: str):

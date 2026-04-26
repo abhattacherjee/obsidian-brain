@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tests/test_get_session_context.py` — comprehensive coverage of markers, peek helpers, resolver, and the project-slug invariant
 
 ### Fixed
+- **Issue #105:** `_get_session_id_fast()` no longer raises `FileNotFoundError`
+  when the cwd is deleted mid-session (e.g. via `gh pr merge --delete-branch`
+  from inside a worktree). Insight savers (`/retro`, `/compress`, `/decide`,
+  `/error-log`) now resolve the active session's SID via a recent-bootstrap
+  best-effort fallback instead of stamping `source_session: unknown`.
 - Source-session basename divergence between `get_session_context()` and SessionEnd that broke insight wikilinks across cross-midnight, worktree, and resumed sessions ([#101](https://github.com/abhattacherjee/obsidian-brain/issues/101))
 - Snapshot/session hash collision in the resolver could pick a snapshot when an insight saver intended to link to a session ([#101](https://github.com/abhattacherjee/obsidian-brain/issues/101) Fix C)
 - `is_resumed_session` now returns True only when a session-type note for the current project (matched by `project_path` against `cwd`) exists for this session_id's hash — eliminating false positives from cross-project hash collisions and snapshot-only matches ([#86](https://github.com/abhattacherjee/obsidian-brain/issues/86), subsumed by [#101](https://github.com/abhattacherjee/obsidian-brain/issues/101))

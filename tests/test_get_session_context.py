@@ -632,3 +632,270 @@ def test_is_resumed_session_uses_provided_cwd_over_getcwd(tmp_path, monkeypatch)
     assert obsidian_utils.is_resumed_session(
         str(vault), "claude-sessions", sid, cwd=cwd_a
     ) is True
+
+
+# ─── Issue #105: _resolve_project_basename ───────────────────────────
+
+def test_resolve_project_basename_happy_path(monkeypatch, tmp_path):
+    """Happy path: os.getcwd works → returns its basename."""
+    target = tmp_path / "some-project"
+    target.mkdir()
+    monkeypatch.chdir(target)
+    assert obsidian_utils._resolve_project_basename() == "some-project"
+
+
+def test_resolve_project_basename_falls_back_to_env(monkeypatch):
+    """When os.getcwd raises, returns basename of CLAUDE_PROJECT_DIR."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/tmp/fake-project-dir/my-proj")
+    assert obsidian_utils._resolve_project_basename() == "my-proj"
+
+
+def test_resolve_project_basename_returns_none_when_both_unavailable(monkeypatch):
+    """When both cwd and CLAUDE_PROJECT_DIR fail, returns None for caller
+    to treat as 'cannot determine project'."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    assert obsidian_utils._resolve_project_basename() is None
+
+
+def test_resolve_project_basename_normalizes_root_cwd_to_none(monkeypatch):
+    """cwd='/' has basename '' which would unsafely become a cross-project
+    glob ('~/.claude/projects/*/*.jsonl') downstream. Normalize to None per
+    Copilot R2 PR #113 so caller falls through to the strict layer-4 scan."""
+    monkeypatch.setattr(os, "getcwd", lambda: "/")
+    assert obsidian_utils._resolve_project_basename() is None
+
+
+def test_resolve_project_basename_normalizes_env_trailing_slash(monkeypatch):
+    """CLAUDE_PROJECT_DIR ending with '/' has basename '' which would unsafely
+    become a cross-project glob downstream. Strip trailing slash before
+    basename, then normalize empty to None per Copilot R2 PR #113."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/path/to/myproj/")
+    assert obsidian_utils._resolve_project_basename() == "myproj"
+
+
+def test_resolve_project_basename_env_root_normalizes_to_none(monkeypatch):
+    """CLAUDE_PROJECT_DIR='/' normalizes to None (root path is not a project)."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/")
+    assert obsidian_utils._resolve_project_basename() is None
+
+
+# ─── Issue #105: _recent_bootstrap_sid ────────────────────────────────
+
+def _seed_bootstrap(home: Path, project: str, sid: str, mtime_offset: float = 0.0) -> Path:
+    """Helper: create a sid-<project> bootstrap file under home with given content
+    and set mtime to (now + offset). Returns the file path."""
+    import time
+    bdir = home / ".claude" / "obsidian-brain"
+    bdir.mkdir(parents=True, exist_ok=True)
+    bdir.chmod(0o700)
+    path = bdir / f"sid-{project}"
+    path.write_text(sid)
+    if mtime_offset != 0.0:
+        ts = time.time() + mtime_offset
+        os.utime(path, (ts, ts))
+    return path
+
+
+def test_recent_bootstrap_sid_zero_recent_returns_none(isolated_home):
+    """Empty bootstrap dir → None."""
+    assert obsidian_utils._recent_bootstrap_sid() is None
+
+
+def test_recent_bootstrap_sid_exactly_one_recent_returns_sid(isolated_home):
+    """Single recent bootstrap → returns its content."""
+    sid = _unique_sid()
+    _seed_bootstrap(isolated_home, "myproj", sid)
+    assert obsidian_utils._recent_bootstrap_sid() == sid
+
+
+def test_recent_bootstrap_sid_two_recent_returns_none(isolated_home):
+    """Two recent bootstraps → None (strict; never silently mis-attributes)."""
+    _seed_bootstrap(isolated_home, "proj-a", _unique_sid())
+    _seed_bootstrap(isolated_home, "proj-b", _unique_sid())
+    assert obsidian_utils._recent_bootstrap_sid() is None
+
+
+def test_recent_bootstrap_sid_skips_tmp_partials(isolated_home):
+    """sid-*.tmp atomic-write residue is not counted as a bootstrap."""
+    sid = _unique_sid()
+    # One real recent bootstrap + one .tmp partial → still exactly-one
+    _seed_bootstrap(isolated_home, "myproj", sid)
+    tmp = isolated_home / ".claude" / "obsidian-brain" / ".ob-sid-abc.tmp"
+    tmp.write_text("garbage")
+    assert obsidian_utils._recent_bootstrap_sid() == sid
+
+
+def test_recent_bootstrap_sid_skips_stale(isolated_home):
+    """Bootstrap file outside recency window → None."""
+    # Set mtime 700s in the past (window default is 600s)
+    _seed_bootstrap(isolated_home, "myproj", _unique_sid(), mtime_offset=-700.0)
+    assert obsidian_utils._recent_bootstrap_sid() is None
+
+
+def test_recent_bootstrap_sid_skips_empty_content(isolated_home):
+    """Recent bootstrap with empty/whitespace content → None (corrupted write)."""
+    bdir = isolated_home / ".claude" / "obsidian-brain"
+    bdir.mkdir(parents=True, exist_ok=True)
+    bdir.chmod(0o700)
+    (bdir / "sid-myproj").write_text("   \n  ")
+    assert obsidian_utils._recent_bootstrap_sid() is None
+
+
+def test_recent_bootstrap_sid_rejects_unsafe_sid_format(isolated_home):
+    """Bootstrap content failing _SID_FILENAME_SAFE regex → None.
+
+    Without this validation, a corrupted or attacker-controlled bootstrap file
+    with content like '../../../tmp/foo' could propagate path-traversal strings
+    into cache_get/cache_set composition. Per Copilot R1 PR #113.
+    """
+    bdir = isolated_home / ".claude" / "obsidian-brain"
+    bdir.mkdir(parents=True, exist_ok=True)
+    bdir.chmod(0o700)
+    # Attacker-controlled / corrupted SIDs that should all be rejected
+    for unsafe in [
+        "../../../tmp/escape",        # path traversal
+        "/absolute/path",             # absolute path
+        "sid with spaces",            # whitespace
+        "sid\nwith-newline",          # newline
+        "sid\twith-tab",              # tab
+        "sid*glob",                   # glob char
+        "sid/with-slash",             # path separator
+        "sid\\with-backslash",        # backslash
+        "x" * 200,                    # exceeds 128-char limit
+    ]:
+        # Reset dir for each iteration so this is exactly-one
+        for f in bdir.glob("sid-*"):
+            f.unlink()
+        (bdir / "sid-myproj").write_text(unsafe)
+        assert obsidian_utils._recent_bootstrap_sid() is None, \
+            f"Unsafe SID format should be rejected: {unsafe!r}"
+
+
+# ─── Issue #105: _resolve_session_id integration ──────────────────────
+
+def test_resolve_session_id_cwd_gone_uses_recent_bootstrap(isolated_home, monkeypatch):
+    """Headline regression: cwd-gone + valid recent bootstrap → returns the SID
+    via layer 4. This is the scenario from 2026-04-24 retros that motivated #105."""
+    sid = _unique_sid()
+    _seed_bootstrap(isolated_home, "myworktree", sid)
+
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+
+    assert obsidian_utils._resolve_session_id() == sid
+
+
+def test_resolve_session_id_cwd_gone_no_bootstrap_returns_unknown(isolated_home, monkeypatch):
+    """Cwd-gone + no recent bootstrap → 'unknown' sentinel (graceful, never raises)."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+
+    assert obsidian_utils._resolve_session_id() == "unknown"
+
+
+def test_resolve_session_id_happy_path_uses_existing_layers(isolated_home, monkeypatch, tmp_path):
+    """Cwd valid + bootstrap valid → resolves via layer 2 (no behavior change)."""
+    sid = _unique_sid()
+    project = "happypath-proj"
+
+    # Seed the existing bootstrap fast path machinery: write sid-<project> AND
+    # a JSONL the fast path can stat.
+    _seed_bootstrap(isolated_home, project, sid)
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    # _bootstrap_prefix() reads the module-level _BOOTSTRAP_PREFIX which is
+    # frozen at import time to the real $HOME. Redirect it for this test so
+    # the fast path actually finds the seeded bootstrap.
+    bdir = isolated_home / ".claude" / "obsidian-brain"
+    monkeypatch.setattr(
+        obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-"
+    )
+
+    assert obsidian_utils._resolve_session_id(allow_bootstrap=True) == sid
+
+
+def test_resolve_session_id_slow_path_skips_layer_2(isolated_home, monkeypatch, tmp_path):
+    """allow_bootstrap=False (used by _slow_path_newest_sid) skips layer 2
+    even when bootstrap exists. Preserves the existing 'health-check is
+    bootstrap-blind' contract."""
+    project = "slowpath-proj"
+    bootstrap_sid = _unique_sid()
+    jsonl_sid = _unique_sid()
+
+    # Seed bootstrap with one SID, JSONL with a different one — slow path must
+    # return the JSONL's SID, ignoring the bootstrap file entirely.
+    _seed_bootstrap(isolated_home, project, bootstrap_sid)
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{jsonl_sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    # Layer 2 is skipped here, so _BOOTSTRAP_PREFIX redirect is unnecessary;
+    # but the slow-path uses _glob_project_jsonls which uses expanduser at
+    # call time → HOME monkeypatch (already done by isolated_home) is enough.
+    assert obsidian_utils._resolve_session_id(allow_bootstrap=False) == jsonl_sid
+
+
+def test_try_bootstrap_fast_path_rejects_unsafe_cached_sid(isolated_home, monkeypatch):
+    """_try_bootstrap_fast_path validates cached_sid against _SID_FILENAME_SAFE
+    before trusting it. Symmetric to the validation in _recent_bootstrap_sid.
+    Without this, a corrupted sid-<project> file with content like '../foo'
+    could propagate path-traversal strings into cache_get/cache_set composition.
+    Per Copilot R2 PR #113."""
+    project = "fastpath-proj"
+    bdir = isolated_home / ".claude" / "obsidian-brain"
+    bdir.mkdir(parents=True, exist_ok=True)
+    bdir.chmod(0o700)
+    # Write an unsafe (path-traversal) value into the bootstrap.
+    (bdir / f"sid-{project}").write_text("../../../tmp/escape")
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-")
+
+    # No JSONL setup is needed here: this test asserts that the fast path
+    # rejects unsafe bootstrap content before trusting or composing with it.
+    assert obsidian_utils._try_bootstrap_fast_path(project) is None
+
+
+def test_resolve_session_id_slow_path_skips_layer_4_recent_bootstrap(isolated_home, monkeypatch):
+    """allow_bootstrap=False (used by _slow_path_newest_sid) skips BOTH layer 2
+    AND layer 4 — does not trust the cross-project recent-bootstrap scan either.
+    Preserves the bootstrap-blind health-check contract that check_hook_status
+    relies on at obsidian_utils.py:827."""
+    project = "healthcheck-proj"
+    bootstrap_sid = _unique_sid()
+
+    # Seed a recent bootstrap (would normally be picked up by layer 4)
+    _seed_bootstrap(isolated_home, project, bootstrap_sid)
+
+    # cwd valid, but NO matching JSONL exists for this project — slow path
+    # returns "unknown" → without the fix, layer 4 would find bootstrap_sid
+    # and return it. With the fix, layer 4 is gated off → returns "unknown".
+    target = isolated_home / project
+    target.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(target)
+
+    assert obsidian_utils._resolve_session_id(allow_bootstrap=False) == "unknown"
