@@ -661,3 +661,65 @@ def test_resolve_project_basename_returns_none_when_both_unavailable(monkeypatch
     monkeypatch.setattr(os, "getcwd", _raise)
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     assert obsidian_utils._resolve_project_basename() is None
+
+
+# ─── Issue #105: _recent_bootstrap_sid ────────────────────────────────
+
+def _seed_bootstrap(home: Path, project: str, sid: str, mtime_offset: float = 0.0) -> Path:
+    """Helper: create a sid-<project> bootstrap file under home with given content
+    and set mtime to (now + offset). Returns the file path."""
+    import time
+    bdir = home / ".claude" / "obsidian-brain"
+    bdir.mkdir(parents=True, exist_ok=True)
+    bdir.chmod(0o700)
+    path = bdir / f"sid-{project}"
+    path.write_text(sid)
+    if mtime_offset != 0.0:
+        ts = time.time() + mtime_offset
+        os.utime(path, (ts, ts))
+    return path
+
+
+def test_recent_bootstrap_sid_zero_recent_returns_none(isolated_home):
+    """Empty bootstrap dir → None."""
+    assert obsidian_utils._recent_bootstrap_sid() is None
+
+
+def test_recent_bootstrap_sid_exactly_one_recent_returns_sid(isolated_home):
+    """Single recent bootstrap → returns its content."""
+    sid = _unique_sid()
+    _seed_bootstrap(isolated_home, "myproj", sid)
+    assert obsidian_utils._recent_bootstrap_sid() == sid
+
+
+def test_recent_bootstrap_sid_two_recent_returns_none(isolated_home):
+    """Two recent bootstraps → None (strict; never silently mis-attributes)."""
+    _seed_bootstrap(isolated_home, "proj-a", _unique_sid())
+    _seed_bootstrap(isolated_home, "proj-b", _unique_sid())
+    assert obsidian_utils._recent_bootstrap_sid() is None
+
+
+def test_recent_bootstrap_sid_skips_tmp_partials(isolated_home):
+    """sid-*.tmp atomic-write residue is not counted as a bootstrap."""
+    sid = _unique_sid()
+    # One real recent bootstrap + one .tmp partial → still exactly-one
+    _seed_bootstrap(isolated_home, "myproj", sid)
+    tmp = isolated_home / ".claude" / "obsidian-brain" / ".ob-sid-abc.tmp"
+    tmp.write_text("garbage")
+    assert obsidian_utils._recent_bootstrap_sid() == sid
+
+
+def test_recent_bootstrap_sid_skips_stale(isolated_home):
+    """Bootstrap file outside recency window → None."""
+    # Set mtime 700s in the past (window default is 600s)
+    _seed_bootstrap(isolated_home, "myproj", _unique_sid(), mtime_offset=-700.0)
+    assert obsidian_utils._recent_bootstrap_sid() is None
+
+
+def test_recent_bootstrap_sid_skips_empty_content(isolated_home):
+    """Recent bootstrap with empty/whitespace content → None (corrupted write)."""
+    bdir = isolated_home / ".claude" / "obsidian-brain"
+    bdir.mkdir(parents=True, exist_ok=True)
+    bdir.chmod(0o700)
+    (bdir / "sid-myproj").write_text("   \n  ")
+    assert obsidian_utils._recent_bootstrap_sid() is None

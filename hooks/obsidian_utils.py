@@ -297,6 +297,52 @@ def _resolve_project_basename() -> str | None:
         return os.path.basename(env) if env else None
 
 
+def _recent_bootstrap_sid(window_seconds: int = 600) -> str | None:
+    """Final-fallback session-id resolver for issue #105 (cwd-gone scenario).
+
+    Scans ~/.claude/obsidian-brain/sid-* for files with mtime within the recency
+    window (default 10 min — covers any normal SessionStart-to-/retro interaction
+    window). Returns the SID iff exactly ONE recent file is found. Strict by
+    design: zero or 2+ matches return None to prevent silent mis-attribution
+    across projects (the same bug class as issue #101).
+
+    NOTE: bootstrap files are written exactly once by SessionStart and immutable
+    thereafter — so mtime IS capture time for them. This is the opposite of the
+    `technical_mtime_not_capture_time` warning, which applies to vault notes
+    edited by /check-items, /link, etc.
+
+    Reads the bootstrap dir via os.path.expanduser at call time (not the
+    module-level _SECURE_DIR constant) so HOME-redirecting test fixtures work.
+    """
+    import time
+    bdir = os.path.expanduser("~/.claude/obsidian-brain")
+    cutoff = time.time() - window_seconds
+    try:
+        entries = os.listdir(bdir)
+    except OSError:
+        return None
+
+    candidates: list[str] = []
+    for name in entries:
+        if not name.startswith("sid-") or name.endswith(".tmp"):
+            continue
+        path = os.path.join(bdir, name)
+        if _safe_mtime(path) < cutoff:
+            continue
+        try:
+            with open(path, "r") as f:
+                content = f.read().strip()
+        except OSError:
+            continue
+        if not content:
+            continue
+        candidates.append(content)
+        if len(candidates) > 1:
+            return None  # short-circuit — strict exactly-one
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
 # --- Secure working directory ---
 # All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
 # This prevents symlink attacks and cache poisoning on multi-user systems.
