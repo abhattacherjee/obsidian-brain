@@ -154,6 +154,18 @@ def main() -> None:
         _run()
     except Exception as exc:
         print(f"[obsidian-brain] session-log unexpected error: {exc}", file=sys.stderr)
+        # Best-effort: try to extract a project + sid from stdin for the log line.
+        # If stdin was already consumed (it was, by _run), use "unknown" placeholders.
+        try:
+            _append_sessionend_log(
+                project="unknown",
+                session_id="unknown",
+                outcome=_Outcome.EXCEPTION,
+                detail=repr(exc)[:200],
+            )
+        except Exception:
+            # Logging itself failed — nothing else to do; we still exit 0.
+            pass
     sys.exit(0)
 
 

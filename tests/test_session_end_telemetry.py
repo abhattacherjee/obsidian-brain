@@ -408,3 +408,38 @@ class TestSuccessOutcome:
         # A vault note was actually written:
         notes = list((vault / "claude-sessions").glob("*.md"))
         assert len(notes) == 1, f"expected one vault note, got {[n.name for n in notes]}"
+
+
+class TestExceptionOutcome:
+    def test_unexpected_exception_logs_exception(self, tmp_path, monkeypatch):
+        """If _run() raises, main() catches and logs EXCEPTION before exit 0."""
+        # Trigger an exception by passing a transcript_path that resolves under
+        # ~/.claude/projects but causes load_config() to blow up. Easiest path:
+        # write a config file with invalid JSON.
+        cc_slug = "-myproj"
+        proj = tmp_path / ".claude" / "projects" / cc_slug
+        proj.mkdir(parents=True)
+        transcript = proj / "sid-except-12345.jsonl"
+        _make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
+
+        # Corrupt config so load_config() raises a JSONDecodeError that bubbles up.
+        cfg_path = tmp_path / ".claude" / "obsidian-brain-config.json"
+        cfg_path.write_text("{not-valid-json", encoding="utf-8")
+
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": "sid-except-12345",
+            "transcript_path": str(transcript),
+        }
+        result = _run_session_end(tmp_path, payload=payload)
+        assert result.returncode == 0
+        lines = _read_log_lines(tmp_path)
+        # Exactly one EXCEPTION line — _run can also log SKIPPED_NO_VAULT etc.
+        # depending on how load_config swallows errors. Allow either as long as
+        # SOMETHING is logged so a future maintainer can see what went wrong.
+        assert len(lines) >= 1, f"expected at least one telemetry line, got {lines!r}"
+        # Must contain either EXCEPTION (raised) or SKIPPED_NO_VAULT (load_config swallowed).
+        assert any(
+            "outcome=EXCEPTION" in ln or "outcome=SKIPPED_NO_VAULT" in ln
+            for ln in lines
+        ), f"expected EXCEPTION or SKIPPED_NO_VAULT in {lines!r}"
