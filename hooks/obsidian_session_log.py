@@ -61,6 +61,19 @@ class _Outcome:
 
 
 # ---------------------------------------------------------------------------
+# Telemetry helpers
+# ---------------------------------------------------------------------------
+
+
+def _project_slug_for_log(cwd: str) -> str:
+    """Derive a project slug for telemetry from the hook's cwd field.
+
+    Returns 'unknown' when cwd is empty rather than slugify's default 'session'.
+    """
+    return slugify(Path(cwd).name) if cwd else "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Session cache cleanup
 # ---------------------------------------------------------------------------
 
@@ -176,7 +189,7 @@ def _run() -> None:
             if not os.path.realpath(transcript_path).startswith(allowed_root + os.sep):
                 print("[obsidian-brain] transcript_path outside ~/.claude/projects, skipping", file=sys.stderr)
                 _append_sessionend_log(
-                    project=slugify(Path(cwd).name) if cwd else "unknown",
+                    project=_project_slug_for_log(cwd),
                     session_id=session_id,
                     outcome=_Outcome.SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS,
                     detail=os.path.realpath(transcript_path),
@@ -186,7 +199,7 @@ def _run() -> None:
         if not session_id or not transcript_path:
             print("[obsidian-brain] missing session_id or transcript_path, skipping", file=sys.stderr)
             _append_sessionend_log(
-                project=slugify(Path(cwd).name) if cwd else "unknown",
+                project=_project_slug_for_log(cwd),
                 session_id=session_id,
                 outcome=_Outcome.SKIPPED_INVALID_INPUT,
                 detail=(
@@ -201,7 +214,7 @@ def _run() -> None:
         if not config.get("auto_log_enabled", True):
             print("[obsidian-brain] auto_log_enabled is False, skipping", file=sys.stderr)
             _append_sessionend_log(
-                project=slugify(Path(cwd).name) if cwd else "unknown",
+                project=_project_slug_for_log(cwd),
                 session_id=session_id,
                 outcome=_Outcome.SKIPPED_AUTO_LOG_OFF,
             )
@@ -211,7 +224,7 @@ def _run() -> None:
         if not vault_path:
             print("[obsidian-brain] no vault_path configured, skipping", file=sys.stderr)
             _append_sessionend_log(
-                project=slugify(Path(cwd).name) if cwd else "unknown",
+                project=_project_slug_for_log(cwd),
                 session_id=session_id,
                 outcome=_Outcome.SKIPPED_NO_VAULT,
             )
@@ -226,7 +239,7 @@ def _run() -> None:
         if not messages:
             print("[obsidian-brain] empty transcript, skipping", file=sys.stderr)
             _append_sessionend_log(
-                project=slugify(Path(cwd).name) if cwd else "unknown",
+                project=_project_slug_for_log(cwd),
                 session_id=session_id,
                 outcome=_Outcome.SKIPPED_NO_TRANSCRIPT,
                 detail=transcript_path,
