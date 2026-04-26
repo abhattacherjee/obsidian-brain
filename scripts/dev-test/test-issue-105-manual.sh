@@ -30,6 +30,25 @@ if [ -z "$CACHE_DIR" ] || [ ! -d "$CACHE_DIR" ]; then
 fi
 
 HOOK_DIR=$(find "$CACHE_DIR" -maxdepth 2 -type d -name hooks | sort -V | tail -1)
+if [ -z "$HOOK_DIR" ] || [ ! -d "$HOOK_DIR" ] || [ ! -r "$HOOK_DIR/obsidian_utils.py" ]; then
+    echo "❌ Could not locate a valid hooks directory in the obsidian-brain plugin cache."
+    echo "   Expected a readable file at: $HOOK_DIR/obsidian_utils.py"
+    echo "   Run /dev-test install first, or verify the plugin cache layout under:"
+    echo "   $CACHE_DIR"
+    exit 1
+fi
+
+# Sanity-check that the cache has the issue #105 functions before running
+# Phase A-E. Without this, AttributeErrors get swallowed by the per-assertion
+# `2>/dev/null` and surface as misleading "expected '<X>', got ''" failures.
+PYTHONPATH="$HOOK_DIR" python3 -c \
+    'import obsidian_utils; assert hasattr(obsidian_utils, "_resolve_project_basename"), "missing _resolve_project_basename"' \
+    >/dev/null 2>&1 || {
+    echo "❌ Plugin cache at $HOOK_DIR is missing issue #105 functions."
+    echo "   Run /dev-test install in a sibling Claude Code session to sync"
+    echo "   the feature branch into the cache, then re-run this script."
+    exit 1
+}
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "Issue #105 — cwd-gone session-id resolution"

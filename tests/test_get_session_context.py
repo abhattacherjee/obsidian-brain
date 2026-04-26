@@ -725,6 +725,36 @@ def test_recent_bootstrap_sid_skips_empty_content(isolated_home):
     assert obsidian_utils._recent_bootstrap_sid() is None
 
 
+def test_recent_bootstrap_sid_rejects_unsafe_sid_format(isolated_home):
+    """Bootstrap content failing _SID_FILENAME_SAFE regex → None.
+
+    Without this validation, a corrupted or attacker-controlled bootstrap file
+    with content like '../../../tmp/foo' could propagate path-traversal strings
+    into cache_get/cache_set composition. Per Copilot R1 PR #113.
+    """
+    bdir = isolated_home / ".claude" / "obsidian-brain"
+    bdir.mkdir(parents=True, exist_ok=True)
+    bdir.chmod(0o700)
+    # Attacker-controlled / corrupted SIDs that should all be rejected
+    for unsafe in [
+        "../../../tmp/escape",        # path traversal
+        "/absolute/path",             # absolute path
+        "sid with spaces",            # whitespace
+        "sid\nwith-newline",          # newline
+        "sid\twith-tab",              # tab
+        "sid*glob",                   # glob char
+        "sid/with-slash",             # path separator
+        "sid\\with-backslash",        # backslash
+        "x" * 200,                    # exceeds 128-char limit
+    ]:
+        # Reset dir for each iteration so this is exactly-one
+        for f in bdir.glob("sid-*"):
+            f.unlink()
+        (bdir / "sid-myproj").write_text(unsafe)
+        assert obsidian_utils._recent_bootstrap_sid() is None, \
+            f"Unsafe SID format should be rejected: {unsafe!r}"
+
+
 # ─── Issue #105: _resolve_session_id integration ──────────────────────
 
 def test_resolve_session_id_cwd_gone_uses_recent_bootstrap(isolated_home, monkeypatch):

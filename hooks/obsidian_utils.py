@@ -336,6 +336,12 @@ def _recent_bootstrap_sid(window_seconds: int = 600) -> str | None:
             continue
         if not content:
             continue
+        # Validate SID format before trusting the file content. Without this,
+        # a corrupted or attacker-controlled bootstrap file could propagate
+        # path-traversal-style strings (e.g., "../foo") into cache_get/cache_set
+        # path composition. _SID_FILENAME_SAFE is [A-Za-z0-9._-]{1,128}.
+        if not _SID_FILENAME_SAFE.fullmatch(content):
+            continue
         candidates.append(content)
         if len(candidates) > 1:
             return None  # short-circuit — strict exactly-one
