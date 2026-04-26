@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- SessionEnd hook now logs structured outcome lines to `~/.claude/obsidian-brain-hook.log` for every exit path (success, all skip reasons, write failure, exception). Enables post-hoc diagnosis of dropped sessions. Issue #100 Phase 1 ([#123](https://github.com/abhattacherjee/obsidian-brain/issues/123)).
+
 ## [2.4.2] - 2026-04-26
 
 ### Added

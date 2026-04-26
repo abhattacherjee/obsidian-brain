@@ -443,3 +443,36 @@ class TestExceptionOutcome:
             "outcome=EXCEPTION" in ln or "outcome=SKIPPED_NO_VAULT" in ln
             for ln in lines
         ), f"expected EXCEPTION or SKIPPED_NO_VAULT in {lines!r}"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for helper edge-cases (improve line coverage)
+# ---------------------------------------------------------------------------
+
+
+class TestProjectSlugForLog:
+    """_project_slug_for_log: empty cwd → 'unknown' (line 73 coverage)."""
+
+    def test_empty_cwd_returns_unknown(self):
+        from obsidian_session_log import _project_slug_for_log
+        assert _project_slug_for_log("") == "unknown"
+
+    def test_nonempty_cwd_returns_slug(self):
+        from obsidian_session_log import _project_slug_for_log
+        assert _project_slug_for_log("/home/user/myproject") == "myproject"
+
+
+class TestCleanupSessionCacheException:
+    """_cleanup_session_cache: exception branch (lines 90-91 coverage)."""
+
+    def test_exception_in_unlink_is_swallowed(self, tmp_path, monkeypatch):
+        """If os.unlink raises, _cleanup_session_cache must not propagate."""
+        import obsidian_session_log
+
+        # Monkeypatch os.path.exists to return True (so unlink is attempted)
+        # and os.unlink to raise an OSError.
+        monkeypatch.setattr("obsidian_session_log.os.path.exists", lambda p: True)
+        monkeypatch.setattr("obsidian_session_log.os.unlink", lambda p: (_ for _ in ()).throw(OSError("simulated")))
+
+        # Must not raise, and must exit cleanly.
+        obsidian_session_log._cleanup_session_cache("any-session-id")
