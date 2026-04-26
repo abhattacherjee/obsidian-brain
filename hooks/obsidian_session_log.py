@@ -374,6 +374,19 @@ def _run() -> None:
             )
             return
         print("[obsidian-brain] raw note written (summarization deferred to /recall)", file=sys.stderr)
+        _append_sessionend_log(
+            project=metadata.get("project") or _project_slug_for_log(cwd),
+            session_id=session_id,
+            outcome=_Outcome.OK_RAW_NOTE_ONLY,
+            msgs=len(user_msgs),
+            dur_min=float(metadata.get("duration_minutes", 0.0)),
+            detail="snapshot-bypass" if (
+                should_skip_session(
+                    user_msgs, metadata.get("duration_minutes", 0.0),
+                    min_messages=min_messages, min_duration=min_duration,
+                ) and snapshots
+            ) else "",
+        )
     finally:
         # Run cache cleanup regardless of how _run() exits so /tmp does not
         # accumulate stale cache files on any SessionEnd outcome — including

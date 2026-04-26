@@ -370,3 +370,41 @@ class TestWriteFailedOutcome:
         finally:
             # Restore permissions so pytest's tmp_path cleanup can rm it.
             os.chmod(sessions, 0o700)
+
+
+class TestSuccessOutcome:
+    def test_successful_write_logs_ok_raw_note_only(self, tmp_path):
+        """A normal above-threshold session that writes a vault note logs OK_RAW_NOTE_ONLY."""
+        cc_slug = "-myproj"
+        proj = tmp_path / ".claude" / "projects" / cc_slug
+        proj.mkdir(parents=True)
+        transcript = proj / "sid-success-1234.jsonl"
+        _make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
+
+        vault = tmp_path / "vault"
+        (vault / "claude-sessions").mkdir(parents=True)
+
+        cfg = {
+            "vault_path": str(vault),
+            "sessions_folder": "claude-sessions",
+            "auto_log_enabled": True,
+            "min_messages": 3,
+            "min_duration_minutes": 2,
+        }
+        cfg_path = tmp_path / ".claude" / "obsidian-brain-config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": "sid-success-1234",
+            "transcript_path": str(transcript),
+        }
+        result = _run_session_end(tmp_path, payload=payload)
+        assert result.returncode == 0
+        lines = _read_log_lines(tmp_path)
+        assert len(lines) == 1, f"expected one line, got {lines!r}"
+        assert "outcome=OK_RAW_NOTE_ONLY" in lines[0]
+        assert "msgs=10" in lines[0]
+        # A vault note was actually written:
+        notes = list((vault / "claude-sessions").glob("*.md"))
+        assert len(notes) == 1, f"expected one vault note, got {[n.name for n in notes]}"
