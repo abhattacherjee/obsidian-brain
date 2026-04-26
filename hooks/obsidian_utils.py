@@ -277,6 +277,26 @@ def _safe_getcwd() -> str:
         return ""
 
 
+def _resolve_project_basename() -> str | None:
+    """Project basename for CC-path lookups (~/.claude/projects/, sid-* bootstraps).
+
+    Resolution order:
+      1. os.getcwd() — normal case
+      2. CLAUDE_PROJECT_DIR env var — when cwd is gone (worktree deleted
+         mid-session via `gh pr merge --delete-branch`); see issue #105
+      3. None — caller should treat as 'cannot determine project' and
+         fall through to project-agnostic fallbacks
+
+    Never raises. Mirrors the env-fallback contract that obsidian_session_hint.py
+    line 117 already uses for hook input (cwd ← hook payload, getcwd second).
+    """
+    try:
+        return os.path.basename(os.getcwd())
+    except OSError:
+        env = os.environ.get("CLAUDE_PROJECT_DIR")
+        return os.path.basename(env) if env else None
+
+
 # --- Secure working directory ---
 # All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
 # This prevents symlink attacks and cache poisoning on multi-user systems.

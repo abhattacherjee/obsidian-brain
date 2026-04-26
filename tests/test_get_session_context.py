@@ -632,3 +632,32 @@ def test_is_resumed_session_uses_provided_cwd_over_getcwd(tmp_path, monkeypatch)
     assert obsidian_utils.is_resumed_session(
         str(vault), "claude-sessions", sid, cwd=cwd_a
     ) is True
+
+
+# ─── Issue #105: _resolve_project_basename ───────────────────────────
+
+def test_resolve_project_basename_happy_path(monkeypatch, tmp_path):
+    """Happy path: os.getcwd works → returns its basename."""
+    target = tmp_path / "some-project"
+    target.mkdir()
+    monkeypatch.chdir(target)
+    assert obsidian_utils._resolve_project_basename() == "some-project"
+
+
+def test_resolve_project_basename_falls_back_to_env(monkeypatch):
+    """When os.getcwd raises, returns basename of CLAUDE_PROJECT_DIR."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/tmp/fake-project-dir/my-proj")
+    assert obsidian_utils._resolve_project_basename() == "my-proj"
+
+
+def test_resolve_project_basename_returns_none_when_both_unavailable(monkeypatch):
+    """When both cwd and CLAUDE_PROJECT_DIR fail, returns None for caller
+    to treat as 'cannot determine project'."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    assert obsidian_utils._resolve_project_basename() is None
