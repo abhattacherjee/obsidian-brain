@@ -216,6 +216,20 @@ class TestInvalidInputOutcomes:
         assert len(lines) == 1
         assert "outcome=SKIPPED_INVALID_INPUT" in lines[0]
 
+    def test_missing_transcript_path_logs_skipped_invalid_input(self, tmp_path):
+        """session_id present but transcript_path missing: SKIPPED_INVALID_INPUT with detail='missing transcript_path'."""
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": "sid-no-tp-1234",
+            # transcript_path absent
+        }
+        result = _run_session_end(tmp_path, payload=payload)
+        assert result.returncode == 0
+        lines = _read_log_lines(tmp_path)
+        assert len(lines) == 1
+        assert "outcome=SKIPPED_INVALID_INPUT" in lines[0]
+        assert "detail=missing transcript_path" in lines[0]
+
     def test_transcript_outside_projects_logs_outside_projects_outcome(self, tmp_path):
         # transcript_path that does NOT live under ~/.claude/projects
         bogus_transcript = tmp_path / "evil" / "transcript.jsonl"
@@ -329,6 +343,7 @@ class TestThresholdOutcomes:
 
 
 class TestWriteFailedOutcome:
+    @pytest.mark.skipif(os.getuid() == 0, reason="root bypasses chmod restrictions")
     def test_write_failure_logs_write_failed(self, tmp_path):
         """When the vault sessions folder is unwritable, _run logs WRITE_FAILED."""
         # Set up a valid above-threshold session
@@ -343,8 +358,6 @@ class TestWriteFailedOutcome:
         vault.mkdir()
         sessions = vault / "claude-sessions"
         sessions.mkdir()
-        # Make the sessions folder read-only so write_vault_note() fails.
-        os.chmod(sessions, 0o500)
 
         cfg = {
             "vault_path": str(vault),
@@ -362,17 +375,102 @@ class TestWriteFailedOutcome:
             "transcript_path": str(transcript),
         }
         try:
+            # Make the sessions folder read-only INSIDE try so restore always runs.
+            os.chmod(sessions, 0o500)
             result = _run_session_end(tmp_path, payload=payload)
             assert result.returncode == 0
             lines = _read_log_lines(tmp_path)
             assert len(lines) == 1, f"expected one line, got {lines!r}"
             assert "outcome=WRITE_FAILED" in lines[0]
+            # Verify detail= is the LAST field — vault paths with spaces (common
+            # on macOS) would fragment earlier fields if this ordering broke.
+            assert "detail=" in lines[0]
+            assert lines[0].rfind("detail=") > lines[0].rfind("dur=")
         finally:
             # Restore permissions so pytest's tmp_path cleanup can rm it.
             os.chmod(sessions, 0o700)
 
 
 class TestSuccessOutcome:
+    def test_snapshot_bypass_logs_ok_with_snapshot_bypass_detail(self, tmp_path):
+        """Below-threshold session with existing snapshot writes OK_RAW_NOTE_ONLY + detail=snapshot-bypass.
+
+        The hook derives early_project = slugify(Path(cwd).name). The snapshot
+        filename glob is {date}-{slug}-*-snapshot*.md and frontmatter must have
+        matching session_id + project. We construct the fixture dynamically so
+        it survives pytest's generated tmp_path names.
+        """
+        import datetime as _dt
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent / "hooks"))
+        from obsidian_utils import slugify as _slugify
+
+        # early_project is derived from cwd basename (tmp_path.name).
+        early_project = _slugify(tmp_path.name)
+        cc_slug = f"-{tmp_path.name.replace('_', '-')}"
+        proj = tmp_path / ".claude" / "projects" / cc_slug
+        proj.mkdir(parents=True)
+        sid = "sid-bypass-12345"
+        transcript = proj / f"{sid}.jsonl"
+        # 2 user messages, 5 minutes — below msg threshold (3) but above duration (2).
+        # The message-count check fires first; snapshot presence bypasses it.
+        _make_jsonl(transcript, n_user_msgs=2, duration_sec=300)
+
+        vault = tmp_path / "vault"
+        sessions_dir = vault / "claude-sessions"
+        sessions_dir.mkdir(parents=True)
+
+        # Build snapshot file matching the glob {date}-{slug}-*-snapshot*.md.
+        today = _dt.date.today().isoformat()
+        snapshot_name = f"{today}-{early_project}-bypass-snapshot-120000.md"
+        snapshot_path = sessions_dir / snapshot_name
+        snapshot_path.write_text(
+            "---\n"
+            "type: claude-snapshot\n"
+            f"date: {today}\n"
+            f"session_id: {sid}\n"
+            f"project: {early_project}\n"
+            "---\n\n"
+            "# Snapshot\n\nbody\n",
+            encoding="utf-8",
+        )
+
+        cfg = {
+            "vault_path": str(vault),
+            "sessions_folder": "claude-sessions",
+            "auto_log_enabled": True,
+            "min_messages": 3,
+            "min_duration_minutes": 2,
+        }
+        cfg_path = tmp_path / ".claude" / "obsidian-brain-config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": sid,
+            "transcript_path": str(transcript),
+        }
+        result = _run_session_end(tmp_path, payload=payload)
+        assert result.returncode == 0
+        lines = _read_log_lines(tmp_path)
+        assert len(lines) == 1, f"expected one line, got {lines!r}"
+        assert "outcome=OK_RAW_NOTE_ONLY" in lines[0], f"unexpected outcome in: {lines[0]!r}"
+        assert "detail=snapshot-bypass" in lines[0], (
+            f"expected snapshot-bypass detail, got: {lines[0]!r}"
+        )
+        # A vault note was written as anchor for the snapshot.
+        # Filter by frontmatter type — the session note has type: claude-session,
+        # the fixture snapshot has type: claude-snapshot.
+        all_notes = list(sessions_dir.glob("*.md"))
+        session_notes = [
+            n for n in all_notes
+            if "claude-session" in n.read_text(encoding="utf-8")
+        ]
+        assert len(session_notes) >= 1, (
+            f"expected at least one claude-session note; got files: "
+            f"{[n.name for n in all_notes]}"
+        )
+
     def test_successful_write_logs_ok_raw_note_only(self, tmp_path):
         """A normal above-threshold session that writes a vault note logs OK_RAW_NOTE_ONLY."""
         cc_slug = "-myproj"
@@ -411,38 +509,75 @@ class TestSuccessOutcome:
 
 
 class TestExceptionOutcome:
-    def test_unexpected_exception_logs_exception(self, tmp_path, monkeypatch):
-        """If _run() raises, main() catches and logs EXCEPTION before exit 0."""
-        # Trigger an exception by passing a transcript_path that resolves under
-        # ~/.claude/projects but causes load_config() to blow up. Easiest path:
-        # write a config file with invalid JSON.
+    def test_corrupt_config_logs_skipped_no_vault(self, tmp_path):
+        """Corrupt config JSON: load_config swallows JSONDecodeError and returns
+        empty defaults, so SessionEnd hits the SKIPPED_NO_VAULT path. Verifies
+        even a broken config produces structured telemetry, not a silent drop."""
         cc_slug = "-myproj"
         proj = tmp_path / ".claude" / "projects" / cc_slug
         proj.mkdir(parents=True)
-        transcript = proj / "sid-except-12345.jsonl"
+        transcript = proj / "sid-noconf-12345.jsonl"
         _make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
 
-        # Corrupt config so load_config() raises a JSONDecodeError that bubbles up.
         cfg_path = tmp_path / ".claude" / "obsidian-brain-config.json"
         cfg_path.write_text("{not-valid-json", encoding="utf-8")
 
         payload = {
             "cwd": str(tmp_path),
-            "session_id": "sid-except-12345",
+            "session_id": "sid-noconf-12345",
             "transcript_path": str(transcript),
         }
         result = _run_session_end(tmp_path, payload=payload)
         assert result.returncode == 0
         lines = _read_log_lines(tmp_path)
-        # Exactly one EXCEPTION line — _run can also log SKIPPED_NO_VAULT etc.
-        # depending on how load_config swallows errors. Allow either as long as
-        # SOMETHING is logged so a future maintainer can see what went wrong.
-        assert len(lines) >= 1, f"expected at least one telemetry line, got {lines!r}"
-        # Must contain either EXCEPTION (raised) or SKIPPED_NO_VAULT (load_config swallowed).
-        assert any(
-            "outcome=EXCEPTION" in ln or "outcome=SKIPPED_NO_VAULT" in ln
-            for ln in lines
-        ), f"expected EXCEPTION or SKIPPED_NO_VAULT in {lines!r}"
+        assert len(lines) == 1
+        assert "outcome=SKIPPED_NO_VAULT" in lines[0]
+
+    @pytest.mark.skipif(os.getuid() == 0, reason="root bypasses chmod restrictions")
+    def test_unreadable_transcript_logs_telemetry(self, tmp_path):
+        """A transcript file that exists at a valid path but is chmod 0o000
+        triggers an OSError in read_transcript. The outcome may be EXCEPTION
+        (if read_transcript propagates) or SKIPPED_NO_TRANSCRIPT (if it
+        swallows and returns []). Either way: structured telemetry, not a
+        silent drop."""
+        cc_slug = "-myproj"
+        proj = tmp_path / ".claude" / "projects" / cc_slug
+        proj.mkdir(parents=True)
+        transcript = proj / "sid-unreadable-12.jsonl"
+        _make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
+
+        vault = tmp_path / "vault"
+        (vault / "claude-sessions").mkdir(parents=True)
+        cfg = {
+            "vault_path": str(vault),
+            "sessions_folder": "claude-sessions",
+            "auto_log_enabled": True,
+            "min_messages": 3,
+            "min_duration_minutes": 2,
+        }
+        cfg_path = tmp_path / ".claude" / "obsidian-brain-config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": "sid-unreadable-12",
+            "transcript_path": str(transcript),
+        }
+        try:
+            os.chmod(transcript, 0o000)
+            result = _run_session_end(tmp_path, payload=payload)
+            assert result.returncode == 0
+            lines = _read_log_lines(tmp_path)
+            assert len(lines) >= 1, f"expected telemetry, got {lines!r}"
+            # read_transcript may raise (PermissionError → EXCEPTION) or swallow
+            # and return [] (→ SKIPPED_NO_TRANSCRIPT). Both are valid: the goal
+            # is no silent drops.
+            assert any(
+                "outcome=EXCEPTION" in ln or "outcome=SKIPPED_NO_TRANSCRIPT" in ln
+                for ln in lines
+            ), f"expected EXCEPTION or SKIPPED_NO_TRANSCRIPT in {lines!r}"
+        finally:
+            os.chmod(transcript, 0o600)  # let pytest cleanup work
 
 
 # ---------------------------------------------------------------------------
