@@ -390,8 +390,8 @@ def _bootstrap_prefix() -> str:
 # SessionEnd telemetry log
 # ---------------------------------------------------------------------------
 
-_SESSIONEND_LOG_NAME = "obsidian-brain-hook.log"
-_SESSIONEND_LOG_MAX_BYTES = 100 * 1024  # 100 KB — same cap as SessionStart log
+_HOOK_LOG_NAME = "obsidian-brain-hook.log"
+_HOOK_LOG_MAX_BYTES = 100 * 1024  # 100 KB — same cap as SessionStart log
 
 
 def _append_sessionend_log(
@@ -408,14 +408,15 @@ def _append_sessionend_log(
     entries. Never raises — failure to log must not block the SessionEnd hook.
     """
     log_dir = os.path.join(os.path.expanduser("~"), ".claude")
-    log_path = os.path.join(log_dir, _SESSIONEND_LOG_NAME)
+    log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
     try:
         os.makedirs(log_dir, exist_ok=True)
         try:
-            if os.path.getsize(log_path) > _SESSIONEND_LOG_MAX_BYTES:
+            if os.path.getsize(log_path) > _HOOK_LOG_MAX_BYTES:
                 os.replace(log_path, log_path + ".1")
-        except OSError:
+        except FileNotFoundError:
             pass  # no existing log; nothing to rotate
+        # Other OSError (permission, etc.) propagates to outer except → stderr warning
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         short_sid = (session_id or "unknown")[:8]
         # Sanitize fields that could contain spaces/newlines — keep one-line-per-event.
@@ -429,6 +430,10 @@ def _append_sessionend_log(
         )
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line)
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass  # best-effort; chmod failure is not fatal for telemetry
     except OSError as exc:
         print(f"[obsidian-brain] sessionend log append failed: {exc}", file=sys.stderr)
 

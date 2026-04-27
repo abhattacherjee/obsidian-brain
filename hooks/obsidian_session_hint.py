@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from obsidian_utils import (  # noqa: E402
     _bootstrap_prefix,
     _ensure_secure_dir,
+    _HOOK_LOG_MAX_BYTES,
+    _HOOK_LOG_NAME,
     find_latest_session,
     get_project_name,
     load_config,
@@ -31,9 +33,6 @@ from obsidian_utils import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Bootstrap-file + audit-log helpers
 # ---------------------------------------------------------------------------
-
-_HOOK_LOG_NAME = "obsidian-brain-hook.log"
-_HOOK_LOG_MAX_BYTES = 100 * 1024  # 100 KB
 
 
 def _write_bootstrap_atomic(project: str, session_id: str) -> bool:
@@ -79,8 +78,9 @@ def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool) -> 
         try:
             if os.path.getsize(log_path) > _HOOK_LOG_MAX_BYTES:
                 os.replace(log_path, log_path + ".1")
-        except OSError:
+        except FileNotFoundError:
             pass  # no existing log; nothing to rotate
+        # Other OSError (permission, etc.) propagates to outer except → stderr warning
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         short_sid = (session_id or "unknown")[:8]
         safe_project = (project or "unknown").replace(" ", "_").replace("\n", " ")
@@ -90,6 +90,10 @@ def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool) -> 
         )
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line)
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass  # best-effort; chmod failure is not fatal for telemetry
     except OSError as exc:
         print(f"[obsidian-brain] hook log append failed: {exc}", file=sys.stderr)
 
