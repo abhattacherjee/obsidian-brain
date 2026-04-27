@@ -430,7 +430,7 @@ def _append_sessionend_log(
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         # Sanitize all fields — \n, \r, or \t in any field would corrupt the
         # one-line-per-event format.
-        short_sid = _sanitize_log_field((session_id or "unknown")[:8])
+        short_sid = _sanitize_log_field((session_id or "unknown")[:8]).replace(" ", "_")
         safe_project = _sanitize_log_field(project, "unknown").replace(" ", "_")
         safe_outcome = _sanitize_log_field(outcome, "UNKNOWN").replace(" ", "_")
         safe_detail = _sanitize_log_field(detail)

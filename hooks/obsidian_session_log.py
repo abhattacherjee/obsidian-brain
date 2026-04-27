@@ -191,6 +191,12 @@ def _run() -> None:
         print(f"[obsidian-brain] invalid stdin JSON: {exc}", file=sys.stderr)
         hook_input = {}
 
+    # JSON can legally return non-dict (list, string, number); coerce to {}
+    # so downstream .get() calls don't AttributeError. Treated as
+    # SKIPPED_INVALID_INPUT below via the empty-input branch.
+    if not isinstance(hook_input, dict):
+        hook_input = {}
+
     # Extract session_id up front so the finally block can always clean up,
     # regardless of which early-return path below we take.
     session_id = hook_input.get("session_id", "")

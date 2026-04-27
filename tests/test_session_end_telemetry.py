@@ -651,6 +651,50 @@ class TestExceptionOutcome:
         finally:
             os.chmod(transcript, 0o600)
 
+    def test_main_logs_exception_when_run_raises(self, tmp_path, monkeypatch):
+        """In-process strict test: main() catches _run() exceptions and logs EXCEPTION
+        with project/sid context if _run() updated _LAST_PROJECT/_LAST_SESSION_ID first."""
+        import importlib
+        import obsidian_utils
+        import obsidian_session_log
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        # Reload obsidian_utils so the HOME-derived log path takes effect
+        importlib.reload(obsidian_utils)
+        # Reload session_log AFTER utils so it picks up the reloaded helper
+        importlib.reload(obsidian_session_log)
+
+        # Pretend _run() got far enough to update _LAST_* before raising
+        obsidian_session_log._LAST_PROJECT = "myproj"
+        obsidian_session_log._LAST_SESSION_ID = "sid-explode-1234"
+
+        # Make _run raise
+        def _boom():
+            raise RuntimeError("simulated mid-run failure")
+        monkeypatch.setattr(obsidian_session_log, "_run", _boom)
+
+        # Avoid sys.exit propagating out of pytest
+        with pytest.raises(SystemExit) as exc_info:
+            obsidian_session_log.main()
+        assert exc_info.value.code == 0  # hook exits 0 even on exception
+
+        log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+        assert log_path.exists()
+        content = log_path.read_text(encoding="utf-8")
+        lines = [ln for ln in content.splitlines() if "SessionEnd" in ln]
+        assert len(lines) == 1
+        assert "outcome=EXCEPTION" in lines[0]
+        assert "project=myproj" in lines[0]
+        assert "sid=sid-expl" in lines[0]  # short_sid is first 8
+        # detail should contain the exception repr (truncated to 200 chars)
+        assert "RuntimeError" in lines[0] or "simulated" in lines[0]
+
+        # Restore real HOME so module-level constants in obsidian_utils are
+        # recomputed against the real HOME for subsequent tests in this session.
+        monkeypatch.undo()
+        importlib.reload(obsidian_utils)
+        importlib.reload(obsidian_session_log)
+
 
 # ---------------------------------------------------------------------------
 # Unit tests for helper edge-cases (improve line coverage)

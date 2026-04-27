@@ -83,7 +83,7 @@ def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool) -> 
             pass  # no existing log; nothing to rotate
         # Other OSError (permission, etc.) propagates to outer except → stderr warning
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-        short_sid = _sanitize_log_field((session_id or "unknown")[:8])
+        short_sid = _sanitize_log_field((session_id or "unknown")[:8]).replace(" ", "_")
         safe_project = _sanitize_log_field(project, "unknown").replace(" ", "_")
         line = (
             f"{timestamp} SessionStart project={safe_project} sid={short_sid} "

@@ -45,7 +45,7 @@ python3 hooks/obsidian_context_snapshot.py
 
 Sessions are logged with a **write-first pattern**: the raw note (with conversation excerpts, tool usage, metadata) is always saved to the vault immediately. AI summarization is deferred entirely: notes are written in raw form and upgraded by `/recall` on demand.
 
-Structured outcome telemetry is appended to `~/.claude/obsidian-brain-hook.log` for every SessionEnd exit path (success, all skip reasons, write failure, exception) and every SessionStart bootstrap event. The log uses one line per event with grep-friendly `key=value` fields, rotates at 100 KB to `obsidian-brain-hook.log.1`, and is the primary diagnostic surface for sessions that did not produce a vault note. Inspect with `awk '{print $5}' ~/.claude/obsidian-brain-hook.log | sort | uniq -c` for an outcome distribution.
+Structured outcome telemetry is appended to `~/.claude/obsidian-brain-hook.log` for every SessionEnd exit path (success, all skip reasons, write failure, exception) and every SessionStart bootstrap event. The log uses one line per event with grep-friendly `key=value` fields, rotates at 100 KB to `obsidian-brain-hook.log.1`, and is the primary diagnostic surface for sessions that did not produce a vault note. Inspect with `awk '/SessionEnd/ {print $5}' ~/.claude/obsidian-brain-hook.log | sort | uniq -c` for a SessionEnd outcome distribution.
 
 ### Configuration
 
