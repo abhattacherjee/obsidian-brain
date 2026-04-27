@@ -48,7 +48,7 @@ from obsidian_utils import (  # noqa: E402
 
 class _Outcome:
     """String constants for SessionEnd hook outcomes written to the rotated audit log."""
-    OK = "OK"  # Reserved for Phase 2 (#124/#125) — async summarization success path
+    OK = "OK"  # Reserved for Phase 3 (#125) — reaper writes "Reaped OK" for reconstructed sessions
     OK_RAW_NOTE_ONLY = "OK_RAW_NOTE_ONLY"
     SKIPPED_BELOW_THRESHOLD = "SKIPPED_BELOW_THRESHOLD"
     SKIPPED_NO_TRANSCRIPT = "SKIPPED_NO_TRANSCRIPT"
@@ -154,8 +154,7 @@ def main() -> None:
         _run()
     except Exception as exc:
         print(f"[obsidian-brain] session-log unexpected error: {exc}", file=sys.stderr)
-        # Best-effort: try to extract a project + sid from stdin for the log line.
-        # If stdin was already consumed (it was, by _run), use "unknown" placeholders.
+        # stdin was already consumed by _run(); use "unknown" placeholders.
         try:
             _append_sessionend_log(
                 project="unknown",
@@ -335,6 +334,7 @@ def _run() -> None:
 
         # Re-check with actual duration — BUT if snapshots exist, bypass
         # thresholds so the session note always anchors the snapshots.
+        # Cached: also drives detail="snapshot-bypass" on the OK_RAW_NOTE_ONLY log line below.
         was_threshold_skipped = should_skip_session(
             user_msgs, metadata["duration_minutes"],
             min_messages=min_messages, min_duration=min_duration,
