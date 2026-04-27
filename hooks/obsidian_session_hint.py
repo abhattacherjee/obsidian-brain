@@ -24,6 +24,7 @@ from obsidian_utils import (  # noqa: E402
     _ensure_secure_dir,
     _HOOK_LOG_MAX_BYTES,
     _HOOK_LOG_NAME,
+    _sanitize_log_field,
     find_latest_session,
     get_project_name,
     load_config,
@@ -82,8 +83,8 @@ def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool) -> 
             pass  # no existing log; nothing to rotate
         # Other OSError (permission, etc.) propagates to outer except → stderr warning
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-        short_sid = (session_id or "unknown")[:8]
-        safe_project = (project or "unknown").replace(" ", "_").replace("\n", " ")
+        short_sid = _sanitize_log_field((session_id or "unknown")[:8])
+        safe_project = _sanitize_log_field(project, "unknown").replace(" ", "_")
         line = (
             f"{timestamp} SessionStart project={safe_project} sid={short_sid} "
             f"bootstrap_updated={'true' if bootstrap_updated else 'false'}\n"

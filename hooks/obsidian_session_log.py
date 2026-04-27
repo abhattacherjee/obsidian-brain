@@ -60,6 +60,13 @@ class _Outcome:
     EXCEPTION = "EXCEPTION"
 
 
+# Updated by _run() as soon as hook_input is parsed; read by main()'s
+# exception handler so EXCEPTION telemetry can carry real project/sid
+# context instead of just "unknown".
+_LAST_PROJECT: str = "unknown"
+_LAST_SESSION_ID: str = "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Telemetry helpers
 # ---------------------------------------------------------------------------
@@ -154,11 +161,12 @@ def main() -> None:
         _run()
     except Exception as exc:
         print(f"[obsidian-brain] session-log unexpected error: {exc}", file=sys.stderr)
-        # stdin was already consumed by _run(); use "unknown" placeholders.
+        # _run() may have updated _LAST_PROJECT / _LAST_SESSION_ID before raising;
+        # use those for telemetry context rather than literal "unknown".
         try:
             _append_sessionend_log(
-                project="unknown",
-                session_id="unknown",
+                project=_LAST_PROJECT,
+                session_id=_LAST_SESSION_ID,
                 outcome=_Outcome.EXCEPTION,
                 detail=repr(exc)[:200],
             )
@@ -169,6 +177,12 @@ def main() -> None:
 
 
 def _run() -> None:
+    global _LAST_PROJECT, _LAST_SESSION_ID
+    # Reset so a stale value from a prior invocation in the same process does
+    # not bleed into this run's EXCEPTION telemetry.
+    _LAST_PROJECT = "unknown"
+    _LAST_SESSION_ID = "unknown"
+
     # 1. Read hook input from stdin
     try:
         raw = sys.stdin.read(1_000_000)
@@ -180,6 +194,8 @@ def _run() -> None:
     # Extract session_id up front so the finally block can always clean up,
     # regardless of which early-return path below we take.
     session_id = hook_input.get("session_id", "")
+    if session_id:
+        _LAST_SESSION_ID = session_id
 
     try:
         if not hook_input:
@@ -192,6 +208,8 @@ def _run() -> None:
             return
 
         cwd = hook_input.get("cwd", "")
+        if cwd:
+            _LAST_PROJECT = _project_slug_for_log(cwd)
         transcript_path = hook_input.get("transcript_path", "")
 
         # Validate transcript_path stays inside ~/.claude/projects/

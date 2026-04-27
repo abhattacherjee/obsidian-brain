@@ -394,6 +394,12 @@ _HOOK_LOG_NAME = "obsidian-brain-hook.log"
 _HOOK_LOG_MAX_BYTES = 100 * 1024  # 100 KB — same cap as SessionStart log
 
 
+def _sanitize_log_field(value: str, default: str = "") -> str:
+    """Sanitize a log field: strip \\n, \\r, \\t so each event stays on one line."""
+    s = value if value else default
+    return s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+
+
 def _append_sessionend_log(
     project: str,
     session_id: str,
@@ -404,8 +410,12 @@ def _append_sessionend_log(
 ) -> None:
     """Append a one-line SessionEnd outcome record; rotate when oversized.
 
-    Writes to ~/.claude/obsidian-brain-hook.log alongside SessionStart and Reaped
-    entries. Never raises — failure to log must not block the SessionEnd hook.
+    Writes to ~/.claude/obsidian-brain-hook.log alongside SessionStart entries
+    and the future Reaped entries (issue #125 reaper).
+
+    Best-effort: catches any exception (OSError from filesystem, TypeError
+    from bad input types, etc.) and prints a stderr warning. Failure to log
+    must not block the SessionEnd hook contract — the hook always exits 0.
     """
     log_dir = os.path.join(os.path.expanduser("~"), ".claude")
     log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
@@ -416,13 +426,14 @@ def _append_sessionend_log(
                 os.replace(log_path, log_path + ".1")
         except FileNotFoundError:
             pass  # no existing log; nothing to rotate
-        # Other OSError (permission, etc.) propagates to outer except → stderr warning
+        # Other errors (permission, etc.) propagate to outer except → stderr warning
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-        short_sid = (session_id or "unknown")[:8]
-        # Sanitize fields that could contain spaces/newlines — keep one-line-per-event.
-        safe_project = (project or "unknown").replace(" ", "_").replace("\n", " ")
-        safe_outcome = (outcome or "UNKNOWN").replace(" ", "_").replace("\n", " ")
-        safe_detail = (detail or "").replace("\n", " ").replace("\r", " ")
+        # Sanitize all fields — \n, \r, or \t in any field would corrupt the
+        # one-line-per-event format.
+        short_sid = _sanitize_log_field((session_id or "unknown")[:8])
+        safe_project = _sanitize_log_field(project, "unknown").replace(" ", "_")
+        safe_outcome = _sanitize_log_field(outcome, "UNKNOWN").replace(" ", "_")
+        safe_detail = _sanitize_log_field(detail)
         line = (
             f"{timestamp} SessionEnd project={safe_project} sid={short_sid} "
             f"outcome={safe_outcome} msgs={int(msgs)} dur={float(dur_min):.1f} "
@@ -434,7 +445,7 @@ def _append_sessionend_log(
             os.chmod(log_path, 0o600)
         except OSError:
             pass  # best-effort; chmod failure is not fatal for telemetry
-    except OSError as exc:
+    except Exception as exc:
         print(f"[obsidian-brain] sessionend log append failed: {exc}", file=sys.stderr)
 
 

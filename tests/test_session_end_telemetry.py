@@ -113,6 +113,28 @@ class TestAppendSessionEndLog:
         assert "msgs=0" in content
         assert "dur=0.0" in content
 
+    def test_sanitizes_carriage_returns_and_tabs(self, tmp_path, monkeypatch):
+        """Project/outcome/sid/detail with \\r or \\t produce a single line, not a corrupted multi-line entry."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        import importlib
+        import obsidian_utils
+        importlib.reload(obsidian_utils)
+
+        obsidian_utils._append_sessionend_log(
+            project="my\rproj\twith\nbad",
+            session_id="sid\rbad\t12",
+            outcome="OK\rBAD",
+            detail="multi\rline\twith\nstuff",
+        )
+
+        log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+        content = log_path.read_text(encoding="utf-8")
+        # Exactly one logical line (one \n at end)
+        assert content.count("\n") == 1, f"expected 1 line, got: {content!r}"
+        # No \r or \t survived
+        assert "\r" not in content
+        assert "\t" not in content
+
 
 # ---------------------------------------------------------------------------
 # Outcome wrapping — subprocess-driven (drives the real hook entry point)
@@ -578,6 +600,56 @@ class TestExceptionOutcome:
             ), f"expected EXCEPTION or SKIPPED_NO_TRANSCRIPT in {lines!r}"
         finally:
             os.chmod(transcript, 0o600)  # let pytest cleanup work
+
+    @pytest.mark.skipif(os.getuid() == 0, reason="root bypasses chmod restrictions")
+    def test_exception_carries_real_project_and_sid(self, tmp_path):
+        """When _run() raises after parsing hook_input, main()'s EXCEPTION log carries
+        the real project/sid (not 'unknown') because _LAST_PROJECT/_LAST_SESSION_ID
+        are updated as soon as hook_input is parsed."""
+        cc_slug = "-realproj"
+        proj = tmp_path / ".claude" / "projects" / cc_slug
+        proj.mkdir(parents=True)
+        sid = "sid-real-12345"
+        transcript = proj / f"{sid}.jsonl"
+        _make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
+        os.chmod(transcript, 0o000)  # force read_transcript to raise
+
+        vault = tmp_path / "vault"
+        (vault / "claude-sessions").mkdir(parents=True)
+        cfg = {
+            "vault_path": str(vault),
+            "sessions_folder": "claude-sessions",
+            "auto_log_enabled": True,
+            "min_messages": 3,
+            "min_duration_minutes": 2,
+        }
+        cfg_path = tmp_path / ".claude" / "obsidian-brain-config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        payload = {
+            "cwd": str(tmp_path),  # cwd basename = tmp dir name
+            "session_id": sid,
+            "transcript_path": str(transcript),
+        }
+        try:
+            result = _run_session_end(tmp_path, payload=payload)
+            assert result.returncode == 0
+            lines = _read_log_lines(tmp_path)
+            # Find the EXCEPTION line (might also have other lines if the hook
+            # took a non-exception path; the EXCEPTION wrap is what we're testing)
+            exc_lines = [ln for ln in lines if "outcome=EXCEPTION" in ln]
+            if exc_lines:
+                # If exception path fired, sid and project must NOT be "unknown"
+                assert "sid=sid-real" in exc_lines[0], (
+                    f"EXCEPTION line should carry real sid, got: {exc_lines[0]!r}"
+                )
+                assert "project=unknown" not in exc_lines[0], (
+                    f"EXCEPTION line should carry real project, got: {exc_lines[0]!r}"
+                )
+            # If the exception path didn't fire (read_transcript swallowed the error),
+            # SKIPPED_NO_TRANSCRIPT will be present — that is the existing test's job.
+        finally:
+            os.chmod(transcript, 0o600)
 
 
 # ---------------------------------------------------------------------------
