@@ -386,6 +386,69 @@ def _bootstrap_prefix() -> str:
     return _BOOTSTRAP_PREFIX
 
 
+# ---------------------------------------------------------------------------
+# SessionEnd telemetry log
+# ---------------------------------------------------------------------------
+
+_HOOK_LOG_NAME = "obsidian-brain-hook.log"
+_HOOK_LOG_MAX_BYTES = 100 * 1024  # 100 KB — same cap as SessionStart log
+
+
+def _sanitize_log_field(value: str, default: str = "") -> str:
+    """Sanitize a log field: strip \\n, \\r, \\t so each event stays on one line."""
+    s = value if value else default
+    return s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+
+
+def _append_sessionend_log(
+    project: str,
+    session_id: str,
+    outcome: str,
+    msgs: int = 0,
+    dur_min: float = 0.0,
+    detail: str = "",
+) -> None:
+    """Append a one-line SessionEnd outcome record; rotate when oversized.
+
+    Writes to ~/.claude/obsidian-brain-hook.log alongside SessionStart entries
+    and the future Reaped entries (issue #125 reaper).
+
+    Best-effort: catches any exception (OSError from filesystem, TypeError
+    from bad input types, etc.) and prints a stderr warning. Failure to log
+    must not block the SessionEnd hook contract — the hook always exits 0.
+    """
+    log_dir = os.path.join(os.path.expanduser("~"), ".claude")
+    log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        try:
+            if os.path.getsize(log_path) > _HOOK_LOG_MAX_BYTES:
+                os.replace(log_path, log_path + ".1")
+        except FileNotFoundError:
+            pass  # no existing log; nothing to rotate
+        # Other errors (permission, etc.) propagate to outer except → stderr warning
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        # Sanitize all fields — \n, \r, or \t in any field would corrupt the
+        # one-line-per-event format.
+        short_sid = _sanitize_log_field((session_id or "unknown")[:8]).replace(" ", "_")
+        safe_project = _sanitize_log_field(project, "unknown").replace(" ", "_")
+        safe_outcome = _sanitize_log_field(outcome, "UNKNOWN").replace(" ", "_")
+        safe_detail = _sanitize_log_field(detail)
+        line = (
+            f"{timestamp} SessionEnd project={safe_project} sid={short_sid} "
+            f"outcome={safe_outcome} msgs={int(msgs)} dur={float(dur_min):.1f} "
+            f"detail={safe_detail}\n"
+        )
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass  # best-effort; chmod failure is not fatal for telemetry
+    except Exception as exc:
+        print(f"[obsidian-brain] sessionend log append failed: {exc}", file=sys.stderr)
+
+
 def _safe_mtime(path: str) -> float:
     """Return file mtime, or -1.0 if the path is missing/unstatable.
 
