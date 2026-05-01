@@ -135,12 +135,32 @@ def _parse_sessionend_log_line(line: str) -> dict:
     return out
 
 
+def _stage_fixture_under_projects(jsonl: Path, cwd: str) -> Path:
+    """Copy the fixture to $HOME/.claude/projects/<slug>/<sid>.jsonl.
+
+    Production `_run()` requires `transcript_path` to be inside
+    `~/.claude/projects/` (containment check at obsidian_session_log.py:223).
+    Without staging, every fixture replay would short-circuit with
+    `SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS` and we'd never exercise the
+    threshold/write/skip logic the bug actually lives in.
+
+    The slug mimics CC's path-encoded layout: leading `-` + cwd with `/` → `-`.
+    """
+    slug = "-" + cwd.lstrip("/").replace("/", "-")
+    projects_dir = Path(os.path.expanduser("~/.claude/projects")) / slug
+    projects_dir.mkdir(parents=True, exist_ok=True)
+    staged = projects_dir / f"{jsonl.stem}.jsonl"
+    staged.write_bytes(jsonl.read_bytes())
+    return staged
+
+
 def _run_sessionend(args: argparse.Namespace) -> int:
     if not args.jsonl.exists():
         print(f"ERROR: --jsonl not found: {args.jsonl}", file=sys.stderr)
         return 2
 
     derived_sid = args.jsonl.stem  # basename without .jsonl
+    staged_jsonl = _stage_fixture_under_projects(args.jsonl, args.cwd)
 
     # Optionally patch write_vault_note for --dry-run.
     vault_writes: list[tuple[str, int]] = []
@@ -167,7 +187,7 @@ def _run_sessionend(args: argparse.Namespace) -> int:
 
     stdin_payload = {
         "session_id": derived_sid,
-        "transcript_path": str(args.jsonl.resolve()),
+        "transcript_path": str(staged_jsonl.resolve()),
         "cwd": args.cwd,
     }
 
