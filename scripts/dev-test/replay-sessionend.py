@@ -145,6 +145,13 @@ def _stage_fixture_under_projects(jsonl: Path, cwd: str) -> Path:
     threshold/write/skip logic the bug actually lives in.
 
     The slug mimics CC's path-encoded layout: leading `-` + cwd with `/` → `-`.
+
+    WARNING: when invoked without HOME redirected to a tmpdir, this writes
+    into the user's real `~/.claude/projects/<slug>/`. Fixture filenames
+    (`d63cc484-3min-14msg.jsonl` etc.) don't collide with real CC session
+    JSONLs (which use full UUIDs), but they accumulate. Tests use
+    `monkeypatch.setenv("HOME", tmp_path)`; the manual runner uses
+    `tempfile.mkdtemp()`. Direct CLI invocation should set `HOME` first.
     """
     slug = "-" + cwd.lstrip("/").replace("/", "-")
     projects_dir = Path(os.path.expanduser("~/.claude/projects")) / slug
@@ -164,6 +171,8 @@ def _run_sessionend(args: argparse.Namespace) -> int:
 
     # Optionally patch write_vault_note for --dry-run.
     vault_writes: list[tuple[str, int]] = []
+    original = None
+    original_sl = None
     if args.dry_run:
         import obsidian_utils  # type: ignore
         original = obsidian_utils.write_vault_note
@@ -173,15 +182,16 @@ def _run_sessionend(args: argparse.Namespace) -> int:
             return True
 
         obsidian_utils.write_vault_note = _record_call  # type: ignore[assignment]
-        # Also patch in the imported namespace inside obsidian_session_log.
+        # Also patch in the imported namespace inside obsidian_session_log
+        # (it does `from obsidian_utils import write_vault_note`, binding
+        # the reference at import time — patching the module above isn't enough).
         try:
             import obsidian_session_log  # type: ignore
             if hasattr(obsidian_session_log, "write_vault_note"):
+                original_sl = obsidian_session_log.write_vault_note
                 obsidian_session_log.write_vault_note = _record_call  # type: ignore[assignment]
         except Exception:
             pass
-    else:
-        original = None  # for restoration parity
 
     pre = _snapshot_log_size()
 
@@ -214,6 +224,9 @@ def _run_sessionend(args: argparse.Namespace) -> int:
         if args.dry_run and original is not None:
             import obsidian_utils  # type: ignore
             obsidian_utils.write_vault_note = original  # type: ignore[assignment]
+            if original_sl is not None:
+                import obsidian_session_log  # type: ignore
+                obsidian_session_log.write_vault_note = original_sl  # type: ignore[assignment]
 
     new_lines = _read_new_log_lines(pre)
     sessionend_lines = [ln for ln in new_lines if "SessionEnd" in ln]
