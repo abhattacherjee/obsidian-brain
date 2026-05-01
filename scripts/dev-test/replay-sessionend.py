@@ -91,8 +91,130 @@ def main(argv: list[str] | None = None) -> int:
     return _run_sessionend(args)
 
 
+def _hook_log_path() -> Path:
+    return Path(os.path.expanduser("~/.claude/obsidian-brain-hook.log"))
+
+
+def _snapshot_log_size() -> int:
+    p = _hook_log_path()
+    return p.stat().st_size if p.exists() else 0
+
+
+def _read_new_log_lines(pre_size: int) -> list[str]:
+    p = _hook_log_path()
+    if not p.exists():
+        return []
+    with open(p, "rb") as f:
+        f.seek(pre_size)
+        new = f.read().decode("utf-8", errors="replace")
+    return [ln for ln in new.splitlines() if ln.strip()]
+
+
+def _parse_sessionend_log_line(line: str) -> dict:
+    """Extract key=value pairs after the SessionEnd marker."""
+    # Format: <ISO8601> SessionEnd project=X sid=Y outcome=Z msgs=N dur=M detail=...
+    out: dict[str, str] = {}
+    if "SessionEnd" not in line:
+        return out
+    tail = line.split("SessionEnd", 1)[1].strip()
+    # Tokenize on space, but `detail=...` may contain spaces — capture rest after detail=.
+    parts = tail.split(" ")
+    i = 0
+    while i < len(parts):
+        kv = parts[i]
+        if "=" not in kv:
+            i += 1
+            continue
+        k, v = kv.split("=", 1)
+        if k == "detail":
+            v = " ".join([v] + parts[i + 1:]).strip()
+            out[k] = v
+            break
+        out[k] = v
+        i += 1
+    return out
+
+
 def _run_sessionend(args: argparse.Namespace) -> int:
-    raise NotImplementedError  # filled in Task 6
+    if not args.jsonl.exists():
+        print(f"ERROR: --jsonl not found: {args.jsonl}", file=sys.stderr)
+        return 2
+
+    derived_sid = args.jsonl.stem  # basename without .jsonl
+
+    # Optionally patch write_vault_note for --dry-run.
+    vault_writes: list[tuple[str, int]] = []
+    if args.dry_run:
+        import obsidian_utils  # type: ignore
+        original = obsidian_utils.write_vault_note
+
+        def _record_call(path, content, *a, **kw):  # noqa: ARG001
+            vault_writes.append((str(path), len(content)))
+            return True
+
+        obsidian_utils.write_vault_note = _record_call  # type: ignore[assignment]
+        # Also patch in the imported namespace inside obsidian_session_log.
+        try:
+            import obsidian_session_log  # type: ignore
+            if hasattr(obsidian_session_log, "write_vault_note"):
+                obsidian_session_log.write_vault_note = _record_call  # type: ignore[assignment]
+        except Exception:
+            pass
+    else:
+        original = None  # for restoration parity
+
+    pre = _snapshot_log_size()
+
+    stdin_payload = {
+        "session_id": derived_sid,
+        "transcript_path": str(args.jsonl.resolve()),
+        "cwd": args.cwd,
+    }
+
+    payload: dict = {}
+    try:
+        import obsidian_session_log  # type: ignore
+        # _run() reads from sys.stdin in production; we shim it to read our dict.
+        import io
+        original_stdin = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(stdin_payload))
+        try:
+            obsidian_session_log._run()
+        finally:
+            sys.stdin = original_stdin
+    except SystemExit as exc:
+        # _run() should not exit; main() does. If it does, treat code 0 as fine.
+        if exc.code not in (0, None):
+            payload["outcome"] = "EXCEPTION"
+            payload["detail"] = f"SystemExit({exc.code})"
+    except Exception as exc:
+        payload["outcome"] = "EXCEPTION"
+        payload["detail"] = f"{exc.__class__.__name__}: {exc}"
+    finally:
+        if args.dry_run and original is not None:
+            import obsidian_utils  # type: ignore
+            obsidian_utils.write_vault_note = original  # type: ignore[assignment]
+
+    new_lines = _read_new_log_lines(pre)
+    sessionend_lines = [ln for ln in new_lines if "SessionEnd" in ln]
+
+    if not sessionend_lines and "outcome" not in payload:
+        # CLI-side sentinel — NOT an _Outcome enum value.
+        payload["outcome"] = "NO_LOG_LINE_EMITTED"
+        payload["detail"] = "no SessionEnd line appended to hook log; #123 universal-emit regression"
+        payload["msgs"] = ""
+        payload["dur"] = ""
+        payload["hook_log_line"] = ""
+    elif sessionend_lines:
+        parsed = _parse_sessionend_log_line(sessionend_lines[-1])
+        payload.setdefault("outcome", parsed.get("outcome", "UNKNOWN"))
+        payload["msgs"] = parsed.get("msgs", "")
+        payload["dur"] = parsed.get("dur", "")
+        payload["hook_log_line"] = sessionend_lines[-1]
+
+    payload["vault_writes"] = vault_writes
+    _emit(payload, args.emit_json)
+    return 0
 
 
 def _run_reaper(args: argparse.Namespace) -> int:
