@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import sys
 from pathlib import Path
-
-import pytest
 
 _SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "dev-test" / "capture-jsonl-fixture.py"
 _spec = importlib.util.spec_from_file_location("capture_jsonl_fixture", _SCRIPT_PATH)
