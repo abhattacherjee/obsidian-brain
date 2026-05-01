@@ -238,7 +238,16 @@ def _run_sessionend(args: argparse.Namespace) -> int:
 
 
 def _run_reaper(args: argparse.Namespace) -> int:
-    raise NotImplementedError  # filled in Task 7
+    try:
+        # Module won't exist on develop until #125 lands.
+        from obsidian_session_reaper import _reap_orphaned_sessions  # type: ignore  # noqa: F401
+    except ImportError:
+        print("reaper module not yet implemented (#125)", file=sys.stderr)
+        return 2
+
+    # Once #125 lands, the staging + invocation logic goes here. Until then,
+    # this branch is unreachable; tests assert the exit-2 path.
+    raise NotImplementedError("reaper invocation pending #125 — replay CLI needs orphan-dir staging")
 
 
 if __name__ == "__main__":
