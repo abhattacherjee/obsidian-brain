@@ -103,6 +103,84 @@ class TestReplayCliArgparse:
         sessions_dir = isolated_home / "vault" / "sessions"
         assert not list(sessions_dir.glob("*.md"))
 
+    def test_jsonl_path_does_not_exist(self, isolated_home, tmp_path):
+        """Guard at _run_sessionend line ~174: --jsonl provided but file missing."""
+        result = _run_cli(
+            "--jsonl", str(tmp_path / "nonexistent.jsonl"),
+            "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
+            env_extra={"HOME": str(isolated_home), "_REAL_VAULT_GUARD": "1"},
+        )
+        assert result.returncode == 2
+        assert "not found" in result.stderr.lower()
+
+
+# -------------------- TestReplayCliCaptureAlgorithm --------------------
+
+class TestReplayCliCaptureAlgorithm:
+    """Exercise the truncation halving loop and NO_LOG_LINE_EMITTED sentinel."""
+
+    def test_halving_loop_actually_executes(self, tmp_path):
+        """Construct a fixture that requires at least one halving iteration."""
+        # Import capture script as module.
+        capture_path = _REPO_ROOT / "scripts" / "dev-test" / "capture-jsonl-fixture.py"
+        spec = importlib.util.spec_from_file_location("capture_jsonl_fixture", capture_path)
+        capture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(capture)  # type: ignore[union-attr]
+
+        # 100 records × 4 KB body bypasses small-source passthrough (head+tail=60).
+        # max_bytes=10240 forces several halvings: head/tail starts at 30 → 15 →
+        # 7 → 3 → 1; iter 4 (1+marker+1 ≈ 9 KB) fits under 10 KB.
+        src = tmp_path / "big.jsonl"
+        out = tmp_path / "small.jsonl"
+        records = []
+        for i in range(100):
+            records.append(json.dumps({
+                "type": "user" if i % 2 == 0 else "assistant",
+                "uuid": f"00000000-0000-0000-0000-{i:012d}",
+                "timestamp": f"2026-05-01T00:{i % 60:02d}:00.000Z",
+                "cwd": "/fake/cwd",
+                "message": {"role": "user", "content": "x" * 4096},
+            }))
+        src.write_text("\n".join(records) + "\n")
+        rc = capture.main(["--source", str(src), "--out", str(out), "--max-bytes", "10240"])
+        assert rc == 0, "halving loop should converge"
+        assert out.stat().st_size <= 10240
+        # Verify halving actually happened: output has fewer than 30+30+1 records.
+        lines = [json.loads(l) for l in out.read_text().splitlines() if l.strip()]
+        assert len(lines) < 61, f"expected halved output (<61 records), got {len(lines)}"
+
+    def test_no_log_line_emitted_sentinel(self, isolated_home):
+        """If _run() returns without writing to the hook log, CLI emits the sentinel.
+
+        Reproduce by passing a transcript_path that's parsed-but-empty: the cwd
+        gets a slug, fixture is staged, _run() reads stdin, but if auto_log is
+        OFF the hook's universal-emit guarantee from #123 should still emit
+        a SKIPPED_AUTO_LOG_OFF line. This test is the negative — we use a config
+        with auto_log OFF and assert outcome is SKIPPED_AUTO_LOG_OFF (not the
+        NO_LOG_LINE_EMITTED sentinel) which proves the universal-emit invariant
+        from #123 holds. If #123 ever regresses, this test will flip to
+        NO_LOG_LINE_EMITTED and surface the regression loudly.
+        """
+        # Rewrite config with auto_log_enabled=False
+        config_path = isolated_home / ".claude" / "obsidian-brain-config.json"
+        cfg = json.loads(config_path.read_text())
+        cfg["auto_log_enabled"] = False
+        config_path.write_text(json.dumps(cfg))
+
+        result = _run_cli(
+            "--jsonl", str(_FIXTURES / "d63cc484-3min-14msg.jsonl"),
+            "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
+            "--json",
+            env_extra={"HOME": str(isolated_home), "_REAL_VAULT_GUARD": "1"},
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        out = json.loads(result.stdout)
+        # #123 universal-emit means we get a real outcome, NOT the sentinel.
+        assert out["outcome"] == "SKIPPED_AUTO_LOG_OFF", (
+            f"expected SKIPPED_AUTO_LOG_OFF (proves #123 universal-emit holds), "
+            f"got {out['outcome']!r}. If this is NO_LOG_LINE_EMITTED, #123 regressed."
+        )
+
 
 # -------------------- TestReplayCliSessionEnd --------------------
 

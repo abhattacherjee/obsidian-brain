@@ -50,18 +50,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _check_vault_sentinel(config_path: Path) -> tuple[bool, str]:
-    """Return (ok, message). If guard active and vault path looks real, ok=False."""
+    """Return (ok, message). If guard active and config's vault_path resolves
+    under ~/obsidian/, refuse to run (hardcoded protection for the author's
+    production vault path).
+    """
     if os.environ.get("_REAL_VAULT_GUARD") != "1":
         return True, ""
     try:
         with open(config_path) as f:
             cfg = json.load(f)
-    except Exception:
-        return True, ""  # No config to read — let later code handle it
+    except FileNotFoundError:
+        return True, ""  # No config yet — later code will handle it
+    except json.JSONDecodeError:
+        return True, ""  # Malformed config — _run() will surface it
+    except OSError as exc:
+        # PermissionError, IsADirectoryError, etc. — fail-safe (refuse to proceed).
+        return False, f"cannot read config for vault-sentinel check: {exc}"
     vault = cfg.get("vault_path", "")
     real_vault = str(Path("~/obsidian").expanduser())
     resolved = str(Path(vault).expanduser().resolve()) if vault else ""
-    if resolved.startswith(real_vault):
+    # Append os.sep + equality check so ~/obsidian-work doesn't match ~/obsidian.
+    if resolved == real_vault or resolved.startswith(real_vault + os.sep):
         return False, f"refusing to run: vault path {vault} appears to be the user's real vault"
     return True, ""
 
@@ -167,7 +176,15 @@ def _run_sessionend(args: argparse.Namespace) -> int:
         return 2
 
     derived_sid = args.jsonl.stem  # basename without .jsonl
-    staged_jsonl = _stage_fixture_under_projects(args.jsonl, args.cwd)
+    try:
+        staged_jsonl = _stage_fixture_under_projects(args.jsonl, args.cwd)
+    except OSError as exc:
+        print(
+            f"ERROR: cannot stage fixture under ~/.claude/projects/: {exc}\n"
+            f"  Hint: set HOME to a tmpdir or use --config to redirect config path.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Optionally patch write_vault_note for --dry-run.
     vault_writes: list[tuple[str, int]] = []
@@ -190,8 +207,20 @@ def _run_sessionend(args: argparse.Namespace) -> int:
             if hasattr(obsidian_session_log, "write_vault_note"):
                 original_sl = obsidian_session_log.write_vault_note
                 obsidian_session_log.write_vault_note = _record_call  # type: ignore[assignment]
-        except Exception:
-            pass
+        except ImportError:
+            # Module not importable — leaves only obsidian_utils patched, which
+            # is partial protection. Surface so the user knows --dry-run is incomplete.
+            print(
+                "WARNING: --dry-run: obsidian_session_log not importable; "
+                "vault-write suppression is partial",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print(
+                f"WARNING: --dry-run: failed to patch obsidian_session_log.write_vault_note: "
+                f"{exc.__class__.__name__}: {exc} — vault writes may not be suppressed",
+                file=sys.stderr,
+            )
 
     pre = _snapshot_log_size()
 
@@ -213,8 +242,18 @@ def _run_sessionend(args: argparse.Namespace) -> int:
         finally:
             sys.stdin = original_stdin
     except SystemExit as exc:
-        # _run() should not exit; main() does. If it does, treat code 0 as fine.
-        if exc.code not in (0, None):
+        # _run() is a contract violation if it calls sys.exit() — main() does.
+        # Surface even exit(0) so a regression in #123's universal-emit guarantee
+        # doesn't hide behind a silent absorption.
+        if exc.code in (0, None):
+            print(
+                "WARNING: _run() called sys.exit(0) — unexpected early exit; "
+                "outcome may be incomplete",
+                file=sys.stderr,
+            )
+            payload["outcome"] = "UNEXPECTED_SYSEXIT_0"
+            payload["detail"] = "sys.exit(0) from within _run() — see #123"
+        else:
             payload["outcome"] = "EXCEPTION"
             payload["detail"] = f"SystemExit({exc.code})"
     except Exception as exc:

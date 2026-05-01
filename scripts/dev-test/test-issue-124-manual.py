@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -64,25 +65,38 @@ CASES = [
 
 def main() -> int:
     home = _make_isolated_home()
-    failures = 0
-    for fixture, mode, expected_rc, expected_outcome in CASES:
-        result = _run(home, fixture, mode)
-        rc_ok = result.returncode == expected_rc
-        outcome_ok = True
-        if expected_outcome and rc_ok:
-            try:
-                outcome_ok = json.loads(result.stdout)["outcome"] == expected_outcome
-            except Exception:
-                outcome_ok = False
-        passed = rc_ok and outcome_ok
-        marker = f"{_GREEN}PASS{_RESET}" if passed else f"{_RED}FAIL{_RESET}"
-        print(f"{marker} {mode:10s} {fixture}  rc={result.returncode}  expected_rc={expected_rc}  expected_outcome={expected_outcome}")
-        if not passed:
-            failures += 1
-            print(f"      stdout: {result.stdout.strip()[:200]}")
-            print(f"      stderr: {result.stderr.strip()[:200]}")
-    print(f"\n{len(CASES) - failures}/{len(CASES)} passed")
-    return 0 if failures == 0 else 1
+    try:
+        failures = 0
+        for fixture, mode, expected_rc, expected_outcome in CASES:
+            result = _run(home, fixture, mode)
+            rc_ok = result.returncode == expected_rc
+            outcome_ok = True
+            parse_error = None
+            if expected_outcome and rc_ok:
+                try:
+                    parsed = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    outcome_ok = False
+                    parse_error = f"stdout not valid JSON ({exc}) — subprocess may have crashed"
+                else:
+                    if "outcome" not in parsed:
+                        outcome_ok = False
+                        parse_error = f"no 'outcome' key — output format changed? keys={list(parsed.keys())}"
+                    else:
+                        outcome_ok = parsed["outcome"] == expected_outcome
+            passed = rc_ok and outcome_ok
+            marker = f"{_GREEN}PASS{_RESET}" if passed else f"{_RED}FAIL{_RESET}"
+            print(f"{marker} {mode:10s} {fixture}  rc={result.returncode}  expected_rc={expected_rc}  expected_outcome={expected_outcome}")
+            if not passed:
+                failures += 1
+                if parse_error:
+                    print(f"      ERROR: {parse_error}")
+                print(f"      stdout: {result.stdout.strip()[:200]}")
+                print(f"      stderr: {result.stderr.strip()[:200]}")
+        print(f"\n{len(CASES) - failures}/{len(CASES)} passed")
+        return 0 if failures == 0 else 1
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
 
 
 if __name__ == "__main__":
