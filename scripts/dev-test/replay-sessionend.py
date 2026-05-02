@@ -293,7 +293,13 @@ def _run_sessionend(args: argparse.Namespace) -> int:
                 obsidian_session_log.write_vault_note = original_sl  # type: ignore[assignment]
 
     new_lines = _read_new_log_lines(pre)
-    sessionend_lines = [ln for ln in new_lines if "SessionEnd" in ln]
+    # Filter to lines whose sid= matches THIS run's derived_sid[:8]. Hooks
+    # truncate sid to 8 chars in log lines (per memory
+    # technical_load_config_cache_keyed_by_cwd_sid.md); without this filter,
+    # a concurrent SessionEnd from another process could attribute its
+    # outcome to our replay.
+    sid_marker = f"sid={derived_sid[:8]}"
+    sessionend_lines = [ln for ln in new_lines if "SessionEnd" in ln and sid_marker in ln]
 
     if not sessionend_lines and "outcome" not in payload:
         # CLI-side sentinel — NOT an _Outcome enum value.

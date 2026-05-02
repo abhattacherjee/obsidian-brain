@@ -77,7 +77,11 @@ def _build_truncated(records: list[dict], head: int, tail: int, original_count: 
         "original_bytes": original_bytes,
         "captured_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    return records[:head] + [marker] + records[-tail:]
+    # Clamp tail start so head and tail slices don't overlap (can happen when
+    # the byte-budget fallthrough drops us into truncation with head+tail >
+    # len(records) — e.g., 40-record source with default head=30/tail=30).
+    tail_start = max(head, len(records) - tail)
+    return records[:head] + [marker] + records[tail_start:]
 
 
 def _serialize(records: list[dict]) -> bytes:

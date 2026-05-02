@@ -181,6 +181,70 @@ class TestReplayCliCaptureAlgorithm:
             f"got {out['outcome']!r}. If this is NO_LOG_LINE_EMITTED, #123 regressed."
         )
 
+    def test_dry_run_intercepts_write_vault_note_call(self, isolated_home, tmp_path):
+        """Behavioral test for --dry-run: synthesize a fixture that passes thresholds,
+        assert vault_writes is non-empty AND no .md file lands on disk.
+
+        Closes the AC3 coverage gap: all 5 H1/H2 fixtures hit
+        SKIPPED_BELOW_THRESHOLD before reaching write_vault_note, so the
+        dry-run patch (whose 4-arg signature was silently broken until
+        Copilot R2) was previously unprotected against regressions.
+        """
+        # Build a JSONL with 5 user messages spanning 5 minutes (passes
+        # min_messages: 3 + min_duration_minutes: 2 thresholds).
+        fixture = tmp_path / "synthetic-write-path.jsonl"
+        records = []
+        for i in range(5):
+            records.append(json.dumps({
+                "type": "user",
+                "uuid": f"00000000-0000-0000-0000-{i:012d}",
+                "timestamp": f"2026-05-01T00:{i * 2:02d}:00.000Z",
+                "cwd": "/Users/abhishek/dev/claude_workspace/obsidian-brain",
+                "message": {"role": "user", "content": f"user message {i} " * 50},
+            }))
+            records.append(json.dumps({
+                "type": "assistant",
+                "uuid": f"11111111-1111-1111-1111-{i:012d}",
+                "timestamp": f"2026-05-01T00:{i * 2:02d}:30.000Z",
+                "cwd": "/Users/abhishek/dev/claude_workspace/obsidian-brain",
+                "message": {"role": "assistant", "content": f"reply {i} " * 50},
+            }))
+        fixture.write_text("\n".join(records) + "\n")
+
+        result = _run_cli(
+            "--jsonl", str(fixture),
+            "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
+            "--dry-run",
+            "--json",
+            env_extra={"HOME": str(isolated_home), "_REAL_VAULT_GUARD": "1"},
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        out = json.loads(result.stdout)
+        # The fixture should pass thresholds and reach write_vault_note.
+        assert out["outcome"] in ("OK_RAW_NOTE_ONLY", "WRITE_FAILED"), (
+            f"expected fixture to pass threshold and reach write_vault_note, "
+            f"got outcome={out['outcome']!r}. hook_log_line={out.get('hook_log_line')!r}"
+        )
+        # Dry-run should record the call with correct (path, len) tuple.
+        assert len(out["vault_writes"]) >= 1, (
+            f"expected dry-run to record at least one write_vault_note call; "
+            f"if 0, the patch isn't intercepting (regression in dual-namespace patching)"
+        )
+        # Path should look like vault/sessions/<filename>.md
+        recorded_path, recorded_len = out["vault_writes"][0]
+        assert "/sessions/" in recorded_path and recorded_path.endswith(".md"), (
+            f"recorded path malformed: {recorded_path!r} — _record_call signature regression?"
+        )
+        assert recorded_len > 100, (
+            f"recorded content length {recorded_len} too small — likely captured "
+            f"len(folder_string) instead of len(content) (the bug Copilot R2 caught)"
+        )
+        # And no real .md file written to disk.
+        sessions_dir = isolated_home / "vault" / "sessions"
+        assert not list(sessions_dir.glob("*.md")), (
+            f"--dry-run should not touch disk; found: {list(sessions_dir.glob('*.md'))}"
+        )
+
 
 # -------------------- TestReplayCliSessionEnd --------------------
 
