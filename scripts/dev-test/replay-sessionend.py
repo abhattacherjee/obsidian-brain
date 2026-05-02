@@ -145,27 +145,43 @@ def _parse_sessionend_log_line(line: str) -> dict:
 
 
 def _stage_fixture_under_projects(jsonl: Path, cwd: str) -> Path:
-    """Copy the fixture to $HOME/.claude/projects/<slug>/<sid>.jsonl.
+    """Ensure the JSONL satisfies the production containment check at
+    `~/.claude/projects/`. Two paths:
+
+    1. If `jsonl` already resolves under `~/.claude/projects/`, return it
+       as-is — no staging needed (containment check already passes, and
+       copying would clobber a real session transcript with itself).
+    2. Otherwise, copy to `~/.claude/projects/<slug>/replay-<stem>.jsonl`.
+       The `replay-` prefix guarantees no collision with real CC session
+       JSONLs (which are UUID-stemmed) even if someone passes a fixture
+       whose stem happens to look UUID-like.
 
     Production `_run()` requires `transcript_path` to be inside
-    `~/.claude/projects/` (containment check at obsidian_session_log.py:223).
+    `~/.claude/projects/` (containment check at obsidian_session_log.py:224).
     Without staging, every fixture replay would short-circuit with
     `SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS` and we'd never exercise the
     threshold/write/skip logic the bug actually lives in.
 
-    The slug mimics CC's path-encoded layout: leading `-` + cwd with `/` → `-`.
-
     WARNING: when invoked without HOME redirected to a tmpdir, this writes
-    into the user's real `~/.claude/projects/<slug>/`. Fixture filenames
-    (`d63cc484-3min-14msg.jsonl` etc.) don't collide with real CC session
-    JSONLs (which use full UUIDs), but they accumulate. Tests use
-    `monkeypatch.setenv("HOME", tmp_path)`; the manual runner uses
-    `tempfile.mkdtemp()`. Direct CLI invocation should set `HOME` first.
+    into the user's real `~/.claude/projects/<slug>/`. The `replay-` prefix
+    prevents collision with real session JSONLs, but staged files do
+    accumulate. Tests use `monkeypatch.setenv("HOME", tmp_path)`; the
+    manual runner uses `tempfile.mkdtemp()`. Direct CLI invocation should
+    set `HOME` first.
     """
+    projects_root = Path(os.path.expanduser("~/.claude/projects")).resolve()
+    try:
+        resolved_jsonl = jsonl.resolve()
+        # Path.is_relative_to is 3.9+; fall back to startswith for older.
+        if str(resolved_jsonl).startswith(str(projects_root) + os.sep):
+            return resolved_jsonl  # Already inside — no staging needed.
+    except OSError:
+        pass  # Resolution failed; fall through to staging.
+
     slug = "-" + cwd.lstrip("/").replace("/", "-")
     projects_dir = Path(os.path.expanduser("~/.claude/projects")) / slug
     projects_dir.mkdir(parents=True, exist_ok=True)
-    staged = projects_dir / f"{jsonl.stem}.jsonl"
+    staged = projects_dir / f"replay-{jsonl.stem}.jsonl"
     staged.write_bytes(jsonl.read_bytes())
     return staged
 
