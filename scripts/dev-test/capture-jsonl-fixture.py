@@ -112,17 +112,23 @@ def main(argv: list[str] | None = None) -> int:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    # If small, emit unchanged.
+    # Passthrough only if the file is small in BOTH record count AND serialized
+    # bytes. A few-but-very-large records source (e.g., transcripts dominated
+    # by attachments) can have count <= head+tail while still exceeding
+    # --max-bytes — fall through to truncation in that case.
     if original_count <= args.head_records + args.tail_records:
-        args.out.write_bytes(_serialize(records))
-        print(f"source already small: {original_count} records, {original_bytes} bytes")
-        try:
-            _validate_round_trip(args.out)
-        except Exception as exc:
-            args.out.unlink(missing_ok=True)
-            print(f"ERROR: validation failed for unchanged passthrough: {exc.__class__.__name__}: {exc}", file=sys.stderr)
-            return 1
-        return 0
+        passthrough_bytes = _serialize(records)
+        if len(passthrough_bytes) <= args.max_bytes:
+            args.out.write_bytes(passthrough_bytes)
+            print(f"source already small: {original_count} records, {original_bytes} bytes")
+            try:
+                _validate_round_trip(args.out)
+            except Exception as exc:
+                args.out.unlink(missing_ok=True)
+                print(f"ERROR: validation failed for unchanged passthrough: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+                return 1
+            return 0
+        # Else fall through to truncation loop below.
 
     head = args.head_records
     tail = args.tail_records

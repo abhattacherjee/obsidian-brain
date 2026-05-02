@@ -5,8 +5,7 @@ fixture and emit a machine-readable outcome.
 
 Usage:
     replay-sessionend.py --jsonl PATH --cwd PATH
-                         [--config PATH] [--mode sessionend|reaper]
-                         [--dry-run] [--json]
+                         [--mode sessionend|reaper] [--dry-run] [--json]
 
 Modes:
     sessionend (default) — synthesize SessionEnd hook input dict and call
@@ -39,8 +38,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--jsonl", required=True, type=Path)
     p.add_argument("--cwd", required=True, type=str)
-    p.add_argument("--config", type=Path, default=None,
-                   help="Override $HOME/.claude/obsidian-brain-config.json")
     p.add_argument("--mode", choices=["sessionend", "reaper"], default="sessionend")
     p.add_argument("--dry-run", action="store_true",
                    help="Patch write_vault_note to record calls without writing")
@@ -89,7 +86,7 @@ def _emit(payload: dict, as_json: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    config_path = args.config or Path(os.path.expanduser("~/.claude/obsidian-brain-config.json"))
+    config_path = Path(os.path.expanduser("~/.claude/obsidian-brain-config.json"))
     ok, msg = _check_vault_sentinel(config_path)
     if not ok:
         print(msg, file=sys.stderr)
@@ -110,11 +107,21 @@ def _snapshot_log_size() -> int:
 
 
 def _read_new_log_lines(pre_size: int) -> list[str]:
+    """Read log lines appended since pre_size, surviving rotation.
+
+    `_append_sessionend_log()` rotates at 100 KB via `os.replace()` — the
+    new log file may be smaller than `pre_size`. In that case, seeking to
+    pre_size lands past EOF and we'd silently miss the new SessionEnd line
+    (false NO_LOG_LINE_EMITTED). Detect post-rotation shrink and re-read
+    from offset 0.
+    """
     p = _hook_log_path()
     if not p.exists():
         return []
+    current_size = p.stat().st_size
+    seek_to = pre_size if current_size >= pre_size else 0
     with open(p, "rb") as f:
-        f.seek(pre_size)
+        f.seek(seek_to)
         new = f.read().decode("utf-8", errors="replace")
     return [ln for ln in new.splitlines() if ln.strip()]
 
@@ -197,7 +204,7 @@ def _run_sessionend(args: argparse.Namespace) -> int:
     except OSError as exc:
         print(
             f"ERROR: cannot stage fixture under ~/.claude/projects/: {exc}\n"
-            f"  Hint: set HOME to a tmpdir or use --config to redirect config path.",
+            f"  Hint: set HOME to a tmpdir to redirect ~/.claude/projects/.",
             file=sys.stderr,
         )
         return 2
@@ -210,8 +217,10 @@ def _run_sessionend(args: argparse.Namespace) -> int:
         import obsidian_utils  # type: ignore
         original = obsidian_utils.write_vault_note
 
-        def _record_call(path, content, *a, **kw):  # noqa: ARG001
-            vault_writes.append((str(path), len(content)))
+        def _record_call(vault_path, folder, filename, content, *a, **kw):  # noqa: ARG001
+            # Match production signature: write_vault_note(vault_path, folder, filename, content).
+            dest = str(Path(vault_path) / folder / filename)
+            vault_writes.append((dest, len(content)))
             return True
 
         obsidian_utils.write_vault_note = _record_call  # type: ignore[assignment]
