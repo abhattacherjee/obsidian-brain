@@ -289,6 +289,8 @@ def test_reaper_writes_above_threshold_orphan(reaper_env):
     assert "reconstructed: true" in content
     assert "claude/reconstructed" in content
     assert "Reconstructed by SessionStart reaper" in content
+    # Regression guard: project field must reflect the real project, not "unknown"
+    assert f"project: {reaper_env['project']}" in content
 
 
 # ---------------------------------------------------------------------------

@@ -283,6 +283,9 @@ def _reap_orphaned_sessions(
             # Use empty cwd — we don't know the original working directory
             # for an orphaned/reconstructed session.
             metadata = extract_session_metadata(messages, "")
+            # Override the extractor's "unknown" project with the real project
+            # parameter so reaped notes get correct frontmatter and tags.
+            metadata["project"] = project
         except Exception as exc:
             _append_reaper_log(project=project, sid=sid_short,
                                event="READ_FAILED", detail=str(exc))
