@@ -401,15 +401,16 @@ def _run() -> None:
         tool_uses = extract_tool_uses(messages)
         raw_body = build_raw_fallback(user_msgs, metadata, assistant_msgs=assistant_msgs, tool_uses=tool_uses, config=config)
         raw_content = _build_note(session_id, metadata, raw_body, resumed=resumed)
-        if not write_vault_note(vault_path, sessions_folder, filename, raw_content):
-            print("[obsidian-brain] failed to write raw note, aborting", file=sys.stderr)
+        write_err = write_vault_note(vault_path, sessions_folder, filename, raw_content)
+        if write_err is not None:
+            print(f"[obsidian-brain] failed to write raw note: {write_err}", file=sys.stderr)
             _append_sessionend_log(
                 project=metadata.get("project") or _project_slug_for_log(cwd),
                 session_id=session_id,
                 outcome=_Outcome.WRITE_FAILED,
                 msgs=len(user_msgs),
                 dur_min=float(metadata.get("duration_minutes", 0.0)),
-                detail=f"write_vault_note returned False; target={Path(vault_path) / sessions_folder / filename}",
+                detail=f"{write_err}; target={Path(vault_path) / sessions_folder / filename}",
             )
             return
         print("[obsidian-brain] raw note written (summarization deferred to /recall)", file=sys.stderr)

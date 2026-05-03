@@ -1916,10 +1916,14 @@ def escape_wikilinks(text: str) -> str:
 
 def write_vault_note(
     vault_path: str, folder: str, filename: str, content: str
-) -> bool:
+) -> Optional[str]:
     """Atomic write: temp file + chmod 0o600 + rename into vault folder.
 
-    Creates the target folder if it does not exist.  Returns True on success.
+    Creates the target folder if it does not exist.
+
+    Returns:
+        None on success.
+        A non-empty error string on failure (F2 contract — callers check ``if err:``).
     """
     dest_dir = Path(vault_path) / folder
     dest = dest_dir / filename
@@ -1927,17 +1931,16 @@ def write_vault_note(
     # Path traversal check — BEFORE any filesystem side effects
     vault_real = Path(vault_path).resolve()
     if not dest.resolve().is_relative_to(vault_real):
-        print(f"[obsidian-brain] path traversal blocked: {dest}", file=sys.stderr)
-        return False
+        msg = f"path traversal blocked: {dest}"
+        print(f"[obsidian-brain] {msg}", file=sys.stderr)
+        return msg
 
     try:
         dest_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        print(
-            f"[obsidian-brain] cannot create vault dir {dest_dir}: {exc}",
-            file=sys.stderr,
-        )
-        return False
+        msg = f"cannot create vault dir {dest_dir}: {exc}"
+        print(f"[obsidian-brain] {msg}", file=sys.stderr)
+        return msg
 
     try:
         fd, tmp_path = tempfile.mkstemp(
@@ -1955,11 +1958,12 @@ def write_vault_note(
                 pass
             raise
     except Exception as exc:
-        print(f"[obsidian-brain] write failed for {dest}: {exc}", file=sys.stderr)
-        return False
+        msg = f"write failed for {dest}: {exc}"
+        print(f"[obsidian-brain] {msg}", file=sys.stderr)
+        return msg
 
     print(f"[obsidian-brain] wrote {dest}", file=sys.stderr)
-    return True
+    return None
 
 
 def flip_note_status(path: str, old_status: str, new_status: str) -> bool:

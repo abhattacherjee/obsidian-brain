@@ -412,6 +412,73 @@ class TestWriteFailedOutcome:
             # Restore permissions so pytest's tmp_path cleanup can rm it.
             os.chmod(sessions, 0o700)
 
+    def test_sessionend_write_fail_logs_errno(self, tmp_path, monkeypatch):
+        """Simulated OSError from write_vault_note produces detail= containing errno in structured log."""
+        import importlib
+        import obsidian_utils
+        import obsidian_session_log
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        importlib.reload(obsidian_utils)
+        importlib.reload(obsidian_session_log)
+
+        # Monkeypatch write_vault_note to simulate a disk-full error.
+        simulated_err = "OSError: [Errno 28] No space left on device: /tmp/foo.md.tmp"
+        monkeypatch.setattr(obsidian_session_log, "write_vault_note", lambda *a, **kw: simulated_err)
+
+        # Create the transcript so _run() reaches the write_vault_note call.
+        cc_slug = "-myproj"
+        proj = tmp_path / ".claude" / "projects" / cc_slug
+        proj.mkdir(parents=True)
+        transcript = proj / "sid-errno-1234.jsonl"
+        _make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
+
+        # Config pointing at a vault that exists (write will be intercepted before FS touch).
+        vault = tmp_path / "vault"
+        (vault / "claude-sessions").mkdir(parents=True)
+        obsidian_session_log._LAST_PROJECT = ""
+        obsidian_session_log._LAST_SESSION_ID = ""
+
+        config = {
+            "vault_path": str(vault),
+            "sessions_folder": "claude-sessions",
+            "auto_log_enabled": True,
+            "min_messages": 3,
+            "min_duration_minutes": 2,
+        }
+        cfg_path = tmp_path / ".claude" / "obsidian-brain-config.json"
+        cfg_path.write_text(json.dumps(config), encoding="utf-8")
+
+        payload = json.dumps({
+            "cwd": str(tmp_path),
+            "session_id": "sid-errno-1234",
+            "transcript_path": str(transcript),
+        })
+
+        # Drive _run() in-process via stdin mock.
+        import io
+        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        with pytest.raises(SystemExit) as exc_info:
+            obsidian_session_log.main()
+        assert exc_info.value.code == 0
+
+        log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+        assert log_path.exists(), "hook log was not created"
+        lines = [ln for ln in log_path.read_text(encoding="utf-8").splitlines()
+                 if "SessionEnd" in ln]
+        assert len(lines) == 1, f"expected one SessionEnd line, got {lines!r}"
+        line = lines[0]
+        assert "outcome=WRITE_FAILED" in line, f"expected WRITE_FAILED outcome, got: {line!r}"
+        # The detail= field must surface the errno from the simulated error string.
+        assert "Errno 28" in line or "No space" in line, (
+            f"expected errno detail in log line, got: {line!r}"
+        )
+
+        # Restore module state for subsequent tests.
+        monkeypatch.undo()
+        importlib.reload(obsidian_utils)
+        importlib.reload(obsidian_session_log)
+
 
 class TestSuccessOutcome:
     def test_snapshot_bypass_logs_ok_with_snapshot_bypass_detail(self, tmp_path):
