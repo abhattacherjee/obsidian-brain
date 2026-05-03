@@ -449,6 +449,40 @@ def _append_sessionend_log(
         print(f"[obsidian-brain] sessionend log append failed: {exc}", file=sys.stderr)
 
 
+def _append_reaper_log(project: str, sid: Optional[str], event: str, detail: str = "") -> None:
+    """Reaper-specific telemetry. Same log file + rotation as SessionEnd
+    telemetry, but uses event= keyword to keep enum spaces distinct.
+
+    Per-jsonl events include sid=<short>; summary events pass sid=None.
+    """
+    log_dir = Path.home() / ".claude"
+    log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log_path = log_dir / "obsidian-brain-hook.log"
+
+    # Rotate at 100 KB (mirrors _append_sessionend_log)
+    try:
+        if log_path.exists() and log_path.stat().st_size >= _HOOK_LOG_MAX_BYTES:
+            rotated = log_dir / "obsidian-brain-hook.log.1"
+            os.replace(log_path, rotated)
+    except OSError:
+        pass
+
+    iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    parts = [iso, "Reaper", f"project={project}"]
+    if sid:
+        parts.append(f"sid={sid}")
+    parts.append(f"event={event}")
+    if detail:
+        parts.append(f"detail={detail}")
+    line = " ".join(parts) + "\n"
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+        os.chmod(log_path, 0o600)
+    except OSError:
+        pass  # best-effort
+
+
 def _safe_mtime(path: str) -> float:
     """Return file mtime, or -1.0 if the path is missing/unstatable.
 

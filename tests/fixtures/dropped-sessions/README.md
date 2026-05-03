@@ -1,10 +1,12 @@
 # Dropped-Session Fixture Corpus (#124)
 
-5 truncated JSONLs reproducing the known SessionEnd silent-drop bug from
-[#100](https://github.com/abhattacherjee/obsidian-brain/issues/100). Each fixture
-is captured via `scripts/dev-test/capture-jsonl-fixture.py` (head/tail truncation
-with iterative byte-cap shrink and round-trip validation through
-`obsidian_utils.read_transcript` + `extract_session_metadata`).
+6 JSONLs reproducing the known SessionEnd silent-drop bug from
+[#100](https://github.com/abhattacherjee/obsidian-brain/issues/100). Five are
+truncated head+tail snapshots captured via `scripts/dev-test/capture-jsonl-fixture.py`.
+The sixth (`d2cc7e46-long-617min-full.jsonl`) is a density-preserving subset of the
+same d2cc7e46 source: lines 0–66 plus the final record, with `tool_result` bodies
+scrubbed and `attachment` blobs stubbed — retaining 3 real user-text messages and the
+full 1841-minute duration so the reaper success path (`REAPED_OK`) is exercised.
 
 Used by `tests/test_replay_cli.py` to drive `obsidian_session_log._run()`
 deterministically. See spec `docs/superpowers/specs/2026-05-01-issue-124-sessionend-replay-cli-design.md`.
@@ -15,6 +17,19 @@ If a fixture's source JSONL needs re-capture (e.g., after schema change), run
 the captured-by command shown for each fixture below. The truncation marker's
 `captured_at` field will change but the head/tail records stay byte-identical,
 so the fixture remains stable for assertion.
+
+---
+
+## d2cc7e46-long-617min-full.jsonl
+
+- **Source SID:** `d2cc7e46-9778-41be-bebb-8fb22a491204`
+- **Source path:** `~/.claude/projects/-Users-abhishek-dev-claude-workspace-obsidian-brain/d2cc7e46-9778-41be-bebb-8fb22a491204.jsonl`
+- **Original size:** 2,393,897 bytes / 1,136 records
+- **Generated:** 2026-05-03 (87,272 bytes / 68 records)
+- **Generation method:** Lines 0–66 of source + final record; `tool_result` bodies scrubbed to `[truncated-for-fixture]`; `attachment` blobs stubbed to `{type, timestamp, uuid, sessionId, _scrubbed: true}`.
+- **Purpose:** Above-threshold subset — 3 real user-text messages, duration 1841 min — exercises the reaper `REAPED_OK` success path in `TestReplayCliReaper`.
+- **Reaper expectation:** `REAPED_OK`
+- **Original cwd:** `/Users/abhishek/dev/claude_workspace/obsidian-brain`
 
 ---
 

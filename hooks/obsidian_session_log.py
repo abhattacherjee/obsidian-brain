@@ -108,6 +108,7 @@ def _build_note(
     metadata: dict,
     body: str,
     resumed: bool = False,
+    reconstructed: bool = False,
 ) -> str:
     """Construct full markdown note with YAML frontmatter."""
     date_str = datetime.date.today().isoformat()
@@ -118,6 +119,8 @@ def _build_note(
         f"claude/project/{slugify(project)}",
         "claude/auto",
     ]
+    if reconstructed:
+        tags.append("claude/reconstructed")
 
     fm_lines = [
         "---",
@@ -131,6 +134,8 @@ def _build_note(
     ]
     if resumed:
         fm_lines.append("resumed: true")
+    if reconstructed:
+        fm_lines.append("reconstructed: true")
     # Snapshot back-reference: append only if the caller discovered siblings.
     snapshots = metadata.get("snapshots") or []
     if snapshots:
@@ -143,6 +148,15 @@ def _build_note(
         "status: auto-logged",
         "---",
     ])
+
+    if reconstructed:
+        banner = (
+            "> **Reconstructed by SessionStart reaper.** The SessionEnd hook did not fire "
+            "for this session (likely SIGKILL, harness crash, or process termination "
+            "before hook dispatch). Original JSONL: `~/.claude/projects/<slug>/<sid>.jsonl`. "
+            "AI summarization deferred to `/recall`.\n\n"
+        )
+        body = banner + body
 
     title = f"# Session: {project}"
     if metadata.get("git_branch"):

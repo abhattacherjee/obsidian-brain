@@ -8,7 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **SessionStart orphan reaper** (`hooks/obsidian_session_reaper.py`): recovers
+  above-threshold sessions whose SessionEnd hook never fired (e.g. SIGKILL,
+  harness crash). Runs at SessionStart with a 5 s wall-clock cap, permission
+  canary, and per-project watermark so the same session is never written twice.
+  Opt-out via `reaper_enabled: false` in config. Telemetry via new
+  `_append_reaper_log` helper; events land in the existing
+  `~/.claude/obsidian-brain-hook.log`. Closes [#125](https://github.com/abhattacherjee/obsidian-brain/issues/125);
+  completes Phase 3 of [#100](https://github.com/abhattacherjee/obsidian-brain/issues/100).
 - SessionEnd hook now logs structured outcome lines to `~/.claude/obsidian-brain-hook.log` for every exit path (success, all skip reasons, write failure, exception). Enables post-hoc diagnosis of dropped sessions. Issue #100 Phase 1 ([#123](https://github.com/abhattacherjee/obsidian-brain/issues/123)).
+
+### Changed
+- `write_vault_note()` returns `Optional[str]` (None = success, error string on
+  failure) instead of `bool`. Callers updated throughout. SessionEnd
+  `WRITE_FAILED` log lines now include `errno` + target path in `detail=`
+  rather than the hardcoded string "write_vault_note returned False"
+  ([#125](https://github.com/abhattacherjee/obsidian-brain/issues/125) F2).
 - Executable dev-test spec at `scripts/dev-test/test-issue-128-manual.py` for the proposed `vault-reindex` observability + safety improvements. Sanity check aborts until the implementation lands; encodes acceptance criteria as runnable Python. Refs [#128](https://github.com/abhattacherjee/obsidian-brain/issues/128).
 - SessionEnd replay CLI (`scripts/dev-test/replay-sessionend.py`) and dropped-session fixture corpus (`tests/fixtures/dropped-sessions/`) for regression-guarding the #100 silent-drop bug. Five truncated fixtures (3 H1 long-session/worktree-teardown, 2 H2 partial-flush) drive the real `obsidian_session_log._run()` deterministically. Pair-pattern tests with `xfail strict` automatically detect when the F3 reaper fix lands in #125. Includes `capture-jsonl-fixture.py` for adding new cases. Issue #100 Phase 2 ([#124](https://github.com/abhattacherjee/obsidian-brain/issues/124)).
 
