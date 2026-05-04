@@ -63,6 +63,7 @@ The active conversation buffer only covers the post-compact half of long session
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+mkdir -p "$HOME/.claude/obsidian-brain" && chmod 700 "$HOME/.claude/obsidian-brain"
 _OB_BUNDLE="$HOME/.claude/obsidian-brain/retro-bundle-$$.json"
 _OB_ERR="$HOME/.claude/obsidian-brain/retro-bundle-$$.err"
 python3 -c '
@@ -83,16 +84,18 @@ print(json.dumps(bundle))
 ' >"$_OB_BUNDLE" 2>"$_OB_ERR"
 _OB_RC=$?
 if [ $_OB_RC -ne 0 ]; then
-  _OB_ERRMSG=$(head -c 500 "$_OB_ERR")
-  python3 -c "
-import json, sys
+  _OB_ERRMSG="$([ -f "$_OB_ERR" ] && head -c 500 "$_OB_ERR" || echo "")"
+  _OB_RC="$_OB_RC" _OB_ERRMSG="$_OB_ERRMSG" python3 -c "
+import os, json
+rc = os.environ.get('_OB_RC', '?')
+errmsg = os.environ.get('_OB_ERRMSG', '')
 print(json.dumps({
   'session_id': 'unknown',
   'snapshots': [],
   'insights': [],
   'decisions': [],
   'error_fixes': [],
-  'discovery_errors': ['evidence helper crashed (exit=${_OB_RC}): ${_OB_ERRMSG}'],
+  'discovery_errors': [f'evidence helper crashed (exit={rc}): {errmsg[:500]}'],
   '_ctx': {'session_id': 'unknown', 'hash': 'unknown', 'project': 'unknown', 'session_note_name': 'unknown'},
 }))
 "

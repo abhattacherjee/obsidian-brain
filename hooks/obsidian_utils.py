@@ -1112,7 +1112,7 @@ def read_note_metadata(file_path: str) -> dict | None:
 
 
 def find_snapshots_for_session(
-    sessions_folder_path: Path, session_id: str, date: str, project: str
+    sessions_folder_path: Path, session_id: str, date: str | None, project: str
 ) -> list[str]:
     """Return chronologically-sorted wikilinks of all snapshots whose
     frontmatter session_id and project match the given session. Empty list
@@ -1127,12 +1127,21 @@ def find_snapshots_for_session(
 
     Sorted lexicographically by filename stem; HHMMSS suffix makes this
     chronological for post-spec snapshots. Pre-spec (no HHMMSS) sorts first.
+
+    If `date` is None, discovery is date-agnostic: globs `*-{slug}-*-snapshot*.md`
+    and relies entirely on frontmatter session_id+project filtering. Use this
+    mode for cross-midnight sessions where snapshots may span multiple
+    YYYY-MM-DD prefixes.
     """
     if not sessions_folder_path.is_dir():
         return []
     slug = slugify(project)
     wikilinks: list[str] = []
-    for p in sorted(sessions_folder_path.glob(f"{date}-{slug}-*-snapshot*.md")):
+    if date is None:
+        glob_pattern = f"*-{slug}-*-snapshot*.md"
+    else:
+        glob_pattern = f"{date}-{slug}-*-snapshot*.md"
+    for p in sorted(sessions_folder_path.glob(glob_pattern)):
         try:
             meta = read_note_metadata(str(p))
             if not meta:
@@ -1331,7 +1340,11 @@ def gather_session_evidence(
         return bundle
     sessions_path = Path(vault_path) / sessions_folder
     if sessions_path.is_dir():
-        for link in find_snapshots_for_session(sessions_path, session_id, date, project):
+        # Pass date=None for date-agnostic discovery so cross-midnight sessions
+        # (snapshots written on YYYY-MM-DD and YYYY-MM-(DD+1)) are both found.
+        # Frontmatter session_id+project filters inside find_snapshots_for_session
+        # exclude any cross-project or cross-session decoys the broader glob picks up.
+        for link in find_snapshots_for_session(sessions_path, session_id, None, project):
             stem = link.strip("[]")
             snap_path = sessions_path / f"{stem}.md"
             if not snap_path.exists():
@@ -1349,7 +1362,7 @@ def gather_session_evidence(
                 "trigger": meta.get("trigger", "auto"),
                 "body": body,
             })
-        bundle["snapshots"].sort(key=lambda s: s["hhmmss"])
+        bundle["snapshots"].sort(key=lambda s: (0 if s["hhmmss"] == "??????" else 1, s["hhmmss"]))
     insights_path = Path(vault_path) / insights_folder
     if insights_path.is_dir():
         type_buckets = {
