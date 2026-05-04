@@ -211,6 +211,7 @@ def _reap_orphaned_sessions(
         _append_reaper_log,
         _safe_mtime,
         build_raw_fallback,
+        canonical_project_name,
         extract_assistant_messages,
         extract_session_metadata,
         extract_tool_uses,
@@ -283,9 +284,15 @@ def _reap_orphaned_sessions(
             # Use empty cwd — we don't know the original working directory
             # for an orphaned/reconstructed session.
             metadata = extract_session_metadata(messages, "")
-            # Override the extractor's "unknown" project with the real project
-            # parameter so reaped notes get correct frontmatter and tags.
-            metadata["project"] = project
+            # Override the extractor's "unknown" project with the canonical project
+            # name so worktree variants (e.g. obsidian-brain-issue-125-...) collapse
+            # to the main repo name.  canonical_project_name() uses the current
+            # process cwd (SessionStart cwd = the new session's project root), which
+            # resolves the worktree to its main-repo basename.
+            # Falls back to `project` param if canonical resolution returns "unknown"
+            # (e.g., cwd deleted or not a git repo).
+            canonical = canonical_project_name()
+            metadata["project"] = project if canonical == "unknown" else canonical
         except Exception as exc:
             _append_reaper_log(project=project, sid=sid_short,
                                event="READ_FAILED", detail=str(exc))
@@ -319,7 +326,10 @@ def _reap_orphaned_sessions(
                 break
             canary_done = True
 
-        # Build and write the reconstructed note
+        # Build and write the reconstructed note.
+        # Thread the real JSONL path into metadata so _build_note can substitute
+        # it into the reconstructed-note banner instead of literal <slug>/<sid>.
+        metadata["transcript_path"] = str(jsonl)
         assistant_msgs = extract_assistant_messages(messages)
         tool_uses = extract_tool_uses(messages)
         body = build_raw_fallback(user_msgs, metadata,

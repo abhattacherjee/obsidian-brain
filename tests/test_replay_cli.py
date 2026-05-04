@@ -221,9 +221,15 @@ class TestReplayCliCaptureAlgorithm:
         assert result.returncode == 0, f"stderr: {result.stderr}"
         out = json.loads(result.stdout)
         # The fixture should pass thresholds and reach write_vault_note.
-        assert out["outcome"] in ("OK_RAW_NOTE_ONLY", "WRITE_FAILED"), (
-            f"expected fixture to pass threshold and reach write_vault_note, "
-            f"got outcome={out['outcome']!r}. hook_log_line={out.get('hook_log_line')!r}"
+        # Regression guard (R2 fix): _record_call must return None, not True.
+        # Returning True falsely triggers WRITE_FAILED under Optional[str] contract
+        # (caller checks `if write_err is not None:`).
+        assert out["outcome"] == "OK_RAW_NOTE_ONLY", (
+            f"expected OK_RAW_NOTE_ONLY from dry-run with healthy fixture, "
+            f"got outcome={out['outcome']!r}. "
+            f"If WRITE_FAILED: _record_call in replay-sessionend.py returned True "
+            f"instead of None (truthy triggers write-error path). "
+            f"hook_log_line={out.get('hook_log_line')!r}"
         )
         # Dry-run should record the call with correct (path, len) tuple.
         assert len(out["vault_writes"]) >= 1, (

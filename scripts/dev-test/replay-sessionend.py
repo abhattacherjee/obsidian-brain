@@ -221,7 +221,7 @@ def _run_sessionend(args: argparse.Namespace) -> int:
             # Match production signature: write_vault_note(vault_path, folder, filename, content).
             dest = str(Path(vault_path) / folder / filename)
             vault_writes.append((dest, len(content)))
-            return True
+            return None  # None = success under Optional[str] contract (truthy True was wrong)
 
         obsidian_utils.write_vault_note = _record_call  # type: ignore[assignment]
         # Also patch in the imported namespace inside obsidian_session_log

@@ -291,6 +291,68 @@ def test_reaper_writes_above_threshold_orphan(reaper_env):
     assert "Reconstructed by SessionStart reaper" in content
     # Regression guard: project field must reflect the real project, not "unknown"
     assert f"project: {reaper_env['project']}" in content
+    # Regression guard (R2 fix): banner must contain the real SID, not literal <sid>
+    assert sid[:8] in content, (
+        f"Expected real SID prefix {sid[:8]!r} in banner (not literal '<sid>'); "
+        f"transcript_path not threaded into metadata before _build_note call"
+    )
+    assert "<sid>" not in content, (
+        "Banner still contains literal '<sid>' placeholder — "
+        "metadata['transcript_path'] not set before _build_note call"
+    )
+
+
+# ---------------------------------------------------------------------------
+# FIX 4 (R2): Canonical project name — worktree variant collapses to main-repo name
+# ---------------------------------------------------------------------------
+
+def test_reaper_uses_canonical_project_name_not_worktree_variant(reaper_env, monkeypatch):
+    """Regression guard (R2 fix): reaped note's project: frontmatter must be the
+    canonical project name, not a worktree variant like
+    'obsidian-brain-issue-125-sessionend-reaper'.
+    """
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions
+    from hooks import obsidian_utils
+
+    # Simulate a worktree-variant project being passed in (the cwd-basename).
+    worktree_project = "obsidian-brain-issue-125-sessionend-reaper"
+    # Patch the project_jsonl_dir to point to the existing reaper_env dir
+    # even though project name is different (the resolver heuristic won't find
+    # the worktree dir under the fake HOME, so we monkeypatch it directly).
+    import hooks.obsidian_session_reaper as reaper_mod
+    monkeypatch.setattr(
+        reaper_mod, "_resolve_project_jsonl_dir",
+        lambda p: reaper_env["project_jsonl_dir"],
+    )
+    # Patch canonical_project_name to return the canonical name regardless of cwd.
+    monkeypatch.setattr(
+        obsidian_utils, "canonical_project_name",
+        lambda cwd=None: "obsidian-brain",
+    )
+
+    sid = "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee"
+    jsonl = reaper_env["project_jsonl_dir"] / f"{sid}.jsonl"
+    _make_above_threshold_jsonl(jsonl, sid, n_user_msgs=5)
+
+    out = _reap_orphaned_sessions(
+        project=worktree_project,
+        vault_path=str(reaper_env["vault"]),
+        sessions_folder="claude-sessions",
+        config=reaper_env["config"],
+    )
+
+    assert out.reaped == 1
+    written = list(reaper_env["sessions"].glob("*.md"))
+    assert len(written) == 1
+    content = written[0].read_text()
+    # Must use canonical name, not the worktree variant
+    assert "project: obsidian-brain" in content, (
+        f"Expected canonical 'project: obsidian-brain' in frontmatter; "
+        f"got worktree variant. FIX 4 regression."
+    )
+    assert f"project: {worktree_project}" not in content, (
+        f"Worktree project name {worktree_project!r} must not appear in frontmatter"
+    )
 
 
 # ---------------------------------------------------------------------------

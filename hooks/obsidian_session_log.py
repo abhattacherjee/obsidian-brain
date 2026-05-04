@@ -150,10 +150,16 @@ def _build_note(
     ])
 
     if reconstructed:
+        # Use the real transcript path threaded from the reaper call site;
+        # fall back to a generic hint if not set (e.g. future callers).
+        transcript_path = (
+            metadata.get("transcript_path")
+            or f"~/.claude/projects/<see session_id frontmatter>/{session_id[:8]}....jsonl"
+        )
         banner = (
             "> **Reconstructed by SessionStart reaper.** The SessionEnd hook did not fire "
             "for this session (likely SIGKILL, harness crash, or process termination "
-            "before hook dispatch). Original JSONL: `~/.claude/projects/<slug>/<sid>.jsonl`. "
+            f"before hook dispatch). Original JSONL: `{transcript_path}`. "
             "AI summarization deferred to `/recall`.\n\n"
         )
         body = banner + body
