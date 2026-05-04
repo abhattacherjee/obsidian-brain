@@ -1358,11 +1358,7 @@ def gather_session_evidence(
             "claude-error-fix": bundle["error_fixes"],
         }
         for note_path in sorted(insights_path.glob("*.md")):
-            try:
-                meta = read_note_metadata(str(note_path))
-            except Exception as exc:  # noqa: BLE001
-                bundle["discovery_errors"].append(f"{note_path.name}: {exc}")
-                continue
+            meta = read_note_metadata(str(note_path))
             if meta is None:
                 # read_note_metadata returns None on OSError (suppressed) or
                 # if the file has no frontmatter. Probe ourselves so unreadable

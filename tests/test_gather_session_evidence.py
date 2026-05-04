@@ -277,3 +277,94 @@ def test_gather_session_evidence_unreadable_file_in_discovery_errors(
 
     assert [i["path"] for i in bundle["insights"]] == [str(good)]
     assert any("bad-bbbb" in err for err in bundle["discovery_errors"])
+
+
+def test_gather_session_evidence_empty_when_no_matches(tmp_vault: Path) -> None:
+    """Vault dirs exist but contain no notes matching the session — clean empty bundle."""
+    # Populate with a note belonging to a different session
+    insights_dir = tmp_vault / "claude-insights"
+    _make_insight(
+        insights_dir,
+        filename="2026-05-03-other-aaaa.md",
+        note_type="claude-insight",
+        sid="SID-OTHER",
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-Z",
+        date="2026-05-03",
+        project="obsidian-brain",
+    )
+
+    assert bundle["session_id"] == "SID-Z"
+    assert bundle["snapshots"] == []
+    assert bundle["insights"] == []
+    assert bundle["decisions"] == []
+    assert bundle["error_fixes"] == []
+    assert bundle["discovery_errors"] == []
+
+
+def test_gather_session_evidence_missing_folders_no_crash(tmp_path: Path) -> None:
+    """Missing sessions or insights folder must not crash — just return empty lists."""
+    # Case A: only claude-insights exists, sessions folder absent
+    only_insights = tmp_path / "case-a"
+    only_insights.mkdir()
+    (only_insights / "claude-insights").mkdir()
+
+    bundle_a = obsidian_utils.gather_session_evidence(
+        vault_path=str(only_insights),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        date="2026-05-03",
+        project="obsidian-brain",
+    )
+    assert bundle_a["snapshots"] == []
+    assert bundle_a["discovery_errors"] == []
+
+    # Case B: only claude-sessions exists, insights folder absent
+    only_sessions = tmp_path / "case-b"
+    only_sessions.mkdir()
+    (only_sessions / "claude-sessions").mkdir()
+
+    bundle_b = obsidian_utils.gather_session_evidence(
+        vault_path=str(only_sessions),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        date="2026-05-03",
+        project="obsidian-brain",
+    )
+    assert bundle_b["insights"] == []
+    assert bundle_b["decisions"] == []
+    assert bundle_b["error_fixes"] == []
+    assert bundle_b["discovery_errors"] == []
+
+
+def test_gather_session_evidence_unknown_type_isolated(tmp_vault: Path) -> None:
+    """A note in insights_folder with wrong type (e.g. claude-snapshot) is silently skipped."""
+    insights_dir = tmp_vault / "claude-insights"
+    _make_insight(
+        insights_dir,
+        filename="2026-05-03-misrouted-aaaa.md",
+        note_type="claude-snapshot",  # wrong type for insights folder
+        sid="SID-A",
+        title="Misrouted Snapshot",
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        date="2026-05-03",
+        project="obsidian-brain",
+    )
+
+    assert bundle["insights"] == []
+    assert bundle["decisions"] == []
+    assert bundle["error_fixes"] == []
+    assert bundle["discovery_errors"] == []

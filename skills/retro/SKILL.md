@@ -63,6 +63,8 @@ The active conversation buffer only covers the post-compact half of long session
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+_OB_BUNDLE="$HOME/.claude/obsidian-brain/retro-bundle-$$.json"
+_OB_ERR="$HOME/.claude/obsidian-brain/retro-bundle-$$.err"
 python3 -c '
 import sys, os, json, glob, datetime
 sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
@@ -78,16 +80,41 @@ bundle = gather_session_evidence(
 )
 bundle["_ctx"] = ctx
 print(json.dumps(bundle))
-'
+' >"$_OB_BUNDLE" 2>"$_OB_ERR"
+_OB_RC=$?
+if [ $_OB_RC -ne 0 ]; then
+  _OB_ERRMSG=$(head -c 500 "$_OB_ERR")
+  python3 -c "
+import json, sys
+print(json.dumps({
+  'session_id': 'unknown',
+  'snapshots': [],
+  'insights': [],
+  'decisions': [],
+  'error_fixes': [],
+  'discovery_errors': ['evidence helper crashed (exit=${_OB_RC}): ${_OB_ERRMSG}'],
+  '_ctx': {'session_id': 'unknown', 'hash': 'unknown', 'project': 'unknown', 'session_note_name': 'unknown'},
+}))
+"
+else
+  cat "$_OB_BUNDLE"
+fi
+rm -f "$_OB_BUNDLE" "$_OB_ERR"
 ```
 
 Parse the JSON output. The bundle has these fields: `session_id`, `snapshots`, `insights`, `decisions`, `error_fixes`, `discovery_errors`, and `_ctx` (the cached `get_session_context()` result reused by Step 5).
 
-**Empty-bundle fallback.** If `bundle["_ctx"]["session_id"] == "unknown"` OR `len(bundle["snapshots"]) + len(bundle["insights"]) + len(bundle["decisions"]) + len(bundle["error_fixes"]) == 0`, print:
+**Empty-bundle fallback.** If `bundle["_ctx"]["session_id"] == "unknown"` AND `bundle["discovery_errors"] == []`, print:
 
 > Note: no prior-session evidence found — falling back to active-conversation-only retro.
 
 …and proceed with Step 3 using only the active conversation buffer. Do not include the `## Evidence Consulted` section in Step 4 in that case.
+
+**Helper crash / partial failure.** If `bundle["discovery_errors"]` is non-empty, do **not** silently fall back to "no prior-session evidence found." Instead emit:
+
+> ⚠️ Evidence discovery partially or fully failed. Some vault artifacts may be missing from this retro. See the discovery-errors warning surfaced in Step 6 for details.
+
+Then proceed with whatever evidence was collected (possibly none).
 
 **Discovery errors.** If `bundle["discovery_errors"]` is non-empty, remember the list — it will be surfaced after the preview in Step 6.
 
@@ -215,9 +242,12 @@ Wait for the user's response. Apply any requested edits and show the updated pre
 
 **Discovery errors.** If `bundle["discovery_errors"]` is non-empty, after the preview but before the save/edit/cancel prompt, emit:
 
-> ⚠️ <N> file(s) could not be read during evidence discovery: `<basename-1>`, `<basename-2>`. The retro proceeds with the readable evidence; review the unreadable files manually.
+> ⚠️  <N> file(s) could not be read during evidence discovery:
+>   - `<basename>`: <reason>
+>
+> The retro proceeds with the readable evidence.
 
-This is informational only and does not block save.
+Each `bundle["discovery_errors"]` entry has the form `"<filename>: <exception>"`. Split on the first `: ` to separate `<basename>` from `<reason>` for the bullet rendering. This is informational only and does not block save.
 
 If cancel, stop here.
 
