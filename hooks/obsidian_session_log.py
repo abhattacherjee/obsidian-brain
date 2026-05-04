@@ -108,6 +108,7 @@ def _build_note(
     metadata: dict,
     body: str,
     resumed: bool = False,
+    reconstructed: bool = False,
 ) -> str:
     """Construct full markdown note with YAML frontmatter."""
     date_str = datetime.date.today().isoformat()
@@ -118,6 +119,8 @@ def _build_note(
         f"claude/project/{slugify(project)}",
         "claude/auto",
     ]
+    if reconstructed:
+        tags.append("claude/reconstructed")
 
     fm_lines = [
         "---",
@@ -131,6 +134,8 @@ def _build_note(
     ]
     if resumed:
         fm_lines.append("resumed: true")
+    if reconstructed:
+        fm_lines.append("reconstructed: true")
     # Snapshot back-reference: append only if the caller discovered siblings.
     snapshots = metadata.get("snapshots") or []
     if snapshots:
@@ -143,6 +148,21 @@ def _build_note(
         "status: auto-logged",
         "---",
     ])
+
+    if reconstructed:
+        # Use the real transcript path threaded from the reaper call site;
+        # fall back to a generic hint if not set (e.g. future callers).
+        transcript_path = (
+            metadata.get("transcript_path")
+            or f"~/.claude/projects/<see session_id frontmatter>/{session_id[:8]}....jsonl"
+        )
+        banner = (
+            "> **Reconstructed by SessionStart reaper.** The SessionEnd hook did not fire "
+            "for this session (likely SIGKILL, harness crash, or process termination "
+            f"before hook dispatch). Original JSONL: `{transcript_path}`. "
+            "AI summarization deferred to `/recall`.\n\n"
+        )
+        body = banner + body
 
     title = f"# Session: {project}"
     if metadata.get("git_branch"):
@@ -401,15 +421,16 @@ def _run() -> None:
         tool_uses = extract_tool_uses(messages)
         raw_body = build_raw_fallback(user_msgs, metadata, assistant_msgs=assistant_msgs, tool_uses=tool_uses, config=config)
         raw_content = _build_note(session_id, metadata, raw_body, resumed=resumed)
-        if not write_vault_note(vault_path, sessions_folder, filename, raw_content):
-            print("[obsidian-brain] failed to write raw note, aborting", file=sys.stderr)
+        write_err = write_vault_note(vault_path, sessions_folder, filename, raw_content)
+        if write_err is not None:
+            print(f"[obsidian-brain] failed to write raw note: {write_err}", file=sys.stderr)
             _append_sessionend_log(
                 project=metadata.get("project") or _project_slug_for_log(cwd),
                 session_id=session_id,
                 outcome=_Outcome.WRITE_FAILED,
                 msgs=len(user_msgs),
                 dur_min=float(metadata.get("duration_minutes", 0.0)),
-                detail=f"write_vault_note returned False; target={Path(vault_path) / sessions_folder / filename}",
+                detail=f"{write_err}; target={Path(vault_path) / sessions_folder / filename}",
             )
             return
         print("[obsidian-brain] raw note written (summarization deferred to /recall)", file=sys.stderr)

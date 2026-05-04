@@ -145,6 +145,15 @@ def _run() -> None:
 
     sessions_folder = config.get("sessions_folder", "claude-sessions")
 
+    # 3a. Invoke orphan-session reaper (best-effort, non-fatal)
+    if config.get("reaper_enabled", True):
+        try:
+            import obsidian_session_reaper as _reaper_mod
+            _reaper_mod._reap_orphaned_sessions(project, vault_path, sessions_folder, config)
+        except Exception as exc:
+            # Reaper is best-effort; never break SessionStart
+            print(f"[obsidian-brain] reaper failed: {exc}", file=sys.stderr)
+
     # 4. Find latest session note for this project
     latest = find_latest_session(vault_path, sessions_folder, project)
     if not latest:

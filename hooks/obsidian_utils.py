@@ -449,6 +449,50 @@ def _append_sessionend_log(
         print(f"[obsidian-brain] sessionend log append failed: {exc}", file=sys.stderr)
 
 
+def _append_reaper_log(project: str, sid: Optional[str], event: str, detail: str = "") -> None:
+    """Reaper-specific telemetry. Same log file + rotation as SessionEnd
+    telemetry, but uses event= keyword to keep enum spaces distinct.
+
+    Per-jsonl events include sid=<short>; summary events pass sid=None.
+
+    Best-effort: any exception (including mkdir failure) is caught and printed
+    to stderr so the reaper itself is never interrupted by a log write error.
+    """
+    try:
+        log_dir = Path.home() / ".claude"
+        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        log_path = log_dir / _HOOK_LOG_NAME
+
+        # Rotate at 100 KB (mirrors _append_sessionend_log)
+        try:
+            if log_path.exists() and log_path.stat().st_size >= _HOOK_LOG_MAX_BYTES:
+                rotated = log_dir / (_HOOK_LOG_NAME + ".1")
+                os.replace(log_path, rotated)
+        except OSError:
+            pass
+
+        iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        safe_project = _sanitize_log_field(project, "unknown").replace(" ", "_")
+        parts = [iso, "Reaper", f"project={safe_project}"]
+        if sid:
+            safe_sid = _sanitize_log_field(sid).replace(" ", "_")
+            parts.append(f"sid={safe_sid}")
+        safe_event = _sanitize_log_field(event, "UNKNOWN").replace(" ", "_")
+        parts.append(f"event={safe_event}")
+        if detail:
+            safe_detail = _sanitize_log_field(detail)
+            parts.append(f"detail={safe_detail}")
+        line = " ".join(parts) + "\n"
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass  # best-effort
+    except Exception as exc:
+        print(f"[obsidian-brain] reaper log append failed: {exc}", file=sys.stderr)
+
+
 def _safe_mtime(path: str) -> float:
     """Return file mtime, or -1.0 if the path is missing/unstatable.
 
@@ -1916,10 +1960,14 @@ def escape_wikilinks(text: str) -> str:
 
 def write_vault_note(
     vault_path: str, folder: str, filename: str, content: str
-) -> bool:
+) -> Optional[str]:
     """Atomic write: temp file + chmod 0o600 + rename into vault folder.
 
-    Creates the target folder if it does not exist.  Returns True on success.
+    Creates the target folder if it does not exist.
+
+    Returns:
+        None on success.
+        A non-empty error string on failure (F2 contract — callers check ``if err:``).
     """
     dest_dir = Path(vault_path) / folder
     dest = dest_dir / filename
@@ -1927,17 +1975,16 @@ def write_vault_note(
     # Path traversal check — BEFORE any filesystem side effects
     vault_real = Path(vault_path).resolve()
     if not dest.resolve().is_relative_to(vault_real):
-        print(f"[obsidian-brain] path traversal blocked: {dest}", file=sys.stderr)
-        return False
+        msg = f"path traversal blocked: {dest}"
+        print(f"[obsidian-brain] {msg}", file=sys.stderr)
+        return msg
 
     try:
         dest_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        print(
-            f"[obsidian-brain] cannot create vault dir {dest_dir}: {exc}",
-            file=sys.stderr,
-        )
-        return False
+        msg = f"cannot create vault dir {dest_dir}: {exc}"
+        print(f"[obsidian-brain] {msg}", file=sys.stderr)
+        return msg
 
     try:
         fd, tmp_path = tempfile.mkstemp(
@@ -1955,11 +2002,12 @@ def write_vault_note(
                 pass
             raise
     except Exception as exc:
-        print(f"[obsidian-brain] write failed for {dest}: {exc}", file=sys.stderr)
-        return False
+        msg = f"write failed for {dest}: {exc}"
+        print(f"[obsidian-brain] {msg}", file=sys.stderr)
+        return msg
 
     print(f"[obsidian-brain] wrote {dest}", file=sys.stderr)
-    return True
+    return None
 
 
 def flip_note_status(path: str, old_status: str, new_status: str) -> bool:

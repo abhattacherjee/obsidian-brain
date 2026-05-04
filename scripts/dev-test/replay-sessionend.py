@@ -221,7 +221,7 @@ def _run_sessionend(args: argparse.Namespace) -> int:
             # Match production signature: write_vault_note(vault_path, folder, filename, content).
             dest = str(Path(vault_path) / folder / filename)
             vault_writes.append((dest, len(content)))
-            return True
+            return None  # None = success under Optional[str] contract (truthy True was wrong)
 
         obsidian_utils.write_vault_note = _record_call  # type: ignore[assignment]
         # Also patch in the imported namespace inside obsidian_session_log
@@ -322,15 +322,117 @@ def _run_sessionend(args: argparse.Namespace) -> int:
 
 def _run_reaper(args: argparse.Namespace) -> int:
     try:
-        # Module won't exist on develop until #125 lands.
-        from obsidian_session_reaper import _reap_orphaned_sessions  # type: ignore  # noqa: F401
+        from obsidian_session_reaper import _reap_orphaned_sessions  # type: ignore
     except ImportError:
         print("reaper module not yet implemented (#125)", file=sys.stderr)
         return 2
 
-    # Once #125 lands, the staging + invocation logic goes here. Until then,
-    # this branch is unreachable; tests assert the exit-2 path.
-    raise NotImplementedError("reaper invocation pending #125 — replay CLI needs orphan-dir staging")
+    if not args.jsonl.exists():
+        print(f"ERROR: --jsonl not found: {args.jsonl}", file=sys.stderr)
+        return 2
+
+    # Load config to get vault_path + sessions_folder.
+    config_path = Path(os.path.expanduser("~/.claude/obsidian-brain-config.json"))
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print(f"ERROR: config not found at {config_path}; create it first", file=sys.stderr)
+        return 2
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"ERROR: cannot read config: {exc}", file=sys.stderr)
+        return 2
+
+    vault_path = config.get("vault_path", "")
+    # Default must match obsidian_utils._DEFAULTS["sessions_folder"] == "claude-sessions".
+    # Using "sessions" was wrong and would misroute the reaper's dedupe lookup
+    # when sessions_folder is absent from config.
+    sessions_folder = config.get("sessions_folder", "claude-sessions")
+    if not vault_path:
+        print("ERROR: vault_path missing from config", file=sys.stderr)
+        return 2
+
+    # Derive project name from --cwd (basename, same as get_project_name()).
+    project = Path(args.cwd).name or "unknown"
+
+    # Stage the fixture under ~/.claude/projects/<slug>/ so the reaper's
+    # _resolve_project_jsonl_dir() can find it. Use the same staging logic as
+    # _run_sessionend but always stage (never skip) since the fixture needs to
+    # live in the project dir for _reap_orphaned_sessions to pick it up.
+    try:
+        staged_jsonl = _stage_fixture_under_projects(args.jsonl, args.cwd)
+    except OSError as exc:
+        print(
+            f"ERROR: cannot stage fixture under ~/.claude/projects/: {exc}\n"
+            f"  Hint: set HOME to a tmpdir to redirect ~/.claude/projects/.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Set watermark to 0 so the staged fixture (mtime > 0) always passes the
+    # watermark check. Write it under the same HOME-relative path the reaper uses.
+    watermark_path = Path(os.path.expanduser("~/.claude")) / "obsidian-brain" / f"reaper-watermark-{project}"
+    watermark_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    watermark_path.write_text("0")
+
+    # Patch write_vault_note for --dry-run.
+    vault_writes: list[tuple[str, int]] = []
+    _originals: list = []
+    if args.dry_run:
+        import obsidian_utils  # type: ignore
+
+        def _record_call(vault_path_arg, folder, filename, content, *a, **kw):  # noqa: ARG001
+            dest = str(Path(vault_path_arg) / folder / filename)
+            vault_writes.append((dest, len(content)))
+            return None  # None = success in reaper's write_vault_note contract
+
+        _originals.append((obsidian_utils, "write_vault_note", obsidian_utils.write_vault_note))
+        obsidian_utils.write_vault_note = _record_call  # type: ignore[assignment]
+
+        try:
+            import obsidian_session_reaper  # type: ignore
+            if hasattr(obsidian_session_reaper, "write_vault_note"):
+                _originals.append((
+                    obsidian_session_reaper, "write_vault_note",
+                    obsidian_session_reaper.write_vault_note,
+                ))
+                obsidian_session_reaper.write_vault_note = _record_call  # type: ignore[assignment]
+        except ImportError:
+            pass
+
+    payload: dict = {}
+    try:
+        result = _reap_orphaned_sessions(project, vault_path, sessions_folder, config)
+        # Determine a single top-level outcome key for easy assertion.
+        if result.skipped_permission_blocked:
+            payload["outcome"] = "SKIPPED_PERMISSION_BLOCKED"
+        elif result.reaped > 0:
+            payload["outcome"] = "REAPED_OK"
+        elif result.skipped_below_threshold > 0:
+            payload["outcome"] = "SKIPPED_BELOW_THRESHOLD"
+        elif result.skipped_already_written > 0:
+            payload["outcome"] = "SKIPPED_ALREADY_WRITTEN"
+        elif result.timeout:
+            payload["outcome"] = "TIMEOUT"
+        else:
+            payload["outcome"] = "NO_ORPHANS"
+        payload["reaped"] = result.reaped
+        payload["skipped_below_threshold"] = result.skipped_below_threshold
+        payload["skipped_already_written"] = result.skipped_already_written
+        payload["skipped_permission_blocked"] = result.skipped_permission_blocked
+        payload["timeout"] = result.timeout
+        payload["wall_ms"] = result.wall_ms
+    except Exception as exc:
+        payload["outcome"] = "EXCEPTION"
+        payload["detail"] = f"{exc.__class__.__name__}: {exc}"
+    finally:
+        if args.dry_run:
+            for mod, attr, orig in _originals:
+                setattr(mod, attr, orig)
+
+    payload["vault_writes"] = vault_writes
+    _emit(payload, args.emit_json)
+    return 0
 
 
 if __name__ == "__main__":
