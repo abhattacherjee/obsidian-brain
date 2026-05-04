@@ -236,3 +236,44 @@ def test_gather_session_evidence_filters_decoys(tmp_vault: Path) -> None:
     assert [i["path"] for i in bundle["insights"]] == [str(own)]
     assert bundle["decisions"] == []
     assert bundle["error_fixes"] == []
+
+
+def test_gather_session_evidence_unreadable_file_in_discovery_errors(
+    tmp_vault: Path,
+) -> None:
+    """A file we can't read appears in discovery_errors but doesn't break the bundle."""
+    insights_dir = tmp_vault / "claude-insights"
+    good = _make_insight(
+        insights_dir,
+        filename="2026-05-03-good-aaaa.md",
+        note_type="claude-insight",
+        sid="SID-A",
+    )
+    bad = _make_insight(
+        insights_dir,
+        filename="2026-05-03-bad-bbbb.md",
+        note_type="claude-insight",
+        sid="SID-A",
+    )
+
+    # Make the body read fail by chmod'ing the file unreadable. The frontmatter
+    # read in read_note_metadata() will also fail, which routes through the
+    # OSError branch in the discovery loop. We use 0o000 rather than removing
+    # the file so the glob still finds it.
+    if os.geteuid() == 0:
+        pytest.skip("chmod-based unreadable test does not work for root")
+    os.chmod(bad, 0o000)
+    try:
+        bundle = obsidian_utils.gather_session_evidence(
+            vault_path=str(tmp_vault),
+            sessions_folder="claude-sessions",
+            insights_folder="claude-insights",
+            session_id="SID-A",
+            date="2026-05-03",
+            project="obsidian-brain",
+        )
+    finally:
+        os.chmod(bad, 0o600)  # restore so pytest tmp_path teardown can delete
+
+    assert [i["path"] for i in bundle["insights"]] == [str(good)]
+    assert any("bad-bbbb" in err for err in bundle["discovery_errors"])

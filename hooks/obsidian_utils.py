@@ -1359,9 +1359,20 @@ def gather_session_evidence(
         }
         for note_path in sorted(insights_path.glob("*.md")):
             try:
-                meta = read_note_metadata(str(note_path)) or {}
+                meta = read_note_metadata(str(note_path))
             except Exception as exc:  # noqa: BLE001
                 bundle["discovery_errors"].append(f"{note_path.name}: {exc}")
+                continue
+            if meta is None:
+                # read_note_metadata returns None on OSError (suppressed) or
+                # if the file has no frontmatter. Probe ourselves so unreadable
+                # files surface in discovery_errors instead of silently being
+                # skipped. No-frontmatter files do not contribute to evidence,
+                # so the additional probe only fires when meta is None.
+                try:
+                    note_path.read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    bundle["discovery_errors"].append(f"{note_path.name}: {exc}")
                 continue
             if meta.get("source_session") != session_id:
                 continue
