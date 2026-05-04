@@ -112,6 +112,18 @@ Evaluate the session across these five dimensions:
 Draft the note body using this exact structure:
 
 ```markdown
+## Evidence Consulted
+- Active conversation: <N> messages (post-compact buffer)
+- Snapshots: <K> file(s)
+  - [[<stem-1>]] (<hhmmss>, <trigger>)
+  - [[<stem-2>]] (<hhmmss>, <trigger>)
+- Insights: <K> file(s)
+  - [[<stem-1>]] — <title>
+- Decisions: <K> file(s)
+  - [[<stem-1>]] — <title>
+- Error-fixes: <K> file(s)
+  - [[<stem-1>]] — <title>
+
 ## What Went Well
 - <specific thing that worked, with enough context to be meaningful>
 
@@ -126,6 +138,12 @@ Draft the note body using this exact structure:
 ## Process Improvements
 - [ ] <specific actionable change for future sessions>
 ```
+
+**Rules for `## Evidence Consulted`:**
+- Omit any list line whose count is 0 (no `Snapshots: 0 file(s)` noise).
+- Omit the entire `## Evidence Consulted` section if the empty-bundle fallback fired in Step 3a.
+- Wikilinks (`[[stem]]`) preserve Obsidian backlinks and round-trip through the FTS index.
+- Active-conversation message count is approximate — the count visible to the model when /retro fires; an order-of-magnitude figure is fine.
 
 **Important:** "What Didn't Work" should have MORE items than "What Went Well." If the session went smoothly with no obvious failures, still find at least one improvement opportunity — there is always something.
 
