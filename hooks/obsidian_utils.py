@@ -1329,7 +1329,27 @@ def gather_session_evidence(
     }
     if session_id == "unknown" or not session_id:
         return bundle
-    # TODO Task 3: snapshot discovery
+    sessions_path = Path(vault_path) / sessions_folder
+    if sessions_path.is_dir():
+        for link in find_snapshots_for_session(sessions_path, session_id, date, project):
+            stem = link.strip("[]")
+            snap_path = sessions_path / f"{stem}.md"
+            if not snap_path.exists():
+                continue
+            try:
+                body = snap_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                bundle["discovery_errors"].append(f"{snap_path.name}: {exc}")
+                continue
+            meta = read_note_metadata(str(snap_path)) or {}
+            bundle["snapshots"].append({
+                "path": str(snap_path),
+                "stem": stem,
+                "hhmmss": _extract_hhmmss_from_filename(snap_path.name),
+                "trigger": meta.get("trigger", "auto"),
+                "body": body,
+            })
+        bundle["snapshots"].sort(key=lambda s: s["hhmmss"])
     # TODO Task 4: insight/decision/error-fix discovery
     return bundle
 
