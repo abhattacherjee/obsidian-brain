@@ -1312,7 +1312,6 @@ def gather_session_evidence(
     sessions_folder: str,
     insights_folder: str,
     session_id: str,
-    date: str,
     project: str,
 ) -> dict:
     """Discover and load all artifacts written during this session.
@@ -1321,7 +1320,9 @@ def gather_session_evidence(
     insights/decisions/error-fixes (from insights_folder) whose frontmatter
     `source_session` matches the given session_id.
 
-    Snapshots are returned sorted ascending by hhmmss extracted from filename.
+    Snapshots are returned sorted ascending by stem (YYYY-MM-DD-... prefix),
+    which gives correct chronological order including across-midnight sessions.
+    Pre-spec snapshots (hhmmss == '??????') sort before all post-spec ones.
     Insights/decisions/error-fixes are returned sorted ascending by filename.
     File-read failures are captured in `discovery_errors` and never raised.
 
@@ -1362,7 +1363,7 @@ def gather_session_evidence(
                 "trigger": meta.get("trigger", "auto"),
                 "body": body,
             })
-        bundle["snapshots"].sort(key=lambda s: (0 if s["hhmmss"] == "??????" else 1, s["hhmmss"]))
+        bundle["snapshots"].sort(key=lambda s: (0 if s["hhmmss"] == "??????" else 1, s["stem"]))
     insights_path = Path(vault_path) / insights_folder
     if insights_path.is_dir():
         type_buckets = {
@@ -1398,6 +1399,7 @@ def gather_session_evidence(
             title = title_match.group(1).strip() if title_match else note_path.stem
             target.append({
                 "path": str(note_path),
+                "stem": note_path.stem,
                 "title": title,
                 "body": body,
             })

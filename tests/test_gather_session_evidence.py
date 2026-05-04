@@ -26,7 +26,6 @@ def test_gather_session_evidence_unknown_sid_returns_empty(tmp_vault: Path) -> N
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="unknown",
-        date="2026-05-03",
         project="obsidian-brain",
     )
     assert bundle["session_id"] == "unknown"
@@ -78,7 +77,6 @@ def test_gather_session_evidence_snapshots_happy_path(tmp_vault: Path) -> None:
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-A",
-        date="2026-05-03",
         project="obsidian-brain",
     )
 
@@ -101,7 +99,6 @@ def test_gather_session_evidence_snapshots_sorted_ascending_by_hhmmss(tmp_vault:
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-A",
-        date="2026-05-03",
         project="obsidian-brain",
     )
 
@@ -126,7 +123,6 @@ def test_gather_session_evidence_snapshots_filter_other_project(tmp_vault: Path)
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-A",
-        date="2026-05-03",
         project="obsidian-brain",
     )
 
@@ -191,7 +187,6 @@ def test_gather_session_evidence_partitions_by_type(tmp_vault: Path) -> None:
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-A",
-        date="2026-05-03",
         project="obsidian-brain",
     )
 
@@ -229,7 +224,6 @@ def test_gather_session_evidence_filters_decoys(tmp_vault: Path) -> None:
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-A",
-        date="2026-05-03",
         project="obsidian-brain",
     )
 
@@ -269,7 +263,6 @@ def test_gather_session_evidence_unreadable_file_in_discovery_errors(
             sessions_folder="claude-sessions",
             insights_folder="claude-insights",
             session_id="SID-A",
-            date="2026-05-03",
             project="obsidian-brain",
         )
     finally:
@@ -295,7 +288,6 @@ def test_gather_session_evidence_empty_when_no_matches(tmp_vault: Path) -> None:
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-Z",
-        date="2026-05-03",
         project="obsidian-brain",
     )
 
@@ -319,7 +311,6 @@ def test_gather_session_evidence_missing_folders_no_crash(tmp_path: Path) -> Non
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-A",
-        date="2026-05-03",
         project="obsidian-brain",
     )
     assert bundle_a["snapshots"] == []
@@ -335,7 +326,6 @@ def test_gather_session_evidence_missing_folders_no_crash(tmp_path: Path) -> Non
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-A",
-        date="2026-05-03",
         project="obsidian-brain",
     )
     assert bundle_b["insights"] == []
@@ -360,7 +350,6 @@ def test_gather_session_evidence_unknown_type_isolated(tmp_vault: Path) -> None:
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-A",
-        date="2026-05-03",
         project="obsidian-brain",
     )
 
@@ -432,17 +421,16 @@ def test_gather_session_evidence_cross_midnight_snapshots(tmp_vault: Path) -> No
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-X",
-        date="2026-05-04",  # /retro running on the later date
         project="obsidian-brain",
     )
 
     assert len(bundle["snapshots"]) == 2, (
         "Both cross-midnight snapshots must appear; date-agnostic discovery expected"
     )
-    # Both have numeric hhmmss — sorted ascending by hhmmss string value.
-    # "001000" < "235000" so the after-midnight snapshot sorts first.
+    # Sorted by stem (YYYY-MM-DD-...): "2026-05-03-..." < "2026-05-04-..."
+    # so day N (235000) sorts before day N+1 (001000) — chronologically correct.
     hhmmss_seq = [s["hhmmss"] for s in bundle["snapshots"]]
-    assert hhmmss_seq == ["001000", "235000"]
+    assert hhmmss_seq == ["235000", "001000"]
     assert bundle["discovery_errors"] == []
 
 
@@ -486,7 +474,6 @@ def test_gather_session_evidence_pre_spec_snapshot_sorts_first(tmp_vault: Path) 
         sessions_folder="claude-sessions",
         insights_folder="claude-insights",
         session_id="SID-A",
-        date="2026-05-03",
         project="obsidian-brain",
     )
 

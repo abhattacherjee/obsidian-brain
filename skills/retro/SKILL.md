@@ -67,17 +67,16 @@ mkdir -p "$HOME/.claude/obsidian-brain" && chmod 700 "$HOME/.claude/obsidian-bra
 _OB_BUNDLE="$HOME/.claude/obsidian-brain/retro-bundle-$$.json"
 _OB_ERR="$HOME/.claude/obsidian-brain/retro-bundle-$$.err"
 python3 -c '
-import sys, os, json, glob, datetime
+import sys, os, json, glob
 sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import load_config, get_session_context, gather_session_evidence
 c = load_config()
 ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
-date = datetime.date.today().isoformat()
 bundle = gather_session_evidence(
     c["vault_path"],
     c.get("sessions_folder", "claude-sessions"),
     c.get("insights_folder", "claude-insights"),
-    ctx["session_id"], date, ctx["project"],
+    ctx["session_id"], ctx["project"],
 )
 bundle["_ctx"] = ctx
 print(json.dumps(bundle))
