@@ -1350,7 +1350,37 @@ def gather_session_evidence(
                 "body": body,
             })
         bundle["snapshots"].sort(key=lambda s: s["hhmmss"])
-    # TODO Task 4: insight/decision/error-fix discovery
+    insights_path = Path(vault_path) / insights_folder
+    if insights_path.is_dir():
+        type_buckets = {
+            "claude-insight": bundle["insights"],
+            "claude-decision": bundle["decisions"],
+            "claude-error-fix": bundle["error_fixes"],
+        }
+        for note_path in sorted(insights_path.glob("*.md")):
+            try:
+                meta = read_note_metadata(str(note_path)) or {}
+            except Exception as exc:  # noqa: BLE001
+                bundle["discovery_errors"].append(f"{note_path.name}: {exc}")
+                continue
+            if meta.get("source_session") != session_id:
+                continue
+            note_type = meta.get("type", "")
+            target = type_buckets.get(note_type)
+            if target is None:
+                continue
+            try:
+                body = note_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                bundle["discovery_errors"].append(f"{note_path.name}: {exc}")
+                continue
+            title_match = re.search(r"^# (.+?)$", body, re.MULTILINE)
+            title = title_match.group(1).strip() if title_match else note_path.stem
+            target.append({
+                "path": str(note_path),
+                "title": title,
+                "body": body,
+            })
     return bundle
 
 

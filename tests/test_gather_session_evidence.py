@@ -132,3 +132,107 @@ def test_gather_session_evidence_snapshots_filter_other_project(tmp_vault: Path)
 
     paths = [s["path"] for s in bundle["snapshots"]]
     assert paths == [str(own)]
+
+
+INSIGHT_TEMPLATE = """\
+---
+type: {note_type}
+source_session: {sid}
+project: obsidian-brain
+date: 2026-05-03
+---
+
+# {title}
+
+{body}
+"""
+
+
+def _make_insight(
+    insights_dir: Path,
+    *,
+    filename: str,
+    note_type: str,
+    sid: str,
+    title: str = "Test Title",
+    body: str = "Test body content.",
+) -> Path:
+    path = insights_dir / filename
+    _write(path, INSIGHT_TEMPLATE.format(note_type=note_type, sid=sid, title=title, body=body))
+    return path
+
+
+def test_gather_session_evidence_partitions_by_type(tmp_vault: Path) -> None:
+    insights_dir = tmp_vault / "claude-insights"
+    ins = _make_insight(
+        insights_dir,
+        filename="2026-05-03-finding-aaaa.md",
+        note_type="claude-insight",
+        sid="SID-A",
+        title="An insight",
+    )
+    dec = _make_insight(
+        insights_dir,
+        filename="2026-05-03-decision-bbbb-decision.md",
+        note_type="claude-decision",
+        sid="SID-A",
+        title="A decision",
+    )
+    err = _make_insight(
+        insights_dir,
+        filename="2026-05-03-bug-cccc-error-fix.md",
+        note_type="claude-error-fix",
+        sid="SID-A",
+        title="An error fix",
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        date="2026-05-03",
+        project="obsidian-brain",
+    )
+
+    assert [i["path"] for i in bundle["insights"]] == [str(ins)]
+    assert [d["path"] for d in bundle["decisions"]] == [str(dec)]
+    assert [e["path"] for e in bundle["error_fixes"]] == [str(err)]
+    assert bundle["insights"][0]["title"] == "An insight"
+    assert "Test body content." in bundle["insights"][0]["body"]
+
+
+def test_gather_session_evidence_filters_decoys(tmp_vault: Path) -> None:
+    """Notes belonging to other sessions or types must not leak into the bundle."""
+    insights_dir = tmp_vault / "claude-insights"
+    own = _make_insight(
+        insights_dir,
+        filename="2026-05-03-mine-aaaa.md",
+        note_type="claude-insight",
+        sid="SID-A",
+    )
+    _make_insight(  # other session — must be excluded
+        insights_dir,
+        filename="2026-05-03-theirs-bbbb.md",
+        note_type="claude-insight",
+        sid="SID-B",
+    )
+    _make_insight(  # ignored type (e.g. retro from prior session) — must be excluded
+        insights_dir,
+        filename="2026-05-03-old-retro-cccc.md",
+        note_type="claude-retro",
+        sid="SID-A",
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        date="2026-05-03",
+        project="obsidian-brain",
+    )
+
+    assert [i["path"] for i in bundle["insights"]] == [str(own)]
+    assert bundle["decisions"] == []
+    assert bundle["error_fixes"] == []
