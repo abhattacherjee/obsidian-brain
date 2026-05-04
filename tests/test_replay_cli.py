@@ -358,3 +358,59 @@ class TestFixtureIntegrity:
                 f"{fixture.name}: metadata missing session_start/duration_minutes"
             assert fixture.stat().st_size <= 102_400, \
                 f"{fixture.name} is {fixture.stat().st_size} bytes (>100 KB cap)"
+
+
+# -------------------- TestReaperSessionsFolderDefault (N10) --------------------
+
+
+class TestReaperSessionsFolderDefault:
+    """N10 (R5): _run_reaper() sessions_folder default must be 'claude-sessions',
+    matching obsidian_utils._DEFAULTS['sessions_folder'], not the old wrong 'sessions'.
+    """
+
+    def test_reaper_sessions_folder_default_is_claude_sessions(self, isolated_home):
+        """Config without sessions_folder key: reaper must use 'claude-sessions' as default.
+
+        Verify by writing the REAPED_OK fixture into the isolated HOME so the reaper
+        can find it, then running in --dry-run mode and asserting the recorded path
+        contains 'claude-sessions', not 'sessions'.
+        """
+        # The isolated_home fixture writes sessions_folder="sessions" (the old wrong default).
+        # Remove it from the config so the script's fallback default kicks in.
+        config_path = isolated_home / ".claude" / "obsidian-brain-config.json"
+        cfg = json.loads(config_path.read_text())
+        del cfg["sessions_folder"]
+        config_path.write_text(json.dumps(cfg))
+
+        # Create the claude-sessions dir so the reaper can write (it's expected by the
+        # production flow; --dry-run patches write_vault_note but the dir must exist for
+        # _permission_canary to succeed).
+        (isolated_home / "vault" / "claude-sessions").mkdir(parents=True, exist_ok=True)
+
+        fixture = _FIXTURES / "d2cc7e46-long-617min-full.jsonl"
+
+        result = _run_cli(
+            "--jsonl", str(fixture),
+            "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
+            "--mode", "reaper",
+            "--dry-run",
+            "--json",
+            env_extra={"HOME": str(isolated_home), "_REAL_VAULT_GUARD": "1"},
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        out_lines = [ln for ln in result.stdout.strip().splitlines() if ln.startswith("{")]
+        assert out_lines, f"no JSON line in stdout: {result.stdout!r}"
+        outcome = json.loads(out_lines[-1])
+
+        # The REAPED_OK fixture should produce a vault_writes entry with the right folder.
+        vault_writes = outcome.get("vault_writes", [])
+        assert vault_writes, (
+            f"Expected at least one vault_writes entry from REAPED_OK fixture; "
+            f"outcome: {outcome!r}. N10: if sessions_folder default is wrong, the "
+            f"dedupe lookup targets the wrong folder and may still write."
+        )
+        recorded_path = vault_writes[0][0]
+        assert "/claude-sessions/" in recorded_path, (
+            f"Expected recorded path to contain '/claude-sessions/' (correct default); "
+            f"got {recorded_path!r}. N10 regression: default was 'sessions' not 'claude-sessions'."
+        )

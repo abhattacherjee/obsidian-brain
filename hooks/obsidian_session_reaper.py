@@ -263,18 +263,45 @@ def _reap_orphaned_sessions(
         _log_summary(project, out)
         return out
 
-    jsonls = sorted(
-        (p for p in project_jsonl_dir.iterdir() if p.suffix == ".jsonl"),
-        key=lambda p: _safe_mtime(p),
-    )
-
-    existing_sids = _build_existing_sid_set(vault_path, sessions_folder, project)
+    try:
+        jsonls = sorted(
+            (p for p in project_jsonl_dir.iterdir() if p.suffix == ".jsonl"),
+            key=lambda p: _safe_mtime(p),
+        )
+    except OSError as exc:
+        _append_reaper_log(project=project, sid=None,
+                           event="READ_DIR_FAILED",
+                           detail=f"{type(exc).__name__}: {exc}")
+        wall_ms = int((time.monotonic() - start_ts) * 1000)
+        out = ReaperOutcome(
+            reaped=0,
+            skipped_below_threshold=0,
+            skipped_already_written=0,
+            skipped_permission_blocked=False,
+            timeout=False,
+            wall_ms=wall_ms,
+        )
+        _log_summary(project, out)
+        return out
 
     # Hoist canonical_project_name() before the loop — spawns git rev-parse
     # only once per reaper invocation instead of once per JSONL file.
     # Falls back to `project` param if canonical resolution returns "unknown"
     # (e.g., cwd deleted or not a git repo).
     canonical = canonical_project_name()
+
+    # effective_project is used for all VAULT-SIDE identifiers: frontmatter,
+    # dedupe set lookup, and filename slug.  This collapses worktree variants
+    # (e.g. "obsidian-brain-issue-125-...") to the canonical repo name so the
+    # reaper never creates duplicate notes with a different basename than what
+    # live SessionEnd would produce.
+    #
+    # NOTE: _resolve_project_jsonl_dir MUST keep using raw `project` (the
+    # cwd-basename → CC's path encoding).  Only vault-side identifiers use
+    # effective_project.
+    effective_project = canonical if canonical and canonical != "unknown" else project
+
+    existing_sids = _build_existing_sid_set(vault_path, sessions_folder, effective_project)
 
     canary_done = False
     last_processed_mtime = watermark
@@ -308,12 +335,11 @@ def _reap_orphaned_sessions(
             # Use empty cwd — we don't know the original working directory
             # for an orphaned/reconstructed session.
             metadata = extract_session_metadata(messages, "")
-            # Override the extractor's "unknown" project with the canonical project
-            # name so worktree variants (e.g. obsidian-brain-issue-125-...) collapse
-            # to the main repo name.  canonical_project_name() uses the current
-            # process cwd (SessionStart cwd = the new session's project root), which
-            # resolves the worktree to its main-repo basename.
-            metadata["project"] = project if canonical == "unknown" else canonical
+            # Override the extractor's "unknown" project with effective_project
+            # so worktree variants (e.g. obsidian-brain-issue-125-...) collapse
+            # to the canonical repo name.  effective_project is hoisted above the
+            # loop and matches the project name used for dedupe + filename slug.
+            metadata["project"] = effective_project
         except Exception as exc:
             _append_reaper_log(project=project, sid=sid_short,
                                event="READ_FAILED", detail=str(exc))
@@ -358,7 +384,7 @@ def _reap_orphaned_sessions(
                                   tool_uses=tool_uses, config=config)
         content = _build_note(sid, metadata, body, resumed=False, reconstructed=True)
         date_str = _first_seen_date(sid)
-        filename = make_filename(date_str, slugify(project), sid)
+        filename = make_filename(date_str, slugify(effective_project), sid)
         err = write_vault_note(vault_path, sessions_folder, filename, content)
         if err is None:
             n_reaped += 1

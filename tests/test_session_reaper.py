@@ -1324,3 +1324,181 @@ def test_build_existing_sid_set_includes_notes_without_project_field(reaper_env)
     assert sid_legacy in sids, (
         "Legacy note without project: frontmatter must still be counted (backward-compat)"
     )
+
+
+# ---------------------------------------------------------------------------
+# N7 (R5): iterdir() OSError — returns zero-counter ReaperOutcome + logs READ_DIR_FAILED
+# ---------------------------------------------------------------------------
+
+
+def test_reap_iterdir_oserror_returns_zero_outcome(reaper_env, monkeypatch):
+    """If project_jsonl_dir.iterdir() raises OSError, _reap_orphaned_sessions must:
+    - return a valid ReaperOutcome with all counters at zero/False
+    - log a READ_DIR_FAILED event to the hook log (N7 regression guard).
+    """
+    import hooks.obsidian_session_reaper as reaper_mod
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions
+
+    # _reap_orphaned_sessions uses `from obsidian_utils import _append_reaper_log`
+    # at function-entry time — so the spy must be installed on the bare
+    # `obsidian_utils` module (same object the from-import resolves from).
+    import obsidian_utils as utils_mod  # bare, matches reaper's from-import target
+
+    # Stub _resolve_project_jsonl_dir to return a fake object whose iterdir() raises.
+    class _UnreadableDir:
+        def is_dir(self):
+            return True
+
+        def iterdir(self):
+            raise PermissionError("[Errno 13] Permission denied: '/fake/dir'")
+
+    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dir", lambda p: _UnreadableDir())
+
+    # Spy on _append_reaper_log via the bare obsidian_utils module.
+    logged: list[dict] = []
+    original_arl = utils_mod._append_reaper_log
+
+    def spy_log(project, sid, event, detail=""):
+        logged.append({"project": project, "sid": sid, "event": event, "detail": detail})
+        original_arl(project=project, sid=sid, event=event, detail=detail)
+
+    monkeypatch.setattr(utils_mod, "_append_reaper_log", spy_log)
+
+    out = _reap_orphaned_sessions(
+        project=reaper_env["project"],
+        vault_path=str(reaper_env["vault"]),
+        sessions_folder="claude-sessions",
+        config=reaper_env["config"],
+    )
+
+    # Must return a zero-counter outcome (not raise)
+    assert out.reaped == 0
+    assert out.skipped_below_threshold == 0
+    assert out.skipped_already_written == 0
+    assert out.skipped_permission_blocked is False
+    assert out.timeout is False
+
+    # Must have logged a READ_DIR_FAILED event
+    read_dir_failed = [e for e in logged if e.get("event") == "READ_DIR_FAILED"]
+    assert read_dir_failed, (
+        "Expected READ_DIR_FAILED in hook log when iterdir() raises OSError; "
+        f"logged events: {[e.get('event') for e in logged]}"
+    )
+    assert "PermissionError" in read_dir_failed[0].get("detail", ""), (
+        f"READ_DIR_FAILED detail should name exception type; got: {read_dir_failed[0]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# N8+N9 (R5): Worktree correctness — dedupe + filename use effective_project (canonical)
+# ---------------------------------------------------------------------------
+
+
+def test_reaper_worktree_dedupe_uses_canonical_not_raw(reaper_env, monkeypatch):
+    """When a vault note was written by live SessionEnd using canonical project name,
+    the reaper called with the raw worktree-variant cwd-basename must still detect it
+    as already-written (skipped_already_written == 1), not write a duplicate.
+
+    This guards N8: _build_existing_sid_set must use effective_project (canonical),
+    not the raw project param.
+    """
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions
+    from hooks import obsidian_utils
+    import hooks.obsidian_session_reaper as reaper_mod
+
+    canonical = "obsidian-brain"
+    worktree_project = "obsidian-brain-issue-125-sessionend-reaper"
+
+    # Pre-write vault note using the CANONICAL project name (as live SessionEnd would).
+    sid = "bbbb2222-cccc-dddd-eeee-ffffffffffff"
+    sid_short = sid[:8]
+    pre_existing = reaper_env["sessions"] / f"2026-04-24-{canonical}-{sid_short}.md"
+    pre_existing.write_text(
+        f"---\ntype: claude-session\nproject: {canonical}\nsession_id: {sid}\n---\n# Pre-existing\n"
+    )
+
+    # Place JSONL in the project dir so the reaper finds it
+    jsonl = reaper_env["project_jsonl_dir"] / f"{sid}.jsonl"
+    _make_above_threshold_jsonl(jsonl, sid, n_user_msgs=5)
+
+    # Route raw worktree project dir to the fixture dir
+    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dir",
+                        lambda p: reaper_env["project_jsonl_dir"])
+    # canonical_project_name() returns the canonical name
+    monkeypatch.setattr(obsidian_utils, "canonical_project_name",
+                        lambda cwd=None: canonical)
+
+    out = _reap_orphaned_sessions(
+        project=worktree_project,
+        vault_path=str(reaper_env["vault"]),
+        sessions_folder="claude-sessions",
+        config=reaper_env["config"],
+    )
+
+    assert out.skipped_already_written == 1, (
+        f"Expected skipped_already_written=1 (dedupe hit canonical note); "
+        f"got reaped={out.reaped}, skipped_already_written={out.skipped_already_written}. "
+        f"N8 regression: _build_existing_sid_set not using effective_project."
+    )
+    assert out.reaped == 0, (
+        "Reaper must not write a duplicate note when canonical note already exists; "
+        "N8 regression."
+    )
+    # Vault must have exactly one note (the pre-existing one, not a new duplicate)
+    all_notes = list(reaper_env["sessions"].glob("*.md"))
+    assert len(all_notes) == 1, (
+        f"Expected 1 note (pre-existing); got {len(all_notes)} — N8 duplicate write."
+    )
+
+
+def test_reaper_worktree_filename_uses_canonical_slug(reaper_env, monkeypatch):
+    """Newly-reaped note filename must use slugify(effective_project) == slugify(canonical),
+    matching what live SessionEnd would produce — not the raw worktree-variant slug.
+
+    This guards N9: make_filename must receive effective_project, not raw project.
+    """
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions
+    from hooks import obsidian_utils
+    import hooks.obsidian_session_reaper as reaper_mod
+
+    canonical = "obsidian-brain"
+    worktree_project = "obsidian-brain-issue-125-sessionend-reaper"
+
+    sid = "cccc3333-dddd-eeee-ffff-aaaaaaaaaaaa"
+
+    jsonl = reaper_env["project_jsonl_dir"] / f"{sid}.jsonl"
+    _make_above_threshold_jsonl(jsonl, sid, n_user_msgs=5)
+
+    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dir",
+                        lambda p: reaper_env["project_jsonl_dir"])
+    monkeypatch.setattr(obsidian_utils, "canonical_project_name",
+                        lambda cwd=None: canonical)
+
+    out = _reap_orphaned_sessions(
+        project=worktree_project,
+        vault_path=str(reaper_env["vault"]),
+        sessions_folder="claude-sessions",
+        config=reaper_env["config"],
+    )
+
+    assert out.reaped == 1, (
+        f"Expected reaped=1; got {out.reaped}. Check fixture setup."
+    )
+
+    written = list(reaper_env["sessions"].glob("*.md"))
+    assert len(written) == 1
+
+    filename = written[0].name
+    # Filename must use canonical slug, not the worktree-variant slug
+    from hooks.obsidian_utils import slugify
+    canonical_slug = slugify(canonical)
+    worktree_slug = slugify(worktree_project)
+
+    assert canonical_slug in filename, (
+        f"Filename {filename!r} must contain canonical slug {canonical_slug!r}; "
+        f"N9 regression: make_filename received raw worktree project."
+    )
+    assert worktree_slug not in filename, (
+        f"Filename {filename!r} must NOT contain worktree slug {worktree_slug!r}; "
+        f"N9 regression: make_filename received raw worktree project."
+    )

@@ -344,7 +344,10 @@ def _run_reaper(args: argparse.Namespace) -> int:
         return 2
 
     vault_path = config.get("vault_path", "")
-    sessions_folder = config.get("sessions_folder", "sessions")
+    # Default must match obsidian_utils._DEFAULTS["sessions_folder"] == "claude-sessions".
+    # Using "sessions" was wrong and would misroute the reaper's dedupe lookup
+    # when sessions_folder is absent from config.
+    sessions_folder = config.get("sessions_folder", "claude-sessions")
     if not vault_path:
         print("ERROR: vault_path missing from config", file=sys.stderr)
         return 2
