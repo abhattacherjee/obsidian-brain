@@ -1298,6 +1298,42 @@ def fetch_snapshot_summaries(
     return results
 
 
+def gather_session_evidence(
+    vault_path: str,
+    sessions_folder: str,
+    insights_folder: str,
+    session_id: str,
+    date: str,
+    project: str,
+) -> dict:
+    """Discover and load all artifacts written during this session.
+
+    Returns a structured bundle of snapshots (from sessions_folder) and
+    insights/decisions/error-fixes (from insights_folder) whose frontmatter
+    `source_session` matches the given session_id.
+
+    Snapshots are returned sorted ascending by hhmmss extracted from filename.
+    Insights/decisions/error-fixes are returned sorted ascending by filename.
+    File-read failures are captured in `discovery_errors` and never raised.
+
+    Used by /retro to ground retrospective analysis in the full session
+    arc (pre-compact + post-compact) rather than just the active conversation.
+    """
+    bundle: dict = {
+        "session_id": session_id,
+        "snapshots": [],
+        "insights": [],
+        "decisions": [],
+        "error_fixes": [],
+        "discovery_errors": [],
+    }
+    if session_id == "unknown" or not session_id:
+        return bundle
+    # TODO Task 3: snapshot discovery
+    # TODO Task 4: insight/decision/error-fix discovery
+    return bundle
+
+
 def match_items_against_evidence(
     evidence_text: str,
     open_items: list[tuple[str, int, str]],
