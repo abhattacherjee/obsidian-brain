@@ -95,6 +95,8 @@ Parse the JSON output. The bundle has these fields: `session_id`, `snapshots`, `
 
 Review the full current conversation. Be **candid**, not defensive or self-congratulatory.
 
+**When the bundle from Step 3a is non-empty:** treat its snapshot bodies and insight/decision/error-fix bodies as **first-class evidence**, not background context. Pre-compact arcs in snapshot files almost always contain more decision points and dead ends than the post-compact half — surface specific corrections and abandoned approaches from there. The "What Didn't Work" section in particular should reflect the relative duration and decision density of both halves; if the pre-compact half ran 6 hours and the post-compact half ran 90 minutes, the analysis should weight accordingly.
+
 The **"What Didn't Work"** section is the MOST valuable part of this retrospective — invest the most analysis there.
 
 Evaluate the session across these five dimensions:
