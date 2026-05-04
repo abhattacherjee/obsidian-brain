@@ -30,10 +30,10 @@ Related: **#100** (Phase 1 — SessionEnd outcome logging, already shipped)
 Before starting the live phases, confirm the Tier-1 fixture harness passes:
 
 ```bash
-python3 -m pytest scripts/dev-test/test-issue-125-manual.py -q
+python3 scripts/dev-test/test-issue-125-manual.py
 ```
 
-All 897 assertions should pass. Only proceed once the script shows `0 failed`.
+All 23 assertions should pass. Only proceed once the script shows `0 failed`.
 
 ---
 
@@ -390,8 +390,8 @@ the `WRITE_FAILED detail=` field.
   python3 -m pytest -q
   ```
 
-  Expected: 897 passed (or higher if new tests were added in this PR), 0
-  failed.
+  Expected: all tests pass (0 failed). Count will be higher than 897 as
+  new tests have been added since this document was authored.
 
 - [ ] **7c.** Verify there are no stale orphan notes left from the test run:
 

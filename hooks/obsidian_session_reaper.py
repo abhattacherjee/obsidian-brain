@@ -178,6 +178,11 @@ def _build_existing_sid_set(vault_path: str, sessions_folder: str, project: str)
         note_type = _peek_frontmatter_type(note) or "claude-session"
         if note_type != "claude-session":
             continue  # skip snapshots, insights, etc.
+        # Project filter: only count notes belonging to this project.
+        # Reduces I/O on multi-project vaults by skipping unrelated notes.
+        note_project = _peek_frontmatter_field(note, "project")
+        if note_project and note_project != project:
+            continue
         raw_sid = _peek_frontmatter_field(note, "session_id")
         if raw_sid:
             sids.add(raw_sid)
@@ -265,6 +270,12 @@ def _reap_orphaned_sessions(
 
     existing_sids = _build_existing_sid_set(vault_path, sessions_folder, project)
 
+    # Hoist canonical_project_name() before the loop — spawns git rev-parse
+    # only once per reaper invocation instead of once per JSONL file.
+    # Falls back to `project` param if canonical resolution returns "unknown"
+    # (e.g., cwd deleted or not a git repo).
+    canonical = canonical_project_name()
+
     canary_done = False
     last_processed_mtime = watermark
 
@@ -302,9 +313,6 @@ def _reap_orphaned_sessions(
             # to the main repo name.  canonical_project_name() uses the current
             # process cwd (SessionStart cwd = the new session's project root), which
             # resolves the worktree to its main-repo basename.
-            # Falls back to `project` param if canonical resolution returns "unknown"
-            # (e.g., cwd deleted or not a git repo).
-            canonical = canonical_project_name()
             metadata["project"] = project if canonical == "unknown" else canonical
         except Exception as exc:
             _append_reaper_log(project=project, sid=sid_short,
@@ -417,6 +425,13 @@ def reap_orphaned_sessions(
     try:
         return _reap_orphaned_sessions(project, vault_path, sessions_folder, config)
     except Exception as exc:
+        from obsidian_utils import _append_reaper_log
+        _append_reaper_log(
+            project=project,
+            sid=None,
+            event="REAPER_CRASHED",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
         print(f"[obsidian-brain] reaper unexpected error: {exc}", file=sys.stderr)
         return ReaperOutcome(
             reaped=0,

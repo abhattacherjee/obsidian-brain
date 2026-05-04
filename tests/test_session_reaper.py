@@ -1210,3 +1210,117 @@ def test_build_existing_sid_set_full_sid_comparison(reaper_env):
     assert full_sid in sids, "Full SID must be in the set"
     # 8-char prefix alone must not be a member (no prefix-only entries)
     assert full_sid[:8] not in sids
+
+
+# ---------------------------------------------------------------------------
+# N1 (R4): REAPER_CRASHED event logged from public wrapper exception
+# ---------------------------------------------------------------------------
+
+
+def test_reap_orphaned_sessions_public_wrapper_logs_reaper_crashed(
+    reaper_env, monkeypatch, tmp_path
+):
+    """reap_orphaned_sessions() must log REAPER_CRASHED to obsidian-brain-hook.log
+    in addition to printing to stderr when _reap_orphaned_sessions raises."""
+    from hooks.obsidian_session_reaper import reap_orphaned_sessions
+    import hooks.obsidian_session_reaper as reaper_mod
+    import obsidian_utils as utils_mod
+
+    monkeypatch.setattr(
+        reaper_mod,
+        "_reap_orphaned_sessions",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    log_calls = []
+    original_arl = utils_mod._append_reaper_log
+
+    def spy_log(*args, **kwargs):
+        log_calls.append(kwargs)
+        original_arl(*args, **kwargs)
+
+    monkeypatch.setattr(utils_mod, "_append_reaper_log", spy_log)
+
+    out = reap_orphaned_sessions(
+        project=reaper_env["project"],
+        vault_path=str(reaper_env["vault"]),
+        sessions_folder="claude-sessions",
+        config=reaper_env["config"],
+    )
+
+    # Outcome must still be a zero-outcome (never raises)
+    assert out.reaped == 0
+    assert out.wall_ms == 0.0
+
+    # REAPER_CRASHED event must be in the log
+    crashed_calls = [c for c in log_calls if c.get("event") == "REAPER_CRASHED"]
+    assert len(crashed_calls) == 1, (
+        f"Expected exactly one REAPER_CRASHED log call; got {log_calls}"
+    )
+    detail = crashed_calls[0].get("detail", "")
+    assert "RuntimeError" in detail, f"detail must name exception type: {detail!r}"
+    assert "boom" in detail, f"detail must include exception message: {detail!r}"
+
+
+# ---------------------------------------------------------------------------
+# N2 (R4): _build_existing_sid_set filters by project: frontmatter
+# ---------------------------------------------------------------------------
+
+
+def test_build_existing_sid_set_filters_by_project(reaper_env):
+    """Notes from a different project must NOT appear in the SID set for project X.
+
+    Regression guard: reaper for project Y must not see project X's notes as
+    already-written, avoiding false-positive skips on multi-project vaults.
+    """
+    from hooks.obsidian_session_reaper import _build_existing_sid_set
+
+    sid_x = "proj-x-01-1111-2222-3333-444444444444"
+    sid_y = "proj-y-01-1111-2222-3333-444444444444"
+    sessions = reaper_env["sessions"]
+
+    # Note for project X
+    (sessions / "note-project-x.md").write_text(
+        f"---\ntype: claude-session\nproject: project-x\nsession_id: {sid_x}\n---\n# X\n"
+    )
+    # Note for project Y
+    (sessions / "note-project-y.md").write_text(
+        f"---\ntype: claude-session\nproject: project-y\nsession_id: {sid_y}\n---\n# Y\n"
+    )
+
+    # Query for project Y — must only see Y's SID
+    sids_y = _build_existing_sid_set(str(reaper_env["vault"]), "claude-sessions", "project-y")
+    assert sid_y in sids_y, "project-y SID must be in the set"
+    assert sid_x not in sids_y, (
+        "project-x SID must NOT appear in project-y's existing-SID set (N2 regression)"
+    )
+
+    # Query for project X — must only see X's SID
+    sids_x = _build_existing_sid_set(str(reaper_env["vault"]), "claude-sessions", "project-x")
+    assert sid_x in sids_x, "project-x SID must be in the set"
+    assert sid_y not in sids_x, (
+        "project-y SID must NOT appear in project-x's existing-SID set (N2 regression)"
+    )
+
+
+def test_build_existing_sid_set_includes_notes_without_project_field(reaper_env):
+    """Legacy notes without a project: field must still be counted (backward-compat).
+
+    Notes written before the project: filter was added have no project: frontmatter.
+    They must remain in the SID set regardless of which project is queried, so the
+    reaper never re-writes a note for a session that was already captured.
+    """
+    from hooks.obsidian_session_reaper import _build_existing_sid_set
+
+    sid_legacy = "legacy01-1111-2222-3333-444444444444"
+    # Note has no project: field
+    (reaper_env["sessions"] / "note-legacy.md").write_text(
+        f"---\ntype: claude-session\nsession_id: {sid_legacy}\n---\n# Legacy\n"
+    )
+
+    sids = _build_existing_sid_set(
+        str(reaper_env["vault"]), "claude-sessions", "any-project"
+    )
+    assert sid_legacy in sids, (
+        "Legacy note without project: frontmatter must still be counted (backward-compat)"
+    )
