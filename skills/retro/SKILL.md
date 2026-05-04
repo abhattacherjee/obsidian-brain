@@ -2,7 +2,7 @@
 name: retro
 description: "Generates honest session retrospectives analyzing what worked, what didn't, key learnings, and actionable process improvements. Use when: (1) /retro command at end of session, (2) user wants to reflect on session quality and outcomes."
 metadata:
-  version: 1.0.0
+  version: 1.1.0
 ---
 
 # Retro — Generate Honest Session Retrospective
