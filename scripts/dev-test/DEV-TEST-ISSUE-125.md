@@ -306,21 +306,25 @@ reaper activity, even with orphans present.
   WM_PATH=~/.claude/obsidian-brain/reaper-watermark-obsidian-brain
   ls -la "$WM_PATH"
   cat "$WM_PATH"
+  # Convert to human-readable date:
+  date -r "$(cat "$WM_PATH")"
   ```
 
   Expected:
   - File mode `-rw-------` (0o600)
-  - Contents: an ISO-8601 UTC timestamp (e.g. `2026-05-03T10:32:17.123456+00:00`)
+  - Contents: an integer Unix epoch seconds timestamp (e.g. `1746307200`)
+  - `date -r` output should show a recent date matching the last reap run
 
 - [ ] **5b.** Verify the watermark advances after a successful reap (Phase 1
-  should have already done this). Compare timestamps:
+  should have already done this). Compare values:
 
   ```bash
   cat ~/.claude/obsidian-brain/reaper-watermark-obsidian-brain
-  # should be newer than before Phase 1
+  # should be a larger epoch value than before Phase 1
+  date -r "$(cat ~/.claude/obsidian-brain/reaper-watermark-obsidian-brain)"
   ```
 
-  Expected: timestamp is later than the `$KILLED_SID` session's start time.
+  Expected: the converted date is later than the `$KILLED_SID` session's start time.
 
 - [ ] **5c.** Verify the watermark directory has correct permissions:
 
@@ -330,7 +334,7 @@ reaper activity, even with orphans present.
 
   Expected: the `obsidian-brain/` directory is mode `drwx------` (0o700).
 
-**Pass criteria:** watermark file at 0o600, valid ISO-8601 UTC content,
+**Pass criteria:** watermark file at 0o600, integer epoch-seconds content,
 directory at 0o700.
 
 ---

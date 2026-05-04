@@ -19,6 +19,7 @@ Python stdlib only (no pip dependencies).
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tempfile
@@ -151,23 +152,35 @@ def _resolve_project_jsonl_dir(project: str) -> Path:
 
 
 def _build_existing_sid_set(vault_path: str, sessions_folder: str, project: str) -> set:
-    """Set of 8-char SID prefixes for which a vault note already exists.
+    """Set of full SIDs for which a ``claude-session`` vault note already exists.
 
-    Reads the ``session_id`` frontmatter field from each note (rather than parsing
-    the filename) because make_filename uses a 4-char SHA256 hash, not the SID.
-    This is O(N) I/O where N is the count of existing session notes for this project.
-    The lookup is robust regardless of filename hash length or slug format.
+    Reads ``session_id`` AND ``type`` frontmatter fields from each note (rather
+    than parsing the filename) because make_filename uses a 4-char SHA256 hash,
+    not the SID.  Only notes with ``type: claude-session`` are counted —
+    snapshots (``type: claude-snapshot``) must NOT block reaping: a session that
+    was SIGKILL'd after a PreCompact snapshot but before SessionEnd fired would
+    be incorrectly marked as "already written" if snapshots were included.
+
+    Legacy notes without a ``type`` field are treated as ``claude-session`` for
+    backward-compat (mirrors the same convention used elsewhere in obsidian_utils).
+
+    This is O(N) I/O where N is the count of existing session notes for this
+    project.  The lookup uses full SIDs to eliminate the collision risk of the
+    previous 8-char prefix set.
     """
-    from obsidian_utils import _peek_frontmatter_field
+    from obsidian_utils import _peek_frontmatter_field, _peek_frontmatter_type
 
     sessions = Path(vault_path) / sessions_folder
     if not sessions.is_dir():
         return set()
     sids: set = set()
     for note in sessions.glob("*.md"):
+        note_type = _peek_frontmatter_type(note) or "claude-session"
+        if note_type != "claude-session":
+            continue  # skip snapshots, insights, etc.
         raw_sid = _peek_frontmatter_field(note, "session_id")
         if raw_sid:
-            sids.add(raw_sid[:8])
+            sids.add(raw_sid)
     return sids
 
 
@@ -273,7 +286,7 @@ def _reap_orphaned_sessions(
 
         sid = jsonl.stem
         sid_short = sid[:8]
-        if sid_short in existing_sids:
+        if sid in existing_sids:
             n_existing += 1
             last_processed_mtime = max(last_processed_mtime, mtime)
             continue
@@ -350,7 +363,10 @@ def _reap_orphaned_sessions(
 
     if last_processed_mtime > watermark:
         try:
-            _write_watermark_atomic(watermark_path, int(last_processed_mtime))
+            # Use math.ceil so the watermark advances past sub-second mtime
+            # fragments — prevents re-reading files whose fractional mtime would
+            # still satisfy `mtime > watermark` on the next run.
+            _write_watermark_atomic(watermark_path, math.ceil(last_processed_mtime))
         except OSError as exc:
             _append_reaper_log(project=project, sid=None,
                                event="WATERMARK_WRITE_FAILED", detail=str(exc))

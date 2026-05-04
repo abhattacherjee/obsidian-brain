@@ -1063,3 +1063,150 @@ def test_reap_orphaned_sessions_public_wrapper_exception(reaper_env, monkeypatch
     assert out.reaped == 0
     assert out.timeout is False
     assert out.wall_ms == 0.0
+
+
+# ---------------------------------------------------------------------------
+# C2 (R3): fractional mtime → math.ceil watermark advancement
+# ---------------------------------------------------------------------------
+
+def test_watermark_advances_past_fractional_mtime(reaper_env, monkeypatch):
+    """Regression: a JSONL with fractional-second mtime must NOT be re-processed on
+    the next run.  math.ceil() ensures the watermark is always strictly greater
+    than the float mtime, so `mtime > watermark` is False on subsequent runs.
+    """
+    import hooks.obsidian_session_reaper as reaper_mod
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions, _read_watermark
+
+    sid = "frac0001-1111-2222-3333-444444444444"
+    jsonl = reaper_env["project_jsonl_dir"] / f"{sid}.jsonl"
+    _make_above_threshold_jsonl(jsonl, sid, n_user_msgs=5)
+
+    # Set fractional mtime: 1746307200.789
+    fractional_mtime = 1746307200.789
+    os.utime(jsonl, (fractional_mtime, fractional_mtime))
+
+    out = _reap_orphaned_sessions(
+        project=reaper_env["project"],
+        vault_path=str(reaper_env["vault"]),
+        sessions_folder="claude-sessions",
+        config=reaper_env["config"],
+    )
+    assert out.reaped == 1
+
+    watermark_path = (reaper_env["home"] / ".claude" / "obsidian-brain" /
+                      f"reaper-watermark-{reaper_env['project']}")
+    wm = _read_watermark(watermark_path)
+    # Watermark must be ceil(1746307200.789) = 1746307201, strictly > float mtime
+    assert wm == 1746307201
+    assert wm > fractional_mtime
+
+    # Second run: the same JSONL must NOT be processed again (mtime <= watermark)
+    out2 = _reap_orphaned_sessions(
+        project=reaper_env["project"],
+        vault_path=str(reaper_env["vault"]),
+        sessions_folder="claude-sessions",
+        config=reaper_env["config"],
+    )
+    assert out2.skipped_already_written == 0  # not even checked — mtime gate skips it
+    assert out2.reaped == 0
+    assert out2.skipped_below_threshold == 0
+
+
+# ---------------------------------------------------------------------------
+# C3 (R3): _append_reaper_log sanitization + mkdir-failure safety
+# ---------------------------------------------------------------------------
+
+def test_append_reaper_log_sanitizes_newlines_in_detail(tmp_path, monkeypatch):
+    """Newlines in detail= must be replaced so the log stays one-line-per-event."""
+    from hooks.obsidian_utils import _append_reaper_log
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+
+    _append_reaper_log(project="my-proj", sid="abc12345",
+                       event="REAPED_OK", detail="multi\nline\ndetail")
+    content = log_path.read_text()
+    lines = [l for l in content.splitlines() if "REAPED_OK" in l]
+    assert len(lines) == 1, "Expected exactly one log line for the event"
+    assert "\n" not in lines[0]
+    assert "multi line detail" in lines[0] or "multi" in lines[0]
+
+
+def test_append_reaper_log_sanitizes_newlines_in_project(tmp_path, monkeypatch):
+    """Newlines in project= must also be sanitized."""
+    from hooks.obsidian_utils import _append_reaper_log
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+
+    _append_reaper_log(project="proj\nwith\nnewlines", sid="abc12345",
+                       event="SUMMARY", detail="")
+    content = log_path.read_text()
+    lines = [l for l in content.splitlines() if "SUMMARY" in l]
+    assert len(lines) == 1, "Multi-line project must not split the log line"
+
+
+def test_append_reaper_log_mkdir_failure_does_not_raise(monkeypatch):
+    """mkdir failure inside _append_reaper_log must NOT propagate — best-effort only."""
+    from hooks.obsidian_utils import _append_reaper_log
+    import pathlib
+
+    def boom_home():
+        # Return a Path whose mkdir will fail by returning a non-writable root path
+        return pathlib.Path("/nonexistent/path/that/cannot/be/created")
+
+    monkeypatch.setattr("pathlib.Path.home", boom_home)
+
+    # Must not raise — the function swallows all exceptions
+    _append_reaper_log(project="p", sid="s", event="REAPED_OK", detail="x")
+
+
+# ---------------------------------------------------------------------------
+# C6 (R3): _build_existing_sid_set skips snapshot notes
+# ---------------------------------------------------------------------------
+
+def test_reaper_does_not_skip_session_with_only_snapshot_note(reaper_env):
+    """A JSONL whose sid only has a snapshot note (type: claude-snapshot) in the vault
+    must NOT be counted as already-written.  The reaper should reap it normally.
+    """
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions
+
+    sid = "snap0001-1111-2222-3333-444444444444"
+    sid_short = sid[:8]
+    jsonl = reaper_env["project_jsonl_dir"] / f"{sid}.jsonl"
+    _make_above_threshold_jsonl(jsonl, sid, n_user_msgs=5)
+
+    # Pre-write a SNAPSHOT note for the same session_id — must NOT block reaping.
+    snapshot_note = reaper_env["sessions"] / f"2026-04-24-obsidian-brain-snap-{sid_short}.md"
+    snapshot_note.write_text(
+        f"---\ntype: claude-snapshot\nsession_id: {sid}\n---\n# Snapshot\n"
+    )
+
+    out = _reap_orphaned_sessions(
+        project=reaper_env["project"],
+        vault_path=str(reaper_env["vault"]),
+        sessions_folder="claude-sessions",
+        config=reaper_env["config"],
+    )
+
+    assert out.reaped == 1, (
+        "Session with only a snapshot note should be reaped — snapshot must not "
+        "block the reaper (C6 regression)"
+    )
+    assert out.skipped_already_written == 0
+
+
+def test_build_existing_sid_set_full_sid_comparison(reaper_env):
+    """_build_existing_sid_set must return full SIDs, not 8-char prefixes."""
+    from hooks.obsidian_session_reaper import _build_existing_sid_set
+
+    full_sid = "abcdef01-1111-2222-3333-444444444444"
+    note = reaper_env["sessions"] / "2026-04-24-obsidian-brain-note.md"
+    note.write_text(
+        f"---\ntype: claude-session\nsession_id: {full_sid}\n---\n# Note\n"
+    )
+
+    sids = _build_existing_sid_set(
+        str(reaper_env["vault"]), "claude-sessions", reaper_env["project"]
+    )
+    assert full_sid in sids, "Full SID must be in the set"
+    # 8-char prefix alone must not be a member (no prefix-only entries)
+    assert full_sid[:8] not in sids

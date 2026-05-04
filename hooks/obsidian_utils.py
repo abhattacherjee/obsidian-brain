@@ -454,33 +454,43 @@ def _append_reaper_log(project: str, sid: Optional[str], event: str, detail: str
     telemetry, but uses event= keyword to keep enum spaces distinct.
 
     Per-jsonl events include sid=<short>; summary events pass sid=None.
+
+    Best-effort: any exception (including mkdir failure) is caught and printed
+    to stderr so the reaper itself is never interrupted by a log write error.
     """
-    log_dir = Path.home() / ".claude"
-    log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    log_path = log_dir / "obsidian-brain-hook.log"
-
-    # Rotate at 100 KB (mirrors _append_sessionend_log)
     try:
-        if log_path.exists() and log_path.stat().st_size >= _HOOK_LOG_MAX_BYTES:
-            rotated = log_dir / "obsidian-brain-hook.log.1"
-            os.replace(log_path, rotated)
-    except OSError:
-        pass
+        log_dir = Path.home() / ".claude"
+        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        log_path = log_dir / _HOOK_LOG_NAME
 
-    iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    parts = [iso, "Reaper", f"project={project}"]
-    if sid:
-        parts.append(f"sid={sid}")
-    parts.append(f"event={event}")
-    if detail:
-        parts.append(f"detail={detail}")
-    line = " ".join(parts) + "\n"
-    try:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(line)
-        os.chmod(log_path, 0o600)
-    except OSError:
-        pass  # best-effort
+        # Rotate at 100 KB (mirrors _append_sessionend_log)
+        try:
+            if log_path.exists() and log_path.stat().st_size >= _HOOK_LOG_MAX_BYTES:
+                rotated = log_dir / (_HOOK_LOG_NAME + ".1")
+                os.replace(log_path, rotated)
+        except OSError:
+            pass
+
+        iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        safe_project = _sanitize_log_field(project, "unknown").replace(" ", "_")
+        parts = [iso, "Reaper", f"project={safe_project}"]
+        if sid:
+            safe_sid = _sanitize_log_field(sid).replace(" ", "_")
+            parts.append(f"sid={safe_sid}")
+        safe_event = _sanitize_log_field(event, "UNKNOWN").replace(" ", "_")
+        parts.append(f"event={safe_event}")
+        if detail:
+            safe_detail = _sanitize_log_field(detail)
+            parts.append(f"detail={safe_detail}")
+        line = " ".join(parts) + "\n"
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass  # best-effort
+    except Exception as exc:
+        print(f"[obsidian-brain] reaper log append failed: {exc}", file=sys.stderr)
 
 
 def _safe_mtime(path: str) -> float:
