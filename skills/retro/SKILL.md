@@ -83,7 +83,7 @@ print(json.dumps(bundle))
 
 Parse the JSON output. The bundle has these fields: `session_id`, `snapshots`, `insights`, `decisions`, `error_fixes`, `discovery_errors`, and `_ctx` (the cached `get_session_context()` result reused by Step 5).
 
-**Empty-bundle fallback.** If `bundle["_ctx"]["session_id"] == "unknown"` OR `len(snapshots) + len(insights) + len(decisions) + len(error_fixes) == 0`, print:
+**Empty-bundle fallback.** If `bundle["_ctx"]["session_id"] == "unknown"` OR `len(bundle["snapshots"]) + len(bundle["insights"]) + len(bundle["decisions"]) + len(bundle["error_fixes"]) == 0`, print:
 
 > Note: no prior-session evidence found — falling back to active-conversation-only retro.
 
