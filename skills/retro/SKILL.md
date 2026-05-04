@@ -149,21 +149,12 @@ Draft the note body using this exact structure:
 
 ### Step 5 — Derive session ID and backlinks
 
-Get session context via the shared helper:
+The Step 3a bundle already carries the cached session context as `bundle["_ctx"]`. Read these fields directly:
 
-```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
-from obsidian_utils import load_config, get_session_context
-c = load_config()
-ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
-print("SID=" + ctx["session_id"] + " HASH=" + ctx["hash"] + " PROJECT=" + ctx["project"] + " SESSION_NOTE=" + ctx["session_note_name"])
-'
-```
-
-Parse the output to get `SESSION_ID`, `HASH`, `PROJECT`, and `SESSION_NOTE`.
+- `SESSION_ID` = `bundle["_ctx"]["session_id"]`
+- `HASH` = `bundle["_ctx"]["hash"]`
+- `PROJECT` = `bundle["_ctx"]["project"]`
+- `SESSION_NOTE` = `bundle["_ctx"]["session_note_name"]`
 
 **Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely.
 
@@ -218,6 +209,12 @@ Ask the user:
 > - **cancel** — discard this note
 
 Wait for the user's response. Apply any requested edits and show the updated preview. Repeat until the user says **save** or **cancel**.
+
+**Discovery errors.** If `bundle["discovery_errors"]` is non-empty, after the preview but before the save/edit/cancel prompt, emit:
+
+> ⚠️ <N> file(s) could not be read during evidence discovery: `<basename-1>`, `<basename-2>`. The retro proceeds with the readable evidence; review the unreadable files manually.
+
+This is informational only and does not block save.
 
 If cancel, stop here.
 
