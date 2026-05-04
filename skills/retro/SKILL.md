@@ -57,6 +57,40 @@ If FAIL, tell the user:
 
 Stop here if FAIL.
 
+### Step 3a — Discover full session evidence
+
+The active conversation buffer only covers the post-compact half of long sessions. Before drafting the analysis, gather every artifact the active session has already written to the vault.
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys, os, json, glob, datetime
+sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from obsidian_utils import load_config, get_session_context, gather_session_evidence
+c = load_config()
+ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
+date = datetime.date.today().isoformat()
+bundle = gather_session_evidence(
+    c["vault_path"],
+    c.get("sessions_folder", "claude-sessions"),
+    c.get("insights_folder", "claude-insights"),
+    ctx["session_id"], date, ctx["project"],
+)
+bundle["_ctx"] = ctx
+print(json.dumps(bundle))
+'
+```
+
+Parse the JSON output. The bundle has these fields: `session_id`, `snapshots`, `insights`, `decisions`, `error_fixes`, `discovery_errors`, and `_ctx` (the cached `get_session_context()` result reused by Step 5).
+
+**Empty-bundle fallback.** If `bundle["_ctx"]["session_id"] == "unknown"` OR `len(snapshots) + len(insights) + len(decisions) + len(error_fixes) == 0`, print:
+
+> Note: no prior-session evidence found — falling back to active-conversation-only retro.
+
+…and proceed with Step 3 using only the active conversation buffer. Do not include the `## Evidence Consulted` section in Step 4 in that case.
+
+**Discovery errors.** If `bundle["discovery_errors"]` is non-empty, remember the list — it will be surfaced after the preview in Step 6.
+
 ### Step 3 — Analyze the session honestly
 
 Review the full current conversation. Be **candid**, not defensive or self-congratulatory.
