@@ -1112,7 +1112,7 @@ def read_note_metadata(file_path: str) -> dict | None:
 
 
 def find_snapshots_for_session(
-    sessions_folder_path: Path, session_id: str, date: str, project: str
+    sessions_folder_path: Path, session_id: str, date: str | None, project: str
 ) -> list[str]:
     """Return chronologically-sorted wikilinks of all snapshots whose
     frontmatter session_id and project match the given session. Empty list
@@ -1127,12 +1127,21 @@ def find_snapshots_for_session(
 
     Sorted lexicographically by filename stem; HHMMSS suffix makes this
     chronological for post-spec snapshots. Pre-spec (no HHMMSS) sorts first.
+
+    If `date` is None, discovery is date-agnostic: globs `*-{slug}-*-snapshot*.md`
+    and relies entirely on frontmatter session_id+project filtering. Use this
+    mode for cross-midnight sessions where snapshots may span multiple
+    YYYY-MM-DD prefixes.
     """
     if not sessions_folder_path.is_dir():
         return []
     slug = slugify(project)
     wikilinks: list[str] = []
-    for p in sorted(sessions_folder_path.glob(f"{date}-{slug}-*-snapshot*.md")):
+    if date is None:
+        glob_pattern = f"*-{slug}-*-snapshot*.md"
+    else:
+        glob_pattern = f"{date}-{slug}-*-snapshot*.md"
+    for p in sorted(sessions_folder_path.glob(glob_pattern)):
         try:
             meta = read_note_metadata(str(p))
             if not meta:
@@ -1296,6 +1305,105 @@ def fetch_snapshot_summaries(
             "key_context": key_context,
         })
     return results
+
+
+def gather_session_evidence(
+    vault_path: str,
+    sessions_folder: str,
+    insights_folder: str,
+    session_id: str,
+    project: str,
+) -> dict:
+    """Discover and load all artifacts written during this session.
+
+    Returns a structured bundle of snapshots (from sessions_folder) and
+    insights/decisions/error-fixes (from insights_folder) whose frontmatter
+    `source_session` matches the given session_id.
+
+    Snapshots are returned sorted ascending by stem (YYYY-MM-DD-... prefix),
+    which gives correct chronological order including across-midnight sessions.
+    Pre-spec snapshots (hhmmss == '??????') sort before all post-spec ones.
+    Insights/decisions/error-fixes are returned sorted ascending by filename.
+    File-read failures are captured in `discovery_errors` and never raised.
+
+    Used by /retro to ground retrospective analysis in the full session
+    arc (pre-compact + post-compact) rather than just the active conversation.
+    """
+    bundle: dict = {
+        "session_id": session_id,
+        "snapshots": [],
+        "insights": [],
+        "decisions": [],
+        "error_fixes": [],
+        "discovery_errors": [],
+    }
+    if session_id == "unknown" or not session_id:
+        return bundle
+    sessions_path = Path(vault_path) / sessions_folder
+    if sessions_path.is_dir():
+        # Pass date=None for date-agnostic discovery so cross-midnight sessions
+        # (snapshots written on YYYY-MM-DD and YYYY-MM-(DD+1)) are both found.
+        # Frontmatter session_id+project filters inside find_snapshots_for_session
+        # exclude any cross-project or cross-session decoys the broader glob picks up.
+        for link in find_snapshots_for_session(sessions_path, session_id, None, project):
+            stem = link.strip("[]")
+            snap_path = sessions_path / f"{stem}.md"
+            if not snap_path.exists():
+                continue
+            try:
+                body = snap_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                bundle["discovery_errors"].append(f"{snap_path.name}: {exc}")
+                continue
+            meta = read_note_metadata(str(snap_path)) or {}
+            bundle["snapshots"].append({
+                "path": str(snap_path),
+                "stem": stem,
+                "hhmmss": _extract_hhmmss_from_filename(snap_path.name),
+                "trigger": meta.get("trigger", "auto"),
+                "body": body,
+            })
+        bundle["snapshots"].sort(key=lambda s: (0 if s["hhmmss"] == "??????" else 1, s["stem"]))
+    insights_path = Path(vault_path) / insights_folder
+    if insights_path.is_dir():
+        type_buckets = {
+            "claude-insight": bundle["insights"],
+            "claude-decision": bundle["decisions"],
+            "claude-error-fix": bundle["error_fixes"],
+        }
+        for note_path in sorted(insights_path.glob("*.md")):
+            meta = read_note_metadata(str(note_path))
+            if meta is None:
+                # read_note_metadata returns None on OSError (suppressed) or
+                # if the file has no frontmatter. Probe ourselves so unreadable
+                # files surface in discovery_errors instead of silently being
+                # skipped. No-frontmatter files do not contribute to evidence,
+                # so the additional probe only fires when meta is None.
+                try:
+                    note_path.read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    bundle["discovery_errors"].append(f"{note_path.name}: {exc}")
+                continue
+            if meta.get("source_session") != session_id:
+                continue
+            note_type = meta.get("type", "")
+            target = type_buckets.get(note_type)
+            if target is None:
+                continue
+            try:
+                body = note_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                bundle["discovery_errors"].append(f"{note_path.name}: {exc}")
+                continue
+            title_match = re.search(r"^# (.+?)$", body, re.MULTILINE)
+            title = title_match.group(1).strip() if title_match else note_path.stem
+            target.append({
+                "path": str(note_path),
+                "stem": note_path.stem,
+                "title": title,
+                "body": body,
+            })
+    return bundle
 
 
 def match_items_against_evidence(
