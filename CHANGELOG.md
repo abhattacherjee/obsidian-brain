@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.3] - 2026-05-05
+
 ### Added
 - **SessionStart orphan reaper** (`hooks/obsidian_session_reaper.py`): recovers
   above-threshold sessions whose SessionEnd hook never fired (e.g. SIGKILL,
