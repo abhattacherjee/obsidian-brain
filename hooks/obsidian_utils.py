@@ -55,6 +55,57 @@ _RE_RAW_CONVERSATION = re.compile(
 _SID_FILENAME_SAFE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
 
 
+def parse_frontmatter_field(content: str, key: str) -> str | None:
+    """Return the YAML scalar value for ``key``, or None.
+
+    Returns None when:
+      - content is empty
+      - key is absent
+      - key is present but value is empty (after stripping horizontal
+        whitespace and surrounding quotes)
+
+    Only horizontal whitespace (space, tab) is consumed between the colon
+    and the value — never ``\n`` — so an empty ``key:`` line cannot
+    capture the next YAML key's value (issue #94).
+
+    Search region:
+      - If ``content`` starts with ``---`` and a closing ``\n---`` is
+        found, the search region is the frontmatter block up to and
+        including the closing fence.
+      - Otherwise the search region is the full ``content``. This
+        tolerates callers that pass already-sliced frontmatter (with or
+        without the closing fence) as well as callers that pass full file
+        content or a head buffer (e.g. ``vault_stats``'s 2 KB read).
+
+    Quote stripping uses ``.strip().strip('"').strip("'")`` — matches the
+    existing 7 migrated sites for strictly behaviorally-equivalent reads
+    on the happy path.
+
+    Stdlib only.
+    """
+    if not content:
+        return None
+
+    if content.startswith("---"):
+        end = content.find("\n---", 3)
+        if end != -1:
+            search_region = content[: end + 4]
+        else:
+            search_region = content
+    else:
+        search_region = content
+
+    pattern = re.compile(rf"^{re.escape(key)}:[ \t]*(.*)$", re.MULTILINE)
+    m = pattern.search(search_region)
+    if not m:
+        return None
+
+    value = m.group(1).strip().strip('"').strip("'")
+    if not value:
+        return None
+    return value
+
+
 def _first_seen_date(sid: str) -> str:
     """Return the canonical first-seen calendar date for a session_id.
 
