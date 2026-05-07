@@ -5,15 +5,7 @@ value, empty values map to None, no cross-newline regex bug.
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-# Add hooks/ to sys.path so we can import obsidian_utils without installing.
-HOOKS_DIR = Path(__file__).resolve().parents[1] / "hooks"
-if str(HOOKS_DIR) not in sys.path:
-    sys.path.insert(0, str(HOOKS_DIR))
-
-from obsidian_utils import parse_frontmatter_field  # noqa: E402
+from obsidian_utils import parse_frontmatter_field
 
 
 # ---------- Happy path ----------
