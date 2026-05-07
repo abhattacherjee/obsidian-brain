@@ -78,7 +78,7 @@ def parse_frontmatter_field(content: str, key: str) -> str | None:
         content or a head buffer (e.g. ``vault_stats``'s 2 KB read).
 
     Quote stripping uses ``.strip().strip('"').strip("'")`` — matches the
-    existing 7 migrated sites for strictly behaviorally-equivalent reads
+    existing 8 migrated call sites for strictly behaviorally-equivalent reads
     on the happy path.
 
     Stdlib only.
