@@ -80,13 +80,14 @@ def parse_frontmatter_field(content: str, key: str) -> str | None:
       - If ``content`` does not start with ``---``, the search region
         is the full ``content``.
 
-    Quote stripping uses ``.strip().strip('"').strip("'")`` — matches the
-    existing 8 migrated call sites for strictly behaviorally-equivalent
-    reads on the happy path. Empty-value semantics intentionally differ
-    from the old buggy regex (which could cross newlines into the next
-    YAML key); see ``tests/test_frontmatter_field_migration_parity.py``
-    for the full parity matrix and ``test_empty_type_treated_as_legacy_keep``
-    for the type-filter behavioral pin.
+    Quote stripping uses ``.strip().strip('"').strip("'")`` to match the
+    existing migrated call sites — strictly behaviorally-equivalent reads
+    on the happy path. Empty-value semantics intentionally differ from
+    the old buggy regex (which could cross newlines into the next YAML
+    key); see ``tests/test_frontmatter_field_migration_parity.py`` for
+    the full parity matrix and
+    ``test_empty_type_treated_as_legacy_keep`` for the type-filter
+    behavioral pin.
 
     Stdlib only.
     """
