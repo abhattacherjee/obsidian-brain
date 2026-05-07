@@ -2250,16 +2250,14 @@ def find_latest_session(
         frontmatter = text[: fm_end + 4]
 
         # Match project field (case-insensitive basename or slug)
-        project_match = re.search(r"^project:\s*(.+)$", frontmatter, re.MULTILINE)
-        if not project_match:
+        fm_project = parse_frontmatter_field(frontmatter, "project")
+        if not fm_project:
             continue
-        fm_project = project_match.group(1).strip().strip('"').strip("'")
         if fm_project.lower() != project.lower() and slugify(fm_project) != slug:
             continue
 
         # Extract date from frontmatter
-        date_match = re.search(r"^date:\s*(.+)$", frontmatter, re.MULTILINE)
-        date_str = date_match.group(1).strip() if date_match else ""
+        date_str = parse_frontmatter_field(frontmatter, "date") or ""
 
         # Extract summary section
         summary = ""
@@ -2327,23 +2325,20 @@ def find_unsummarized_notes(
         frontmatter = content[:fm_end]
 
         # Must be auto-logged
-        status_match = re.search(r'^status:\s*(.+)$', frontmatter, re.MULTILINE)
-        if not status_match or status_match.group(1).strip() != 'auto-logged':
+        status_val = parse_frontmatter_field(frontmatter, "status")
+        if status_val != "auto-logged":
             continue
 
         # Type filter — accept both sessions and snapshots. Legacy notes
         # without a type field are kept (current permissive behavior).
-        type_match = re.search(r'^type:\s*(.+)$', frontmatter, re.MULTILINE)
-        if type_match:
-            type_val = type_match.group(1).strip().strip('"').strip("'")
-            if type_val not in ("claude-session", "claude-snapshot"):
-                continue
+        type_val = parse_frontmatter_field(frontmatter, "type")
+        if type_val and type_val not in ("claude-session", "claude-snapshot"):
+            continue
 
         # Must match project
-        project_match = re.search(r'^project:\s*(.+)$', frontmatter, re.MULTILINE)
-        if not project_match:
+        fm_project = parse_frontmatter_field(frontmatter, "project")
+        if not fm_project:
             continue
-        fm_project = project_match.group(1).strip().strip('"').strip("'")
         if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
             continue
 
