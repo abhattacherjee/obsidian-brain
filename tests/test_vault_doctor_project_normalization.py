@@ -254,7 +254,8 @@ def test_scan_ignores_project_pattern_in_body(norm_vault):
         "type: claude-session\n"
         "---\n"
         "## Body\n"
-        "Some text mentioning project: bogus_underscored\n"
+        "Some text mentioning project: bogus_underscored\n",
+        encoding="utf-8",
     )
     issues = check.scan(
         str(norm_vault["vault"]),
@@ -288,7 +289,8 @@ def test_scan_skips_notes_with_empty_project_field(norm_vault):
         'project_path: "/"\n'
         "type: claude-session\n"
         "---\n"
-        "Body.\n"
+        "Body.\n",
+        encoding="utf-8",
     )
 
     issues = check.scan(
