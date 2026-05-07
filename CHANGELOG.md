@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fix YAML-frontmatter regex `\s*` cross-newline bug across 8 call sites in
+  `hooks/obsidian_utils.py`, `hooks/vault_stats.py`, and
+  `scripts/vault_doctor_checks/project_name_normalization.py`. An empty
+  `project:` (or `date:`, `status:`, `type:`, `session_id:`) field no longer
+  causes the next YAML key's value to be misread. Adds a shared
+  `parse_frontmatter_field()` helper. (#94)
+
 ## [2.4.3] - 2026-05-05
 
 ### Added
