@@ -33,6 +33,8 @@ def test_helper_reads_non_empty_scalar(key, value, expected):
 @pytest.mark.parametrize("key", ["project", "date", "status", "type", "session_id"])
 def test_helper_returns_none_for_empty_value(key):
     """Issue #94: empty value must NOT cross newline to next key."""
+    # Mirrors the issue #94 reproducer (`project:` followed by
+    # `project_path: "/"`); applied to other keys for parametric coverage.
     fm = f"---\n{key}: \nnext_key: trap-value\nproject_path: \"/\"\n---\n"
     assert parse_frontmatter_field(fm, key) is None
 

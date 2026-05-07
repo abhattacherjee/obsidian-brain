@@ -71,15 +71,22 @@ def parse_frontmatter_field(content: str, key: str) -> str | None:
     Search region:
       - If ``content`` starts with ``---`` and a closing ``\n---`` is
         found, the search region is the frontmatter block up to and
-        including the closing fence.
-      - Otherwise the search region is the full ``content``. This
-        tolerates callers that pass already-sliced frontmatter (with or
-        without the closing fence) as well as callers that pass full file
-        content or a head buffer (e.g. ``vault_stats``'s 2 KB read).
+        including the three dashes of the closing fence (no trailing
+        newline).
+      - If ``content`` starts with ``---`` but no closing ``\n---`` is
+        found, the search region is the full ``content`` (best-effort
+        for callers like ``vault_stats``'s 2 KB head buffer that may
+        truncate before the closing fence).
+      - If ``content`` does not start with ``---``, the search region
+        is the full ``content``.
 
     Quote stripping uses ``.strip().strip('"').strip("'")`` — matches the
-    existing 8 migrated call sites for strictly behaviorally-equivalent reads
-    on the happy path.
+    existing 8 migrated call sites for strictly behaviorally-equivalent
+    reads on the happy path. Empty-value semantics intentionally differ
+    from the old buggy regex (which could cross newlines into the next
+    YAML key); see ``tests/test_frontmatter_field_migration_parity.py``
+    for the full parity matrix and ``test_empty_type_treated_as_legacy_keep``
+    for the type-filter behavioral pin.
 
     Stdlib only.
     """
@@ -2330,7 +2337,8 @@ def find_unsummarized_notes(
             continue
 
         # Type filter — accept both sessions and snapshots. Legacy notes
-        # without a type field are kept (current permissive behavior).
+        # without a `type:` field — and notes with an empty `type:` value —
+        # are kept (current permissive behavior; #94 made these equivalent).
         type_val = parse_frontmatter_field(frontmatter, "type")
         if type_val and type_val not in ("claude-session", "claude-snapshot"):
             continue

@@ -242,6 +242,34 @@ def test_apply_backup_includes_source_folder(norm_vault):
         assert os.path.isfile(p)
 
 
+def test_scan_ignores_project_pattern_in_body(norm_vault):
+    """Site H frontmatter slicing must isolate body content. A `project:`
+    line in the body must not produce a separate normalization issue."""
+    import vault_doctor_checks.project_name_normalization as check
+
+    note = norm_vault["sessions"] / "2026-05-07-body-collision.md"
+    note.write_text(
+        "---\n"
+        "project: legitimate-project\n"
+        "type: claude-session\n"
+        "---\n"
+        "## Body\n"
+        "Some text mentioning project: bogus_underscored\n"
+    )
+    issues = check.scan(
+        str(norm_vault["vault"]),
+        "claude-sessions",
+        "claude-insights",
+        days=9999,
+    )
+    # The body's "project: bogus_underscored" must NOT generate a
+    # normalization issue. The legitimate frontmatter project has no
+    # underscore so generates nothing either.
+    assert all(i.note_path != str(note) for i in issues), (
+        "Body line containing `project:` falsely triggered a normalization issue"
+    )
+
+
 def test_scan_skips_notes_with_empty_project_field(norm_vault):
     """Issue #94: regex must not cross newlines into the next YAML key.
 
