@@ -635,44 +635,75 @@ def scan(
                         )
                         if fallback_path is not None:
                             window = _jsonl_window(str(fallback_path))
+                    overlap_ok = False
                     if day_start is not None and window is not None:
                         day_end = day_start + 86400
                         first_ts, last_ts = window
-                        if first_ts < day_end and last_ts > day_start:
-                            # UUID resolves AND window overlaps note's day → UUID is correct.
-                            # Now check if source_session_note basename is stale.
-                            actual_basename = sess["basename"]
-                            if (
-                                current_src_basename
-                                and current_src_basename != actual_basename
-                            ):
-                                # Basename mismatch (e.g., un-truncated worktree slug
-                                # vs truncated actual filename). Propose basename-only
-                                # repair; UUID stays the same.
-                                issues.append(
-                                    Issue(
-                                        check=NAME,
-                                        note_path=str(note),
-                                        project=note_project,
-                                        current_source=current_source_display,
-                                        proposed_source=f"[[{actual_basename}]]",
-                                        reason=(
-                                            f"source_session UUID {current_sid[:8]} resolves "
-                                            f"correctly but source_session_note basename is "
-                                            f"stale (expected '{actual_basename}', got "
-                                            f"'{current_src_basename}')"
-                                        ),
-                                        confidence=0.99,
-                                        extra={
-                                            "proposed_sid": current_sid,
-                                            "basename_only": True,
-                                            "capture_signal": capture_signal,
-                                            "capture_confidence": capture_conf,
-                                            "signal_class": "uuid-basename-stale",
-                                        },
-                                    )
-                                )
-                            continue  # UUID is authoritative either way; skip matcher
+                        overlap_ok = first_ts < day_end and last_ts > day_start
+
+                    actual_basename = sess["basename"]
+                    if day_start is not None and window is not None and not overlap_ok:
+                        # Issue #106: UUID resolves but JSONL window does NOT overlap
+                        # note's calendar day. Emit a WARN at conf=0.0; never propose
+                        # a SID rewrite. Operators must verify manually (likely a
+                        # cross-midnight write-side stamp bug or a worktree edge case
+                        # outside #101's scope).
+                        first_ts, last_ts = window
+                        issues.append(
+                            Issue(
+                                check=NAME,
+                                note_path=str(note),
+                                project=note_project,
+                                current_source=current_source_display,
+                                proposed_source="",
+                                reason=(
+                                    f"source_session UUID {current_sid[:8]} resolves "
+                                    f"but JSONL window "
+                                    f"{datetime.fromtimestamp(first_ts, timezone.utc).date()}..{datetime.fromtimestamp(last_ts, timezone.utc).date()} "
+                                    f"does not overlap note day {datetime.fromtimestamp(day_start, timezone.utc).date()} "
+                                    f"— verify manually, never auto-rewrite"
+                                ),
+                                confidence=0.0,
+                                extra={
+                                    "unresolved": True,
+                                    "capture_signal": capture_signal,
+                                    "capture_confidence": capture_conf,
+                                    "signal_class": "uuid-day-mismatch",
+                                },
+                            )
+                        )
+                        continue
+
+                    # UUID resolves AND (overlap_ok OR overlap inconclusive) →
+                    # UUID is authoritative. Check basename staleness.
+                    if (
+                        current_src_basename
+                        and current_src_basename != actual_basename
+                    ):
+                        issues.append(
+                            Issue(
+                                check=NAME,
+                                note_path=str(note),
+                                project=note_project,
+                                current_source=current_source_display,
+                                proposed_source=f"[[{actual_basename}]]",
+                                reason=(
+                                    f"source_session UUID {current_sid[:8]} resolves "
+                                    f"correctly but source_session_note basename is "
+                                    f"stale (expected '{actual_basename}', got "
+                                    f"'{current_src_basename}')"
+                                ),
+                                confidence=0.99,
+                                extra={
+                                    "proposed_sid": current_sid,
+                                    "basename_only": True,
+                                    "capture_signal": capture_signal,
+                                    "capture_confidence": capture_conf,
+                                    "signal_class": "uuid-basename-stale",
+                                },
+                            )
+                        )
+                    continue  # UUID is authoritative; skip matcher
                 else:
                     # UUID not in session-note index — but a real JSONL may
                     # still exist (SessionEnd hook missed; see issue #98).

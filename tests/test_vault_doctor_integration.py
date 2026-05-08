@@ -48,13 +48,18 @@ def test_end_to_end_scan_apply_verify(tmp_path):
         encoding="utf-8",
     )
 
-    # Stale insight (captured in session B but stamped with session A)
+    # Stale insight (captured in session B but stamped with a UUID not in the
+    # session-note index). Using a UUID absent from the index ensures Phase 1
+    # UUID-first does not intercept it — the date-window matcher then finds sid-b
+    # and produces a rewritable issue. (Issue #106: if source_session were sid-a,
+    # which IS in the index with date 2026-04-09, Phase 1 would emit
+    # uuid-day-mismatch/unresolved for this 2026-04-10 note and stop.)
     insight = vault / "claude-insights" / "2026-04-10-stale-e2e.md"
     insight.write_text(
         '---\n'
         'type: claude-insight\n'
         'date: 2026-04-10\n'
-        'source_session: sid-a\n'
+        'source_session: not-in-index-e2e-uuid\n'
         'source_session_note: "[[2026-04-09-proj1-aaaa]]"\n'
         'project: proj1\n'
         'tags:\n'
@@ -172,15 +177,18 @@ def test_json_payload_has_top_level_signal_and_convergence_keys(tmp_path):
         encoding="utf-8",
     )
 
-    # Two stale insights on 2026-04-10 both pointing at sid-a — both will
-    # converge onto sid-b via the date-overlap matcher.
-    for slug in ("conv-one", "conv-two"):
+    # Two stale insights on 2026-04-10 both converging onto sid-b via the
+    # date-overlap matcher. source_session uses UUIDs not in the session-note
+    # index so Phase 1 UUID-first does not intercept them (Issue #106: if they
+    # pointed at sid-a, Phase 1 would emit uuid-day-mismatch/unresolved for
+    # these 2026-04-10 notes and the convergence guard would never fire).
+    for i, slug in enumerate(("conv-one", "conv-two")):
         insight = vault / "claude-insights" / f"2026-04-10-{slug}.md"
         insight.write_text(
             '---\n'
             'type: claude-insight\n'
             'date: 2026-04-10\n'
-            'source_session: sid-a\n'
+            f'source_session: not-in-index-conv-{i}\n'
             'source_session_note: "[[2026-04-09-convproj-aaaa]]"\n'
             'project: convproj\n'
             'tags:\n'
