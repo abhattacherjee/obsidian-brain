@@ -791,16 +791,37 @@ def scan(
             if match["sid"] == current_sid:
                 continue  # correct
 
-            # Cap confidence on date-only signals: day-precision matching can still
-            # be ambiguous on multi-session days because multiple windows may overlap
-            # the same UTC calendar day. `created_at` is the only signal precise
-            # enough for high confidence.
-            if capture_signal == "created_at":
-                proposed_conf = 0.95
-            elif capture_signal == "mtime":
-                proposed_conf = 0.3  # below convergence floor; never auto-apply
-            else:
-                proposed_conf = 0.6
+            # Issue #106: date-window matcher only fires when UUID is empty/unresolved.
+            # When it does fire, it's a HINT, never an auto-applyable proposal:
+            #   date / filename → conf=0.5 (date-window-hint); operator content-greps
+            #   mtime → handled below; early-exits as unresolved (no SID proposal)
+            #   corrupt (signal=none, conf=0.0) → filtered before this block; never reaches here
+            if capture_signal == "mtime":
+                # mtime is too imprecise to anchor a hint. Re-emit as unresolved
+                # so it surfaces in the WARN list without proposing a SID.
+                if current_sid not in idx:
+                    issues.append(
+                        Issue(
+                            check=NAME,
+                            note_path=str(note),
+                            project=note_project,
+                            current_source=current_source_display,
+                            proposed_source="",
+                            reason=(
+                                f"capture_signal=mtime is too imprecise to "
+                                f"anchor a date-window hint (issue #106)"
+                            ),
+                            confidence=0.0,
+                            extra={
+                                "unresolved": True,
+                                "capture_signal": capture_signal,
+                                "capture_confidence": capture_conf,
+                                "signal_class": "unresolved",
+                            },
+                        )
+                    )
+                continue
+            proposed_conf = 0.5
             # Build reason text matching the matcher actually used (Copilot R4):
             # day-overlap → describe calendar-day match; point-in-window →
             # describe capture_time match. mtime with no date/filename takes

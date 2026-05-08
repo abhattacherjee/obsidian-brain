@@ -232,6 +232,7 @@ def test_scan_marks_unresolved_when_no_window_matches(doctor_vault, monkeypatch)
     assert iss.confidence == 0.0
     assert iss.proposed_source == ""
     assert "gap-insight" in iss.note_path
+    assert iss.extra.get("signal_class") == "unresolved"
 
 
 def test_apply_rewrites_only_source_session_fields(doctor_vault, tmp_path, monkeypatch):
@@ -928,6 +929,7 @@ def test_scan_unresolved_reason_uses_capture_time(doctor_vault, monkeypatch):
     assert "mtime" not in iss.reason, f"reason should not mention mtime: {iss.reason!r}"
     assert iss.extra.get("capture_signal") == "date"
     assert iss.extra.get("capture_confidence") == 0.9
+    assert iss.extra.get("signal_class") == "unresolved"
 
 
 def test_scan_trusts_current_source_when_same_day(doctor_vault, monkeypatch):
@@ -1131,57 +1133,6 @@ def test_scan_basename_only_repair_when_uuid_resolves(doctor_vault, monkeypatch)
     assert sess.stem in iss.proposed_source  # actual basename in proposal
     assert iss.confidence >= 0.95
 
-
-def test_scan_caps_date_signal_confidence(doctor_vault, monkeypatch):
-    """Matcher-proposed flags using only date/filename signals must be capped
-    at confidence <= 0.6 -- multi-session days collapse onto noon-UTC and
-    produce uniform-but-wrong proposals."""
-    vault = doctor_vault["vault"]
-    home = doctor_vault["home"]
-    jsonl_dir = doctor_vault["jsonl_dir"]
-    project = doctor_vault["project"]
-    monkeypatch.setenv("HOME", str(home))
-
-    sid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa11"
-    sid_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb11"
-
-    a_first = datetime(2026, 4, 21, 10, 0, tzinfo=timezone.utc).timestamp()
-    a_last = datetime(2026, 4, 21, 18, 0, tzinfo=timezone.utc).timestamp()
-    _write_jsonl(jsonl_dir / f"{sid_a}.jsonl",
-                 datetime.fromtimestamp(a_first, tz=timezone.utc).isoformat(),
-                 a_last)
-    b_first = datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc).timestamp()
-    b_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
-    _write_jsonl(jsonl_dir / f"{sid_b}.jsonl",
-                 datetime.fromtimestamp(b_first, tz=timezone.utc).isoformat(),
-                 b_last)
-
-    _write_session_note(vault / "claude-sessions", "2026-04-21", project, sid_a, "1111")
-    _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid_b, "2222")
-
-    # Insight on day B (sole same-day session) but source_session points to
-    # day-A session whose UUID does NOT resolve (no entry in idx for proj1)
-    bogus_sid = "00000000-0000-0000-0000-000000000000"
-    _write_insight(
-        vault / "claude-insights",
-        date="2026-04-22",
-        slug="conf-cap",
-        project=project,
-        src_sid=bogus_sid,
-        src_note_basename="2026-04-22-bogus",
-        mtime=b_first + 1800,
-    )
-
-    issues = ss.scan(
-        vault_path=str(vault),
-        sessions_folder="claude-sessions",
-        insights_folder="claude-insights",
-        days=10000,
-        project=project,
-    )
-    flagged = [i for i in issues if "conf-cap" in i.note_path and not i.extra.get("unresolved")]
-    assert len(flagged) == 1
-    assert flagged[0].confidence <= 0.6
 
 
 @pytest.mark.parametrize("n_flags", [2, 3, 5])
@@ -1551,80 +1502,6 @@ def test_scan_day_overlap_picks_morning_session(doctor_vault, monkeypatch):
     )
 
 
-def test_scan_caps_mtime_signal_confidence_below_convergence_floor(doctor_vault, monkeypatch):
-    """When capture_signal falls all the way to mtime (no created_at, no date
-    frontmatter, no YYYY-MM-DD filename prefix), the proposed-rewrite confidence
-    must be capped at <=0.3 — below the convergence floor of 0.4 — so an
-    operator never auto-applies an mtime-only proposal (review C2)."""
-    vault = doctor_vault["vault"]
-    home = doctor_vault["home"]
-    jsonl_dir = doctor_vault["jsonl_dir"]
-    project = doctor_vault["project"]
-    monkeypatch.setenv("HOME", str(home))
-
-    # Two sessions on different days so the date-overlap matcher returns a
-    # different session than the one currently referenced.
-    a_start = calendar.timegm(time.strptime("2026-04-15 10:00", "%Y-%m-%d %H:%M"))
-    a_end = a_start + 3600
-    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-15T10:00:00Z", a_end)
-    _write_session_note(vault / "claude-sessions", "2026-04-15", project, "sid-a", "aaaa")
-
-    b_start = calendar.timegm(time.strptime("2026-04-16 10:00", "%Y-%m-%d %H:%M"))
-    b_end = b_start + 4 * 3600
-    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-16T10:00:00Z", b_end)
-    _write_session_note(vault / "claude-sessions", "2026-04-16", project, "sid-b", "bbbb")
-
-    # Insight with NO created_at, NO date frontmatter, NO YYYY-MM-DD filename
-    # prefix → mtime is the only available signal. Filename intentionally
-    # avoids the date prefix.
-    #
-    # NOTE (Issue #106): source_session is set to a UUID not in the session-note
-    # index. If it were set to "sid-a" (which is in the index), Phase 1 UUID-first
-    # would intercept: with no date in the note, day_start=None → the basename
-    # check runs → basename matches ("2026-04-15-proj1-aaaa") → continue, skip
-    # matcher. The mtime-stale path would never fire.
-    insight = vault / "claude-insights" / "no-date-prefix-mtime-only.md"
-    insight.write_text(
-        "---\n"
-        "type: claude-insight\n"
-        f"source_session: not-in-index-mtime-uuid\n"
-        f'source_session_note: "[[2026-04-15-{project}-aaaa]]"\n'
-        f"project: {project}\n"
-        "tags:\n"
-        "  - claude/insight\n"
-        f"  - claude/project/{project}\n"
-        "---\n"
-        "# body\n",
-        encoding="utf-8",
-    )
-    # Set mtime inside session B's window so the matcher proposes sid-b.
-    insight_mtime = b_start + 1800
-    os.utime(insight, (insight_mtime, insight_mtime))
-
-    issues = ss.scan(
-        vault_path=str(vault),
-        sessions_folder="claude-sessions",
-        insights_folder="claude-insights",
-        days=10000,
-        project=project,
-    )
-    flagged = [
-        i for i in issues
-        if i.note_path == str(insight)
-        and not i.extra.get("unresolved")
-        and not i.extra.get("basename_only")
-    ]
-    assert len(flagged) == 1, (
-        f"expected 1 stale flag for mtime-signal insight, got {len(flagged)}: "
-        f"{[(i.confidence, i.extra) for i in flagged]}"
-    )
-    assert flagged[0].extra.get("capture_signal") == "mtime", (
-        f"test setup error: expected mtime signal, got {flagged[0].extra.get('capture_signal')}"
-    )
-    assert flagged[0].confidence <= 0.3, (
-        f"mtime-signal confidence must be <=0.3, got {flagged[0].confidence}"
-    )
-
 
 def test_scan_emits_unresolved_when_jsonl_exists_but_session_note_missing(
     doctor_vault, monkeypatch
@@ -1949,13 +1826,13 @@ def test_scan_reason_text_branches_by_signal(doctor_vault, monkeypatch):
     assert "matches session" in ca_issue.reason and "window" in ca_issue.reason
 
 
-def test_scan_reason_text_for_mtime_fallback_uses_point_in_window(
+def test_scan_reason_text_for_mtime_fallback_emits_unresolved(
     doctor_vault, monkeypatch
 ):
-    """Copilot R4-1: when capture_signal is 'mtime' AND there's no fm.date
-    AND no YYYY-MM-DD filename prefix, scan() falls through to the point-in-
-    window matcher (not day-overlap). Reason text must say 'capture_time
-    matches session window' not 'calendar day overlaps session window'.
+    """Issue #106: when capture_signal is 'mtime' AND there's no fm.date
+    AND no YYYY-MM-DD filename prefix, scan() now emits an unresolved WARN
+    (conf=0.0, no proposed SID) rather than a point-in-window SID rewrite.
+    mtime is too imprecise to anchor a date-window hint.
     """
     vault = doctor_vault["vault"]
     home = doctor_vault["home"]
@@ -1999,15 +1876,17 @@ def test_scan_reason_text_for_mtime_fallback_uses_point_in_window(
         project=project,
     )
     flagged = [i for i in issues if i.note_path == str(note)]
-    assert flagged, "mtime-only note should flag (mtime falls inside window)"
+    assert flagged, "mtime-only note should flag as unresolved (issue #106)"
     issue = flagged[0]
     assert issue.extra.get("capture_signal") == "mtime"
-    assert "capture_time" in issue.reason, (
-        f"mtime fallback uses point-in-window matcher; reason should say "
-        f"'capture_time' not 'calendar day'. Got: {issue.reason}"
+    assert issue.extra.get("unresolved") is True, (
+        f"mtime-only note must emit as unresolved, not a SID rewrite. Got: {issue!r}"
     )
-    assert "calendar day" not in issue.reason, (
-        f"mtime-fallback reason must not claim calendar-day overlap. Got: {issue.reason}"
+    assert issue.extra.get("signal_class") == "unresolved"
+    assert issue.confidence == 0.0
+    assert issue.proposed_source == ""
+    assert "mtime" in issue.reason, (
+        f"reason should mention mtime. Got: {issue.reason}"
     )
 
 
@@ -2072,8 +1951,8 @@ def test_convergence_guard_excludes_created_at_signal(doctor_vault, monkeypatch)
         f"got {len(created_at_flags)}"
     )
     for issue in created_at_flags:
-        assert issue.confidence == 0.95, (
-            f"created_at-signal flag must keep its 0.95 confidence — "
+        assert issue.confidence == 0.5, (
+            f"created_at-signal flag must keep its 0.5 confidence (issue #106 band) — "
             f"convergence guard should not cap created_at. Got: {issue.confidence}"
         )
         assert not issue.extra.get("convergence_warning"), (
@@ -2302,3 +2181,53 @@ def test_uuid_resolves_jsonl_window_outside_note_day_emits_warn(doctor_vault, mo
     assert flagged[0].extra.get("unresolved") is True
     assert flagged[0].proposed_source == ""
     assert flagged[0].extra.get("proposed_sid") in (None, "")
+
+
+def test_unknown_uuid_with_date_window_candidate_hint(doctor_vault, monkeypatch):
+    """Spec #106 test #5: source_session: 'unknown' + date-window candidate exists →
+    1 issue, conf=0.5, signal_class='date-window-hint', reason instructs operator
+    to content-grep before applying."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    sid_real = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+    r_first = datetime(2026, 4, 22, 9, 0, tzinfo=timezone.utc).timestamp()
+    r_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_real}.jsonl",
+                 datetime.fromtimestamp(r_first, tz=timezone.utc).isoformat(),
+                 r_last)
+    sess = _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid_real, "eeee")
+
+    bogus_sid = "00000000-0000-0000-0000-000000000099"
+    insight_path = vault / "claude-insights" / "2026-04-22-dwh.md"
+    insight_path.write_text(
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: 2026-04-22\n"
+        f"source_session: {bogus_sid}\n"
+        f'source_session_note: "[[2026-04-22-bogus]]"\n'
+        f"project: {project}\n"
+        f"---\n# stub\n",
+        encoding="utf-8",
+    )
+    os.utime(insight_path, (r_first + 1800, r_first + 1800))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [
+        i for i in issues
+        if i.note_path == str(insight_path) and not i.extra.get("unresolved")
+    ]
+    assert len(flagged) == 1
+    assert flagged[0].confidence == 0.5
+    assert flagged[0].extra.get("signal_class") == "date-window-hint"
+    assert flagged[0].extra.get("proposed_sid") == sid_real
+    assert sess.stem in flagged[0].proposed_source
