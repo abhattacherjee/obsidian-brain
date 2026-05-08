@@ -401,7 +401,13 @@ def test_parse_date_midpoint_negative_edges_return_none(bad_date):
 
 
 def test_scan_latest_start_wins_on_boundary_tie(doctor_vault, monkeypatch):
-    """When two session windows both contain capture_time, latest first_ts wins."""
+    """When two session windows both contain capture_time, latest first_ts wins.
+
+    Issue #106: UUID-first now fires for created_at signals too. To exercise
+    the timestamp-matcher tie-break path, the note's source_session must be a
+    UUID that has neither a JSONL nor a session note — so UUID-first cannot
+    resolve it and the matcher runs on the created_at anchor.
+    """
     import vault_doctor_checks.source_sessions as check
 
     v = doctor_vault["vault"]
@@ -421,17 +427,17 @@ def test_scan_latest_start_wins_on_boundary_tie(doctor_vault, monkeypatch):
     _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T14:00:00Z", b_mtime)
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
 
-    # Insight captured at 14:02 — inside BOTH windows.
-    # We inject created_at so _capture_time uses the precise sub-day timestamp
-    # (date: midday = 12:00, which only falls in A; we need 14:02 in both).
+    # Insight: currently stamped with a phantom SID (no JSONL, no session note)
+    # so UUID-first cannot resolve it; the matcher runs on created_at.
+    phantom_sid = "ffffffff-ffff-ffff-ffff-000000000000"
     insight_mtime = calendar.timegm(time.strptime("2026-04-10 14:02", "%Y-%m-%d %H:%M"))
     insight_path = _write_insight(
         v / "claude-insights",
         "2026-04-10",
         "boundary-tie-insight",
         "proj1",
-        "sid-a",  # currently (wrongly) stamped with the older session
-        "2026-04-10-proj1-aaaa",
+        phantom_sid,  # UUID that resolves nowhere
+        "2026-04-10-proj1-phantom",
         insight_mtime,
     )
     # Inject created_at so _capture_time resolves to 14:02 (inside both windows)
@@ -959,86 +965,6 @@ def test_scan_trusts_current_source_when_same_day(doctor_vault, monkeypatch):
     )
 
 
-def test_scan_created_at_bypasses_early_exit(doctor_vault, monkeypatch):
-    """Pin test for the capture_signal != 'created_at' carve-out in Phase 1b
-    early-exit (issue #93). A note with created_at AND a same-day current
-    source MUST still be validated by the matcher; the early-exit must NOT
-    short-circuit just because date strings agree.
-
-    If this test goes silent (passes when it shouldn't), the carve-out has
-    been removed and high-precision created_at notes are being trusted on
-    same-day SID match alone — masking actual corruption."""
-    vault = doctor_vault["vault"]
-    home = doctor_vault["home"]
-    jsonl_dir = doctor_vault["jsonl_dir"]
-    project = doctor_vault["project"]
-
-    monkeypatch.setenv("HOME", str(home))
-
-    day = "2026-04-22"
-    sid_x = "33333333-3333-3333-3333-333333333333"
-    sid_y = "44444444-4444-4444-4444-444444444444"
-
-    # Two same-day sessions, NON-overlapping.
-    # Session X: 09:00–11:00 (current source — INCORRECT for the note).
-    # Session Y: 14:00–16:00 (the note's actual created_at falls here).
-    x_start = datetime(2026, 4, 22, 9, 0, tzinfo=timezone.utc).timestamp()
-    x_end = datetime(2026, 4, 22, 11, 0, tzinfo=timezone.utc).timestamp()
-    _write_jsonl(jsonl_dir / f"{sid_x}.jsonl",
-                 datetime.fromtimestamp(x_start, tz=timezone.utc).isoformat(),
-                 x_end)
-
-    y_start = datetime(2026, 4, 22, 14, 0, tzinfo=timezone.utc).timestamp()
-    y_end = datetime(2026, 4, 22, 16, 0, tzinfo=timezone.utc).timestamp()
-    _write_jsonl(jsonl_dir / f"{sid_y}.jsonl",
-                 datetime.fromtimestamp(y_start, tz=timezone.utc).isoformat(),
-                 y_end)
-
-    sess_x = _write_session_note(vault / "claude-sessions", day, project, sid_x, "3333")
-    sess_y = _write_session_note(vault / "claude-sessions", day, project, sid_y, "4444")
-
-    # Insight: source_session is X (same day, would satisfy date-equality early-exit
-    # if signal were date/filename), but created_at = 14:30 falls in Y's window.
-    # The matcher MUST be allowed to run and propose Y. Early-exit must NOT fire.
-    insight_path = vault / "claude-insights" / f"{day}-pin-carveout.md"
-    insight_path.write_text(
-        f"---\n"
-        f"type: claude-insight\n"
-        f"date: {day}\n"
-        f"created_at: 2026-04-22T14:30:00+00:00\n"
-        f"source_session: {sid_x}\n"
-        f'source_session_note: "[[{sess_x.stem}]]"\n'
-        f"project: {project}\n"
-        f"tags:\n"
-        f"  - claude/insight\n"
-        f"  - claude/project/{project}\n"
-        f"---\n"
-        f"# pin\n",
-        encoding="utf-8",
-    )
-    # Set mtime to a known stable value (irrelevant for matching now)
-    import os as _os
-    _os.utime(insight_path, (y_start + 1800, y_start + 1800))
-
-    issues = ss.scan(
-        vault_path=str(vault),
-        sessions_folder="claude-sessions",
-        insights_folder="claude-insights",
-        days=10000,
-        project=project,
-    )
-    flagged = [i for i in issues if i.note_path == str(insight_path)]
-    assert len(flagged) == 1, (
-        "carve-out regression: created_at note with same-day current source "
-        "was not re-validated by matcher (early-exit fired when it should not)"
-    )
-    iss = flagged[0]
-    assert iss.extra.get("capture_signal") == "created_at"
-    assert iss.extra.get("proposed_sid") == sid_y, (
-        f"matcher should propose Y (where created_at falls), got {iss.extra.get('proposed_sid')!r}"
-    )
-
-
 def test_scan_uuid_first_lookup_across_projects(doctor_vault, monkeypatch):
     """Phase 1b looks up source_session UUID across all projects, not just
     the note's declared project. Insight notes from a worktree-launched skill
@@ -1099,6 +1025,32 @@ def test_scan_uuid_first_lookup_across_projects(doctor_vault, monkeypatch):
         "regression: cross-project UUID resolution failed; insight flagged "
         "despite source UUID resolving to a real session note"
     )
+
+    # Issue #106 broaden: also exercise the basename-stale case across projects.
+    # Worktree-style adjacent project's session, but insight has a STALE basename.
+    insight2_path = vault / "claude-insights" / "2026-04-22-cross-stale-bn.md"
+    insight2_path.write_text(
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: 2026-04-22\n"
+        f"source_session: {sid_w}\n"
+        f'source_session_note: "[[2026-04-22-proj1-OLD-truncated]]"\n'
+        f"project: {project}\n"
+        f"---\n# stub\n",
+        encoding="utf-8",
+    )
+    os.utime(insight2_path, (w_first + 1800, w_first + 1800))
+
+    issues2 = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged2 = [i for i in issues2 if i.note_path == str(insight2_path)]
+    assert len(flagged2) == 1
+    assert flagged2[0].extra.get("signal_class") == "uuid-basename-stale"
 
 
 def test_scan_basename_only_repair_when_uuid_resolves(doctor_vault, monkeypatch):
@@ -2206,3 +2158,63 @@ def test_uuid_resolves_basename_points_at_unrelated_session(doctor_vault, monkey
     )
     assert sess_a.stem in flagged[0].proposed_source
     assert sess_b.stem not in flagged[0].proposed_source
+
+
+@pytest.mark.parametrize("capture_signal_kind", ["created_at", "date", "filename", "mtime"])
+def test_uuid_resolves_basename_matches_no_issue(doctor_vault, monkeypatch, capture_signal_kind):
+    """Spec #106 test #1: UUID resolves and basename matches → 0 issues, uniformly
+    across all capture signals. Verifies the dropped capture_signal != 'created_at'
+    carve-out: UUID-first now fires for every signal class."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    sid = "ccccccc1-cccc-cccc-cccc-cccccccccccc"
+    s_first = datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc).timestamp()
+    s_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid}.jsonl",
+                 datetime.fromtimestamp(s_first, tz=timezone.utc).isoformat(),
+                 s_last)
+    sess = _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid, "ccc1")
+
+    fm_lines = [
+        "---",
+        "type: claude-insight",
+        f"source_session: {sid}",
+        f'source_session_note: "[[{sess.stem}]]"',
+        f"project: {project}",
+    ]
+    if capture_signal_kind == "created_at":
+        fm_lines.append("date: 2026-04-22")
+        fm_lines.append(
+            f"created_at: {datetime.fromtimestamp(s_first + 1800, tz=timezone.utc).isoformat()}"
+        )
+        insight_path = vault / "claude-insights" / "2026-04-22-uniform-created-at.md"
+    elif capture_signal_kind == "date":
+        fm_lines.append("date: 2026-04-22")
+        insight_path = vault / "claude-insights" / "2026-04-22-uniform-date.md"
+    elif capture_signal_kind == "filename":
+        # No date in fm; filename prefix carries the date signal.
+        insight_path = vault / "claude-insights" / "2026-04-22-uniform-filename.md"
+    else:  # mtime
+        # No date, no filename prefix → mtime is the only signal.
+        insight_path = vault / "claude-insights" / "uniform-mtime-only.md"
+    fm_lines.append("---")
+
+    insight_path.write_text("\n".join(fm_lines) + "\n# stub\n", encoding="utf-8")
+    os.utime(insight_path, (s_first + 1800, s_first + 1800))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(insight_path)]
+    assert flagged == [], (
+        f"capture_signal_kind={capture_signal_kind}: expected 0 issues "
+        f"(UUID resolves + basename matches), got {len(flagged)}: {flagged}"
+    )

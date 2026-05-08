@@ -595,18 +595,19 @@ def scan(
             else:
                 current_source_display = ""
 
-            # Phase 1b — UUID-first authoritative signal:
+            # Phase 1 — UUID-FIRST (uniform across all capture signals):
             # if current source's UUID resolves to ANY session note in the
             # vault (cross-project, since worktree-launched skills may write
             # `project:` from main-repo cwd while their source session ran
             # in a worktree), check whether the JSONL window overlaps the
             # note's calendar day. If yes, the UUID is correct; only the
-            # basename in source_session_note may need updating.
+            # basename in source_session_note may need updating. If no,
+            # emit a uuid-day-mismatch WARN — never a SID rewrite proposal.
             #
-            # Only applies for day-precision signals (date, filename, mtime).
-            # When created_at provides a precise sub-day timestamp the matcher
-            # has enough resolution; let it run.
-            if current_sid and capture_signal != "created_at":
+            # Issue #106: removed the capture_signal != "created_at" carve-out;
+            # UUID resolution is the primary signal regardless of capture-time
+            # precision.
+            if current_sid and current_sid != "unknown":
                 if global_sid_index is None:
                     global_sid_index = _list_all_session_notes(sessions_dir)
                 if current_sid in global_sid_index:
