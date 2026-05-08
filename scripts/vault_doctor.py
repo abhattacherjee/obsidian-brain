@@ -181,6 +181,7 @@ def main() -> int:
                     "reason": i.reason,
                     "confidence": i.confidence,
                     "unresolved": i.extra.get("unresolved", False),
+                    "signal_class": i.extra.get("signal_class", ""),
                     "capture_signal": i.extra.get("capture_signal", ""),
                     "capture_confidence": i.extra.get("capture_confidence", 0.0),
                     "convergence_warning": i.extra.get("convergence_warning", False),
