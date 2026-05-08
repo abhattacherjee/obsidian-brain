@@ -225,3 +225,14 @@ def test_json_payload_has_top_level_signal_and_convergence_keys(tmp_path):
         assert "capture_confidence" in issue, f"missing capture_confidence: {issue}"
         assert "convergence_warning" in issue, f"missing convergence_warning: {issue}"
         assert "convergence_count" in issue, f"missing convergence_count: {issue}"
+        assert "signal_class" in issue, (
+            f"signal_class must be top-level in JSON payload, got keys: {list(issue.keys())}"
+        )
+        assert issue["signal_class"] in (
+            "uuid-basename-stale",
+            "uuid-day-mismatch",
+            "missing-session-note",
+            "date-window-hint",
+            "unresolved",
+            "",  # default for any future Issue lacking the field
+        ), f"signal_class={issue['signal_class']!r} not in documented taxonomy"
