@@ -1330,6 +1330,7 @@ def test_scan_trusts_uuid_when_jsonl_exists_but_note_missing(doctor_vault, monke
         "regression: must not propose a different session when source UUID "
         "had a real JSONL (just missing session note)"
     )
+    assert flagged[0].extra.get("signal_class") == "missing-session-note"
 
 
 # ---------------------------------------------------------------------------
@@ -1446,6 +1447,7 @@ def test_scan_emits_unresolved_when_jsonl_exists_but_session_note_missing(
     assert issue.extra.get("missing_session_note") is True
     assert issue.extra.get("jsonl_path") == str(orphan_jsonl)
     assert issue.confidence == 0.0
+    assert issue.extra.get("signal_class") == "missing-session-note"
 
 
 def test_list_all_session_notes_warns_on_malformed_frontmatter(tmp_path, capsys):
@@ -2089,3 +2091,143 @@ def test_apply_raises_runtime_error_on_unknown_signal_class(tmp_path):
     backup_root = tmp_path / "backup"
     with pytest.raises(RuntimeError, match="signal_class='date-window-hint'"):
         ss.apply([bad], str(backup_root))
+
+
+# ---------------------------------------------------------------------------
+# PR #151 review fixes — Phase 1 nesting correctness
+# ---------------------------------------------------------------------------
+
+def test_uuid_resolves_basename_matches_skips_even_when_window_disjoint(doctor_vault, monkeypatch):
+    """Spec #106 nesting: when basename matches, skip outright — even if the
+    JSONL window doesn't overlap the note's day. Cross-midnight notes whose
+    basename is correct should not produce WARN noise."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # Session ran 2026-04-20 evening; note dated 2026-04-21 (cross-midnight scenario)
+    sid = "12121212-1212-1212-1212-121212121212"
+    s_first = datetime(2026, 4, 20, 22, 0, tzinfo=timezone.utc).timestamp()
+    s_last = datetime(2026, 4, 20, 23, 30, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid}.jsonl",
+                 datetime.fromtimestamp(s_first, tz=timezone.utc).isoformat(),
+                 s_last)
+    sess = _write_session_note(vault / "claude-sessions", "2026-04-20", project, sid, "1212")
+
+    insight_path = vault / "claude-insights" / "2026-04-21-cross-midnight-correct.md"
+    insight_path.write_text(
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: 2026-04-21\n"
+        f"source_session: {sid}\n"
+        f'source_session_note: "[[{sess.stem}]]"\n'
+        f"project: {project}\n"
+        f"---\n# stub\n",
+        encoding="utf-8",
+    )
+    os.utime(insight_path, (s_last + 60, s_last + 60))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(insight_path)]
+    assert flagged == [], (
+        f"basename matches resolved UUID — should skip outright, got {flagged}"
+    )
+
+
+def test_uuid_resolves_basename_diverges_no_jsonl_emits_day_mismatch(doctor_vault, monkeypatch):
+    """Spec #106 fail-closed: UUID resolves, basename diverges, but no JSONL
+    is available anywhere → emit uuid-day-mismatch (overlap inconclusive),
+    NEVER auto-apply at conf=0.99."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # Session note exists but no JSONL anywhere
+    sid = "13131313-1313-1313-1313-131313131313"
+    sess = _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid, "1313")
+
+    insight_path = vault / "claude-insights" / "2026-04-22-no-jsonl.md"
+    insight_path.write_text(
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: 2026-04-22\n"
+        f"source_session: {sid}\n"
+        f'source_session_note: "[[2026-04-22-WRONG-bn]]"\n'
+        f"project: {project}\n"
+        f"---\n# stub\n",
+        encoding="utf-8",
+    )
+    os.utime(insight_path, (
+        datetime(2026, 4, 22, 12, 0, tzinfo=timezone.utc).timestamp(),
+        datetime(2026, 4, 22, 12, 0, tzinfo=timezone.utc).timestamp(),
+    ))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(insight_path)]
+    assert len(flagged) == 1
+    assert flagged[0].confidence == 0.0
+    assert flagged[0].extra.get("signal_class") == "uuid-day-mismatch"
+    assert flagged[0].proposed_source == ""
+    assert flagged[0].extra.get("proposed_sid") in (None, "")
+
+
+def test_unknown_literal_with_date_window_candidate_hint(doctor_vault, monkeypatch):
+    """Verify literal source_session: 'unknown' sentinel → falls through to
+    date-window matcher (the carve-out at line 609 short-circuits empty/unknown)."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    sid_real = "14141414-1414-1414-1414-141414141414"
+    r_first = datetime(2026, 4, 22, 9, 0, tzinfo=timezone.utc).timestamp()
+    r_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_real}.jsonl",
+                 datetime.fromtimestamp(r_first, tz=timezone.utc).isoformat(),
+                 r_last)
+    _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid_real, "1414")
+
+    insight_path = vault / "claude-insights" / "2026-04-22-unknown-sentinel.md"
+    insight_path.write_text(
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: 2026-04-22\n"
+        f"source_session: unknown\n"
+        f'source_session_note: "[[2026-04-22-stub]]"\n'
+        f"project: {project}\n"
+        f"---\n# stub\n",
+        encoding="utf-8",
+    )
+    os.utime(insight_path, (r_first + 1800, r_first + 1800))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [
+        i for i in issues
+        if i.note_path == str(insight_path) and not i.extra.get("unresolved")
+    ]
+    assert len(flagged) == 1
+    assert flagged[0].confidence == 0.5
+    assert flagged[0].extra.get("signal_class") == "date-window-hint"
+    assert flagged[0].extra.get("proposed_sid") == sid_real
