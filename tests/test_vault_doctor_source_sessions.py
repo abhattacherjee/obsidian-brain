@@ -82,62 +82,6 @@ def _write_insight(dir_path: Path, date: str, slug: str, project: str, src_sid: 
     return note
 
 
-def test_scan_flags_insight_stamped_to_wrong_session(doctor_vault, monkeypatch):
-    """Insight dated 2026-04-10 references a source_session UUID not in the
-    session-note index; date-window matcher proposes session-B (same day).
-
-    NOTE (Issue #106): the UUID must NOT resolve to a known session note.
-    If it did, Phase 1's UUID-first path would emit uuid-day-mismatch (conf=0.0,
-    unresolved) and stop — never proposing a rewrite. This test exercises the
-    fall-through-to-date-matcher path that still fires when UUID is absent from
-    the global session-note index.
-    """
-    import vault_doctor_checks.source_sessions as check
-
-    v = doctor_vault["vault"]
-    home = doctor_vault["home"]
-    jsonl_dir = doctor_vault["jsonl_dir"]
-    monkeypatch.setenv("HOME", str(home))
-
-    # Session A: 2026-04-09 10:00–11:00 (NOT referenced by the insight)
-    a_start = calendar.timegm(time.strptime("2026-04-09 10:00", "%Y-%m-%d %H:%M"))
-    a_end = a_start + 3600
-    _write_jsonl(jsonl_dir / "sid-a.jsonl", "2026-04-09T10:00:00Z", a_end)
-    _write_session_note(v / "claude-sessions", "2026-04-09", "proj1", "sid-a", "aaaa")
-
-    # Session B: 2026-04-10 10:00–14:00 (window must contain midday for the
-    # date-based capture_time match under the fix for issue #93)
-    b_start = calendar.timegm(time.strptime("2026-04-10 10:00", "%Y-%m-%d %H:%M"))
-    b_end = b_start + 4 * 3600
-    _write_jsonl(jsonl_dir / "sid-b.jsonl", "2026-04-10T10:00:00Z", b_end)
-    _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
-
-    # Insight captured 2026-04-10 10:30 but wrongly stamped with a UUID that
-    # is NOT in the session-note index (so Phase 1 UUID-first does not intercept
-    # it, and the date-window matcher runs and proposes sid-b).
-    insight_mtime = b_start + 1800
-    _write_insight(
-        v / "claude-insights",
-        "2026-04-10",
-        "stale-insight-0001",
-        "proj1",
-        "not-in-index-uuid",
-        "2026-04-09-proj1-aaaa",
-        insight_mtime,
-    )
-
-    issues = check.scan(
-        str(v), "claude-sessions", "claude-insights", days=60, project="proj1"
-    )
-    assert len(issues) == 1
-    iss = issues[0]
-    assert "stale-insight-0001" in iss.note_path
-    assert iss.current_source == "[[2026-04-09-proj1-aaaa]]"
-    assert iss.proposed_source == "[[2026-04-10-proj1-bbbb]]"
-    assert iss.project == "proj1"
-    assert iss.extra.get("proposed_sid") == "sid-b"
-
-
 def test_scan_ignores_correct_insight(doctor_vault, monkeypatch):
     """Insight mtime matches its referenced session window → not flagged."""
     import vault_doctor_checks.source_sessions as check
@@ -238,10 +182,10 @@ def test_scan_marks_unresolved_when_no_window_matches(doctor_vault, monkeypatch)
 def test_apply_rewrites_only_source_session_fields(doctor_vault, tmp_path, monkeypatch):
     """After apply, only source_session/source_session_note change; body+tags preserved.
 
-    NOTE (Issue #106): uses a source_session UUID that is NOT in the session-note
-    index so the date-window fall-through produces a rewritable issue. If the UUID
-    resolved to a session note on a different day, Phase 1 would emit uuid-day-mismatch
-    (unresolved) and apply() would skip it — making this test moot.
+    Uses the uuid-basename-stale scenario (Issue #106 Phase 1): source_session UUID
+    resolves to a known session note but source_session_note basename points to the
+    wrong session. scan() emits signal_class='uuid-basename-stale' (conf=0.99) which
+    apply() accepts. date-window-hint issues are blocked by the apply() guard.
     """
     import vault_doctor_checks.source_sessions as check
 
@@ -260,14 +204,15 @@ def test_apply_rewrites_only_source_session_fields(doctor_vault, tmp_path, monke
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
 
     # Build an insight with extra tags and body content we want preserved.
-    # source_session is a UUID not in the session-note index so the date-window
-    # matcher can fire and produce a rewritable issue.
+    # source_session matches sid-b (in the index) but source_session_note
+    # erroneously points to session-A's note — the uuid-basename-stale
+    # scenario (Issue #106 Phase 1 UUID-first, conf=0.99, auto-applyable).
     note = v / "claude-insights" / "2026-04-10-rewrite-me.md"
     note.write_text(
         "---\n"
         "type: claude-insight\n"
         "date: 2026-04-10\n"
-        "source_session: not-in-index-uuid\n"
+        "source_session: sid-b\n"
         'source_session_note: "[[2026-04-09-proj1-aaaa]]"\n'
         "project: proj1\n"
         "tags:\n"
@@ -343,7 +288,7 @@ def test_apply_skips_unresolved(doctor_vault, tmp_path):
         proposed_source="",
         reason="no window",
         confidence=0.0,
-        extra={"unresolved": True},
+        extra={"unresolved": True, "signal_class": "unresolved"},
     )
 
     backup_root = tmp_path / "backups"
@@ -373,7 +318,7 @@ def test_apply_errors_on_missing_proposed_sid(doctor_vault, tmp_path):
         proposed_source="[[bar]]",  # proposed basename exists but extra['proposed_sid'] is missing
         reason="test",
         confidence=0.95,
-        extra={},  # no proposed_sid
+        extra={"signal_class": "uuid-basename-stale"},  # no proposed_sid
     )
 
     backup_root = tmp_path / "backups"
@@ -555,15 +500,16 @@ def test_apply_preserves_note_mtime(doctor_vault, tmp_path, monkeypatch):
     _write_session_note(v / "claude-sessions", "2026-04-10", "proj1", "sid-b", "bbbb")
 
     original_mtime = b_start + 1800  # 2026-04-10 10:30
-    # Use a source_session UUID not in the session-note index so Phase 1 UUID-first
-    # does not intercept it (Issue #106: if the UUID resolves to a session note on a
-    # different day, Phase 1 emits uuid-day-mismatch/unresolved and apply() skips it).
+    # source_session matches sid-b (in the index) but source_session_note
+    # erroneously points to session-A's note — uuid-basename-stale (conf=0.99,
+    # auto-applyable). Issue #106: only uuid-basename-stale issues can be
+    # auto-applied; date-window-hint issues are blocked by the apply() guard.
     _write_insight(
         v / "claude-insights",
         "2026-04-10",
         "mtime-preserve",
         "proj1",
-        "not-in-index-uuid",
+        "sid-b",
         "2026-04-09-proj1-aaaa",
         original_mtime,
     )
@@ -679,7 +625,7 @@ def test_apply_rejects_path_traversal_in_project_name(doctor_vault, tmp_path):
         proposed_source="[[new]]",
         reason="test",
         confidence=0.95,
-        extra={"proposed_sid": "sid-b"},
+        extra={"proposed_sid": "sid-b", "signal_class": "uuid-basename-stale"},
     )
 
     backup_root = tmp_path / "backups"
@@ -2107,3 +2053,39 @@ def test_unknown_uuid_with_date_window_candidate_hint(doctor_vault, monkeypatch)
     assert flagged[0].extra.get("signal_class") == "date-window-hint"
     assert flagged[0].extra.get("proposed_sid") == sid_real
     assert sess.stem in flagged[0].proposed_source
+
+
+def test_apply_raises_runtime_error_on_unknown_signal_class(tmp_path):
+    """Spec #106 (apply guard): apply() refuses any non-skipped Issue whose
+    signal_class != 'uuid-basename-stale', regardless of confidence value.
+    --min-confidence override-safety."""
+    from vault_doctor_checks import Issue
+
+    note_path = tmp_path / "note.md"
+    note_path.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        "source_session: 99999999-9999-9999-9999-999999999999\n"
+        'source_session_note: "[[2026-04-22-stub]]"\n'
+        "---\n# stub\n",
+        encoding="utf-8",
+    )
+
+    bad = Issue(
+        check="source-sessions",
+        note_path=str(note_path),
+        project="proj1",
+        current_source='[[2026-04-22-stub]]',
+        proposed_source="[[2026-04-22-replacement]]",
+        reason="hypothetical bypass",
+        confidence=0.5,
+        extra={
+            "proposed_sid": "88888888-8888-8888-8888-888888888888",
+            "signal_class": "date-window-hint",
+            # NOTE: no "unresolved": True — to exercise the new guard.
+        },
+    )
+
+    backup_root = tmp_path / "backup"
+    with pytest.raises(RuntimeError, match="signal_class='date-window-hint'"):
+        ss.apply([bad], str(backup_root))

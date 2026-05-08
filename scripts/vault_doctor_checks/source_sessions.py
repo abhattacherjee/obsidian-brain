@@ -919,6 +919,20 @@ def apply(issues, backup_root) -> list[Result]:
             )
             continue
 
+        # Issue #106 defense-in-depth: only uuid-basename-stale issues are
+        # auto-applyable. Anything else reaching this point (i.e., not
+        # filtered by the unresolved skip above) is a programming error —
+        # scan() should have marked all non-applyable signal classes
+        # unresolved=True. Raise loudly so operators see it instead of
+        # writing the wrong file.
+        sc = issue.extra.get("signal_class", "")
+        if sc != "uuid-basename-stale":
+            raise RuntimeError(
+                f"apply() refuses signal_class={sc!r} for {issue.note_path}; "
+                f"only uuid-basename-stale is auto-applyable. "
+                f"Edit the note manually after content-grep."
+            )
+
         proposed_sid = issue.extra.get("proposed_sid", "")
         proposed_basename = issue.proposed_source.strip().lstrip("[").rstrip("]")
         if not proposed_sid or not proposed_basename:

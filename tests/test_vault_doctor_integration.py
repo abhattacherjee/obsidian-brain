@@ -48,18 +48,17 @@ def test_end_to_end_scan_apply_verify(tmp_path):
         encoding="utf-8",
     )
 
-    # Stale insight (captured in session B but stamped with a UUID not in the
-    # session-note index). Using a UUID absent from the index ensures Phase 1
-    # UUID-first does not intercept it — the date-window matcher then finds sid-b
-    # and produces a rewritable issue. (Issue #106: if source_session were sid-a,
-    # which IS in the index with date 2026-04-09, Phase 1 would emit
-    # uuid-day-mismatch/unresolved for this 2026-04-10 note and stop.)
+    # Stale insight: source_session matches sid-b (in the session-note index)
+    # but source_session_note erroneously points to session-A's note. This is
+    # the uuid-basename-stale scenario (Issue #106 Phase 1 UUID-first,
+    # conf=0.99, auto-applyable). date-window-hint issues are blocked by the
+    # apply() defense-in-depth guard.
     insight = vault / "claude-insights" / "2026-04-10-stale-e2e.md"
     insight.write_text(
         '---\n'
         'type: claude-insight\n'
         'date: 2026-04-10\n'
-        'source_session: not-in-index-e2e-uuid\n'
+        'source_session: sid-b\n'
         'source_session_note: "[[2026-04-09-proj1-aaaa]]"\n'
         'project: proj1\n'
         'tags:\n'
