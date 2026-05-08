@@ -98,7 +98,7 @@ heuristic-fall cases are visible (e.g., `signal=mtime conf=0.5` indicates
 no immutable signal was available — the operator should sample a few flagged
 notes before running `fix`). For unresolved issues with no `proposed:` line,
 render `signal:` after `reason:`.
-Render `signal_class` (from extra.signal_class) as a prefix tag so operators
+Render `signal_class` (from the top-level signal_class field) as a prefix tag so operators
 can distinguish: [uuid-basename-stale], [uuid-day-mismatch],
 [missing-session-note], [date-window-hint], [unresolved]. The
 convergence_warning/convergence_count fields are deprecated as of #106

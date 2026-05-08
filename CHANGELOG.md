@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `vault-doctor source-sessions`: removed the `capture_signal != "created_at"` carve-out around Phase 1b — UUID-first now runs uniformly.
 - `vault-doctor source-sessions`: removed the convergence guard (multiple-flag confidence cap). Made moot by UUID-first.
 - `vault-doctor source-sessions`: removed the mtime SID-rewrite path (`proposed_conf=0.3`). Mtime emits as unresolved.
-- `vault-doctor source-sessions`: removed the `created_at` SID-rewrite path (`proposed_conf=0.95`). Made moot by UUID-first.
+- `vault-doctor source-sessions`: removed the dedicated `created_at` SID-rewrite confidence (`proposed_conf=0.95`). Created_at signals can still produce a proposal when the UUID is empty/unresolved, but at conf=0.5 as `date-window-hint` (not auto-applyable) rather than the old high-confidence path.
 
 ### Fixed
 

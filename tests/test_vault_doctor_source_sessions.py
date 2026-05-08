@@ -1385,9 +1385,13 @@ def test_scan_day_overlap_picks_morning_session(doctor_vault, monkeypatch):
         days=10000,
         project=project,
     )
-    flagged = [i for i in issues if i.note_path == str(insight) and not i.extra.get("unresolved")]
+    flagged = [
+        i for i in issues
+        if i.note_path == str(insight)
+        and i.extra.get("signal_class") == "date-window-hint"
+    ]
     assert len(flagged) == 1, (
-        f"expected exactly one non-unresolved issue for {insight}, got {len(flagged)}: {flagged}"
+        f"expected exactly one date-window-hint issue for {insight}, got {len(flagged)}: {flagged}"
     )
     # Day-overlap matcher should pick the morning session (larger overlap)
     assert flagged[0].extra.get("proposed_sid") == sid_morning, (
@@ -2048,7 +2052,8 @@ def test_unknown_uuid_with_date_window_candidate_hint(doctor_vault, monkeypatch)
     )
     flagged = [
         i for i in issues
-        if i.note_path == str(insight_path) and not i.extra.get("unresolved")
+        if i.note_path == str(insight_path)
+        and i.extra.get("signal_class") == "date-window-hint"
     ]
     assert len(flagged) == 1
     assert flagged[0].confidence == 0.5
@@ -2225,7 +2230,8 @@ def test_unknown_literal_with_date_window_candidate_hint(doctor_vault, monkeypat
     )
     flagged = [
         i for i in issues
-        if i.note_path == str(insight_path) and not i.extra.get("unresolved")
+        if i.note_path == str(insight_path)
+        and i.extra.get("signal_class") == "date-window-hint"
     ]
     assert len(flagged) == 1
     assert flagged[0].confidence == 0.5

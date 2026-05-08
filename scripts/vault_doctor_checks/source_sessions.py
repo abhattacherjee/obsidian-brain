@@ -884,6 +884,7 @@ def scan(
                         "capture_signal": capture_signal,
                         "capture_confidence": capture_conf,
                         "signal_class": "date-window-hint",
+                        "unresolved": True,
                     },
                 )
             )
