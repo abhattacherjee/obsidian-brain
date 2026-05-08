@@ -2011,10 +2011,12 @@ def test_uuid_resolves_jsonl_window_outside_note_day_emits_warn(doctor_vault, mo
     assert flagged[0].extra.get("proposed_sid") in (None, "")
 
 
-def test_unknown_uuid_with_date_window_candidate_hint(doctor_vault, monkeypatch):
-    """Spec #106 test #5: source_session: 'unknown' + date-window candidate exists →
-    1 issue, conf=0.5, signal_class='date-window-hint', reason instructs operator
-    to content-grep before applying."""
+def test_unresolvable_uuid_with_date_window_candidate_hint(doctor_vault, monkeypatch):
+    """Spec #106 test #5: source_session is an unresolvable UUID literal (not in
+    the session-note index, no JSONL anywhere) AND a date-window candidate
+    exists → 1 issue, conf=0.5, signal_class='date-window-hint', reason
+    instructs operator to content-grep before applying. The literal `unknown`
+    sentinel is covered separately by test_unknown_literal_with_date_window_candidate_hint."""
     vault = doctor_vault["vault"]
     home = doctor_vault["home"]
     jsonl_dir = doctor_vault["jsonl_dir"]
