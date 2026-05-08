@@ -134,10 +134,10 @@ def test_end_to_end_scan_apply_verify(tmp_path):
 
 
 def test_json_payload_has_top_level_signal_and_convergence_keys(tmp_path):
-    """Two stale insights converging on a single proposed sid must emit
-    convergence_warning=True and convergence_count>=2 at the top level of
-    each issue dict — alongside capture_signal and capture_confidence
-    (review C1, I6).
+    """Stale insights must emit capture_signal and capture_confidence at the
+    top level of each issue dict in the JSON payload (review C1, I6).
+    convergence_warning and convergence_count keys are still present (as
+    defaults False/0) but the convergence guard was removed in issue #106.
     """
     vault = tmp_path / "vault"
     (vault / "claude-sessions").mkdir(parents=True)
@@ -218,19 +218,11 @@ def test_json_payload_has_top_level_signal_and_convergence_keys(tmp_path):
     issues = payload["issues"]
     assert len(issues) >= 2, f"expected >=2 issues, got {len(issues)}: {issues}"
 
-    # Every issue must have all four keys at the TOP level (not under extra).
+    # Every issue must have capture_signal and capture_confidence at the TOP
+    # level (not under extra). convergence_warning/count keys are still present
+    # as defaults (False/0) after the convergence guard was removed (#106).
     for issue in issues:
         assert "capture_signal" in issue, f"missing capture_signal: {issue}"
         assert "capture_confidence" in issue, f"missing capture_confidence: {issue}"
         assert "convergence_warning" in issue, f"missing convergence_warning: {issue}"
         assert "convergence_count" in issue, f"missing convergence_count: {issue}"
-
-    converged = [i for i in issues if i["convergence_warning"] is True]
-    assert len(converged) >= 2, (
-        f"expected >=2 issues with convergence_warning=True, got {len(converged)}: "
-        f"{[(i['note_path'], i['convergence_warning']) for i in issues]}"
-    )
-    for issue in converged:
-        assert issue["convergence_count"] >= 2, (
-            f"convergence_count must be >=2 when warned: {issue}"
-        )

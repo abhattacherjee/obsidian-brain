@@ -14,7 +14,6 @@ Detection strategy:
 
 from __future__ import annotations
 
-import dataclasses
 import glob
 import json
 import os
@@ -858,45 +857,6 @@ def scan(
                     },
                 )
             )
-
-    # Convergence guard: if multiple flags in a project propose the same
-    # target session, the date-window heuristic has structurally collapsed
-    # across a multi-session day. Lower confidence and tag for operator review.
-    #
-    # Restrict the guard to day-precision signals (date/filename/mtime) —
-    # `created_at` matches use point-in-window with sub-day precision, so two
-    # legitimate stale notes from the same session sharing a proposal target
-    # is just normal cluster behavior, not heuristic collapse (Copilot R4-2).
-    from collections import Counter
-    _DAY_PRECISION_SIGNALS = {"date", "filename", "mtime"}
-    targets = Counter(
-        (i.project, i.extra.get("proposed_sid", ""))
-        for i in issues
-        if (
-            i.extra.get("proposed_sid")
-            and not i.extra.get("basename_only")
-            and i.extra.get("capture_signal") in _DAY_PRECISION_SIGNALS
-        )
-    )
-    issues = [
-        dataclasses.replace(
-            i,
-            confidence=min(i.confidence, 0.4),
-            extra={
-                **i.extra,
-                "convergence_warning": True,
-                "convergence_count": targets[(i.project, i.extra.get("proposed_sid", ""))],
-            },
-        )
-        if (
-            not i.extra.get("basename_only")
-            and i.extra.get("proposed_sid")
-            and i.extra.get("capture_signal") in _DAY_PRECISION_SIGNALS
-            and targets[(i.project, i.extra.get("proposed_sid", ""))] >= 2
-        )
-        else i
-        for i in issues
-    ]
 
     return issues
 
