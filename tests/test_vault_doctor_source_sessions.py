@@ -2095,3 +2095,114 @@ def test_convergence_guard_excludes_created_at_signal(doctor_vault, monkeypatch)
             f"convergence_warning must be False for created_at flags. "
             f"Got: {issue.extra}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #106 — UUID-first detection contract
+# ---------------------------------------------------------------------------
+
+def test_uuid_resolves_basename_stale_emits_basename_only(doctor_vault, monkeypatch):
+    """Spec #106 test #2: UUID resolves correctly but stamp's basename is stale →
+    1 issue, conf=0.99, signal_class='uuid-basename-stale', proposed_sid==current_sid."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    sid = "11111111-1111-1111-1111-111111111111"
+    s_first = datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc).timestamp()
+    s_last = datetime(2026, 4, 22, 18, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid}.jsonl",
+                 datetime.fromtimestamp(s_first, tz=timezone.utc).isoformat(),
+                 s_last)
+    sess = _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid, "1111")
+
+    insight_path = vault / "claude-insights" / "2026-04-22-stale-bn.md"
+    insight_path.write_text(
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: 2026-04-22\n"
+        f"source_session: {sid}\n"
+        f'source_session_note: "[[2026-04-22-proj1-WRONG]]"\n'
+        f"project: {project}\n"
+        f"---\n# stub\n",
+        encoding="utf-8",
+    )
+    os.utime(insight_path, (s_first + 1800, s_first + 1800))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(insight_path)]
+    assert len(flagged) == 1
+    assert flagged[0].confidence == 0.99
+    assert flagged[0].extra.get("signal_class") == "uuid-basename-stale"
+    assert flagged[0].extra.get("basename_only") is True
+    assert flagged[0].extra.get("proposed_sid") == sid
+    assert sess.stem in flagged[0].proposed_source
+
+
+def test_uuid_resolves_basename_points_at_unrelated_session(doctor_vault, monkeypatch):
+    """Spec #106 test #3 (telegram-analytics regression): UUID resolves to A but
+    stamp's basename points at unrelated B. Must propose A's canonical basename
+    (not B, not date-window pick)."""
+    vault = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    jsonl_dir = doctor_vault["jsonl_dir"]
+    project = doctor_vault["project"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # Session A — the correct one (UUID resolves here)
+    sid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa11"
+    a_first = datetime(2026, 4, 22, 9, 0, tzinfo=timezone.utc).timestamp()
+    a_last = datetime(2026, 4, 22, 12, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_a}.jsonl",
+                 datetime.fromtimestamp(a_first, tz=timezone.utc).isoformat(),
+                 a_last)
+    sess_a = _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid_a, "aaaa")
+
+    # Session B — unrelated, also same day, larger window
+    sid_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb11"
+    b_first = datetime(2026, 4, 22, 13, 0, tzinfo=timezone.utc).timestamp()
+    b_last = datetime(2026, 4, 22, 22, 0, tzinfo=timezone.utc).timestamp()
+    _write_jsonl(jsonl_dir / f"{sid_b}.jsonl",
+                 datetime.fromtimestamp(b_first, tz=timezone.utc).isoformat(),
+                 b_last)
+    sess_b = _write_session_note(vault / "claude-sessions", "2026-04-22", project, sid_b, "bbbb")
+
+    # Insight: source_session=A (correct), source_session_note=B (wrong stamp).
+    # Pre-#106: matcher would propose B (larger overlap). Post-#106: must propose A.
+    insight_path = vault / "claude-insights" / "2026-04-22-tgan.md"
+    insight_path.write_text(
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: 2026-04-22\n"
+        f"source_session: {sid_a}\n"
+        f'source_session_note: "[[{sess_b.stem}]]"\n'
+        f"project: {project}\n"
+        f"---\n# stub\n",
+        encoding="utf-8",
+    )
+    os.utime(insight_path, (a_first + 1800, a_first + 1800))
+
+    issues = ss.scan(
+        vault_path=str(vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        days=10000,
+        project=project,
+    )
+    flagged = [i for i in issues if i.note_path == str(insight_path)]
+    assert len(flagged) == 1
+    assert flagged[0].extra.get("signal_class") == "uuid-basename-stale"
+    assert flagged[0].extra.get("proposed_sid") == sid_a, (
+        f"regression: must propose A's UUID (UUID-first is authoritative), "
+        f"got {flagged[0].extra.get('proposed_sid')}"
+    )
+    assert sess_a.stem in flagged[0].proposed_source
+    assert sess_b.stem not in flagged[0].proposed_source

@@ -667,6 +667,7 @@ def scan(
                                             "basename_only": True,
                                             "capture_signal": capture_signal,
                                             "capture_confidence": capture_conf,
+                                            "signal_class": "uuid-basename-stale",
                                         },
                                     )
                                 )
@@ -700,6 +701,7 @@ def scan(
                                     "jsonl_path": str(jsonl_path),
                                     "capture_signal": capture_signal,
                                     "capture_confidence": capture_conf,
+                                    "signal_class": "missing-session-note",
                                 },
                             )
                         )
@@ -748,6 +750,7 @@ def scan(
                                 "unresolved": True,
                                 "capture_signal": capture_signal,
                                 "capture_confidence": capture_conf,
+                                "signal_class": "unresolved",
                             },
                         )
                     )
@@ -798,6 +801,7 @@ def scan(
                         "proposed_sid": match["sid"],
                         "capture_signal": capture_signal,
                         "capture_confidence": capture_conf,
+                        "signal_class": "date-window-hint",
                     },
                 )
             )
