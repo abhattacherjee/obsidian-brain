@@ -2062,6 +2062,10 @@ def test_unresolvable_uuid_with_date_window_candidate_hint(doctor_vault, monkeyp
     assert flagged[0].extra.get("signal_class") == "date-window-hint"
     assert flagged[0].extra.get("proposed_sid") == sid_real
     assert sess.stem in flagged[0].proposed_source
+    assert "content-grep" in flagged[0].reason.lower(), (
+        f"date-window-hint reason should instruct operator to content-grep "
+        f"the JSONL before applying. Got: {flagged[0].reason}"
+    )
 
 
 def test_apply_raises_runtime_error_on_unknown_signal_class(tmp_path):
@@ -2239,3 +2243,7 @@ def test_unknown_literal_with_date_window_candidate_hint(doctor_vault, monkeypat
     assert flagged[0].confidence == 0.5
     assert flagged[0].extra.get("signal_class") == "date-window-hint"
     assert flagged[0].extra.get("proposed_sid") == sid_real
+    assert "content-grep" in flagged[0].reason.lower(), (
+        f"date-window-hint reason should instruct operator to content-grep "
+        f"the JSONL before applying. Got: {flagged[0].reason}"
+    )

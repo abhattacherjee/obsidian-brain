@@ -860,7 +860,8 @@ def scan(
                     f"note calendar day {note_date_for_match}"
                     f" (signal={capture_signal}, conf={capture_conf})"
                     f" overlaps session {match['sid'][:8]} window most, "
-                    f"not current source {current_sid[:8]}"
+                    f"not current source {current_sid[:8] if current_sid else '<empty>'}"
+                    f" — content-grep the JSONL before applying"
                 )
             else:
                 reason = (
@@ -868,7 +869,8 @@ def scan(
                     f"{datetime.fromtimestamp(capture_time, timezone.utc).isoformat(timespec='seconds')}"
                     f" (signal={capture_signal}, conf={capture_conf})"
                     f" matches session {match['sid'][:8]} window, "
-                    f"not current source {current_sid[:8]}"
+                    f"not current source {current_sid[:8] if current_sid else '<empty>'}"
+                    f" — content-grep the JSONL before applying"
                 )
             issues.append(
                 Issue(
