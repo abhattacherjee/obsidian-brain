@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `vault-doctor source-sessions`: detection refactored around UUID-first contract. The conf=0.4–0.6 wrong-pick class is eliminated. Confidence bands are now strictly `0.99` (uuid-basename-stale, auto-apply), `0.5` (date-window-hint, manual verify), `0.0` (uuid-day-mismatch / missing-session-note / unresolved, WARN). Every emitted Issue carries a `signal_class` tag. In the `--json` output, `signal_class` is exposed as a **top-level** field on each issue (no `extra` wrapper); the internal `Issue` dataclass stores it under `extra` as an implementation detail. The `apply()` path refuses to write unless `signal_class == "uuid-basename-stale"`, regardless of `--min-confidence`. (#106)
+
+### Removed
+- `vault-doctor source-sessions`: removed the `capture_signal != "created_at"` carve-out around Phase 1b — UUID-first now runs uniformly.
+- `vault-doctor source-sessions`: removed the convergence guard (multiple-flag confidence cap). Made moot by UUID-first.
+- `vault-doctor source-sessions`: removed the mtime SID-rewrite path (`proposed_conf=0.3`). Mtime emits as unresolved.
+- `vault-doctor source-sessions`: removed the dedicated `created_at` SID-rewrite confidence (`proposed_conf=0.95`). Created_at signals can still produce a proposal when the UUID is empty/unresolved, but at conf=0.5 as `date-window-hint` (not auto-applyable) rather than the old high-confidence path.
+
 ### Fixed
 
 - Fix YAML-frontmatter regex `\s*` cross-newline bug across 8 call sites in

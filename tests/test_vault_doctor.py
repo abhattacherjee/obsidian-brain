@@ -67,9 +67,11 @@ def test_cli_dry_run_reports_issues(tmp_path):
         "---\ntype: claude-session\ndate: 2026-04-10\nsession_id: sid-b\nproject: proj1\nstatus: summarized\n---\n# s\n",
         encoding="utf-8",
     )
+    # source_session matches sid-b (in the index) but source_session_note
+    # erroneously points to session-A's note → uuid-basename-stale (Issue #106).
     insight = vault / "claude-insights" / "2026-04-10-stale.md"
     insight.write_text(
-        '---\ntype: claude-insight\ndate: 2026-04-10\nsource_session: sid-a\nsource_session_note: "[[2026-04-09-proj1-aaaa]]"\nproject: proj1\n---\n# x\n',
+        '---\ntype: claude-insight\ndate: 2026-04-10\nsource_session: sid-b\nsource_session_note: "[[2026-04-09-proj1-aaaa]]"\nproject: proj1\n---\n# x\n',
         encoding="utf-8",
     )
     os.utime(insight, (b_start + 1800, b_start + 1800))
@@ -94,7 +96,7 @@ def test_cli_dry_run_reports_issues(tmp_path):
     assert payload["total_issues"] >= 1
     assert any(i["check"] == "source-sessions" for i in payload["issues"])
     # File was NOT modified (dry-run default)
-    assert "source_session: sid-a" in insight.read_text(encoding="utf-8")
+    assert "source_session: sid-b" in insight.read_text(encoding="utf-8")
 
 
 def test_cli_apply_with_yes(tmp_path):
@@ -121,9 +123,11 @@ def test_cli_apply_with_yes(tmp_path):
         "---\ntype: claude-session\ndate: 2026-04-10\nsession_id: sid-b\nproject: proj1\nstatus: summarized\n---\n# s\n",
         encoding="utf-8",
     )
+    # source_session matches sid-b (in the index) but source_session_note
+    # erroneously points to session-A's note → uuid-basename-stale (Issue #106).
     insight = vault / "claude-insights" / "2026-04-10-apply.md"
     insight.write_text(
-        '---\ntype: claude-insight\ndate: 2026-04-10\nsource_session: sid-a\nsource_session_note: "[[2026-04-09-proj1-aaaa]]"\nproject: proj1\n---\n# x\n',
+        '---\ntype: claude-insight\ndate: 2026-04-10\nsource_session: sid-b\nsource_session_note: "[[2026-04-09-proj1-aaaa]]"\nproject: proj1\n---\n# x\n',
         encoding="utf-8",
     )
     os.utime(insight, (b_start + 1800, b_start + 1800))
