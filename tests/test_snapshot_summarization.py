@@ -295,3 +295,34 @@ def test_augment_omits_current_tail_banner_when_transcript_empty(tmp_path):
     assert "Some mid-session work." in result
     # No dangling tail banner when transcript is empty (preamble mode)
     assert "CURRENT TAIL" not in result
+
+
+def test_find_unsummarized_keeps_notes_with_empty_type_field(tmp_path):
+    """Issue #94 site D — empty `type:` was previously cross-newline-captured
+    into a non-allowlisted value and silently skipped. After the fix, empty
+    `type:` returns None from the helper and is treated as legacy (kept).
+    """
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+
+    note = sess / "2026-04-24-demo-hhhh-legacy-empty-type.md"
+    note.write_text(
+        "---\n"
+        "project: demo\n"
+        "type: \n"
+        "status: auto-logged\n"
+        "date: 2026-04-24\n"
+        "---\n"
+        "# Session\n\n"
+        "## Conversation (raw)\n"
+        "**User:** hello\n**Assistant:** world\n",
+        encoding="utf-8",
+    )
+
+    result = json.loads(find_unsummarized_notes(str(vault), "claude-sessions", "demo"))
+    names = [Path(p).name for p in result["unsummarized"]]
+    assert note.name in names, (
+        f"Note with empty `type:` should be kept as legacy but was skipped; "
+        f"returned: {names}"
+    )
