@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.4] - 2026-05-11
+
 ### Changed
 - `vault-doctor source-sessions`: detection refactored around UUID-first contract. The conf=0.4–0.6 wrong-pick class is eliminated. Confidence bands are now strictly `0.99` (uuid-basename-stale, auto-apply), `0.5` (date-window-hint, manual verify), `0.0` (uuid-day-mismatch / missing-session-note / unresolved, WARN). Every emitted Issue carries a `signal_class` tag. In the `--json` output, `signal_class` is exposed as a **top-level** field on each issue (no `extra` wrapper); the internal `Issue` dataclass stores it under `extra` as an implementation detail. The `apply()` path refuses to write unless `signal_class == "uuid-basename-stale"`, regardless of `--min-confidence`. (#106)
 
