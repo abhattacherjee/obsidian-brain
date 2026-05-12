@@ -67,7 +67,7 @@ Note: `window_days` in scope controls how many sessions' files to pass as `basen
 
 ```bash
 raw_path=$(python3 -c "
-import sys, os, glob, json
+import sys, os, glob, json, itertools
 sys.path.insert(0, max(
     glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')),
     default='hooks'
@@ -110,7 +110,7 @@ if projects is None:
             fpath = os.path.join(sessions_dir, fname)
             try:
                 with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                    for line in f.readlines()[:20]:
+                    for line in itertools.islice(f, 20):
                         if line.strip().startswith('project:'):
                             proj = line.strip().split(':', 1)[1].strip().strip('\"').strip(\"'\")
                             if proj:
@@ -164,7 +164,7 @@ echo "raw_path=$raw_path"
 
 ## Step 3 — Coarse-group + cache partition (Stage 2a + cache load)
 
-Steps 4-10 follow the same bash + env-var heredoc pattern used in Steps 1-4: each step is a bash block that sets env vars (e.g. `SCOPE_PATH="$scope_path"`) and runs `python3 << 'PYEOF' ... PYEOF`. The Python reads its inputs via `os.environ["VAR_NAME"]` — never via `sys.argv`. Do not use raw `python3` blocks that rely on `sys.argv` for file-path arguments; all steps, without exception, must use this bash + env-var heredoc pattern.
+Convention: each step is a `bash` block. Steps 1-2 use `python3 -c "..."` with positional argv tokens (inputs passed as `sys.argv` args, e.g. `python3 -c "..." "$scope_path"`). Steps 3-10 use `python3 << 'PYEOF' ... PYEOF` heredoc with inputs passed via environment variables (e.g. `SCOPE_PATH="$scope_path" python3 << 'PYEOF' ... PYEOF`); the Python reads them via `os.environ["VAR_NAME"]` — never via `sys.argv`. Both patterns produce a runnable shell block — never paste raw `python3` blocks that rely on `sys.argv` without an argv-passing wrapper, and never use env-var heredoc style for Steps 1-2 which expect positional args.
 
 ```bash
 part_path=$(SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" python3 << 'PYEOF'

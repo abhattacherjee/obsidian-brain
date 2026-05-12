@@ -1093,8 +1093,9 @@ def merge_groups_semantically(coarse_groups):
         return coarse_groups
 
     workdir = _check_items_workdir()
-    in_path = workdir / f"semantic-merge-{os.getpid()}.in.json"
-    out_path = workdir / f"semantic-merge-{os.getpid()}.out.json"
+    _unique = f"{os.getpid()}-{time.time_ns()}"
+    in_path = workdir / f"semantic-merge-{_unique}.in.json"
+    out_path = workdir / f"semantic-merge-{_unique}.out.json"
     payload = {"groups": [
         {
             "group_id": g.get("group_id"),
@@ -1113,6 +1114,11 @@ def merge_groups_semantically(coarse_groups):
             file=sys.stderr,
         )
         _LAST_SEMANTIC_MERGE_MODE = "token-only (payload too large)"
+        for p in (in_path, out_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
         if return_dict_shape:
             return coarse_groups
         return flat_groups
@@ -1256,8 +1262,9 @@ def classify_groups_with_agent(merged_groups, evidence):
         return []
 
     workdir = _check_items_workdir()
-    in_path = workdir / f"classify-{os.getpid()}.in.json"
-    out_path = workdir / f"classify-{os.getpid()}.out.json"
+    _unique = f"{os.getpid()}-{time.time_ns()}"
+    in_path = workdir / f"classify-{_unique}.in.json"
+    out_path = workdir / f"classify-{_unique}.out.json"
 
     payload = {
         "groups": [
@@ -1283,6 +1290,11 @@ def classify_groups_with_agent(merged_groups, evidence):
             file=sys.stderr,
         )
         _LAST_CLASSIFIER_MODE = "heuristic-fallback"
+        for p in (in_path, out_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
         return []
 
     in_path.write_text(payload_str, encoding="utf-8")
