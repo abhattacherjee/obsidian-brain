@@ -1133,3 +1133,148 @@ def test_verify_before_edit_handles_line_out_of_range(tmp_path):
     f.write_text("only one line\n")
     ok = verify_before_edit(str(f), line_number=99, expected_text="anything")
     assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Task 22: Dashboard report writer
+# ---------------------------------------------------------------------------
+
+def test_dashboard_report_always_written_on_dry_run(tmp_path):
+    """Test 7 - --dry-run still writes the report."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+
+    path = write_check_items_dashboard(
+        vault_path=str(vault),
+        scope_name="obsidian-brain",
+        date_str="2026-05-11",
+        window_days=14,
+        raw_count=225,
+        group_count=40,
+        classifications=[],
+        applied=0,
+        cascaded=0,
+        merges=[],
+        semantic_merge_mode="ok",
+        classifier_mode="ok",
+        dry_run=True,
+    )
+    assert os.path.exists(path)
+    content = open(path).read()
+    assert "type: claude-check-items-report" in content
+    assert "scope: obsidian-brain" in content
+
+
+def test_report_filename_scope_suffix(tmp_path):
+    """Test 8 - project scope -> check-items-<project>-<date>.md;
+    'vault' -> check-items-vault-<date>.md."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+
+    p1 = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="obsidian-brain", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=False
+    )
+    p2 = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="vault", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=False
+    )
+    assert p1.endswith("check-items-obsidian-brain-2026-05-11.md")
+    assert p2.endswith("check-items-vault-2026-05-11.md")
+
+
+def test_dashboard_body_includes_merged_groups_audit(tmp_path):
+    """Spec § Dashboard audit — body must list each merge with reasoning.
+    Also exercises all four classification buckets and action_required."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    merges = [
+        {"canonical_group_id": "ob-0004", "absorbed_group_ids": ["ob-0003"],
+         "reasoning": "Both describe N=1 text-fallback routing decision."}
+    ]
+    classifications = [
+        {"group_id": "g1", "classification": "DONE",
+         "canonical_text": "Ship it", "evidence_citation": "PR #87 merged",
+         "action_required": None},
+        {"group_id": "g2", "classification": "NEEDS-ACTION",
+         "canonical_text": "Close #534", "evidence_citation": "Story 11.12",
+         "action_required": 'gh issue close 534'},
+        {"group_id": "g3", "classification": "STALE",
+         "canonical_text": "Old TODO", "evidence_citation": None,
+         "action_required": None},
+        {"group_id": "g4", "classification": "ACTIVE",
+         "canonical_text": "Still open", "evidence_citation": None,
+         "action_required": None},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="obsidian-brain", date_str="2026-05-11",
+        window_days=14, raw_count=10, group_count=8,
+        classifications=classifications,
+        applied=1, cascaded=0, merges=merges, semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "## Merged Groups" in body
+    assert "ob-0004" in body and "ob-0003" in body
+    assert "N=1 text-fallback routing" in body
+    assert "Ship it" in body
+    assert "Close #534" in body
+    assert "gh issue close 534" in body
+    assert "Old TODO" in body
+    assert "Still open" in body
+
+
+def test_dashboard_idempotent_overwrite(tmp_path):
+    """Same scope + same date overwrites previous file."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    p1 = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=1, group_count=1, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    p2 = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=2, group_count=2, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    assert p1 == p2
+    assert "groups: 2" in open(p2).read()
+
+
+def test_dashboard_active_truncation_and_path_guard(tmp_path):
+    """ACTIVE >50 items are truncated in the body; path-containment guard is present."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    active_items = [
+        {"group_id": f"g{i}", "classification": "ACTIVE",
+         "canonical_text": f"item {i}", "evidence_citation": None,
+         "action_required": None}
+        for i in range(55)
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=55, group_count=55,
+        classifications=active_items,
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=False
+    )
+    body = open(path).read()
+    assert "and 5 more (truncated)" in body
+
+    # Verify the containment guard is present in source (security pattern per CLAUDE.md).
+    import check_items_report as cr
+    src = open(cr.__file__).read()
+    assert "is_relative_to" in src
+    assert "refusing to write outside vault" in src
