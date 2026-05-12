@@ -578,14 +578,14 @@ def deep_analysis_pipeline(
 
         proj_evidence: dict[str, object] = {}
 
-        # git log (last 20 commits)
+        # git log (last 40 commits)
         try:
             proc = subprocess.run(
-                ["git", "log", "--oneline", "-20"],
+                ["git", "log", "--oneline", "-40"],
                 cwd=repo_path, capture_output=True, text=True, timeout=10,
             )
             if proc.returncode == 0:
-                proj_evidence["commits"] = proc.stdout.strip().split("\n")[:20]
+                proj_evidence["commits"] = proc.stdout.strip().split("\n")[:40]
             else:
                 print(f"[obsidian-brain] git log failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -603,6 +603,46 @@ def deep_analysis_pipeline(
                 print(f"[obsidian-brain] gh release list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
         except (OSError, subprocess.TimeoutExpired) as exc:
             print(f"[obsidian-brain] gh release error for {project}: {exc}", file=sys.stderr)
+
+        # gh pr list --state merged
+        try:
+            proc = subprocess.run(
+                ["gh", "pr", "list", "--state", "merged", "--limit", "20",
+                 "--json", "number,title,mergedAt,url"],
+                cwd=repo_path, capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode == 0:
+                try:
+                    proj_evidence["merged_prs"] = json.loads(proc.stdout)
+                except json.JSONDecodeError as exc:
+                    print(f"[obsidian-brain] gh pr list JSON error for {project}: {exc}", file=sys.stderr)
+                    proj_evidence["merged_prs"] = []
+            else:
+                print(f"[obsidian-brain] gh pr list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                proj_evidence["merged_prs"] = []
+        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+            print(f"[obsidian-brain] gh pr list error for {project}: {exc}", file=sys.stderr)
+            proj_evidence["merged_prs"] = []
+
+        # gh issue list --state closed
+        try:
+            proc = subprocess.run(
+                ["gh", "issue", "list", "--state", "closed", "--limit", "20",
+                 "--json", "number,title,closedAt,body,url"],
+                cwd=repo_path, capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode == 0:
+                try:
+                    proj_evidence["closed_issues"] = json.loads(proc.stdout)
+                except json.JSONDecodeError as exc:
+                    print(f"[obsidian-brain] gh issue list JSON error for {project}: {exc}", file=sys.stderr)
+                    proj_evidence["closed_issues"] = []
+            else:
+                print(f"[obsidian-brain] gh issue list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                proj_evidence["closed_issues"] = []
+        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+            print(f"[obsidian-brain] gh issue list error for {project}: {exc}", file=sys.stderr)
+            proj_evidence["closed_issues"] = []
 
         # CHANGELOG.md excerpt
         changelog_path = os.path.join(repo_path, "CHANGELOG.md")
