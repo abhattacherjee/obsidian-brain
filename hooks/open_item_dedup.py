@@ -1109,3 +1109,114 @@ def get_last_semantic_merge_mode():
     """Returns 'ok' on last successful merge, or
     'token-only (semantic pass failed)' on fallback."""
     return _LAST_SEMANTIC_MERGE_MODE
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: classify_groups_with_agent orchestrator (Task 16)
+# ---------------------------------------------------------------------------
+
+_VALID_CLASSIFICATIONS = {"DONE", "NEEDS-ACTION", "STALE", "ACTIVE"}
+_REQUIRED_CLASSIFIER_FIELDS = {
+    "group_id", "classification", "confidence",
+    "canonical_text", "evidence_citation", "action_required",
+}
+
+
+def _validate_classifier_response(parsed):
+    """Return True iff parsed is a list of dicts containing all required fields
+    with classification in the valid set."""
+    if not isinstance(parsed, list):
+        return False
+    for item in parsed:
+        if not isinstance(item, dict):
+            return False
+        if not _REQUIRED_CLASSIFIER_FIELDS.issubset(item.keys()):
+            return False
+        if item.get("classification") not in _VALID_CLASSIFICATIONS:
+            return False
+    return True
+
+
+def classify_groups_with_agent(merged_groups, evidence):
+    """
+    Stage 4 orchestrator: invoke the classifier sub-agent via
+    check_items_cli.run_classifier with one retry on schema-validation
+    failure. Returns the parsed list on success.
+
+    On 2 consecutive failures, returns [] and sets
+    `_LAST_CLASSIFIER_MODE = 'heuristic-fallback'`.
+
+    Spec §§ Pipeline architecture Stage 4 + Expected output.
+    """
+    global _LAST_CLASSIFIER_MODE
+    _LAST_CLASSIFIER_MODE = "ok"
+
+    if not merged_groups:
+        return []
+
+    workdir = _check_items_workdir()
+    in_path = workdir / f"classify-{os.getpid()}.in.json"
+    out_path = workdir / f"classify-{os.getpid()}.out.json"
+
+    payload = {
+        "groups": [
+            {
+                "group_id": g.get("group_id"),
+                "project": g.get("project"),
+                "representative": g.get("representative", ""),
+                "instances": [
+                    {"file": m.get("file"), "line": m.get("line"), "text": m.get("text", "")}
+                    for m in g.get("members", [])
+                ],
+            }
+            for g in merged_groups
+        ],
+        "evidence": evidence or {},
+    }
+    in_path.write_text(json.dumps(payload), encoding="utf-8")
+    os.chmod(str(in_path), 0o600)
+
+    cli_path = os.path.join(os.path.dirname(__file__), "check_items_cli.py")
+    parsed = None
+    attempt = 0
+    while attempt < 2:
+        attempt += 1
+        try:
+            cp = subprocess.run(
+                ["python3", cli_path, "classifier", str(out_path)],
+                input=in_path.read_text(),
+                capture_output=True,
+                text=True,
+                timeout=70,
+            )
+            if cp.returncode != 0 or not out_path.exists():
+                continue
+            candidate = json.loads(out_path.read_text())
+            if not _validate_classifier_response(candidate):
+                continue
+            parsed = candidate
+            break
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
+            print(f"[check-items] classifier attempt {attempt} failed: {exc}",
+                  file=sys.stderr)
+            continue
+
+    for p in (in_path, out_path):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+    if parsed is None:
+        _LAST_CLASSIFIER_MODE = "heuristic-fallback"
+        return []
+    return parsed
+
+
+_LAST_CLASSIFIER_MODE = "ok"
+
+
+def get_last_classifier_mode():
+    """Returns 'ok' on success or 'heuristic-fallback' if Task 17's
+    heuristic must be invoked."""
+    return _LAST_CLASSIFIER_MODE

@@ -850,3 +850,83 @@ def test_run_classifier_invalid_stdout_json_returns_4(tmp_path, monkeypatch):
     out_path = tmp_path / "no_such_classifier.json"
     rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
     assert rc == 4
+
+
+# ---------------------------------------------------------------------------
+# Task 16: classify_groups_with_agent orchestrator
+# ---------------------------------------------------------------------------
+
+def test_classifier_retry_on_malformed_json(monkeypatch):
+    """Test 2 - first sub-agent response missing 'classification'; retry succeeds."""
+    import open_item_dedup as oid
+
+    call_count = {"n": 0}
+
+    def fake_cli_run(cmd, *args, **kwargs):
+        call_count["n"] += 1
+        out_path = next((c for c in cmd if isinstance(c, str)
+                         and c.endswith(".json") and "out" in c), None)
+        if call_count["n"] == 1:
+            if out_path:
+                with open(out_path, "w") as f:
+                    json.dump([{"group_id": "g1", "confidence": "LOW"}], f)
+            return _fake_completed(returncode=0)
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump([{
+                    "group_id": "g1",
+                    "classification": "DONE",
+                    "confidence": "HIGH",
+                    "canonical_text": "ship it",
+                    "evidence_citation": "PR #87 merged",
+                    "action_required": None,
+                }], f)
+        return _fake_completed(returncode=0)
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+
+    merged_groups = [
+        {"group_id": "g1", "project": "p", "representative": "ship",
+         "members": [{"file": "a.md", "line": 1, "text": "ship"}]}
+    ]
+    evidence = {"p": {"commits": [], "merged_prs": [], "closed_issues": []}}
+
+    out = oid.classify_groups_with_agent(merged_groups, evidence)
+    assert call_count["n"] == 2, "expected one retry"
+    assert len(out) == 1
+    assert out[0]["classification"] == "DONE"
+
+
+def test_needs_action_surfaces_command(monkeypatch):
+    """Test 5 - NEEDS-ACTION items carry an `action_required` command string."""
+    import open_item_dedup as oid
+
+    def fake_cli_run(cmd, *args, **kwargs):
+        out_path = next((c for c in cmd if isinstance(c, str)
+                         and c.endswith(".json") and "out" in c), None)
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump([{
+                    "group_id": "tva-0003",
+                    "classification": "NEEDS-ACTION",
+                    "confidence": "HIGH",
+                    "canonical_text": "Close issue #534",
+                    "evidence_citation": "Story 11.12 shipped",
+                    "action_required": 'gh issue close 534 --comment "Fixed in Story 11.12"',
+                }], f)
+        return _fake_completed(returncode=0)
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+
+    merged_groups = [
+        {"group_id": "tva-0003", "project": "tiny-vacation-agent",
+         "representative": "Close issue #534", "members": []}
+    ]
+    evidence = {"tiny-vacation-agent": {}}
+
+    out = oid.classify_groups_with_agent(merged_groups, evidence)
+    assert len(out) == 1
+    item = out[0]
+    assert item["classification"] == "NEEDS-ACTION"
+    assert item["action_required"] is not None
+    assert "gh issue close 534" in item["action_required"]
