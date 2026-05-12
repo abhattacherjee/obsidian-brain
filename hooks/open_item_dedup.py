@@ -544,7 +544,9 @@ def deep_analysis_pipeline(
     Spec § Open questions / Cache coupling (line 699);
     Testing test 12 (line 658). Refs #87.
     """
-    _cache_key = (projects_json, vault_path, sessions_folder)
+    _basenames_key = tuple(sorted(basenames)) if basenames else ()
+    _cache_key = (_basenames_key, projects_json, vault_path, sessions_folder,
+                  insights_folder, db_path or "")
     _now = time.time()
     _cached = _evidence_cache_get(_cache_key, _now)
     if _cached is not None:

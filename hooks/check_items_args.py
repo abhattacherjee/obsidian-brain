@@ -52,6 +52,7 @@ def parse_scope(argv):
             continue
         if tok in ("all", "--vault"):
             scope.mode = "vault"
+            scope.project = None  # clear stale project if 'all' appears after a project token
             continue
         m = _WINDOW_RE.match(tok)
         if m:

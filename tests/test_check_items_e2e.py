@@ -317,15 +317,28 @@ class TestDeepAnalysisPipelineCache:
     Tests target the _evidence_cache_get/_evidence_cache_put helpers directly
     so the test does not need to invoke the full pipeline (which requires a live
     vault_index) and is immune to test-ordering contamination via the shared
-    module-level dict. Real cache key: (projects_json, vault_path, sessions_folder).
+    module-level dict.
 
-    Cache entry format (post Finding-1 fix): _evidence_cache_put accepts a
-    (status, output_json) tuple; _evidence_cache_get returns the same tuple or
-    None on miss/expiry. This ensures cache hits can re-write output_path.
+    Real cache key (post R3 Finding C fix):
+        (basenames_tuple, projects_json, vault_path, sessions_folder,
+         insights_folder, db_path_or_empty)
+
+    Cache entry format: _evidence_cache_put accepts a (status, output_json)
+    tuple; _evidence_cache_get returns the same tuple or None on miss/expiry.
+    This ensures cache hits can re-write output_path.
     """
 
     # Canonical sentinel for the output JSON stored alongside the status string.
     _SENTINEL_JSON = '{"items": {"total_raw": 5, "groups": [], "group_count": 2}, "evidence": {}}'
+
+    # Helper to build the full cache key matching deep_analysis_pipeline's construction.
+    @staticmethod
+    def _make_key(basenames=None, projects_json='["test-project"]',
+                  vault_path="/vault/path", sessions_folder="claude-sessions",
+                  insights_folder="claude-insights", db_path=None):
+        basenames_key = tuple(sorted(basenames)) if basenames else ()
+        return (basenames_key, projects_json, vault_path, sessions_folder,
+                insights_folder, db_path or "")
 
     def _clear_pipeline_cache(self):
         """Wipe the module-level cache dict so tests are isolation-safe."""
@@ -334,14 +347,14 @@ class TestDeepAnalysisPipelineCache:
     def test_cache_miss_on_empty(self):
         """Cold cache → _evidence_cache_get returns None."""
         self._clear_pipeline_cache()
-        key = ('["test-project"]', "/vault/path", "claude-sessions")
+        key = self._make_key(projects_json='["test-project"]', vault_path="/vault/path")
         result = oid._evidence_cache_get(key, now=1_000_000.0)
         assert result is None, "expected cache miss on empty cache"
 
     def test_cache_put_then_hit(self):
         """put + get with same key → (status, output_json) tuple returned."""
         self._clear_pipeline_cache()
-        key = ('["obsidian-brain"]', "/vault/path", "claude-sessions")
+        key = self._make_key(projects_json='["obsidian-brain"]', vault_path="/vault/path")
         oid._evidence_cache_put(key, ("OK:5:2:1", self._SENTINEL_JSON), now=1_000_000.0)
         result = oid._evidence_cache_get(key, now=1_000_000.0 + 1)
         assert result == ("OK:5:2:1", self._SENTINEL_JSON), (
@@ -356,7 +369,7 @@ class TestDeepAnalysisPipelineCache:
         two put+get cycles with the same key.
         """
         self._clear_pipeline_cache()
-        key = ('["obsidian-brain"]', "/vault/path2", "claude-sessions")
+        key = self._make_key(projects_json='["obsidian-brain"]', vault_path="/vault/path2")
         now_ts = 1_000_000.0
 
         # Simulate first pipeline run: put the result
@@ -379,7 +392,7 @@ class TestDeepAnalysisPipelineCache:
     def test_cache_miss_after_ttl(self):
         """get after TTL expiry → returns None (cache busted)."""
         self._clear_pipeline_cache()
-        key = ('["obsidian-brain"]', "/vault/path3", "claude-sessions")
+        key = self._make_key(projects_json='["obsidian-brain"]', vault_path="/vault/path3")
         now_ts = 1_000_000.0
 
         oid._evidence_cache_put(key, ("OK:7:1:1", self._SENTINEL_JSON), now=now_ts)
@@ -392,16 +405,15 @@ class TestDeepAnalysisPipelineCache:
         """Different projects_json (different cache key) → cache miss.
 
         This covers the second assertion from spec test 12: cache miss when
-        window_days changes. Since the real cache key is (projects_json, vault_path,
-        sessions_folder) — window_days is not part of the real signature — we
-        use different projects_json to simulate the cache-miss scenario.
+        window_days changes. Since basenames/projects_json/vault/sessions/insights/db
+        are all in the cache key, different projects_json triggers a miss.
         """
         self._clear_pipeline_cache()
         vault_path = "/vault/shared"
         now_ts = 1_000_000.0
 
-        key_a = ('["project-alpha"]', vault_path, "claude-sessions")
-        key_b = ('["project-beta"]', vault_path, "claude-sessions")
+        key_a = self._make_key(projects_json='["project-alpha"]', vault_path=vault_path)
+        key_b = self._make_key(projects_json='["project-beta"]', vault_path=vault_path)
 
         oid._evidence_cache_put(key_a, ("OK:3:1:1", self._SENTINEL_JSON), now=now_ts)
 
@@ -423,8 +435,8 @@ class TestDeepAnalysisPipelineCache:
         projects_json = '["obsidian-brain"]'
         now_ts = 2_000_000.0
 
-        key_v1 = (projects_json, "/vault/one", "claude-sessions")
-        key_v2 = (projects_json, "/vault/two", "claude-sessions")
+        key_v1 = self._make_key(projects_json=projects_json, vault_path="/vault/one")
+        key_v2 = self._make_key(projects_json=projects_json, vault_path="/vault/two")
 
         oid._evidence_cache_put(key_v1, ("OK:1:0:0", self._SENTINEL_JSON), now=now_ts)
 
@@ -433,6 +445,57 @@ class TestDeepAnalysisPipelineCache:
         )
         assert oid._evidence_cache_get(key_v1, now=now_ts + 1) == ("OK:1:0:0", self._SENTINEL_JSON), (
             "vault_one cache entry should still be present"
+        )
+
+    def test_pipeline_cache_key_includes_basenames(self):
+        """Different basenames → independent cache entries (Finding C regression test)."""
+        self._clear_pipeline_cache()
+        projects_json = '["obsidian-brain"]'
+        vault_path = "/vault/shared2"
+        now_ts = 3_000_000.0
+
+        key_a = self._make_key(basenames=["2026-05-01-session.md"],
+                               projects_json=projects_json, vault_path=vault_path)
+        key_b = self._make_key(basenames=["2026-05-02-session.md"],
+                               projects_json=projects_json, vault_path=vault_path)
+
+        oid._evidence_cache_put(key_a, ("OK:2:1:0", self._SENTINEL_JSON), now=now_ts)
+
+        assert oid._evidence_cache_get(key_b, now=now_ts + 1) is None, (
+            "different basenames must not share a cache entry"
+        )
+        assert oid._evidence_cache_get(key_a, now=now_ts + 1) == ("OK:2:1:0", self._SENTINEL_JSON), (
+            "key_a cache entry should still be present"
+        )
+
+    def test_pipeline_cache_key_includes_insights_folder(self):
+        """Different insights_folder → independent cache entries (Finding C regression test)."""
+        self._clear_pipeline_cache()
+        vault_path = "/vault/shared3"
+        now_ts = 3_000_000.0
+
+        key_a = self._make_key(vault_path=vault_path, insights_folder="claude-insights")
+        key_b = self._make_key(vault_path=vault_path, insights_folder="other-insights")
+
+        oid._evidence_cache_put(key_a, ("OK:2:1:0", self._SENTINEL_JSON), now=now_ts)
+
+        assert oid._evidence_cache_get(key_b, now=now_ts + 1) is None, (
+            "different insights_folder must not share a cache entry"
+        )
+
+    def test_pipeline_cache_key_includes_db_path(self):
+        """Different db_path → independent cache entries (Finding C regression test)."""
+        self._clear_pipeline_cache()
+        vault_path = "/vault/shared4"
+        now_ts = 3_000_000.0
+
+        key_a = self._make_key(vault_path=vault_path, db_path="/tmp/vault_a.db")
+        key_b = self._make_key(vault_path=vault_path, db_path="/tmp/vault_b.db")
+
+        oid._evidence_cache_put(key_a, ("OK:2:1:0", self._SENTINEL_JSON), now=now_ts)
+
+        assert oid._evidence_cache_get(key_b, now=now_ts + 1) is None, (
+            "different db_path must not share a cache entry"
         )
 
     def test_pipeline_cache_constant_ttl(self):

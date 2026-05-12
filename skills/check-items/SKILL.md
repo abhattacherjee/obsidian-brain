@@ -303,9 +303,12 @@ if os.path.isdir(sessions_dir):
         if not fname.endswith(".md"):
             continue
         # Filenames are YYYY-MM-DD-* — date prefix determines recency
+        if len(fname) < 10 or fname[4] != "-" or fname[7] != "-":
+            continue
         date_prefix = fname[:10]
-        if date_prefix >= cutoff:
-            basenames.append(fname)
+        if date_prefix < cutoff:
+            break  # sorted reverse-chronological; once below cutoff we're done
+        basenames.append(fname)
 
 projects = list(data["merged_by_proj"].keys()) if isinstance(data["merged_by_proj"], dict) else []
 output_path = os.path.join(os.path.dirname(scope_path), "pipeline_evidence.json")
@@ -376,7 +379,8 @@ for g in all_merged:
             "confidence": g.get("_cached_confidence", "LOW"),
             "canonical_text": g.get("representative", ""),
             "evidence_citation": g.get("_cached_evidence_citation"),
-            "action_required": None,
+            "action_required": g.get("_cached_action_required"),
+            "project": g.get("project"),
         })
 
 out = os.path.join(os.path.dirname(scope_path), "classifications.json")
@@ -520,6 +524,7 @@ for c in data["classifications"]:
         "confidence": c.get("confidence"),
         "evidence_citation": c.get("evidence_citation"),
         "classified_ts": int(time.time()),
+        "_group_project": group.get("project", "unknown"),  # carried for fresh_by_proj attribution
     })
 
 # Group by project for per-project update_cache calls.
@@ -528,12 +533,9 @@ for g in all_groups:
     groups_by_proj.setdefault(g.get("project", "unknown"), []).append(g)
 fresh_by_proj = {}
 for fc in fresh_classifications:
-    # Match classification to project via canonical_hash lookup in all_groups
-    proj = next(
-        (g.get("project", "unknown") for g in all_groups
-         if canonical_hash(g.get("representative", "")) == fc.get("canonical_hash")),
-        "unknown"
-    )
+    # Derive project from the looked-up group (groups_by_id[gid]["project"]), not hash matching,
+    # so same canonical text in multiple projects is attributed correctly.
+    proj = fc.pop("_group_project", "unknown")
     fresh_by_proj.setdefault(proj, []).append(fc)
 
 cache = load_cache()

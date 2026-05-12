@@ -361,3 +361,55 @@ def test_cache_update_preserves_unchanged_classifications():
     assert out["canonical_hash"] == "h1"
     assert out["classification"] == "DONE"
     assert out["evidence_citation"] == "test"
+
+
+# ---------------------------------------------------------------------------
+# R3 regression tests: Finding A1 + A2
+# ---------------------------------------------------------------------------
+
+def test_cache_preserves_action_required_on_warm_runs():
+    """NEEDS-ACTION groups must retain action_required across cache cycles (Finding A1)."""
+    from check_items_cache import update_cache, partition
+    cache = {"schema_version": 1, "runs": {}}
+    all_groups = [_make_group("h1")]
+    fresh = [{
+        "canonical_hash": "h1",
+        "canonical_text": "Close #534",
+        "members": [{"file": "n.md", "line": 1, "mtime": 1735000000}],
+        "classification": "NEEDS-ACTION",
+        "confidence": "HIGH",
+        "evidence_citation": "Story 11.12",
+        "action_required": 'gh issue close 534 --comment "Fixed"',
+        "classified_ts": int(time.time()) - 60,
+    }]
+    updated = update_cache(cache, project="p", all_groups=all_groups,
+                           fresh_classifications=fresh, head_sha="h")
+    cached_entry = updated["runs"]["p"]["groups"][0]
+    assert cached_entry["action_required"] == 'gh issue close 534 --comment "Fixed"'
+
+    # Round-trip through partition
+    known, _ = partition(all_groups, updated, project="p", head_sha="h")
+    assert len(known) == 1
+    assert known[0]["_cached_action_required"] == 'gh issue close 534 --comment "Fixed"'
+
+
+def test_partition_skips_corrupted_cache_entries():
+    """Cache entries missing canonical_hash must not crash partition (Finding A2)."""
+    from check_items_cache import partition
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "p": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "h",
+                "groups": [
+                    {"no_hash_field": True},   # corrupt entry
+                    _make_cached_entry("h1"),   # valid
+                ],
+            }
+        },
+    }
+    groups = [_make_group("h1")]
+    # Should not raise KeyError; corrupted entry is silently skipped
+    known, needs = partition(groups, cache, project="p", head_sha="h")
+    assert len(known) == 1

@@ -1099,6 +1099,16 @@ def test_parse_scope_flags():
     assert s.no_cache is True
 
 
+def test_parse_scope_all_clears_stale_project(monkeypatch):
+    """When 'all' appears after a project token, scope.project must be cleared (Finding B)."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects",
+                        lambda: {"obsidian-brain"})
+    scope = check_items_args.parse_scope(["obsidian-brain", "all"])
+    assert scope.mode == "vault"
+    assert scope.project is None
+
+
 # ---------------------------------------------------------------------------
 # verify_before_edit — Stage 6 pre-Edit guard
 # ---------------------------------------------------------------------------

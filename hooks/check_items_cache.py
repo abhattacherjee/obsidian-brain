@@ -136,7 +136,11 @@ def partition(
     if now is None:
         now = time.time()
     run = cache.get("runs", {}).get(project, {})
-    cached_groups_by_hash = {g["canonical_hash"]: g for g in run.get("groups", [])}
+    cached_groups_by_hash = {
+        g["canonical_hash"]: g
+        for g in run.get("groups", [])
+        if isinstance(g, dict) and isinstance(g.get("canonical_hash"), str)
+    }
     cached_head = run.get("project_head_at_classify")
 
     known: list[dict] = []
@@ -169,6 +173,7 @@ def partition(
         g["_cached_classification"] = cached.get("classification")
         g["_cached_confidence"] = cached.get("confidence")
         g["_cached_evidence_citation"] = cached.get("evidence_citation")
+        g["_cached_action_required"] = cached.get("action_required")
         known.append(g)
 
     return known, needs
@@ -233,5 +238,6 @@ def _freeze_classification(fc: dict, now: float) -> dict:
         "classification": fc.get("classification"),
         "confidence": fc.get("confidence"),
         "evidence_citation": fc.get("evidence_citation"),
+        "action_required": fc.get("action_required"),
         "classified_ts": fc.get("classified_ts", int(now)),
     }
