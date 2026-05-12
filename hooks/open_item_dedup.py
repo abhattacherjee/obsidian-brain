@@ -1444,9 +1444,11 @@ def verify_before_edit(file_path: str, line_number: int, expected_text: str) -> 
     Re-read target line and compare against expected text BEFORE flipping
     a checkbox via Edit tool.
 
-    Returns True iff line[line_number] matches expected_text (rstrip
-    whitespace tolerant). False on missing file, out-of-range line, or
-    read error.
+    Returns True iff line[line_number] matches expected_text after
+    `.strip()` is applied to both sides (leading + trailing whitespace
+    tolerant — handles nested-list checkboxes that collect_open_items
+    matches with `.strip().startswith('- [ ] ')`). False on missing
+    file, out-of-range line, or read error.
 
     Memory feedback_open_item_checkoff_verify_before_edit: verification
     is mandatory before Edit-tool dispatch.

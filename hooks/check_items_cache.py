@@ -130,8 +130,10 @@ def partition(
     """
     Apply invalidation rules in spec order (first match wins):
         force -> new -> head_changed -> mtime_changed -> ttl_expired.
-    Returns (known_unchanged, needs_reclassification). Each routed group
-    receives a `_reason` key for dashboard visibility.
+    Returns (known_unchanged, needs_reclassification). Groups routed to
+    `needs` carry `_reason` for dashboard visibility. Groups routed to
+    `known` carry `_cached_classification` / `_cached_confidence` /
+    `_cached_evidence_citation` / `_cached_action_required` (NOT `_reason`).
     """
     if now is None:
         now = time.time()
