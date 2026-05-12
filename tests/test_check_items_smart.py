@@ -451,3 +451,99 @@ def test_run_semantic_merge_prompt_includes_five_examples():
     assert "Investigate" in prompt and "Fix" in prompt
     assert "PR #67" in prompt or "PR #70" in prompt
     assert "STRICT JSON" in prompt or "strict JSON" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# Task 12: merge_groups_semantically() orchestrator
+# ---------------------------------------------------------------------------
+
+def test_semantic_merge_pairs_with_zero_token_overlap(tmp_path, monkeypatch):
+    """Test 1b - sub-agent merges two zero-token-overlap items into one group."""
+    import open_item_dedup as oid
+
+    def fake_cli_run(cmd, *args, **kwargs):
+        out_path = None
+        for i, c in enumerate(cmd):
+            if c.endswith(".json") and "out" in c:
+                out_path = c
+        merge_map = {
+            "merges": [
+                {
+                    "canonical_group_id": "ob-0004",
+                    "absorbed_group_ids": ["ob-0003"],
+                    "reasoning": "Both describe N=1 text-fallback routing decision",
+                }
+            ],
+            "total_groups_before": 2,
+            "total_groups_after": 1,
+        }
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump(merge_map, f)
+        return _fake_completed(stdout=json.dumps(merge_map), returncode=0)
+
+    coarse = [
+        {
+            "group_id": "ob-0003",
+            "project": "obsidian-brain",
+            "representative": "Decide text-fallback routing vs. sentinel option to satisfy AskUserQuestion minItems=2",
+            "members": [{"file": "a.md", "line": 1, "text": "..."}],
+        },
+        {
+            "group_id": "ob-0004",
+            "project": "obsidian-brain",
+            "representative": "Review fuzzy-matched cascade candidate about routing N=1 to text-fallback",
+            "members": [{"file": "b.md", "line": 2, "text": "..."}],
+        },
+    ]
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    merged = oid.merge_groups_semantically({"obsidian-brain": coarse})
+
+    flat = merged if isinstance(merged, list) else [
+        g for v in merged.values() for g in v
+    ]
+    assert len(flat) == 1, f"expected 1 merged group, got {len(flat)}: {flat}"
+    assert flat[0]["group_id"] == "ob-0004"
+    assert len(flat[0]["members"]) == 2
+
+
+def test_semantic_merge_rejects_cross_project(tmp_path, monkeypatch):
+    """Test 1c - sub-agent returns a cross-project merge; Python filter drops it."""
+    import open_item_dedup as oid
+
+    def fake_cli_run(cmd, *args, **kwargs):
+        out_path = None
+        for c in cmd:
+            if isinstance(c, str) and c.endswith(".json") and "out" in c:
+                out_path = c
+        merge_map = {
+            "merges": [
+                {
+                    "canonical_group_id": "ob-0001",
+                    "absorbed_group_ids": ["tva-0001"],
+                    "reasoning": "sub-agent erroneously merged across projects",
+                }
+            ],
+            "total_groups_before": 2,
+            "total_groups_after": 1,
+        }
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump(merge_map, f)
+        return _fake_completed(stdout=json.dumps(merge_map), returncode=0)
+
+    coarse_by_proj = {
+        "obsidian-brain": [{"group_id": "ob-0001", "project": "obsidian-brain",
+                            "representative": "X", "members": []}],
+        "tiny-vacation-agent": [{"group_id": "tva-0001", "project": "tiny-vacation-agent",
+                                  "representative": "Y", "members": []}],
+    }
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    merged = oid.merge_groups_semantically(coarse_by_proj)
+
+    flat = merged if isinstance(merged, list) else [
+        g for v in merged.values() for g in v
+    ]
+    assert len(flat) == 2, "cross-project merge must be filtered out"

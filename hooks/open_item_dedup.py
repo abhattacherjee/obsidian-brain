@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 # --- Module-level compiled regexes (computed once at import) ---
 
@@ -974,3 +975,120 @@ def cross_project_dedup(groups_by_project):
             out.setdefault("project", project)
             flat.append(out)
     return flat
+
+
+def merge_groups_semantically(coarse_groups):
+    """
+    Stage 2b orchestrator: invoke the semantic-merge sub-agent via
+    check_items_cli.run_semantic_merge, validate the response, enforce
+    same-project rule, and apply the merge map by folding absorbed group
+    members into the canonical group.
+
+    Accepts either a list of groups OR a dict {project: [groups]}.
+    Returns the same shape it received.
+
+    On 2 consecutive sub-agent failures, returns coarse_groups unchanged.
+    (Token-only fallback marker added in Task 13.)
+
+    Spec §§ Pipeline architecture Stage 2b (lines 73-86) and Merge-pass rules.
+    """
+    return_dict_shape = isinstance(coarse_groups, dict)
+    if return_dict_shape:
+        flat_groups = [g for v in coarse_groups.values() for g in v]
+    else:
+        flat_groups = list(coarse_groups or [])
+
+    if not flat_groups:
+        return coarse_groups
+
+    workdir = _check_items_workdir()
+    in_path = workdir / f"semantic-merge-{os.getpid()}.in.json"
+    out_path = workdir / f"semantic-merge-{os.getpid()}.out.json"
+    payload = {"groups": [
+        {
+            "group_id": g.get("group_id"),
+            "project": g.get("project"),
+            "representative": g.get("representative", ""),
+            "member_texts": [m.get("text", "") for m in g.get("members", [])],
+        }
+        for g in flat_groups
+    ]}
+    in_path.write_text(json.dumps(payload), encoding="utf-8")
+    os.chmod(str(in_path), 0o600)
+
+    cli_path = os.path.join(os.path.dirname(__file__), "check_items_cli.py")
+    attempt = 0
+    merge_map = None
+    while attempt < 2:
+        attempt += 1
+        try:
+            cp = subprocess.run(
+                ["python3", cli_path, "semantic_merge", str(out_path)],
+                input=in_path.read_text(),
+                capture_output=True,
+                text=True,
+                timeout=70,
+            )
+            if cp.returncode != 0 or not out_path.exists():
+                continue
+            merge_map = json.loads(out_path.read_text())
+            if not isinstance(merge_map, dict) or "merges" not in merge_map:
+                merge_map = None
+                continue
+            break
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
+            print(f"[check-items] semantic-merge attempt {attempt} failed: {exc}",
+                  file=sys.stderr)
+            continue
+
+    for p in (in_path, out_path):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+    if merge_map is None:
+        if return_dict_shape:
+            return coarse_groups
+        return flat_groups
+
+    groups_by_id = {g.get("group_id"): dict(g) for g in flat_groups}
+
+    for merge in merge_map.get("merges", []):
+        canonical_id = merge.get("canonical_group_id")
+        absorbed_ids = merge.get("absorbed_group_ids", [])
+        canonical = groups_by_id.get(canonical_id)
+        if canonical is None:
+            continue
+        canonical_project = canonical.get("project")
+        for aid in absorbed_ids:
+            absorbed = groups_by_id.get(aid)
+            if absorbed is None:
+                continue
+            if absorbed.get("project") != canonical_project:
+                print(f"[check-items] dropping cross-project merge "
+                      f"{aid} -> {canonical_id}", file=sys.stderr)
+                continue
+            canonical.setdefault("members", []).extend(absorbed.get("members", []))
+            canonical.setdefault("absorbed_reasoning", []).append({
+                "absorbed": aid,
+                "reasoning": merge.get("reasoning", ""),
+            })
+            groups_by_id.pop(aid, None)
+        groups_by_id[canonical_id] = canonical
+
+    surviving = list(groups_by_id.values())
+
+    if return_dict_shape:
+        out = {}
+        for g in surviving:
+            out.setdefault(g.get("project"), []).append(g)
+        return out
+    return surviving
+
+
+def _check_items_workdir():
+    """Return the 0o700 workdir under ~/.claude/obsidian-brain."""
+    p = Path.home() / ".claude" / "obsidian-brain"
+    p.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return p
