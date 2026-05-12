@@ -1313,3 +1313,26 @@ def partition_for_review(classifications, show_all=False):
             scrubbed["evidence_citation"] = None
             dashboard_only.append(scrubbed)
     return {"review": review, "dashboard_only": dashboard_only}
+
+
+def verify_before_edit(file_path: str, line_number: int, expected_text: str) -> bool:
+    """
+    Re-read target line and compare against expected text BEFORE flipping
+    a checkbox via Edit tool.
+
+    Returns True iff line[line_number] matches expected_text (rstrip
+    whitespace tolerant). False on missing file, out-of-range line, or
+    read error.
+
+    Memory feedback_open_item_checkoff_verify_before_edit: verification
+    is mandatory before Edit-tool dispatch.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+    if not 1 <= line_number <= len(lines):
+        return False
+    actual = lines[line_number - 1].rstrip()
+    return actual == (expected_text or "").rstrip()

@@ -1097,3 +1097,39 @@ def test_parse_scope_flags():
     s = parse_scope(["--dry-run", "--no-cache"])
     assert s.dry_run is True
     assert s.no_cache is True
+
+
+# ---------------------------------------------------------------------------
+# verify_before_edit — Stage 6 pre-Edit guard
+# ---------------------------------------------------------------------------
+
+def test_verify_before_edit_match_returns_true(tmp_path):
+    from open_item_dedup import verify_before_edit
+    f = tmp_path / "note.md"
+    f.write_text("line one\n- [ ] Fix #87 ship it\nline three\n")
+    ok = verify_before_edit(str(f), line_number=2, expected_text="- [ ] Fix #87 ship it")
+    assert ok is True
+
+
+def test_verify_before_edit_mismatch_aborts(tmp_path):
+    """Test 9 - mocked line content differs from preview; verify returns False."""
+    from open_item_dedup import verify_before_edit
+    f = tmp_path / "note.md"
+    f.write_text("line one\n- [x] Fix #87 ALREADY DONE\nline three\n")
+    ok = verify_before_edit(str(f), line_number=2, expected_text="- [ ] Fix #87 ship it")
+    assert ok is False
+
+
+def test_verify_before_edit_handles_missing_file(tmp_path):
+    from open_item_dedup import verify_before_edit
+    ok = verify_before_edit(str(tmp_path / "missing.md"), line_number=1,
+                            expected_text="anything")
+    assert ok is False
+
+
+def test_verify_before_edit_handles_line_out_of_range(tmp_path):
+    from open_item_dedup import verify_before_edit
+    f = tmp_path / "note.md"
+    f.write_text("only one line\n")
+    ok = verify_before_edit(str(f), line_number=99, expected_text="anything")
+    assert ok is False
