@@ -164,7 +164,7 @@ echo "raw_path=$raw_path"
 
 ## Step 3 — Coarse-group + cache partition (Stage 2a + cache load)
 
-Steps 4-10 follow the same bash+python3 -c pattern: embed the Python logic in `python3 -c "..." "$scope_path" "$prev_path"` so that `sys.argv[1]`, `sys.argv[2]`, … receive the correct file paths. Do not run raw `python3` blocks that rely on `sys.argv` without this wrapper.
+Steps 4-10 follow the same bash + env-var heredoc pattern used in Steps 1-4: each step is a bash block that sets env vars (e.g. `SCOPE_PATH="$scope_path"`) and runs `python3 << 'PYEOF' ... PYEOF`. The Python reads its inputs via `os.environ["VAR_NAME"]` — never via `sys.argv`. Do not use raw `python3` blocks that rely on `sys.argv` for file-path arguments; all steps, without exception, must use this bash + env-var heredoc pattern.
 
 ```bash
 part_path=$(SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" python3 << 'PYEOF'
@@ -302,15 +302,17 @@ echo "merged_path=$merged_path"
 
 ## Step 5 — Gather evidence (Stage 3)
 
-```python
-import sys, os, glob, json
+```bash
+evidence_path=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" python3 << 'PYEOF'
+import sys, os, glob, json, datetime
 sys.path.insert(0, max(
     glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
     default="hooks"
 ))
 from open_item_dedup import deep_analysis_pipeline
 
-scope_path, merged_path = sys.argv[1], sys.argv[2]
+scope_path = os.environ["SCOPE_PATH"]
+merged_path = os.environ["MERGED_PATH"]
 scope = json.load(open(scope_path))
 data = json.load(open(merged_path))
 config = json.load(open(os.path.expanduser("~/.claude/obsidian-brain-config.json")))
@@ -319,7 +321,6 @@ sessions_folder = config.get("sessions_folder", "claude-sessions")
 insights_folder = config.get("insights_folder", "claude-insights")
 
 # Collect session file basenames within window_days to scope evidence gathering.
-import datetime
 window_days = scope.get("window_days", 14)
 cutoff = (datetime.date.today() - datetime.timedelta(days=window_days)).isoformat()
 sessions_dir = os.path.join(vault_path, sessions_folder)
@@ -351,26 +352,31 @@ status = deep_analysis_pipeline(
     insights_folder=insights_folder,
 )
 if not status.startswith("OK"):
-    print(f"WARNING: deep_analysis_pipeline returned: {status}")
+    print(f"WARNING: deep_analysis_pipeline returned: {status}", file=sys.stderr)
 
 # Read the written evidence from output_path for downstream use.
 try:
     pipeline_data = json.load(open(output_path))
     evidence = pipeline_data.get("evidence", {})
 except (OSError, json.JSONDecodeError) as e:
-    print(f"WARNING: could not read pipeline output: {e}")
+    print(f"WARNING: could not read pipeline output: {e}", file=sys.stderr)
     evidence = {}
 
 out = os.path.join(os.path.dirname(scope_path), "evidence.json")
 with open(out, "w") as f:
     json.dump(evidence, f, default=str, indent=2)
 os.chmod(out, 0o600)
-print(out, "—", len(evidence), "projects, pipeline status:", status)
+print(out)
+PYEOF
+)
+
+echo "evidence_path=$evidence_path"
 ```
 
 ## Step 6 — Classify (Stage 4) with fallback chain
 
-```python
+```bash
+classifications_path=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" EVIDENCE_PATH="$evidence_path" python3 << 'PYEOF'
 import sys, os, glob, json
 sys.path.insert(0, max(
     glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
@@ -380,7 +386,9 @@ from open_item_dedup import (
     classify_groups_with_agent, classify_groups_heuristic, get_last_classifier_mode
 )
 
-scope_path, merged_path, evidence_path = sys.argv[1], sys.argv[2], sys.argv[3]
+scope_path = os.environ["SCOPE_PATH"]
+merged_path = os.environ["MERGED_PATH"]
+evidence_path = os.environ["EVIDENCE_PATH"]
 data = json.load(open(merged_path))
 evidence = json.load(open(evidence_path))
 
@@ -413,12 +421,17 @@ out = os.path.join(os.path.dirname(scope_path), "classifications.json")
 with open(out, "w") as f:
     json.dump({"classifications": classifications, "classifier_mode": mode}, f, indent=2)
 os.chmod(out, 0o600)
-print(out, "—", len(classifications), "classified, mode=", mode)
+print(out)
+PYEOF
+)
+
+echo "classifications_path=$classifications_path"
 ```
 
 ## Step 7 — Apply tier rules + present review (Stage 5)
 
-```python
+```bash
+buckets_path=$(SCOPE_PATH="$scope_path" CLASSIFICATIONS_PATH="$classifications_path" python3 << 'PYEOF'
 import sys, os, glob, json
 sys.path.insert(0, max(
     glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
@@ -426,7 +439,8 @@ sys.path.insert(0, max(
 ))
 from open_item_dedup import assign_tier, partition_for_review
 
-scope_path, classifications_path = sys.argv[1], sys.argv[2]
+scope_path = os.environ["SCOPE_PATH"]
+classifications_path = os.environ["CLASSIFICATIONS_PATH"]
 scope = json.load(open(scope_path))
 data = json.load(open(classifications_path))
 for item in data["classifications"]:
@@ -435,21 +449,25 @@ for item in data["classifications"]:
 buckets = partition_for_review(data["classifications"], show_all=scope["show_all"])
 # Format: HIGH first, MED next, LOW (only if show_all). DONE preselected [x],
 # NEEDS-ACTION [ ] with action_required command surfaced.
-print("\n=== Review ===")
+print("\n=== Review ===", file=sys.stderr)
 for item in sorted(buckets["review"],
                    key=lambda x: ("HIGH MED LOW".split().index(x.get("tier", "LOW")),
                                   x.get("classification"))):
     mark = "[x]" if item["classification"] == "DONE" and item["tier"] == "HIGH" else "[ ]"
-    print(f"  {mark} ({item['classification']}/{item['tier']}) {item['canonical_text']}")
-    print(f"      evidence: {item.get('evidence_citation')}")
+    print(f"  {mark} ({item['classification']}/{item['tier']}) {item['canonical_text']}", file=sys.stderr)
+    print(f"      evidence: {item.get('evidence_citation')}", file=sys.stderr)
     if item.get("action_required"):
-        print(f"      action:   {item['action_required']}")
+        print(f"      action:   {item['action_required']}", file=sys.stderr)
 
 out = os.path.join(os.path.dirname(scope_path), "buckets.json")
 with open(out, "w") as f:
     json.dump(buckets, f, indent=2)
 os.chmod(out, 0o600)
 print(out)
+PYEOF
+)
+
+echo "buckets_path=$buckets_path"
 ```
 
 If `scope.dry_run` is true OR the user types `none` at the confirm prompt: skip Step 8 (Edit + cascade) and go straight to Step 9 (dashboard). The dashboard is ALWAYS written.
@@ -465,8 +483,9 @@ For each item the user kept selected (default-selected for HIGH+DONE, opt-in for
 
 After the user-confirmed batch, run cascade:
 
-```python
-import sys, os, glob, json
+```bash
+SCOPE_PATH="$scope_path" BUCKETS_PATH="$buckets_path" python3 << 'PYEOF'
+import sys, os, glob, json, re
 sys.path.insert(0, max(
     glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
     default="hooks"
@@ -474,7 +493,8 @@ sys.path.insert(0, max(
 from open_item_dedup import batch_cascade_checkoff
 
 # batch_cascade_checkoff(vault_path, sessions_folder, project, checked_texts) -> str
-scope_path, buckets_path = sys.argv[1], sys.argv[2]
+scope_path = os.environ["SCOPE_PATH"]
+buckets_path = os.environ["BUCKETS_PATH"]
 config = json.load(open(os.path.expanduser("~/.claude/obsidian-brain-config.json")))
 vault_path = config["vault_path"]
 sessions_folder = config.get("sessions_folder", "claude-sessions")
@@ -493,12 +513,12 @@ for proj, checked_texts in done_by_project.items():
     summary = batch_cascade_checkoff(vault_path, sessions_folder, proj, checked_texts)
     print(f"[cascade/{proj}] {summary}")
     # Count cascaded items from summary string ("Cascaded N high-confidence ...")
-    import re
     m = re.search(r"Cascaded (\d+)", summary)
     if m:
         cascade_total += int(m.group(1))
 
 print(f"cascaded_total={cascade_total}")
+PYEOF
 ```
 
 ## Step 9 — Write dashboard report (Stage 8) — ALWAYS
@@ -507,7 +527,8 @@ print(f"cascaded_total={cascade_total}")
 
 ## Step 10 — Persist cache updates
 
-```python
+```bash
+SCOPE_PATH="$scope_path" CLASSIFICATIONS_PATH="$classifications_path" PARTITION_PATH="$part_path" python3 << 'PYEOF'
 import sys, os, glob, json, time, subprocess
 sys.path.insert(0, max(
     glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
@@ -515,7 +536,9 @@ sys.path.insert(0, max(
 ))
 from check_items_cache import load_cache, save_cache, update_cache, canonical_hash
 
-scope_path, classifications_path, partition_path = sys.argv[1], sys.argv[2], sys.argv[3]
+scope_path = os.environ["SCOPE_PATH"]
+classifications_path = os.environ["CLASSIFICATIONS_PATH"]
+partition_path = os.environ["PARTITION_PATH"]
 scope = json.load(open(scope_path))
 data = json.load(open(classifications_path))
 part = json.load(open(partition_path))
@@ -586,6 +609,7 @@ for proj, proj_groups in groups_by_proj.items():
 
 save_cache(cache)
 print("cache updated")
+PYEOF
 ```
 
 ## Output format

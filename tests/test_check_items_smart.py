@@ -1442,3 +1442,84 @@ def test_dashboard_yaml_rejects_date_injection(tmp_path):
     # The frontmatter date: line must be a single sanitized token (no embedded newlines).
     date_lines = [ln for ln in fm_block.splitlines() if ln.startswith("date:")]
     assert len(date_lines) == 1, f"expected exactly 1 date: line in frontmatter, got: {date_lines}"
+
+
+# ---------------------------------------------------------------------------
+# R6 regression: prompt piped via stdin, not argv  (Finding A + B)
+# ---------------------------------------------------------------------------
+
+def test_run_semantic_merge_pipes_prompt_via_stdin(tmp_path, monkeypatch):
+    """Prompt must NOT appear in argv (avoids ARG_MAX + ps leakage).
+
+    After the R6 fix, cmd is ["claude", "-p", "--model", model] and the full
+    prompt is passed via the `input=` kwarg to subprocess.run.
+    """
+    import check_items_cli as cli
+
+    captured = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["input"] = kwargs.get("input", "")
+        out_path = tmp_path / "out.json"
+        out_path.write_text(json.dumps({
+            "merges": [],
+            "total_groups_before": 0,
+            "total_groups_after": 0,
+        }))
+        return _fake_completed(stdout=out_path.read_text(), returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    out_path = tmp_path / "merge.json"
+    rc = cli.run_semantic_merge(
+        stdin_json=json.dumps({"groups": []}),
+        output_path=str(out_path),
+    )
+    assert rc == 0
+    # argv must only contain the known-safe tokens; no prompt text
+    allowed = {"claude", "-p", "--model", "haiku", "sonnet"}
+    unexpected = [arg for arg in captured["cmd"] if arg not in allowed]
+    assert not unexpected, (
+        f"argv contains unexpected items (likely prompt leaked into argv): {unexpected}"
+    )
+    # Prompt should be delivered via stdin (the input= kwarg)
+    assert "SHOULD MERGE" in captured["input"], (
+        "SEMANTIC_MERGE_PROMPT must be piped via stdin, not argv"
+    )
+
+
+def test_run_classifier_pipes_prompt_via_stdin(tmp_path, monkeypatch):
+    """Same stdin-pipe contract for run_classifier (R6 Finding B).
+
+    cmd must be ["claude", "-p", "--model", model]; classifier prompt piped via input=.
+    """
+    import check_items_cli as cli
+
+    captured = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["input"] = kwargs.get("input", "")
+        out_path = tmp_path / "out.json"
+        out_path.write_text(json.dumps([]))
+        return _fake_completed(stdout=out_path.read_text(), returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    payload = {"groups": [], "evidence": {}}
+    out_path = tmp_path / "classify.json"
+    rc = cli.run_classifier(
+        stdin_json=json.dumps(payload),
+        output_path=str(out_path),
+    )
+    assert rc == 0
+    allowed = {"claude", "-p", "--model", "haiku", "sonnet"}
+    unexpected = [arg for arg in captured["cmd"] if arg not in allowed]
+    assert not unexpected, (
+        f"argv contains unexpected items (likely prompt leaked into argv): {unexpected}"
+    )
+    # Classifier prompt must also be delivered via stdin
+    assert "discovery" in captured["input"].lower(), (
+        "CLASSIFIER_PROMPT must be piped via stdin, not argv"
+    )

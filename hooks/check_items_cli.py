@@ -153,10 +153,11 @@ def run_semantic_merge(stdin_json: str, output_path: str) -> int:
         "<output-json-path>", output_path
     )
 
-    cmd = ["claude", "-p", "--model", model, prompt]
+    cmd = ["claude", "-p", "--model", model]
     try:
         cp = subprocess.run(
             cmd,
+            input=prompt,
             capture_output=True,
             text=True,
             timeout=SUBAGENT_TIMEOUT_SEC,
@@ -299,10 +300,10 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
         "<output-json-path>", output_path
     )
 
-    cmd = ["claude", "-p", "--model", model, prompt]
+    cmd = ["claude", "-p", "--model", model]
     try:
         cp = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=SUBAGENT_TIMEOUT_SEC
+            cmd, input=prompt, capture_output=True, text=True, timeout=SUBAGENT_TIMEOUT_SEC
         )
     except subprocess.TimeoutExpired:
         print(f"[check-items-cli] classifier timeout after {SUBAGENT_TIMEOUT_SEC}s",
