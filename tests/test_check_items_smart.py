@@ -994,3 +994,49 @@ def test_classify_groups_heuristic_distinctive_token_and_completion_phrase():
     assert by_id["g1"]["classification"] == "ACTIVE"
     assert by_id["g2"]["classification"] == "ACTIVE"
     assert by_id["g3"]["classification"] == "DONE"
+
+
+# ---------------------------------------------------------------------------
+# Task 18: partition_for_review with STALE hide-by-default and ACTIVE omission
+# ---------------------------------------------------------------------------
+
+def test_stale_hidden_without_show_all():
+    """Test 6 - STALE items absent from default review; present with --show-all."""
+    from open_item_dedup import partition_for_review
+
+    classifications = [
+        {"group_id": "g1", "classification": "DONE", "confidence": "HIGH",
+         "canonical_text": "x", "evidence_citation": "c", "action_required": None},
+        {"group_id": "g2", "classification": "NEEDS-ACTION", "confidence": "HIGH",
+         "canonical_text": "y", "evidence_citation": "c", "action_required": "gh ..."},
+        {"group_id": "g3", "classification": "STALE", "confidence": "LOW",
+         "canonical_text": "z", "evidence_citation": None, "action_required": None},
+        {"group_id": "g4", "classification": "ACTIVE", "confidence": "LOW",
+         "canonical_text": "w", "evidence_citation": None, "action_required": None},
+    ]
+
+    default = partition_for_review(classifications, show_all=False)
+    review_ids = {item["group_id"] for item in default["review"]}
+    assert review_ids == {"g1", "g2"}
+    assert any(d["group_id"] == "g4" and d["evidence_citation"] is None
+               for d in default["dashboard_only"])
+    assert all(d["group_id"] != "g3" for d in default["review"])
+
+    expanded = partition_for_review(classifications, show_all=True)
+    review_ids_expanded = {item["group_id"] for item in expanded["review"]}
+    assert "g3" in review_ids_expanded
+
+
+def test_active_groups_carry_null_citation_to_dashboard():
+    """ACTIVE entries are written to dashboard with evidence_citation=null
+    per spec line 322."""
+    from open_item_dedup import partition_for_review
+
+    classifications = [
+        {"group_id": "g1", "classification": "ACTIVE", "confidence": "LOW",
+         "canonical_text": "w", "evidence_citation": "garbage that should be cleared",
+         "action_required": None},
+    ]
+    out = partition_for_review(classifications, show_all=False)
+    assert len(out["dashboard_only"]) == 1
+    assert out["dashboard_only"][0]["evidence_citation"] is None

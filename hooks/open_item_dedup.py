@@ -1278,3 +1278,38 @@ def classify_groups_heuristic(merged_groups, evidence):
             "action_required": None,
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: partition_for_review (Task 18)
+# ---------------------------------------------------------------------------
+
+def partition_for_review(classifications, show_all=False):
+    """
+    Partition classifier output into UX-relevant buckets for Stage 5.
+
+    Returns:
+        {
+            "review": [...DONE + NEEDS-ACTION (+ STALE if show_all)...],
+            "dashboard_only": [...ACTIVE (always) + STALE (default-mode)...]
+        }
+
+    ACTIVE entries have evidence_citation forced to None before dashboard
+    write, per spec § Classification semantics line 322.
+    """
+    review = []
+    dashboard_only = []
+    for item in classifications or []:
+        kind = item.get("classification")
+        if kind in ("DONE", "NEEDS-ACTION"):
+            review.append(item)
+        elif kind == "STALE":
+            if show_all:
+                review.append(item)
+            else:
+                dashboard_only.append(item)
+        elif kind == "ACTIVE":
+            scrubbed = dict(item)
+            scrubbed["evidence_citation"] = None
+            dashboard_only.append(scrubbed)
+    return {"review": review, "dashboard_only": dashboard_only}
