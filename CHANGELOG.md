@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `/check-items` now uses evidence-grounded AI classification (reuses `/standup deep` pipeline). Closes #87.
+- `/check-items` supports `all`, `<project>`, `Nd`, `--show-all`, `--dry-run`, `--no-cache` arguments. Order-independent and combinable.
+- Two-pass deduplication: token-based coarse grouping followed by an AI semantic merge pass that catches near-duplicate items with zero token overlap. Same-project only; audit trail in dashboard report.
+- Cross-project deduplication when scope is `all` — `#534` in two repos no longer collides.
+- Dashboard report written to `claude-dashboards/check-items-<scope>-<date>.md` on every run (always, even on `--dry-run` or user cancel).
+- `NEEDS-ACTION` tier surfaces fixes that are shipped but require external commands (`gh issue close`, token rotations, etc.) as copy-pasteable strings.
+- Classification cache at `~/.claude/obsidian-brain/check-items-classifications.json` with hash / mtime / HEAD / TTL invalidation. Warm-cache runs complete in near-zero time at zero cost; only newly-changed groups are re-classified.
+
+### Changed
+
+- `/recall` no longer surfaces checkoff candidates. Runs as a pure read-only context load with a one-line footer nudge to invoke `/check-items` when there are open items in the project. Closes the 4-6-iteration deferral loop documented in user memory `feedback_recall_deferral_loop.md`.
+- `/check-items` argument parsing is now order-independent.
+
+### Removed
+
+- `/recall` checkoff step — the /recall checkoff step (Steps 4-7.5 in prior SKILL.md versions) is gone. Users with muscle memory for `/recall → "skip" → continue` just get shorter `/recall` output; the new footer nudge makes the migration discoverable.
+
 ## [2.4.4] - 2026-05-11
 
 ### Changed
