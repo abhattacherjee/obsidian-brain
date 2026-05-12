@@ -172,3 +172,66 @@ def partition(
         known.append(g)
 
     return known, needs
+
+
+def update_cache(
+    cache: dict,
+    project: str,
+    all_groups: list[dict],
+    fresh_classifications: list[dict],
+    head_sha: str,
+    now: float | None = None,
+) -> dict:
+    """
+    Merge fresh classifications into the cache and GC entries whose
+    canonical_hash is no longer in the current run.
+
+    1. Build a hash set from all_groups (the current run's groups).
+    2. Keep cached groups whose hash is in the current set; evict the rest.
+    3. Overwrite by canonical_hash with any fresh classifications.
+    4. Bump last_run_ts and project_head_at_classify.
+    """
+    if now is None:
+        now = time.time()
+    current_hashes = {g.get("canonical_hash") for g in all_groups}
+    fresh_by_hash = {fc.get("canonical_hash"): fc for fc in fresh_classifications}
+
+    cache.setdefault("schema_version", SCHEMA_VERSION)
+    cache.setdefault("runs", {})
+    run = cache["runs"].setdefault(project, {})
+    existing_groups = run.get("groups", [])
+
+    surviving: list[dict] = []
+    seen: set[str] = set()
+    for g in existing_groups:
+        h = g.get("canonical_hash")
+        if h not in current_hashes:
+            continue
+        if h in fresh_by_hash:
+            surviving.append(_freeze_classification(fresh_by_hash[h], now))
+        else:
+            surviving.append(g)
+        seen.add(h)
+
+    for h, fc in fresh_by_hash.items():
+        if h in seen or h not in current_hashes:
+            continue
+        surviving.append(_freeze_classification(fc, now))
+
+    run["groups"] = surviving
+    run["last_run_ts"] = int(now)
+    run["project_head_at_classify"] = head_sha
+    return cache
+
+
+def _freeze_classification(fc: dict, now: float) -> dict:
+    """Normalize a fresh classification dict into the on-disk cache entry shape."""
+    return {
+        "canonical_hash": fc.get("canonical_hash"),
+        "canonical_text": fc.get("canonical_text") or fc.get("representative", ""),
+        "members": fc.get("members", []),
+        "classification": fc.get("classification"),
+        "confidence": fc.get("confidence"),
+        "evidence_citation": fc.get("evidence_citation"),
+        "classified_ts": fc.get("classified_ts", int(now)),
+    }

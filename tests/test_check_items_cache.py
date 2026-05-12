@@ -297,3 +297,67 @@ def test_ttl_active_longer_than_done():
                              head_sha="abc1234", now=now)
     assert len(known) == 1
     assert len(needs) == 0
+
+
+def test_cache_evicts_removed_items():
+    """Test 20 - cached entries whose canonical_hash is not in current run are GC'd."""
+    from check_items_cache import update_cache
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": 1734000000,
+                "project_head_at_classify": "OLDHEAD",
+                "groups": [
+                    _make_cached_entry("gone1"),
+                    _make_cached_entry("kept1"),
+                    _make_cached_entry("kept2"),
+                ],
+            }
+        },
+    }
+    all_groups = [_make_group("kept1"), _make_group("kept2"), _make_group("fresh")]
+    fresh_classifications = [
+        {
+            "canonical_hash": "fresh",
+            "canonical_text": "New item",
+            "members": [{"file": "x.md", "line": 1, "mtime": 1735000000}],
+            "classification": "ACTIVE",
+            "confidence": "LOW",
+            "evidence_citation": None,
+            "classified_ts": 1735000000,
+        }
+    ]
+    updated = update_cache(cache, project="obsidian-brain",
+                           all_groups=all_groups,
+                           fresh_classifications=fresh_classifications,
+                           head_sha="NEWHEAD")
+    hashes = {g["canonical_hash"] for g in updated["runs"]["obsidian-brain"]["groups"]}
+    assert "gone1" not in hashes
+    assert hashes == {"kept1", "kept2", "fresh"}
+    assert updated["runs"]["obsidian-brain"]["project_head_at_classify"] == "NEWHEAD"
+
+
+def test_cache_update_preserves_unchanged_classifications():
+    """Cached entries surviving GC keep their classification/citation if no fresh override."""
+    from check_items_cache import update_cache
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": 1734000000,
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE")],
+            }
+        },
+    }
+    all_groups = [_make_group("h1")]
+    fresh_classifications = []
+    updated = update_cache(cache, project="obsidian-brain",
+                           all_groups=all_groups,
+                           fresh_classifications=fresh_classifications,
+                           head_sha="abc1234")
+    out = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert out["canonical_hash"] == "h1"
+    assert out["classification"] == "DONE"
+    assert out["evidence_citation"] == "test"
