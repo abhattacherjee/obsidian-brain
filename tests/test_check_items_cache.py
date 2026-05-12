@@ -179,3 +179,121 @@ def test_new_group_triggers_reclassify():
     assert len(known) == 0
     assert len(needs) == 1
     assert needs[0].get("_reason") == "new"
+
+
+def test_mtime_bump_triggers_partial_reclassify():
+    """Test 16 - one member mtime bumped -> that group reclassifies; the other stays."""
+    from check_items_cache import partition
+    groups = [
+        _make_group("h1", members=[{"file": "a.md", "line": 1, "mtime": 1735000000}]),
+        _make_group("h2", members=[{"file": "b.md", "line": 1, "mtime": 1735000100}]),
+    ]
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "abc1234",
+                "groups": [
+                    _make_cached_entry("h1", members=[
+                        {"file": "a.md", "line": 1, "mtime": 1735000000}
+                    ]),
+                    _make_cached_entry("h2", members=[
+                        {"file": "b.md", "line": 1, "mtime": 1735000050}
+                    ]),
+                ],
+            }
+        },
+    }
+    known, needs = partition(groups, cache, project="obsidian-brain", head_sha="abc1234")
+    assert len(known) == 1
+    assert len(needs) == 1
+    assert needs[0]["canonical_hash"] == "h2"
+    assert needs[0]["_reason"] == "mtime_changed"
+
+
+def test_mtime_one_second_tolerance():
+    """+/- 1s mtime tolerance per spec; FS noise must not invalidate."""
+    from check_items_cache import partition
+    groups = [_make_group("h1", members=[{"file": "a.md", "line": 1, "mtime": 1735000000.5}])]
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", members=[
+                    {"file": "a.md", "line": 1, "mtime": 1735000000.0}
+                ])],
+            }
+        },
+    }
+    known, needs = partition(groups, cache, project="obsidian-brain", head_sha="abc1234")
+    assert len(known) == 1
+    assert len(needs) == 0
+
+
+def test_ttl_expires_for_done_at_24h():
+    """Test 18 - DONE expires at TTL_DONE; under-TTL stays known."""
+    from check_items_cache import partition, TTL_DONE
+    now = 1735100000.0
+    cache_within = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE",
+                    classified_ts=now - (TTL_DONE - 300)
+                )],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache_within,
+                             project="obsidian-brain", head_sha="abc1234", now=now)
+    assert len(known) == 1
+    assert len(needs) == 0
+
+    cache_expired = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE",
+                    classified_ts=now - (TTL_DONE + 60)
+                )],
+            }
+        },
+    }
+    known2, needs2 = partition([_make_group("h1")], cache_expired,
+                               project="obsidian-brain", head_sha="abc1234", now=now)
+    assert len(known2) == 0
+    assert len(needs2) == 1
+    assert needs2[0]["_reason"] == "ttl_expired"
+
+
+def test_ttl_active_longer_than_done():
+    """ACTIVE TTL is 7d; an age that expires DONE keeps ACTIVE cached."""
+    from check_items_cache import partition, TTL_DONE, TTL_ACTIVE
+    now = 1735100000.0
+    age = TTL_DONE + 3600  # 25h
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="ACTIVE", classified_ts=now - age
+                )],
+            }
+        },
+    }
+    assert age < TTL_ACTIVE
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=now)
+    assert len(known) == 1
+    assert len(needs) == 0
