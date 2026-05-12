@@ -1040,3 +1040,60 @@ def test_active_groups_carry_null_citation_to_dashboard():
     out = partition_for_review(classifications, show_all=False)
     assert len(out["dashboard_only"]) == 1
     assert out["dashboard_only"][0]["evidence_citation"] is None
+
+
+# ---------------------------------------------------------------------------
+# Task 20 — Order-independent argument parser (check_items_args.py)
+# Spec § Invocation contract lines 35-52
+# ---------------------------------------------------------------------------
+
+def test_parse_scope_defaults():
+    from check_items_args import parse_scope
+    scope = parse_scope([])
+    assert scope.mode == "current"
+    assert scope.window_days == 14
+    assert scope.show_all is False
+    assert scope.dry_run is False
+    assert scope.no_cache is False
+
+
+def test_parse_scope_all_keyword():
+    from check_items_args import parse_scope
+    scope = parse_scope(["all"])
+    assert scope.mode == "vault"
+
+
+def test_parse_scope_window_only():
+    from check_items_args import parse_scope
+    scope = parse_scope(["30d"])
+    assert scope.mode == "current"
+    assert scope.window_days == 30
+
+
+def test_parse_scope_combinations_order_independent():
+    """Spec line 46 — all arguments combinable: /check-items all 30d --show-all."""
+    from check_items_args import parse_scope
+    a = parse_scope(["all", "30d", "--show-all"])
+    b = parse_scope(["--show-all", "30d", "all"])
+    c = parse_scope(["30d", "--show-all", "all"])
+    for s in (a, b, c):
+        assert s.mode == "vault"
+        assert s.window_days == 30
+        assert s.show_all is True
+
+
+def test_parse_scope_project_name(monkeypatch):
+    """Positional matching a known project directory routes to project scope."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects",
+                        lambda: {"obsidian-brain", "tiny-vacation-agent"})
+    scope = check_items_args.parse_scope(["obsidian-brain"])
+    assert scope.mode == "project"
+    assert scope.project == "obsidian-brain"
+
+
+def test_parse_scope_flags():
+    from check_items_args import parse_scope
+    s = parse_scope(["--dry-run", "--no-cache"])
+    assert s.dry_run is True
+    assert s.no_cache is True
