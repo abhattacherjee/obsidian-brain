@@ -930,3 +930,67 @@ def test_needs_action_surfaces_command(monkeypatch):
     assert item["classification"] == "NEEDS-ACTION"
     assert item["action_required"] is not None
     assert "gh issue close 534" in item["action_required"]
+
+
+# ---------------------------------------------------------------------------
+# Task 17: heuristic fallback classifier
+# ---------------------------------------------------------------------------
+
+def test_classifier_heuristic_fallback(monkeypatch):
+    """Test 3 - both sub-agent attempts fail; heuristic fallback runs."""
+    import open_item_dedup as oid
+
+    def always_fail(cmd, *args, **kwargs):
+        return _fake_completed(stdout="not json", returncode=1)
+
+    monkeypatch.setattr(oid.subprocess, "run", always_fail)
+
+    merged_groups = [
+        {"group_id": "g1", "project": "p",
+         "representative": "Fix bug #87 merged in v2.5.0",
+         "members": [{"file": "a.md", "line": 1,
+                      "text": "Fix bug #87 — done; merged in v2.5.0 release."}]},
+        {"group_id": "g2", "project": "p",
+         "representative": "Investigate something unrelated",
+         "members": [{"file": "b.md", "line": 2, "text": "TBD"}]},
+    ]
+    evidence = {"p": {}}
+
+    primary = oid.classify_groups_with_agent(merged_groups, evidence)
+    assert primary == []
+    assert oid.get_last_classifier_mode() == "heuristic-fallback"
+
+    fallback = oid.classify_groups_heuristic(merged_groups, evidence)
+    assert isinstance(fallback, list)
+    assert len(fallback) == 2
+
+    by_id = {item["group_id"]: item for item in fallback}
+    assert by_id["g1"]["classification"] == "DONE"
+    assert by_id["g2"]["classification"] == "ACTIVE"
+    assert all(item["confidence"] in ("HIGH", "MED", "LOW") for item in fallback)
+
+
+def test_classify_groups_heuristic_distinctive_token_and_completion_phrase():
+    """Tightened heuristic from feedback_check_items_filter_tightening:
+    DONE requires a distinctive token AND a completion phrase within +/- 120 chars."""
+    import open_item_dedup as oid
+
+    merged_groups = [
+        {"group_id": "g1", "project": "p",
+         "representative": "Track issue #87 work",
+         "members": [{"file": "a.md", "line": 1,
+                      "text": "Track issue #87 work (no completion words)"}]},
+        {"group_id": "g2", "project": "p",
+         "representative": "Generic done note",
+         "members": [{"file": "b.md", "line": 1,
+                      "text": "this is done now finally"}]},
+        {"group_id": "g3", "project": "p",
+         "representative": "PR #99 merged",
+         "members": [{"file": "c.md", "line": 1,
+                      "text": "Fix #99 merged - this work is done; release shipped."}]},
+    ]
+    out = oid.classify_groups_heuristic(merged_groups, {})
+    by_id = {i["group_id"]: i for i in out}
+    assert by_id["g1"]["classification"] == "ACTIVE"
+    assert by_id["g2"]["classification"] == "ACTIVE"
+    assert by_id["g3"]["classification"] == "DONE"

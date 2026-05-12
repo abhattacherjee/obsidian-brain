@@ -1220,3 +1220,61 @@ def get_last_classifier_mode():
     """Returns 'ok' on success or 'heuristic-fallback' if Task 17's
     heuristic must be invoked."""
     return _LAST_CLASSIFIER_MODE
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: classify_groups_heuristic (Task 17 — long-term fallback)
+# ---------------------------------------------------------------------------
+
+_DISTINCTIVE_TOKEN_RE = re.compile(
+    r"(#\d+|\b[0-9a-f]{7,40}\b|\bv\d+\.\d+(?:\.\d+)?\b)"
+)
+_COMPLETION_PHRASE_RE = re.compile(
+    r"\b(done|merged|shipped|closed|fixed|complete[d]?|resolved|release[d]?)\b",
+    re.IGNORECASE,
+)
+_HEURISTIC_PROXIMITY_CHARS = 120
+
+
+def classify_groups_heuristic(merged_groups, evidence):
+    """
+    Tightened heuristic classifier (long-term fallback).
+
+    Spec § Interim coexistence Patch 2 + memory feedback_check_items_filter_tightening:
+    DONE requires BOTH a distinctive token AND a completion phrase within
+    +/- 120 chars in the same member text. Otherwise -> ACTIVE.
+
+    NEEDS-ACTION and STALE are not assigned by the heuristic (they need
+    cross-source evidence the sub-agent provides).
+    """
+    out = []
+    for g in merged_groups or []:
+        classification = "ACTIVE"
+        confidence = "LOW"
+        evidence_citation = None
+        canonical_text = g.get("representative", "")
+
+        for m in g.get("members", []) or []:
+            text = m.get("text", "") or ""
+            tok_match = _DISTINCTIVE_TOKEN_RE.search(text)
+            phr_match = _COMPLETION_PHRASE_RE.search(text)
+            if tok_match and phr_match:
+                distance = abs(tok_match.start() - phr_match.start())
+                if distance <= _HEURISTIC_PROXIMITY_CHARS:
+                    classification = "DONE"
+                    confidence = "HIGH" if distance <= 60 else "MED"
+                    evidence_citation = (
+                        f"heuristic: token '{tok_match.group(0)}' "
+                        f"near completion phrase '{phr_match.group(0)}'"
+                    )
+                    break
+
+        out.append({
+            "group_id": g.get("group_id"),
+            "classification": classification,
+            "confidence": confidence,
+            "canonical_text": canonical_text,
+            "evidence_citation": evidence_citation,
+            "action_required": None,
+        })
+    return out
