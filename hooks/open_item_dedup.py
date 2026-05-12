@@ -462,7 +462,8 @@ def batch_cascade_checkoff(
 _RE_WIKILINK = re.compile(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]')
 
 # Module-level cache for deep_analysis_pipeline evidence gathering.
-# Keyed by (projects_json, vault_path, sessions_folder); TTL = 15 minutes.
+# Key shape: see _cache_key() — 6-tuple (basenames, projects_json, vault_path,
+#   sessions_folder, insights_folder, db_path). TTL = 15 minutes.
 # Prevents redundant git/gh subprocess calls when /check-items and /standup
 # deep mode run back-to-back in the same interpreter process.
 # Spec § Open questions / Cache coupling (line 699); Testing test 12 (line 658).
@@ -490,6 +491,21 @@ def _evidence_cache_put(key: tuple, result: tuple[str, str], now: float) -> None
     """Store (status, output_json) tuple in the module-level cache."""
     status, output_json = result
     _PIPELINE_EVIDENCE_CACHE[key] = (now, status, output_json)
+
+
+def _cache_key(basenames, projects_json, vault_path, sessions_folder,
+               insights_folder, db_path):
+    """Stable hashable key for _PIPELINE_EVIDENCE_CACHE.
+
+    Includes every input that materially affects deep_analysis_pipeline output:
+    basenames (sorted to normalize order), projects_json, vault_path,
+    sessions_folder, insights_folder, db_path. A change in any field forces
+    a fresh subprocess burst.
+    """
+    basenames_key = tuple(sorted(basenames)) if basenames else ()
+    return (basenames_key, projects_json, vault_path, sessions_folder,
+            insights_folder, db_path or "")
+
 
 # Note types excluded from orphan detection (they are aggregation notes)
 _ORPHAN_EXCLUDE_TYPES = frozenset({
@@ -544,11 +560,10 @@ def deep_analysis_pipeline(
     Spec § Open questions / Cache coupling (line 699);
     Testing test 12 (line 658). Refs #87.
     """
-    _basenames_key = tuple(sorted(basenames)) if basenames else ()
-    _cache_key = (_basenames_key, projects_json, vault_path, sessions_folder,
-                  insights_folder, db_path or "")
+    _ck = _cache_key(basenames, projects_json, vault_path, sessions_folder,
+                     insights_folder, db_path)
     _now = time.time()
-    _cached = _evidence_cache_get(_cache_key, _now)
+    _cached = _evidence_cache_get(_ck, _now)
     if _cached is not None:
         # Warm-cache hit: skip all subprocess calls; re-write output_path so the
         # caller always finds a valid file regardless of which path was used on
@@ -821,11 +836,16 @@ def deep_analysis_pipeline(
     total = len(all_raw_items)
     groups = len(all_groups)
     _result = f"OK:{total}:{groups}:{projects_with_evidence}"
+    # Cache from in-memory output_data rather than re-reading the file on disk.
+    # Re-reading could yield an empty string on a race or disk error, which
+    # would make later cache hits silently rewrite output_path with empty JSON.
     try:
-        _output_json_str = Path(output_path).read_text(encoding="utf-8")
-    except OSError:
-        _output_json_str = ""
-    _evidence_cache_put(_cache_key, (_result, _output_json_str), _now)
+        _output_json_str = json.dumps(output_data, indent=2)
+    except (TypeError, ValueError) as exc:
+        print(f"[obsidian-brain] cache skip: couldn't serialise output_data ({exc})",
+              file=sys.stderr)
+        return _result
+    _evidence_cache_put(_ck, (_result, _output_json_str), _now)
     return _result
 
 
@@ -1084,7 +1104,20 @@ def merge_groups_semantically(coarse_groups):
         }
         for g in flat_groups
     ]}
-    in_path.write_text(json.dumps(payload), encoding="utf-8")
+    payload_str = json.dumps(payload)
+    _STDIN_CAP_BYTES = 1_000_000
+    if len(payload_str.encode("utf-8")) >= _STDIN_CAP_BYTES:
+        print(
+            f"[check-items] payload {len(payload_str)} bytes >= {_STDIN_CAP_BYTES} cap; "
+            f"skipping semantic-merge sub-agent, using token-only.",
+            file=sys.stderr,
+        )
+        _LAST_SEMANTIC_MERGE_MODE = "token-only (payload too large)"
+        if return_dict_shape:
+            return coarse_groups
+        return flat_groups
+
+    in_path.write_text(payload_str, encoding="utf-8")
     os.chmod(str(in_path), 0o600)
 
     cli_path = os.path.join(os.path.dirname(__file__), "check_items_cli.py")
@@ -1241,7 +1274,18 @@ def classify_groups_with_agent(merged_groups, evidence):
         ],
         "evidence": evidence or {},
     }
-    in_path.write_text(json.dumps(payload), encoding="utf-8")
+    payload_str = json.dumps(payload)
+    _STDIN_CAP_BYTES = 1_000_000
+    if len(payload_str.encode("utf-8")) >= _STDIN_CAP_BYTES:
+        print(
+            f"[check-items] classifier payload {len(payload_str)} bytes >= "
+            f"{_STDIN_CAP_BYTES} cap; falling back to heuristic.",
+            file=sys.stderr,
+        )
+        _LAST_CLASSIFIER_MODE = "heuristic-fallback"
+        return []
+
+    in_path.write_text(payload_str, encoding="utf-8")
     os.chmod(str(in_path), 0o600)
 
     cli_path = os.path.join(os.path.dirname(__file__), "check_items_cli.py")

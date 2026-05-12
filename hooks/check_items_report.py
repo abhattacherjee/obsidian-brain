@@ -35,12 +35,15 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
                "STALE": "stale", "ACTIVE": "active"}.get(kind)
         if key:
             counts[key] += 1
-    tag_proj = scope_name
+    # scope_name is expected to already be sanitized (via _safe_filename_component
+    # in write_check_items_dashboard), but re-sanitize defensively so this helper
+    # is safe even if called directly with a raw value.
+    safe_scope = _safe_filename_component(scope_name)
     return (
         "---\n"
         "type: claude-check-items-report\n"
         f"date: {date_str}\n"
-        f"scope: {scope_name}\n"
+        f"scope: {safe_scope}\n"
         f"window: {window_days}d\n"
         f"total_raw_items: {raw_count}\n"
         f"groups: {group_count}\n"
@@ -55,7 +58,7 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
         f"cascaded: {cascaded}\n"
         "tags:\n"
         "  - claude/check-items\n"
-        f"  - claude/project/{tag_proj}\n"
+        f"  - claude/project/{safe_scope}\n"
         "---\n"
     )
 
@@ -146,10 +149,13 @@ def write_check_items_dashboard(
     if not target.resolve().is_relative_to(dashboards_dir.resolve()):
         raise ValueError(f"refusing to write outside dashboards dir: {target}")
 
-    content = (_frontmatter(scope_name, date_str, window_days, raw_count, group_count,
+    # Use safe_scope (computed above for the filename) throughout the note body
+    # and frontmatter so that crafted scope values cannot inject YAML fields or
+    # markdown headings with newlines/colons.
+    content = (_frontmatter(safe_scope, date_str, window_days, raw_count, group_count,
                             classifications, applied, cascaded,
                             semantic_merge_mode, classifier_mode)
-               + _body(scope_name, date_str, window_days, raw_count, group_count,
+               + _body(safe_scope, date_str, window_days, raw_count, group_count,
                        classifications, applied, cascaded, merges))
 
     tmp = tempfile.NamedTemporaryFile(

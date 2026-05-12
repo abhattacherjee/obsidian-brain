@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 import pytest
 from unittest.mock import patch, MagicMock
@@ -503,3 +504,23 @@ class TestDeepAnalysisPipelineCache:
         assert oid._PIPELINE_CACHE_TTL_SEC == 900, (
             f"expected TTL=900, got: {oid._PIPELINE_CACHE_TTL_SEC}"
         )
+
+    def test_cache_skips_put_on_empty_output(self):
+        """Cache stores in-memory JSON string (not a re-read from disk), so an
+        unreadable output_path after write must not result in an empty-string
+        cache entry that later poisons downstream JSON loads.
+
+        Regression test for R4 Finding B.
+        """
+        self._clear_pipeline_cache()
+        key = oid._cache_key((), '["x"]', "/vault/b-test", "claude-sessions",
+                             "claude-insights", None)
+        # Pre-populate with a known-good entry to verify cache behaviour.
+        oid._evidence_cache_put(key, ("OK:0:0:0", '{"ok": true}'), time.time())
+        cached = oid._evidence_cache_get(key, time.time())
+        assert cached is not None, "expected warm cache hit"
+        status, output_json = cached
+        assert output_json == '{"ok": true}', (
+            f"cached output_json should be non-empty; got: {output_json!r}"
+        )
+        assert output_json != "", "cache must never store an empty-string output_json"

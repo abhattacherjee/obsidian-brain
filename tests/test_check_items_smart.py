@@ -1323,3 +1323,88 @@ def test_verify_before_edit_handles_indented_checkbox(tmp_path):
     f.write_text("line one\n    - [ ] Indented item ship it\nline three\n")
     ok = verify_before_edit(str(f), line_number=2, expected_text="- [ ] Indented item ship it")
     assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# R4 regression: Finding D — classify_groups_with_agent oversized payload
+# ---------------------------------------------------------------------------
+
+def test_classify_groups_oversized_payload_skips_subagent(monkeypatch):
+    """Payloads exceeding 1MB stdin cap must skip the sub-agent and fall back
+    to heuristic mode without invoking subprocess.run.
+
+    Regression test for R4 Finding D.
+    """
+    import open_item_dedup as oid
+
+    call_count = {"n": 0}
+
+    def fake_run(cmd, *args, **kwargs):
+        call_count["n"] += 1
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = ""
+        m.stderr = ""
+        return m
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_run)
+
+    # Build a huge payload: 500 groups with 4KB representative each ≈ 2MB
+    big_groups = [
+        {
+            "group_id": f"g{i}",
+            "project": "p",
+            "representative": "X" * 4096,
+            "members": [],
+        }
+        for i in range(500)
+    ]
+    evidence = {"p": {}}
+
+    result = oid.classify_groups_with_agent(big_groups, evidence)
+    assert result == [], "oversized payload must return empty list (fallback)"
+    assert oid.get_last_classifier_mode() == "heuristic-fallback", (
+        f"expected 'heuristic-fallback', got: {oid.get_last_classifier_mode()!r}"
+    )
+    assert call_count["n"] == 0, (
+        f"sub-agent must NOT be invoked when payload oversized; "
+        f"subprocess.run called {call_count['n']} time(s)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# R4 regression: Finding E — YAML frontmatter injection via scope_name
+# ---------------------------------------------------------------------------
+
+def test_dashboard_yaml_frontmatter_rejects_injection(tmp_path):
+    """scope_name containing newlines/colons must be sanitized in frontmatter
+    so that crafted values cannot inject extra YAML fields.
+
+    Regression test for R4 Finding E.
+    The sanitizer (_safe_filename_component) collapses newlines to underscores,
+    so the attack vector `\\nmalicious_field: pwned\\n` becomes part of a single
+    sanitized token — no standalone `malicious_field: pwned` line is injected.
+    """
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    crafted = "obsidian-brain\nmalicious_field: pwned\nscope2"
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name=crafted, date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True,
+    )
+    content = open(path).read()
+    # The injected payload must NOT appear as a standalone `key: value` line.
+    # The sanitizer collapses whitespace/special chars to underscores, so the
+    # `malicious_field: pwned` text must appear only as part of the sanitized
+    # scope token — never as a bare YAML key on its own line.
+    assert "malicious_field: pwned" not in content, (
+        "crafted scope_name must not inject a 'malicious_field: pwned' YAML line"
+    )
+    # The frontmatter scope: line must be a single line (no embedded newlines).
+    assert content.startswith("---"), "output must be a valid frontmatter file"
+    fm_block = content.split("---")[1]  # middle block between --- markers
+    scope_lines = [ln for ln in fm_block.splitlines() if ln.startswith("scope:")]
+    assert len(scope_lines) == 1, f"expected exactly 1 scope: line, got: {scope_lines}"
