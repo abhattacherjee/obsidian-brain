@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -93,3 +94,81 @@ def save_cache(data: dict[str, Any]) -> None:
         tmp.close()
     os.replace(tmp.name, str(CACHE_PATH))
     os.chmod(str(CACHE_PATH), 0o600)
+
+
+def _ttl_for(classification: str) -> int:
+    return {
+        "DONE": TTL_DONE,
+        "NEEDS-ACTION": TTL_NEEDS_ACTION,
+        "STALE": TTL_STALE,
+    }.get(classification, TTL_ACTIVE)
+
+
+def _mtime_matches(cached_members: list[dict], current_members: list[dict]) -> bool:
+    """True iff all current member mtimes match cached within 1s tolerance."""
+    cached_by_key = {(m.get("file"), m.get("line")): m.get("mtime") for m in cached_members}
+    for cm in current_members:
+        cached_mtime = cached_by_key.get((cm.get("file"), cm.get("line")))
+        if cached_mtime is None:
+            return False
+        try:
+            if abs(float(cm.get("mtime", 0)) - float(cached_mtime)) > 1.0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def partition(
+    groups: list[dict],
+    cache: dict,
+    project: str,
+    head_sha: str,
+    force: bool = False,
+    now: float | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Apply invalidation rules in spec order (first match wins):
+        force -> new -> head_changed -> mtime_changed -> ttl_expired.
+    Returns (known_unchanged, needs_reclassification). Each routed group
+    receives a `_reason` key for dashboard visibility.
+    """
+    if now is None:
+        now = time.time()
+    run = cache.get("runs", {}).get(project, {})
+    cached_groups_by_hash = {g["canonical_hash"]: g for g in run.get("groups", [])}
+    cached_head = run.get("project_head_at_classify")
+
+    known: list[dict] = []
+    needs: list[dict] = []
+
+    for g in groups:
+        h = g.get("canonical_hash")
+        if force:
+            g["_reason"] = "force"
+            needs.append(g)
+            continue
+        cached = cached_groups_by_hash.get(h)
+        if cached is None:
+            g["_reason"] = "new"
+            needs.append(g)
+            continue
+        if cached_head != head_sha:
+            g["_reason"] = "head_changed"
+            needs.append(g)
+            continue
+        if not _mtime_matches(cached.get("members", []), g.get("members", [])):
+            g["_reason"] = "mtime_changed"
+            needs.append(g)
+            continue
+        classified_ts = cached.get("classified_ts", 0)
+        if now - classified_ts > _ttl_for(cached.get("classification", "ACTIVE")):
+            g["_reason"] = "ttl_expired"
+            needs.append(g)
+            continue
+        g["_cached_classification"] = cached.get("classification")
+        g["_cached_confidence"] = cached.get("confidence")
+        g["_cached_evidence_citation"] = cached.get("evidence_citation")
+        known.append(g)
+
+    return known, needs

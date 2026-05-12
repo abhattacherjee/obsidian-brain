@@ -82,3 +82,100 @@ def test_cache_save_then_load_roundtrip(tmp_path, monkeypatch):
 
     loaded = load_cache()
     assert loaded == data
+
+
+import time
+
+
+def _make_group(canonical_hash, project="obsidian-brain", text="Item X", members=None):
+    return {
+        "canonical_hash": canonical_hash,
+        "project": project,
+        "canonical_text": text,
+        "members": members or [{"file": "n.md", "line": 1, "mtime": 1735000000}],
+    }
+
+
+def _make_cached_entry(canonical_hash, classification="DONE", classified_ts=None,
+                      members=None):
+    return {
+        "canonical_hash": canonical_hash,
+        "canonical_text": "Item X",
+        "members": members or [{"file": "n.md", "line": 1, "mtime": 1735000000}],
+        "classification": classification,
+        "confidence": "HIGH",
+        "evidence_citation": "test",
+        "classified_ts": classified_ts if classified_ts is not None else int(time.time()) - 60,
+    }
+
+
+def test_cache_hit_skips_reclassification():
+    """Test 15 - fresh cache with matching hash + mtime + HEAD returns known=N, needs=0."""
+    from check_items_cache import partition
+    head = "abc1234"
+    groups = [_make_group("h1"), _make_group("h2")]
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": head,
+                "groups": [_make_cached_entry("h1"), _make_cached_entry("h2")],
+            }
+        },
+    }
+    known, needs = partition(groups, cache, project="obsidian-brain", head_sha=head)
+    assert len(known) == 2
+    assert len(needs) == 0
+
+
+def test_head_change_triggers_full_reclassify_phase1():
+    """Test 17 - cached HEAD != current HEAD invalidates all groups (Phase 1 coarse)."""
+    from check_items_cache import partition
+    groups = [_make_group("h1"), _make_group("h2")]
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "OLDHEAD",
+                "groups": [_make_cached_entry("h1"), _make_cached_entry("h2")],
+            }
+        },
+    }
+    known, needs = partition(groups, cache, project="obsidian-brain", head_sha="NEWHEAD")
+    assert len(known) == 0
+    assert len(needs) == 2
+    assert all(g.get("_reason") == "head_changed" for g in needs)
+
+
+def test_force_flag_invalidates_everything():
+    """Test 19 - force=True always returns known=0, needs=N."""
+    from check_items_cache import partition
+    groups = [_make_group("h1"), _make_group("h2")]
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1"), _make_cached_entry("h2")],
+            }
+        },
+    }
+    known, needs = partition(groups, cache, project="obsidian-brain",
+                             head_sha="abc1234", force=True)
+    assert len(known) == 0
+    assert len(needs) == 2
+    assert all(g.get("_reason") == "force" for g in needs)
+
+
+def test_new_group_triggers_reclassify():
+    """Cache-miss canonical_hash routes to needs with _reason='new'."""
+    from check_items_cache import partition
+    groups = [_make_group("h_new")]
+    cache = {"schema_version": 1, "runs": {}}
+    known, needs = partition(groups, cache, project="obsidian-brain", head_sha="abc1234")
+    assert len(known) == 0
+    assert len(needs) == 1
+    assert needs[0].get("_reason") == "new"
