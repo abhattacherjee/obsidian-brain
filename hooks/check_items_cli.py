@@ -187,6 +187,148 @@ def run_semantic_merge(stdin_json: str, output_path: str) -> int:
     return 0
 
 
+# Stage 4 classifier prompt. Spec §§:
+#   - Classifier contract / Prompt shape (lines 262-289)
+#   - Classification semantics (lines 317-322) — INCLUDING the self-referential
+#     rule (line 321, Patch 3): discovery evidence is NOT completion evidence.
+CLASSIFIER_PROMPT = """You are the classifier sub-agent for /check-items. Read the JSON at
+<input-json-path>. It contains:
+  - groups: list of merged open-item groups (post Stage 2b).
+  - evidence: per-project bundle (commits, merged_prs, closed_issues,
+    releases, changelog_excerpt, fts_mentions).
+
+## Your job
+
+For each group, decide whether the action it describes is DONE,
+NEEDS-ACTION, STALE, or ACTIVE. Cite the specific evidence you used.
+
+## Classification semantics
+
+- DONE — the action is complete. Cite at least one of: merged PR title,
+  commit sha, closed issue body, release note, or an insight note that
+  explicitly marks the item done.
+- NEEDS-ACTION — the fix is shipped, but the literal action is an
+  external command this tool cannot run (e.g. `gh issue close`, token
+  rotation, manual verification). Set `action_required` to a
+  copy-pasteable command or instruction.
+- STALE — item is >90 days old and no recent evidence mentions it.
+  LOW confidence by default.
+- ACTIVE — you did not find sufficient evidence to close. Set
+  `evidence_citation` to null.
+
+## Self-referential evidence rule (CRITICAL)
+
+If the cited evidence is a discovery or description of the bug rather
+than its fix-merge (closed PR/issue or commit sha), prefer ACTIVE.
+Discovery evidence is NOT completion evidence. Examples:
+
+- Item: "Fix dispatcher-discovery fallback to probe check availability"
+- Evidence: "Note 2026-04-22 describes the dispatcher-discovery bug."
+- -> ACTIVE. The note describes the bug; it does not ship the fix.
+
+- Item: "Close GitHub issue #534"
+- Evidence: "PR #534 merged as abc1234 on 2026-04-24."
+- -> DONE. The fix-merge is cited directly.
+
+## Anti-conflation rule
+
+Different PR numbers under the same parent feature ship different work.
+If the item references PR #N and the only evidence is PR #M (M != N),
+do NOT mark DONE. Prefer ACTIVE unless there is independent evidence
+that #N itself merged.
+
+## Output format
+
+Return STRICT JSON ONLY - no prose, no markdown fences. Write the same
+JSON to <output-json-path>.
+
+[
+  {
+    "group_id": "ob-NNNN",
+    "classification": "DONE | NEEDS-ACTION | STALE | ACTIVE",
+    "confidence": "HIGH | MED | LOW",
+    "canonical_text": "<short canonical phrasing of the action>",
+    "evidence_citation": "<specific commit sha / PR# / issue# / release / note ref, OR null>",
+    "action_required": "<command string for NEEDS-ACTION, else null>"
+  }
+]
+
+Your final message must be exactly the JSON array.
+"""
+
+
+def _pick_classifier_model(group_count: int) -> str:
+    """<=30 merged groups -> haiku; >30 -> sonnet. Per spec line 106."""
+    return "haiku" if group_count <= 30 else "sonnet"
+
+
+def run_classifier(stdin_json: str, output_path: str) -> int:
+    """
+    Stage 4: invoke the classifier sub-agent.
+
+    Reads merged groups + evidence from stdin_json, writes a strict-JSON
+    array of {group_id, classification, confidence, canonical_text,
+    evidence_citation, action_required} to output_path. Returns 0 on
+    success, non-zero on failure.
+    """
+    try:
+        payload = json.loads(stdin_json)
+    except json.JSONDecodeError as exc:
+        print(f"[check-items-cli] ERROR: classifier stdin invalid JSON: {exc}",
+              file=sys.stderr)
+        return 2
+
+    groups = payload.get("groups", [])
+    model = _pick_classifier_model(len(groups))
+
+    workdir = _safe_workdir()
+    in_tmp = tempfile.NamedTemporaryFile(
+        mode="w", delete=False, dir=str(workdir), suffix=".classin.json", encoding="utf-8"
+    )
+    try:
+        json.dump(payload, in_tmp)
+        in_tmp.flush()
+    finally:
+        in_tmp.close()
+    os.chmod(in_tmp.name, 0o600)
+
+    prompt = CLASSIFIER_PROMPT.replace(
+        "<input-json-path>", in_tmp.name
+    ).replace(
+        "<output-json-path>", output_path
+    )
+
+    cmd = ["claude", "-p", "--model", model, prompt]
+    try:
+        cp = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=SUBAGENT_TIMEOUT_SEC
+        )
+    except subprocess.TimeoutExpired:
+        print(f"[check-items-cli] classifier timeout after {SUBAGENT_TIMEOUT_SEC}s",
+              file=sys.stderr)
+        return 3
+    finally:
+        try:
+            os.unlink(in_tmp.name)
+        except OSError:
+            pass
+
+    if cp.returncode != 0:
+        print(f"[check-items-cli] classifier failed rc={cp.returncode}: {cp.stderr[:500]}",
+              file=sys.stderr)
+        return cp.returncode
+
+    if not Path(output_path).exists():
+        try:
+            parsed = json.loads(cp.stdout)
+        except json.JSONDecodeError as exc:
+            print(f"[check-items-cli] classifier output invalid JSON: {exc}", file=sys.stderr)
+            return 4
+        Path(output_path).write_text(json.dumps(parsed), encoding="utf-8")
+
+    return 0
+
+
 def main():
     """CLI entrypoint. Usage: python3 check_items_cli.py <command> <output_path>"""
     if len(sys.argv) < 3:
@@ -198,6 +340,8 @@ def main():
     stdin_json = _read_stdin_capped()
     if cmd == "semantic_merge":
         sys.exit(run_semantic_merge(stdin_json, output_path))
+    if cmd == "classifier":
+        sys.exit(run_classifier(stdin_json, output_path))
     print(f"unknown command: {cmd}", file=sys.stderr)
     sys.exit(2)
 

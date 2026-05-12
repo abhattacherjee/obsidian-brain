@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 
 import pytest
@@ -22,6 +23,10 @@ import pytest
 # conftest.py adds hooks/ to sys.path; import after that
 import open_item_dedup as oid
 from unittest.mock import patch, MagicMock
+
+# Imported here for use in timeout error-path tests
+import check_items_cli as _check_items_cli_mod
+SUBAGENT_TIMEOUT_SEC = _check_items_cli_mod.SUBAGENT_TIMEOUT_SEC
 
 
 # ---------------------------------------------------------------------------
@@ -669,3 +674,179 @@ def test_semantic_merge_prompt_contains_negative_examples():
     assert "Investigate dispatcher-discovery fallback logic" in SEMANTIC_MERGE_PROMPT
     assert "Fix dispatcher-discovery fallback" in SEMANTIC_MERGE_PROMPT
     assert "DO NOT MERGE" in SEMANTIC_MERGE_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 — run_classifier() tests  (Task 15)
+# ---------------------------------------------------------------------------
+
+
+def test_run_classifier_picks_haiku_at_30_or_fewer(tmp_path, monkeypatch):
+    """<=30 merged groups -> claude -p --model haiku per spec line 106."""
+    import check_items_cli as cli
+
+    captured = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = cmd
+        out_path = tmp_path / "out.json"
+        out_path.write_text(json.dumps([
+            {"group_id": "g1", "classification": "ACTIVE", "confidence": "LOW",
+             "canonical_text": "x", "evidence_citation": None, "action_required": None}
+        ]))
+        return _fake_completed(stdout=out_path.read_text(), returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    payload = {
+        "groups": [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
+                    "instances": []} for i in range(30)],
+        "evidence": {"p": {}},
+    }
+    out_path = tmp_path / "classify.json"
+    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    assert rc == 0
+    assert "haiku" in " ".join(captured["cmd"])
+
+
+def test_run_classifier_picks_sonnet_above_30(tmp_path, monkeypatch):
+    """>30 merged groups escalates to sonnet."""
+    import check_items_cli as cli
+
+    captured = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = cmd
+        out_path = tmp_path / "out.json"
+        out_path.write_text(json.dumps([]))
+        return _fake_completed(stdout=out_path.read_text(), returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    payload = {
+        "groups": [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
+                    "instances": []} for i in range(45)],
+        "evidence": {"p": {}},
+    }
+    out_path = tmp_path / "classify2.json"
+    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    assert rc == 0
+    assert "sonnet" in " ".join(captured["cmd"])
+
+
+def test_classifier_prompt_includes_self_referential_rule():
+    """Per spec § Classification semantics (line 321) Patch 3: prompt MUST include the
+    self-referential rule: discovery evidence is not completion evidence."""
+    import check_items_cli as cli
+    p = cli.CLASSIFIER_PROMPT
+    assert "discovery" in p.lower() and "fix" in p.lower()
+    assert "prefer ACTIVE" in p or "prefer ACTIVE." in p
+    for c in ("DONE", "NEEDS-ACTION", "STALE", "ACTIVE"):
+        assert c in p, f"prompt missing classification: {c}"
+    assert "STRICT JSON" in p or "strict JSON" in p.lower()
+    for field in ("group_id", "classification", "confidence",
+                  "canonical_text", "evidence_citation", "action_required"):
+        assert field in p, f"prompt missing schema field: {field}"
+
+
+# ---------------------------------------------------------------------------
+# Coverage: error paths in run_semantic_merge and run_classifier  (Task 15)
+# These cover lines that were not reachable via orchestrator-level tests.
+# ---------------------------------------------------------------------------
+
+
+def test_run_semantic_merge_invalid_json_returns_2():
+    """run_semantic_merge returns 2 on invalid stdin JSON."""
+    import check_items_cli as cli
+    rc = cli.run_semantic_merge(stdin_json="not-json", output_path="/dev/null")
+    assert rc == 2
+
+
+def test_run_semantic_merge_timeout_returns_3(tmp_path, monkeypatch):
+    """run_semantic_merge returns 3 on subprocess timeout."""
+    import check_items_cli as cli
+
+    def fake_run(cmd, *args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, SUBAGENT_TIMEOUT_SEC)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    payload = {"groups": [{"group_id": "g1", "project": "p",
+                           "representative": "x", "instances": []}]}
+    out_path = tmp_path / "out.json"
+    rc = cli.run_semantic_merge(stdin_json=json.dumps(payload), output_path=str(out_path))
+    assert rc == 3
+
+
+def test_run_semantic_merge_nonzero_rc_propagated(tmp_path, monkeypatch):
+    """run_semantic_merge propagates non-zero subprocess return code."""
+    import check_items_cli as cli
+
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda *a, **kw: _fake_completed(returncode=5))
+    payload = {"groups": [{"group_id": "g1", "project": "p",
+                           "representative": "x", "instances": []}]}
+    out_path = tmp_path / "out.json"
+    rc = cli.run_semantic_merge(stdin_json=json.dumps(payload), output_path=str(out_path))
+    assert rc == 5
+
+
+def test_run_semantic_merge_invalid_stdout_json_returns_4(tmp_path, monkeypatch):
+    """run_semantic_merge returns 4 when stdout is not valid JSON and output file absent."""
+    import check_items_cli as cli
+
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda *a, **kw: _fake_completed(stdout="not-json", returncode=0))
+    payload = {"groups": [{"group_id": "g1", "project": "p",
+                           "representative": "x", "instances": []}]}
+    out_path = tmp_path / "no_such.json"  # must not exist
+    rc = cli.run_semantic_merge(stdin_json=json.dumps(payload), output_path=str(out_path))
+    assert rc == 4
+
+
+def test_run_classifier_invalid_json_returns_2():
+    """run_classifier returns 2 on invalid stdin JSON."""
+    import check_items_cli as cli
+    rc = cli.run_classifier(stdin_json="bad-json", output_path="/dev/null")
+    assert rc == 2
+
+
+def test_run_classifier_timeout_returns_3(tmp_path, monkeypatch):
+    """run_classifier returns 3 on subprocess timeout."""
+    import check_items_cli as cli
+
+    def fake_run(cmd, *args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, SUBAGENT_TIMEOUT_SEC)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    payload = {"groups": [{"group_id": "g1", "project": "p",
+                           "representative": "x", "instances": []}],
+               "evidence": {"p": {}}}
+    out_path = tmp_path / "out.json"
+    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    assert rc == 3
+
+
+def test_run_classifier_nonzero_rc_propagated(tmp_path, monkeypatch):
+    """run_classifier propagates non-zero subprocess return code."""
+    import check_items_cli as cli
+
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda *a, **kw: _fake_completed(returncode=7))
+    payload = {"groups": [{"group_id": "g1", "project": "p",
+                           "representative": "x", "instances": []}],
+               "evidence": {"p": {}}}
+    out_path = tmp_path / "out.json"
+    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    assert rc == 7
+
+
+def test_run_classifier_invalid_stdout_json_returns_4(tmp_path, monkeypatch):
+    """run_classifier returns 4 when stdout is not valid JSON and output file absent."""
+    import check_items_cli as cli
+
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda *a, **kw: _fake_completed(stdout="not-json", returncode=0))
+    payload = {"groups": [{"group_id": "g1", "project": "p",
+                           "representative": "x", "instances": []}],
+               "evidence": {"p": {}}}
+    out_path = tmp_path / "no_such_classifier.json"
+    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    assert rc == 4
