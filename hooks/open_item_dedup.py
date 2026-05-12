@@ -28,6 +28,60 @@ _STOPWORDS = frozenset({
     'with', 'from', 'by', 'at', 'it', 'as', 'if', 'so', 'do', 'no',
 })
 
+# ---------------------------------------------------------------------------
+# Confidence tier rules (spec § Confidence tiers, lines 324-332)
+# ---------------------------------------------------------------------------
+
+CONFIDENCE_TIER_RULES = {
+    "HIGH": {
+        "literal_ref_patterns": [
+            r"\b[0-9a-f]{7,40}\b",
+            r"#\d+",
+            r"\bv\d+\.\d+(?:\.\d+)?\b",
+        ],
+    },
+    "MED": {
+        "inferred_ref_patterns": [
+            r"\bStory\s+\d+(?:\.\d+)*\b",
+            r"\bshipped\b",
+            r"\bcovered by\b",
+            r"#\d+",
+        ],
+    },
+    "LOW": {
+        "fts_only_markers": ["FTS mention", "occurrence", "mentions:", "FTS:"],
+    },
+}
+
+
+def assign_tier(evidence_citation, item_text):
+    """Deterministically assign HIGH | MED | LOW from evidence citation shape.
+
+    HIGH requires a literal ref (sha, #N, vX.Y) appearing in BOTH the citation
+    and the item text. MED matches an inferred-ref shape in the citation only.
+    LOW is the default.
+
+    Spec § Confidence tiers (lines 324-332).
+    """
+    if not evidence_citation or not item_text:
+        return "LOW"
+    citation = str(evidence_citation)
+    text = str(item_text)
+
+    for pattern in CONFIDENCE_TIER_RULES["HIGH"]["literal_ref_patterns"]:
+        cit_match = re.search(pattern, citation)
+        if not cit_match:
+            continue
+        ref = cit_match.group(0)
+        if ref in text:
+            return "HIGH"
+
+    for pattern in CONFIDENCE_TIER_RULES["MED"]["inferred_ref_patterns"]:
+        if re.search(pattern, citation):
+            return "MED"
+
+    return "LOW"
+
 _COMPLETION_PHRASES = frozenset({
     'merged', 'shipped', 'fixed', 'released', 'closed', 'removed',
     'implemented', 'deleted', 'done', 'completed',
