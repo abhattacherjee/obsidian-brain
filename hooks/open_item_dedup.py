@@ -992,6 +992,9 @@ def merge_groups_semantically(coarse_groups):
 
     Spec §§ Pipeline architecture Stage 2b (lines 73-86) and Merge-pass rules.
     """
+    global _LAST_SEMANTIC_MERGE_MODE
+    _LAST_SEMANTIC_MERGE_MODE = "ok"
+
     return_dict_shape = isinstance(coarse_groups, dict)
     if return_dict_shape:
         flat_groups = [g for v in coarse_groups.values() for g in v]
@@ -1048,6 +1051,7 @@ def merge_groups_semantically(coarse_groups):
             pass
 
     if merge_map is None:
+        _LAST_SEMANTIC_MERGE_MODE = "token-only (semantic pass failed)"
         if return_dict_shape:
             return coarse_groups
         return flat_groups
@@ -1092,3 +1096,16 @@ def _check_items_workdir():
     p = Path.home() / ".claude" / "obsidian-brain"
     p.mkdir(mode=0o700, parents=True, exist_ok=True)
     return p
+
+
+# ---------------------------------------------------------------------------
+# Semantic merge mode tracker (Task 13)
+# ---------------------------------------------------------------------------
+
+_LAST_SEMANTIC_MERGE_MODE = "ok"
+
+
+def get_last_semantic_merge_mode():
+    """Returns 'ok' on last successful merge, or
+    'token-only (semantic pass failed)' on fallback."""
+    return _LAST_SEMANTIC_MERGE_MODE

@@ -547,3 +547,54 @@ def test_semantic_merge_rejects_cross_project(tmp_path, monkeypatch):
         g for v in merged.values() for g in v
     ]
     assert len(flat) == 2, "cross-project merge must be filtered out"
+
+
+# ---------------------------------------------------------------------------
+# Task 13: token-only fallback after 2 sub-agent failures
+# ---------------------------------------------------------------------------
+
+def test_semantic_merge_fallback_on_failure(monkeypatch, tmp_path):
+    """Test 1d - sub-agent returns malformed JSON twice; coarse groups pass through
+    with pipeline_mode flag set."""
+    import open_item_dedup as oid
+
+    call_count = {"n": 0}
+
+    def fake_cli_run(cmd, *args, **kwargs):
+        call_count["n"] += 1
+        return _fake_completed(stdout="not valid json", returncode=0)
+
+    coarse = [
+        {"group_id": "g1", "project": "p", "representative": "A", "members": []},
+        {"group_id": "g2", "project": "p", "representative": "B", "members": []},
+    ]
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    merged = oid.merge_groups_semantically(coarse)
+
+    assert call_count["n"] == 2, f"expected 2 attempts before fallback, got {call_count['n']}"
+    flat = merged if isinstance(merged, list) else [g for v in merged.values() for g in v]
+    assert len(flat) == 2, "fallback must pass coarse groups through unchanged"
+    mode = oid.get_last_semantic_merge_mode()
+    assert mode == "token-only (semantic pass failed)"
+
+
+def test_semantic_merge_mode_reset_on_success(monkeypatch, tmp_path):
+    """Successful merge clears the failure flag."""
+    import open_item_dedup as oid
+
+    def fake_cli_run(cmd, *args, **kwargs):
+        out_path = None
+        for c in cmd:
+            if isinstance(c, str) and c.endswith(".json") and "out" in c:
+                out_path = c
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump({"merges": [], "total_groups_before": 1, "total_groups_after": 1}, f)
+        return _fake_completed(returncode=0)
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    oid.merge_groups_semantically([
+        {"group_id": "g1", "project": "p", "representative": "A", "members": []}
+    ])
+    assert oid.get_last_semantic_merge_mode() == "ok"
