@@ -318,7 +318,14 @@ class TestDeepAnalysisPipelineCache:
     so the test does not need to invoke the full pipeline (which requires a live
     vault_index) and is immune to test-ordering contamination via the shared
     module-level dict. Real cache key: (projects_json, vault_path, sessions_folder).
+
+    Cache entry format (post Finding-1 fix): _evidence_cache_put accepts a
+    (status, output_json) tuple; _evidence_cache_get returns the same tuple or
+    None on miss/expiry. This ensures cache hits can re-write output_path.
     """
+
+    # Canonical sentinel for the output JSON stored alongside the status string.
+    _SENTINEL_JSON = '{"items": {"total_raw": 5, "groups": [], "group_count": 2}, "evidence": {}}'
 
     def _clear_pipeline_cache(self):
         """Wipe the module-level cache dict so tests are isolation-safe."""
@@ -332,17 +339,19 @@ class TestDeepAnalysisPipelineCache:
         assert result is None, "expected cache miss on empty cache"
 
     def test_cache_put_then_hit(self):
-        """put + get with same key → same result returned (no subprocess call needed)."""
+        """put + get with same key → (status, output_json) tuple returned."""
         self._clear_pipeline_cache()
         key = ('["obsidian-brain"]', "/vault/path", "claude-sessions")
-        oid._evidence_cache_put(key, "OK:5:2:1", now=1_000_000.0)
+        oid._evidence_cache_put(key, ("OK:5:2:1", self._SENTINEL_JSON), now=1_000_000.0)
         result = oid._evidence_cache_get(key, now=1_000_000.0 + 1)
-        assert result == "OK:5:2:1", f"expected cache hit, got: {result!r}"
+        assert result == ("OK:5:2:1", self._SENTINEL_JSON), (
+            f"expected cache hit (status+json tuple), got: {result!r}"
+        )
 
     def test_cache_hit_within_ttl(self):
-        """get within TTL window → returns cached string (subprocess count unchanged).
+        """get within TTL window → returns (status, output_json) tuple (subprocess count unchanged).
 
-        Back-to-back assertion: second call returns cached string without any
+        Back-to-back assertion: second call returns cached tuple without any
         subprocess invocation. Verified by counting subprocess.run calls across
         two put+get cycles with the same key.
         """
@@ -351,7 +360,7 @@ class TestDeepAnalysisPipelineCache:
         now_ts = 1_000_000.0
 
         # Simulate first pipeline run: put the result
-        oid._evidence_cache_put(key, "OK:10:3:1", now=now_ts)
+        oid._evidence_cache_put(key, ("OK:10:3:1", self._SENTINEL_JSON), now=now_ts)
 
         # Simulate second pipeline call (e.g. /standup deep): hit the cache
         call_count_before = 0  # baseline
@@ -360,7 +369,9 @@ class TestDeepAnalysisPipelineCache:
             cached = oid._evidence_cache_get(key, now=now_ts + 60)  # 1 min later, within 15m TTL
             call_count_after = mock_sp.call_count
 
-        assert cached == "OK:10:3:1", f"expected cache hit, got: {cached!r}"
+        assert cached == ("OK:10:3:1", self._SENTINEL_JSON), (
+            f"expected cache hit (status+json), got: {cached!r}"
+        )
         assert call_count_after == call_count_before, (
             f"subprocess.run called {call_count_after} times on cache hit; expected 0"
         )
@@ -371,7 +382,7 @@ class TestDeepAnalysisPipelineCache:
         key = ('["obsidian-brain"]', "/vault/path3", "claude-sessions")
         now_ts = 1_000_000.0
 
-        oid._evidence_cache_put(key, "OK:7:1:1", now=now_ts)
+        oid._evidence_cache_put(key, ("OK:7:1:1", self._SENTINEL_JSON), now=now_ts)
         # Advance time past the 15-minute TTL
         expired_now = now_ts + oid._PIPELINE_CACHE_TTL_SEC + 1
         result = oid._evidence_cache_get(key, now=expired_now)
@@ -392,7 +403,7 @@ class TestDeepAnalysisPipelineCache:
         key_a = ('["project-alpha"]', vault_path, "claude-sessions")
         key_b = ('["project-beta"]', vault_path, "claude-sessions")
 
-        oid._evidence_cache_put(key_a, "OK:3:1:1", now=now_ts)
+        oid._evidence_cache_put(key_a, ("OK:3:1:1", self._SENTINEL_JSON), now=now_ts)
 
         # key_b is different → must be a miss
         result_b = oid._evidence_cache_get(key_b, now=now_ts + 1)
@@ -402,7 +413,7 @@ class TestDeepAnalysisPipelineCache:
 
         # key_a is still warm → must still hit
         result_a = oid._evidence_cache_get(key_a, now=now_ts + 1)
-        assert result_a == "OK:3:1:1", (
+        assert result_a == ("OK:3:1:1", self._SENTINEL_JSON), (
             f"expected cache hit for key_a still, got: {result_a!r}"
         )
 
@@ -415,12 +426,12 @@ class TestDeepAnalysisPipelineCache:
         key_v1 = (projects_json, "/vault/one", "claude-sessions")
         key_v2 = (projects_json, "/vault/two", "claude-sessions")
 
-        oid._evidence_cache_put(key_v1, "OK:1:0:0", now=now_ts)
+        oid._evidence_cache_put(key_v1, ("OK:1:0:0", self._SENTINEL_JSON), now=now_ts)
 
         assert oid._evidence_cache_get(key_v2, now=now_ts + 1) is None, (
             "vault_two should not hit vault_one's cache entry"
         )
-        assert oid._evidence_cache_get(key_v1, now=now_ts + 1) == "OK:1:0:0", (
+        assert oid._evidence_cache_get(key_v1, now=now_ts + 1) == ("OK:1:0:0", self._SENTINEL_JSON), (
             "vault_one cache entry should still be present"
         )
 

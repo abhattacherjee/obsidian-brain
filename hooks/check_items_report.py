@@ -67,7 +67,7 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     )
     parts.append("")
 
-    parts.append(f"## Done ({len(by_kind['DONE'])} applied)")
+    parts.append(f"## Done ({applied} applied of {len(by_kind['DONE'])} classified)")
     for c in by_kind["DONE"]:
         parts.append(f"- [x] {c.get('canonical_text', '')}")
         parts.append(f"  - Evidence: {c.get('evidence_citation', 'n/a')}")

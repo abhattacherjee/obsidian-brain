@@ -24,31 +24,23 @@ Arguments are order-independent and combinable: `/check-items all 30d --show-all
 Run this Python block. It parses argv per the invocation contract above (positional project / `all` / `Nd`, plus the three flags). Output goes to a temp directory under `~/.claude/obsidian-brain/`; the printed path is passed to every subsequent step via argv.
 
 ```python
-import sys, os, glob, json, re, tempfile, argparse
+import sys, os, glob, json, tempfile
 sys.path.insert(0, max(
     glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
     default="hooks"
 ))
+from check_items_args import parse_scope
 
 ARGS = $ARGUMENTS.split() if "$ARGUMENTS" else []
-parser = argparse.ArgumentParser(add_help=False)
-parser.add_argument("positional", nargs="*")
-parser.add_argument("--show-all", action="store_true")
-parser.add_argument("--dry-run", action="store_true")
-parser.add_argument("--no-cache", action="store_true")
-ns, _ = parser.parse_known_args(ARGS)
-
-scope = {"mode": "current", "project": None, "window_days": 14,
-         "show_all": ns.show_all, "dry_run": ns.dry_run, "no_cache": ns.no_cache}
-known_projects = set(os.listdir(os.path.expanduser("~/dev/claude_workspace")))
-for tok in ns.positional:
-    if tok == "all" or tok == "--vault":
-        scope["mode"] = "vault"
-    elif re.fullmatch(r"\d+d", tok):
-        scope["window_days"] = int(tok[:-1])
-    elif tok in known_projects:
-        scope["mode"] = "project"
-        scope["project"] = tok
+scope_obj = parse_scope(ARGS)
+scope = {
+    "mode": scope_obj.mode,
+    "project": scope_obj.project,
+    "window_days": scope_obj.window_days,
+    "show_all": scope_obj.show_all,
+    "dry_run": scope_obj.dry_run,
+    "no_cache": scope_obj.no_cache,
+}
 
 workdir = tempfile.mkdtemp(prefix="check-items-", dir=os.path.expanduser("~/.claude/obsidian-brain"))
 os.chmod(workdir, 0o700)
@@ -123,7 +115,7 @@ if projects is None:
                 vault_path=vault_path,
                 sessions_folder=sessions_folder,
                 project=proj,
-                max_sessions=10,
+                max_sessions=50,
             )
             for fpath, line_num, item_text in items:
                 raw_items.append({
@@ -141,7 +133,7 @@ else:
             vault_path=vault_path,
             sessions_folder=sessions_folder,
             project=proj,
-            max_sessions=10,
+            max_sessions=50,
         )
         for fpath, line_num, item_text in items:
             raw_items.append({
@@ -191,13 +183,15 @@ for proj, items in by_project.items():
             continue
         others = [(f, l, t) for j, (f, l, t) in enumerate(tuples) if j != idx]
         dupes = find_duplicates(item_text, others)
-        members = [{"file": os.path.basename(fpath), "line": line_num, "text": item_text}]
+        members = [{"file": os.path.basename(fpath), "line": line_num, "text": item_text,
+                     "mtime": os.path.getmtime(fpath) if os.path.exists(fpath) else 0}]
         for df, dl, dt, dc in dupes:
             for j, (f2, l2, t2) in enumerate(tuples):
                 if os.path.abspath(f2) == os.path.abspath(df) and l2 == dl:
                     seen_grouped.add(j)
             members.append({"file": os.path.basename(df), "line": dl,
-                             "text": dt, "confidence": dc})
+                             "text": dt, "confidence": dc,
+                             "mtime": os.path.getmtime(df) if os.path.exists(df) else 0})
         seen_grouped.add(idx)
         import uuid
         g = {
@@ -246,15 +240,27 @@ from open_item_dedup import merge_groups_semantically, get_last_semantic_merge_m
 scope_path, part_path = sys.argv[1], sys.argv[2]
 data = json.load(open(part_path))
 needs = data["needs"]
-# Fold known_unchanged groups back in as merge candidates per spec § Partition flow step 5.
 known = data["known"]
-candidates_by_proj = {}
-for g in needs + known:
-    candidates_by_proj.setdefault(g["project"], []).append(g)
 
-# merge_groups_semantically accepts dict {project: [groups]} or flat list; returns same shape.
-merged_by_proj = merge_groups_semantically(candidates_by_proj)
+# Run semantic merge only over needs-reclassification groups so that known
+# (already-classified) groups are never absorbed into a canonical group and
+# silently lose their _reason flag. Step 6 filters to groups with _reason set;
+# if a needs-group were merged into a known canonical, it would be skipped.
+needs_by_proj = {}
+for g in needs:
+    needs_by_proj.setdefault(g["project"], []).append(g)
+
+# merge_groups_semantically accepts dict {project: [groups]}; returns same shape.
+merged_needs_by_proj = merge_groups_semantically(needs_by_proj) if needs_by_proj else {}
 mode = get_last_semantic_merge_mode()
+
+# Splice known (untouched) back in after merge so Step 6 can iterate all groups.
+merged_by_proj = {}
+for proj, groups in merged_needs_by_proj.items():
+    merged_by_proj.setdefault(proj, []).extend(groups)
+for g in known:
+    merged_by_proj.setdefault(g["project"], []).append(g)
+
 out = os.path.join(os.path.dirname(scope_path), "merged.json")
 with open(out, "w") as f:
     json.dump({"merged_by_proj": merged_by_proj, "mode": mode}, f, indent=2)

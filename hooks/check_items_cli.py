@@ -183,6 +183,7 @@ def run_semantic_merge(stdin_json: str, output_path: str) -> int:
             print(f"[check-items-cli] subagent output invalid JSON: {exc}", file=sys.stderr)
             return 4
         Path(output_path).write_text(json.dumps(parsed), encoding="utf-8")
+        os.chmod(output_path, 0o600)
 
     return 0
 
@@ -325,6 +326,7 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
             print(f"[check-items-cli] classifier output invalid JSON: {exc}", file=sys.stderr)
             return 4
         Path(output_path).write_text(json.dumps(parsed), encoding="utf-8")
+        os.chmod(output_path, 0o600)
 
     return 0
 

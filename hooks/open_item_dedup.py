@@ -466,25 +466,30 @@ _RE_WIKILINK = re.compile(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]')
 # Prevents redundant git/gh subprocess calls when /check-items and /standup
 # deep mode run back-to-back in the same interpreter process.
 # Spec § Open questions / Cache coupling (line 699); Testing test 12 (line 658).
-_PIPELINE_EVIDENCE_CACHE: dict[tuple, tuple[float, str]] = {}
+#
+# Cache entry format: (timestamp: float, status: str, output_json: str)
+# output_json is stored so cache hits can re-write the requested output_path
+# (the cache key does not include output_path, so a hit must replay the write).
+_PIPELINE_EVIDENCE_CACHE: dict[tuple, tuple[float, str, str]] = {}
 _PIPELINE_CACHE_TTL_SEC = 900  # 15 minutes
 
 
-def _evidence_cache_get(key: tuple, now: float) -> str | None:
-    """Return cached result string if entry exists and is not stale, else None."""
+def _evidence_cache_get(key: tuple, now: float) -> tuple[str, str] | None:
+    """Return (status, output_json) if entry exists and is within TTL, else None."""
     entry = _PIPELINE_EVIDENCE_CACHE.get(key)
     if entry is None:
         return None
-    ts, result = entry
+    ts, status, output_json = entry
     if now - ts > _PIPELINE_CACHE_TTL_SEC:
         del _PIPELINE_EVIDENCE_CACHE[key]
         return None
-    return result
+    return (status, output_json)
 
 
-def _evidence_cache_put(key: tuple, result: str, now: float) -> None:
-    """Store result string in the module-level cache."""
-    _PIPELINE_EVIDENCE_CACHE[key] = (now, result)
+def _evidence_cache_put(key: tuple, result: tuple[str, str], now: float) -> None:
+    """Store (status, output_json) tuple in the module-level cache."""
+    status, output_json = result
+    _PIPELINE_EVIDENCE_CACHE[key] = (now, status, output_json)
 
 # Note types excluded from orphan detection (they are aggregation notes)
 _ORPHAN_EXCLUDE_TYPES = frozenset({
@@ -543,8 +548,21 @@ def deep_analysis_pipeline(
     _now = time.time()
     _cached = _evidence_cache_get(_cache_key, _now)
     if _cached is not None:
-        # Warm-cache hit: skip all subprocess calls; output_path already written.
-        return _cached
+        # Warm-cache hit: skip all subprocess calls; re-write output_path so the
+        # caller always finds a valid file regardless of which path was used on
+        # the previous (cold-cache) call (cache key excludes output_path).
+        _cached_status, _cached_json = _cached
+        try:
+            out_dir = os.path.dirname(output_path) or "."
+            os.makedirs(out_dir, mode=0o700, exist_ok=True)
+            _fd, _tmp = tempfile.mkstemp(prefix=".ob-pipeline-hit-", suffix=".json", dir=out_dir)
+            with os.fdopen(_fd, 'w', encoding='utf-8') as _f:
+                _f.write(_cached_json)
+            os.chmod(_tmp, 0o600)
+            os.replace(_tmp, output_path)
+        except OSError as _exc:
+            print(f"[obsidian-brain] pipeline cache: write failed: {_exc}", file=sys.stderr)
+        return _cached_status
 
     import vault_index
 
@@ -801,7 +819,11 @@ def deep_analysis_pipeline(
     total = len(all_raw_items)
     groups = len(all_groups)
     _result = f"OK:{total}:{groups}:{projects_with_evidence}"
-    _evidence_cache_put(_cache_key, _result, _now)
+    try:
+        _output_json_str = Path(output_path).read_text(encoding="utf-8")
+    except OSError:
+        _output_json_str = ""
+    _evidence_cache_put(_cache_key, (_result, _output_json_str), _now)
     return _result
 
 
