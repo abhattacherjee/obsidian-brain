@@ -76,8 +76,15 @@ from open_item_dedup import collect_open_items
 
 scope_path = sys.argv[1]
 scope = json.load(open(scope_path))
-config = json.load(open(os.path.expanduser('~/.claude/obsidian-brain-config.json')))
-vault_path = config['vault_path']
+config_path = os.path.expanduser('~/.claude/obsidian-brain-config.json')
+try:
+    config = json.load(open(config_path))
+    vault_path = config.get('vault_path')
+    if not vault_path:
+        raise ValueError('vault_path missing from config')
+except (OSError, json.JSONDecodeError, ValueError) as exc:
+    print(f'ERROR: obsidian-brain config not loadable ({exc}); run /obsidian-setup', file=sys.stderr)
+    sys.exit(1)
 sessions_folder = config.get('sessions_folder', 'claude-sessions')
 
 # Resolve project list from scope
@@ -94,6 +101,10 @@ else:
         ['git', 'rev-parse', '--show-toplevel'],
         capture_output=True, text=True
     )
+    if res.returncode != 0:
+        print('ERROR: /check-items current-project mode requires running inside a git repo.\n'
+              'Use /check-items all (vault-wide) or /check-items <project>.', file=sys.stderr)
+        sys.exit(1)
     cwd_proj = os.path.basename(res.stdout.strip()) if res.returncode == 0 else None
     projects = [cwd_proj] if cwd_proj else None
 
@@ -234,6 +245,8 @@ for proj, groups in coarse_by_proj.items():
     if head_proc.returncode != 0 or not head_proc.stdout.strip():
         print(f"[check-items] no HEAD for {proj} ({repo_path}); forcing reclassify",
               file=sys.stderr)
+        for g in groups:
+            g["_reason"] = "head_unavailable"  # ensure Step 6 includes these in to_classify
         needs.extend(groups)
         continue
     head = head_proc.stdout.strip()
@@ -315,8 +328,15 @@ scope_path = os.environ["SCOPE_PATH"]
 merged_path = os.environ["MERGED_PATH"]
 scope = json.load(open(scope_path))
 data = json.load(open(merged_path))
-config = json.load(open(os.path.expanduser("~/.claude/obsidian-brain-config.json")))
-vault_path = config["vault_path"]
+_config_path = os.path.expanduser("~/.claude/obsidian-brain-config.json")
+try:
+    config = json.load(open(_config_path))
+    vault_path = config.get("vault_path")
+    if not vault_path:
+        raise ValueError("vault_path missing from config")
+except (OSError, json.JSONDecodeError, ValueError) as exc:
+    print(f"ERROR: obsidian-brain config not loadable ({exc}); run /obsidian-setup", file=sys.stderr)
+    sys.exit(1)
 sessions_folder = config.get("sessions_folder", "claude-sessions")
 insights_folder = config.get("insights_folder", "claude-insights")
 
@@ -495,8 +515,15 @@ from open_item_dedup import batch_cascade_checkoff
 # batch_cascade_checkoff(vault_path, sessions_folder, project, checked_texts) -> str
 scope_path = os.environ["SCOPE_PATH"]
 buckets_path = os.environ["BUCKETS_PATH"]
-config = json.load(open(os.path.expanduser("~/.claude/obsidian-brain-config.json")))
-vault_path = config["vault_path"]
+_config_path = os.path.expanduser("~/.claude/obsidian-brain-config.json")
+try:
+    config = json.load(open(_config_path))
+    vault_path = config.get("vault_path")
+    if not vault_path:
+        raise ValueError("vault_path missing from config")
+except (OSError, json.JSONDecodeError, ValueError) as exc:
+    print(f"ERROR: obsidian-brain config not loadable ({exc}); run /obsidian-setup", file=sys.stderr)
+    sys.exit(1)
 sessions_folder = config.get("sessions_folder", "claude-sessions")
 buckets = json.load(open(buckets_path))
 scope = json.load(open(scope_path))
@@ -566,7 +593,7 @@ for c in data["classifications"]:
     gid = c.get("group_id")
     group = groups_by_id.get(gid, {})
     fresh_classifications.append({
-        "canonical_hash": canonical_hash(c.get("canonical_text", "")),
+        "canonical_hash": group.get("canonical_hash") or canonical_hash(c.get("canonical_text", "")),
         "canonical_text": c.get("canonical_text", ""),
         "members": group.get("members", []),  # file/line/mtime preserved for mtime invalidation
         "classification": c.get("classification"),
