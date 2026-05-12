@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 # --- Module-level compiled regexes (computed once at import) ---
@@ -460,6 +461,31 @@ def batch_cascade_checkoff(
 
 _RE_WIKILINK = re.compile(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]')
 
+# Module-level cache for deep_analysis_pipeline evidence gathering.
+# Keyed by (projects_json, vault_path, sessions_folder); TTL = 15 minutes.
+# Prevents redundant git/gh subprocess calls when /check-items and /standup
+# deep mode run back-to-back in the same interpreter process.
+# Spec § Open questions / Cache coupling (line 699); Testing test 12 (line 658).
+_PIPELINE_EVIDENCE_CACHE: dict[tuple, tuple[float, str]] = {}
+_PIPELINE_CACHE_TTL_SEC = 900  # 15 minutes
+
+
+def _evidence_cache_get(key: tuple, now: float) -> str | None:
+    """Return cached result string if entry exists and is not stale, else None."""
+    entry = _PIPELINE_EVIDENCE_CACHE.get(key)
+    if entry is None:
+        return None
+    ts, result = entry
+    if now - ts > _PIPELINE_CACHE_TTL_SEC:
+        del _PIPELINE_EVIDENCE_CACHE[key]
+        return None
+    return result
+
+
+def _evidence_cache_put(key: tuple, result: str, now: float) -> None:
+    """Store result string in the module-level cache."""
+    _PIPELINE_EVIDENCE_CACHE[key] = (now, result)
+
 # Note types excluded from orphan detection (they are aggregation notes)
 _ORPHAN_EXCLUDE_TYPES = frozenset({
     'claude-standup', 'claude-emerge', 'claude-retro',
@@ -503,7 +529,23 @@ def deep_analysis_pipeline(
 
     Returns 'OK:<total_items>:<groups>:<projects_with_evidence>'.
     Writes structured JSON to output_path (atomic: tempfile + rename).
+
+    15-minute module-level cache keyed on (projects_json, vault_path,
+    sessions_folder): when /check-items and /standup deep both invoke
+    this in the same process back-to-back, the second call skips all
+    git/gh subprocess calls and returns the cached result string.
+    Cache helpers _evidence_cache_get/_evidence_cache_put expose the
+    cache for targeted unit tests without mocking the full pipeline.
+    Spec § Open questions / Cache coupling (line 699);
+    Testing test 12 (line 658). Refs #87.
     """
+    _cache_key = (projects_json, vault_path, sessions_folder)
+    _now = time.time()
+    _cached = _evidence_cache_get(_cache_key, _now)
+    if _cached is not None:
+        # Warm-cache hit: skip all subprocess calls; output_path already written.
+        return _cached
+
     import vault_index
 
     # 1. Warm vault index
@@ -758,7 +800,9 @@ def deep_analysis_pipeline(
 
     total = len(all_raw_items)
     groups = len(all_groups)
-    return f"OK:{total}:{groups}:{projects_with_evidence}"
+    _result = f"OK:{total}:{groups}:{projects_with_evidence}"
+    _evidence_cache_put(_cache_key, _result, _now)
+    return _result
 
 
 def build_deep_presentation(

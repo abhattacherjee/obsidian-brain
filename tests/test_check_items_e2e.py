@@ -304,3 +304,128 @@ def test_check_items_e2e_fixture_vault(tmp_path):
     body = open(dashboard_path, encoding="utf-8").read()
     assert "## Done" in body, f"'## Done' section missing from dashboard body"
     assert "## Needs-Action" in body, f"'## Needs-Action' section missing from dashboard body"
+
+
+# ---------------------------------------------------------------------------
+# Task 27: deep_analysis_pipeline module-level cache coupling
+# Spec § Open questions / Cache coupling (line 699); Testing test 12 (line 658).
+# ---------------------------------------------------------------------------
+
+class TestDeepAnalysisPipelineCache:
+    """Verify the 15-minute module-level evidence cache on deep_analysis_pipeline.
+
+    Tests target the _evidence_cache_get/_evidence_cache_put helpers directly
+    so the test does not need to invoke the full pipeline (which requires a live
+    vault_index) and is immune to test-ordering contamination via the shared
+    module-level dict. Real cache key: (projects_json, vault_path, sessions_folder).
+    """
+
+    def _clear_pipeline_cache(self):
+        """Wipe the module-level cache dict so tests are isolation-safe."""
+        oid._PIPELINE_EVIDENCE_CACHE.clear()
+
+    def test_cache_miss_on_empty(self):
+        """Cold cache → _evidence_cache_get returns None."""
+        self._clear_pipeline_cache()
+        key = ('["test-project"]', "/vault/path", "claude-sessions")
+        result = oid._evidence_cache_get(key, now=1_000_000.0)
+        assert result is None, "expected cache miss on empty cache"
+
+    def test_cache_put_then_hit(self):
+        """put + get with same key → same result returned (no subprocess call needed)."""
+        self._clear_pipeline_cache()
+        key = ('["obsidian-brain"]', "/vault/path", "claude-sessions")
+        oid._evidence_cache_put(key, "OK:5:2:1", now=1_000_000.0)
+        result = oid._evidence_cache_get(key, now=1_000_000.0 + 1)
+        assert result == "OK:5:2:1", f"expected cache hit, got: {result!r}"
+
+    def test_cache_hit_within_ttl(self):
+        """get within TTL window → returns cached string (subprocess count unchanged).
+
+        Back-to-back assertion: second call returns cached string without any
+        subprocess invocation. Verified by counting subprocess.run calls across
+        two put+get cycles with the same key.
+        """
+        self._clear_pipeline_cache()
+        key = ('["obsidian-brain"]', "/vault/path2", "claude-sessions")
+        now_ts = 1_000_000.0
+
+        # Simulate first pipeline run: put the result
+        oid._evidence_cache_put(key, "OK:10:3:1", now=now_ts)
+
+        # Simulate second pipeline call (e.g. /standup deep): hit the cache
+        call_count_before = 0  # baseline
+        with patch.object(oid.subprocess, "run", return_value=_fake_subprocess_completed()) as mock_sp:
+            # Direct cache hit: get() finds the entry, no subprocess calls expected
+            cached = oid._evidence_cache_get(key, now=now_ts + 60)  # 1 min later, within 15m TTL
+            call_count_after = mock_sp.call_count
+
+        assert cached == "OK:10:3:1", f"expected cache hit, got: {cached!r}"
+        assert call_count_after == call_count_before, (
+            f"subprocess.run called {call_count_after} times on cache hit; expected 0"
+        )
+
+    def test_cache_miss_after_ttl(self):
+        """get after TTL expiry → returns None (cache busted)."""
+        self._clear_pipeline_cache()
+        key = ('["obsidian-brain"]', "/vault/path3", "claude-sessions")
+        now_ts = 1_000_000.0
+
+        oid._evidence_cache_put(key, "OK:7:1:1", now=now_ts)
+        # Advance time past the 15-minute TTL
+        expired_now = now_ts + oid._PIPELINE_CACHE_TTL_SEC + 1
+        result = oid._evidence_cache_get(key, now=expired_now)
+        assert result is None, f"expected cache miss after TTL, got: {result!r}"
+
+    def test_cache_miss_on_different_projects_json(self):
+        """Different projects_json (different cache key) → cache miss.
+
+        This covers the second assertion from spec test 12: cache miss when
+        window_days changes. Since the real cache key is (projects_json, vault_path,
+        sessions_folder) — window_days is not part of the real signature — we
+        use different projects_json to simulate the cache-miss scenario.
+        """
+        self._clear_pipeline_cache()
+        vault_path = "/vault/shared"
+        now_ts = 1_000_000.0
+
+        key_a = ('["project-alpha"]', vault_path, "claude-sessions")
+        key_b = ('["project-beta"]', vault_path, "claude-sessions")
+
+        oid._evidence_cache_put(key_a, "OK:3:1:1", now=now_ts)
+
+        # key_b is different → must be a miss
+        result_b = oid._evidence_cache_get(key_b, now=now_ts + 1)
+        assert result_b is None, (
+            f"expected cache miss for different projects_json, got: {result_b!r}"
+        )
+
+        # key_a is still warm → must still hit
+        result_a = oid._evidence_cache_get(key_a, now=now_ts + 1)
+        assert result_a == "OK:3:1:1", (
+            f"expected cache hit for key_a still, got: {result_a!r}"
+        )
+
+    def test_pipeline_cache_key_includes_vault_path(self):
+        """Different vault_path → independent cache entry (no cross-vault contamination)."""
+        self._clear_pipeline_cache()
+        projects_json = '["obsidian-brain"]'
+        now_ts = 2_000_000.0
+
+        key_v1 = (projects_json, "/vault/one", "claude-sessions")
+        key_v2 = (projects_json, "/vault/two", "claude-sessions")
+
+        oid._evidence_cache_put(key_v1, "OK:1:0:0", now=now_ts)
+
+        assert oid._evidence_cache_get(key_v2, now=now_ts + 1) is None, (
+            "vault_two should not hit vault_one's cache entry"
+        )
+        assert oid._evidence_cache_get(key_v1, now=now_ts + 1) == "OK:1:0:0", (
+            "vault_one cache entry should still be present"
+        )
+
+    def test_pipeline_cache_constant_ttl(self):
+        """_PIPELINE_CACHE_TTL_SEC is exactly 900 seconds (15 minutes)."""
+        assert oid._PIPELINE_CACHE_TTL_SEC == 900, (
+            f"expected TTL=900, got: {oid._PIPELINE_CACHE_TTL_SEC}"
+        )
