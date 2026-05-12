@@ -301,3 +301,72 @@ def test_assign_tier_handles_none_or_empty():
     assert assign_tier(None, "item text") == "LOW"
     assert assign_tier("", "item text") == "LOW"
     assert assign_tier("citation", None) == "LOW"
+
+
+def test_cross_project_dedup_respects_project_boundary():
+    """Test 1 - #534 in obsidian-brain and #534 in tiny-vacation-agent stay separate."""
+    from open_item_dedup import cross_project_dedup
+
+    groups_by_project = {
+        "obsidian-brain": [
+            {
+                "group_id": "ob-0001",
+                "project": "obsidian-brain",
+                "representative": "Close GitHub issue #534 (snapshot backlink)",
+                "members": [{"file": "a.md", "line": 1, "text": "Close #534"}],
+            }
+        ],
+        "tiny-vacation-agent": [
+            {
+                "group_id": "tva-0001",
+                "project": "tiny-vacation-agent",
+                "representative": "Close GitHub issue #534 (Story 11.12 fixed)",
+                "members": [{"file": "b.md", "line": 1, "text": "Close #534"}],
+            }
+        ],
+    }
+
+    merged = cross_project_dedup(groups_by_project)
+
+    all_groups = merged if isinstance(merged, list) else [
+        g for project_groups in merged.values() for g in project_groups
+    ]
+    assert len(all_groups) == 2
+    projects = {g["project"] for g in all_groups}
+    assert projects == {"obsidian-brain", "tiny-vacation-agent"}
+
+
+def test_cross_project_dedup_within_project_unchanged():
+    """Within-project dedup is handled upstream by find_duplicates; this fn must
+    not coalesce same-project groups."""
+    from open_item_dedup import cross_project_dedup
+    groups_by_project = {
+        "obsidian-brain": [
+            {"group_id": "ob-0001", "project": "obsidian-brain",
+             "representative": "Fix bug A", "members": []},
+            {"group_id": "ob-0002", "project": "obsidian-brain",
+             "representative": "Fix bug B", "members": []},
+        ],
+    }
+    merged = cross_project_dedup(groups_by_project)
+    all_groups = merged if isinstance(merged, list) else [
+        g for project_groups in merged.values() for g in project_groups
+    ]
+    assert len(all_groups) == 2
+
+
+def test_cross_project_dedup_single_project_passthrough():
+    """When only one project's groups are provided, output equals input shape."""
+    from open_item_dedup import cross_project_dedup
+    groups_by_project = {
+        "obsidian-brain": [
+            {"group_id": "ob-0001", "project": "obsidian-brain",
+             "representative": "Item", "members": []},
+        ],
+    }
+    merged = cross_project_dedup(groups_by_project)
+    all_groups = merged if isinstance(merged, list) else [
+        g for project_groups in merged.values() for g in project_groups
+    ]
+    assert len(all_groups) == 1
+    assert all_groups[0]["project"] == "obsidian-brain"

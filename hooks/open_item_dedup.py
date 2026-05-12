@@ -944,3 +944,33 @@ def build_deep_presentation(
     sections.extend(actions)
 
     return "\n".join(sections)
+
+
+def cross_project_dedup(groups_by_project):
+    """
+    Vault-scope dedup that respects project boundaries.
+
+    Input shape: {project_name: [coarse_group_dict, ...]}
+    Output shape: flat list of group dicts, project boundary preserved.
+
+    Distinctive tokens like '#534' are keyed by (project, token) so the same
+    token in two repos does NOT collide. Within-project grouping is already
+    handled by find_duplicates(); this function is a pass-through with the
+    project-scoped collision-avoidance guarantee for vault-wide scans.
+
+    Spec § Pipeline architecture Stage 2a, lines 67-72.
+    """
+    if not groups_by_project:
+        return []
+    flat = []
+    seen_keys = set()
+    for project, groups in groups_by_project.items():
+        for g in groups:
+            key = (project, g.get("group_id") or id(g))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            out = dict(g)
+            out.setdefault("project", project)
+            flat.append(out)
+    return flat
