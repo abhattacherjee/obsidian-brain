@@ -598,3 +598,74 @@ def test_semantic_merge_mode_reset_on_success(monkeypatch, tmp_path):
         {"group_id": "g1", "project": "p", "representative": "A", "members": []}
     ])
     assert oid.get_last_semantic_merge_mode() == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Task 14: over-merge guards (test-only)
+# ---------------------------------------------------------------------------
+
+def test_semantic_merge_keeps_dry_run_vs_apply_separate(monkeypatch):
+    """Test 1e - dry-run and apply variants of the same command MUST NOT merge."""
+    import open_item_dedup as oid
+
+    def fake_cli_run(cmd, *args, **kwargs):
+        out_path = next((c for c in cmd if isinstance(c, str)
+                         and c.endswith(".json") and "out" in c), None)
+        merge_map = {"merges": [], "total_groups_before": 2, "total_groups_after": 2}
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump(merge_map, f)
+        return _fake_completed(returncode=0)
+
+    coarse = [
+        {"group_id": "g1", "project": "obsidian-brain",
+         "representative": "Run /vault-doctor --check snapshot-integrity (dry-run)",
+         "members": [{"file": "a.md", "line": 1, "text": "..."}]},
+        {"group_id": "g2", "project": "obsidian-brain",
+         "representative": "Run /vault-doctor fix --check snapshot-integrity (apply mode)",
+         "members": [{"file": "b.md", "line": 1, "text": "..."}]},
+    ]
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    merged = oid.merge_groups_semantically(coarse)
+    flat = merged if isinstance(merged, list) else [g for v in merged.values() for g in v]
+    ids = {g["group_id"] for g in flat}
+    assert ids == {"g1", "g2"}, f"dry-run and apply must remain separate; got {ids}"
+
+
+def test_semantic_merge_keeps_investigate_vs_fix_separate(monkeypatch):
+    """Test 1f - 'Investigate X' and 'Fix X' MUST NOT merge."""
+    import open_item_dedup as oid
+
+    def fake_cli_run(cmd, *args, **kwargs):
+        out_path = next((c for c in cmd if isinstance(c, str)
+                         and c.endswith(".json") and "out" in c), None)
+        merge_map = {"merges": [], "total_groups_before": 2, "total_groups_after": 2}
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump(merge_map, f)
+        return _fake_completed(returncode=0)
+
+    coarse = [
+        {"group_id": "g1", "project": "obsidian-brain",
+         "representative": "Investigate dispatcher-discovery fallback logic",
+         "members": [{"file": "a.md", "line": 1, "text": "..."}]},
+        {"group_id": "g2", "project": "obsidian-brain",
+         "representative": "Fix dispatcher-discovery fallback to probe check availability",
+         "members": [{"file": "b.md", "line": 1, "text": "..."}]},
+    ]
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    merged = oid.merge_groups_semantically(coarse)
+    flat = merged if isinstance(merged, list) else [g for v in merged.values() for g in v]
+    ids = {g["group_id"] for g in flat}
+    assert ids == {"g1", "g2"}, f"Investigate and Fix must remain separate; got {ids}"
+
+
+def test_semantic_merge_prompt_contains_negative_examples():
+    """Guard rail: removing Example 3 or Example 4 from the prompt would silently
+    weaken the over-merge guards."""
+    from check_items_cli import SEMANTIC_MERGE_PROMPT
+    assert "vault-doctor --check snapshot-integrity (dry-run)" in SEMANTIC_MERGE_PROMPT
+    assert "vault-doctor fix --check snapshot-integrity (apply mode)" in SEMANTIC_MERGE_PROMPT
+    assert "Investigate dispatcher-discovery fallback logic" in SEMANTIC_MERGE_PROMPT
+    assert "Fix dispatcher-discovery fallback" in SEMANTIC_MERGE_PROMPT
+    assert "DO NOT MERGE" in SEMANTIC_MERGE_PROMPT
