@@ -1277,4 +1277,39 @@ def test_dashboard_active_truncation_and_path_guard(tmp_path):
     import check_items_report as cr
     src = open(cr.__file__).read()
     assert "is_relative_to" in src
-    assert "refusing to write outside vault" in src
+    assert "refusing to write outside" in src
+
+
+# ---------------------------------------------------------------------------
+# R2 regression: Finding 3 — path traversal via scope_name
+# ---------------------------------------------------------------------------
+
+def test_dashboard_rejects_path_traversal_in_scope_name(tmp_path):
+    """Containment guard rejects ../escape attempts in scope_name."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    # Path-traversal scope name: should be sanitized, not escape
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="../../etc/passwd", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True,
+    )
+    # File must land inside claude-dashboards/, with sanitized name
+    assert str(vault / "claude-dashboards") in path
+    assert ".." not in os.path.basename(path)
+    assert "/" not in os.path.basename(path)
+
+
+# ---------------------------------------------------------------------------
+# R2 regression: Finding 6 — verify_before_edit indented checkbox
+# ---------------------------------------------------------------------------
+
+def test_verify_before_edit_handles_indented_checkbox(tmp_path):
+    """Indented checkboxes (nested lists) must verify against the stripped text."""
+    from open_item_dedup import verify_before_edit
+    f = tmp_path / "note.md"
+    f.write_text("line one\n    - [ ] Indented item ship it\nline three\n")
+    ok = verify_before_edit(str(f), line_number=2, expected_text="- [ ] Indented item ship it")
+    assert ok is True

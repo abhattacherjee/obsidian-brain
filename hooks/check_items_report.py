@@ -11,8 +11,18 @@ Atomic temp+rename pattern.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
+
+
+def _safe_filename_component(s: str) -> str:
+    """Restrict to [A-Za-z0-9_-]. Replace anything else (including dots) with '_'.
+
+    Dots are excluded from the allowed set so that path-traversal sequences
+    like '../../etc/passwd' cannot produce '..' components in the filename.
+    """
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(s))[:120]
 
 
 def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
@@ -129,10 +139,12 @@ def write_check_items_dashboard(
     dashboards_dir = Path(vault_path) / "claude-dashboards"
     dashboards_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = f"check-items-{scope_name}-{date_str}.md"
+    safe_scope = _safe_filename_component(scope_name)
+    safe_date = _safe_filename_component(date_str)
+    filename = f"check-items-{safe_scope}-{safe_date}.md"
     target = dashboards_dir / filename
-    if not target.resolve().is_relative_to(Path(vault_path).resolve()):
-        raise ValueError(f"refusing to write outside vault: {target}")
+    if not target.resolve().is_relative_to(dashboards_dir.resolve()):
+        raise ValueError(f"refusing to write outside dashboards dir: {target}")
 
     content = (_frontmatter(scope_name, date_str, window_days, raw_count, group_count,
                             classifications, applied, cascaded,

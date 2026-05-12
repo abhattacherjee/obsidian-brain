@@ -1400,5 +1400,5 @@ def verify_before_edit(file_path: str, line_number: int, expected_text: str) -> 
         return False
     if not 1 <= line_number <= len(lines):
         return False
-    actual = lines[line_number - 1].rstrip()
-    return actual == (expected_text or "").rstrip()
+    actual = lines[line_number - 1].strip()
+    return actual == (expected_text or "").strip()

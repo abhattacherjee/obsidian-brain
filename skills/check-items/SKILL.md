@@ -211,11 +211,17 @@ flat_groups = cross_project_dedup(coarse_by_proj) if scope["mode"] == "vault" el
 cache = load_cache()
 known, needs = [], []
 for proj, groups in coarse_by_proj.items():
-    head = subprocess.run(
-        ["git", "-C", f"{os.path.expanduser('~/dev/claude_workspace')}/{proj}",
-         "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=10
-    ).stdout.strip()
+    repo_path = f"{os.path.expanduser('~/dev/claude_workspace')}/{proj}"
+    head_proc = subprocess.run(
+        ["git", "-C", repo_path, "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if head_proc.returncode != 0 or not head_proc.stdout.strip():
+        print(f"[check-items] no HEAD for {proj} ({repo_path}); forcing reclassify",
+              file=sys.stderr)
+        needs.extend(groups)
+        continue
+    head = head_proc.stdout.strip()
     k, n = partition(groups, cache, project=proj, head_sha=head, force=scope["no_cache"])
     known.extend(k)
     needs.extend(n)
@@ -486,10 +492,35 @@ part = json.load(open(partition_path))
 
 # Re-derive project list and HEAD shas for cache update.
 all_groups = part["flat_groups"]
-fresh_classifications = [
-    dict(c, canonical_hash=canonical_hash(c.get("canonical_text", "")))
-    for c in data["classifications"]
-]
+
+# Build a lookup from merged.json so we can attach members + mtime to each
+# fresh classification. members are required by partition() for mtime
+# invalidation; empty members causes every group to look mtime_changed next run.
+merged_path_for_step10 = os.path.join(os.path.dirname(scope_path), "merged.json")
+try:
+    merged_data = json.load(open(merged_path_for_step10))
+    all_merged = merged_data
+except (OSError, json.JSONDecodeError):
+    all_merged = {}
+
+groups_by_id = {}
+for _proj, _gs in all_merged.get("merged_by_proj", {}).items():
+    for _g in _gs:
+        groups_by_id[_g.get("group_id")] = _g
+
+fresh_classifications = []
+for c in data["classifications"]:
+    gid = c.get("group_id")
+    group = groups_by_id.get(gid, {})
+    fresh_classifications.append({
+        "canonical_hash": canonical_hash(c.get("canonical_text", "")),
+        "canonical_text": c.get("canonical_text", ""),
+        "members": group.get("members", []),  # file/line/mtime preserved for mtime invalidation
+        "classification": c.get("classification"),
+        "confidence": c.get("confidence"),
+        "evidence_citation": c.get("evidence_citation"),
+        "classified_ts": int(time.time()),
+    })
 
 # Group by project for per-project update_cache calls.
 groups_by_proj = {}
@@ -497,6 +528,7 @@ for g in all_groups:
     groups_by_proj.setdefault(g.get("project", "unknown"), []).append(g)
 fresh_by_proj = {}
 for fc in fresh_classifications:
+    # Match classification to project via canonical_hash lookup in all_groups
     proj = next(
         (g.get("project", "unknown") for g in all_groups
          if canonical_hash(g.get("representative", "")) == fc.get("canonical_hash")),
@@ -506,11 +538,16 @@ for fc in fresh_classifications:
 
 cache = load_cache()
 for proj, proj_groups in groups_by_proj.items():
-    head = subprocess.run(
-        ["git", "-C", f"{os.path.expanduser('~/dev/claude_workspace')}/{proj}",
-         "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=10
-    ).stdout.strip()
+    repo_path = f"{os.path.expanduser('~/dev/claude_workspace')}/{proj}"
+    head_proc = subprocess.run(
+        ["git", "-C", repo_path, "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if head_proc.returncode != 0 or not head_proc.stdout.strip():
+        print(f"[check-items] no HEAD for {proj} ({repo_path}); skipping cache update",
+              file=sys.stderr)
+        continue
+    head = head_proc.stdout.strip()
     cache = update_cache(
         cache=cache,
         project=proj,
