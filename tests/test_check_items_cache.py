@@ -413,3 +413,38 @@ def test_partition_skips_corrupted_cache_entries():
     # Should not raise KeyError; corrupted entry is silently skipped
     known, needs = partition(groups, cache, project="p", head_sha="h")
     assert len(known) == 1
+
+
+def test_partition_handles_non_numeric_classified_ts():
+    """Corrupted cache with string classified_ts must not crash partition.
+
+    Regression test for R5 Finding D. When classified_ts is non-numeric
+    (e.g. manual cache edit, partial corruption), the coercion must default
+    to 0.0, which forces ttl_expired and routes the group to needs.
+    """
+    from check_items_cache import partition
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "p": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "h",
+                "groups": [{
+                    "canonical_hash": "h1",
+                    "canonical_text": "x",
+                    "members": [{"file": "n.md", "line": 1, "mtime": 1735000000}],
+                    "classification": "DONE",
+                    "confidence": "HIGH",
+                    "evidence_citation": "c",
+                    "action_required": None,
+                    "classified_ts": "not-a-number",  # corrupt — should not crash
+                }],
+            }
+        },
+    }
+    groups = [_make_group("h1")]
+    # Must not raise TypeError from `now - classified_ts`; corrupt ts → ttl_expired.
+    known, needs = partition(groups, cache, project="p", head_sha="h")
+    assert len(known) == 0, "corrupted classified_ts must force reclassification"
+    assert len(needs) == 1
+    assert needs[0].get("_reason") == "ttl_expired"

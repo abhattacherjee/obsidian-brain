@@ -165,7 +165,10 @@ def partition(
             g["_reason"] = "mtime_changed"
             needs.append(g)
             continue
-        classified_ts = cached.get("classified_ts", 0)
+        try:
+            classified_ts = float(cached.get("classified_ts", 0))
+        except (TypeError, ValueError):
+            classified_ts = 0.0
         if now - classified_ts > _ttl_for(cached.get("classification", "ACTIVE")):
             g["_reason"] = "ttl_expired"
             needs.append(g)

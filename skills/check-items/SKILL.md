@@ -21,69 +21,77 @@ Arguments are order-independent and combinable: `/check-items all 30d --show-all
 
 ## Step 1 — Parse arguments and resolve scope
 
-Run this Python block. It parses argv per the invocation contract above (positional project / `all` / `Nd`, plus the three flags). Output goes to a temp directory under `~/.claude/obsidian-brain/`; the printed path is passed to every subsequent step via argv.
+Run this bash block. It parses `$ARGUMENTS` per the invocation contract above (positional project / `all` / `Nd`, plus the three flags). Output goes to a temp directory under `~/.claude/obsidian-brain/`; the printed path is captured in `$scope_path` and passed to every subsequent step as `"$scope_path"`.
 
-```python
+Each step below is a bash block; the embedded Python reads its inputs from `$1`, `$2`, … via `sys.argv`. Pass `"$scope_path"` captured here as the first arg, and any previous step's output path as subsequent args.
+
+```bash
+ARGUMENTS="${ARGUMENTS:-}"
+scope_path=$(python3 -c "
 import sys, os, glob, json, tempfile
 sys.path.insert(0, max(
-    glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
-    default="hooks"
+    glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')),
+    default='hooks'
 ))
 from check_items_args import parse_scope
 
-ARGS = $ARGUMENTS.split() if "$ARGUMENTS" else []
-scope_obj = parse_scope(ARGS)
+argv = sys.argv[1:]
+scope_obj = parse_scope(argv)
 scope = {
-    "mode": scope_obj.mode,
-    "project": scope_obj.project,
-    "window_days": scope_obj.window_days,
-    "show_all": scope_obj.show_all,
-    "dry_run": scope_obj.dry_run,
-    "no_cache": scope_obj.no_cache,
+    'mode': scope_obj.mode,
+    'project': scope_obj.project,
+    'window_days': scope_obj.window_days,
+    'show_all': scope_obj.show_all,
+    'dry_run': scope_obj.dry_run,
+    'no_cache': scope_obj.no_cache,
 }
 
-workdir = tempfile.mkdtemp(prefix="check-items-", dir=os.path.expanduser("~/.claude/obsidian-brain"))
+workdir = tempfile.mkdtemp(prefix='check-items-', dir=os.path.expanduser('~/.claude/obsidian-brain'))
 os.chmod(workdir, 0o700)
-scope_path = os.path.join(workdir, "scope.json")
-with open(scope_path, "w") as f:
+scope_path = os.path.join(workdir, 'scope.json')
+with open(scope_path, 'w') as f:
     json.dump(scope, f)
 os.chmod(scope_path, 0o600)
 print(scope_path)
-print(json.dumps(scope, indent=2))
+" $ARGUMENTS)
+
+echo "scope_path=$scope_path"
+cat "$scope_path"
 ```
 
-Save the printed `scope.json` path; pass it to every subsequent step via argv.
+Save the printed `scope.json` path in `$scope_path`; pass it to every subsequent step as the first arg.
 
 Note: `window_days` in scope controls how many sessions' files to pass as `basenames` in Step 5. The `collect_open_items` helper itself scans by `max_sessions` count (not calendar days); to apply a window filter, limit the basenames list to files dated within the window before passing to `deep_analysis_pipeline`.
 
 ## Step 2 — Collect open items (Stage 1)
 
-```python
+```bash
+raw_path=$(python3 -c "
 import sys, os, glob, json
 sys.path.insert(0, max(
-    glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
-    default="hooks"
+    glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')),
+    default='hooks'
 ))
 from open_item_dedup import collect_open_items
 
 scope_path = sys.argv[1]
 scope = json.load(open(scope_path))
-config = json.load(open(os.path.expanduser("~/.claude/obsidian-brain-config.json")))
-vault_path = config["vault_path"]
-sessions_folder = config.get("sessions_folder", "claude-sessions")
+config = json.load(open(os.path.expanduser('~/.claude/obsidian-brain-config.json')))
+vault_path = config['vault_path']
+sessions_folder = config.get('sessions_folder', 'claude-sessions')
 
 # Resolve project list from scope
-if scope["mode"] == "vault":
+if scope['mode'] == 'vault':
     # All projects: collect from all session notes without project filter.
     # We use a sentinel to indicate vault-wide scan below.
     projects = None
-elif scope["mode"] == "project" and scope["project"]:
-    projects = [scope["project"]]
+elif scope['mode'] == 'project' and scope['project']:
+    projects = [scope['project']]
 else:
     # current: derive project name from cwd git repo name
     import subprocess
     res = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
+        ['git', 'rev-parse', '--show-toplevel'],
         capture_output=True, text=True
     )
     cwd_proj = os.path.basename(res.stdout.strip()) if res.returncode == 0 else None
@@ -97,14 +105,14 @@ if projects is None:
     if os.path.isdir(sessions_dir):
         seen_projects = set()
         for fname in os.listdir(sessions_dir):
-            if not fname.endswith(".md"):
+            if not fname.endswith('.md'):
                 continue
             fpath = os.path.join(sessions_dir, fname)
             try:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                     for line in f.readlines()[:20]:
-                        if line.strip().startswith("project:"):
-                            proj = line.strip().split(":", 1)[1].strip().strip('"').strip("'")
+                        if line.strip().startswith('project:'):
+                            proj = line.strip().split(':', 1)[1].strip().strip('\"').strip(\"'\")
                             if proj:
                                 seen_projects.add(proj)
                             break
@@ -119,11 +127,11 @@ if projects is None:
             )
             for fpath, line_num, item_text in items:
                 raw_items.append({
-                    "file": os.path.basename(fpath),
-                    "path": fpath,
-                    "line": line_num,
-                    "text": item_text,
-                    "project": proj,
+                    'file': os.path.basename(fpath),
+                    'path': fpath,
+                    'line': line_num,
+                    'text': item_text,
+                    'project': proj,
                 })
 else:
     for proj in projects:
@@ -137,23 +145,29 @@ else:
         )
         for fpath, line_num, item_text in items:
             raw_items.append({
-                "file": os.path.basename(fpath),
-                "path": fpath,
-                "line": line_num,
-                "text": item_text,
-                "project": proj,
+                'file': os.path.basename(fpath),
+                'path': fpath,
+                'line': line_num,
+                'text': item_text,
+                'project': proj,
             })
 
-out_path = os.path.join(os.path.dirname(scope_path), "raw_items.json")
-with open(out_path, "w") as f:
+out_path = os.path.join(os.path.dirname(scope_path), 'raw_items.json')
+with open(out_path, 'w') as f:
     json.dump(raw_items, f, indent=2)
 os.chmod(out_path, 0o600)
-print(out_path, "—", len(raw_items), "raw items")
+print(out_path)
+" "$scope_path")
+
+echo "raw_path=$raw_path"
 ```
 
 ## Step 3 — Coarse-group + cache partition (Stage 2a + cache load)
 
-```python
+Steps 4-10 follow the same bash+python3 -c pattern: embed the Python logic in `python3 -c "..." "$scope_path" "$prev_path"` so that `sys.argv[1]`, `sys.argv[2]`, … receive the correct file paths. Do not run raw `python3` blocks that rely on `sys.argv` without this wrapper.
+
+```bash
+part_path=$(SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" python3 << 'PYEOF'
 import sys, os, glob, json, subprocess
 sys.path.insert(0, max(
     glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
@@ -162,7 +176,8 @@ sys.path.insert(0, max(
 from open_item_dedup import find_duplicates, cross_project_dedup
 from check_items_cache import canonical_hash, load_cache, partition
 
-scope_path, raw_path = sys.argv[1], sys.argv[2]
+scope_path = os.environ["SCOPE_PATH"]
+raw_path = os.environ["RAW_PATH"]
 scope = json.load(open(scope_path))
 raw_items = json.load(open(raw_path))
 
@@ -230,12 +245,17 @@ out = os.path.join(os.path.dirname(scope_path), "partition.json")
 with open(out, "w") as f:
     json.dump({"flat_groups": flat_groups, "known": known, "needs": needs}, f, indent=2)
 os.chmod(out, 0o600)
-print(out, "—", len(known), "cached,", len(needs), "to-classify")
+print(out)
+PYEOF
+)
+
+echo "part_path=$part_path"
 ```
 
 ## Step 4 — Semantic merge on needs-reclassification set (Stage 2b)
 
-```python
+```bash
+merged_path=$(SCOPE_PATH="$scope_path" PART_PATH="$part_path" python3 << 'PYEOF'
 import sys, os, glob, json
 sys.path.insert(0, max(
     glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
@@ -243,7 +263,8 @@ sys.path.insert(0, max(
 ))
 from open_item_dedup import merge_groups_semantically, get_last_semantic_merge_mode
 
-scope_path, part_path = sys.argv[1], sys.argv[2]
+scope_path = os.environ["SCOPE_PATH"]
+part_path = os.environ["PART_PATH"]
 data = json.load(open(part_path))
 needs = data["needs"]
 known = data["known"]
@@ -271,8 +292,13 @@ out = os.path.join(os.path.dirname(scope_path), "merged.json")
 with open(out, "w") as f:
     json.dump({"merged_by_proj": merged_by_proj, "mode": mode}, f, indent=2)
 os.chmod(out, 0o600)
-print(out, "— merge_mode=", mode)
+print(out)
+PYEOF
+)
+
+echo "merged_path=$merged_path"
 ```
+
 
 ## Step 5 — Gather evidence (Stage 3)
 

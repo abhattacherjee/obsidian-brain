@@ -1408,3 +1408,37 @@ def test_dashboard_yaml_frontmatter_rejects_injection(tmp_path):
     fm_block = content.split("---")[1]  # middle block between --- markers
     scope_lines = [ln for ln in fm_block.splitlines() if ln.startswith("scope:")]
     assert len(scope_lines) == 1, f"expected exactly 1 scope: line, got: {scope_lines}"
+
+
+def test_dashboard_yaml_rejects_date_injection(tmp_path):
+    """date_str containing newlines must not inject extra YAML fields.
+
+    Regression test for R5 Finding C. The sanitizer (_safe_filename_component)
+    collapses newlines to underscores so crafted date values cannot produce
+    extra standalone YAML key-value lines inside the frontmatter block.
+    """
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    crafted = "2026-05-11\nmalicious_field: pwned\nextra"
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="obsidian-brain", date_str=crafted,
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True,
+    )
+    content = open(path).read()
+    # Check only the frontmatter block (between the first two --- delimiters).
+    # The body is Markdown and may echo the raw date_str; the YAML injection risk
+    # is exclusively in the frontmatter block.
+    assert content.startswith("---"), "output must begin with YAML frontmatter"
+    fm_block = content.split("---")[1]  # between first and second ---
+    # The attack vector is a bare YAML key injection: `malicious_field: pwned` as its
+    # own line. The sanitizer collapses newlines to underscores, so the substring
+    # becomes part of the date: value — never a standalone key:value line.
+    assert "malicious_field: pwned" not in fm_block, (
+        "crafted date_str must not inject a standalone 'malicious_field: pwned' YAML line"
+    )
+    # The frontmatter date: line must be a single sanitized token (no embedded newlines).
+    date_lines = [ln for ln in fm_block.splitlines() if ln.startswith("date:")]
+    assert len(date_lines) == 1, f"expected exactly 1 date: line in frontmatter, got: {date_lines}"

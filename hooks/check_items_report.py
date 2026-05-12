@@ -35,14 +35,15 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
                "STALE": "stale", "ACTIVE": "active"}.get(kind)
         if key:
             counts[key] += 1
-    # scope_name is expected to already be sanitized (via _safe_filename_component
-    # in write_check_items_dashboard), but re-sanitize defensively so this helper
-    # is safe even if called directly with a raw value.
+    # scope_name and date_str are sanitized defensively so this helper is safe
+    # even if called directly with raw values containing newlines or colons that
+    # could inject extra YAML fields.
     safe_scope = _safe_filename_component(scope_name)
+    safe_date = _safe_filename_component(date_str)
     return (
         "---\n"
         "type: claude-check-items-report\n"
-        f"date: {date_str}\n"
+        f"date: {safe_date}\n"
         f"scope: {safe_scope}\n"
         f"window: {window_days}d\n"
         f"total_raw_items: {raw_count}\n"
