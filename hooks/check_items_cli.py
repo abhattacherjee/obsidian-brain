@@ -1,0 +1,206 @@
+"""
+CLI wrappers for /check-items sub-agent stages.
+
+Keeps SKILL.md free of inline agent prompts. Two entry points:
+  - run_semantic_merge: Stage 2b grouping sub-agent.
+  - run_classifier:     Stage 4 classification sub-agent (Phase E).
+
+Per spec § New hooks/check_items_cli.py (lines 581-587).
+Stdin is capped at 1_000_000 bytes (project CLAUDE.md security pattern).
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+STDIN_CAP_BYTES = 1_000_000
+SUBAGENT_TIMEOUT_SEC = 60
+
+SEMANTIC_MERGE_PROMPT = """You are the semantic-merge sub-agent for an open-items pipeline. Read
+<input-json-path>. It contains N coarse token-grouped open items.
+
+## Your job
+
+Identify groups that describe the same concrete action even when they
+share few tokens. Token-based grouping already caught literal
+duplicates; your job is to catch semantic duplicates.
+
+## The key test - are these the same action?
+
+Two items A and B should merge when a user would mark BOTH as done
+simultaneously once the underlying work ships. If completing A leaves
+B still genuinely to-do, they are NOT the same action.
+
+## Concrete examples from real vault data
+
+### SHOULD MERGE (same action, different phrasing)
+
+Example 1:
+- A: "Decide text-fallback routing vs. sentinel option to satisfy
+     AskUserQuestion minItems=2"
+- B: "Review fuzzy-matched cascade candidate about routing N=1 to
+     text-fallback"
+-> MERGE. Both describe the same decision about N=1 text-fallback
+  routing. B is just pointing at a prior note that raised it.
+
+Example 2:
+- A: "Fresh session: execute Phases 1-4 (live /compact x2 + Ctrl-D)"
+- B: "Complete live-CC smoke test from DEV-TEST-SNAPSHOTS.md"
+-> MERGE. Both describe running the smoke-test protocol; the first
+  literally lists the steps, the second names it.
+
+### SHOULD NOT MERGE (related but distinct)
+
+Example 3:
+- A: "Run /vault-doctor --check snapshot-integrity (dry-run)"
+- B: "Run /vault-doctor fix --check snapshot-integrity (apply mode)"
+-> DO NOT MERGE. Different commands with different side effects.
+
+Example 4:
+- A: "Investigate dispatcher-discovery fallback logic"
+- B: "Fix dispatcher-discovery fallback to probe check availability"
+-> DO NOT MERGE. Investigate is not Fix.
+
+Example 5:
+- A: "PR #67 (doc): Finalize snapshot-summary user-facing docs"
+- B: "PR #70 (read-path): Fix session->snapshots forward backlink
+     undercounting"
+-> DO NOT MERGE. Same parent feature, different PRs shipping different
+  work.
+
+## Rules
+
+1. Same-project only (enforced in Python, not by you).
+2. Apply the "both get marked done simultaneously" test above.
+3. Emit a mergeable pair even when tokens do not overlap - that is the
+   whole reason you exist.
+4. When in doubt between merging and not, DO NOT MERGE. Classifier
+   downstream can still close items separately.
+
+## Output format
+
+Return STRICT JSON ONLY - no prose, no markdown fences, nothing
+outside the JSON. Write the same JSON to <output-json-path>.
+
+{
+  "merges": [
+    {
+      "canonical_group_id": "ob-NNNN",
+      "absorbed_group_ids": ["ob-MMMM"],
+      "reasoning": "one sentence with the both-done-together justification"
+    }
+  ],
+  "total_groups_before": <int>,
+  "total_groups_after": <int>
+}
+
+Your final message must be exactly the JSON.
+"""
+
+
+def _pick_model(group_count: int) -> str:
+    """<=60 groups -> haiku, >60 -> sonnet. Per spec line 83."""
+    return "haiku" if group_count <= 60 else "sonnet"
+
+
+def _read_stdin_capped() -> str:
+    """Read stdin with the 1_000_000-byte cap (project security pattern)."""
+    return sys.stdin.read(STDIN_CAP_BYTES)
+
+
+def _safe_workdir() -> Path:
+    """Return ~/.claude/obsidian-brain/, ensure 0o700, no predictable /tmp paths."""
+    workdir = Path.home() / ".claude" / "obsidian-brain"
+    workdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return workdir
+
+
+def run_semantic_merge(stdin_json: str, output_path: str) -> int:
+    """
+    Stage 2b: invoke the semantic-merge sub-agent.
+
+    Reads coarse groups from stdin_json, writes merge map to output_path
+    as STRICT JSON. Returns 0 on success, non-zero on subprocess failure
+    or JSON validation failure.
+    """
+    try:
+        payload = json.loads(stdin_json)
+    except json.JSONDecodeError as exc:
+        print(f"[check-items-cli] ERROR: invalid stdin JSON: {exc}", file=sys.stderr)
+        return 2
+
+    groups = payload.get("groups", [])
+    model = _pick_model(len(groups))
+
+    workdir = _safe_workdir()
+    in_tmp = tempfile.NamedTemporaryFile(
+        mode="w", delete=False, dir=str(workdir), suffix=".in.json", encoding="utf-8"
+    )
+    try:
+        json.dump(payload, in_tmp)
+        in_tmp.flush()
+    finally:
+        in_tmp.close()
+    os.chmod(in_tmp.name, 0o600)
+
+    prompt = SEMANTIC_MERGE_PROMPT.replace(
+        "<input-json-path>", in_tmp.name
+    ).replace(
+        "<output-json-path>", output_path
+    )
+
+    cmd = ["claude", "-p", "--model", model, prompt]
+    try:
+        cp = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=SUBAGENT_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"[check-items-cli] timeout after {SUBAGENT_TIMEOUT_SEC}s on model={model}",
+              file=sys.stderr)
+        return 3
+    finally:
+        try:
+            os.unlink(in_tmp.name)
+        except OSError:
+            pass
+
+    if cp.returncode != 0:
+        print(f"[check-items-cli] subagent failed rc={cp.returncode}: {cp.stderr[:500]}",
+              file=sys.stderr)
+        return cp.returncode
+
+    if not Path(output_path).exists():
+        try:
+            parsed = json.loads(cp.stdout)
+        except json.JSONDecodeError as exc:
+            print(f"[check-items-cli] subagent output invalid JSON: {exc}", file=sys.stderr)
+            return 4
+        Path(output_path).write_text(json.dumps(parsed), encoding="utf-8")
+
+    return 0
+
+
+def main():
+    """CLI entrypoint. Usage: python3 check_items_cli.py <command> <output_path>"""
+    if len(sys.argv) < 3:
+        print("usage: check_items_cli.py <semantic_merge|classifier> <output_path>",
+              file=sys.stderr)
+        sys.exit(2)
+    cmd = sys.argv[1]
+    output_path = sys.argv[2]
+    stdin_json = _read_stdin_capped()
+    if cmd == "semantic_merge":
+        sys.exit(run_semantic_merge(stdin_json, output_path))
+    print(f"unknown command: {cmd}", file=sys.stderr)
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

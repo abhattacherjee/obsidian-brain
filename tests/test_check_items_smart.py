@@ -370,3 +370,84 @@ def test_cross_project_dedup_single_project_passthrough():
     ]
     assert len(all_groups) == 1
     assert all_groups[0]["project"] == "obsidian-brain"
+
+
+# ---------------------------------------------------------------------------
+# Task 11: run_semantic_merge() CLI wrapper
+# ---------------------------------------------------------------------------
+
+def test_run_semantic_merge_picks_haiku_for_small_groups(tmp_path, monkeypatch):
+    """<=60 groups -> claude -p --model haiku."""
+    import check_items_cli as cli
+
+    captured = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = cmd
+        captured["stdin"] = kwargs.get("input", "")
+        out_path = tmp_path / "out.json"
+        out_path.write_text(json.dumps({
+            "merges": [],
+            "total_groups_before": 5,
+            "total_groups_after": 5,
+        }))
+        return _fake_completed(stdout=out_path.read_text(), returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    stdin_json = json.dumps({"groups": [{"group_id": f"g{i}", "project": "p",
+                                          "representative": f"item {i}", "member_texts": []}
+                                         for i in range(5)]})
+    out_path = tmp_path / "merge.json"
+    rc = cli.run_semantic_merge(stdin_json=stdin_json, output_path=str(out_path))
+    assert rc == 0
+    assert out_path.exists()
+    assert "haiku" in " ".join(captured["cmd"])
+
+
+def test_run_semantic_merge_picks_sonnet_above_60(tmp_path, monkeypatch):
+    """>60 groups escalates to sonnet."""
+    import check_items_cli as cli
+
+    captured = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = cmd
+        out_path = tmp_path / "out.json"
+        out_path.write_text(json.dumps({
+            "merges": [],
+            "total_groups_before": 75,
+            "total_groups_after": 75,
+        }))
+        return _fake_completed(stdout=out_path.read_text(), returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    big_groups = [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
+                   "member_texts": []} for i in range(75)]
+    stdin_json = json.dumps({"groups": big_groups})
+    out_path = tmp_path / "merge2.json"
+    rc = cli.run_semantic_merge(stdin_json=stdin_json, output_path=str(out_path))
+    assert rc == 0
+    assert "sonnet" in " ".join(captured["cmd"])
+
+
+def test_run_semantic_merge_caps_stdin_at_1mb():
+    """Per project CLAUDE.md security pattern, stdin reads cap at 1_000_000 bytes."""
+    import check_items_cli as cli
+    src = open(cli.__file__).read()
+    assert "1_000_000" in src or "1000000" in src, \
+        "check_items_cli must cap stdin reads at 1_000_000 bytes"
+
+
+def test_run_semantic_merge_prompt_includes_five_examples():
+    """Per spec lines 226-228, the 5 canonical examples are LOAD-BEARING and must be present."""
+    import check_items_cli as cli
+    prompt = cli.SEMANTIC_MERGE_PROMPT
+    assert "SHOULD MERGE" in prompt
+    assert "SHOULD NOT MERGE" in prompt
+    assert "text-fallback routing" in prompt or "AskUserQuestion" in prompt
+    assert "vault-doctor" in prompt
+    assert "Investigate" in prompt and "Fix" in prompt
+    assert "PR #67" in prompt or "PR #70" in prompt
+    assert "STRICT JSON" in prompt or "strict JSON" in prompt.lower()
