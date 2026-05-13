@@ -24,6 +24,8 @@ _RE_BRANCH = re.compile(r'(?:feature|release|hotfix)/[\w.-]+')
 _RE_VERSION = re.compile(r'v?\d+\.\d+\.\d+')
 _RE_MARKDOWN = re.compile(r'`([^`]*)`|\*\*([^*]*)\*\*|_([^_]*)_|\[([^\]]*)\]\([^)]*\)')
 
+_CHECKBOX_PREFIX_RE = re.compile(r"^\s*-\s+\[[ xX]\]\s+")
+
 _STOPWORDS = frozenset({
     'the', 'a', 'an', 'to', 'for', 'in', 'on', 'of', 'and', 'or',
     'but', 'is', 'are', 'was', 'were', 'be', 'not', 'this', 'that',
@@ -209,16 +211,27 @@ def find_duplicates(
 
     Returns [(file_path, line_number, item_text, confidence)] where
     confidence is "high" (distinctive token match) or "fuzzy" (token overlap).
+
+    Tier 0: exact text equality after markdown strip + lowercase always yields
+    "high" confidence, regardless of distinctive-token presence. This guarantees
+    character-identical items (including short or stop-word-heavy ones) always
+    cascade correctly.
     Tier 1 short-circuits: if a distinctive token matches, skip Tier 2.
     """
     cleaned = _strip_markdown(candidate_text)
     candidate_distinctive = _extract_distinctive_tokens(cleaned)
     candidate_tokens = _tokenize(cleaned)
+    candidate_normalized = cleaned.strip().lower()
 
     matches: list[tuple[str, int, str, str]] = []
 
     for fpath, line_num, item_text in existing_items:
         item_lower = item_text.lower()
+
+        # Tier 0: exact text equality after markdown strip + lowercase (always high)
+        if _strip_markdown(item_text).strip().lower() == candidate_normalized:
+            matches.append((fpath, line_num, item_text, "high"))
+            continue
 
         # Tier 1: distinctive token match (high confidence, short-circuit)
         tier1_hit = False
@@ -1444,11 +1457,11 @@ def verify_before_edit(file_path: str, line_number: int, expected_text: str) -> 
     Re-read target line and compare against expected text BEFORE flipping
     a checkbox via Edit tool.
 
-    Returns True iff line[line_number] matches expected_text after
-    `.strip()` is applied to both sides (leading + trailing whitespace
-    tolerant — handles nested-list checkboxes that collect_open_items
-    matches with `.strip().startswith('- [ ] ')`). False on missing
-    file, out-of-range line, or read error.
+    Strips the checkbox prefix (`- [ ]`, `- [x]`, `- [X]`) and surrounding
+    whitespace from the file side before comparing to `expected_text`. The
+    classifier produces bare canonical text without the prefix; this function
+    normalizes the file line to match. Returns False on missing file,
+    out-of-range line, or read error.
 
     Memory feedback_open_item_checkoff_verify_before_edit: verification
     is mandatory before Edit-tool dispatch.
@@ -1460,5 +1473,7 @@ def verify_before_edit(file_path: str, line_number: int, expected_text: str) -> 
         return False
     if not 1 <= line_number <= len(lines):
         return False
-    actual = lines[line_number - 1].strip()
-    return actual == (expected_text or "").strip()
+    actual_line = lines[line_number - 1]
+    actual = _CHECKBOX_PREFIX_RE.sub("", actual_line).strip()
+    expected = (expected_text or "").strip()
+    return actual == expected

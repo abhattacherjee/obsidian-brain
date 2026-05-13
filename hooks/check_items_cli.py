@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 STDIN_CAP_BYTES = 1_000_000
-SUBAGENT_TIMEOUT_SEC = 60
+SUBAGENT_TIMEOUT_SEC = int(os.environ.get("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "180"))
 
 SEMANTIC_MERGE_PROMPT = """You are the semantic-merge sub-agent for an open-items pipeline. Read
 <input-json-path>. It contains N coarse token-grouped open items.

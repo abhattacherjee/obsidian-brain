@@ -13,6 +13,7 @@ Adaptations from plan's verbatim version:
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
@@ -1117,7 +1118,8 @@ def test_verify_before_edit_match_returns_true(tmp_path):
     from open_item_dedup import verify_before_edit
     f = tmp_path / "note.md"
     f.write_text("line one\n- [ ] Fix #87 ship it\nline three\n")
-    ok = verify_before_edit(str(f), line_number=2, expected_text="- [ ] Fix #87 ship it")
+    # expected_text is bare canonical text (no checkbox prefix); function strips file side
+    ok = verify_before_edit(str(f), line_number=2, expected_text="Fix #87 ship it")
     assert ok is True
 
 
@@ -1321,7 +1323,8 @@ def test_verify_before_edit_handles_indented_checkbox(tmp_path):
     from open_item_dedup import verify_before_edit
     f = tmp_path / "note.md"
     f.write_text("line one\n    - [ ] Indented item ship it\nline three\n")
-    ok = verify_before_edit(str(f), line_number=2, expected_text="- [ ] Indented item ship it")
+    # expected_text is bare canonical text (no checkbox prefix); function strips file side
+    ok = verify_before_edit(str(f), line_number=2, expected_text="Indented item ship it")
     assert ok is True
 
 
@@ -1523,3 +1526,25 @@ def test_run_classifier_pipes_prompt_via_stdin(tmp_path, monkeypatch):
     assert "discovery" in captured["input"].lower(), (
         "CLASSIFIER_PROMPT must be piped via stdin, not argv"
     )
+
+
+# ---------------------------------------------------------------------------
+# R10 test: SUBAGENT_TIMEOUT_SEC env override (F1 fix)
+# ---------------------------------------------------------------------------
+
+def test_subagent_timeout_env_override(monkeypatch):
+    """CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC env var overrides the default 180s."""
+    import check_items_cli as cli
+
+    # Override via env var
+    monkeypatch.setenv("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "300")
+    importlib.reload(cli)
+    assert cli.SUBAGENT_TIMEOUT_SEC == 300
+
+    # Unset → default 180
+    monkeypatch.delenv("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", raising=False)
+    importlib.reload(cli)
+    assert cli.SUBAGENT_TIMEOUT_SEC == 180
+
+    # Restore module to default state so later tests aren't affected
+    importlib.reload(cli)

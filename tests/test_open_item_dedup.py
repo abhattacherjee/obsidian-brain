@@ -15,6 +15,7 @@ from open_item_dedup import (
     cascade_checkoff,
     dedup_note_open_items,
     batch_cascade_checkoff,
+    verify_before_edit,
 )
 
 
@@ -881,3 +882,57 @@ def test_batch_cascade_checkoff_empty_items_list(tmp_vault):
     # Original item should remain unchecked
     content = (sessions_dir / "2026-04-09-proj-empty.md").read_text(encoding="utf-8")
     assert "- [ ] Some open item" in content
+
+
+# ---------------------------------------------------------------------------
+# R10 tests: verify_before_edit checkbox stripping (F4 fix)
+# ---------------------------------------------------------------------------
+
+def test_verify_before_edit_strips_checkbox_unchecked(tmp_path):
+    """verify_before_edit returns True when file has unchecked checkbox prefix."""
+    note = tmp_path / "note.md"
+    note.write_text("- [ ] real-session benchmark — redundant\n", encoding="utf-8")
+    assert verify_before_edit(str(note), 1, "real-session benchmark — redundant") is True
+
+
+def test_verify_before_edit_strips_checkbox_checked(tmp_path):
+    """verify_before_edit returns True when file has checked checkbox prefix."""
+    note = tmp_path / "note.md"
+    note.write_text("- [x] foo\n", encoding="utf-8")
+    assert verify_before_edit(str(note), 1, "foo") is True
+
+
+def test_verify_before_edit_strips_checkbox_indented(tmp_path):
+    """verify_before_edit handles indented checkbox lines."""
+    note = tmp_path / "note.md"
+    note.write_text("    - [ ] indented\n", encoding="utf-8")
+    assert verify_before_edit(str(note), 1, "indented") is True
+
+
+def test_verify_before_edit_mismatch_still_false(tmp_path):
+    """verify_before_edit returns False when canonical text doesn't match."""
+    note = tmp_path / "note.md"
+    note.write_text("- [ ] foo\n", encoding="utf-8")
+    assert verify_before_edit(str(note), 1, "bar") is False
+
+
+# ---------------------------------------------------------------------------
+# R10 tests: find_duplicates Tier 0 exact-match high confidence (F5 fix)
+# ---------------------------------------------------------------------------
+
+def test_find_duplicates_exact_match_is_high_even_no_distinctive_tokens():
+    """Short/stop-word-only items with exact text match yield 'high' confidence."""
+    # "foo bar" has no distinctive tokens (all short/common); Tier 0 must still fire
+    existing = [("note.md", 5, "foo bar")]
+    results = find_duplicates("foo bar", existing)
+    assert len(results) == 1
+    fpath, line_num, text, confidence = results[0]
+    assert confidence == "high"
+
+
+def test_find_duplicates_exact_match_case_and_markdown_insensitive():
+    """Markdown-wrapped candidate matches plain existing text as 'high'."""
+    existing = [("note.md", 1, "foo bar")]
+    results = find_duplicates("**Foo Bar**", existing)
+    assert len(results) == 1
+    assert results[0][3] == "high"
