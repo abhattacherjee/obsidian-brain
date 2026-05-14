@@ -974,6 +974,29 @@ def load_config() -> dict:
     return config
 
 
+def get_workspace_roots() -> list[str]:
+    """Return list of absolute workspace-root directories to scan for projects.
+
+    Reads ``workspace_roots`` from ~/.claude/obsidian-brain-config.json if
+    present (list of paths, each tilde-expanded). Falls back to historical
+    defaults [~/dev/claude_workspace, ~/projects] when the key is absent so
+    existing users need no config migration.
+
+    Only directories that exist on disk are included in the returned list.
+    """
+    config = load_config()
+    raw = config.get("workspace_roots")
+    if raw is not None and isinstance(raw, list):
+        roots = [os.path.expanduser(str(p)) for p in raw]
+    else:
+        home = os.path.expanduser("~")
+        roots = [
+            os.path.join(home, "dev", "claude_workspace"),
+            os.path.join(home, "projects"),
+        ]
+    return [r for r in roots if os.path.isdir(r)]
+
+
 def check_optional_deps(packages: tuple[str, ...] = ("numpy", "scipy")) -> dict[str, bool]:
     """Return {package: is_importable} for each optional performance dep.
 

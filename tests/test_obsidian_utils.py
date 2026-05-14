@@ -77,6 +77,73 @@ class TestLoadConfig:
         assert obsidian_utils.get_project_name("") == "unknown"
 
 
+class TestGetWorkspaceRoots:
+    """Tests for the get_workspace_roots() helper (R13 C5 — config-driven workspace roots)."""
+
+    def test_reads_workspace_roots_from_config(self, tmp_path, monkeypatch):
+        """Config with workspace_roots returns tilde-expanded, existing dirs."""
+        ws1 = tmp_path / "ws1"
+        ws2 = tmp_path / "ws2"
+        ws1.mkdir()
+        ws2.mkdir()
+
+        config_file = tmp_path / "obsidian-brain-config.json"
+        config_file.write_text(
+            json.dumps({"workspace_roots": [str(ws1), str(ws2)]}),
+            encoding="utf-8",
+        )
+        config_file.chmod(0o600)
+
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        roots = obsidian_utils.get_workspace_roots()
+        assert str(ws1) in roots
+        assert str(ws2) in roots
+
+    def test_falls_back_to_defaults_when_key_absent(self, tmp_path, monkeypatch):
+        """Config without workspace_roots key returns historical defaults (if they exist)."""
+        config_file = tmp_path / "obsidian-brain-config.json"
+        config_file.write_text(json.dumps({"vault_path": str(tmp_path)}), encoding="utf-8")
+        config_file.chmod(0o600)
+
+        # Create the historical default dirs so they pass the isdir filter
+        home = os.path.expanduser("~")
+        default1 = os.path.join(home, "dev", "claude_workspace")
+        default2 = os.path.join(home, "projects")
+
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        roots = obsidian_utils.get_workspace_roots()
+        # We can't assert the exact paths since the test machine may not have them,
+        # but every returned root must exist on disk.
+        for r in roots:
+            assert os.path.isdir(r), f"get_workspace_roots returned non-existent dir: {r}"
+        # Roots must be the defaults — verify by checking they are a subset of the expected set
+        assert all(r in {default1, default2} for r in roots)
+
+    def test_filters_out_missing_directories(self, tmp_path, monkeypatch):
+        """Paths that don't exist on disk are excluded from the returned list."""
+        existing = tmp_path / "real-ws"
+        existing.mkdir()
+        missing = tmp_path / "ghost-ws"  # not created
+
+        config_file = tmp_path / "obsidian-brain-config.json"
+        config_file.write_text(
+            json.dumps({"workspace_roots": [str(existing), str(missing)]}),
+            encoding="utf-8",
+        )
+        config_file.chmod(0o600)
+
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        roots = obsidian_utils.get_workspace_roots()
+        assert str(existing) in roots
+        assert str(missing) not in roots
+
+
 # ===========================================================================
 # Section 2: Frontmatter parsing
 # ===========================================================================
