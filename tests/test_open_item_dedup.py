@@ -15,6 +15,7 @@ from open_item_dedup import (
     cascade_checkoff,
     dedup_note_open_items,
     batch_cascade_checkoff,
+    cascade_group_members,
     verify_before_edit,
 )
 
@@ -936,3 +937,141 @@ def test_find_duplicates_exact_match_case_and_markdown_insensitive():
     results = find_duplicates("**Foo Bar**", existing)
     assert len(results) == 1
     assert results[0][3] == "high"
+
+
+# ---------------------------------------------------------------------------
+# R11 tests: _outer_subagent_timeout (Fix 1 — env-override)
+# ---------------------------------------------------------------------------
+
+def test_outer_wrapper_honors_env_timeout(monkeypatch, tmp_path):
+    """merge_groups_semantically passes SUBAGENT_TIMEOUT_SEC to subprocess.run."""
+    import subprocess
+    import open_item_dedup as oid_module
+
+    monkeypatch.setenv("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "300")
+
+    captured_kwargs: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        captured_kwargs.append(kwargs)
+        # Return a mock CompletedProcess that looks like a successful run
+        result = subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="")
+        return result
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # Build a minimal flat_groups payload so the sub-agent path is exercised.
+    # The call will fail (returncode=1) but we only care about the timeout kwarg.
+    flat_groups = [
+        {"group_id": "abc", "project": "proj", "representative": "Fix #1", "members": []}
+    ]
+    # Patch _check_items_workdir to use tmp_path
+    monkeypatch.setattr(oid_module, "_check_items_workdir", lambda: tmp_path)
+
+    oid_module.merge_groups_semantically(flat_groups)
+
+    # At least one subprocess.run must have been called with timeout=300
+    assert any(kw.get("timeout") == 300 for kw in captured_kwargs), (
+        f"Expected timeout=300 in one of {[kw.get('timeout') for kw in captured_kwargs]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# R11 tests: cascade_group_members (Fix 2 — group-member cascade)
+# ---------------------------------------------------------------------------
+
+def _make_note(path, lines_of_text: list[str]) -> None:
+    """Write a minimal session note with open items at fixed line positions."""
+    content = "---\ntype: claude-session\nproject: proj\n---\n\n"
+    for item in lines_of_text:
+        content += f"- [ ] {item}\n"
+    path.write_text(content, encoding="utf-8")
+
+
+def test_cascade_group_members_flips_all_members(tmp_path):
+    """Single group with 3 members across 2 files: all 3 flip."""
+    file_a = tmp_path / "note_a.md"
+    file_b = tmp_path / "note_b.md"
+    _make_note(file_a, ["Fix issue #42", "Another item"])
+    _make_note(file_b, ["Fix issue #42 — different wording"])
+
+    groups = [
+        {
+            "members": [
+                {"file": str(file_a), "line": 6, "text": "Fix issue #42"},
+                {"file": str(file_a), "line": 7, "text": "Another item"},
+                {"file": str(file_b), "line": 6, "text": "Fix issue #42 — different wording"},
+            ]
+        }
+    ]
+    summary = cascade_group_members(groups, source_skips=None)
+
+    content_a = file_a.read_text(encoding="utf-8")
+    content_b = file_b.read_text(encoding="utf-8")
+    assert "- [x] Fix issue #42\n" in content_a
+    assert "- [x] Another item\n" in content_a
+    assert "- [x] Fix issue #42 — different wording\n" in content_b
+    assert "Cascaded 3 member-line(s) across 2 file(s)." in summary
+
+
+def test_cascade_group_members_respects_source_skips(tmp_path):
+    """Member in source_skips must not be flipped again."""
+    file_a = tmp_path / "note_a.md"
+    _make_note(file_a, ["Fix issue #42", "Sibling item"])
+
+    groups = [
+        {
+            "members": [
+                {"file": str(file_a), "line": 6, "text": "Fix issue #42"},
+                {"file": str(file_a), "line": 7, "text": "Sibling item"},
+            ]
+        }
+    ]
+    source_skips = {(str(file_a), 6)}  # line 6 already primary-flipped
+    cascade_group_members(groups, source_skips=source_skips)
+
+    content = file_a.read_text(encoding="utf-8")
+    # Line 6 skipped — stays unchecked
+    assert "- [ ] Fix issue #42\n" in content
+    # Line 7 not skipped — gets flipped
+    assert "- [x] Sibling item\n" in content
+
+
+def test_cascade_group_members_atomic_write_preserves_mode(tmp_path):
+    """File mode must be preserved after cascade rewrites the file."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Fix issue #42"])
+    os.chmod(str(note), 0o640)
+
+    groups = [{"members": [{"file": str(note), "line": 6, "text": "Fix issue #42"}]}]
+    cascade_group_members(groups)
+
+    stat = os.stat(str(note))
+    assert oct(stat.st_mode & 0o777) == oct(0o640)
+
+
+def test_cascade_group_members_skips_already_checked_line(tmp_path, capsys):
+    """Line already checked off (- [x]) triggers a stderr warning, no double-flip."""
+    note = tmp_path / "note.md"
+    # Write line 6 as already-checked
+    note.write_text(
+        "---\ntype: claude-session\nproject: proj\n---\n\n"
+        "- [x] Fix issue #42\n",
+        encoding="utf-8",
+    )
+
+    groups = [{"members": [{"file": str(note), "line": 6, "text": "Fix issue #42"}]}]
+    summary = cascade_group_members(groups)
+
+    captured = capsys.readouterr()
+    assert "no longer contains expected checkbox" in captured.err
+    # File content unchanged (still [x])
+    assert "- [x] Fix issue #42" in note.read_text(encoding="utf-8")
+    # Nothing was flipped, so summary is the empty-result form
+    assert "No member lines to cascade." in summary
+
+
+def test_cascade_group_members_empty_groups_returns_empty_summary():
+    """Empty groups list returns the no-cascade summary without raising."""
+    result = cascade_group_members([])
+    assert "No member lines to cascade." in result

@@ -499,22 +499,40 @@ For each item the user kept selected (default-selected for HIGH+DONE, opt-in for
 1. Read the target line via Read tool.
 2. Verify the line matches the preview (memory `feedback_open_item_checkoff_verify_before_edit`).
 3. If mismatch: surface the diff, ABORT this item (do not flip), continue with the next.
-4. If match: use Edit tool to flip `- [ ]` → `- [x]` on that line only.
+4. If match: use Edit tool to flip `- [ ]` → `- [x]` on that line only. After a successful flip, append `[full_file_path, line_number]` to a `source_skips` tracking list.
 
-After the user-confirmed batch, run cascade:
+After the user-confirmed batch, write the source-skips tracking list to a tempfile and run cascade via `cascade_group_members` (which consumes the Step-3/Step-4 grouping output directly, so textually-divergent siblings clustered by distinctive tokens are also flipped — not just text-search re-discovery matches):
 
 ```bash
-SCOPE_PATH="$scope_path" BUCKETS_PATH="$buckets_path" python3 << 'PYEOF'
+# Write source_skips JSON — list of [full_path, line_number] pairs for lines
+# the SKILL already primary-flipped above.  Replace the contents below with the
+# actual list collected in the primary-flip loop.
+_skips_file=$(python3 -c "
+import tempfile, os, json, sys
+d = os.path.expanduser('~/.claude/obsidian-brain')
+os.makedirs(d, mode=0o700, exist_ok=True)
+fd, path = tempfile.mkstemp(dir=d, prefix='check-items-source-skips-', suffix='.json')
+with os.fdopen(fd, 'w') as f:
+    json.dump(sys.argv[1:], f)   # placeholder — SKILL replaces with real list
+os.chmod(path, 0o600)
+print(path)
+")
+# ^^^ In practice, Claude writes the actual skips list by passing them as
+# the JSON-serialised content written to $_skips_file after the primary-flip loop.
+
+SCOPE_PATH="$scope_path" BUCKETS_PATH="$buckets_path" MERGED_PATH="$merged_path" SKIPS_FILE="$_skips_file" python3 << 'PYEOF'
 import sys, os, glob, json, re
 sys.path.insert(0, max(
     glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")),
     default="hooks"
 ))
-from open_item_dedup import batch_cascade_checkoff
+from open_item_dedup import cascade_group_members
 
-# batch_cascade_checkoff(vault_path, sessions_folder, project, checked_texts) -> str
 scope_path = os.environ["SCOPE_PATH"]
 buckets_path = os.environ["BUCKETS_PATH"]
+merged_path = os.environ["MERGED_PATH"]
+skips_file = os.environ.get("SKIPS_FILE", "")
+
 _config_path = os.path.expanduser("~/.claude/obsidian-brain-config.json")
 try:
     config = json.load(open(_config_path))
@@ -525,28 +543,71 @@ except (OSError, json.JSONDecodeError, ValueError) as exc:
     print(f"ERROR: obsidian-brain config not loadable ({exc}); run /obsidian-setup", file=sys.stderr)
     sys.exit(1)
 sessions_folder = config.get("sessions_folder", "claude-sessions")
+sessions_dir = os.path.join(vault_path, sessions_folder)
+
 buckets = json.load(open(buckets_path))
 scope = json.load(open(scope_path))
 
-# Group confirmed DONE items by project for per-project cascade calls.
-done_by_project = {}
+# Load merged groups so we can resolve group_id → members with full paths.
+# Members in merged.json store basename only; resolve to full path via sessions_dir.
+try:
+    merged_data = json.load(open(merged_path))
+    groups_by_id = {}
+    for _gs in merged_data.get("merged_by_proj", {}).values():
+        for _g in _gs:
+            groups_by_id[_g.get("group_id")] = _g
+except (OSError, json.JSONDecodeError):
+    groups_by_id = {}
+
+# Load source_skips: set of (full_path, line_number) pairs already primary-flipped.
+source_skips = set()
+if skips_file and os.path.exists(skips_file):
+    try:
+        raw_skips = json.load(open(skips_file))
+        for entry in raw_skips or []:
+            if isinstance(entry, list) and len(entry) == 2:
+                source_skips.add((str(entry[0]), int(entry[1])))
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+# Build groups_to_cascade: DONE items from buckets["review"] that have members
+# in merged.json. Resolve member basenames to full paths.
+groups_to_cascade = []
 for b in buckets["review"]:
-    if b.get("classification") == "DONE":
-        proj = b.get("project") or scope.get("project") or "unknown"
-        done_by_project.setdefault(proj, []).append(b.get("canonical_text", ""))
+    if b.get("classification") != "DONE":
+        continue
+    gid = b.get("group_id")
+    merged_group = groups_by_id.get(gid) if gid else None
+    if not merged_group:
+        continue
+    raw_members = merged_group.get("members", []) or []
+    if not raw_members:
+        continue
+    resolved_members = []
+    for m in raw_members:
+        basename = m.get("file", "")
+        line_num = m.get("line")
+        if not basename or line_num is None:
+            continue
+        full_path = os.path.join(sessions_dir, basename)
+        resolved_members.append({"file": full_path, "line": line_num, "text": m.get("text", "")})
+    if resolved_members:
+        groups_to_cascade.append({"members": resolved_members})
 
-cascade_total = 0
-for proj, checked_texts in done_by_project.items():
-    summary = batch_cascade_checkoff(vault_path, sessions_folder, proj, checked_texts)
-    print(f"[cascade/{proj}] {summary}")
-    # Count cascaded items from summary string ("Cascaded N high-confidence ...")
-    m = re.search(r"Cascaded (\d+)", summary)
-    if m:
-        cascade_total += int(m.group(1))
+summary = cascade_group_members(groups_to_cascade, source_skips)
+print(f"[cascade] {summary}")
 
+# Extract count from summary for downstream use.
+m = re.search(r"Cascaded (\d+)", summary)
+cascade_total = int(m.group(1)) if m else 0
 print(f"cascaded_total={cascade_total}")
 PYEOF
+
+# Clean up source-skips tempfile.
+rm -f "$_skips_file"
 ```
+
+**Note on primary-flip loop tracking:** After each successful Edit in steps 1–4, append the flipped item's full file path and line number as `[path, line]` to a Python list, then write that list as JSON to `$_skips_file` before running the cascade block. This prevents the cascade from double-flipping lines the SKILL already handled. `batch_cascade_checkoff` is retained for ad-hoc text-search use outside this SKILL flow.
 
 ## Step 9 — Write dashboard report (Stage 8) — ALWAYS
 

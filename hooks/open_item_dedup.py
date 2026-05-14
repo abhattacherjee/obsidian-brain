@@ -58,6 +58,17 @@ CONFIDENCE_TIER_RULES = {
 }
 
 
+def _outer_subagent_timeout() -> int:
+    """Return the outer subprocess.run timeout that wraps check_items_cli.py.
+
+    Must be ≥ the inner SUBAGENT_TIMEOUT_SEC so the outer caller never races
+    the inner cli. When changing this constant, grep the codebase for hardcoded
+    copies of the previous value (e.g. `grep -rn "timeout=70" hooks/`) — the
+    R10 dispatch missed these two outer callers and caused silent fallback.
+    """
+    return int(os.environ.get("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "180"))
+
+
 def assign_tier(evidence_citation, item_text):
     """Deterministically assign HIGH | MED | LOW from evidence citation shape.
 
@@ -466,6 +477,111 @@ def batch_cascade_checkoff(
                 parts.append(f'  - "{item_text}" in {basename}')
 
     return "\n".join(parts) if parts else "No duplicates found for cascading."
+
+
+def cascade_group_members(
+    groups: list,
+    source_skips: "set[tuple[str, int]] | None" = None,
+) -> str:
+    """Flip checkbox on every member of each group, atomically per file.
+
+    Each group dict must contain a ``members`` list of dicts with at least
+    ``file`` (full path) and ``line`` keys. Members whose ``(file, line)`` is
+    in ``source_skips`` are NOT flipped (caller already primary-flipped them).
+
+    Lines that no longer contain a ``- [ ] `` checkbox at apply-time are
+    skipped with a stderr warning (file may have changed since grouping).
+
+    Returns a compact summary string: ``"Cascaded N member-line(s) across M
+    file(s)."`` or ``"No member lines to cascade."`` for empty input.
+    """
+    if source_skips is None:
+        source_skips = set()
+
+    # Collect all (full_path, line_number) targets, deduplicated
+    targets: dict[tuple[str, int], None] = {}  # ordered dict as ordered set
+    for group in groups or []:
+        for m in group.get("members", []) or []:
+            fpath = m.get("file", "")
+            line_num = m.get("line")
+            if not fpath or line_num is None:
+                continue
+            key = (fpath, line_num)
+            if key in source_skips:
+                continue
+            targets[key] = None
+
+    if not targets:
+        return "No member lines to cascade."
+
+    # Group by file to minimise rewrites
+    files_to_lines: dict[str, list[int]] = {}
+    for fpath, line_num in targets:
+        files_to_lines.setdefault(fpath, []).append(line_num)
+
+    total_flipped = 0
+    files_edited: set[str] = set()
+
+    for fpath, line_nums in files_to_lines.items():
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError as exc:
+            print(
+                f"[obsidian-brain] cascade_group_members: cannot read "
+                f"{os.path.basename(fpath)}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+
+        file_flipped = 0
+        for ln in line_nums:
+            idx = ln - 1  # 0-indexed
+            if 0 <= idx < len(lines) and lines[idx].lstrip().startswith("- [ ] "):
+                lines[idx] = lines[idx].replace("- [ ] ", "- [x] ", 1)
+                file_flipped += 1
+            else:
+                print(
+                    f"[obsidian-brain] cascade_group_members: line {ln} in "
+                    f"{os.path.basename(fpath)} no longer contains expected "
+                    f"checkbox (file may have changed); skipping.",
+                    file=sys.stderr,
+                )
+
+        if file_flipped == 0:
+            continue
+
+        note_dir = os.path.dirname(fpath)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".ob-cascade-", suffix=".md.tmp", dir=note_dir,
+        )
+        try:
+            try:
+                orig_mode = os.stat(fpath).st_mode
+            except OSError:
+                orig_mode = 0o644
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.writelines(lines)
+            os.chmod(tmp_path, orig_mode)
+            os.replace(tmp_path, fpath)
+            files_edited.add(os.path.basename(fpath))
+            total_flipped += file_flipped
+        except OSError as exc:
+            print(
+                f"[obsidian-brain] cascade_group_members: write failed for "
+                f"{os.path.basename(fpath)}: {exc}",
+                file=sys.stderr,
+            )
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    if total_flipped == 0:
+        return "No member lines to cascade."
+    return (
+        f"Cascaded {total_flipped} member-line(s) across {len(files_edited)} file(s)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1150,7 +1266,7 @@ def merge_groups_semantically(coarse_groups):
                 input=in_path.read_text(),
                 capture_output=True,
                 text=True,
-                timeout=70,
+                timeout=_outer_subagent_timeout(),
             )
             if cp.returncode != 0 or not out_path.exists():
                 continue
@@ -1324,7 +1440,7 @@ def classify_groups_with_agent(merged_groups, evidence):
                 input=in_path.read_text(),
                 capture_output=True,
                 text=True,
-                timeout=70,
+                timeout=_outer_subagent_timeout(),
             )
             if cp.returncode != 0 or not out_path.exists():
                 continue

@@ -141,7 +141,10 @@ high-confidence DONE item. Accept the proposed checkoffs.
 **Pass criteria**
 - [ ] Edit applies `- [x]` to the correct line in the correct file (verify by
       opening the cited file).
-- [ ] Cascade checkoff propagates across same-canonical-hash group members.
+- [ ] Cascade flips **every** member of the confirmed group (consumes the
+      Step-3/Step-4 grouping output via `cascade_group_members`, not
+      text-search re-discovery). Textually-divergent siblings clustered by
+      distinctive tokens get flipped, not only literal-text matches.
 - [ ] Final summary reports `Applied: N` matching the count you accepted.
 - [ ] Next `/check-items` run on the same project does NOT re-surface the
       checked-off items.
