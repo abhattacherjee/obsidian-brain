@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,29 @@ from pathlib import Path
 
 STDIN_CAP_BYTES = 1_000_000
 SUBAGENT_TIMEOUT_SEC = int(os.environ.get("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "180"))
+
+
+_FENCE_OPEN_RE = re.compile(r"^\s*```(?:json|JSON)?\s*\n?")
+_FENCE_CLOSE_RE = re.compile(r"\n?\s*```\s*$")
+
+
+def _strip_json_fences(text: str) -> str:
+    """Strip leading/trailing markdown code fences (```json … ```) from sub-agent
+    stdout output. Some models (notably Haiku) wrap JSON responses in fences
+    even when prompted to write raw JSON; the stdout-fallback path must
+    tolerate this before json.loads.
+
+    R12 dogfood finding: 52-group obsidian-brain payload, Haiku semantic-merge
+    consistently emits fenced output AND skips the output_path write, so the
+    fallback's json.loads(cp.stdout) crashed on the leading backtick."""
+    if not text:
+        return text
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    stripped = _FENCE_OPEN_RE.sub("", stripped, count=1)
+    stripped = _FENCE_CLOSE_RE.sub("", stripped, count=1)
+    return stripped.strip()
 
 SEMANTIC_MERGE_PROMPT = """You are the semantic-merge sub-agent for an open-items pipeline. Read
 <input-json-path>. It contains N coarse token-grouped open items.
@@ -179,7 +203,7 @@ def run_semantic_merge(stdin_json: str, output_path: str) -> int:
 
     if not Path(output_path).exists():
         try:
-            parsed = json.loads(cp.stdout)
+            parsed = json.loads(_strip_json_fences(cp.stdout))
         except json.JSONDecodeError as exc:
             print(f"[check-items-cli] subagent output invalid JSON: {exc}", file=sys.stderr)
             return 4
@@ -322,7 +346,7 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
 
     if not Path(output_path).exists():
         try:
-            parsed = json.loads(cp.stdout)
+            parsed = json.loads(_strip_json_fences(cp.stdout))
         except json.JSONDecodeError as exc:
             print(f"[check-items-cli] classifier output invalid JSON: {exc}", file=sys.stderr)
             return 4

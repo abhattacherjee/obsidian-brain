@@ -1548,3 +1548,57 @@ def test_subagent_timeout_env_override(monkeypatch):
 
     # Restore module to default state so later tests aren't affected
     importlib.reload(cli)
+
+
+# ---------------------------------------------------------------------------
+# R12 Finding 1 — _strip_json_fences helper
+# ---------------------------------------------------------------------------
+
+def test_strip_json_fences_unwraps_haiku_fenced_output():
+    """Haiku wraps JSON responses in ```json ... ``` fences even when prompted
+    for raw JSON. The cli stdout-fallback path must strip them before json.loads.
+    R12 dogfood finding — 52-group payload reliably hit this on cold-cache.
+    """
+    import json
+    import check_items_cli as cli
+
+    fenced = '```json\n{"merged_by_proj": {"foo": []}}\n```\n'
+    stripped = cli._strip_json_fences(fenced)
+    # Round-trips through json.loads without raising
+    parsed = json.loads(stripped)
+    assert parsed == {"merged_by_proj": {"foo": []}}
+
+
+def test_strip_json_fences_handles_bare_backticks_no_language_tag():
+    import json
+    import check_items_cli as cli
+
+    fenced = '```\n[1, 2, 3]\n```'
+    parsed = json.loads(cli._strip_json_fences(fenced))
+    assert parsed == [1, 2, 3]
+
+
+def test_strip_json_fences_passthrough_when_no_fence():
+    import check_items_cli as cli
+
+    raw = '{"already": "raw json"}'
+    assert cli._strip_json_fences(raw) == raw
+
+
+def test_strip_json_fences_handles_leading_whitespace():
+    """Some models prepend whitespace/newlines before the opening fence."""
+    import json
+    import check_items_cli as cli
+
+    fenced = '\n  \n```json\n{"x": 1}\n```'
+    parsed = json.loads(cli._strip_json_fences(fenced))
+    assert parsed == {"x": 1}
+
+
+def test_strip_json_fences_empty_and_none_safe():
+    import check_items_cli as cli
+
+    assert cli._strip_json_fences("") == ""
+    # None would raise on .strip() — function should handle this defensively
+    # via the truthy guard
+    assert cli._strip_json_fences(None) is None
