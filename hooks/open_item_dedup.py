@@ -16,6 +16,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from obsidian_utils import get_workspace_roots
+
 # --- Module-level compiled regexes (computed once at import) ---
 
 _RE_FILE_PATH = re.compile(r'[\w./-]+\.(py|md|json|ts|js|tsx|jsx)')
@@ -645,14 +647,12 @@ _ORPHAN_EXCLUDE_TYPES = frozenset({
 def _resolve_project_paths() -> dict[str, str]:
     """Return dict mapping project name -> repo path for local git repos.
 
-    Scans common directories for directories containing .git.
+    Scans workspace roots from config (or historical defaults) for directories
+    containing .git.  Roots are supplied by get_workspace_roots() which reads
+    ``workspace_roots`` from obsidian-brain-config.json when present.
     """
     result: dict[str, str] = {}
-    home = os.path.expanduser("~")
-    scan_dirs = [
-        os.path.join(home, "dev", "claude_workspace"),
-        os.path.join(home, "projects"),
-    ]
+    scan_dirs = get_workspace_roots()
     for scan_dir in scan_dirs:
         if not os.path.isdir(scan_dir):
             continue
@@ -1585,9 +1585,18 @@ def verify_before_edit(file_path: str, line_number: int, expected_text: str) -> 
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
-    except OSError:
+    except OSError as exc:
+        print(
+            f"[check-items] verify_before_edit: cannot read {file_path}: {exc}",
+            file=sys.stderr,
+        )
         return False
     if not 1 <= line_number <= len(lines):
+        print(
+            f"[check-items] verify_before_edit: line {line_number} out of range for"
+            f" {file_path} ({len(lines)} lines)",
+            file=sys.stderr,
+        )
         return False
     actual_line = lines[line_number - 1]
     actual = _CHECKBOX_PREFIX_RE.sub("", actual_line).strip()

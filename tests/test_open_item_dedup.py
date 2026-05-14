@@ -1075,3 +1075,42 @@ def test_cascade_group_members_empty_groups_returns_empty_summary():
     """Empty groups list returns the no-cascade summary without raising."""
     result = cascade_group_members([])
     assert "No member lines to cascade." in result
+
+
+# ---------------------------------------------------------------------------
+# R13 C4 — verify_before_edit stderr logging
+# ---------------------------------------------------------------------------
+
+def test_verify_before_edit_logs_oserror_to_stderr(tmp_path, capsys):
+    """verify_before_edit logs an OSError to stderr and returns False.
+
+    Previously OSError was swallowed silently; users couldn't distinguish
+    file-drift from permissions/missing-file errors (R13 C4).
+    """
+    missing_path = str(tmp_path / "nonexistent.md")
+    result = verify_before_edit(missing_path, 1, "some text")
+
+    assert result is False
+    captured = capsys.readouterr()
+    assert "verify_before_edit" in captured.err
+    assert "cannot read" in captured.err
+    assert missing_path in captured.err
+
+
+def test_verify_before_edit_logs_out_of_range_to_stderr(tmp_path, capsys):
+    """verify_before_edit logs an out-of-range line number to stderr and returns False.
+
+    Previously the out-of-range case was a silent False return; R13 C4 adds
+    a stderr log so users can distinguish it from content drift.
+    """
+    note = tmp_path / "note.md"
+    note.write_text("---\ntype: claude-session\n---\n\n- [ ] Fix bug\n", encoding="utf-8")
+
+    # File has 5 lines; request line 99
+    result = verify_before_edit(str(note), 99, "Fix bug")
+
+    assert result is False
+    captured = capsys.readouterr()
+    assert "verify_before_edit" in captured.err
+    assert "out of range" in captured.err
+    assert "99" in captured.err

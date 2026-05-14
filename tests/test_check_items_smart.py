@@ -1602,3 +1602,110 @@ def test_strip_json_fences_empty_and_none_safe():
     # None would raise on .strip() — function should handle this defensively
     # via the truthy guard
     assert cli._strip_json_fences(None) is None
+
+
+# ---------------------------------------------------------------------------
+# R13 C1 — classifier stdout-fallback shape validation
+# ---------------------------------------------------------------------------
+
+def test_classifier_stdout_fallback_rejects_invalid_shape(tmp_path, monkeypatch):
+    """run_classifier stdout-fallback must reject wrong-shape JSON (rc=4).
+
+    When the sub-agent writes a valid JSON object that doesn't match the
+    classifier list-of-dicts contract, the old code wrote it to output_path
+    and returned 0. The downstream orchestrator then consumed the bad data.
+    R13 C1 fix: _validate_classifier_payload rejects it and returns rc=4.
+    """
+    import json
+    import subprocess
+    import check_items_cli as cli
+    from unittest.mock import patch, MagicMock
+
+    output_path = str(tmp_path / "out.json")
+
+    valid_payload = json.dumps({
+        "groups": [{"group_id": "g1", "representative": "Do the thing", "members": []}],
+        "evidence": {},
+    })
+
+    # Sub-agent returns rc=0 but emits wrong-shape JSON (object, not list)
+    cp = MagicMock()
+    cp.returncode = 0
+    cp.stdout = '{"not_classifications": []}'
+    cp.stderr = ""
+
+    with patch.object(cli.subprocess, "run", return_value=cp):
+        rc = cli.run_classifier(valid_payload, output_path)
+
+    assert rc == 4, f"Expected rc=4 for invalid shape, got {rc}"
+    # Output file must NOT have been written
+    assert not (tmp_path / "out.json").exists(), "output_path must not be written for invalid shape"
+
+
+def test_classifier_stdout_fallback_accepts_valid_shape(tmp_path, monkeypatch):
+    """run_classifier stdout-fallback writes output for a correctly-shaped response."""
+    import json
+    import check_items_cli as cli
+    from unittest.mock import patch, MagicMock
+
+    output_path = str(tmp_path / "out.json")
+
+    valid_payload = json.dumps({
+        "groups": [{"group_id": "g1", "representative": "Do the thing", "members": []}],
+        "evidence": {},
+    })
+
+    valid_response = json.dumps([
+        {
+            "group_id": "g1",
+            "classification": "DONE",
+            "confidence": 0.9,
+            "canonical_text": "Do the thing",
+            "evidence_citation": "commit abc",
+            "action_required": "",
+        }
+    ])
+
+    cp = MagicMock()
+    cp.returncode = 0
+    cp.stdout = valid_response
+    cp.stderr = ""
+
+    with patch.object(cli.subprocess, "run", return_value=cp):
+        rc = cli.run_classifier(valid_payload, output_path)
+
+    assert rc == 0
+    written = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+    assert isinstance(written, list)
+    assert written[0]["classification"] == "DONE"
+
+
+def test_validate_classifier_payload_rejects_missing_field():
+    """_validate_classifier_payload returns False when a required field is absent."""
+    import check_items_cli as cli
+
+    bad = [{"group_id": "g1", "classification": "DONE"}]  # missing required fields
+    assert cli._validate_classifier_payload(bad) is False
+
+
+def test_validate_classifier_payload_rejects_invalid_classification():
+    """_validate_classifier_payload returns False for unrecognised classification."""
+    import check_items_cli as cli
+
+    bad = [{
+        "group_id": "g1",
+        "classification": "MAYBE",  # not in valid set
+        "confidence": 0.5,
+        "canonical_text": "x",
+        "evidence_citation": "",
+        "action_required": "",
+    }]
+    assert cli._validate_classifier_payload(bad) is False
+
+
+def test_validate_classifier_payload_rejects_non_list():
+    """_validate_classifier_payload returns False when parsed is not a list."""
+    import check_items_cli as cli
+
+    assert cli._validate_classifier_payload({"not": "a list"}) is False
+    assert cli._validate_classifier_payload(None) is False

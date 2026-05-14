@@ -44,6 +44,34 @@ def _strip_json_fences(text: str) -> str:
     stripped = _FENCE_CLOSE_RE.sub("", stripped, count=1)
     return stripped.strip()
 
+
+_REQUIRED_CLASSIFIER_FIELDS = {
+    "group_id", "classification", "confidence",
+    "canonical_text", "evidence_citation", "action_required",
+}
+_VALID_CLASSIFICATIONS = frozenset({"DONE", "NEEDS-ACTION", "STALE", "ACTIVE"})
+
+
+def _validate_classifier_payload(parsed) -> bool:
+    """Return True iff parsed is a list of dicts with all required classifier
+    fields and a recognised classification value.
+
+    Mirrors the checks in open_item_dedup._validate_classifier_response so the
+    stdout-fallback path in run_classifier() rejects wrong-shape sub-agent
+    responses before they are written to disk.
+    """
+    if not isinstance(parsed, list):
+        return False
+    for item in parsed:
+        if not isinstance(item, dict):
+            return False
+        if not _REQUIRED_CLASSIFIER_FIELDS.issubset(item.keys()):
+            return False
+        if item.get("classification") not in _VALID_CLASSIFICATIONS:
+            return False
+    return True
+
+
 SEMANTIC_MERGE_PROMPT = """You are the semantic-merge sub-agent for an open-items pipeline. Read
 <input-json-path>. It contains N coarse token-grouped open items.
 
@@ -349,6 +377,13 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
             parsed = json.loads(_strip_json_fences(cp.stdout))
         except json.JSONDecodeError as exc:
             print(f"[check-items-cli] classifier output invalid JSON: {exc}", file=sys.stderr)
+            return 4
+        if not _validate_classifier_payload(parsed):
+            print(
+                "[check-items-cli] classifier stdout-fallback produced invalid shape"
+                f" (expected list of classifier objects, got {type(parsed).__name__})",
+                file=sys.stderr,
+            )
             return 4
         Path(output_path).write_text(json.dumps(parsed), encoding="utf-8")
         os.chmod(output_path, 0o600)

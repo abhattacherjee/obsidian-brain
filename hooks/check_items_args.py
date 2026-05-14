@@ -10,6 +10,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from obsidian_utils import get_workspace_roots
+
 
 @dataclass
 class Scope:
@@ -22,17 +24,19 @@ class Scope:
 
 
 _WINDOW_RE = re.compile(r"^(\d+)d$")
-_WORKSPACE_ROOT = os.path.expanduser("~/dev/claude_workspace")
 
 
 def _known_projects():
-    try:
-        return {
-            name for name in os.listdir(_WORKSPACE_ROOT)
-            if os.path.isdir(os.path.join(_WORKSPACE_ROOT, name))
-        }
-    except OSError:
-        return set()
+    projects: set[str] = set()
+    for root in get_workspace_roots():
+        try:
+            projects.update(
+                name for name in os.listdir(root)
+                if os.path.isdir(os.path.join(root, name))
+            )
+        except OSError:
+            continue
+    return projects
 
 
 def parse_scope(argv):

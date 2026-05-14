@@ -186,6 +186,7 @@ sys.path.insert(0, max(
 ))
 from open_item_dedup import find_duplicates, cross_project_dedup
 from check_items_cache import canonical_hash, load_cache, partition
+from obsidian_utils import get_workspace_roots
 
 scope_path = os.environ["SCOPE_PATH"]
 raw_path = os.environ["RAW_PATH"]
@@ -237,7 +238,19 @@ flat_groups = cross_project_dedup(coarse_by_proj) if scope["mode"] == "vault" el
 cache = load_cache()
 known, needs = [], []
 for proj, groups in coarse_by_proj.items():
-    repo_path = f"{os.path.expanduser('~/dev/claude_workspace')}/{proj}"
+    repo_path = None
+    for _root in get_workspace_roots():
+        _candidate = os.path.join(_root, proj)
+        if os.path.isdir(os.path.join(_candidate, ".git")):
+            repo_path = _candidate
+            break
+    if not repo_path:
+        print(f"[check-items] no repo found for {proj} in {get_workspace_roots()}; forcing reclassify",
+              file=sys.stderr)
+        for g in groups:
+            g["_reason"] = "head_unavailable"  # ensure Step 6 includes these in to_classify
+        needs.extend(groups)
+        continue
     head_proc = subprocess.run(
         ["git", "-C", repo_path, "rev-parse", "HEAD"],
         capture_output=True, text=True, timeout=10,
@@ -556,8 +569,12 @@ try:
     for _gs in merged_data.get("merged_by_proj", {}).values():
         for _g in _gs:
             groups_by_id[_g.get("group_id")] = _g
-except (OSError, json.JSONDecodeError):
-    groups_by_id = {}
+except (OSError, json.JSONDecodeError) as exc:
+    print(
+        f"[check-items] FATAL: cannot load merged.json ({exc}) — skipping cascade to avoid corrupt cache",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 # Load source_skips: set of (full_path, line_number) pairs already primary-flipped.
 source_skips = set()
@@ -567,8 +584,9 @@ if skips_file and os.path.exists(skips_file):
         for entry in raw_skips or []:
             if isinstance(entry, list) and len(entry) == 2:
                 source_skips.add((str(entry[0]), int(entry[1])))
-    except (OSError, json.JSONDecodeError, ValueError):
-        pass
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"[check-items] WARNING: source_skips load failed ({exc}); cascade summary may be inaccurate", file=sys.stderr)
+        source_skips = set()
 
 # Build groups_to_cascade: DONE items from buckets["review"] that have members
 # in merged.json. Resolve member basenames to full paths.
@@ -623,6 +641,7 @@ sys.path.insert(0, max(
     default="hooks"
 ))
 from check_items_cache import load_cache, save_cache, update_cache, canonical_hash
+from obsidian_utils import get_workspace_roots
 
 scope_path = os.environ["SCOPE_PATH"]
 classifications_path = os.environ["CLASSIFICATIONS_PATH"]
@@ -641,8 +660,12 @@ merged_path_for_step10 = os.path.join(os.path.dirname(scope_path), "merged.json"
 try:
     merged_data = json.load(open(merged_path_for_step10))
     all_merged = merged_data
-except (OSError, json.JSONDecodeError):
-    all_merged = {}
+except (OSError, json.JSONDecodeError) as exc:
+    print(
+        f"[check-items] FATAL: cannot load merged.json ({exc}) — skipping cache update to avoid corrupt cache",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 groups_by_id = {}
 for _proj, _gs in all_merged.get("merged_by_proj", {}).items():
@@ -676,8 +699,18 @@ for fc in fresh_classifications:
     fresh_by_proj.setdefault(proj, []).append(fc)
 
 cache = load_cache()
+_workspace_roots = get_workspace_roots()
 for proj, proj_groups in groups_by_proj.items():
-    repo_path = f"{os.path.expanduser('~/dev/claude_workspace')}/{proj}"
+    repo_path = None
+    for _root in _workspace_roots:
+        _candidate = os.path.join(_root, proj)
+        if os.path.isdir(os.path.join(_candidate, ".git")):
+            repo_path = _candidate
+            break
+    if not repo_path:
+        print(f"[check-items] no repo found for {proj} in {_workspace_roots}; skipping cache update",
+              file=sys.stderr)
+        continue
     head_proc = subprocess.run(
         ["git", "-C", repo_path, "rev-parse", "HEAD"],
         capture_output=True, text=True, timeout=10,
