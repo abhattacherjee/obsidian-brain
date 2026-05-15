@@ -258,6 +258,13 @@ Machine-local config at `~/.claude/obsidian-brain-config.json`:
 }
 ```
 
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHECK_ITEMS_PREFILTER` | `on` | Set to `off` to disable the L2 evidence-presence pre-filter and route all L1-miss items to the `claude -p` sub-agent. Useful for debugging or A/B comparison. L1 cache is unaffected. |
+| `CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC` | `180` | Timeout in seconds for each `claude -p` sub-agent call during `/check-items` Stage 4 classification. |
+
 ## Multi-Device Support
 
 - **Obsidian Sync:** Works seamlessly — all vault writes are new markdown files (no conflict risk). Config lives at `~/.claude/` (machine-local, outside the vault).

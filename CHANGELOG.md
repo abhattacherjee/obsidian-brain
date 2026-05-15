@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- L2 evidence-presence pre-filter for `/check-items` Stage 4 (`hooks/check_items_prefilter.py`).
+  Items with no token overlap with the evidence bundle and no `#N`/commit-sha references are
+  classified as ACTIVE or STALE (LOW confidence) without dispatching a `claude -p` sub-agent.
+  Bypass with `CHECK_ITEMS_PREFILTER=off`. (#160)
+- Telemetry line on every Stage 4 run: `[check-items-cli] classifier: total=N cache_hit=- prefiltered=P subagent=S wall=Ws`
+  emitted to stderr for verification and debugging. (#160)
+- `mtime` field threaded through `classify_groups_with_agent` payload so L2 can compute item
+  age (STALE threshold: >90 days since earliest member mtime). (#160)
+
+### Fixed
+- Reduced `claude -p` sub-agent invocations for vaults with many open items that lack
+  completion evidence, addressing the timeout root cause reported in issue #160.
+
 ## [2.5.0] - 2026-05-14
 
 ### Added

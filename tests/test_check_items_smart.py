@@ -686,6 +686,9 @@ def test_run_classifier_picks_haiku_at_30_or_fewer(tmp_path, monkeypatch):
     """<=30 merged groups -> claude -p --model haiku per spec line 106."""
     import check_items_cli as cli
 
+    # Disable L2 prefilter: this test exercises sub-agent model selection, not L2.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
     captured = {}
 
     def fake_run(cmd, *args, **kwargs):
@@ -712,6 +715,9 @@ def test_run_classifier_picks_haiku_at_30_or_fewer(tmp_path, monkeypatch):
 def test_run_classifier_picks_sonnet_above_30(tmp_path, monkeypatch):
     """>30 merged groups escalates to sonnet."""
     import check_items_cli as cli
+
+    # Disable L2 prefilter: this test exercises sub-agent model selection, not L2.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
 
     captured = {}
 
@@ -813,6 +819,9 @@ def test_run_classifier_timeout_returns_3(tmp_path, monkeypatch):
     """run_classifier returns 3 on subprocess timeout."""
     import check_items_cli as cli
 
+    # Disable L2 prefilter so group reaches sub-agent and can trigger timeout.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
     def fake_run(cmd, *args, **kwargs):
         raise subprocess.TimeoutExpired(cmd, SUBAGENT_TIMEOUT_SEC)
 
@@ -829,6 +838,9 @@ def test_run_classifier_nonzero_rc_propagated(tmp_path, monkeypatch):
     """run_classifier propagates non-zero subprocess return code."""
     import check_items_cli as cli
 
+    # Disable L2 prefilter so group reaches sub-agent and can return non-zero rc.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
     monkeypatch.setattr(cli.subprocess, "run",
                         lambda *a, **kw: _fake_completed(returncode=7))
     payload = {"groups": [{"group_id": "g1", "project": "p",
@@ -842,6 +854,9 @@ def test_run_classifier_nonzero_rc_propagated(tmp_path, monkeypatch):
 def test_run_classifier_invalid_stdout_json_returns_4(tmp_path, monkeypatch):
     """run_classifier returns 4 when stdout is not valid JSON and output file absent."""
     import check_items_cli as cli
+
+    # Disable L2 prefilter so group reaches sub-agent and can trigger the json-error path.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
 
     monkeypatch.setattr(cli.subprocess, "run",
                         lambda *a, **kw: _fake_completed(stdout="not-json", returncode=0))
@@ -931,6 +946,158 @@ def test_needs_action_surfaces_command(monkeypatch):
     assert item["classification"] == "NEEDS-ACTION"
     assert item["action_required"] is not None
     assert "gh issue close 534" in item["action_required"]
+
+
+# ---------------------------------------------------------------------------
+# Task 7: outer telemetry line in classify_groups_with_agent
+# ---------------------------------------------------------------------------
+
+def test_outer_telemetry_line_format(monkeypatch, capsys):
+    """classify_groups_with_agent emits a [check-items] classifier-result line
+    with total_classified/prefiltered/subagent fields and no cache_hit key
+    (cache_hit lives outside this function's visibility — see Task 7 option b)."""
+    import open_item_dedup as oid
+    import re
+
+    def fake_cli_run(cmd, *args, **kwargs):
+        out_path = next((c for c in cmd if isinstance(c, str)
+                         and c.endswith(".json") and "out" in c), None)
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump([
+                    {
+                        "group_id": "g1",
+                        "classification": "DONE",
+                        "confidence": "HIGH",
+                        "canonical_text": "ship it",
+                        "evidence_citation": "PR #87 merged",
+                        "action_required": None,
+                    },
+                    {
+                        "group_id": "g2",
+                        "classification": "ACTIVE",
+                        "confidence": "LOW",
+                        "canonical_text": "explore growth",
+                        "evidence_citation": None,
+                        "action_required": None,
+                        "prefiltered": True,
+                    },
+                ], f)
+        return _fake_completed(returncode=0)
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+
+    merged_groups = [
+        {"group_id": "g1", "project": "p", "representative": "ship",
+         "members": [{"file": "a.md", "line": 1, "text": "ship"}]},
+        {"group_id": "g2", "project": "p", "representative": "explore growth",
+         "members": [{"file": "b.md", "line": 2, "text": "explore growth"}]},
+    ]
+    evidence = {"p": {"commits": [], "merged_prs": [], "closed_issues": []}}
+
+    parsed = oid.classify_groups_with_agent(merged_groups, evidence)
+    assert len(parsed) == 2
+
+    captured = capsys.readouterr()
+    outer_lines = [
+        l for l in captured.err.splitlines()
+        if l.startswith("[check-items] classifier-result:")
+    ]
+    assert len(outer_lines) == 1, (
+        f"Expected exactly 1 outer telemetry line, got: {outer_lines}"
+    )
+    line = outer_lines[0]
+
+    # Required fields
+    assert re.search(r'total_classified=2', line), f"Bad total_classified in: {line}"
+    assert re.search(r'prefiltered=1', line), f"Bad prefiltered in: {line}"
+    assert re.search(r'subagent=1', line), f"Bad subagent in: {line}"
+
+    # cache_hit must NOT appear in the outer line (plan Task 7 Step 4 option b:
+    # drop it entirely rather than emit a placeholder).
+    assert "cache_hit" not in line, (
+        f"Outer line must not include cache_hit (orchestration is SKILL.md "
+        f"prose; plan fallback drops the key). Got: {line}"
+    )
+
+
+def test_outer_telemetry_invariant_with_partial_parse(monkeypatch, capsys):
+    """total_classified must equal prefiltered + subagent even when the CLI
+    returns fewer records than merged_groups (e.g. partial parse, dropped
+    entries). All three counts derive from `parsed`, not merged_groups."""
+    import open_item_dedup as oid
+    import re
+
+    # 3 input groups but CLI only returns 2 records (one dropped/lost).
+    # Of the 2 returned: 1 prefiltered, 1 subagent.
+    def fake_cli_run(cmd, *args, **kwargs):
+        out_path = next((c for c in cmd if isinstance(c, str)
+                         and c.endswith(".json") and "out" in c), None)
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump([
+                    {
+                        "group_id": "g1",
+                        "classification": "DONE",
+                        "confidence": "HIGH",
+                        "canonical_text": "ship",
+                        "evidence_citation": "PR #1",
+                        "action_required": None,
+                    },
+                    {
+                        "group_id": "g3",
+                        "classification": "ACTIVE",
+                        "confidence": "LOW",
+                        "canonical_text": "explore",
+                        "evidence_citation": None,
+                        "action_required": None,
+                        "prefiltered": True,
+                    },
+                    # g2 deliberately omitted
+                ], f)
+        return _fake_completed(returncode=0)
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+
+    merged_groups = [
+        {"group_id": "g1", "project": "p", "representative": "ship",
+         "members": [{"file": "a.md", "line": 1, "text": "ship"}]},
+        {"group_id": "g2", "project": "p", "representative": "dropped",
+         "members": [{"file": "b.md", "line": 2, "text": "dropped"}]},
+        {"group_id": "g3", "project": "p", "representative": "explore",
+         "members": [{"file": "c.md", "line": 3, "text": "explore"}]},
+    ]
+    evidence = {"p": {"commits": [], "merged_prs": [], "closed_issues": []}}
+
+    parsed = oid.classify_groups_with_agent(merged_groups, evidence)
+    assert len(parsed) == 2  # one dropped
+
+    captured = capsys.readouterr()
+    outer_lines = [
+        l for l in captured.err.splitlines()
+        if l.startswith("[check-items] classifier-result:")
+    ]
+    assert len(outer_lines) == 1
+    line = outer_lines[0]
+
+    total_m = re.search(r'total_classified=(\d+)', line)
+    prefiltered_m = re.search(r'prefiltered=(\d+)', line)
+    subagent_m = re.search(r'subagent=(\d+)', line)
+    assert total_m and prefiltered_m and subagent_m, f"Missing field in: {line}"
+
+    total = int(total_m.group(1))
+    prefiltered = int(prefiltered_m.group(1))
+    subagent = int(subagent_m.group(1))
+
+    # Invariant: counts sum correctly. total_classified must reflect parsed,
+    # NOT merged_groups (which would give 3 and break the invariant).
+    assert total == 2, f"total_classified should equal len(parsed)=2, got {total}: {line}"
+    assert prefiltered == 1, f"prefiltered=1, got {prefiltered}: {line}"
+    assert subagent == 1, f"subagent=1, got {subagent}: {line}"
+    assert total == prefiltered + subagent, (
+        f"Invariant broken: total={total} != prefiltered={prefiltered} + "
+        f"subagent={subagent}; line: {line}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1499,18 +1666,29 @@ def test_run_classifier_pipes_prompt_via_stdin(tmp_path, monkeypatch):
     """
     import check_items_cli as cli
 
+    # Disable L2 prefilter: this test exercises prompt delivery via stdin, not L2.
+    # Also requires at least one group with content so sub-agent dispatch happens.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
     captured = {}
 
     def fake_run(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
         captured["input"] = kwargs.get("input", "")
         out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps([]))
+        out_path.write_text(json.dumps([
+            {"group_id": "g1", "classification": "ACTIVE", "confidence": "LOW",
+             "canonical_text": "Investigate dispatcher", "evidence_citation": None,
+             "action_required": None}
+        ]))
         return _fake_completed(stdout=out_path.read_text(), returncode=0)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
-    payload = {"groups": [], "evidence": {}}
+    payload = {"groups": [{"group_id": "g1", "project": "p",
+                           "representative": "Investigate dispatcher",
+                           "instances": []}],
+               "evidence": {}}
     out_path = tmp_path / "classify.json"
     rc = cli.run_classifier(
         stdin_json=json.dumps(payload),
@@ -1621,6 +1799,9 @@ def test_classifier_stdout_fallback_rejects_invalid_shape(tmp_path, monkeypatch)
     import check_items_cli as cli
     from unittest.mock import patch, MagicMock
 
+    # Disable L2 prefilter so group reaches sub-agent and triggers the fallback path.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
     output_path = str(tmp_path / "out.json")
 
     valid_payload = json.dumps({
@@ -1647,6 +1828,9 @@ def test_classifier_stdout_fallback_accepts_valid_shape(tmp_path, monkeypatch):
     import json
     import check_items_cli as cli
     from unittest.mock import patch, MagicMock
+
+    # Disable L2 prefilter so group reaches sub-agent and triggers the fallback path.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
 
     output_path = str(tmp_path / "out.json")
 
