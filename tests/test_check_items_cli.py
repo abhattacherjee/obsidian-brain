@@ -357,3 +357,70 @@ def test_bare_key_evidence_bridging_no_match(tmp_path, monkeypatch):
     out = json.loads(Path(output_path).read_text())
     assert len(out) == 1
     assert out[0].get("prefiltered") is True
+
+
+# ---------------------------------------------------------------------------
+# Tests for telemetry line
+# ---------------------------------------------------------------------------
+
+def test_telemetry_line_appears_in_stderr(tmp_path, monkeypatch, capsys):
+    """run_classifier emits exactly one telemetry line to stderr."""
+    import check_items_cli
+
+    mtime_recent = time.time() - (10 * 86400)
+    groups = [_make_group("g1", "Investigate dispatcher discovery", mtime_recent)]
+    payload_str = _make_payload(groups, EVIDENCE_EMPTY_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
+    with patch("check_items_cli.subprocess.run", MagicMock()):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    telemetry_lines = [
+        l for l in captured.err.splitlines()
+        if l.startswith("[check-items-cli] classifier:")
+    ]
+    assert len(telemetry_lines) == 1, f"Expected exactly 1 telemetry line, got: {telemetry_lines}"
+
+
+def test_telemetry_line_has_all_five_fields(tmp_path, monkeypatch, capsys):
+    """Telemetry line contains total, cache_hit, prefiltered, subagent, wall fields."""
+    import check_items_cli
+    import re
+
+    mtime_recent = time.time() - (10 * 86400)
+    groups = [
+        _make_group("g1", "Investigate dispatcher discovery", mtime_recent),
+        _make_group("g2", "Explore vault growth patterns", mtime_recent),
+    ]
+    payload_str = _make_payload(groups, EVIDENCE_EMPTY_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
+    with patch("check_items_cli.subprocess.run", MagicMock()):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    telemetry_line = next(
+        (l for l in captured.err.splitlines() if "[check-items-cli] classifier:" in l),
+        None,
+    )
+    assert telemetry_line is not None
+
+    # Parse and verify all five fields are present and have parseable values
+    assert re.search(r'total=\d+', telemetry_line), f"Missing total= in: {telemetry_line}"
+    assert re.search(r'cache_hit=[-\d]+', telemetry_line), f"Missing cache_hit= in: {telemetry_line}"
+    assert re.search(r'prefiltered=\d+', telemetry_line), f"Missing prefiltered= in: {telemetry_line}"
+    assert re.search(r'subagent=\d+', telemetry_line), f"Missing subagent= in: {telemetry_line}"
+    assert re.search(r'wall=\d+s', telemetry_line), f"Missing wall= in: {telemetry_line}"
+
+    # Verify numeric values are consistent with the all-synthetic scenario
+    total_m = re.search(r'total=(\d+)', telemetry_line)
+    prefiltered_m = re.search(r'prefiltered=(\d+)', telemetry_line)
+    subagent_m = re.search(r'subagent=(\d+)', telemetry_line)
+    assert int(total_m.group(1)) == 2
+    assert int(prefiltered_m.group(1)) == 2
+    assert int(subagent_m.group(1)) == 0

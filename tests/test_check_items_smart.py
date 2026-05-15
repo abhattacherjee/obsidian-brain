@@ -949,6 +949,158 @@ def test_needs_action_surfaces_command(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Task 7: outer telemetry line in classify_groups_with_agent
+# ---------------------------------------------------------------------------
+
+def test_outer_telemetry_line_format(monkeypatch, capsys):
+    """classify_groups_with_agent emits a [check-items] classifier-result line
+    with total_classified/prefiltered/subagent fields and no cache_hit key
+    (cache_hit lives outside this function's visibility — see Task 7 option b)."""
+    import open_item_dedup as oid
+    import re
+
+    def fake_cli_run(cmd, *args, **kwargs):
+        out_path = next((c for c in cmd if isinstance(c, str)
+                         and c.endswith(".json") and "out" in c), None)
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump([
+                    {
+                        "group_id": "g1",
+                        "classification": "DONE",
+                        "confidence": "HIGH",
+                        "canonical_text": "ship it",
+                        "evidence_citation": "PR #87 merged",
+                        "action_required": None,
+                    },
+                    {
+                        "group_id": "g2",
+                        "classification": "ACTIVE",
+                        "confidence": "LOW",
+                        "canonical_text": "explore growth",
+                        "evidence_citation": None,
+                        "action_required": None,
+                        "prefiltered": True,
+                    },
+                ], f)
+        return _fake_completed(returncode=0)
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+
+    merged_groups = [
+        {"group_id": "g1", "project": "p", "representative": "ship",
+         "members": [{"file": "a.md", "line": 1, "text": "ship"}]},
+        {"group_id": "g2", "project": "p", "representative": "explore growth",
+         "members": [{"file": "b.md", "line": 2, "text": "explore growth"}]},
+    ]
+    evidence = {"p": {"commits": [], "merged_prs": [], "closed_issues": []}}
+
+    parsed = oid.classify_groups_with_agent(merged_groups, evidence)
+    assert len(parsed) == 2
+
+    captured = capsys.readouterr()
+    outer_lines = [
+        l for l in captured.err.splitlines()
+        if l.startswith("[check-items] classifier-result:")
+    ]
+    assert len(outer_lines) == 1, (
+        f"Expected exactly 1 outer telemetry line, got: {outer_lines}"
+    )
+    line = outer_lines[0]
+
+    # Required fields
+    assert re.search(r'total_classified=2', line), f"Bad total_classified in: {line}"
+    assert re.search(r'prefiltered=1', line), f"Bad prefiltered in: {line}"
+    assert re.search(r'subagent=1', line), f"Bad subagent in: {line}"
+
+    # cache_hit must NOT appear in the outer line (plan Task 7 Step 4 option b:
+    # drop it entirely rather than emit a placeholder).
+    assert "cache_hit" not in line, (
+        f"Outer line must not include cache_hit (orchestration is SKILL.md "
+        f"prose; plan fallback drops the key). Got: {line}"
+    )
+
+
+def test_outer_telemetry_invariant_with_partial_parse(monkeypatch, capsys):
+    """total_classified must equal prefiltered + subagent even when the CLI
+    returns fewer records than merged_groups (e.g. partial parse, dropped
+    entries). All three counts derive from `parsed`, not merged_groups."""
+    import open_item_dedup as oid
+    import re
+
+    # 3 input groups but CLI only returns 2 records (one dropped/lost).
+    # Of the 2 returned: 1 prefiltered, 1 subagent.
+    def fake_cli_run(cmd, *args, **kwargs):
+        out_path = next((c for c in cmd if isinstance(c, str)
+                         and c.endswith(".json") and "out" in c), None)
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump([
+                    {
+                        "group_id": "g1",
+                        "classification": "DONE",
+                        "confidence": "HIGH",
+                        "canonical_text": "ship",
+                        "evidence_citation": "PR #1",
+                        "action_required": None,
+                    },
+                    {
+                        "group_id": "g3",
+                        "classification": "ACTIVE",
+                        "confidence": "LOW",
+                        "canonical_text": "explore",
+                        "evidence_citation": None,
+                        "action_required": None,
+                        "prefiltered": True,
+                    },
+                    # g2 deliberately omitted
+                ], f)
+        return _fake_completed(returncode=0)
+
+    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+
+    merged_groups = [
+        {"group_id": "g1", "project": "p", "representative": "ship",
+         "members": [{"file": "a.md", "line": 1, "text": "ship"}]},
+        {"group_id": "g2", "project": "p", "representative": "dropped",
+         "members": [{"file": "b.md", "line": 2, "text": "dropped"}]},
+        {"group_id": "g3", "project": "p", "representative": "explore",
+         "members": [{"file": "c.md", "line": 3, "text": "explore"}]},
+    ]
+    evidence = {"p": {"commits": [], "merged_prs": [], "closed_issues": []}}
+
+    parsed = oid.classify_groups_with_agent(merged_groups, evidence)
+    assert len(parsed) == 2  # one dropped
+
+    captured = capsys.readouterr()
+    outer_lines = [
+        l for l in captured.err.splitlines()
+        if l.startswith("[check-items] classifier-result:")
+    ]
+    assert len(outer_lines) == 1
+    line = outer_lines[0]
+
+    total_m = re.search(r'total_classified=(\d+)', line)
+    prefiltered_m = re.search(r'prefiltered=(\d+)', line)
+    subagent_m = re.search(r'subagent=(\d+)', line)
+    assert total_m and prefiltered_m and subagent_m, f"Missing field in: {line}"
+
+    total = int(total_m.group(1))
+    prefiltered = int(prefiltered_m.group(1))
+    subagent = int(subagent_m.group(1))
+
+    # Invariant: counts sum correctly. total_classified must reflect parsed,
+    # NOT merged_groups (which would give 3 and break the invariant).
+    assert total == 2, f"total_classified should equal len(parsed)=2, got {total}: {line}"
+    assert prefiltered == 1, f"prefiltered=1, got {prefiltered}: {line}"
+    assert subagent == 1, f"subagent=1, got {subagent}: {line}"
+    assert total == prefiltered + subagent, (
+        f"Invariant broken: total={total} != prefiltered={prefiltered} + "
+        f"subagent={subagent}; line: {line}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Task 17: heuristic fallback classifier
 # ---------------------------------------------------------------------------
 

@@ -1469,6 +1469,34 @@ def classify_groups_with_agent(merged_groups, evidence):
     if parsed is None:
         _LAST_CLASSIFIER_MODE = "heuristic-fallback"
         return []
+
+    # Outer telemetry: summary of this classification run.
+    # cache_hit is intentionally NOT emitted here — the orchestration layer
+    # is SKILL.md prose: Step 3 heredoc owns partition()'s `known` list,
+    # Step 6 heredoc owns this function's invocation, and they share state
+    # only via partition.json on disk. Threading len(known) through
+    # classify_groups_with_agent's signature is invasive (plan Task 7
+    # Step 4 fallback: drop cache_hit entirely rather than emit a
+    # placeholder).
+    #
+    # All three counts derive from `parsed` (the output) so the invariant
+    # `total_classified == prefiltered + subagent` holds by construction
+    # even if the CLI returned fewer records than merged_groups (partial
+    # parse, dropped entries). Each dict-shaped entry is counted into
+    # exactly one bucket via direct iteration — no subtraction that could
+    # go negative when isinstance excludes malformed entries.
+    _prefiltered_count = sum(
+        1 for r in parsed if isinstance(r, dict) and r.get("prefiltered")
+    )
+    _subagent_count = sum(
+        1 for r in parsed if isinstance(r, dict) and not r.get("prefiltered")
+    )
+    _total_classified = _prefiltered_count + _subagent_count
+    print(
+        f"[check-items] classifier-result: total_classified={_total_classified} "
+        f"prefiltered={_prefiltered_count} subagent={_subagent_count}",
+        file=sys.stderr,
+    )
     return parsed
 
 

@@ -513,14 +513,14 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
     os.chmod(output_path, 0o600)
 
     # -----------------------------------------------------------------------
-    # Telemetry (Task 7 stub — full implementation in Task 7)
+    # Telemetry — inner line (CLI sees only L1-miss groups; cache_hit is '-'
+    # by design — the orchestration layer in open_item_dedup.py holds that
+    # count and emits the outer classifier-result line with real cache_hit).
     # -----------------------------------------------------------------------
     _wall = int(_time.monotonic() - _wall_start)
     total = len(groups)
     prefiltered_count = len(synthetic)
     subagent_count = len(sub_results)
-    # cache_hit is tracked by the SKILL.md orchestration layer (partition()),
-    # not here. Emit '-' as placeholder; see Task 7b for outer telemetry line.
     print(
         f"[check-items-cli] classifier: total={total} cache_hit=- "
         f"prefiltered={prefiltered_count} subagent={subagent_count} wall={_wall}s",
