@@ -6,6 +6,7 @@ Python stdlib only. Per spec docs/superpowers/specs/2026-05-15-check-items-call-
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 
@@ -122,3 +123,14 @@ def synthetic_classification(group: dict, now: float | None = None) -> dict:
         "action_required": None,
         "prefiltered": True,
     }
+
+
+def is_prefilter_enabled() -> bool:
+    """Return True unless CHECK_ITEMS_PREFILTER=off (case-insensitive).
+
+    Default: enabled. Set CHECK_ITEMS_PREFILTER=off to skip L2 and route
+    all L1-miss items directly to the sub-agent (useful for A/B comparison
+    and debugging). L1 cache is unaffected by this flag.
+    """
+    val = os.environ.get("CHECK_ITEMS_PREFILTER", "on")
+    return val.strip().lower() != "off"

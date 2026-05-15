@@ -228,3 +228,30 @@ def test_synthetic_classification_now_injection_stale():
     assert result["classification"] == "STALE"
     assert result["confidence"] == "LOW"
     assert result["prefiltered"] is True
+
+
+# ---------------------------------------------------------------------------
+# Tests for is_prefilter_enabled
+# ---------------------------------------------------------------------------
+
+def test_prefilter_enabled_by_default(monkeypatch):
+    """CHECK_ITEMS_PREFILTER not set → prefilter is enabled."""
+    import check_items_prefilter
+    monkeypatch.delenv("CHECK_ITEMS_PREFILTER", raising=False)
+    assert check_items_prefilter.is_prefilter_enabled() is True
+
+
+def test_prefilter_disabled_by_off(monkeypatch):
+    """CHECK_ITEMS_PREFILTER=off → prefilter disabled (case-insensitive)."""
+    import check_items_prefilter
+    for val in ("off", "OFF", "Off"):
+        monkeypatch.setenv("CHECK_ITEMS_PREFILTER", val)
+        assert check_items_prefilter.is_prefilter_enabled() is False, f"Expected False for {val!r}"
+
+
+def test_prefilter_enabled_for_non_off_values(monkeypatch):
+    """Any value other than 'off' (case-insensitive) leaves prefilter enabled."""
+    import check_items_prefilter
+    for val in ("on", "1", "true", "yes", ""):
+        monkeypatch.setenv("CHECK_ITEMS_PREFILTER", val)
+        assert check_items_prefilter.is_prefilter_enabled() is True, f"Expected True for {val!r}"
