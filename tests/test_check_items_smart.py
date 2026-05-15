@@ -686,6 +686,9 @@ def test_run_classifier_picks_haiku_at_30_or_fewer(tmp_path, monkeypatch):
     """<=30 merged groups -> claude -p --model haiku per spec line 106."""
     import check_items_cli as cli
 
+    # Disable L2 prefilter: this test exercises sub-agent model selection, not L2.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
     captured = {}
 
     def fake_run(cmd, *args, **kwargs):
@@ -712,6 +715,9 @@ def test_run_classifier_picks_haiku_at_30_or_fewer(tmp_path, monkeypatch):
 def test_run_classifier_picks_sonnet_above_30(tmp_path, monkeypatch):
     """>30 merged groups escalates to sonnet."""
     import check_items_cli as cli
+
+    # Disable L2 prefilter: this test exercises sub-agent model selection, not L2.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
 
     captured = {}
 
@@ -813,6 +819,9 @@ def test_run_classifier_timeout_returns_3(tmp_path, monkeypatch):
     """run_classifier returns 3 on subprocess timeout."""
     import check_items_cli as cli
 
+    # Disable L2 prefilter so group reaches sub-agent and can trigger timeout.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
     def fake_run(cmd, *args, **kwargs):
         raise subprocess.TimeoutExpired(cmd, SUBAGENT_TIMEOUT_SEC)
 
@@ -829,6 +838,9 @@ def test_run_classifier_nonzero_rc_propagated(tmp_path, monkeypatch):
     """run_classifier propagates non-zero subprocess return code."""
     import check_items_cli as cli
 
+    # Disable L2 prefilter so group reaches sub-agent and can return non-zero rc.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
     monkeypatch.setattr(cli.subprocess, "run",
                         lambda *a, **kw: _fake_completed(returncode=7))
     payload = {"groups": [{"group_id": "g1", "project": "p",
@@ -842,6 +854,9 @@ def test_run_classifier_nonzero_rc_propagated(tmp_path, monkeypatch):
 def test_run_classifier_invalid_stdout_json_returns_4(tmp_path, monkeypatch):
     """run_classifier returns 4 when stdout is not valid JSON and output file absent."""
     import check_items_cli as cli
+
+    # Disable L2 prefilter so group reaches sub-agent and can trigger the json-error path.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
 
     monkeypatch.setattr(cli.subprocess, "run",
                         lambda *a, **kw: _fake_completed(stdout="not-json", returncode=0))
@@ -1499,18 +1514,29 @@ def test_run_classifier_pipes_prompt_via_stdin(tmp_path, monkeypatch):
     """
     import check_items_cli as cli
 
+    # Disable L2 prefilter: this test exercises prompt delivery via stdin, not L2.
+    # Also requires at least one group with content so sub-agent dispatch happens.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
     captured = {}
 
     def fake_run(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
         captured["input"] = kwargs.get("input", "")
         out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps([]))
+        out_path.write_text(json.dumps([
+            {"group_id": "g1", "classification": "ACTIVE", "confidence": "LOW",
+             "canonical_text": "Investigate dispatcher", "evidence_citation": None,
+             "action_required": None}
+        ]))
         return _fake_completed(stdout=out_path.read_text(), returncode=0)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
-    payload = {"groups": [], "evidence": {}}
+    payload = {"groups": [{"group_id": "g1", "project": "p",
+                           "representative": "Investigate dispatcher",
+                           "instances": []}],
+               "evidence": {}}
     out_path = tmp_path / "classify.json"
     rc = cli.run_classifier(
         stdin_json=json.dumps(payload),
@@ -1621,6 +1647,9 @@ def test_classifier_stdout_fallback_rejects_invalid_shape(tmp_path, monkeypatch)
     import check_items_cli as cli
     from unittest.mock import patch, MagicMock
 
+    # Disable L2 prefilter so group reaches sub-agent and triggers the fallback path.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
     output_path = str(tmp_path / "out.json")
 
     valid_payload = json.dumps({
@@ -1647,6 +1676,9 @@ def test_classifier_stdout_fallback_accepts_valid_shape(tmp_path, monkeypatch):
     import json
     import check_items_cli as cli
     from unittest.mock import patch, MagicMock
+
+    # Disable L2 prefilter so group reaches sub-agent and triggers the fallback path.
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
 
     output_path = str(tmp_path / "out.json")
 

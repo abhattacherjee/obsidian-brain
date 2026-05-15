@@ -316,15 +316,86 @@ def _pick_classifier_model(group_count: int) -> str:
     return "haiku" if group_count <= 30 else "sonnet"
 
 
+def _bridge_project_evidence(evidence: dict, project: str) -> dict:
+    """Convert project evidence to the _text-suffixed flat format expected by
+    has_classifiable_evidence().
+
+    The live evidence payload from open_item_dedup.py uses a project-keyed nested
+    structure with bare keys:
+        {project_name: {"commits": [...], "merged_prs": [...], ...}}
+
+    has_classifiable_evidence() expects a flat dict with _text-suffixed keys:
+        {"commits_text": "...", "merged_prs_text": "...", ...}
+
+    This helper bridges both shapes:
+    - If the evidence dict contains the project key AND its value is a dict
+      with bare keys → extract and convert to _text form.
+    - If the evidence dict already has _text-suffixed keys at the top level
+      (test fixtures, simplified payloads) → return as-is.
+    - If neither shape matches → return empty dict (fail-safe: no evidence → synthetic).
+    """
+    # Shape A: project-nested bare keys (production shape from open_item_dedup.py)
+    if project and project in evidence and isinstance(evidence[project], dict):
+        proj = evidence[project]
+        # Convert list/dict values to text by joining stringified items
+        def _to_text(val) -> str:
+            if not val:
+                return ""
+            if isinstance(val, str):
+                return val
+            if isinstance(val, list):
+                parts = []
+                for item in val:
+                    if isinstance(item, str):
+                        parts.append(item)
+                    elif isinstance(item, dict):
+                        # merged_prs / closed_issues are dicts with title, number, etc.
+                        parts.append(" ".join(str(v) for v in item.values() if v))
+                return " ".join(parts)
+            if isinstance(val, dict):
+                # fts_mentions: {text: count} — join all keys
+                return " ".join(str(k) for k in val)
+            return str(val)
+
+        return {
+            "commits_text": _to_text(proj.get("commits")),
+            "merged_prs_text": _to_text(proj.get("merged_prs")),
+            "closed_issues_text": _to_text(proj.get("closed_issues")),
+            "releases_text": _to_text(proj.get("releases")),
+            "changelog_excerpt": proj.get("changelog_excerpt") or "",
+            "fts_mentions_text": _to_text(proj.get("fts_mentions")),
+        }
+
+    # Shape B: already _text-suffixed at top level (test fixtures / simplified payloads)
+    _TEXT_KEYS = {"commits_text", "merged_prs_text", "closed_issues_text",
+                  "releases_text", "changelog_excerpt", "fts_mentions_text"}
+    if _TEXT_KEYS.intersection(evidence.keys()):
+        return evidence
+
+    # Unknown shape or missing project → no evidence (fail-safe)
+    return {}
+
+
 def run_classifier(stdin_json: str, output_path: str) -> int:
     """
-    Stage 4: invoke the classifier sub-agent.
+    Stage 4: invoke the classifier sub-agent, with L2 evidence-presence
+    pre-filter applied to all groups before any claude -p dispatch.
 
-    Reads merged groups + evidence from stdin_json, writes a strict-JSON
-    array of {group_id, classification, confidence, canonical_text,
-    evidence_citation, action_required} to output_path. Returns 0 on
-    success, non-zero on failure.
+    Flow:
+      1. Parse stdin JSON to extract groups + evidence.
+      2. Apply L2 pre-filter (if enabled): items with no evidence go to
+         synthetic_classification(); items with evidence go to the sub-agent.
+      3. If to_classify is non-empty, dispatch claude -p exactly once on
+         the reduced payload.
+      4. Merge sub-agent results + synthetic results in input order.
+      5. Write merged output to output_path (0o600).
+      6. Emit telemetry line to stderr.
+
+    Returns 0 on success, non-zero on failure.
     """
+    import time as _time
+    _wall_start = _time.monotonic()
+
     try:
         payload = json.loads(stdin_json)
     except json.JSONDecodeError as exc:
@@ -333,60 +404,128 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
         return 2
 
     groups = payload.get("groups", [])
-    model = _pick_classifier_model(len(groups))
+    evidence = payload.get("evidence", {})
 
-    workdir = _safe_workdir()
-    in_tmp = tempfile.NamedTemporaryFile(
-        mode="w", delete=False, dir=str(workdir), suffix=".classin.json", encoding="utf-8"
-    )
-    try:
-        json.dump(payload, in_tmp)
-        in_tmp.flush()
-    finally:
-        in_tmp.close()
-    os.chmod(in_tmp.name, 0o600)
-
-    prompt = CLASSIFIER_PROMPT.replace(
-        "<input-json-path>", in_tmp.name
-    ).replace(
-        "<output-json-path>", output_path
+    # -----------------------------------------------------------------------
+    # L2: evidence-presence pre-filter
+    # Groups reaching this function are already L1-miss (partition() in the
+    # SKILL.md orchestration layer handled cache hits before calling the CLI).
+    # -----------------------------------------------------------------------
+    from check_items_prefilter import (
+        has_classifiable_evidence,
+        synthetic_classification,
+        is_prefilter_enabled,
     )
 
-    cmd = ["claude", "-p", "--model", model]
-    try:
-        cp = subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True, timeout=SUBAGENT_TIMEOUT_SEC
+    synthetic: list = []
+    to_classify: list = list(groups)
+
+    if is_prefilter_enabled() and groups:
+        to_classify = []
+        for g in groups:
+            project = g.get("project", "")
+            bridged_evidence = _bridge_project_evidence(evidence, project)
+            if has_classifiable_evidence(g, bridged_evidence):
+                to_classify.append(g)
+            else:
+                synthetic.append(synthetic_classification(g))
+
+    # -----------------------------------------------------------------------
+    # Sub-agent dispatch — only on groups that have evidence
+    # -----------------------------------------------------------------------
+    sub_results: list = []
+
+    if to_classify:
+        model = _pick_classifier_model(len(to_classify))
+
+        workdir = _safe_workdir()
+        in_tmp = tempfile.NamedTemporaryFile(
+            mode="w", delete=False, dir=str(workdir), suffix=".classin.json", encoding="utf-8"
         )
-    except subprocess.TimeoutExpired:
-        print(f"[check-items-cli] classifier timeout after {SUBAGENT_TIMEOUT_SEC}s",
-              file=sys.stderr)
-        return 3
-    finally:
         try:
-            os.unlink(in_tmp.name)
-        except OSError:
-            pass
+            sub_payload = {"groups": to_classify, "evidence": evidence}
+            json.dump(sub_payload, in_tmp)
+            in_tmp.flush()
+        finally:
+            in_tmp.close()
+        os.chmod(in_tmp.name, 0o600)
 
-    if cp.returncode != 0:
-        print(f"[check-items-cli] classifier failed rc={cp.returncode}: {cp.stderr[:500]}",
-              file=sys.stderr)
-        return cp.returncode
+        prompt = CLASSIFIER_PROMPT.replace(
+            "<input-json-path>", in_tmp.name
+        ).replace(
+            "<output-json-path>", output_path
+        )
 
-    if not Path(output_path).exists():
+        cmd = ["claude", "-p", "--model", model]
         try:
-            parsed = json.loads(_strip_json_fences(cp.stdout))
-        except json.JSONDecodeError as exc:
-            print(f"[check-items-cli] classifier output invalid JSON: {exc}", file=sys.stderr)
-            return 4
-        if not _validate_classifier_payload(parsed):
-            print(
-                "[check-items-cli] classifier stdout-fallback produced invalid shape"
-                f" (expected list of classifier objects, got {type(parsed).__name__})",
-                file=sys.stderr,
+            cp = subprocess.run(
+                cmd, input=prompt, capture_output=True, text=True, timeout=SUBAGENT_TIMEOUT_SEC
             )
-            return 4
-        Path(output_path).write_text(json.dumps(parsed), encoding="utf-8")
-        os.chmod(output_path, 0o600)
+        except subprocess.TimeoutExpired:
+            print(f"[check-items-cli] classifier timeout after {SUBAGENT_TIMEOUT_SEC}s",
+                  file=sys.stderr)
+            return 3
+        finally:
+            try:
+                os.unlink(in_tmp.name)
+            except OSError:
+                pass
+
+        if cp.returncode != 0:
+            print(f"[check-items-cli] classifier failed rc={cp.returncode}: {cp.stderr[:500]}",
+                  file=sys.stderr)
+            return cp.returncode
+
+        # Load sub-agent results from output_path or stdout fallback
+        if Path(output_path).exists():
+            try:
+                sub_results = json.loads(Path(output_path).read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                print(f"[check-items-cli] classifier output invalid JSON: {exc}", file=sys.stderr)
+                return 4
+        else:
+            try:
+                parsed = json.loads(_strip_json_fences(cp.stdout))
+            except json.JSONDecodeError as exc:
+                print(f"[check-items-cli] classifier output invalid JSON: {exc}", file=sys.stderr)
+                return 4
+            if not _validate_classifier_payload(parsed):
+                print(
+                    "[check-items-cli] classifier stdout-fallback produced invalid shape"
+                    f" (expected list of classifier objects, got {type(parsed).__name__})",
+                    file=sys.stderr,
+                )
+                return 4
+            sub_results = parsed
+
+    # -----------------------------------------------------------------------
+    # Merge in input order and write final output
+    # -----------------------------------------------------------------------
+    merged_by_id: dict = {}
+    for s in sub_results:
+        merged_by_id[s["group_id"]] = s
+    for s in synthetic:
+        merged_by_id[s["group_id"]] = s
+
+    ordered = [merged_by_id[g["group_id"]] for g in groups if g["group_id"] in merged_by_id]
+
+    Path(output_path).write_text(json.dumps(ordered), encoding="utf-8")
+    os.chmod(output_path, 0o600)
+
+    # -----------------------------------------------------------------------
+    # Telemetry (Task 7 stub — full implementation in Task 7)
+    # -----------------------------------------------------------------------
+    _wall = int(_time.monotonic() - _wall_start)
+    total = len(groups)
+    prefiltered_count = len(synthetic)
+    subagent_count = len(sub_results)
+    # cache_hit is tracked by the SKILL.md orchestration layer (partition()),
+    # not here. Emit '-' as placeholder; see Task 7b for outer telemetry line.
+    print(
+        f"[check-items-cli] classifier: total={total} cache_hit=- "
+        f"prefiltered={prefiltered_count} subagent={subagent_count} wall={_wall}s",
+        file=sys.stderr,
+    )
 
     return 0
 
