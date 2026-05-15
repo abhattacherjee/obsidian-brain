@@ -1402,7 +1402,13 @@ def classify_groups_with_agent(merged_groups, evidence):
                 "project": g.get("project"),
                 "representative": g.get("representative", ""),
                 "instances": [
-                    {"file": m.get("file"), "line": m.get("line"), "text": m.get("text", "")}
+                    {
+                        "file": m.get("file"),
+                        "line": m.get("line"),
+                        "text": m.get("text", ""),
+                        # Missing mtime → 0 → epoch (1970), which L2 bins as STALE (fail-safe).
+                        "mtime": m.get("mtime", 0),
+                    }
                     for m in g.get("members", [])
                 ],
             }
