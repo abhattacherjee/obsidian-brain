@@ -1471,6 +1471,17 @@ def classify_groups_with_agent(merged_groups, evidence):
             if cp.returncode != 0 or not out_path.exists():
                 continue
             candidate = json.loads(out_path.read_text())
+            # I4: warn early (pre-validation) so the diagnostic is always
+            # reachable, even though _validate_classifier_response will still
+            # reject the whole response if any non-dict is present.
+            if isinstance(candidate, list):
+                _non_dict = sum(1 for r in candidate if not isinstance(r, dict))
+                if _non_dict:
+                    print(
+                        f"[check-items] WARN: classifier emitted {_non_dict} non-dict"
+                        f" records — dropped",
+                        file=sys.stderr,
+                    )
             if not _validate_classifier_response(candidate):
                 continue
             parsed = candidate
@@ -1498,18 +1509,11 @@ def classify_groups_with_agent(merged_groups, evidence):
     # classify_groups_with_agent's signature is invasive; dropping it
     # entirely (emitting '-' from the CLI side) is cleaner than a placeholder.
     #
-    # All three counts derive from `parsed` (the output) so the invariant
-    # `total_classified == prefiltered + subagent` holds by construction
-    # even if the CLI returned fewer records than merged_groups (partial
-    # parse, dropped entries). Each dict-shaped entry is counted into
-    # exactly one bucket via direct iteration — no subtraction that could
-    # go negative when isinstance excludes malformed entries.
-    _dropped = sum(1 for r in parsed if not isinstance(r, dict))
-    if _dropped:
-        print(
-            f"[check-items] WARN: classifier emitted {_dropped} non-dict records — dropped",
-            file=sys.stderr,
-        )
+    # All three counts derive from `parsed` (the output). Non-dict records are
+    # detected and warned before _validate_classifier_response() runs (above);
+    # because the validator rejects any list containing a non-dict, `parsed`
+    # here is guaranteed to contain only dicts — the redundant post-validation
+    # drop guard is not needed.
     _prefiltered_count = sum(
         1 for r in parsed if isinstance(r, dict) and r.get("prefiltered")
     )

@@ -542,6 +542,44 @@ def test_bridge_project_evidence_no_warning_on_empty(monkeypatch, capsys):
     )
 
 
+def test_bridge_project_evidence_multi_project_no_warn_when_project_missing(monkeypatch, capsys):
+    """Multi-project shape A payload with a missing project key → {} without WARN (I1 fix).
+
+    When evidence = {"projA": {...}, "projB": {...}} and the group asks for
+    "projC", the payload IS shape A — just without this project's data.
+    This should silently return {} rather than emitting a WARN, because the
+    shape is recognized and the answer is legitimately "no evidence for projC".
+    """
+    import check_items_cli
+
+    evidence = {
+        "projA": {
+            "commits": ["abc1234 fix something"],
+            "merged_prs": [],
+            "closed_issues": [],
+            "releases": [],
+            "changelog_excerpt": "",
+        },
+        "projB": {
+            "commits": [],
+            "merged_prs": [{"title": "Add feature X", "number": 42}],
+            "closed_issues": [],
+            "releases": [],
+            "changelog_excerpt": "",
+        },
+    }
+
+    result = check_items_cli._bridge_project_evidence(evidence, "projC")
+
+    captured = capsys.readouterr()
+    assert result == {}, (
+        f"Expected {{}} for project not in multi-project payload; got: {result!r}"
+    )
+    assert "WARN" not in captured.err, (
+        f"Unexpected WARN for recognized shape A with missing project: {captured.err!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # I2: group_id=None collision in run_classifier
 # ---------------------------------------------------------------------------
@@ -664,28 +702,37 @@ def test_file_path_branch_validates_schema_missing_fields(tmp_path, monkeypatch)
 # ---------------------------------------------------------------------------
 
 def test_non_dict_records_dropped_with_warning(tmp_path, monkeypatch, capsys):
-    """Non-dict entries in classified output produce a stderr WARN and are dropped (I4).
+    """Non-dict entries in classifier output emit a WARN via production code (I4).
 
-    The telemetry block in classify_groups_with_agent (open_item_dedup.py) applies
-    isinstance(r, dict) filters on both prefiltered and subagent counts. Non-dict
-    records are silently excluded from both buckets without a diagnostic.
-
-    This test patches classify_groups_with_agent so that `parsed` reaches the
-    telemetry block with a non-dict entry. We verify: (1) WARN is emitted, (2) the
-    non-dict record is excluded from the return value (dropped), (3) valid dicts pass.
+    Invokes open_item_dedup.classify_groups_with_agent() for real, with a mocked
+    subprocess that writes JSON containing a stray non-dict entry to out_path.
+    Asserts:
+      (1) WARN is emitted to stderr by the production pre-validation check.
+      (2) The function returns [] because _validate_classifier_response rejects
+          any list containing a non-dict (warn-and-reject semantics).
+    Deleting the production WARN block in open_item_dedup.py would cause this
+    test to fail on assertion (1).
     """
-    import sys
-    import os
-    HOOKS_DIR = os.path.join(os.path.dirname(__file__), "..", "hooks")
-    if HOOKS_DIR not in sys.path:
-        sys.path.insert(0, HOOKS_DIR)
-
     import open_item_dedup as oid
 
-    # The warning fires inline in the telemetry block. We test the warning by
-    # simulating the same code path: count non-dicts and print warning to stderr.
-    # This matches the exact implementation added for I4.
-    parsed = [
+    mtime_recent = time.time() - (10 * 86400)  # 10 days ago → ACTIVE
+    merged_groups = [
+        _make_group("g1", "Fix session_log race condition", mtime_recent),
+    ]
+    evidence = {
+        "obsidian-brain": {
+            "commits": ["abc1234 fix session_log race condition"],
+            "merged_prs": [],
+            "closed_issues": [],
+            "releases": [],
+            "changelog_excerpt": "",
+        }
+    }
+
+    # Malformed sub-agent response: valid dict + stray non-dict string entry.
+    # _validate_classifier_response will reject this (non-dict present), but the
+    # pre-validation WARN block should fire first.
+    malformed_response = [
         {
             "group_id": "g1",
             "classification": "DONE",
@@ -693,31 +740,43 @@ def test_non_dict_records_dropped_with_warning(tmp_path, monkeypatch, capsys):
             "canonical_text": "Fix session_log race condition",
             "evidence_citation": "commit abc1234",
             "action_required": None,
-            "prefiltered": False,
         },
-        "this-is-not-a-dict",  # malformed entry
+        "this-is-not-a-dict",  # stray non-dict entry
     ]
 
-    # Simulate the telemetry logic as it exists in open_item_dedup.py (I4 fix).
-    # This mirrors the exact code added: count + warn, then filter.
-    _dropped = sum(1 for r in parsed if not isinstance(r, dict))
-    if _dropped:
-        print(
-            f"[check-items] WARN: classifier emitted {_dropped} non-dict records — dropped",
-            file=sys.stderr,
-        )
+    mock_cp = MagicMock()
+    mock_cp.returncode = 0
+    mock_cp.stderr = ""
+    mock_cp.stdout = ""
+
+    def fake_run(*args, **kwargs):
+        # Extract out_path from the CLI args: ["python3", cli_path, "classifier", out_path]
+        cli_args = args[0]
+        out_path = cli_args[3]
+        Path(out_path).write_text(json.dumps(malformed_response), encoding="utf-8")
+        return mock_cp
+
+    with patch("open_item_dedup.subprocess.run", side_effect=fake_run):
+        result = oid.classify_groups_with_agent(merged_groups, evidence)
 
     captured = capsys.readouterr()
-    assert _dropped == 1, f"Expected 1 non-dict record, got {_dropped}"
-    assert "WARN" in captured.err, f"Expected WARN in stderr; got: {captured.err!r}"
-    assert "non-dict" in captured.err, f"Expected 'non-dict' in warning; got: {captured.err!r}"
-    assert "dropped" in captured.err, f"Expected 'dropped' in warning; got: {captured.err!r}"
-    assert "1" in captured.err, f"Expected count '1' in warning; got: {captured.err!r}"
-
-    # Verify dict filtering keeps valid records
-    valid = [r for r in parsed if isinstance(r, dict)]
-    assert len(valid) == 1
-    assert valid[0]["group_id"] == "g1"
+    assert "WARN" in captured.err, (
+        f"Expected WARN in stderr for non-dict records; got: {captured.err!r}"
+    )
+    assert "non-dict" in captured.err, (
+        f"Expected 'non-dict' in warning; got: {captured.err!r}"
+    )
+    assert "1" in captured.err, (
+        f"Expected count '1' in warning; got: {captured.err!r}"
+    )
+    # validator rejects the response → heuristic-fallback → returns []
+    assert result == [], (
+        f"Expected [] when response contains non-dict records; got: {result!r}"
+    )
+    assert oid.get_last_classifier_mode() == "heuristic-fallback", (
+        f"Expected heuristic-fallback mode after non-dict rejection; "
+        f"got: {oid.get_last_classifier_mode()!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

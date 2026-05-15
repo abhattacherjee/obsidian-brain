@@ -372,10 +372,25 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
     if _TEXT_KEYS.intersection(evidence.keys()):
         return evidence
 
-    # Unknown shape or missing project → no evidence (fail-safe)
-    # Warn when the evidence dict has keys but matches neither shape — this
-    # indicates a payload format change and would silently STALE all groups
-    # without this diagnostic.
+    # Unknown shape or missing project → no evidence (fail-safe).
+    # Before warning, check whether the payload IS a valid shape A for a
+    # different project (multi-project payload, this group's project not
+    # present). Shape A is recognized by any top-level value being a dict
+    # that contains at least one bare evidence key. In that case, the
+    # legitimate answer is "no evidence for this project" — return {} silently.
+    # Only WARN when neither shape A nor shape B is recognizable at all.
+    _BARE_KEYS = {"commits", "merged_prs", "closed_issues", "releases",
+                  "changelog_excerpt", "fts_mentions"}
+    _is_shape_a_payload = any(
+        isinstance(v, dict) and _BARE_KEYS.intersection(v.keys())
+        for v in evidence.values()
+    )
+    if _is_shape_a_payload:
+        # Valid shape A payload, but project not present — no evidence for this group.
+        return {}
+
+    # Genuinely unrecognized shape — warn, as this indicates a format change
+    # that would silently STALE all groups without this diagnostic.
     if evidence:
         print(
             f"[check-items-cli] WARN: _bridge_project_evidence unrecognized shape "
