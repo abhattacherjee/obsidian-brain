@@ -107,3 +107,124 @@ def test_has_evidence_empty_evidence_dict():
     from check_items_prefilter import has_classifiable_evidence
     group = _make_group("Investigate dispatcher discovery")
     assert has_classifiable_evidence(group, {}) is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for synthetic_classification
+# ---------------------------------------------------------------------------
+
+import time as _time
+
+
+def _make_group_with_mtime(canonical_text: str, mtime: float) -> dict:
+    """Build a group with instances carrying a known mtime."""
+    return {
+        "group_id": "test-synth-01",
+        "project": "obsidian-brain",
+        "representative": canonical_text,
+        "instances": [
+            {"file": "note.md", "line": 1, "text": canonical_text, "mtime": mtime},
+        ],
+    }
+
+
+def test_synthetic_young_item_is_active():
+    """Item first seen 30 days ago (<=90d) → ACTIVE/LOW."""
+    from check_items_prefilter import synthetic_classification
+    mtime_30d_ago = _time.time() - (30 * 86400)
+    group = _make_group_with_mtime("Investigate dispatcher discovery", mtime_30d_ago)
+    result = synthetic_classification(group)
+    assert result["classification"] == "ACTIVE"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+    assert result["group_id"] == "test-synth-01"
+    assert result["evidence_citation"] is None
+    assert result["action_required"] is None
+
+
+def test_synthetic_old_item_is_stale():
+    """Item first seen >90 days ago → STALE/LOW."""
+    from check_items_prefilter import synthetic_classification
+    mtime_100d_ago = _time.time() - (100 * 86400)
+    group = _make_group_with_mtime("Fix ancient configuration bug", mtime_100d_ago)
+    result = synthetic_classification(group)
+    assert result["classification"] == "STALE"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+
+
+def test_synthetic_missing_mtime_treats_as_stale():
+    """No mtime in instances → defaults to 0 → age computed as large number → STALE.
+
+    Note: mtime=0 (epoch) means the file dates to 1970, which is >90 days ago.
+    This is the safe conservative path: if we don't know the age, treat as STALE
+    (older items are more likely to be stale). If the implementer finds 0→ACTIVE
+    is preferable (treat unknown as young), this test must be updated to assert ACTIVE.
+    The canonical decision: mtime=0 → age = now - 0 which is always > 90d → STALE.
+    """
+    from check_items_prefilter import synthetic_classification
+    group = {
+        "group_id": "test-synth-missing",
+        "project": "obsidian-brain",
+        "representative": "Some item text",
+        "instances": [{"file": "note.md", "line": 1, "text": "Some item text"}],
+        # no 'mtime' key in instances
+    }
+    result = synthetic_classification(group)
+    # mtime defaults to 0 → epoch → age >> 90d → STALE
+    assert result["classification"] == "STALE"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+
+
+def test_synthetic_empty_instances_treats_as_stale():
+    """Empty instances list → no mtimes → earliest_mtime = 0.0 → epoch → STALE.
+
+    Fail-safe path for groups with no instances at all (defensive guard against
+    malformed input). `min(mtimes) if mtimes else 0.0` yields 0.0, the epoch,
+    so age > 90d → STALE.
+    """
+    from check_items_prefilter import synthetic_classification
+    group = {
+        "group_id": "test-synth-empty",
+        "project": "obsidian-brain",
+        "representative": "Some item text",
+        "instances": [],
+    }
+    result = synthetic_classification(group)
+    assert result["classification"] == "STALE"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+
+
+def test_synthetic_record_has_canonical_text():
+    """The synthetic record carries canonical_text matching the representative."""
+    from check_items_prefilter import synthetic_classification
+    mtime_recent = _time.time() - (10 * 86400)
+    group = _make_group_with_mtime("Check vault integrity", mtime_recent)
+    result = synthetic_classification(group)
+    assert result["canonical_text"] == "Check vault integrity"
+
+
+def test_synthetic_classification_now_injection_active():
+    """Fixed clock — ACTIVE branch. Exercises the `now=` injection path."""
+    from check_items_prefilter import synthetic_classification
+    mtime = 1_000_000.0
+    group = _make_group_with_mtime("Investigate dispatcher discovery", mtime)
+    # 30 days after mtime → ACTIVE
+    result = synthetic_classification(group, now=mtime + 30 * 86_400)
+    assert result["classification"] == "ACTIVE"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+
+
+def test_synthetic_classification_now_injection_stale():
+    """Fixed clock — STALE branch. Exercises the `now=` injection path."""
+    from check_items_prefilter import synthetic_classification
+    mtime = 1_000_000.0
+    group = _make_group_with_mtime("Fix ancient configuration bug", mtime)
+    # 100 days after mtime → STALE
+    result = synthetic_classification(group, now=mtime + 100 * 86_400)
+    assert result["classification"] == "STALE"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True

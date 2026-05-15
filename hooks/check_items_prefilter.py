@@ -7,6 +7,7 @@ Python stdlib only. Per spec docs/superpowers/specs/2026-05-15-check-items-call-
 from __future__ import annotations
 
 import re
+import time
 
 STOPWORDS = frozenset({
     "the", "and", "or", "for", "of", "to", "in", "is", "a", "an",
@@ -67,3 +68,57 @@ def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
     ]).lower()
 
     return any(t.lower() in haystack for t in tokens)
+
+
+_STALE_THRESHOLD_DAYS = 90
+_STALE_THRESHOLD_SECS = _STALE_THRESHOLD_DAYS * 86_400
+
+
+def synthetic_classification(group: dict, now: float | None = None) -> dict:
+    """Produce a synthetic classification record for a group with no evidence.
+
+    Decision matrix (per spec § L2 Decision matrix):
+    - Item age > 90 days since oldest (smallest) member mtime → STALE / LOW
+    - Item age <= 90 days                                     → ACTIVE / LOW
+
+    Age is derived from the oldest (smallest) mtime across the group's
+    'instances' list. If mtime is 0 or missing, defaults to 0 (epoch),
+    which yields an age larger than any threshold → STALE.
+
+    The returned record shape matches _validate_classifier_payload():
+        group_id, classification, confidence, canonical_text,
+        evidence_citation, action_required.
+    Plus the L2-specific marker: prefiltered=True.
+    L2 synthetic records are NOT written to the L1 cache.
+
+    Args:
+        group: Group dict with 'group_id', 'representative' (canonical text),
+               and 'instances' list. Each instance may carry 'mtime' (float,
+               seconds since epoch; from Task 1 threading in open_item_dedup.py).
+        now: Current time as float (seconds since epoch). Defaults to time.time().
+             Injectable for deterministic tests.
+
+    Returns:
+        Classification dict compatible with the classifier output schema.
+    """
+    if now is None:
+        now = time.time()
+
+    instances = group.get("instances", [])
+    mtimes = [float(inst.get("mtime", 0)) for inst in instances]
+    earliest_mtime = min(mtimes) if mtimes else 0.0
+
+    age_secs = now - earliest_mtime
+    classification = "STALE" if age_secs > _STALE_THRESHOLD_SECS else "ACTIVE"
+
+    canonical_text = group.get("representative") or group.get("canonical_text", "")
+
+    return {
+        "group_id": group.get("group_id"),
+        "classification": classification,
+        "confidence": "LOW",
+        "canonical_text": canonical_text,
+        "evidence_citation": None,
+        "action_required": None,
+        "prefiltered": True,
+    }
