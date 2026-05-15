@@ -373,6 +373,15 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
         return evidence
 
     # Unknown shape or missing project → no evidence (fail-safe)
+    # Warn when the evidence dict has keys but matches neither shape — this
+    # indicates a payload format change and would silently STALE all groups
+    # without this diagnostic.
+    if evidence:
+        print(
+            f"[check-items-cli] WARN: _bridge_project_evidence unrecognized shape "
+            f"for project={project!r}; top-level keys={list(evidence.keys())[:10]}",
+            file=sys.stderr,
+        )
     return {}
 
 
@@ -405,6 +414,20 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
 
     groups = payload.get("groups", [])
     evidence = payload.get("evidence", {})
+
+    # -----------------------------------------------------------------------
+    # Validate group_id presence — a None group_id causes silent key collision
+    # in merged_by_id, so two groups overwrite each other and the ordered list
+    # contains the same record twice.  Fail fast with a clear diagnostic.
+    # -----------------------------------------------------------------------
+    invalid_ids = [i for i, g in enumerate(groups) if g.get("group_id") is None]
+    if invalid_ids:
+        print(
+            f"[check-items-cli] ERROR: {len(invalid_ids)} group(s) have group_id=None "
+            f"(indices {invalid_ids[:10]}); cannot merge — aborting classifier",
+            file=sys.stderr,
+        )
+        return 5
 
     # -----------------------------------------------------------------------
     # L2: evidence-presence pre-filter
@@ -482,6 +505,13 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
                 sub_results = json.loads(Path(output_path).read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
                 print(f"[check-items-cli] classifier output invalid JSON: {exc}", file=sys.stderr)
+                return 4
+            if not _validate_classifier_payload(sub_results):
+                print(
+                    "[check-items-cli] classifier file-path output produced invalid shape"
+                    f" (expected list of classifier objects, got {type(sub_results).__name__})",
+                    file=sys.stderr,
+                )
                 return 4
         else:
             try:

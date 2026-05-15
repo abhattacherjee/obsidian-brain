@@ -95,7 +95,7 @@ def synthetic_classification(group: dict, now: float | None = None) -> dict:
     Args:
         group: Group dict with 'group_id', 'representative' (canonical text),
                and 'instances' list. Each instance may carry 'mtime' (float,
-               seconds since epoch; from Task 1 threading in open_item_dedup.py).
+               seconds since epoch; threaded from member dicts in classify_groups_with_agent).
         now: Current time as float (seconds since epoch). Defaults to time.time().
              Injectable for deterministic tests.
 

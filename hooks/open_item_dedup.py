@@ -1495,9 +1495,8 @@ def classify_groups_with_agent(merged_groups, evidence):
     # is SKILL.md prose: Step 3 heredoc owns partition()'s `known` list,
     # Step 6 heredoc owns this function's invocation, and they share state
     # only via partition.json on disk. Threading len(known) through
-    # classify_groups_with_agent's signature is invasive (plan Task 7
-    # Step 4 fallback: drop cache_hit entirely rather than emit a
-    # placeholder).
+    # classify_groups_with_agent's signature is invasive; dropping it
+    # entirely (emitting '-' from the CLI side) is cleaner than a placeholder.
     #
     # All three counts derive from `parsed` (the output) so the invariant
     # `total_classified == prefiltered + subagent` holds by construction
@@ -1505,6 +1504,12 @@ def classify_groups_with_agent(merged_groups, evidence):
     # parse, dropped entries). Each dict-shaped entry is counted into
     # exactly one bucket via direct iteration — no subtraction that could
     # go negative when isinstance excludes malformed entries.
+    _dropped = sum(1 for r in parsed if not isinstance(r, dict))
+    if _dropped:
+        print(
+            f"[check-items] WARN: classifier emitted {_dropped} non-dict records — dropped",
+            file=sys.stderr,
+        )
     _prefiltered_count = sum(
         1 for r in parsed if isinstance(r, dict) and r.get("prefiltered")
     )
