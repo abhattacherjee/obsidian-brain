@@ -126,6 +126,24 @@ def _tokenize(text: str) -> set[str]:
     return {w for w in words if len(w) >= 3 and w not in _STOPWORDS}
 
 
+def _safe_mtime(path: str) -> float:
+    """Return os.path.getmtime(path), falling back to 0.0 on OSError.
+
+    0.0 (epoch) is the safe-conservative fallback: age = now - 0 is always
+    > 90 days, so L2 classifies the item as STALE rather than silently
+    treating a stat-failure as ACTIVE. A one-line warning is emitted to
+    stderr so the failure is visible in hook logs.
+    """
+    try:
+        return os.path.getmtime(path)
+    except OSError as exc:
+        print(
+            f"[obsidian-brain] mtime unavailable for {path!r}: {exc}; defaulting to 0 (STALE)",
+            file=sys.stderr,
+        )
+        return 0.0
+
+
 def collect_open_items(
     vault_path: str,
     sessions_folder: str,
@@ -808,6 +826,7 @@ def deep_analysis_pipeline(
                     "file": os.path.basename(fpath),
                     "line": line_num,
                     "text": item_text,
+                    "mtime": _safe_mtime(fpath),
                 }]
                 for df, dl, dt, dc in dupes:
                     # Mark dupe indices as seen
@@ -819,6 +838,7 @@ def deep_analysis_pipeline(
                         "line": dl,
                         "text": dt,
                         "confidence": dc,
+                        "mtime": _safe_mtime(df),
                     })
                 all_groups.append({
                     "project": project,
