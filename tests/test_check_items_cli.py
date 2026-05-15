@@ -424,3 +424,46 @@ def test_telemetry_line_has_all_five_fields(tmp_path, monkeypatch, capsys):
     assert int(total_m.group(1)) == 2
     assert int(prefiltered_m.group(1)) == 2
     assert int(subagent_m.group(1)) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test: empty to_classify path — subprocess never invoked
+# ---------------------------------------------------------------------------
+
+def test_all_synthetic_subprocess_never_invoked(tmp_path, monkeypatch):
+    """When all groups are prefiltered by L2, subprocess.run is never called.
+
+    This is the critical optimization: no claude -p invocations when the vault
+    has no completion evidence for any open item. The all-synthetic case must
+    exit 0 and write valid output without touching the subprocess machinery.
+    """
+    import check_items_cli
+
+    mtime_recent = time.time() - (10 * 86400)
+    groups = [
+        _make_group("g1", "Investigate dispatcher discovery", mtime_recent),
+        _make_group("g2", "Explore vault growth patterns", mtime_recent),
+        _make_group("g3", "Document architecture decisions", mtime_recent),
+    ]
+    payload_str = _make_payload(groups, EVIDENCE_EMPTY_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
+    mock_sub = MagicMock()
+    with patch("check_items_cli.subprocess.run", mock_sub):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 0, f"Expected exit 0, got {rc}"
+    assert mock_sub.call_count == 0, (
+        f"subprocess.run was called {mock_sub.call_count} time(s) — "
+        "expected 0 when all groups have no evidence"
+    )
+
+    out = json.loads(Path(output_path).read_text())
+    assert len(out) == 3, "All 3 groups must appear in output"
+    group_ids = [r["group_id"] for r in out]
+    assert group_ids == ["g1", "g2", "g3"], "Input order must be preserved"
+    for record in out:
+        assert record.get("prefiltered") is True
+        assert record["classification"] in ("ACTIVE", "STALE")
+        assert record["confidence"] == "LOW"
