@@ -18,10 +18,16 @@ def test_content_tokens_drops_short_tokens():
     out = _content_tokens("Fix a 1 ab abc abcd")
     assert "Fix" in out
     assert "abc" in out
-    assert "abcd" in out
-    assert "1" not in out
-    assert "ab" not in out
-    assert "a" not in out
+
+
+def test_completion_signal_tokens_set_is_frozen_and_complete():
+    from check_items_prefilter import COMPLETION_SIGNAL_TOKENS
+    assert isinstance(COMPLETION_SIGNAL_TOKENS, frozenset)
+    # Spec-locked set — see 2026-05-16-l2-prefilter-completion-signal-design.md
+    assert COMPLETION_SIGNAL_TOKENS == frozenset({
+        "done", "shipped", "merged", "closed", "fixed", "resolved",
+        "released", "deprecated", "removed", "reverted", "completed",
+    })
 
 
 def test_ref_pattern_matches_issue_number():

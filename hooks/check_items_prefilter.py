@@ -15,6 +15,11 @@ STOPWORDS = frozenset({
     "that", "this", "with", "on", "by", "it", "as", "be", "are",
 })
 
+COMPLETION_SIGNAL_TOKENS = frozenset({
+    "done", "shipped", "merged", "closed", "fixed", "resolved",
+    "released", "deprecated", "removed", "reverted", "completed",
+})
+
 REF_PATTERN = re.compile(r'(?<!\w)#\d+\b|\b[0-9a-f]{7,40}\b')
 
 _WORD_RE = re.compile(r'\w+')
