@@ -105,17 +105,29 @@ If N <= 5, create a sub-task for each note (subject `"Upgrade: <basename>"`, act
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '%s' "$UNSUMMARIZED_PATHS_JSON" | python3 -c '
 import sys, os, json
+from collections import Counter
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import upgrade_batch
 paths = json.loads(sys.stdin.read())
 results = upgrade_batch(paths, sys.argv[1], sys.argv[2], sys.argv[3])
-print(json.dumps([{"path": p, "status": s} for p, s in results]))
+# results is list[dict] with keys: path, status, elapsed_s, model_used, fallback_reason
+total_s = round(sum(r["elapsed_s"] for r in results), 1)
+model_counts = Counter()
+for r in results:
+    tag = r["model_used"] or "fallback"
+    model_counts[tag] += 1
+DASH = chr(45)
+breakdown = " / ".join(f"{n} {m.split(DASH)[0]}" for m, n in model_counts.most_common())
+print(json.dumps(results))
+print(f"[obsidian-brain] Step 2: upgraded {len(results)} note(s) in {total_s}s ({breakdown})", file=sys.stderr)
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-Parse the returned JSON array. For each entry:
+Parse the returned JSON array. Each result dict has: `path`, `status`, `elapsed_s`, `model_used` (`haiku-4.5` | `subagent-*` | `None`), `fallback_reason` (`haiku_timeout` | `empty_output` | `haiku_subprocess_error` | `None`). For each entry:
 - `status` starts with `Upgraded ` → mark as succeeded
 - anything else (including `Failed: ...`, empty, or unexpected prefix) → add to the Phase 2 fallback list
+
+The stderr line emits a per-model breakdown visible in the tool trace (e.g. `Step 2: upgraded 7 note(s) in 12.4s (5 haiku / 2 fallback)`).
 
 If N <= 5: update each sub-task accordingly (succeeded or `Failed: <basename>`).
 If N > 5: update task #2 subject to `Upgrade N notes: M succeeded, F pending fallback`.
