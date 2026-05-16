@@ -181,7 +181,7 @@ def test_snapshot_routes_through_snapshot_prompt(tmp_path):
          patch("hooks.obsidian_utils.generate_summary", fake_session_summary):
         result = upgrade_unsummarized_note(str(snap_path), str(vault), "claude-sessions", "demo")
 
-    assert not result.startswith("Failed"), result
+    assert not result[0].startswith("Failed"), result[0]
     types_called = [c[0] for c in calls]
     assert types_called == ["snapshot"]
     # File now contains the snapshot-shaped summary
@@ -219,7 +219,7 @@ def test_session_routes_through_session_prompt(tmp_path):
          patch("hooks.obsidian_utils.generate_summary", fake_session_summary):
         result = upgrade_unsummarized_note(str(sess_path), str(vault), "claude-sessions", "demo")
 
-    assert not result.startswith("Failed"), result
+    assert not result[0].startswith("Failed"), result[0]
     types_called = [c[0] for c in calls]
     assert types_called == ["session"]
 

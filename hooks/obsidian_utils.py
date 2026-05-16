@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -4173,27 +4174,46 @@ def upgrade_unsummarized_note(
     project: str,
     summary_model: str = "haiku",
     summary_timeout: int | None = None,
-) -> str:
+) -> tuple[str, float, str | None, str | None]:
     """Upgrade an unsummarized session note with an AI summary.
 
     Orchestrates: find JSONL → parse transcript → decide source →
     generate summary → dedup open items → atomic write.
 
-    Returns a one-line status string for the model to relay.
+    Returns a 4-tuple ``(status, elapsed_s, model_used, fallback_reason)``:
 
-    Return contract: success strings begin with ``"Upgraded "``; all other
-    return values (including ``"Failed: ..."``, empty, or any unexpected
-    prefix) indicate failure. Callers routing on return value — notably
-    ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the ``"Upgraded "``
-    prefix as the positive path. Adding any new return prefix to this
-    function requires an audit of routing call sites.
+    - **status** (*str*) — one-line status string for the model to relay.
+      Success strings begin with ``"Upgraded "``; all other values (including
+      ``"Failed: ..."``) indicate failure. Callers routing on return value —
+      notably ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the
+      ``"Upgraded "`` prefix as the positive path.
+    - **elapsed_s** (*float*) — wall-clock seconds rounded to 2 decimal places.
+    - **model_used** (*str | None*) — model that produced the summary, or
+      ``None`` on failure paths that never reached summarization. Day-one
+      values: ``"haiku-4.5"`` on success, ``None`` on all failure paths.
+      Sonnet/Opus/sub-agent tags are reserved for Phase 2/3 instrumentation.
+    - **fallback_reason** (*str | None*) — non-``None`` when
+      ``generate_summary`` / ``generate_snapshot_summary`` used a fallback
+      strategy; threaded through from those functions unchanged.
+
+    Adding any new return prefix to the ``status`` field requires an audit
+    of routing call sites.
     """
+    _t0 = time.monotonic()
+
+    def _ret(
+        status: str,
+        model_used: str | None = None,
+        fallback_reason: str | None = None,
+    ) -> tuple[str, float, str | None, str | None]:
+        return status, round(time.monotonic() - _t0, 2), model_used, fallback_reason
+
     # Read the raw note
     try:
         with open(note_path, 'r', encoding='utf-8') as f:
             raw_lines = f.readlines()
     except OSError as exc:
-        return f"Failed: cannot read {os.path.basename(note_path)}: {exc}"
+        return _ret(f"Failed: cannot read {os.path.basename(note_path)}: {exc}")
 
     # Extract session_id from frontmatter
     session_id = None
@@ -4203,7 +4223,7 @@ def upgrade_unsummarized_note(
             session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
             break
     if not session_id:
-        return f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}"
+        return _ret(f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}")
 
     # Find and parse the JSONL transcript
     jsonl_path = find_transcript_jsonl(session_id)
@@ -4268,7 +4288,7 @@ def upgrade_unsummarized_note(
                     assistant_msgs.append(stripped[14:].strip())
 
     if not user_msgs and not assistant_msgs:
-        return f"Failed: no conversation content in {os.path.basename(note_path)}"
+        return _ret(f"Failed: no conversation content in {os.path.basename(note_path)}")
 
     # Build metadata for generate_summary
     metadata: dict = {"project": project, "vault_path": vault_path, "sessions_folder": sessions_folder}
@@ -4323,12 +4343,17 @@ def upgrade_unsummarized_note(
         )
 
     if not summary_text:
-        return f"Failed: AI summarization returned empty for {os.path.basename(note_path)}"
+        return _ret(
+            f"Failed: AI summarization returned empty for {os.path.basename(note_path)}",
+            model_used=None,
+            fallback_reason=fallback_reason,
+        )
 
-    return upgrade_note_with_summary(
+    status = upgrade_note_with_summary(
         note_path, summary_text, vault_path, sessions_folder, project,
         source=source, warnings=warnings,
     )
+    return _ret(status, model_used="haiku-4.5", fallback_reason=None)
 
 
 def upgrade_batch(
@@ -4389,7 +4414,10 @@ def upgrade_batch(
         results: list[tuple[str, str]] = []
         for p, fut in zip(paths, futs):
             try:
-                results.append((p, fut.result()))
+                # Task 7 rewrites this loop to the dict shape; for now unpack
+                # the 4-tuple and preserve the existing (path, status) contract.
+                status, _elapsed, _model, _reason = fut.result()
+                results.append((p, status))
             except Exception as exc:  # noqa: BLE001 — per-note isolation
                 results.append((p, f"Failed: {type(exc).__name__}: {exc}"))
         return results
