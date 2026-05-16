@@ -682,6 +682,40 @@ def test_semantic_merge_prompt_contains_negative_examples():
 # ---------------------------------------------------------------------------
 
 
+def _make_model_pick_fake_run(captured: dict):
+    """Chunk-aware subprocess.run stub for model-selection assertions.
+
+    Parses the embedded output path out of the prompt and writes a one-record
+    classifier payload there, so the stub works for both single and chunked
+    dispatch paths. Records the most recent cmd in captured["cmd"].
+    """
+    import re as _re
+    from pathlib import Path as _Path
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = cmd
+        prompt = kwargs.get("input", "")
+        in_match = _re.search(r"(/\S+\.classin\.json)", prompt)
+        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
+        assert in_match and out_match, f"paths missing from prompt: {prompt[:200]!r}"
+        chunk_in = json.loads(_Path(in_match.group(1)).read_text())
+        chunk_out = [
+            {
+                "group_id": g["group_id"],
+                "classification": "ACTIVE",
+                "confidence": "LOW",
+                "canonical_text": g["representative"],
+                "evidence_citation": None,
+                "action_required": None,
+            }
+            for g in chunk_in["groups"]
+        ]
+        _Path(out_match.group(1)).write_text(json.dumps(chunk_out))
+        return _fake_completed(stdout=json.dumps(chunk_out), returncode=0)
+
+    return fake_run
+
+
 def test_run_classifier_picks_haiku_at_30_or_fewer(tmp_path, monkeypatch):
     """<=30 merged groups -> claude -p --model haiku per spec line 106."""
     import check_items_cli as cli
@@ -689,18 +723,8 @@ def test_run_classifier_picks_haiku_at_30_or_fewer(tmp_path, monkeypatch):
     # Disable L2 prefilter: this test exercises sub-agent model selection, not L2.
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
 
-    captured = {}
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = cmd
-        out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps([
-            {"group_id": "g1", "classification": "ACTIVE", "confidence": "LOW",
-             "canonical_text": "x", "evidence_citation": None, "action_required": None}
-        ]))
-        return _fake_completed(stdout=out_path.read_text(), returncode=0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    captured: dict = {}
+    monkeypatch.setattr(cli.subprocess, "run", _make_model_pick_fake_run(captured))
     payload = {
         "groups": [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
                     "instances": []} for i in range(30)],
@@ -719,15 +743,8 @@ def test_run_classifier_picks_sonnet_above_30(tmp_path, monkeypatch):
     # Disable L2 prefilter: this test exercises sub-agent model selection, not L2.
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
 
-    captured = {}
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = cmd
-        out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps([]))
-        return _fake_completed(stdout=out_path.read_text(), returncode=0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    captured: dict = {}
+    monkeypatch.setattr(cli.subprocess, "run", _make_model_pick_fake_run(captured))
     payload = {
         "groups": [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
                     "instances": []} for i in range(45)],

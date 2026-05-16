@@ -40,9 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against the issue-173 reference payload: `prefiltered` jumps from 0
   to 12 on 21 groups. (#173)
 
+- `/check-items` Stage 4 classifier sub-agent now chunks when more than
+  `CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE` (default 25) groups reach
+  dispatch. Each chunk is sent to `claude -p` sequentially so a single
+  call stays well under `SUBAGENT_TIMEOUT_SEC`. Empirical evidence:
+  stock v2.5.0 timed out on 58 groups / 121 KB classifier input
+  (Sonnet > 180s). Telemetry adds `chunks=N` when N > 1. Reopens the
+  scope of issue #160 inside this PR rather than deferring. (#173)
+
 ### Fixed
 - Reduced `claude -p` sub-agent invocations for vaults with many open items that lack
-  completion evidence, addressing the timeout root cause reported in issue #160.
+  completion evidence, addressing the timeout root cause reported in issue #160 and
+  closed prematurely by #164 (chunking now ships as the durable fix).
 
 ## [2.5.0] - 2026-05-14
 

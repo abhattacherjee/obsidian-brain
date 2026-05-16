@@ -1014,3 +1014,193 @@ def test_strip_unreleased_unreleased_at_end_with_no_released_section():
     out = _strip_unreleased_section(cl)
     assert "foo_bar" not in out
     # Header may or may not be retained — either is fine, but WIP content must be gone
+
+
+# ---------------------------------------------------------------------------
+# Classifier chunking — sequential dispatch for large group counts (#160/#173)
+# ---------------------------------------------------------------------------
+
+def _make_chunking_fake_run(output_path: str, return_rcs: list | None = None,
+                            timeout_on: int | None = None):
+    """Build a subprocess.run stub that handles chunked dispatch.
+
+    For each call, the stub:
+      - parses the embedded `<output-json-path>` from the prompt (which is
+        either output_path for single dispatch, or a temp `.classout.json`
+        file for chunked dispatch)
+      - reads the corresponding `<input-json-path>` to learn which group_ids
+        are in this chunk
+      - writes one DONE-classification record per group_id to the per-chunk
+        output path
+    Optionally returns a non-zero rc for the call index in `return_rcs`, or
+    raises TimeoutExpired for the call index in `timeout_on`.
+    """
+    import re as _re
+    call_index = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        idx = call_index["n"]
+        call_index["n"] += 1
+
+        if timeout_on is not None and idx == timeout_on:
+            raise subprocess.TimeoutExpired(cmd=args[0] if args else "claude", timeout=1)
+
+        prompt = kwargs.get("input", "")
+        in_match = _re.search(r"(/\S+\.classin\.json)", prompt)
+        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
+        assert in_match, f"input path missing from prompt: {prompt[:200]!r}"
+        assert out_match, f"output path missing from prompt: {prompt[:200]!r}"
+        in_path = in_match.group(1)
+        out_path = out_match.group(1)
+
+        chunk_payload = json.loads(Path(in_path).read_text())
+        chunk_results = [
+            {
+                "group_id": g["group_id"],
+                "classification": "DONE",
+                "confidence": "HIGH",
+                "canonical_text": g["representative"],
+                "evidence_citation": "commit abc1234",
+                "action_required": None,
+            }
+            for g in chunk_payload["groups"]
+        ]
+        Path(out_path).write_text(json.dumps(chunk_results), encoding="utf-8")
+
+        mock_cp = MagicMock()
+        mock_cp.returncode = (return_rcs[idx] if return_rcs and idx < len(return_rcs) else 0)
+        mock_cp.stderr = ""
+        mock_cp.stdout = ""
+        return mock_cp
+
+    return fake_run, call_index
+
+
+# Need subprocess import in the test module for TimeoutExpired (already imported
+# transitively via patch target, but make it explicit here).
+import subprocess  # noqa: E402
+
+
+def test_classifier_chunking_under_threshold_single_dispatch(tmp_path, monkeypatch, capsys):
+    """N groups at exactly the chunk-size threshold → single dispatch, no `chunks=` in telemetry."""
+    import check_items_cli
+
+    monkeypatch.setattr("check_items_cli.CLASSIFIER_CHUNK_SIZE", 25)
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")  # force all → classifier
+
+    groups = [_make_group(f"g{i}", f"Fix bug number {i}") for i in range(25)]
+    payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    fake_run, calls = _make_chunking_fake_run(output_path)
+    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 0
+    assert calls["n"] == 1, f"Expected 1 dispatch for 25 groups (threshold), got {calls['n']}"
+
+    out = json.loads(Path(output_path).read_text())
+    assert len(out) == 25
+    assert [r["group_id"] for r in out] == [f"g{i}" for i in range(25)]
+
+    captured = capsys.readouterr()
+    assert "chunks=" not in captured.err, (
+        f"Telemetry must not include chunks= for single-dispatch path; got: {captured.err!r}"
+    )
+
+
+def test_classifier_chunking_above_threshold_splits(tmp_path, monkeypatch, capsys):
+    """N > chunk_size groups → ceil(N/chunk) sequential dispatches, results merged."""
+    import check_items_cli
+
+    monkeypatch.setattr("check_items_cli.CLASSIFIER_CHUNK_SIZE", 25)
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
+    # 60 groups → 3 chunks of 25 / 25 / 10
+    groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(60)]
+    payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    fake_run, calls = _make_chunking_fake_run(output_path)
+    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 0
+    assert calls["n"] == 3, f"Expected 3 chunks for 60 groups (chunk_size=25), got {calls['n']}"
+
+    out = json.loads(Path(output_path).read_text())
+    assert len(out) == 60
+    # Input order preserved across chunk boundaries
+    assert [r["group_id"] for r in out] == [f"g{i:03d}" for i in range(60)]
+
+    captured = capsys.readouterr()
+    assert "chunks=3" in captured.err, (
+        f"Telemetry must include chunks=3 for 3-chunk dispatch; got: {captured.err!r}"
+    )
+    assert "chunking 60 groups into 3 chunk(s)" in captured.err, (
+        f"Chunking announcement missing from stderr; got: {captured.err!r}"
+    )
+
+
+def test_classifier_chunking_chunk_failure_returns_rc(tmp_path, monkeypatch):
+    """If any chunk times out, run_classifier returns rc=3 (all-or-nothing)."""
+    import check_items_cli
+
+    monkeypatch.setattr("check_items_cli.CLASSIFIER_CHUNK_SIZE", 10)
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
+    # 30 groups → 3 chunks of 10. Time out the 2nd chunk.
+    groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(30)]
+    payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    fake_run, calls = _make_chunking_fake_run(output_path, timeout_on=1)
+    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 3, f"Expected rc=3 (timeout) when chunk 2/3 times out, got {rc}"
+    # Dispatch stopped at the failing chunk (no chunk 3 attempted)
+    assert calls["n"] == 2, f"Expected 2 dispatches before bail-out, got {calls['n']}"
+
+
+def test_classifier_chunking_env_override(tmp_path, monkeypatch, capsys):
+    """CLASSIFIER_CHUNK_SIZE override via module attribute splits at the new threshold."""
+    import check_items_cli
+
+    monkeypatch.setattr("check_items_cli.CLASSIFIER_CHUNK_SIZE", 5)
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
+    # 12 groups, chunk_size=5 → 3 chunks of 5/5/2
+    groups = [_make_group(f"g{i:02d}", f"Fix bug number {i}") for i in range(12)]
+    payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    fake_run, calls = _make_chunking_fake_run(output_path)
+    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 0
+    assert calls["n"] == 3, f"Expected 3 chunks for 12 groups (chunk_size=5), got {calls['n']}"
+
+    captured = capsys.readouterr()
+    assert "chunks=3" in captured.err
+
+
+def test_classifier_chunk_size_env_clamped_to_minimum():
+    """CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE values below 1 are clamped to 1 at import time."""
+    import importlib
+    import check_items_cli
+    saved = os.environ.get("CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE")
+    try:
+        os.environ["CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE"] = "0"
+        importlib.reload(check_items_cli)
+        assert check_items_cli.CLASSIFIER_CHUNK_SIZE == 1
+        os.environ["CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE"] = "-5"
+        importlib.reload(check_items_cli)
+        assert check_items_cli.CLASSIFIER_CHUNK_SIZE == 1
+    finally:
+        if saved is None:
+            os.environ.pop("CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE", None)
+        else:
+            os.environ["CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE"] = saved
+        importlib.reload(check_items_cli)
