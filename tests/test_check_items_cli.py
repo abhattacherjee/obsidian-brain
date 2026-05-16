@@ -40,7 +40,7 @@ EVIDENCE_EMPTY_TEXT = {
 }
 
 EVIDENCE_WITH_MATCH_TEXT = {
-    "commits_text": "fix session_log race condition abc1234",
+    "commits_text": "fixed session_log race condition",
     "merged_prs_text": "",
     "closed_issues_text": "",
     "releases_text": "",
@@ -52,7 +52,7 @@ EVIDENCE_WITH_MATCH_TEXT = {
 # nested under a project key — this is the live production shape.
 EVIDENCE_BARE_KEYS_WITH_MATCH = {
     "obsidian-brain": {
-        "commits": ["abc1234 fix session_log race condition"],
+        "commits": ["abc1234 fixed session_log race condition"],
         "merged_prs": [],
         "closed_issues": [],
         "releases": [],

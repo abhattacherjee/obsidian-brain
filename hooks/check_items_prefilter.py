@@ -63,20 +63,26 @@ def _has_nearby_completion_signal(haystack: str, content_tokens: list[str],
 
 
 def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
-    """Return True if the group has any plausible completion evidence.
+    """Return True if the group has plausible completion evidence.
 
-    Two checks (first match wins):
-    1. Explicit issue/PR/commit-sha references in canonical_text — let the
-       sub-agent handle anti-conflation (spec § Anti-conflation rule).
-    2. Token overlap between canonical_text content tokens and the evidence
-       bundle haystack.
+    Zone-aware rules (first match wins):
+      1. Ref shortcut: REF_PATTERN matches #N or commit-sha in canonical_text.
+      2. Completion-zone overlap: any content-token from canonical_text
+         appears in (merged_prs_text + closed_issues_text + releases_text +
+         changelog_excerpt). These buckets pre-encode completion.
+      3. Activity-zone proximity: a content-token appears in
+         (commits_text + fts_mentions_text) AND a COMPLETION_SIGNAL_TOKENS
+         entry occurs within 120 chars of that hit.
+
+    Otherwise returns False; the caller produces a synthetic STALE/ACTIVE
+    classification via synthetic_classification().
 
     Args:
-        group: A group dict with at minimum a 'representative' field containing
-               the canonical text. May also carry 'instances' list with 'text'.
+        group: Group dict with at minimum a 'representative' field containing
+               canonical text. May also carry 'canonical_text'.
         evidence: Dict with optional keys: commits_text, merged_prs_text,
                   closed_issues_text, releases_text, changelog_excerpt,
-                  fts_mentions_text. Any missing key is treated as empty string.
+                  fts_mentions_text. Any missing key is treated as empty.
 
     Returns:
         True if the sub-agent should classify this item; False if L2 can
@@ -84,25 +90,30 @@ def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
     """
     canonical_text = group.get("representative") or group.get("canonical_text", "")
 
-    # Check 1: explicit issue/PR/commit-sha reference
+    # Rule 1: explicit issue/PR/commit-sha reference
     if REF_PATTERN.search(canonical_text):
         return True
 
-    # Check 2: token overlap with evidence bundle
     tokens = _content_tokens(canonical_text)
     if not tokens:
         return False
 
-    haystack = "\n".join([
-        evidence.get("commits_text") or "",
+    # Rule 2: completion-zone overlap (buckets pre-encode completion)
+    completion_haystack = "\n".join([
         evidence.get("merged_prs_text") or "",
         evidence.get("closed_issues_text") or "",
         evidence.get("releases_text") or "",
         evidence.get("changelog_excerpt") or "",
-        evidence.get("fts_mentions_text") or "",
     ]).lower()
+    if any(t.lower() in completion_haystack for t in tokens):
+        return True
 
-    return any(t.lower() in haystack for t in tokens)
+    # Rule 3: activity-zone proximity (requires completion-signal verb nearby)
+    activity_haystack = "\n".join([
+        evidence.get("commits_text") or "",
+        evidence.get("fts_mentions_text") or "",
+    ])
+    return _has_nearby_completion_signal(activity_haystack, tokens)
 
 
 _STALE_THRESHOLD_DAYS = 90

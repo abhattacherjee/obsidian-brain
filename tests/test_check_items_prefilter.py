@@ -82,10 +82,10 @@ def test_has_evidence_commit_sha_wins_immediately():
 
 
 def test_has_evidence_token_overlap_with_commits():
-    """Token overlap with commits_text returns True."""
+    """Token overlap with commits_text + nearby completion verb returns True (activity-zone)."""
     from check_items_prefilter import has_classifiable_evidence
     group = _make_group("Fix session_log race condition")
-    evidence = _make_evidence(commits_text="fix session_log race condition in hook abc1234")
+    evidence = _make_evidence(commits_text="fixed session_log race condition in hook")
     assert has_classifiable_evidence(group, evidence) is True
 
 
@@ -423,3 +423,113 @@ def test_nearby_completion_signal_empty_inputs_return_false():
     from check_items_prefilter import _has_nearby_completion_signal
     assert _has_nearby_completion_signal("", ["anchor"]) is False
     assert _has_nearby_completion_signal("fixed it", []) is False
+
+
+# ---------------------------------------------------------------------------
+# Zone-aware rules — spec table cases (#173, v2.6)
+# ---------------------------------------------------------------------------
+
+def test_has_evidence_ref_only_issue_number_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("Fix issue #42 in loader")
+    assert has_classifiable_evidence(group, _make_evidence()) is True
+
+
+def test_has_evidence_ref_only_commit_sha_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("Backport a1b2c3d to develop")
+    assert has_classifiable_evidence(group, _make_evidence()) is True
+
+
+def test_has_evidence_completion_zone_closed_issues_hit_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("anchor cache regression")
+    ev = _make_evidence(closed_issues_text="anchor caching bug write-up")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_completion_zone_merged_prs_hit_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("telemetry dashboard chip alignment")
+    ev = _make_evidence(merged_prs_text="telemetry dashboard chip layout PR")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_completion_zone_changelog_hit_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("session anchor resolution")
+    ev = _make_evidence(changelog_excerpt="### Added\n- session anchor resolution")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_completion_zone_releases_hit_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("midnight rollover handling")
+    ev = _make_evidence(releases_text="v0.3.0\tmidnight rollover handling shipped")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_activity_zone_proximity_hit_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("anchor regression in pipeline")
+    ev = _make_evidence(commits_text="fixed anchor caching in pipeline")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_activity_zone_no_signal_returns_false():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("anchor regression in pipeline")
+    ev = _make_evidence(commits_text="implement anchor scaffold for new feature")
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_has_evidence_activity_zone_far_signal_returns_false():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("anchor regression")
+    filler = "x " * 200
+    ev = _make_evidence(commits_text=f"anchor work {filler} closed")
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_has_evidence_activity_zone_fts_mentions_with_signal_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("anchor resolution")
+    ev = _make_evidence(fts_mentions_text="anchor resolution completed in session")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_no_content_tokens_returns_false():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("the and of")
+    ev = _make_evidence(commits_text="closed many things", merged_prs_text="shipped lots")
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_has_evidence_no_overlap_anywhere_returns_false():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("widget rendering pipeline")
+    ev = _make_evidence(
+        commits_text="anchor resolution work",
+        merged_prs_text="anchor PR",
+        closed_issues_text="anchor bug",
+    )
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_has_evidence_active_project_wip_item_returns_false():
+    """Regression repro: WIP item shares vocabulary with its own commits but
+    no completion signal nearby — must be prefiltered as ACTIVE."""
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group(
+        "Implement resolveLastSessionAnchor(reader, now) with lifecycle pair "
+        "detection and 5h cap in lib/timeframes/anchors.ts."
+    )
+    ev = _make_evidence(
+        commits_text=(
+            "feat(anchors): scaffold resolveLastSessionAnchor\n"
+            "feat(timeframes): add lifecycle pair detection helper\n"
+            "chore(anchors): rename anchor types\n"
+        ),
+        fts_mentions_text="anchor design discussion in vault note",
+    )
+    assert has_classifiable_evidence(group, ev) is False
