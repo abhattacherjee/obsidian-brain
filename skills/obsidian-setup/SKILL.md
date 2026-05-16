@@ -39,6 +39,7 @@ if vp:
     print(f"SESS={sess}")
     print(f"INS={ins}")
     print(f"DASH={dash}")
+    print(f"CHK={chk}")
 else:
     print("NO_CONFIG")
 '
