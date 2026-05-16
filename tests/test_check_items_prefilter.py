@@ -376,3 +376,50 @@ def test_mtime_threading_old_and_new_files_differ(tmp_path):
         "Old and new groups must classify differently — if both are STALE, "
         "mtime is likely not reaching synthetic_classification (original bug)."
     )
+
+
+def test_nearby_completion_signal_finds_adjacent_verb():
+    from check_items_prefilter import _has_nearby_completion_signal
+    haystack = "fixed anchor caching bug"
+    assert _has_nearby_completion_signal(haystack, ["anchor"]) is True
+
+
+def test_nearby_completion_signal_returns_false_when_only_activity():
+    from check_items_prefilter import _has_nearby_completion_signal
+    haystack = "implement anchor scaffold for new feature"
+    assert _has_nearby_completion_signal(haystack, ["anchor"]) is False
+
+
+def test_nearby_completion_signal_returns_false_when_no_content_hit():
+    from check_items_prefilter import _has_nearby_completion_signal
+    haystack = "closed many things but not this widget"
+    assert _has_nearby_completion_signal(haystack, ["telemetry"]) is False
+
+
+def test_nearby_completion_signal_returns_false_when_signal_outside_window():
+    from check_items_prefilter import _has_nearby_completion_signal
+    # 200 chars of filler between the content token and the completion verb
+    haystack = "anchor work " + ("x " * 200) + "closed"
+    assert _has_nearby_completion_signal(haystack, ["anchor"]) is False
+
+
+def test_nearby_completion_signal_case_insensitive():
+    from check_items_prefilter import _has_nearby_completion_signal
+    haystack = "RESOLVED Anchor regression in pipeline"
+    assert _has_nearby_completion_signal(haystack, ["Anchor"]) is True
+
+
+def test_nearby_completion_signal_default_window_is_120_chars():
+    from check_items_prefilter import _has_nearby_completion_signal
+    # 100 char gap — within default 120 window
+    haystack_in = "anchor" + (" " * 100) + "closed"
+    assert _has_nearby_completion_signal(haystack_in, ["anchor"]) is True
+    # 130 char gap — outside default 120 window
+    haystack_out = "anchor" + (" " * 130) + "closed"
+    assert _has_nearby_completion_signal(haystack_out, ["anchor"]) is False
+
+
+def test_nearby_completion_signal_empty_inputs_return_false():
+    from check_items_prefilter import _has_nearby_completion_signal
+    assert _has_nearby_completion_signal("", ["anchor"]) is False
+    assert _has_nearby_completion_signal("fixed it", []) is False

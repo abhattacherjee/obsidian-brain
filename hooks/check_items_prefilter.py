@@ -33,6 +33,35 @@ def _content_tokens(text: str) -> list[str]:
             if t.lower() not in STOPWORDS and len(t) > 2]
 
 
+def _has_nearby_completion_signal(haystack: str, content_tokens: list[str],
+                                  window: int = 120) -> bool:
+    """Return True if any completion-signal token appears within `window` chars
+    of any content-token hit in `haystack`.
+
+    Both haystack and tokens are matched case-insensitively. Empty inputs
+    return False.
+    """
+    if not haystack or not content_tokens:
+        return False
+    h = haystack.lower()
+    for tok in content_tokens:
+        tok_l = tok.lower()
+        if not tok_l:
+            continue
+        idx = 0
+        while True:
+            i = h.find(tok_l, idx)
+            if i == -1:
+                break
+            lo = max(0, i - window)
+            hi = min(len(h), i + len(tok_l) + window)
+            slice_ = h[lo:hi]
+            if any(sig in slice_ for sig in COMPLETION_SIGNAL_TOKENS):
+                return True
+            idx = i + 1
+    return False
+
+
 def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
     """Return True if the group has any plausible completion evidence.
 
