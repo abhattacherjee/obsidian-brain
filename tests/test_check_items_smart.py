@@ -1463,22 +1463,37 @@ def test_dashboard_active_truncation_and_path_guard(tmp_path):
 # R2 regression: Finding 3 — path traversal via scope_name
 # ---------------------------------------------------------------------------
 
-def test_dashboard_rejects_path_traversal_in_scope_name(tmp_path):
-    """Containment guard rejects ../escape attempts in scope_name."""
-    from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
-    (vault / "claude-dashboards").mkdir(parents=True)
-    # Path-traversal scope name: should be sanitized, not escape
-    path = write_check_items_dashboard(
-        vault_path=str(vault), scope_name="../../etc/passwd", date_str="2026-05-11",
-        window_days=14, raw_count=0, group_count=0, classifications=[],
-        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
-        classifier_mode="ok", dry_run=True,
-    )
-    # File must land inside check-items folder, with sanitized name
-    assert str(vault / "claude-check-items") in path
-    assert ".." not in os.path.basename(path)
-    assert "/" not in os.path.basename(path)
+def test_dashboard_rejects_path_traversal_in_scope_name(tmp_path, monkeypatch):
+    """Containment guard rejects ../escape attempts in scope_name.
+
+    Isolated from the user's live load_config() value by monkeypatching
+    _CONFIG_PATH to a tmp config with no `check_items_folder` override.
+    Without isolation, a cached or user-set `check_items_folder` value
+    would change the expected output path and break the assertion.
+    """
+    import json
+    cfg_path = tmp_path / "obsidian-brain-config.json"
+    cfg_path.write_text(json.dumps({"vault_path": str(tmp_path / "vault")}))
+    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    _reset_load_config_cache()
+
+    try:
+        from check_items_report import write_check_items_dashboard
+        vault = tmp_path / "vault"
+        vault.mkdir(parents=True)
+        # Path-traversal scope name: should be sanitized, not escape
+        path = write_check_items_dashboard(
+            vault_path=str(vault), scope_name="../../etc/passwd", date_str="2026-05-11",
+            window_days=14, raw_count=0, group_count=0, classifications=[],
+            applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+            classifier_mode="ok", dry_run=True,
+        )
+        # File must land inside check-items folder, with sanitized name
+        assert str(vault / "claude-check-items") in path
+        assert ".." not in os.path.basename(path)
+        assert "/" not in os.path.basename(path)
+    finally:
+        _reset_load_config_cache()
 
 
 # ---------------------------------------------------------------------------
