@@ -1,0 +1,30 @@
+{
+  "alpha-project": {
+    "commits": [
+      "abc1234 feat(core): scaffold alpha_task entry point",
+      "def5678 feat(core): add beta_handler for alpha_task",
+      "f1e2d3c chore(core): rename alpha_task internal types",
+      "9a8b7c6 feat(core): integrate gamma_parser with alpha_task",
+      "7d6e5f4 refactor(core): split alpha_task into pure stages",
+      "5c4b3a2 test(core): cover alpha_task edge cases",
+      "1a2b3c4 feat(core): add delta_processor adjacent to alpha_task",
+      "8f7e6d5 chore(core): bump deps for alpha_task",
+      "3e2d1c0 feat(core): epsilon_emitter wires alpha_task output",
+      "0a1b2c3 docs(core): document alpha_task contract"
+    ],
+    "releases": [
+      "v0.2.0\t\tv0.2.0\t2026-05-11T20:19:14Z",
+      "v0.1.0\t\tv0.1.0\t2026-04-30T10:00:00Z"
+    ],
+    "merged_prs": [
+      {"mergedAt": "2026-05-14T19:00:00Z", "number": 50, "title": "feat(ui): shipped zeta_widget rendering", "url": "https://example/pull/50"},
+      {"mergedAt": "2026-05-13T19:00:00Z", "number": 41, "title": "feat(pipeline): completed eta_pipeline ingestion", "url": "https://example/pull/41"}
+    ],
+    "closed_issues": [
+      {"body": "Theta_counter double-counting fixed in cache layer.", "closedAt": "2026-05-11T21:00:00Z", "number": 39, "title": "fix(cache): theta_counter double-count regression", "url": "https://example/issues/39"},
+      {"body": "Iota_pager divergence resolved by aligning two queries.", "closedAt": "2026-05-10T15:00:00Z", "number": 36, "title": "test(e2e): iota_pager divergence", "url": "https://example/issues/36"}
+    ],
+    "changelog_excerpt": "# Changelog\n\n## [0.2.0] - 2026-05-11\n### Added\n- zeta_widget rendering shipped\n- eta_pipeline ingestion completed\n### Fixed\n- theta_counter double-counting in cache layer\n",
+    "fts_mentions": {}
+  }
+}
