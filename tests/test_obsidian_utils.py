@@ -1901,20 +1901,8 @@ class TestUpgradeBatch:
     model_used, fallback_reason.
     """
 
-    @pytest.fixture(autouse=True)
-    def _isolate_summarizer_sink(self, tmp_path, monkeypatch):
-        """Prevent the upgrade_batch test class from writing to ~/.claude."""
-        import sys
-        from pathlib import Path
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-        import summarizer_metrics
-        monkeypatch.setattr(
-            summarizer_metrics, "METRICS_PATH",
-            tmp_path / "test-metrics.jsonl",
-        )
-
-    def test_upgrade_batch_empty_list_returns_empty(self, monkeypatch):
-        """Empty input: return [] immediately and never invoke the wrapped fn."""
+    def test_upgrade_batch_empty_list_returns_empty(self, monkeypatch, tmp_path):
+        """Empty input: return [] immediately and never invoke the wrapped fn or the sink."""
         calls = []
 
         def fake_impl(*args, **kwargs):
@@ -1923,16 +1911,21 @@ class TestUpgradeBatch:
 
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
 
+        metrics_path = tmp_path / "test-metrics.jsonl"
+        import summarizer_metrics
+        monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
+
         result = obsidian_utils.upgrade_batch(
             [], "/vault", "sessions", "proj",
         )
         assert result == []
         assert calls == []
+        assert not metrics_path.exists(), "empty batch must not write a sink record"
 
     def test_upgrade_batch_n1(self, monkeypatch):
         """Single path: single dict with path and status returned."""
         def fake_impl(note_path, *args, **kwargs):
-            return f"Summarized: {os.path.basename(note_path)}", 0.1, "haiku-4.5", None
+            return f"Summarized: {os.path.basename(note_path)}", 0.1, "haiku", None
 
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
 
@@ -1958,7 +1951,7 @@ class TestUpgradeBatch:
 
         def fake_impl(note_path, *args, **kwargs):
             _time.sleep(sleeps[os.path.basename(note_path)])
-            return f"done:{os.path.basename(note_path)}", 0.1, "haiku-4.5", None
+            return f"done:{os.path.basename(note_path)}", 0.1, "haiku", None
 
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
 
@@ -2592,5 +2585,5 @@ class TestUpgradeUnsummarizedNoteReturnsTuple:
         status, elapsed_s, model_used, fallback_reason = result
         assert status.startswith("Upgraded ")
         assert elapsed_s >= 0
-        assert model_used == "haiku-4.5"
+        assert model_used == "haiku"
         assert fallback_reason is None

@@ -77,3 +77,41 @@ def test_write_failure_does_not_raise(tmp_path, monkeypatch, capsys):
 
     err = capsys.readouterr().err
     assert "summarizer_metrics append failed" in err
+
+
+def test_does_not_rotate_at_exact_threshold(tmp_path, monkeypatch):
+    """Strict > predicate: file at exactly ROTATE_BYTES should NOT rotate on next append."""
+    metrics_path = tmp_path / "summarizer-metrics.jsonl"
+    monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
+    monkeypatch.setattr(summarizer_metrics, "ROTATE_BYTES", 100)
+
+    # Pre-seed file to exactly ROTATE_BYTES bytes using a valid JSONL line
+    # (padded to exactly 100 bytes including the trailing newline).
+    pad = "x" * (98 - len('{"seed":true}'))
+    seed_line = f'{{"seed":true,"pad":"{pad}"}}\n'
+    # Adjust to hit exactly 100 bytes
+    seed_line = ("x" * 99 + "\n")  # 100 bytes, valid text, not valid JSON but doesn't matter
+    assert len(seed_line.encode("utf-8")) == 100
+    metrics_path.write_text(seed_line, encoding="utf-8")
+
+    summarizer_metrics.append_metrics_record({"new": "line"})
+
+    rotated = metrics_path.with_suffix(".jsonl.1")
+    assert not rotated.exists(), "should not rotate when size == ROTATE_BYTES (strict >)"
+    # The new record must be in the main file (two lines total)
+    lines = metrics_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[-1]) == {"new": "line"}
+
+
+def test_non_json_serializable_record_does_not_raise(tmp_path, monkeypatch, capsys):
+    """A non-JSON-serializable record must never raise — log to stderr and return None."""
+    metrics_path = tmp_path / "summarizer-metrics.jsonl"
+    monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
+
+    # An `object()` is not JSON-serializable; json.dumps raises TypeError
+    result = summarizer_metrics.append_metrics_record({"k": object()})
+    assert result is None
+    err = capsys.readouterr().err
+    assert "summarizer_metrics append failed" in err
+    assert "TypeError" in err

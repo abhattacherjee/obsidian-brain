@@ -1,8 +1,10 @@
 """Append-only JSONL telemetry sink for upgrade_batch() (issue #74).
 
 One JSON object per upgrade_batch() invocation. Owner-only (0o600). Rotates at
-100 KB to <name>.jsonl.1, overwriting any prior rotation. Never raises —
-instrumentation must not be able to break /recall.
+100 KB to <name>.jsonl.1, overwriting any prior rotation. Never raises
+``Exception`` — instrumentation must not be able to break /recall on routine
+I/O failures. (``KeyboardInterrupt`` / ``SystemExit`` still propagate, which is
+correct.)
 """
 from __future__ import annotations
 
@@ -35,4 +37,11 @@ def append_metrics_record(record: dict) -> None:
         if new_file:
             os.chmod(METRICS_PATH, 0o600)
     except Exception as exc:  # noqa: BLE001 — instrumentation never raises
-        print(f"[obsidian-brain] summarizer_metrics append failed: {exc}", file=sys.stderr)
+        try:
+            print(
+                f"[obsidian-brain] summarizer_metrics append failed "
+                f"({type(exc).__name__}): {exc}",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass  # truly airtight; nothing left to log to

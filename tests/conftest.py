@@ -1,9 +1,12 @@
 # tests/conftest.py
 """Shared fixtures for obsidian-brain test suite."""
 
+from __future__ import annotations
+
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -170,3 +173,18 @@ def sample_jsonl(tmp_path):
         encoding="utf-8",
     )
     return jsonl_path
+
+
+@pytest.fixture(autouse=True)
+def _isolate_summarizer_sink_globally(tmp_path_factory, monkeypatch):
+    """Belt-and-suspenders: redirect summarizer_metrics.METRICS_PATH to a tmp
+    path for every test in the suite. Prevents accidental pollution of
+    ~/.claude/obsidian-brain-summarizer-metrics.jsonl when a future test
+    forgets the per-class fixture."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+    try:
+        import summarizer_metrics
+    except ImportError:
+        return  # sink module not present in some test contexts
+    safe_path = tmp_path_factory.mktemp("metrics") / "summarizer-metrics.jsonl"
+    monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", safe_path)

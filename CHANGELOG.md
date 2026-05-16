@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `model_used`, and `fallback_reason`, and appends one record per call to
   `~/.claude/obsidian-brain-summarizer-metrics.jsonl` (100 KB rotation, owner-only).
   The `/recall` status line now reports total wall time and a per-model breakdown
-  (e.g., `Step 2: upgraded 7 note(s) in 12.4s (5 haiku / 2 fallback)`). Foundation
+  (e.g., `Step 2: upgraded 7 note(s) in 12.4s wall (5 haiku / 2 fallback)`). Foundation
   for the cost-reduction work tracked in #169. (#74)
 
 ### Changed

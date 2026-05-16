@@ -37,7 +37,7 @@ def test_upgrade_batch_returns_dicts_with_all_five_fields(monkeypatch, tmp_path,
     )
 
     def fake_uun(path, *a, **kw):
-        return (f"Upgraded {os.path.basename(path)}", 0.5, "haiku-4.5", None)
+        return (f"Upgraded {os.path.basename(path)}", 0.5, "haiku", None)
 
     monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_uun)
 
@@ -54,7 +54,7 @@ def test_upgrade_batch_returns_dicts_with_all_five_fields(monkeypatch, tmp_path,
         assert set(r.keys()) == {"path", "status", "elapsed_s", "model_used", "fallback_reason"}
         assert r["status"].startswith("Upgraded ")
         assert r["elapsed_s"] >= 0
-        assert r["model_used"] == "haiku-4.5"
+        assert r["model_used"] == "haiku"
         assert r["fallback_reason"] is None
     assert result[0]["path"] == str(p1)
     assert result[1]["path"] == str(p2)
@@ -66,7 +66,7 @@ def test_upgrade_batch_writes_telemetry_record(monkeypatch, tmp_path, fake_note)
     monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
 
     def fake_uun(path, *a, **kw):
-        return (f"Upgraded {os.path.basename(path)}", 0.5, "haiku-4.5", None)
+        return (f"Upgraded {os.path.basename(path)}", 0.5, "haiku", None)
 
     monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_uun)
 
@@ -84,7 +84,7 @@ def test_upgrade_batch_writes_telemetry_record(monkeypatch, tmp_path, fake_note)
     assert "ts" in rec
     assert rec["wall_s"] >= 0
     assert len(rec["notes"]) == 1
-    assert rec["notes"][0]["model_used"] == "haiku-4.5"
+    assert rec["notes"][0]["model_used"] == "haiku"
 
 
 def test_upgrade_batch_per_note_failure_captured_with_reason(monkeypatch, tmp_path, fake_note):

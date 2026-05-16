@@ -111,21 +111,26 @@ from obsidian_utils import upgrade_batch
 import time
 paths = json.loads(sys.stdin.read())
 _t0 = time.monotonic()
-results = upgrade_batch(paths, sys.argv[1], sys.argv[2], sys.argv[3])
-# results is list[dict] with keys: path, status, elapsed_s, model_used, fallback_reason
-wall_s = round(time.monotonic() - _t0, 1)
-model_counts = Counter()
-for r in results:
-    tag = r["model_used"] or "fallback"
-    model_counts[tag] += 1
-DASH = chr(45)
-breakdown = " / ".join(f"{n} {m.split(DASH)[0]}" for m, n in model_counts.most_common())
-print(json.dumps(results))
-print(f"[obsidian-brain] Step 2: upgraded {len(results)} note(s) in {wall_s}s wall ({breakdown})", file=sys.stderr)
+try:
+    results = upgrade_batch(paths, sys.argv[1], sys.argv[2], sys.argv[3])
+    # results is list[dict] with keys: path, status, elapsed_s, model_used, fallback_reason
+    wall_s = round(time.monotonic() - _t0, 1)
+    model_counts = Counter()
+    for r in results:
+        tag = r["model_used"] or "fallback"
+        model_counts[tag] += 1
+    DASH = chr(45)
+    breakdown = " / ".join(f"{n} {m.split(DASH)[0]}" for m, n in model_counts.most_common())
+    print(json.dumps(results))
+    print(f"[obsidian-brain] Step 2: upgraded {len(results)} note(s) in {wall_s}s wall ({breakdown})", file=sys.stderr)
+except Exception as exc:
+    print(json.dumps({"error": f"{type(exc).__name__}: {exc}", "results": []}))
+    print(f"[obsidian-brain] upgrade_batch failed: {exc}", file=sys.stderr)
+    sys.exit(1)
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-Parse the returned JSON array. Each result dict has: `path`, `status`, `elapsed_s`, `model_used` (`haiku-4.5` | `subagent-*` | `None`), `fallback_reason` (`haiku_timeout` | `empty_output` | `haiku_subprocess_error` | `None`). For each entry:
+Parse the returned JSON. If the top-level object contains an `"error"` key, `upgrade_batch` itself failed — treat all notes as failed and fall back to the Phase 2 sub-agent path for each. Otherwise, parse the array normally. Each result dict has: `path`, `status`, `elapsed_s`, `model_used` (`haiku-4.5` on success, `None` on failure; `sonnet-4.6` / `opus-*` reserved for Phase 3 #165), `fallback_reason` (`haiku_timeout` | `empty_output` | `haiku_subprocess_error` | `None`). For each entry:
 - `status` starts with `Upgraded ` → mark as succeeded
 - anything else (including `Failed: ...`, empty, or unexpected prefix) → add to the Phase 2 fallback list
 

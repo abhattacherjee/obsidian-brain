@@ -1932,11 +1932,16 @@ def generate_snapshot_summary(
 
     Returns ``(summary_text, fallback_reason)``:
       * On success: ``(text, None)``
-      * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output")``
+      * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output" | "unknown_failure")``
 
     Reuses the retry/timeout pattern of generate_summary but with a tighter
     scope (no open-item dedup, no importance scoring — snapshots don't carry
     those structural fields).
+
+    Note: snapshot summaries are out of scope for the Phase 2 #167 validator
+    (which targets structured session summaries); reserved reasons such as
+    ``"missing_section"`` / ``"importance_missing"`` / ``"schema_loose"`` do
+    not apply here.
     """
     sampled_user = user_msgs[-10:] if len(user_msgs) > 10 else user_msgs
     sampled_asst = assistant_msgs[-10:] if len(assistant_msgs) > 10 else assistant_msgs
@@ -1979,7 +1984,7 @@ def generate_snapshot_summary(
             last_reason = "haiku_subprocess_error"
             print(f"[obsidian-brain] claude -p (snapshot) error: {exc}", file=sys.stderr)
             break
-    return None, last_reason
+    return None, last_reason or "unknown_failure"
 
 
 def generate_summary(
@@ -1993,7 +1998,7 @@ def generate_summary(
 
     Returns ``(summary_text, fallback_reason)``:
       * On success: ``(text, None)``
-      * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output")``
+      * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output" | "unknown_failure")``
 
     Reserved future reasons (populated by Phase 2 #167 validator, not here):
       ``"missing_section"``, ``"importance_missing"``, ``"schema_loose"``.
@@ -2143,7 +2148,7 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
             print(f"[obsidian-brain] claude -p error ({type(exc).__name__}): {exc}", file=sys.stderr)
             break  # unknown error, don't retry
 
-    return None, last_reason
+    return None, last_reason or "unknown_failure"
 
 
 # ---------------------------------------------------------------------------
@@ -4188,13 +4193,16 @@ def upgrade_unsummarized_note(
       notably ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the
       ``"Upgraded "`` prefix as the positive path.
     - **elapsed_s** (*float*) — wall-clock seconds rounded to 2 decimal places.
-    - **model_used** (*str | None*) — model that produced the summary, or
-      ``None`` on failure paths that never reached summarization. Day-one
-      values: ``"haiku-4.5"`` on success, ``None`` on all failure paths.
-      Sonnet/Opus/sub-agent tags are reserved for Phase 2/3 instrumentation.
-    - **fallback_reason** (*str | None*) — non-``None`` when
-      ``generate_summary`` / ``generate_snapshot_summary`` used a fallback
-      strategy; threaded through from those functions unchanged.
+    - **model_used** (*str | None*) — the resolved ``summary_model`` value on
+      success (default ``"haiku"``), or ``None`` on failure paths that never
+      reached summarization. Sonnet/Opus tags are reserved for Phase 3 #165.
+    - **fallback_reason** (*str | None*) — non-``None`` when summarization
+      failed or ``upgrade_batch``'s per-note worker caught an exception.
+      Day-one values: ``"haiku_timeout"``, ``"haiku_subprocess_error"``,
+      ``"empty_output"``, ``"unknown_failure"`` (from generate functions);
+      ``"worker_exception"`` (set by ``upgrade_batch`` when the future raises).
+      Threaded through from ``generate_summary`` / ``generate_snapshot_summary``
+      unchanged on normal failure paths.
 
     Adding any new return prefix to the ``status`` field requires an audit
     of routing call sites.
@@ -4353,7 +4361,9 @@ def upgrade_unsummarized_note(
         note_path, summary_text, vault_path, sessions_folder, project,
         source=source, warnings=warnings,
     )
-    return _ret(status, model_used="haiku-4.5", fallback_reason=None)
+    # summary_model is the CLI alias passed to claude -p --model;
+    # at Phase 1 this is always "haiku" but Phase 3 (#165) will widen the chain.
+    return _ret(status, model_used=summary_model, fallback_reason=None)
 
 
 def upgrade_batch(
@@ -4383,8 +4393,9 @@ def upgrade_batch(
 
     Per-note exceptions are caught and converted to dicts with
     ``status="Failed: <exc_type>: <exc_msg>"``, ``elapsed_s=0.0``,
-    ``model_used=None``, ``fallback_reason=None`` so one bad note never
-    kills the batch.
+    ``model_used=None``, ``fallback_reason="worker_exception"`` so one bad
+    note never kills the batch. The exception message is truncated to 500
+    characters to avoid JSONL blow-out.
 
     Raises ``ValueError`` if ``max_workers < 1``.
     """
@@ -4396,11 +4407,6 @@ def upgrade_batch(
 
     from concurrent.futures import ThreadPoolExecutor
     from datetime import datetime, timezone
-
-    _hooks_dir = os.path.dirname(os.path.abspath(__file__))
-    if _hooks_dir not in sys.path:
-        sys.path.insert(0, _hooks_dir)
-    import summarizer_metrics
 
     workers = min(max_workers, len(paths))
     _wall_t0 = time.monotonic()
@@ -4423,8 +4429,9 @@ def upgrade_batch(
             try:
                 status, elapsed_s, model_used, fallback_reason = fut.result()
             except Exception as exc:  # noqa: BLE001 — per-note isolation
-                status = f"Failed: {type(exc).__name__}: {exc}"
-                elapsed_s, model_used, fallback_reason = 0.0, None, None
+                exc_str = str(exc)[:500]
+                status = f"Failed: {type(exc).__name__}: {exc_str}"
+                elapsed_s, model_used, fallback_reason = 0.0, None, "worker_exception"
             results.append({
                 "path": p,
                 "status": status,
@@ -4435,12 +4442,22 @@ def upgrade_batch(
 
     wall_s = round(time.monotonic() - _wall_t0, 2)
 
-    summarizer_metrics.append_metrics_record({
-        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "project": project,
-        "n_notes": len(results),
-        "wall_s": wall_s,
-        "notes": results,
-    })
+    try:
+        _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+        if _hooks_dir not in sys.path:
+            sys.path.insert(0, _hooks_dir)
+        import summarizer_metrics
+        summarizer_metrics.append_metrics_record({
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "project": project,
+            "n_notes": len(results),
+            "wall_s": wall_s,
+            "notes": results,
+        })
+    except Exception as exc:  # noqa: BLE001 — telemetry must never break recall
+        print(
+            f"[obsidian-brain] metrics sink unavailable ({type(exc).__name__}): {exc}",
+            file=sys.stderr,
+        )
 
     return results
