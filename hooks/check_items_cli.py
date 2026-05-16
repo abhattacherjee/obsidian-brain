@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 STDIN_CAP_BYTES = 1_000_000
-SUBAGENT_TIMEOUT_SEC = int(os.environ.get("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "180"))
+SUBAGENT_TIMEOUT_SEC = int(os.environ.get("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "300"))
 
 # Cap groups per classifier sub-agent dispatch. Above this count, run_classifier()
 # splits into sequential chunks of <=N so a single Sonnet call stays well under
@@ -628,9 +628,8 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
     chunk_count = 0
 
     if to_classify:
-        model = _pick_classifier_model(len(to_classify))
-
         if len(to_classify) <= CLASSIFIER_CHUNK_SIZE:
+            model = _pick_classifier_model(len(to_classify))
             chunk_count = 1
             rc, chunk_results = _dispatch_classifier_chunk(
                 to_classify, evidence, model, output_path
@@ -644,10 +643,14 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
                 for i in range(0, len(to_classify), CLASSIFIER_CHUNK_SIZE)
             ]
             chunk_count = len(chunks)
+            # Per-chunk model picking: the 30-group Haiku/Sonnet threshold was
+            # tuned against single-dispatch payloads. Each chunk here is sized
+            # at <=CLASSIFIER_CHUNK_SIZE, which is below that threshold by
+            # default — so chunks get Haiku regardless of the total payload
+            # size. Lets large vaults stay on the fast/cheap model per call.
             print(
                 f"[check-items-cli] classifier: chunking {len(to_classify)} "
-                f"groups into {chunk_count} chunk(s) of <={CLASSIFIER_CHUNK_SIZE}"
-                f" (model={model})",
+                f"groups into {chunk_count} chunk(s) of <={CLASSIFIER_CHUNK_SIZE}",
                 file=sys.stderr,
             )
             workdir = _safe_workdir()
@@ -661,9 +664,11 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
                     )
                     chunk_outputs.append(out_tmp.name)
                     out_tmp.close()
-                    label = f"chunk {idx + 1}/{chunk_count}: "
+                    chunk_model = _pick_classifier_model(len(chunk))
+                    label = f"chunk {idx + 1}/{chunk_count} (model={chunk_model}): "
                     rc, chunk_results = _dispatch_classifier_chunk(
-                        chunk, evidence, model, out_tmp.name, chunk_label=label,
+                        chunk, evidence, chunk_model, out_tmp.name,
+                        chunk_label=label,
                     )
                     if rc != 0:
                         # Discarded earlier-chunk classifications surfaced so

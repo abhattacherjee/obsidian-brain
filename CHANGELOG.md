@@ -43,10 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/check-items` Stage 4 classifier sub-agent now chunks when more than
   `CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE` (default 25) groups reach
   dispatch. Each chunk is sent to `claude -p` sequentially so a single
-  call stays well under `SUBAGENT_TIMEOUT_SEC`. Empirical evidence:
-  stock v2.5.0 timed out on 58 groups / 121 KB classifier input
-  (Sonnet > 180s). Telemetry adds `chunks=N` when N > 1. Reopens the
-  scope of issue #160 inside this PR rather than deferring. (#173)
+  call stays well under `SUBAGENT_TIMEOUT_SEC`. Telemetry adds
+  `chunks=N` when N > 1. Reopens the scope of issue #160 inside this
+  PR rather than deferring. (#173)
+- `/check-items` classifier picks its model per chunk under chunked
+  dispatch instead of inheriting one model decision from the total
+  payload. Each chunk is sized at `<=CLASSIFIER_CHUNK_SIZE` (default
+  25), which is below the haiku/sonnet 30-group threshold, so chunked
+  runs stay on the fast/cheap model regardless of total payload size.
+  Resolves the empirical 58-group / 121 KB timeout from the 2026-05-15
+  reproduction where each Sonnet chunk still exceeded 180s. (#173)
+- `/check-items` `SUBAGENT_TIMEOUT_SEC` default bumped from 180s to
+  300s for cold-start headroom on heavier vaults. Override via
+  `CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC`.
 
 ### Fixed
 - Reduced `claude -p` sub-agent invocations for vaults with many open items that lack

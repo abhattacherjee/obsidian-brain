@@ -1325,3 +1325,68 @@ def test_classifier_chunking_failure_cleans_up_chunk_outputs(tmp_path, monkeypat
         f"Chunk output temp files leaked on failure path: "
         f"{[p.name for p in leaked]}"
     )
+
+
+def test_classifier_chunking_uses_per_chunk_model_picking(tmp_path, monkeypatch, capsys):
+    """When chunking, model is picked per chunk (not from the total count).
+
+    Without this, 60-group payloads would propagate sonnet to every chunk
+    even though each chunk has <=30 groups and qualifies for haiku.
+    Empirically observed in the 23:07 telemetry replay: 25-group sonnet
+    chunks still timed out, while haiku at the same size finishes well
+    under SUBAGENT_TIMEOUT_SEC.
+    """
+    import re as _re
+    import check_items_cli
+
+    monkeypatch.setattr("check_items_cli.CLASSIFIER_CHUNK_SIZE", 25)
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
+    # 60 groups (total) > 30 (sonnet threshold), but each chunk has 25 or
+    # 10 (haiku threshold). All chunks must pick haiku.
+    groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(60)]
+    payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    models_seen: list = []
+
+    def model_recording_run(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get("args", [])
+        # cmd shape: ["claude", "-p", "--model", model]
+        if len(cmd) >= 4 and cmd[2] == "--model":
+            models_seen.append(cmd[3])
+        # Write empty result to the chunk output path
+        prompt = kwargs.get("input", "")
+        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
+        if out_match:
+            in_match = _re.search(r"(/\S+\.classin\.json)", prompt)
+            chunk_payload = json.loads(Path(in_match.group(1)).read_text())
+            chunk_results = [
+                {
+                    "group_id": g["group_id"],
+                    "classification": "ACTIVE",
+                    "confidence": "LOW",
+                    "canonical_text": g["representative"],
+                    "evidence_citation": None,
+                    "action_required": None,
+                }
+                for g in chunk_payload["groups"]
+            ]
+            Path(out_match.group(1)).write_text(json.dumps(chunk_results))
+        mock_cp = MagicMock()
+        mock_cp.returncode = 0
+        mock_cp.stderr = ""
+        mock_cp.stdout = ""
+        return mock_cp
+
+    with patch("check_items_cli.subprocess.run", side_effect=model_recording_run):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 0
+    assert len(models_seen) == 3, (
+        f"Expected 3 chunks for 60 groups (chunk_size=25), got {len(models_seen)}"
+    )
+    assert all(m == "haiku" for m in models_seen), (
+        f"Every chunk must pick haiku when chunk size <=30; got models: "
+        f"{models_seen!r}"
+    )
