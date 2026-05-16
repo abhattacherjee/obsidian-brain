@@ -349,8 +349,18 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
                     if isinstance(item, str):
                         parts.append(item)
                     elif isinstance(item, dict):
-                        # merged_prs / closed_issues are dicts with title, number, etc.
-                        parts.append(" ".join(str(v) for v in item.values() if v))
+                        # merged_prs / closed_issues: titles encode completion;
+                        # bodies are activity content (discuss problem + adjacent work)
+                        # and would over-trigger Rule 2 of has_classifiable_evidence.
+                        # Include number for traceability but NOT body.
+                        title = item.get("title", "")
+                        number = item.get("number", "")
+                        if title or number:
+                            parts.append(f"#{number} {title}".strip() if number else title)
+                        else:
+                            # Unknown dict shape — fall back to joining values (preserves
+                            # backward-compat for non-{title,body} dicts)
+                            parts.append(" ".join(str(v) for v in item.values() if v))
                 return " ".join(parts)
             if isinstance(val, dict):
                 # fts_mentions: {text: count} — join all keys

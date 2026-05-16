@@ -891,3 +891,58 @@ def test_l2_prefilter_active_project_fixture(tmp_path, monkeypatch, capsys):
         f"L2 prefilter under-delivers on active project fixture: "
         f"prefiltered={prefiltered} (need >= 10). Line: {line!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 7 / #173: bridge narrowing — closed-issue and merged-PR bodies excluded
+# ---------------------------------------------------------------------------
+
+def test_bridge_project_evidence_omits_issue_body_from_closed_issues_text():
+    """Closed-issue and merged-PR bodies are activity content, not completion
+    statements. _bridge_project_evidence must extract titles only, so Rule 2
+    of has_classifiable_evidence does not over-trigger on active projects (#173)."""
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _bridge_project_evidence
+
+    evidence = {
+        "proj-x": {
+            "closed_issues": [
+                {
+                    "body": "We should implement resolveLastSessionAnchor properly in a follow-up.",
+                    "title": "fix(query): widget-z double-count regression",
+                    "number": 39,
+                    "closedAt": "2026-05-11T21:00:00Z",
+                    "url": "https://example/issues/39",
+                }
+            ],
+            "merged_prs": [
+                {
+                    "title": "feat(dashboard): last session chip",
+                    "number": 41,
+                    "mergedAt": "2026-05-13T19:00:00Z",
+                    "url": "https://example/pull/41",
+                }
+            ],
+        }
+    }
+    bridged = _bridge_project_evidence(evidence, "proj-x")
+    closed_text = bridged["closed_issues_text"]
+    merged_text = bridged["merged_prs_text"]
+
+    # Title and number are included
+    assert "widget-z double-count regression" in closed_text
+    assert "#39" in closed_text
+    assert "last session chip" in merged_text
+    assert "#41" in merged_text
+
+    # Body content is NOT included (it's activity, not completion)
+    assert "resolveLastSessionAnchor" not in closed_text
+    assert "follow-up" not in closed_text
+
+    # URL and timestamps are also excluded (noise)
+    assert "https://example" not in closed_text
+    assert "2026-05-11" not in closed_text
