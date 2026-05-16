@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -1926,12 +1927,21 @@ def generate_snapshot_summary(
     metadata: dict,
     model: str = "haiku",
     timeout: int = 30,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """Call ``claude -p --model <model>`` with the snapshot-specific prompt.
 
-    Returns None on failure. Reuses the retry/timeout pattern of
-    generate_summary but with a tighter scope (no open-item dedup, no
-    importance scoring — snapshots don't carry those structural fields).
+    Returns ``(summary_text, fallback_reason)``:
+      * On success: ``(text, None)``
+      * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output" | "unknown_failure")``
+
+    Reuses the retry/timeout pattern of generate_summary but with a tighter
+    scope (no open-item dedup, no importance scoring — snapshots don't carry
+    those structural fields).
+
+    Note: snapshot summaries are out of scope for the Phase 2 #167 validator
+    (which targets structured session summaries); reserved reasons such as
+    ``"missing_section"`` / ``"importance_missing"`` / ``"schema_loose"`` do
+    not apply here.
     """
     sampled_user = user_msgs[-10:] if len(user_msgs) > 10 else user_msgs
     sampled_asst = assistant_msgs[-10:] if len(assistant_msgs) > 10 else assistant_msgs
@@ -1942,6 +1952,7 @@ def generate_snapshot_summary(
     prompt = SNAPSHOT_SUMMARY_PROMPT.format(transcript=transcript)
 
     attempts = (timeout, timeout * 2)
+    last_reason: str | None = None
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
@@ -1949,14 +1960,20 @@ def generate_snapshot_summary(
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
             )
             if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
+                return result.stdout.strip(), None
+            if result.returncode != 0:
+                last_reason = "haiku_subprocess_error"
+            else:
+                last_reason = "empty_output"
             print(f"[obsidian-brain] claude -p (snapshot) failed (rc={result.returncode})",
                   file=sys.stderr)
             break
         except FileNotFoundError:
+            last_reason = "haiku_subprocess_error"
             print("[obsidian-brain] claude CLI not found", file=sys.stderr)
             break
         except subprocess.TimeoutExpired:
+            last_reason = "haiku_timeout"
             if i < len(attempts) - 1:
                 print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s, retrying...",
                       file=sys.stderr)
@@ -1964,9 +1981,10 @@ def generate_snapshot_summary(
             print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s",
                   file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
+            last_reason = "haiku_subprocess_error"
             print(f"[obsidian-brain] claude -p (snapshot) error: {exc}", file=sys.stderr)
             break
-    return None
+    return None, last_reason or "unknown_failure"
 
 
 def generate_summary(
@@ -1975,11 +1993,17 @@ def generate_summary(
     metadata: dict,
     model: str = "haiku",
     timeout: int = 30,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """Call ``claude -p --model <model>`` to summarize the session.
 
+    Returns ``(summary_text, fallback_reason)``:
+      * On success: ``(text, None)``
+      * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output" | "unknown_failure")``
+
+    Reserved future reasons (populated by Phase 2 #167 validator, not here):
+      ``"missing_section"``, ``"importance_missing"``, ``"schema_loose"``.
+
     Samples first 10 + last 10 messages for large sessions.
-    Returns None on failure.
     """
     # Sample messages for large sessions
     if len(user_msgs) > 20:
@@ -2074,6 +2098,7 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
             prompt += f"- {item_text}\n"
 
     attempts = (timeout, timeout * 2)  # escalate on first timeout
+    last_reason: str | None = None
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
@@ -2088,30 +2113,42 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
                 # Layer 2: Post-generation dedup pass (string-based, pre-write)
                 if existing_items:
                     summary_text = _dedup_summary_open_items(summary_text, existing_items)
-                return summary_text
+                return summary_text, None
+            if result.returncode != 0:
+                last_reason = "haiku_subprocess_error"
+                print(
+                    f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
+                    f"{result.stderr[:200]}",
+                    file=sys.stderr,
+                )
+                break  # non-timeout failure, don't retry
+            last_reason = "empty_output"
             print(
                 f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
                 f"{result.stderr[:200]}",
                 file=sys.stderr,
             )
-            break  # non-timeout failure, don't retry
+            break  # empty stdout, don't retry
         except FileNotFoundError:
+            last_reason = "haiku_subprocess_error"
             print(
                 "[obsidian-brain] claude CLI not found, summarization unavailable",
                 file=sys.stderr,
             )
             break  # won't succeed on retry
         except subprocess.TimeoutExpired as exc:
+            last_reason = "haiku_timeout"
             stderr_snippet = f" stderr: {exc.stderr[:200]}" if exc.stderr else ""
             if i < len(attempts) - 1:
                 print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, retrying with {attempts[i+1]}s{stderr_snippet}", file=sys.stderr)
                 continue
             print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, giving up{stderr_snippet}", file=sys.stderr)
         except Exception as exc:
+            last_reason = "haiku_subprocess_error"
             print(f"[obsidian-brain] claude -p error ({type(exc).__name__}): {exc}", file=sys.stderr)
             break  # unknown error, don't retry
 
-    return None
+    return None, last_reason or "unknown_failure"
 
 
 # ---------------------------------------------------------------------------
@@ -3085,13 +3122,13 @@ def upgrade_and_collect_corpus(
                 continue
 
             try:
-                result = upgrade_unsummarized_note(
+                status, _elapsed, _model, _reason = upgrade_unsummarized_note(
                     note_path=str(md_file),
                     vault_path=vault_path,
                     sessions_folder=sessions_folder,
                     project=meta.get("project", ""),
                 )
-                if result and not result.startswith("Failed"):
+                if not status.startswith("Failed"):
                     upgraded += 1
                     # Bust metadata cache for this note
                     session_id = meta.get("session_id", "")
@@ -4142,27 +4179,49 @@ def upgrade_unsummarized_note(
     project: str,
     summary_model: str = "haiku",
     summary_timeout: int | None = None,
-) -> str:
+) -> tuple[str, float, str | None, str | None]:
     """Upgrade an unsummarized session note with an AI summary.
 
     Orchestrates: find JSONL → parse transcript → decide source →
     generate summary → dedup open items → atomic write.
 
-    Returns a one-line status string for the model to relay.
+    Returns a 4-tuple ``(status, elapsed_s, model_used, fallback_reason)``:
 
-    Return contract: success strings begin with ``"Upgraded "``; all other
-    return values (including ``"Failed: ..."``, empty, or any unexpected
-    prefix) indicate failure. Callers routing on return value — notably
-    ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the ``"Upgraded "``
-    prefix as the positive path. Adding any new return prefix to this
-    function requires an audit of routing call sites.
+    - **status** (*str*) — one-line status string for the model to relay.
+      Success strings begin with ``"Upgraded "``; all other values (including
+      ``"Failed: ..."``) indicate failure. Callers routing on return value —
+      notably ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the
+      ``"Upgraded "`` prefix as the positive path.
+    - **elapsed_s** (*float*) — wall-clock seconds rounded to 2 decimal places.
+    - **model_used** (*str | None*) — the resolved ``summary_model`` value on
+      success (default ``"haiku"``), or ``None`` on failure paths that never
+      reached summarization. Sonnet/Opus tags are reserved for Phase 3 #165.
+    - **fallback_reason** (*str | None*) — non-``None`` when summarization
+      failed or ``upgrade_batch``'s per-note worker caught an exception.
+      Day-one values: ``"haiku_timeout"``, ``"haiku_subprocess_error"``,
+      ``"empty_output"``, ``"unknown_failure"`` (from generate functions);
+      ``"worker_exception"`` (set by ``upgrade_batch`` when the future raises).
+      Threaded through from ``generate_summary`` / ``generate_snapshot_summary``
+      unchanged on normal failure paths.
+
+    Adding any new return prefix to the ``status`` field requires an audit
+    of routing call sites.
     """
+    _t0 = time.monotonic()
+
+    def _ret(
+        status: str,
+        model_used: str | None = None,
+        fallback_reason: str | None = None,
+    ) -> tuple[str, float, str | None, str | None]:
+        return status, round(time.monotonic() - _t0, 2), model_used, fallback_reason
+
     # Read the raw note
     try:
         with open(note_path, 'r', encoding='utf-8') as f:
             raw_lines = f.readlines()
     except OSError as exc:
-        return f"Failed: cannot read {os.path.basename(note_path)}: {exc}"
+        return _ret(f"Failed: cannot read {os.path.basename(note_path)}: {exc}")
 
     # Extract session_id from frontmatter
     session_id = None
@@ -4172,7 +4231,7 @@ def upgrade_unsummarized_note(
             session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
             break
     if not session_id:
-        return f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}"
+        return _ret(f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}")
 
     # Find and parse the JSONL transcript
     jsonl_path = find_transcript_jsonl(session_id)
@@ -4237,7 +4296,7 @@ def upgrade_unsummarized_note(
                     assistant_msgs.append(stripped[14:].strip())
 
     if not user_msgs and not assistant_msgs:
-        return f"Failed: no conversation content in {os.path.basename(note_path)}"
+        return _ret(f"Failed: no conversation content in {os.path.basename(note_path)}")
 
     # Build metadata for generate_summary
     metadata: dict = {"project": project, "vault_path": vault_path, "sessions_folder": sessions_folder}
@@ -4268,7 +4327,7 @@ def upgrade_unsummarized_note(
         gen_kwargs["timeout"] = summary_timeout
 
     if note_type == "claude-snapshot":
-        summary_text = generate_snapshot_summary(
+        summary_text, fallback_reason = generate_snapshot_summary(
             user_msgs, assistant_msgs, metadata, **gen_kwargs,
         )
     else:
@@ -4287,17 +4346,24 @@ def upgrade_unsummarized_note(
             # prepend it to its sampled transcript. New optional key; existing
             # callers unaffected (absent key → no-op).
             metadata["snapshot_preamble"] = preamble
-        summary_text = generate_summary(
+        summary_text, fallback_reason = generate_summary(
             user_msgs, assistant_msgs, metadata, **gen_kwargs,
         )
 
     if not summary_text:
-        return f"Failed: AI summarization returned empty for {os.path.basename(note_path)}"
+        return _ret(
+            f"Failed: AI summarization returned empty for {os.path.basename(note_path)}",
+            model_used=None,
+            fallback_reason=fallback_reason,
+        )
 
-    return upgrade_note_with_summary(
+    status = upgrade_note_with_summary(
         note_path, summary_text, vault_path, sessions_folder, project,
         source=source, warnings=warnings,
     )
+    # summary_model is the CLI alias passed to claude -p --model;
+    # at Phase 1 this is always "haiku" but Phase 3 (#165) will widen the chain.
+    return _ret(status, model_used=summary_model, fallback_reason=None)
 
 
 def upgrade_batch(
@@ -4308,27 +4374,30 @@ def upgrade_batch(
     max_workers: int = 10,
     summary_model: str = "haiku",
     summary_timeout: int | None = None,
-) -> list[tuple[str, str]]:
+) -> list[dict]:
     """Fan out upgrade_unsummarized_note() concurrently.
 
-    Returns a list of (path, status_string) tuples IN THE SAME ORDER AS `paths`
-    (not completion order), so callers that zipped inputs with outputs still work.
-    Individual-call exceptions are caught and converted to
-    "Failed: <exc_type>: <exc_msg>" status strings so one bad note never kills
-    the batch.
+    Returns a list of per-note dicts IN THE SAME ORDER AS ``paths`` (not
+    completion order). Each dict has the keys:
 
-    Raises ``ValueError`` if ``max_workers < 1`` — surface caller config bugs
-    at the boundary rather than silently normalizing to a single worker.
+      * ``path``  — vault note path (echoes input)
+      * ``status`` — one-line status string; success starts with ``"Upgraded "``
+      * ``elapsed_s`` — wall-time inside the worker, rounded to 2 dp
+      * ``model_used`` — see ``upgrade_unsummarized_note`` docstring
+      * ``fallback_reason`` — see ``upgrade_unsummarized_note`` docstring
 
-    Return contract: each ``(path, status)`` tuple carries the same per-entry
-    contract as ``upgrade_unsummarized_note`` — success statuses begin with
-    ``"Upgraded "``; anything else (including ``"Failed: ..."`` or unexpected
-    prefixes) indicates failure. See that function's docstring for details.
+    Side effect: appends one record per call to
+    ``~/.claude/obsidian-brain-summarizer-metrics.jsonl`` via
+    ``summarizer_metrics.append_metrics_record`` (issue #74). The sink never
+    raises, so telemetry failures cannot break this function.
 
-    `claude -p --model haiku` is subprocess-bound, so threads release the GIL
-    during the wait and achieve real parallelism. This lets a single Bash tool
-    call fan out N summaries without the Claude Code shell-pool serialization
-    that would otherwise linearize the work.
+    Per-note exceptions are caught and converted to dicts with
+    ``status="Failed: <exc_type>: <exc_msg>"``, ``elapsed_s=0.0``,
+    ``model_used=None``, ``fallback_reason="worker_exception"`` so one bad
+    note never kills the batch. The exception message is truncated to 500
+    characters to avoid JSONL blow-out.
+
+    Raises ``ValueError`` if ``max_workers < 1``.
     """
     if not paths:
         return []
@@ -4336,12 +4405,12 @@ def upgrade_batch(
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
 
-    # Lazy-import so the module stays importable in environments where
-    # concurrent.futures might be stubbed (it's stdlib, so this should always
-    # succeed in CPython, but the lazy import also keeps hook startup cost low).
     from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timezone
 
     workers = min(max_workers, len(paths))
+    _wall_t0 = time.monotonic()
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [
             ex.submit(
@@ -4355,10 +4424,40 @@ def upgrade_batch(
             )
             for p in paths
         ]
-        results: list[tuple[str, str]] = []
+        results: list[dict] = []
         for p, fut in zip(paths, futs):
             try:
-                results.append((p, fut.result()))
+                status, elapsed_s, model_used, fallback_reason = fut.result()
             except Exception as exc:  # noqa: BLE001 — per-note isolation
-                results.append((p, f"Failed: {type(exc).__name__}: {exc}"))
-        return results
+                exc_str = str(exc)[:500]
+                status = f"Failed: {type(exc).__name__}: {exc_str}"
+                elapsed_s, model_used, fallback_reason = 0.0, None, "worker_exception"
+            results.append({
+                "path": p,
+                "status": status,
+                "elapsed_s": elapsed_s,
+                "model_used": model_used,
+                "fallback_reason": fallback_reason,
+            })
+
+    wall_s = round(time.monotonic() - _wall_t0, 2)
+
+    try:
+        _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+        if _hooks_dir not in sys.path:
+            sys.path.insert(0, _hooks_dir)
+        import summarizer_metrics
+        summarizer_metrics.append_metrics_record({
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "project": project,
+            "n_notes": len(results),
+            "wall_s": wall_s,
+            "notes": results,
+        })
+    except Exception as exc:  # noqa: BLE001 — telemetry must never break recall
+        print(
+            f"[obsidian-brain] metrics sink unavailable ({type(exc).__name__}): {exc}",
+            file=sys.stderr,
+        )
+
+    return results

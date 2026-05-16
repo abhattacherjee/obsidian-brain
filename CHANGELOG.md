@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`/recall` telemetry** — `upgrade_batch()` now returns per-note `elapsed_s`,
+  `model_used`, and `fallback_reason`, and appends one record per call to
+  `~/.claude/obsidian-brain-summarizer-metrics.jsonl` (100 KB rotation, owner-only).
+  The `/recall` status line now reports total wall time and a per-model breakdown
+  (e.g., `Step 2: upgraded 7 note(s) in 12.4s wall (5 haiku / 2 fallback)`). Foundation
+  for the cost-reduction work tracked in #169. (#74)
+
+### Changed
+- **`upgrade_batch()` return shape** — was `list[tuple[path, status]]`, now
+  `list[dict]` with 5 keys (`path`, `status`, `elapsed_s`, `model_used`,
+  `fallback_reason`). Backward-incompatible for direct callers; in-tree
+  callers (`skills/recall/SKILL.md`, `TestUpgradeBatch` suite) migrated in the same PR.
+- **`generate_summary` / `generate_snapshot_summary`** — now return
+  `tuple[str | None, str | None]` (text + fallback_reason). Reason is non-None
+  only on failure: `haiku_timeout`, `haiku_subprocess_error`, or `empty_output`.
+- **`upgrade_unsummarized_note`** — now returns
+  `tuple[str, float, str | None, str | None]` (status, elapsed_s, model_used,
+  fallback_reason). `model_used` reflects the resolved `summary_model` parameter
+  (default `"haiku"`); `None` on failure paths. `sonnet-4.6` / `opus-*` tags
+  reserved for Phase 3 (#165).
+
 ## [2.5.1] - 2026-05-16
 
 ### Changed
