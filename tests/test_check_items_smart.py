@@ -1475,8 +1475,8 @@ def test_dashboard_rejects_path_traversal_in_scope_name(tmp_path):
         applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
         classifier_mode="ok", dry_run=True,
     )
-    # File must land inside claude-dashboards/, with sanitized name
-    assert str(vault / "claude-dashboards") in path
+    # File must land inside check-items folder, with sanitized name
+    assert str(vault / "claude-check-items") in path
     assert ".." not in os.path.basename(path)
     assert "/" not in os.path.basename(path)
 
@@ -1893,3 +1893,105 @@ def test_validate_classifier_payload_rejects_non_list():
 
     assert cli._validate_classifier_payload({"not": "a list"}) is False
     assert cli._validate_classifier_payload(None) is False
+
+
+# ---------------------------------------------------------------------------
+# Folder rename: check_items_folder config key drives output location
+# ---------------------------------------------------------------------------
+
+def _reset_load_config_cache():
+    """Force load_config to re-read from disk on the next call.
+
+    load_config caches by session id under ~/.claude/obsidian-brain/cache-<sid>.json;
+    tests that monkeypatch _CONFIG_PATH must blow this away or the second
+    call returns the first call's view. Per technical memory
+    technical_load_config_cache_keyed_by_cwd_sid.md.
+    """
+    import obsidian_utils
+    sid = obsidian_utils._get_session_id_fast()
+    obsidian_utils.cache_invalidate(sid, "config")
+
+
+def test_check_items_report_default_folder_is_claude_check_items(tmp_path, monkeypatch):
+    """Default folder for /check-items reports is `claude-check-items/`,
+    not the legacy `claude-dashboards/`, since these notes list items
+    rather than driving Dataview queries."""
+    import os, sys, json
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    # Point config at a temp location with no `check_items_folder` set,
+    # so the default kicks in.
+    cfg_path = tmp_path / "obsidian-brain-config.json"
+    cfg_path.write_text(json.dumps({"vault_path": str(tmp_path / "vault")}))
+    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    _reset_load_config_cache()
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    from check_items_report import write_check_items_dashboard
+    path = write_check_items_dashboard(
+        vault_path=str(vault),
+        scope_name="proj-x",
+        date_str="2026-05-16",
+        window_days=14,
+        raw_count=0,
+        group_count=0,
+        classifications=[],
+        applied=0,
+        cascaded=0,
+        merges=[],
+        semantic_merge_mode="ok",
+        classifier_mode="ok",
+        dry_run=True,
+    )
+    try:
+        assert "claude-check-items" in path, (
+            f"Default folder must be claude-check-items, got: {path}"
+        )
+        assert "claude-dashboards" not in path
+        assert (vault / "claude-check-items").is_dir()
+    finally:
+        _reset_load_config_cache()
+
+
+def test_check_items_report_honors_check_items_folder_config(tmp_path, monkeypatch):
+    """A user who configures `check_items_folder` in obsidian-brain-config.json
+    can keep using `claude-dashboards/` (or any other folder) for backward
+    compat or organization preference."""
+    import os, sys, json
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    cfg_path = tmp_path / "obsidian-brain-config.json"
+    cfg_path.write_text(json.dumps({
+        "vault_path": str(tmp_path / "vault"),
+        "check_items_folder": "claude-dashboards",
+    }))
+    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    _reset_load_config_cache()
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    from check_items_report import write_check_items_dashboard
+    path = write_check_items_dashboard(
+        vault_path=str(vault),
+        scope_name="proj-y",
+        date_str="2026-05-16",
+        window_days=14,
+        raw_count=0,
+        group_count=0,
+        classifications=[],
+        applied=0,
+        cascaded=0,
+        merges=[],
+        semantic_merge_mode="ok",
+        classifier_mode="ok",
+        dry_run=True,
+    )
+    try:
+        assert "claude-dashboards" in path, (
+            f"Override must place file in claude-dashboards, got: {path}"
+        )
+    finally:
+        _reset_load_config_cache()
