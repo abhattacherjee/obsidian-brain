@@ -823,3 +823,71 @@ def test_empty_evidence_dict_all_groups_synthetic(tmp_path, monkeypatch):
         )
     # Input order preserved
     assert [r["group_id"] for r in out] == ["g1", "g2", "g3"]
+
+
+# ---------------------------------------------------------------------------
+# Task 6 / #173: integration test — active-project fixture achieves >= 10 prefiltered
+# ---------------------------------------------------------------------------
+
+def test_l2_prefilter_active_project_fixture(tmp_path, monkeypatch, capsys):
+    """Regression repro: 21-group active-project payload must achieve
+    prefiltered >= 10 under the zone-aware completion-signal rules (#173)."""
+    import json
+    import os
+    import sys
+
+    fixtures = os.path.join(
+        os.path.dirname(__file__),
+        "fixtures",
+        "check_items_prefilter",
+    )
+    with open(os.path.join(fixtures, "active_project_evidence.json")) as f:
+        evidence = json.load(f)
+    with open(os.path.join(fixtures, "active_project_partition.json")) as f:
+        partition = json.load(f)
+
+    # Build the run_classifier stdin payload shape
+    payload = {
+        "groups": partition["needs"],
+        "evidence": evidence,
+    }
+    stdin_json = json.dumps(payload)
+    output_path = str(tmp_path / "classifications.json")
+
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    import check_items_cli
+
+    # Stub the sub-agent dispatch to a no-op that writes an empty result list to
+    # output_path. The integration test asserts on the L2 partition only — what
+    # the sub-agent would have classified is out of scope for #173.
+    def _fake_run(*_a, **_k):
+        # run_classifier passes output_path as the 4th positional CLI arg:
+        # ["python3", cli_path, "classifier", output_path, ...]
+        cli_args = _a[0] if _a else _k.get("args", [])
+        if len(cli_args) >= 4:
+            Path(cli_args[3]).write_text(json.dumps([]), encoding="utf-8")
+
+        class R:
+            returncode = 0
+            stdout = json.dumps([])
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(check_items_cli.subprocess, "run", _fake_run)
+    check_items_cli.run_classifier(stdin_json, output_path)
+
+    err = capsys.readouterr().err
+    # Telemetry shape: "[check-items-cli] classifier: total=21 cache_hit=- prefiltered=P subagent=S wall=Ts"
+    line = next((ln for ln in err.splitlines() if "[check-items-cli] classifier:" in ln), None)
+    assert line is not None, f"no classifier telemetry line found in stderr:\n{err}"
+    import re
+    m = re.search(r"prefiltered=(\d+)", line)
+    assert m is not None, f"prefiltered count missing in telemetry: {line!r}"
+    prefiltered = int(m.group(1))
+    assert prefiltered >= 10, (
+        f"L2 prefilter under-delivers on active project fixture: "
+        f"prefiltered={prefiltered} (need >= 10). Line: {line!r}"
+    )
