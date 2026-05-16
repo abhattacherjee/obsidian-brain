@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `/check-items` reports now write to `<vault>/claude-check-items/`
+  by default instead of `<vault>/claude-dashboards/`. These notes
+  list open items rather than driving Dataview queries, so a
+  dedicated folder keeps them organisationally separate from real
+  dashboards. New config key `check_items_folder` (default
+  `claude-check-items`) — set it to `"claude-dashboards"` in
+  `~/.claude/obsidian-brain-config.json` to keep the legacy
+  location. Existing files in `claude-dashboards/` are not migrated.
+
 ### Added
 - L2 evidence-presence pre-filter for `/check-items` Stage 4 (`hooks/check_items_prefilter.py`).
   Items with no token overlap with the evidence bundle and no `#N`/commit-sha references are

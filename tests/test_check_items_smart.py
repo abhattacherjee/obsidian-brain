@@ -1463,22 +1463,37 @@ def test_dashboard_active_truncation_and_path_guard(tmp_path):
 # R2 regression: Finding 3 — path traversal via scope_name
 # ---------------------------------------------------------------------------
 
-def test_dashboard_rejects_path_traversal_in_scope_name(tmp_path):
-    """Containment guard rejects ../escape attempts in scope_name."""
-    from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
-    (vault / "claude-dashboards").mkdir(parents=True)
-    # Path-traversal scope name: should be sanitized, not escape
-    path = write_check_items_dashboard(
-        vault_path=str(vault), scope_name="../../etc/passwd", date_str="2026-05-11",
-        window_days=14, raw_count=0, group_count=0, classifications=[],
-        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
-        classifier_mode="ok", dry_run=True,
-    )
-    # File must land inside claude-dashboards/, with sanitized name
-    assert str(vault / "claude-dashboards") in path
-    assert ".." not in os.path.basename(path)
-    assert "/" not in os.path.basename(path)
+def test_dashboard_rejects_path_traversal_in_scope_name(tmp_path, monkeypatch):
+    """Containment guard rejects ../escape attempts in scope_name.
+
+    Isolated from the user's live load_config() value by monkeypatching
+    _CONFIG_PATH to a tmp config with no `check_items_folder` override.
+    Without isolation, a cached or user-set `check_items_folder` value
+    would change the expected output path and break the assertion.
+    """
+    import json
+    cfg_path = tmp_path / "obsidian-brain-config.json"
+    cfg_path.write_text(json.dumps({"vault_path": str(tmp_path / "vault")}))
+    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    _reset_load_config_cache()
+
+    try:
+        from check_items_report import write_check_items_dashboard
+        vault = tmp_path / "vault"
+        vault.mkdir(parents=True)
+        # Path-traversal scope name: should be sanitized, not escape
+        path = write_check_items_dashboard(
+            vault_path=str(vault), scope_name="../../etc/passwd", date_str="2026-05-11",
+            window_days=14, raw_count=0, group_count=0, classifications=[],
+            applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+            classifier_mode="ok", dry_run=True,
+        )
+        # File must land inside check-items folder, with sanitized name
+        assert str(vault / "claude-check-items") in path
+        assert ".." not in os.path.basename(path)
+        assert "/" not in os.path.basename(path)
+    finally:
+        _reset_load_config_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -1893,3 +1908,203 @@ def test_validate_classifier_payload_rejects_non_list():
 
     assert cli._validate_classifier_payload({"not": "a list"}) is False
     assert cli._validate_classifier_payload(None) is False
+
+
+# ---------------------------------------------------------------------------
+# Folder rename: check_items_folder config key drives output location
+# ---------------------------------------------------------------------------
+
+def _reset_load_config_cache():
+    """Invalidate the disk-cached config so the next load_config() re-reads.
+
+    load_config keys its cache by session id under
+    ~/.claude/obsidian-brain/cache-<sid>.json; tests that monkeypatch
+    _CONFIG_PATH must invalidate or the next call returns the prior view.
+    """
+    import obsidian_utils
+    sid = obsidian_utils._get_session_id_fast()
+    obsidian_utils.cache_invalidate(sid, "config")
+
+
+def test_check_items_report_default_folder_is_claude_check_items(tmp_path, monkeypatch):
+    """Default folder for /check-items reports is `claude-check-items/`,
+    not the legacy `claude-dashboards/`, since these notes list items
+    rather than driving Dataview queries."""
+    import os, sys, json
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    # Point config at a temp location with no `check_items_folder` set,
+    # so the default kicks in.
+    cfg_path = tmp_path / "obsidian-brain-config.json"
+    cfg_path.write_text(json.dumps({"vault_path": str(tmp_path / "vault")}))
+    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    _reset_load_config_cache()
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    from check_items_report import write_check_items_dashboard
+    try:
+        path = write_check_items_dashboard(
+            vault_path=str(vault),
+            scope_name="proj-x",
+            date_str="2026-05-16",
+            window_days=14,
+            raw_count=0,
+            group_count=0,
+            classifications=[],
+            applied=0,
+            cascaded=0,
+            merges=[],
+            semantic_merge_mode="ok",
+            classifier_mode="ok",
+            dry_run=True,
+        )
+        assert "claude-check-items" in path, (
+            f"Default folder must be claude-check-items, got: {path}"
+        )
+        assert "claude-dashboards" not in path
+        assert (vault / "claude-check-items").is_dir()
+    finally:
+        _reset_load_config_cache()
+
+
+def test_check_items_report_honors_check_items_folder_config(tmp_path, monkeypatch):
+    """A user who configures `check_items_folder` in obsidian-brain-config.json
+    can keep using `claude-dashboards/` (or any other folder) for backward
+    compat or organization preference."""
+    import os, sys, json
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    cfg_path = tmp_path / "obsidian-brain-config.json"
+    cfg_path.write_text(json.dumps({
+        "vault_path": str(tmp_path / "vault"),
+        "check_items_folder": "claude-dashboards",
+    }))
+    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    _reset_load_config_cache()
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    from check_items_report import write_check_items_dashboard
+    try:
+        path = write_check_items_dashboard(
+            vault_path=str(vault),
+            scope_name="proj-y",
+            date_str="2026-05-16",
+            window_days=14,
+            raw_count=0,
+            group_count=0,
+            classifications=[],
+            applied=0,
+            cascaded=0,
+            merges=[],
+            semantic_merge_mode="ok",
+            classifier_mode="ok",
+            dry_run=True,
+        )
+        assert "claude-dashboards" in path, (
+            f"Override must place file in claude-dashboards, got: {path}"
+        )
+    finally:
+        _reset_load_config_cache()
+
+
+def _make_minimal_dashboard_kwargs(vault, scope="proj-x"):
+    return dict(
+        vault_path=str(vault),
+        scope_name=scope,
+        date_str="2026-05-16",
+        window_days=14,
+        raw_count=0,
+        group_count=0,
+        classifications=[],
+        applied=0,
+        cascaded=0,
+        merges=[],
+        semantic_merge_mode="ok",
+        classifier_mode="ok",
+        dry_run=True,
+    )
+
+
+def test_check_items_report_rejects_parent_traversal_in_folder_config(tmp_path, monkeypatch):
+    """A hostile check_items_folder value containing `..` must raise rather
+    than escape vault_path. Guards against the regression where the
+    containment check was anchored on target_dir (itself derived from
+    user input) instead of the vault root.
+    """
+    import os, sys, json, pytest as _pytest
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    cfg_path = tmp_path / "obsidian-brain-config.json"
+    cfg_path.write_text(json.dumps({
+        "vault_path": str(tmp_path / "vault"),
+        "check_items_folder": "../../etc",
+    }))
+    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    _reset_load_config_cache()
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    from check_items_report import write_check_items_dashboard
+    try:
+        with _pytest.raises(ValueError, match="parent-traversing|outside vault root"):
+            write_check_items_dashboard(**_make_minimal_dashboard_kwargs(vault))
+        # No directory escaped the vault
+        assert not (tmp_path / "etc").exists()
+    finally:
+        _reset_load_config_cache()
+
+
+def test_check_items_report_rejects_absolute_folder_config(tmp_path, monkeypatch):
+    """Absolute paths like `/tmp/anywhere` in check_items_folder must raise."""
+    import os, sys, json, pytest as _pytest
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    cfg_path = tmp_path / "obsidian-brain-config.json"
+    cfg_path.write_text(json.dumps({
+        "vault_path": str(tmp_path / "vault"),
+        "check_items_folder": "/tmp/escape",
+    }))
+    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    _reset_load_config_cache()
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    from check_items_report import write_check_items_dashboard
+    try:
+        with _pytest.raises(ValueError, match="absolute|outside vault root"):
+            write_check_items_dashboard(**_make_minimal_dashboard_kwargs(vault))
+    finally:
+        _reset_load_config_cache()
+
+
+def test_check_items_report_empty_string_folder_uses_default(tmp_path, monkeypatch):
+    """check_items_folder: "" → fall back to default (claude-check-items),
+    don't write straight into the vault root."""
+    import os, sys, json
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    cfg_path = tmp_path / "obsidian-brain-config.json"
+    cfg_path.write_text(json.dumps({
+        "vault_path": str(tmp_path / "vault"),
+        "check_items_folder": "",
+    }))
+    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    _reset_load_config_cache()
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    from check_items_report import write_check_items_dashboard
+    try:
+        path = write_check_items_dashboard(**_make_minimal_dashboard_kwargs(vault))
+        assert "claude-check-items" in path, (
+            f"Empty-string folder config must fall back to default; got {path}"
+        )
+    finally:
+        _reset_load_config_cache()
