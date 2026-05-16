@@ -144,22 +144,35 @@ def write_check_items_dashboard(
     Write the check-items dashboard report and return the path.
     Always writes (dry_run only affects upstream pipeline behavior).
     """
-    # Folder is configurable via `check_items_folder` config key; default
-    # `claude-check-items` since these are generated open-item notes, not
-    # Dataview dashboards. Backward-compat: nothing migrates existing files
-    # in `claude-dashboards/`.
+    # Folder name comes from user config. Reject empty / absolute / parent-
+    # escape values explicitly, and anchor the containment check on
+    # vault_root (NOT target_dir, which is itself derived from the same user
+    # input and would make the check tautological).
     from obsidian_utils import load_config
     cfg = load_config()
-    folder_name = cfg.get("check_items_folder") or "claude-check-items"
-    target_dir = Path(vault_path) / folder_name
+    folder_name = cfg.get("check_items_folder", "claude-check-items")
+    if not folder_name or not isinstance(folder_name, str):
+        folder_name = "claude-check-items"
+    if folder_name.startswith("/") or ".." in Path(folder_name).parts:
+        raise ValueError(
+            f"refusing to use absolute or parent-traversing check_items_folder: "
+            f"{folder_name!r}"
+        )
+
+    vault_root = Path(vault_path).resolve()
+    target_dir = (vault_root / folder_name).resolve()
+    if not target_dir.is_relative_to(vault_root):
+        raise ValueError(
+            f"refusing to use check_items_folder outside vault root: {target_dir}"
+        )
     target_dir.mkdir(parents=True, exist_ok=True)
 
     safe_scope = _safe_filename_component(scope_name)
     safe_date = _safe_filename_component(date_str)
     filename = f"check-items-{safe_scope}-{safe_date}.md"
-    target = target_dir / filename
-    if not target.resolve().is_relative_to(target_dir.resolve()):
-        raise ValueError(f"refusing to write outside check-items folder: {target}")
+    target = (target_dir / filename).resolve()
+    if not target.is_relative_to(vault_root):
+        raise ValueError(f"refusing to write outside vault root: {target}")
 
     # Use safe_scope (computed above for the filename) throughout the note body
     # and frontmatter so that crafted scope values cannot inject YAML fields or
