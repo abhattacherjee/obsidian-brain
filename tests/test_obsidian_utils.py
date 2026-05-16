@@ -2126,7 +2126,7 @@ class TestUpgradeBatch:
                 "## Errors Encountered\n- None.\n\n"
                 "## Open Questions / Next Steps\n- [ ] None.\n\n"
                 "IMPORTANCE: 5\n"
-            )
+            ), None
 
         monkeypatch.setattr(
             obsidian_utils, "generate_summary", fake_generate_summary
@@ -2429,3 +2429,106 @@ def test_get_session_context_cache_key_isolates_distinct_worktrees(tmp_path, mon
     )
     # And canonical project naming must agree on both calls
     assert ctx1["project"] == ctx2["project"] == "obsidian-brain"
+
+
+# ===========================================================================
+# Task 4: generate_summary returns (text, fallback_reason)
+# ===========================================================================
+
+
+class TestGenerateSummaryReturnsFallbackReason:
+    """generate_summary returns (summary, fallback_reason); reason populated only on failure."""
+
+    def test_success_returns_summary_and_none_reason(self, monkeypatch):
+        import obsidian_utils
+
+        class FakeResult:
+            returncode = 0
+            stdout = "## Summary\nOK\n## Importance\n5\n"
+            stderr = ""
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+
+        summary, reason = obsidian_utils.generate_summary(
+            ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=30,
+        )
+        assert summary.startswith("## Summary")
+        assert reason is None
+
+    def test_timeout_returns_none_and_haiku_timeout(self, monkeypatch):
+        import obsidian_utils
+
+        def fake_run(*a, **kw):
+            raise obsidian_utils.subprocess.TimeoutExpired(cmd=a, timeout=kw["timeout"])
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        summary, reason = obsidian_utils.generate_summary(
+            ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=1,
+        )
+        assert summary is None
+        assert reason == "haiku_timeout"
+
+    def test_nonzero_rc_returns_none_and_subprocess_error(self, monkeypatch):
+        import obsidian_utils
+
+        class FakeResult:
+            returncode = 2
+            stdout = ""
+            stderr = "boom"
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+        summary, reason = obsidian_utils.generate_summary(
+            ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=30,
+        )
+        assert summary is None
+        assert reason == "haiku_subprocess_error"
+
+    def test_empty_stdout_returns_none_and_empty_output(self, monkeypatch):
+        import obsidian_utils
+
+        class FakeResult:
+            returncode = 0
+            stdout = "   "
+            stderr = ""
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+        summary, reason = obsidian_utils.generate_summary(
+            ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=30,
+        )
+        assert summary is None
+        assert reason == "empty_output"
+
+
+# ===========================================================================
+# Task 5: generate_snapshot_summary returns (text, fallback_reason)
+# ===========================================================================
+
+
+class TestGenerateSnapshotSummaryReturnsFallbackReason:
+    def test_success_returns_summary_and_none_reason(self, monkeypatch):
+        import obsidian_utils
+
+        class FakeResult:
+            returncode = 0
+            stdout = "snapshot OK"
+            stderr = ""
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+        summary, reason = obsidian_utils.generate_snapshot_summary(
+            ["u"], ["a"], {"project": "t"}, model="haiku", timeout=30,
+        )
+        assert summary == "snapshot OK"
+        assert reason is None
+
+    def test_timeout_returns_none_and_haiku_timeout(self, monkeypatch):
+        import obsidian_utils
+
+        def fake_run(*a, **kw):
+            raise obsidian_utils.subprocess.TimeoutExpired(cmd=a, timeout=kw["timeout"])
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        summary, reason = obsidian_utils.generate_snapshot_summary(
+            ["u"], ["a"], {"project": "t"}, model="haiku", timeout=1,
+        )
+        assert summary is None
+        assert reason == "haiku_timeout"

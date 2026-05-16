@@ -1926,12 +1926,16 @@ def generate_snapshot_summary(
     metadata: dict,
     model: str = "haiku",
     timeout: int = 30,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """Call ``claude -p --model <model>`` with the snapshot-specific prompt.
 
-    Returns None on failure. Reuses the retry/timeout pattern of
-    generate_summary but with a tighter scope (no open-item dedup, no
-    importance scoring — snapshots don't carry those structural fields).
+    Returns ``(summary_text, fallback_reason)``:
+      * On success: ``(text, None)``
+      * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output")``
+
+    Reuses the retry/timeout pattern of generate_summary but with a tighter
+    scope (no open-item dedup, no importance scoring — snapshots don't carry
+    those structural fields).
     """
     sampled_user = user_msgs[-10:] if len(user_msgs) > 10 else user_msgs
     sampled_asst = assistant_msgs[-10:] if len(assistant_msgs) > 10 else assistant_msgs
@@ -1942,6 +1946,7 @@ def generate_snapshot_summary(
     prompt = SNAPSHOT_SUMMARY_PROMPT.format(transcript=transcript)
 
     attempts = (timeout, timeout * 2)
+    last_reason: str | None = None
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
@@ -1949,14 +1954,20 @@ def generate_snapshot_summary(
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
             )
             if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
+                return result.stdout.strip(), None
+            if result.returncode != 0:
+                last_reason = "haiku_subprocess_error"
+            else:
+                last_reason = "empty_output"
             print(f"[obsidian-brain] claude -p (snapshot) failed (rc={result.returncode})",
                   file=sys.stderr)
             break
         except FileNotFoundError:
+            last_reason = "haiku_subprocess_error"
             print("[obsidian-brain] claude CLI not found", file=sys.stderr)
             break
         except subprocess.TimeoutExpired:
+            last_reason = "haiku_timeout"
             if i < len(attempts) - 1:
                 print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s, retrying...",
                       file=sys.stderr)
@@ -1964,9 +1975,10 @@ def generate_snapshot_summary(
             print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s",
                   file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
+            last_reason = "haiku_subprocess_error"
             print(f"[obsidian-brain] claude -p (snapshot) error: {exc}", file=sys.stderr)
             break
-    return None
+    return None, last_reason
 
 
 def generate_summary(
@@ -1975,11 +1987,17 @@ def generate_summary(
     metadata: dict,
     model: str = "haiku",
     timeout: int = 30,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """Call ``claude -p --model <model>`` to summarize the session.
 
+    Returns ``(summary_text, fallback_reason)``:
+      * On success: ``(text, None)``
+      * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output")``
+
+    Reserved future reasons (populated by Phase 2 #167 validator, not here):
+      ``"missing_section"``, ``"importance_missing"``, ``"schema_loose"``.
+
     Samples first 10 + last 10 messages for large sessions.
-    Returns None on failure.
     """
     # Sample messages for large sessions
     if len(user_msgs) > 20:
@@ -2074,6 +2092,7 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
             prompt += f"- {item_text}\n"
 
     attempts = (timeout, timeout * 2)  # escalate on first timeout
+    last_reason: str | None = None
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
@@ -2088,30 +2107,42 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
                 # Layer 2: Post-generation dedup pass (string-based, pre-write)
                 if existing_items:
                     summary_text = _dedup_summary_open_items(summary_text, existing_items)
-                return summary_text
+                return summary_text, None
+            if result.returncode != 0:
+                last_reason = "haiku_subprocess_error"
+                print(
+                    f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
+                    f"{result.stderr[:200]}",
+                    file=sys.stderr,
+                )
+                break  # non-timeout failure, don't retry
+            last_reason = "empty_output"
             print(
                 f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
                 f"{result.stderr[:200]}",
                 file=sys.stderr,
             )
-            break  # non-timeout failure, don't retry
+            break  # empty stdout, don't retry
         except FileNotFoundError:
+            last_reason = "haiku_subprocess_error"
             print(
                 "[obsidian-brain] claude CLI not found, summarization unavailable",
                 file=sys.stderr,
             )
             break  # won't succeed on retry
         except subprocess.TimeoutExpired as exc:
+            last_reason = "haiku_timeout"
             stderr_snippet = f" stderr: {exc.stderr[:200]}" if exc.stderr else ""
             if i < len(attempts) - 1:
                 print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, retrying with {attempts[i+1]}s{stderr_snippet}", file=sys.stderr)
                 continue
             print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, giving up{stderr_snippet}", file=sys.stderr)
         except Exception as exc:
+            last_reason = "haiku_subprocess_error"
             print(f"[obsidian-brain] claude -p error ({type(exc).__name__}): {exc}", file=sys.stderr)
             break  # unknown error, don't retry
 
-    return None
+    return None, last_reason
 
 
 # ---------------------------------------------------------------------------
@@ -4268,7 +4299,7 @@ def upgrade_unsummarized_note(
         gen_kwargs["timeout"] = summary_timeout
 
     if note_type == "claude-snapshot":
-        summary_text = generate_snapshot_summary(
+        summary_text, fallback_reason = generate_snapshot_summary(
             user_msgs, assistant_msgs, metadata, **gen_kwargs,
         )
     else:
@@ -4287,7 +4318,7 @@ def upgrade_unsummarized_note(
             # prepend it to its sampled transcript. New optional key; existing
             # callers unaffected (absent key → no-op).
             metadata["snapshot_preamble"] = preamble
-        summary_text = generate_summary(
+        summary_text, fallback_reason = generate_summary(
             user_msgs, assistant_msgs, metadata, **gen_kwargs,
         )
 
