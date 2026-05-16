@@ -1204,3 +1204,122 @@ def test_classifier_chunk_size_env_clamped_to_minimum():
         else:
             os.environ["CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE"] = saved
         importlib.reload(check_items_cli)
+
+
+def test_classifier_chunking_boundary_at_chunk_size_plus_one(tmp_path, monkeypatch):
+    """Exactly CHUNK_SIZE+1 groups → chunked dispatch (2 chunks of N/1).
+
+    Guards against a regression flipping `len > N` to `len >= N` or vice
+    versa: the single-dispatch test at N=25 and the multi-dispatch test
+    at N=60 both pass under the wrong inequality.
+    """
+    import check_items_cli
+
+    monkeypatch.setattr("check_items_cli.CLASSIFIER_CHUNK_SIZE", 25)
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
+    groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(26)]
+    payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    fake_run, calls = _make_chunking_fake_run(output_path)
+    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 0
+    assert calls["n"] == 2, (
+        f"Expected 2 chunks at the threshold+1 boundary (26 groups, "
+        f"chunk_size=25), got {calls['n']}"
+    )
+
+    out = json.loads(Path(output_path).read_text())
+    assert len(out) == 26
+    assert [r["group_id"] for r in out] == [f"g{i:03d}" for i in range(26)]
+
+
+def test_classifier_chunking_merge_preserves_input_order_across_chunks(tmp_path, monkeypatch):
+    """Sub-agent returning each chunk's groups in REVERSE order → final
+    output is still in original input order.
+
+    Exercises the group_id-keyed merge step (lines ~681) for chunked
+    dispatch. The earlier order-preservation test relied on chunks
+    coming back in input order, which would still pass under a buggy
+    merge that keyed on chunk-position rather than group_id.
+    """
+    import check_items_cli
+    import re as _re
+
+    monkeypatch.setattr("check_items_cli.CLASSIFIER_CHUNK_SIZE", 5)
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
+    groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(12)]
+    payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    def fake_run_reversed(*args, **kwargs):
+        prompt = kwargs.get("input", "")
+        in_match = _re.search(r"(/\S+\.classin\.json)", prompt)
+        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
+        chunk_payload = json.loads(Path(in_match.group(1)).read_text())
+        # Reverse the sub-agent's output order — production must reorder by group_id.
+        chunk_results = [
+            {
+                "group_id": g["group_id"],
+                "classification": "DONE",
+                "confidence": "HIGH",
+                "canonical_text": g["representative"],
+                "evidence_citation": "commit abc1234",
+                "action_required": None,
+            }
+            for g in reversed(chunk_payload["groups"])
+        ]
+        Path(out_match.group(1)).write_text(json.dumps(chunk_results))
+        mock_cp = MagicMock()
+        mock_cp.returncode = 0
+        mock_cp.stderr = ""
+        mock_cp.stdout = ""
+        return mock_cp
+
+    with patch("check_items_cli.subprocess.run", side_effect=fake_run_reversed):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 0
+    out = json.loads(Path(output_path).read_text())
+    assert [r["group_id"] for r in out] == [f"g{i:03d}" for i in range(12)], (
+        f"Final output must be in original input order, got: "
+        f"{[r['group_id'] for r in out]!r}"
+    )
+
+
+def test_classifier_chunking_failure_cleans_up_chunk_outputs(tmp_path, monkeypatch):
+    """Chunk-failure path's `finally` must unlink every chunk output temp
+    that was created, including the one from the failing chunk.
+
+    Guards against a future refactor that moves cleanup inside the loop
+    body or drops the `finally`. Without cleanup, 0o600 temp files
+    containing partial classifier output would leak under the workdir.
+    """
+    import check_items_cli
+
+    monkeypatch.setattr("check_items_cli.CLASSIFIER_CHUNK_SIZE", 10)
+    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
+
+    # Probe the workdir contents before
+    workdir = Path(check_items_cli._safe_workdir())
+    pre_classouts = set(workdir.glob("*.classout.json"))
+
+    groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(30)]
+    payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
+    output_path = str(tmp_path / "out.json")
+
+    fake_run, _ = _make_chunking_fake_run(output_path, timeout_on=1)
+    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+        rc = check_items_cli.run_classifier(payload_str, output_path)
+
+    assert rc == 3
+    post_classouts = set(workdir.glob("*.classout.json"))
+    leaked = post_classouts - pre_classouts
+    assert not leaked, (
+        f"Chunk output temp files leaked on failure path: "
+        f"{[p.name for p in leaked]}"
+    )

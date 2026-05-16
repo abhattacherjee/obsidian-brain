@@ -22,10 +22,9 @@ STDIN_CAP_BYTES = 1_000_000
 SUBAGENT_TIMEOUT_SEC = int(os.environ.get("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "180"))
 
 # Cap groups per classifier sub-agent dispatch. Above this count, run_classifier()
-# splits to_classify into sequential chunks of <=N each so a single Sonnet call
-# stays well under SUBAGENT_TIMEOUT_SEC. Tuned against the 58-group / 121 KB
-# empirical timeout from issue #173 (formerly tracked at #160). Override via
-# CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE; values <1 are clamped to 1.
+# splits into sequential chunks of <=N so a single Sonnet call stays well under
+# SUBAGENT_TIMEOUT_SEC. Override via CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE; values <1
+# are clamped to 1.
 CLASSIFIER_CHUNK_SIZE = max(
     1, int(os.environ.get("CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE", "25"))
 )
@@ -441,60 +440,73 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
 
 
 def _dispatch_classifier_chunk(
-    chunk_groups: list, evidence: dict, model: str, output_path: str
+    chunk_groups: list, evidence: dict, model: str, output_path: str,
+    chunk_label: str = "",
 ) -> tuple[int, list]:
     """Dispatch one claude -p classifier call for a single chunk of groups.
 
     Writes the classifier input as a temp file under the workdir, invokes
     `claude -p --model {model}` with the CLASSIFIER_PROMPT pointing at that
     file and at `output_path`, then reads results from `output_path` (or
-    stdout as fallback). The temp input is unlinked regardless of outcome.
+    stdout as fallback). The temp input is unlinked even if json.dump,
+    os.chmod, or the subprocess raise.
+
+    `chunk_label` is prepended to diagnostic messages so callers running
+    multiple sequential dispatches can identify the failing chunk. Pass
+    "" (default) for single-call use.
 
     Returns (rc, sub_results). On success rc == 0 and sub_results is the
     validated classifier payload. On any failure rc is non-zero and
-    sub_results is []. Diagnostic messages are written to stderr.
+    sub_results is [].
+
+    rc semantics: 0 success; 3 subprocess timeout; 4 invalid JSON or
+    wrong payload shape from sub-agent; any other value = passthrough
+    of claude -p's non-zero returncode.
     """
     workdir = _safe_workdir()
     in_tmp = tempfile.NamedTemporaryFile(
         mode="w", delete=False, dir=str(workdir),
         suffix=".classin.json", encoding="utf-8",
     )
+    in_tmp_path = in_tmp.name
     try:
-        sub_payload = {"groups": chunk_groups, "evidence": evidence}
-        json.dump(sub_payload, in_tmp)
-        in_tmp.flush()
-    finally:
-        in_tmp.close()
-    os.chmod(in_tmp.name, 0o600)
+        try:
+            sub_payload = {"groups": chunk_groups, "evidence": evidence}
+            json.dump(sub_payload, in_tmp)
+            in_tmp.flush()
+        finally:
+            in_tmp.close()
+        os.chmod(in_tmp_path, 0o600)
 
-    prompt = CLASSIFIER_PROMPT.replace(
-        "<input-json-path>", in_tmp.name
-    ).replace(
-        "<output-json-path>", output_path
-    )
+        prompt = CLASSIFIER_PROMPT.replace(
+            "<input-json-path>", in_tmp_path
+        ).replace(
+            "<output-json-path>", output_path
+        )
 
-    cmd = ["claude", "-p", "--model", model]
-    try:
-        cp = subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True,
-            timeout=SUBAGENT_TIMEOUT_SEC,
-        )
-    except subprocess.TimeoutExpired:
-        print(
-            f"[check-items-cli] classifier timeout after {SUBAGENT_TIMEOUT_SEC}s",
-            file=sys.stderr,
-        )
-        return 3, []
+        cmd = ["claude", "-p", "--model", model]
+        try:
+            cp = subprocess.run(
+                cmd, input=prompt, capture_output=True, text=True,
+                timeout=SUBAGENT_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"[check-items-cli] {chunk_label}classifier timeout after "
+                f"{SUBAGENT_TIMEOUT_SEC}s",
+                file=sys.stderr,
+            )
+            return 3, []
     finally:
         try:
-            os.unlink(in_tmp.name)
+            os.unlink(in_tmp_path)
         except OSError:
             pass
 
     if cp.returncode != 0:
         print(
-            f"[check-items-cli] classifier failed rc={cp.returncode}: "
-            f"{cp.stderr[:500]}",
+            f"[check-items-cli] {chunk_label}classifier failed "
+            f"rc={cp.returncode}: {cp.stderr[:500]}",
             file=sys.stderr,
         )
         return cp.returncode, []
@@ -504,15 +516,16 @@ def _dispatch_classifier_chunk(
             parsed = json.loads(Path(output_path).read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             print(
-                f"[check-items-cli] classifier output invalid JSON: {exc}",
+                f"[check-items-cli] {chunk_label}classifier output invalid "
+                f"JSON: {exc}",
                 file=sys.stderr,
             )
             return 4, []
         if not _validate_classifier_payload(parsed):
             print(
-                "[check-items-cli] classifier file-path output produced invalid"
-                f" shape (expected list of classifier objects, got "
-                f"{type(parsed).__name__})",
+                f"[check-items-cli] {chunk_label}classifier file-path output "
+                f"produced invalid shape (expected list of classifier "
+                f"objects, got {type(parsed).__name__})",
                 file=sys.stderr,
             )
             return 4, []
@@ -522,15 +535,16 @@ def _dispatch_classifier_chunk(
         parsed = json.loads(_strip_json_fences(cp.stdout))
     except json.JSONDecodeError as exc:
         print(
-            f"[check-items-cli] classifier output invalid JSON: {exc}",
+            f"[check-items-cli] {chunk_label}classifier output invalid "
+            f"JSON: {exc}",
             file=sys.stderr,
         )
         return 4, []
     if not _validate_classifier_payload(parsed):
         print(
-            "[check-items-cli] classifier stdout-fallback produced invalid"
-            f" shape (expected list of classifier objects, got "
-            f"{type(parsed).__name__})",
+            f"[check-items-cli] {chunk_label}classifier stdout-fallback "
+            f"produced invalid shape (expected list of classifier objects, "
+            f"got {type(parsed).__name__})",
             file=sys.stderr,
         )
         return 4, []
@@ -549,7 +563,7 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
       3. If to_classify is non-empty, dispatch claude -p. When
          len(to_classify) > CLASSIFIER_CHUNK_SIZE, split into sequential
          chunks of <=CLASSIFIER_CHUNK_SIZE groups so a single call stays
-         well under SUBAGENT_TIMEOUT_SEC (issue #173 / former #160).
+         well under SUBAGENT_TIMEOUT_SEC.
       4. Merge sub-agent results + synthetic results in input order.
       5. Write merged output to output_path (0o600).
       6. Emit telemetry line to stderr.
@@ -617,7 +631,6 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
         model = _pick_classifier_model(len(to_classify))
 
         if len(to_classify) <= CLASSIFIER_CHUNK_SIZE:
-            # Single dispatch — writes directly to output_path.
             chunk_count = 1
             rc, chunk_results = _dispatch_classifier_chunk(
                 to_classify, evidence, model, output_path
@@ -626,8 +639,6 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
                 return rc
             sub_results = chunk_results
         else:
-            # Chunked dispatch — each chunk writes to a unique temp output;
-            # results are merged into a single ordered list written below.
             chunks = [
                 to_classify[i:i + CLASSIFIER_CHUNK_SIZE]
                 for i in range(0, len(to_classify), CLASSIFIER_CHUNK_SIZE)
@@ -641,25 +652,32 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
             )
             workdir = _safe_workdir()
             chunk_outputs: list = []
+            completed_chunks = 0
             try:
                 for idx, chunk in enumerate(chunks):
                     out_tmp = tempfile.NamedTemporaryFile(
                         mode="w", delete=False, dir=str(workdir),
                         suffix=f".chunk-{idx}.classout.json", encoding="utf-8",
                     )
-                    out_tmp.close()
                     chunk_outputs.append(out_tmp.name)
+                    out_tmp.close()
+                    label = f"chunk {idx + 1}/{chunk_count}: "
                     rc, chunk_results = _dispatch_classifier_chunk(
-                        chunk, evidence, model, out_tmp.name
+                        chunk, evidence, model, out_tmp.name, chunk_label=label,
                     )
                     if rc != 0:
+                        # Discarded earlier-chunk classifications surfaced so
+                        # operators can tell partial chunking from total failure.
                         print(
-                            f"[check-items-cli] classifier chunk {idx + 1}/"
-                            f"{chunk_count} failed rc={rc}",
+                            f"[check-items-cli] classifier: aborting after "
+                            f"chunk {idx + 1}/{chunk_count} rc={rc} "
+                            f"(completed={completed_chunks}, "
+                            f"discarded_groups={len(sub_results)})",
                             file=sys.stderr,
                         )
                         return rc
                     sub_results.extend(chunk_results)
+                    completed_chunks += 1
             finally:
                 for path in chunk_outputs:
                     try:
