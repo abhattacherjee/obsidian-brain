@@ -20,6 +20,11 @@ COMPLETION_SIGNAL_TOKENS = frozenset({
     "released", "deprecated", "removed", "reverted", "completed",
 })
 
+_COMPLETION_SIGNAL_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(s) for s in COMPLETION_SIGNAL_TOKENS) + r")\b",
+    re.IGNORECASE,
+)
+
 REF_PATTERN = re.compile(r'(?<!\w)#\d+\b|\b[0-9a-f]{7,40}\b')
 
 _WORD_RE = re.compile(r'\w+')
@@ -33,13 +38,23 @@ def _content_tokens(text: str) -> list[str]:
             if t.lower() not in STOPWORDS and len(t) > 2]
 
 
+# Length threshold for "distinctive" tokens in Rule 2 of has_classifiable_evidence.
+# Tokens shorter than this need either snake_case or interior mixed-case to qualify
+# as a distinctive Rule-2 signal. Tuned empirically against PR #173's reference
+# payload — see docs/superpowers/specs/2026-05-16-l2-prefilter-completion-signal-design.md.
+_DISTINCTIVE_MIN_LEN = 8
+
+
 def _is_distinctive(token: str) -> bool:
     """Return True if `token` is specific enough to be a meaningful Rule-2 signal.
 
     A distinctive token is one of:
-      - Contains '_' (snake_case identifiers like `last_session_anchor`)
-      - Mixed-case (CamelCase or has both upper and lower — e.g. `resolveAnchor`)
-      - Length >= 8 (long enough to be a domain term, not generic English)
+      - Contains '_' (snake_case identifiers like `last_session_anchor`).
+      - Has length >= `_DISTINCTIVE_MIN_LEN` (long enough to be a domain term).
+      - Has interior mixed-case (CamelCase like `resolveAnchor`, `RangeAnchors`)
+        — sentence-start Title-case like `Add`, `Fix`, `Run` is NOT distinctive,
+        which is why mixed-case checks the substring `token[1:]` rather than
+        the whole token.
 
     Generic short lowercase words ('now', 'add', 'fix', 'chip', 'session')
     are NOT distinctive — they overlap accidentally across unrelated shipped
@@ -49,11 +64,13 @@ def _is_distinctive(token: str) -> bool:
         return False
     if "_" in token:
         return True
-    if len(token) >= 8:
+    if len(token) >= _DISTINCTIVE_MIN_LEN:
         return True
-    has_upper = any(c.isupper() for c in token)
+    # Mixed-case must be interior (e.g. CamelCase `resolveAnchor`, `RangeAnchors`)
+    # — sentence-start Title-case like `Add`, `Fix`, `Run` is a false positive.
+    has_interior_upper = any(c.isupper() for c in token[1:])
     has_lower = any(c.islower() for c in token)
-    return has_upper and has_lower
+    return has_interior_upper and has_lower
 
 
 def _has_nearby_completion_signal(haystack: str, content_tokens: list[str],
@@ -61,8 +78,10 @@ def _has_nearby_completion_signal(haystack: str, content_tokens: list[str],
     """Return True if any completion-signal token appears within `window` chars
     of any content-token hit in `haystack`.
 
-    Both haystack and tokens are matched case-insensitively. Empty inputs
-    return False.
+    Both haystack and tokens are matched case-insensitively.
+    Completion-signal matching uses word boundaries (`_COMPLETION_SIGNAL_RE`)
+    to avoid false positives from substrings like `unmerged`, `enclosed`,
+    `redone`, `undone` that contain signal substrings but are not signals.
     """
     if not haystack or not content_tokens:
         return False
@@ -79,7 +98,7 @@ def _has_nearby_completion_signal(haystack: str, content_tokens: list[str],
             lo = max(0, i - window)
             hi = min(len(h), i + len(tok_l) + window)
             slice_ = h[lo:hi]
-            if any(sig in slice_ for sig in COMPLETION_SIGNAL_TOKENS):
+            if _COMPLETION_SIGNAL_RE.search(slice_):
                 return True
             idx = i + 1
     return False
@@ -95,14 +114,16 @@ def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
          changelog_excerpt). These buckets pre-encode completion.
       3. Activity-zone proximity: a content-token appears in
          (commits_text + fts_mentions_text) AND a COMPLETION_SIGNAL_TOKENS
-         entry occurs within 120 chars of that hit.
+         entry occurs within the proximity window of that hit (see
+         `_has_nearby_completion_signal`, default 120 chars).
 
     Otherwise returns False; the caller produces a synthetic STALE/ACTIVE
     classification via synthetic_classification().
 
     Args:
-        group: Group dict with at minimum a 'representative' field containing
-               canonical text. May also carry 'canonical_text'.
+        group: Group dict carrying canonical text under 'representative' or
+               'canonical_text'. If neither is present (or both empty),
+               returns False.
         evidence: Dict with optional keys: commits_text, merged_prs_text,
                   closed_issues_text, releases_text, changelog_excerpt,
                   fts_mentions_text. Any missing key is treated as empty.

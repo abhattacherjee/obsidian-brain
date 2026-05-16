@@ -618,3 +618,92 @@ def test_has_evidence_camel_case_identifier_triggers_rule_2():
         closed_issues_text="#15 resolveLastSessionAnchor refactor",
     )
     assert has_classifiable_evidence(group, ev) is True
+
+
+# ---------------------------------------------------------------------------
+# Sentence-start Title-case regression (#174 review)
+# ---------------------------------------------------------------------------
+
+def test_is_distinctive_sentence_start_title_case_returns_false():
+    """Sentence-start Title-case words like `Add`/`Fix`/`Run` must NOT be
+    distinctive — they're just lowercase English with a capitalized first
+    letter, and treating them as distinctive re-opens the over-trigger
+    bug PR #173 is fixing (#174 review)."""
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("Add") is False
+    assert _is_distinctive("Fix") is False
+    assert _is_distinctive("Run") is False
+    assert _is_distinctive("Use") is False
+    assert _is_distinctive("Set") is False
+    assert _is_distinctive("Pre") is False
+
+
+def test_is_distinctive_interior_mixed_case_returns_true():
+    """Genuine CamelCase identifiers must remain distinctive."""
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("resolveAnchor") is True
+    assert _is_distinctive("RangeAnchors") is True
+    assert _is_distinctive("FixIt") is True   # short, but interior upper after F
+    assert _is_distinctive("aBc") is True     # minimal interior mixed-case
+
+
+def test_is_distinctive_all_upper_acronym_returns_false():
+    """All-upper acronyms (`PR`, `FTS`, `ABC`) have no lower-case letters and
+    must NOT be distinctive — they're too generic and could match anywhere."""
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("ABC") is False
+    assert _is_distinctive("FTS") is False
+    assert _is_distinctive("PR") is False
+
+
+def test_has_evidence_sentence_start_capital_does_not_trigger_rule_2():
+    """Critical regression from #174 review: a sentence-form representative
+    starting with `Add`/`Fix`/`Run` must NOT match Rule 2 against unrelated
+    completed PR titles, even if those titles also contain the same English
+    verb. Without the interior-mixed-case fix in _is_distinctive, this test
+    fails — demonstrating the over-trigger bug PR #173 was supposed to fix."""
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("Add cache layer for telemetry feature")
+    ev = _make_evidence(merged_prs_text="#41 feat: add new dashboard chip")
+    # Tokens from canonical: 'Add', 'cache', 'layer', 'for', 'telemetry', 'feature'.
+    # - 'Add' is sentence-start Title-case → NOT distinctive.
+    # - 'cache', 'layer', 'for' are too short / are stopwords.
+    # - 'telemetry' (9 chars) is distinctive but does not appear in PR title.
+    # - 'feature' (7 chars, lowercase) is NOT distinctive.
+    # Therefore Rule 2 must NOT fire.
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_nearby_completion_signal_signal_before_content_token():
+    """The proximity window is symmetric — a completion verb appearing BEFORE
+    the content token (e.g. `closed ... anchor`) must trigger Rule 3 just as
+    `anchor ... closed` does. Window is +-120 chars around the content hit."""
+    from check_items_prefilter import _has_nearby_completion_signal
+    # 100 chars of filler between "closed" and "anchor" — within default window
+    haystack = "closed" + (" " * 100) + "anchor"
+    assert _has_nearby_completion_signal(haystack, ["anchor"]) is True
+
+
+def test_nearby_completion_signal_substring_does_not_falsely_match():
+    """Word-boundary check: tokens like `unmerged`, `enclosed`, `redone`,
+    `undone` contain completion-signal substrings (`merged`, `closed`,
+    `done`) but are NOT completion signals themselves. The proximity
+    check must use word boundaries (#174 review)."""
+    from check_items_prefilter import _has_nearby_completion_signal
+    # unmerged: contains 'merged' as substring but not as a whole word
+    assert _has_nearby_completion_signal("anchor unmerged in pipeline", ["anchor"]) is False
+    # enclosed: contains 'closed' as substring
+    assert _has_nearby_completion_signal("anchor enclosed within scope", ["anchor"]) is False
+    # redone: contains 'done' as substring
+    assert _has_nearby_completion_signal("anchor redone but pending", ["anchor"]) is False
+    # undone: contains 'done' as substring
+    assert _has_nearby_completion_signal("anchor undone yesterday", ["anchor"]) is False
+
+
+def test_nearby_completion_signal_genuine_completion_verb_still_triggers():
+    """Verify the word-boundary fix did not over-tighten — `merged`, `closed`,
+    `done` as whole words still trigger."""
+    from check_items_prefilter import _has_nearby_completion_signal
+    assert _has_nearby_completion_signal("anchor merged via PR", ["anchor"]) is True
+    assert _has_nearby_completion_signal("Closed anchor work today", ["anchor"]) is True
+    assert _has_nearby_completion_signal("done with anchor refactor", ["anchor"]) is True
