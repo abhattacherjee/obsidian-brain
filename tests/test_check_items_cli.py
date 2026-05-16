@@ -861,14 +861,16 @@ def test_l2_prefilter_active_project_fixture(tmp_path, monkeypatch, capsys):
     import check_items_cli
 
     # Stub the sub-agent dispatch to a no-op that writes an empty result list to
-    # output_path. The integration test asserts on the L2 partition only — what
-    # the sub-agent would have classified is out of scope for #173.
+    # the per-call output_path (parsed from the prompt). The integration test
+    # asserts on the L2 partition only — what the sub-agent would have
+    # classified is out of scope for #173.
+    import re as _re
+
     def _fake_run(*_a, **_k):
-        # run_classifier passes output_path as the 4th positional CLI arg:
-        # ["python3", cli_path, "classifier", output_path, ...]
-        cli_args = _a[0] if _a else _k.get("args", [])
-        if len(cli_args) >= 4:
-            Path(cli_args[3]).write_text(json.dumps([]), encoding="utf-8")
+        prompt = _k.get("input", "")
+        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
+        if out_match:
+            Path(out_match.group(1)).write_text(json.dumps([]), encoding="utf-8")
 
         class R:
             returncode = 0
