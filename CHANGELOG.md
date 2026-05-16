@@ -25,8 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only on failure: `haiku_timeout`, `haiku_subprocess_error`, or `empty_output`.
 - **`upgrade_unsummarized_note`** — now returns
   `tuple[str, float, str | None, str | None]` (status, elapsed_s, model_used,
-  fallback_reason). `model_used` is `"haiku-4.5"` on success; `None` on failure
-  paths. Sonnet/Opus/sub-agent tags reserved for downstream phases (#165, #167).
+  fallback_reason). `model_used` reflects the resolved `summary_model` parameter
+  (default `"haiku"`); `None` on failure paths. `sonnet-4.6` / `opus-*` tags
+  reserved for Phase 3 (#165).
 
 ## [2.5.1] - 2026-05-16
 
