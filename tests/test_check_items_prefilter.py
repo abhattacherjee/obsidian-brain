@@ -442,9 +442,10 @@ def test_has_evidence_ref_only_commit_sha_returns_true():
 
 
 def test_has_evidence_completion_zone_closed_issues_hit_returns_true():
+    # 'regression' is distinctive (10 chars >= 8) and appears in the haystack.
     from check_items_prefilter import has_classifiable_evidence
     group = _make_group("anchor cache regression")
-    ev = _make_evidence(closed_issues_text="anchor caching bug write-up")
+    ev = _make_evidence(closed_issues_text="anchor caching regression bug write-up")
     assert has_classifiable_evidence(group, ev) is True
 
 
@@ -533,3 +534,87 @@ def test_has_evidence_active_project_wip_item_returns_false():
         fts_mentions_text="anchor design discussion in vault note",
     )
     assert has_classifiable_evidence(group, ev) is False
+
+
+# ---------------------------------------------------------------------------
+# _is_distinctive
+# ---------------------------------------------------------------------------
+
+def test_is_distinctive_snake_case():
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("last_session_anchor") is True
+    assert _is_distinctive("foo_bar") is True
+
+
+def test_is_distinctive_camel_case():
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("resolveLastSessionAnchor") is True
+    assert _is_distinctive("RangeAnchors") is True
+
+
+def test_is_distinctive_long_lowercase():
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("regression") is True
+    assert _is_distinctive("pagination") is True
+    assert _is_distinctive("timeframes") is True
+
+
+def test_is_distinctive_short_lowercase_is_false():
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("now") is False
+    assert _is_distinctive("add") is False
+    assert _is_distinctive("fix") is False
+    assert _is_distinctive("chip") is False
+    assert _is_distinctive("session") is False  # 7 chars, all lowercase
+    assert _is_distinctive("widget") is False   # 6 chars
+
+
+def test_is_distinctive_empty():
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("") is False
+
+
+def test_is_distinctive_exactly_8_chars():
+    from check_items_prefilter import _is_distinctive
+    # 8-char lowercase — boundary, distinctive
+    assert _is_distinctive("abcdefgh") is True
+    # 7-char lowercase — boundary, NOT distinctive
+    assert _is_distinctive("abcdefg") is False
+
+
+def test_has_evidence_generic_token_overlap_does_not_trigger_rule_2():
+    """Regression: generic short-lowercase tokens like 'now', 'fix', 'chip'
+    overlap accidentally across unrelated completed features. Rule 2 must
+    require a distinctive token (#173).
+
+    All tokens in the group are short (<8 chars), all-lowercase, no underscore,
+    no mixed-case — so none pass _is_distinctive and Rule 2 cannot fire.
+    Rule 3 (proximity) doesn't apply because there is no commits_text.
+    """
+    from check_items_prefilter import has_classifiable_evidence
+    # Tokens: 'now', 'fix', 'chip', 'new', 'run' — all short lowercase.
+    group = _make_group("now fix chip new run")
+    ev = _make_evidence(
+        merged_prs_text="now fix chip run for other feature",  # same generic words
+    )
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_has_evidence_distinctive_token_still_triggers_rule_2():
+    """Regression: distinctive tokens (length >= 8 OR has _ OR mixed-case)
+    still trigger Rule 2 on completion-zone overlap (#173)."""
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("Investigate pagination regression")  # both distinctive
+    ev = _make_evidence(
+        merged_prs_text="fix pagination edge case",
+    )
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_camel_case_identifier_triggers_rule_2():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("Implement resolveLastSessionAnchor cleanup")
+    ev = _make_evidence(
+        closed_issues_text="#15 resolveLastSessionAnchor refactor",
+    )
+    assert has_classifiable_evidence(group, ev) is True

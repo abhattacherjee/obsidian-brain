@@ -33,6 +33,29 @@ def _content_tokens(text: str) -> list[str]:
             if t.lower() not in STOPWORDS and len(t) > 2]
 
 
+def _is_distinctive(token: str) -> bool:
+    """Return True if `token` is specific enough to be a meaningful Rule-2 signal.
+
+    A distinctive token is one of:
+      - Contains '_' (snake_case identifiers like `last_session_anchor`)
+      - Mixed-case (CamelCase or has both upper and lower — e.g. `resolveAnchor`)
+      - Length >= 8 (long enough to be a domain term, not generic English)
+
+    Generic short lowercase words ('now', 'add', 'fix', 'chip', 'session')
+    are NOT distinctive — they overlap accidentally across unrelated shipped
+    features in an active project's completion corpus.
+    """
+    if not token:
+        return False
+    if "_" in token:
+        return True
+    if len(token) >= 8:
+        return True
+    has_upper = any(c.isupper() for c in token)
+    has_lower = any(c.islower() for c in token)
+    return has_upper and has_lower
+
+
 def _has_nearby_completion_signal(haystack: str, content_tokens: list[str],
                                   window: int = 120) -> bool:
     """Return True if any completion-signal token appears within `window` chars
@@ -98,14 +121,18 @@ def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
     if not tokens:
         return False
 
-    # Rule 2: completion-zone overlap (buckets pre-encode completion)
+    # Rule 2: completion-zone overlap (buckets pre-encode completion).
+    # Require a DISTINCTIVE token match — generic English content-tokens
+    # (`now`, `add`, `fix`) overlap accidentally across unrelated shipped
+    # features in an active project's completion corpus.
     completion_haystack = "\n".join([
         evidence.get("merged_prs_text") or "",
         evidence.get("closed_issues_text") or "",
         evidence.get("releases_text") or "",
         evidence.get("changelog_excerpt") or "",
     ]).lower()
-    if any(t.lower() in completion_haystack for t in tokens):
+    distinctive_tokens = [t for t in tokens if _is_distinctive(t)]
+    if any(t.lower() in completion_haystack for t in distinctive_tokens):
         return True
 
     # Rule 3: activity-zone proximity (requires completion-signal verb nearby)
