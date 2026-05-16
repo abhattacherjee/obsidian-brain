@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mtime` field threaded through `classify_groups_with_agent` payload so L2 can compute item
   age (STALE threshold: >90 days since earliest member mtime). (#160)
 
+### Changed
+- `/check-items` L2 prefilter now uses a zone-aware completion-signal
+  heuristic. The previous heuristic over-routed items to the sub-agent
+  on active projects where WIP items shared vocabulary with their own
+  recent commits; the new rule requires either a distinctive-token hit
+  in completion-zone buckets (merged PR titles, closed issue titles,
+  releases, released changelog sections) or a completion verb near a
+  content-token hit in commits/notes. The bridge function also narrows
+  PR/issue evidence to titles only and strips `[Unreleased]` from the
+  changelog excerpt before the prefilter sees it. Empirical replay
+  against the issue-173 reference payload: `prefiltered` jumps from 0
+  to 12 on 21 groups. (#173)
+
 ### Fixed
 - Reduced `claude -p` sub-agent invocations for vaults with many open items that lack
   completion evidence, addressing the timeout root cause reported in issue #160.
