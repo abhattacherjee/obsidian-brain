@@ -108,10 +108,12 @@ import sys, os, json
 from collections import Counter
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import upgrade_batch
+import time
 paths = json.loads(sys.stdin.read())
+_t0 = time.monotonic()
 results = upgrade_batch(paths, sys.argv[1], sys.argv[2], sys.argv[3])
 # results is list[dict] with keys: path, status, elapsed_s, model_used, fallback_reason
-total_s = round(sum(r["elapsed_s"] for r in results), 1)
+wall_s = round(time.monotonic() - _t0, 1)
 model_counts = Counter()
 for r in results:
     tag = r["model_used"] or "fallback"
@@ -119,7 +121,7 @@ for r in results:
 DASH = chr(45)
 breakdown = " / ".join(f"{n} {m.split(DASH)[0]}" for m, n in model_counts.most_common())
 print(json.dumps(results))
-print(f"[obsidian-brain] Step 2: upgraded {len(results)} note(s) in {total_s}s ({breakdown})", file=sys.stderr)
+print(f"[obsidian-brain] Step 2: upgraded {len(results)} note(s) in {wall_s}s wall ({breakdown})", file=sys.stderr)
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
@@ -127,7 +129,7 @@ Parse the returned JSON array. Each result dict has: `path`, `status`, `elapsed_
 - `status` starts with `Upgraded ` → mark as succeeded
 - anything else (including `Failed: ...`, empty, or unexpected prefix) → add to the Phase 2 fallback list
 
-The stderr line emits a per-model breakdown visible in the tool trace (e.g. `Step 2: upgraded 7 note(s) in 12.4s (5 haiku / 2 fallback)`).
+The stderr line emits a per-model breakdown visible in the tool trace (e.g. `Step 2: upgraded 7 note(s) in 2.8s wall (5 haiku / 2 fallback)`).
 
 If N <= 5: update each sub-task accordingly (succeeded or `Failed: <basename>`).
 If N > 5: update task #2 subject to `Upgrade N notes: M succeeded, F pending fallback`.
