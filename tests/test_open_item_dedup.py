@@ -944,7 +944,12 @@ def test_find_duplicates_exact_match_case_and_markdown_insensitive():
 # ---------------------------------------------------------------------------
 
 def test_outer_wrapper_honors_env_timeout(monkeypatch, tmp_path):
-    """merge_groups_semantically passes SUBAGENT_TIMEOUT_SEC to subprocess.run."""
+    """merge_groups_semantically passes _outer_subagent_timeout() (inner*6) to subprocess.run.
+
+    The outer wraps a sequential dispatch over N chunks of <=CLASSIFIER_CHUNK_SIZE
+    each, so it must allow inner-per-chunk * max-chunks slack. Setting the env
+    var sets the INNER timeout; outer derives.
+    """
     import subprocess
     import open_item_dedup as oid_module
 
@@ -954,26 +959,37 @@ def test_outer_wrapper_honors_env_timeout(monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         captured_kwargs.append(kwargs)
-        # Return a mock CompletedProcess that looks like a successful run
         result = subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="")
         return result
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    # Build a minimal flat_groups payload so the sub-agent path is exercised.
-    # The call will fail (returncode=1) but we only care about the timeout kwarg.
     flat_groups = [
         {"group_id": "abc", "project": "proj", "representative": "Fix #1", "members": []}
     ]
-    # Patch _check_items_workdir to use tmp_path
     monkeypatch.setattr(oid_module, "_check_items_workdir", lambda: tmp_path)
 
     oid_module.merge_groups_semantically(flat_groups)
 
-    # At least one subprocess.run must have been called with timeout=300
-    assert any(kw.get("timeout") == 300 for kw in captured_kwargs), (
-        f"Expected timeout=300 in one of {[kw.get('timeout') for kw in captured_kwargs]}"
+    # Outer is inner*6 — env=300 → outer=1800. Guards against the regression
+    # where outer used inner directly and killed multi-chunk dispatches early.
+    assert any(kw.get("timeout") == 1800 for kw in captured_kwargs), (
+        f"Expected outer timeout=1800 (inner=300 * 6); got "
+        f"{[kw.get('timeout') for kw in captured_kwargs]}"
     )
+
+
+def test_outer_subagent_timeout_default_is_6x_inner(monkeypatch):
+    """With no env override, _outer_subagent_timeout() returns 300*6=1800.
+
+    Guards against the regression where outer hardcoded `180` while inner was
+    bumped to `300`, causing the outer to kill the inner before any chunk
+    finished (empirical 38-group payload, 2 Haiku chunks at ~75s each were
+    killed after 180s outer wall-clock → heuristic-fallback).
+    """
+    import open_item_dedup as oid_module
+    monkeypatch.delenv("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", raising=False)
+    assert oid_module._outer_subagent_timeout() == 1800
 
 
 # ---------------------------------------------------------------------------

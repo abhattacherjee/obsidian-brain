@@ -15,6 +15,16 @@ STOPWORDS = frozenset({
     "that", "this", "with", "on", "by", "it", "as", "be", "are",
 })
 
+COMPLETION_SIGNAL_TOKENS = frozenset({
+    "done", "shipped", "merged", "closed", "fixed", "resolved",
+    "released", "deprecated", "removed", "reverted", "completed",
+})
+
+_COMPLETION_SIGNAL_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(s) for s in COMPLETION_SIGNAL_TOKENS) + r")\b",
+    re.IGNORECASE,
+)
+
 REF_PATTERN = re.compile(r'(?<!\w)#\d+\b|\b[0-9a-f]{7,40}\b')
 
 _WORD_RE = re.compile(r'\w+')
@@ -28,21 +38,95 @@ def _content_tokens(text: str) -> list[str]:
             if t.lower() not in STOPWORDS and len(t) > 2]
 
 
-def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
-    """Return True if the group has any plausible completion evidence.
+# Length threshold for "distinctive" tokens in Rule 2 of has_classifiable_evidence.
+# Tokens shorter than this need either snake_case or interior mixed-case to qualify
+# as a distinctive Rule-2 signal. Tuned empirically against PR #173's reference
+# payload — see docs/superpowers/specs/2026-05-16-l2-prefilter-completion-signal-design.md.
+_DISTINCTIVE_MIN_LEN = 8
 
-    Two checks (first match wins):
-    1. Explicit issue/PR/commit-sha references in canonical_text — let the
-       sub-agent handle anti-conflation (spec § Anti-conflation rule).
-    2. Token overlap between canonical_text content tokens and the evidence
-       bundle haystack.
+
+def _is_distinctive(token: str) -> bool:
+    """Return True if `token` is specific enough to be a meaningful Rule-2 signal.
+
+    A distinctive token is one of:
+      - Contains '_' (snake_case identifiers like `last_session_anchor`).
+      - Has length >= `_DISTINCTIVE_MIN_LEN` (long enough to be a domain term).
+      - Has interior mixed-case (CamelCase like `resolveAnchor`, `RangeAnchors`)
+        — sentence-start Title-case like `Add`, `Fix`, `Run` is NOT distinctive,
+        which is why mixed-case checks the substring `token[1:]` rather than
+        the whole token.
+
+    Generic short lowercase words ('now', 'add', 'fix', 'chip', 'session')
+    are NOT distinctive — they overlap accidentally across unrelated shipped
+    features in an active project's completion corpus.
+    """
+    if not token:
+        return False
+    if "_" in token:
+        return True
+    if len(token) >= _DISTINCTIVE_MIN_LEN:
+        return True
+    # Mixed-case must be interior (e.g. CamelCase `resolveAnchor`, `RangeAnchors`)
+    # — sentence-start Title-case like `Add`, `Fix`, `Run` is a false positive.
+    has_interior_upper = any(c.isupper() for c in token[1:])
+    has_lower = any(c.islower() for c in token)
+    return has_interior_upper and has_lower
+
+
+def _has_nearby_completion_signal(haystack: str, content_tokens: list[str],
+                                  window: int = 120) -> bool:
+    """Return True if any completion-signal token appears within `window` chars
+    of any content-token hit in `haystack`.
+
+    Both haystack and tokens are matched case-insensitively.
+    Completion-signal matching uses word boundaries (`_COMPLETION_SIGNAL_RE`)
+    to avoid false positives from substrings like `unmerged`, `enclosed`,
+    `redone`, `undone` that contain signal substrings but are not signals.
+    """
+    if not haystack or not content_tokens:
+        return False
+    h = haystack.lower()
+    for tok in content_tokens:
+        tok_l = tok.lower()
+        if not tok_l:
+            continue
+        idx = 0
+        while True:
+            i = h.find(tok_l, idx)
+            if i == -1:
+                break
+            lo = max(0, i - window)
+            hi = min(len(h), i + len(tok_l) + window)
+            slice_ = h[lo:hi]
+            if _COMPLETION_SIGNAL_RE.search(slice_):
+                return True
+            idx = i + 1
+    return False
+
+
+def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
+    """Return True if the group has plausible completion evidence.
+
+    Zone-aware rules (first match wins):
+      1. Ref shortcut: REF_PATTERN matches #N or commit-sha in canonical_text.
+      2. Completion-zone overlap: any content-token from canonical_text
+         appears in (merged_prs_text + closed_issues_text + releases_text +
+         changelog_excerpt). These buckets pre-encode completion.
+      3. Activity-zone proximity: a content-token appears in
+         (commits_text + fts_mentions_text) AND a COMPLETION_SIGNAL_TOKENS
+         entry occurs within the proximity window of that hit (see
+         `_has_nearby_completion_signal`, default 120 chars).
+
+    Otherwise returns False; the caller produces a synthetic STALE/ACTIVE
+    classification via synthetic_classification().
 
     Args:
-        group: A group dict with at minimum a 'representative' field containing
-               the canonical text. May also carry 'instances' list with 'text'.
+        group: Group dict carrying canonical text under 'representative' or
+               'canonical_text'. If neither is present (or both empty),
+               returns False.
         evidence: Dict with optional keys: commits_text, merged_prs_text,
                   closed_issues_text, releases_text, changelog_excerpt,
-                  fts_mentions_text. Any missing key is treated as empty string.
+                  fts_mentions_text. Any missing key is treated as empty.
 
     Returns:
         True if the sub-agent should classify this item; False if L2 can
@@ -50,25 +134,34 @@ def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
     """
     canonical_text = group.get("representative") or group.get("canonical_text", "")
 
-    # Check 1: explicit issue/PR/commit-sha reference
+    # Rule 1: explicit issue/PR/commit-sha reference
     if REF_PATTERN.search(canonical_text):
         return True
 
-    # Check 2: token overlap with evidence bundle
     tokens = _content_tokens(canonical_text)
     if not tokens:
         return False
 
-    haystack = "\n".join([
-        evidence.get("commits_text") or "",
+    # Rule 2: completion-zone overlap (buckets pre-encode completion).
+    # Require a DISTINCTIVE token match — generic English content-tokens
+    # (`now`, `add`, `fix`) overlap accidentally across unrelated shipped
+    # features in an active project's completion corpus.
+    completion_haystack = "\n".join([
         evidence.get("merged_prs_text") or "",
         evidence.get("closed_issues_text") or "",
         evidence.get("releases_text") or "",
         evidence.get("changelog_excerpt") or "",
-        evidence.get("fts_mentions_text") or "",
     ]).lower()
+    distinctive_tokens = [t for t in tokens if _is_distinctive(t)]
+    if any(t.lower() in completion_haystack for t in distinctive_tokens):
+        return True
 
-    return any(t.lower() in haystack for t in tokens)
+    # Rule 3: activity-zone proximity (requires completion-signal verb nearby)
+    activity_haystack = "\n".join([
+        evidence.get("commits_text") or "",
+        evidence.get("fts_mentions_text") or "",
+    ])
+    return _has_nearby_completion_signal(activity_haystack, tokens)
 
 
 _STALE_THRESHOLD_DAYS = 90

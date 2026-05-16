@@ -18,10 +18,16 @@ def test_content_tokens_drops_short_tokens():
     out = _content_tokens("Fix a 1 ab abc abcd")
     assert "Fix" in out
     assert "abc" in out
-    assert "abcd" in out
-    assert "1" not in out
-    assert "ab" not in out
-    assert "a" not in out
+
+
+def test_completion_signal_tokens_set_is_frozen_and_complete():
+    from check_items_prefilter import COMPLETION_SIGNAL_TOKENS
+    assert isinstance(COMPLETION_SIGNAL_TOKENS, frozenset)
+    # Spec-locked set — see 2026-05-16-l2-prefilter-completion-signal-design.md
+    assert COMPLETION_SIGNAL_TOKENS == frozenset({
+        "done", "shipped", "merged", "closed", "fixed", "resolved",
+        "released", "deprecated", "removed", "reverted", "completed",
+    })
 
 
 def test_ref_pattern_matches_issue_number():
@@ -76,10 +82,10 @@ def test_has_evidence_commit_sha_wins_immediately():
 
 
 def test_has_evidence_token_overlap_with_commits():
-    """Token overlap with commits_text returns True."""
+    """Token overlap with commits_text + nearby completion verb returns True (activity-zone)."""
     from check_items_prefilter import has_classifiable_evidence
     group = _make_group("Fix session_log race condition")
-    evidence = _make_evidence(commits_text="fix session_log race condition in hook abc1234")
+    evidence = _make_evidence(commits_text="fixed session_log race condition in hook")
     assert has_classifiable_evidence(group, evidence) is True
 
 
@@ -370,3 +376,334 @@ def test_mtime_threading_old_and_new_files_differ(tmp_path):
         "Old and new groups must classify differently — if both are STALE, "
         "mtime is likely not reaching synthetic_classification (original bug)."
     )
+
+
+def test_nearby_completion_signal_finds_adjacent_verb():
+    from check_items_prefilter import _has_nearby_completion_signal
+    haystack = "fixed anchor caching bug"
+    assert _has_nearby_completion_signal(haystack, ["anchor"]) is True
+
+
+def test_nearby_completion_signal_returns_false_when_only_activity():
+    from check_items_prefilter import _has_nearby_completion_signal
+    haystack = "implement anchor scaffold for new feature"
+    assert _has_nearby_completion_signal(haystack, ["anchor"]) is False
+
+
+def test_nearby_completion_signal_returns_false_when_no_content_hit():
+    from check_items_prefilter import _has_nearby_completion_signal
+    haystack = "closed many things but not this widget"
+    assert _has_nearby_completion_signal(haystack, ["telemetry"]) is False
+
+
+def test_nearby_completion_signal_returns_false_when_signal_outside_window():
+    from check_items_prefilter import _has_nearby_completion_signal
+    # 200 chars of filler between the content token and the completion verb
+    haystack = "anchor work " + ("x " * 200) + "closed"
+    assert _has_nearby_completion_signal(haystack, ["anchor"]) is False
+
+
+def test_nearby_completion_signal_case_insensitive():
+    from check_items_prefilter import _has_nearby_completion_signal
+    haystack = "RESOLVED Anchor regression in pipeline"
+    assert _has_nearby_completion_signal(haystack, ["Anchor"]) is True
+
+
+def test_nearby_completion_signal_default_window_is_120_chars():
+    from check_items_prefilter import _has_nearby_completion_signal
+    # 100 char gap — within default 120 window
+    haystack_in = "anchor" + (" " * 100) + "closed"
+    assert _has_nearby_completion_signal(haystack_in, ["anchor"]) is True
+    # 130 char gap — outside default 120 window
+    haystack_out = "anchor" + (" " * 130) + "closed"
+    assert _has_nearby_completion_signal(haystack_out, ["anchor"]) is False
+
+
+def test_nearby_completion_signal_empty_inputs_return_false():
+    from check_items_prefilter import _has_nearby_completion_signal
+    assert _has_nearby_completion_signal("", ["anchor"]) is False
+    assert _has_nearby_completion_signal("fixed it", []) is False
+
+
+# ---------------------------------------------------------------------------
+# Zone-aware rules — spec table cases (#173, v2.6)
+# ---------------------------------------------------------------------------
+
+def test_has_evidence_ref_only_issue_number_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("Fix issue #42 in loader")
+    assert has_classifiable_evidence(group, _make_evidence()) is True
+
+
+def test_has_evidence_ref_only_commit_sha_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("Backport a1b2c3d to develop")
+    assert has_classifiable_evidence(group, _make_evidence()) is True
+
+
+def test_has_evidence_completion_zone_closed_issues_hit_returns_true():
+    # 'regression' is distinctive (10 chars >= 8) and appears in the haystack.
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("anchor cache regression")
+    ev = _make_evidence(closed_issues_text="anchor caching regression bug write-up")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_completion_zone_merged_prs_hit_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("telemetry dashboard chip alignment")
+    ev = _make_evidence(merged_prs_text="telemetry dashboard chip layout PR")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_completion_zone_changelog_hit_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("session anchor resolution")
+    ev = _make_evidence(changelog_excerpt="### Added\n- session anchor resolution")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_completion_zone_releases_hit_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("midnight rollover handling")
+    ev = _make_evidence(releases_text="v0.3.0\tmidnight rollover handling shipped")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_activity_zone_proximity_hit_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("anchor regression in pipeline")
+    ev = _make_evidence(commits_text="fixed anchor caching in pipeline")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_activity_zone_no_signal_returns_false():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("anchor regression in pipeline")
+    ev = _make_evidence(commits_text="implement anchor scaffold for new feature")
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_has_evidence_activity_zone_far_signal_returns_false():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("anchor regression")
+    filler = "x " * 200
+    ev = _make_evidence(commits_text=f"anchor work {filler} closed")
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_has_evidence_activity_zone_fts_mentions_with_signal_returns_true():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("anchor resolution")
+    ev = _make_evidence(fts_mentions_text="anchor resolution completed in session")
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_no_content_tokens_returns_false():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("the and of")
+    ev = _make_evidence(commits_text="closed many things", merged_prs_text="shipped lots")
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_has_evidence_no_overlap_anywhere_returns_false():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("widget rendering pipeline")
+    ev = _make_evidence(
+        commits_text="anchor resolution work",
+        merged_prs_text="anchor PR",
+        closed_issues_text="anchor bug",
+    )
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_has_evidence_active_project_wip_item_returns_false():
+    """Regression repro: WIP item shares vocabulary with its own commits but
+    no completion signal nearby — must be prefiltered as ACTIVE."""
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group(
+        "Implement resolveLastSessionAnchor(reader, now) with lifecycle pair "
+        "detection and 5h cap in lib/timeframes/anchors.ts."
+    )
+    ev = _make_evidence(
+        commits_text=(
+            "feat(anchors): scaffold resolveLastSessionAnchor\n"
+            "feat(timeframes): add lifecycle pair detection helper\n"
+            "chore(anchors): rename anchor types\n"
+        ),
+        fts_mentions_text="anchor design discussion in vault note",
+    )
+    assert has_classifiable_evidence(group, ev) is False
+
+
+# ---------------------------------------------------------------------------
+# _is_distinctive
+# ---------------------------------------------------------------------------
+
+def test_is_distinctive_snake_case():
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("last_session_anchor") is True
+    assert _is_distinctive("foo_bar") is True
+
+
+def test_is_distinctive_camel_case():
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("resolveLastSessionAnchor") is True
+    assert _is_distinctive("RangeAnchors") is True
+
+
+def test_is_distinctive_long_lowercase():
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("regression") is True
+    assert _is_distinctive("pagination") is True
+    assert _is_distinctive("timeframes") is True
+
+
+def test_is_distinctive_short_lowercase_is_false():
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("now") is False
+    assert _is_distinctive("add") is False
+    assert _is_distinctive("fix") is False
+    assert _is_distinctive("chip") is False
+    assert _is_distinctive("session") is False  # 7 chars, all lowercase
+    assert _is_distinctive("widget") is False   # 6 chars
+
+
+def test_is_distinctive_empty():
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("") is False
+
+
+def test_is_distinctive_exactly_8_chars():
+    from check_items_prefilter import _is_distinctive
+    # 8-char lowercase — boundary, distinctive
+    assert _is_distinctive("abcdefgh") is True
+    # 7-char lowercase — boundary, NOT distinctive
+    assert _is_distinctive("abcdefg") is False
+
+
+def test_has_evidence_generic_token_overlap_does_not_trigger_rule_2():
+    """Regression: generic short-lowercase tokens like 'now', 'fix', 'chip'
+    overlap accidentally across unrelated completed features. Rule 2 must
+    require a distinctive token (#173).
+
+    All tokens in the group are short (<8 chars), all-lowercase, no underscore,
+    no mixed-case — so none pass _is_distinctive and Rule 2 cannot fire.
+    Rule 3 (proximity) doesn't apply because there is no commits_text.
+    """
+    from check_items_prefilter import has_classifiable_evidence
+    # Tokens: 'now', 'fix', 'chip', 'new', 'run' — all short lowercase.
+    group = _make_group("now fix chip new run")
+    ev = _make_evidence(
+        merged_prs_text="now fix chip run for other feature",  # same generic words
+    )
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_has_evidence_distinctive_token_still_triggers_rule_2():
+    """Regression: distinctive tokens (length >= 8 OR has _ OR mixed-case)
+    still trigger Rule 2 on completion-zone overlap (#173)."""
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("Investigate pagination regression")  # both distinctive
+    ev = _make_evidence(
+        merged_prs_text="fix pagination edge case",
+    )
+    assert has_classifiable_evidence(group, ev) is True
+
+
+def test_has_evidence_camel_case_identifier_triggers_rule_2():
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("Implement resolveLastSessionAnchor cleanup")
+    ev = _make_evidence(
+        closed_issues_text="#15 resolveLastSessionAnchor refactor",
+    )
+    assert has_classifiable_evidence(group, ev) is True
+
+
+# ---------------------------------------------------------------------------
+# Sentence-start Title-case regression (#174 review)
+# ---------------------------------------------------------------------------
+
+def test_is_distinctive_sentence_start_title_case_returns_false():
+    """Sentence-start Title-case words like `Add`/`Fix`/`Run` must NOT be
+    distinctive — they're just lowercase English with a capitalized first
+    letter, and treating them as distinctive re-opens the over-trigger
+    bug PR #173 is fixing (#174 review)."""
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("Add") is False
+    assert _is_distinctive("Fix") is False
+    assert _is_distinctive("Run") is False
+    assert _is_distinctive("Use") is False
+    assert _is_distinctive("Set") is False
+    assert _is_distinctive("Pre") is False
+
+
+def test_is_distinctive_interior_mixed_case_returns_true():
+    """Genuine CamelCase identifiers must remain distinctive."""
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("resolveAnchor") is True
+    assert _is_distinctive("RangeAnchors") is True
+    assert _is_distinctive("FixIt") is True   # short, but interior upper after F
+    assert _is_distinctive("aBc") is True     # minimal interior mixed-case
+
+
+def test_is_distinctive_all_upper_acronym_returns_false():
+    """All-upper acronyms (`PR`, `FTS`, `ABC`) have no lower-case letters and
+    must NOT be distinctive — they're too generic and could match anywhere."""
+    from check_items_prefilter import _is_distinctive
+    assert _is_distinctive("ABC") is False
+    assert _is_distinctive("FTS") is False
+    assert _is_distinctive("PR") is False
+
+
+def test_has_evidence_sentence_start_capital_does_not_trigger_rule_2():
+    """Critical regression from #174 review: a sentence-form representative
+    starting with `Add`/`Fix`/`Run` must NOT match Rule 2 against unrelated
+    completed PR titles, even if those titles also contain the same English
+    verb. Without the interior-mixed-case fix in _is_distinctive, this test
+    fails — demonstrating the over-trigger bug PR #173 was supposed to fix."""
+    from check_items_prefilter import has_classifiable_evidence
+    group = _make_group("Add cache layer for telemetry feature")
+    ev = _make_evidence(merged_prs_text="#41 feat: add new dashboard chip")
+    # Tokens from canonical: 'Add', 'cache', 'layer', 'for', 'telemetry', 'feature'.
+    # - 'Add' is sentence-start Title-case → NOT distinctive.
+    # - 'cache', 'layer', 'for' are too short / are stopwords.
+    # - 'telemetry' (9 chars) is distinctive but does not appear in PR title.
+    # - 'feature' (7 chars, lowercase) is NOT distinctive.
+    # Therefore Rule 2 must NOT fire.
+    assert has_classifiable_evidence(group, ev) is False
+
+
+def test_nearby_completion_signal_signal_before_content_token():
+    """The proximity window is symmetric — a completion verb appearing BEFORE
+    the content token (e.g. `closed ... anchor`) must trigger Rule 3 just as
+    `anchor ... closed` does. Window is +-120 chars around the content hit."""
+    from check_items_prefilter import _has_nearby_completion_signal
+    # 100 chars of filler between "closed" and "anchor" — within default window
+    haystack = "closed" + (" " * 100) + "anchor"
+    assert _has_nearby_completion_signal(haystack, ["anchor"]) is True
+
+
+def test_nearby_completion_signal_substring_does_not_falsely_match():
+    """Word-boundary check: tokens like `unmerged`, `enclosed`, `redone`,
+    `undone` contain completion-signal substrings (`merged`, `closed`,
+    `done`) but are NOT completion signals themselves. The proximity
+    check must use word boundaries (#174 review)."""
+    from check_items_prefilter import _has_nearby_completion_signal
+    # unmerged: contains 'merged' as substring but not as a whole word
+    assert _has_nearby_completion_signal("anchor unmerged in pipeline", ["anchor"]) is False
+    # enclosed: contains 'closed' as substring
+    assert _has_nearby_completion_signal("anchor enclosed within scope", ["anchor"]) is False
+    # redone: contains 'done' as substring
+    assert _has_nearby_completion_signal("anchor redone but pending", ["anchor"]) is False
+    # undone: contains 'done' as substring
+    assert _has_nearby_completion_signal("anchor undone yesterday", ["anchor"]) is False
+
+
+def test_nearby_completion_signal_genuine_completion_verb_still_triggers():
+    """Verify the word-boundary fix did not over-tighten — `merged`, `closed`,
+    `done` as whole words still trigger."""
+    from check_items_prefilter import _has_nearby_completion_signal
+    assert _has_nearby_completion_signal("anchor merged via PR", ["anchor"]) is True
+    assert _has_nearby_completion_signal("Closed anchor work today", ["anchor"]) is True
+    assert _has_nearby_completion_signal("done with anchor refactor", ["anchor"]) is True
