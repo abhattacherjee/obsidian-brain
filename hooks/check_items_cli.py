@@ -316,6 +316,27 @@ def _pick_classifier_model(group_count: int) -> str:
     return "haiku" if group_count <= 30 else "sonnet"
 
 
+def _strip_unreleased_section(changelog: str) -> str:
+    """Remove the `## [Unreleased]` section (up to the next `## [x.y.z]` heading
+    or end of text) from a Keep-a-Changelog excerpt. Released sections are
+    completion statements by construction; the Unreleased section is WIP and
+    over-triggers Rule 2 of has_classifiable_evidence.
+
+    Case-insensitive match on `## [Unreleased]` (with optional trailing
+    whitespace). If no Unreleased section is present, returns the input
+    unchanged.
+    """
+    if not changelog:
+        return ""
+    # Match "## [Unreleased]" through the start of the next "## [" version heading
+    # OR end-of-string. DOTALL so '.' spans newlines.
+    pattern = re.compile(
+        r"##\s*\[Unreleased\][^\n]*\n.*?(?=^##\s*\[|\Z)",
+        flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    )
+    return pattern.sub("", changelog)
+
+
 def _bridge_project_evidence(evidence: dict, project: str) -> dict:
     """Convert project evidence to the _text-suffixed flat format expected by
     has_classifiable_evidence().
@@ -372,7 +393,7 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
             "merged_prs_text": _to_text(proj.get("merged_prs")),
             "closed_issues_text": _to_text(proj.get("closed_issues")),
             "releases_text": _to_text(proj.get("releases")),
-            "changelog_excerpt": proj.get("changelog_excerpt") or "",
+            "changelog_excerpt": _strip_unreleased_section(proj.get("changelog_excerpt") or ""),
             "fts_mentions_text": _to_text(proj.get("fts_mentions")),
         }
 

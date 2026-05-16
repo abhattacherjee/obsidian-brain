@@ -946,3 +946,71 @@ def test_bridge_project_evidence_omits_issue_body_from_closed_issues_text():
     # URL and timestamps are also excluded (noise)
     assert "https://example" not in closed_text
     assert "2026-05-11" not in closed_text
+
+
+def test_strip_unreleased_removes_unreleased_section():
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _strip_unreleased_section
+
+    cl = (
+        "# Changelog\n\n"
+        "## [Unreleased]\n"
+        "### Added\n"
+        "- WIP feature foo_bar in module-x\n"
+        "- Pending widget for module-y\n\n"
+        "## [0.2.0] - 2026-05-11\n"
+        "### Fixed\n"
+        "- widget-z double-counting in query layer\n"
+    )
+    out = _strip_unreleased_section(cl)
+    assert "foo_bar" not in out
+    assert "Pending widget" not in out
+    # Released sections preserved
+    assert "[0.2.0]" in out
+    assert "widget-z double-counting" in out
+
+
+def test_strip_unreleased_no_unreleased_section_returns_unchanged():
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _strip_unreleased_section
+
+    cl = "# Changelog\n\n## [0.1.0] - 2026-04-30\n- Initial release\n"
+    assert _strip_unreleased_section(cl) == cl
+
+
+def test_strip_unreleased_empty_input_returns_empty():
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _strip_unreleased_section
+    assert _strip_unreleased_section("") == ""
+    assert _strip_unreleased_section(None) == ""
+
+
+def test_strip_unreleased_unreleased_at_end_with_no_released_section():
+    """Edge case: only `[Unreleased]` section present, nothing released yet."""
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _strip_unreleased_section
+    cl = (
+        "# Changelog\n\n"
+        "## [Unreleased]\n"
+        "### Added\n"
+        "- WIP foo_bar\n"
+    )
+    out = _strip_unreleased_section(cl)
+    assert "foo_bar" not in out
+    # Header may or may not be retained — either is fine, but WIP content must be gone
