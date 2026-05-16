@@ -63,12 +63,18 @@ CONFIDENCE_TIER_RULES = {
 def _outer_subagent_timeout() -> int:
     """Return the outer subprocess.run timeout that wraps check_items_cli.py.
 
-    Must be ≥ the inner SUBAGENT_TIMEOUT_SEC so the outer caller never races
-    the inner cli. When changing this constant, grep the codebase for hardcoded
-    copies of the previous value (e.g. `grep -rn "timeout=70" hooks/`) — the
-    R10 dispatch missed these two outer callers and caused silent fallback.
+    Must be ≥ inner SUBAGENT_TIMEOUT_SEC * max-expected-chunks so the outer
+    caller never races the inner cli. The inner CLI dispatches sequentially
+    over N chunks of <=CLASSIFIER_CHUNK_SIZE groups each, so a payload of 4
+    chunks at 300s/chunk needs ~1200s of outer headroom.
+
+    Reads CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC; the env var sets the INNER
+    per-chunk timeout. Outer is then `inner * 6` so users only need to tune
+    one knob (and 6 covers up to ~150 classifier-eligible groups under the
+    default CLASSIFIER_CHUNK_SIZE=25 — well above realistic vault sizes).
     """
-    return int(os.environ.get("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "180"))
+    inner = int(os.environ.get("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "300"))
+    return inner * 6
 
 
 def assign_tier(evidence_citation, item_text):
