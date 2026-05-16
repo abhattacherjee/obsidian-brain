@@ -58,7 +58,7 @@ All data flows are **one-directional filesystem writes** — no MCP server, no R
 Run `/obsidian-setup` after installation. It will:
 
 1. Ask for your Obsidian vault path
-2. Create folders: `claude-sessions/`, `claude-insights/`, `claude-dashboards/`
+2. Create folders: `claude-sessions/`, `claude-insights/`, `claude-dashboards/`, `claude-check-items/`
 3. Copy Dataview dashboard templates into your vault
 4. Write machine-local config to `~/.claude/obsidian-brain-config.json`
 5. Verify write access with a test file
@@ -163,6 +163,7 @@ YourVault/
   claude-sessions/       # Auto-logged sessions + context snapshots
   claude-insights/       # Curated insights, decisions, error fixes
   claude-dashboards/     # Dataview query dashboards
+  claude-check-items/    # /check-items per-run reports
 ```
 
 ### Folder Details
@@ -192,6 +193,12 @@ Contains Obsidian Dataview dashboard templates that auto-update as notes are add
 **Dashboards included:** Sessions Overview, Project Index, Weekly Review, Learning Velocity, Decision Timeline, Open Items. See the [Dataview Dashboards](#dataview-dashboards) section below for descriptions.
 
 **Requires:** [Dataview](https://github.com/blacksmithgu/obsidian-dataview) community plugin with JavaScript Queries enabled.
+
+#### `claude-check-items/` — Open Item Reports
+
+Holds per-run reports produced by `/check-items`: a markdown note per scope (project or `all`) per day, listing the open-item groups, AI classifications (DONE / NEEDS-ACTION / STALE / ACTIVE), and the audit trail of any auto-applied checkoffs. These are notes you read, not Dataview queries — they live in their own folder so dashboards stay browseable.
+
+**Configuration:** Folder name is set by `check_items_folder` in `~/.claude/obsidian-brain-config.json` (default `claude-check-items`). To keep the legacy v2.5.0 location, set it to `"claude-dashboards"`. Existing files in `claude-dashboards/check-items-*.md` are not migrated automatically.
 
 ### Context Loading Summary
 

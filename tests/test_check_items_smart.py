@@ -1944,22 +1944,22 @@ def test_check_items_report_default_folder_is_claude_check_items(tmp_path, monke
     vault = tmp_path / "vault"
     vault.mkdir()
     from check_items_report import write_check_items_dashboard
-    path = write_check_items_dashboard(
-        vault_path=str(vault),
-        scope_name="proj-x",
-        date_str="2026-05-16",
-        window_days=14,
-        raw_count=0,
-        group_count=0,
-        classifications=[],
-        applied=0,
-        cascaded=0,
-        merges=[],
-        semantic_merge_mode="ok",
-        classifier_mode="ok",
-        dry_run=True,
-    )
     try:
+        path = write_check_items_dashboard(
+            vault_path=str(vault),
+            scope_name="proj-x",
+            date_str="2026-05-16",
+            window_days=14,
+            raw_count=0,
+            group_count=0,
+            classifications=[],
+            applied=0,
+            cascaded=0,
+            merges=[],
+            semantic_merge_mode="ok",
+            classifier_mode="ok",
+            dry_run=True,
+        )
         assert "claude-check-items" in path, (
             f"Default folder must be claude-check-items, got: {path}"
         )
@@ -1988,22 +1988,22 @@ def test_check_items_report_honors_check_items_folder_config(tmp_path, monkeypat
     vault = tmp_path / "vault"
     vault.mkdir()
     from check_items_report import write_check_items_dashboard
-    path = write_check_items_dashboard(
-        vault_path=str(vault),
-        scope_name="proj-y",
-        date_str="2026-05-16",
-        window_days=14,
-        raw_count=0,
-        group_count=0,
-        classifications=[],
-        applied=0,
-        cascaded=0,
-        merges=[],
-        semantic_merge_mode="ok",
-        classifier_mode="ok",
-        dry_run=True,
-    )
     try:
+        path = write_check_items_dashboard(
+            vault_path=str(vault),
+            scope_name="proj-y",
+            date_str="2026-05-16",
+            window_days=14,
+            raw_count=0,
+            group_count=0,
+            classifications=[],
+            applied=0,
+            cascaded=0,
+            merges=[],
+            semantic_merge_mode="ok",
+            classifier_mode="ok",
+            dry_run=True,
+        )
         assert "claude-dashboards" in path, (
             f"Override must place file in claude-dashboards, got: {path}"
         )
