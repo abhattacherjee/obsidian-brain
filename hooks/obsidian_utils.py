@@ -3117,13 +3117,13 @@ def upgrade_and_collect_corpus(
                 continue
 
             try:
-                result = upgrade_unsummarized_note(
+                status, _elapsed, _model, _reason = upgrade_unsummarized_note(
                     note_path=str(md_file),
                     vault_path=vault_path,
                     sessions_folder=sessions_folder,
                     project=meta.get("project", ""),
                 )
-                if result and not result.startswith("Failed"):
+                if not status.startswith("Failed"):
                     upgraded += 1
                     # Bust metadata cache for this note
                     session_id = meta.get("session_id", "")
