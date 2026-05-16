@@ -1,0 +1,25 @@
+{
+  "needs": [
+    {"group_id": "g01", "project": "alpha-project", "representative": "Implement alpha_task entry point in core.", "instances": [{"file": "n01.md", "line": 1, "text": "Implement alpha_task entry point in core.", "mtime": 1747353600.0}]},
+    {"group_id": "g02", "project": "alpha-project", "representative": "Scaffold beta_handler for alpha_task.", "instances": [{"file": "n02.md", "line": 1, "text": "Scaffold beta_handler for alpha_task.", "mtime": 1747353600.0}]},
+    {"group_id": "g03", "project": "alpha-project", "representative": "Rename alpha_task internal types for clarity.", "instances": [{"file": "n03.md", "line": 1, "text": "Rename alpha_task internal types for clarity.", "mtime": 1747353600.0}]},
+    {"group_id": "g04", "project": "alpha-project", "representative": "Integrate gamma_parser with alpha_task downstream.", "instances": [{"file": "n04.md", "line": 1, "text": "Integrate gamma_parser with alpha_task downstream.", "mtime": 1747353600.0}]},
+    {"group_id": "g05", "project": "alpha-project", "representative": "Split alpha_task into pure stages.", "instances": [{"file": "n05.md", "line": 1, "text": "Split alpha_task into pure stages.", "mtime": 1747353600.0}]},
+    {"group_id": "g06", "project": "alpha-project", "representative": "Cover alpha_task edge cases with unit tests.", "instances": [{"file": "n06.md", "line": 1, "text": "Cover alpha_task edge cases with unit tests.", "mtime": 1747353600.0}]},
+    {"group_id": "g07", "project": "alpha-project", "representative": "Scaffold delta_processor adjacent to alpha_task.", "instances": [{"file": "n07.md", "line": 1, "text": "Scaffold delta_processor adjacent to alpha_task.", "mtime": 1747353600.0}]},
+    {"group_id": "g08", "project": "alpha-project", "representative": "Bump deps for alpha_task in core.", "instances": [{"file": "n08.md", "line": 1, "text": "Bump deps for alpha_task in core.", "mtime": 1747353600.0}]},
+    {"group_id": "g09", "project": "alpha-project", "representative": "Wire epsilon_emitter output into core.", "instances": [{"file": "n09.md", "line": 1, "text": "Wire epsilon_emitter output into core.", "mtime": 1747353600.0}]},
+    {"group_id": "g10", "project": "alpha-project", "representative": "Document alpha_task contract in core.", "instances": [{"file": "n10.md", "line": 1, "text": "Document alpha_task contract in core.", "mtime": 1747353600.0}]},
+    {"group_id": "g11", "project": "alpha-project", "representative": "Continue scaffolding alpha_task stages in core.", "instances": [{"file": "n11.md", "line": 1, "text": "Continue scaffolding alpha_task stages in core.", "mtime": 1747353600.0}]},
+    {"group_id": "g12", "project": "alpha-project", "representative": "Ship zeta_widget rendering in ui.", "instances": [{"file": "n12.md", "line": 1, "text": "Ship zeta_widget rendering in ui.", "mtime": 1747353600.0}]},
+    {"group_id": "g13", "project": "alpha-project", "representative": "Complete eta_pipeline ingestion.", "instances": [{"file": "n13.md", "line": 1, "text": "Complete eta_pipeline ingestion.", "mtime": 1747353600.0}]},
+    {"group_id": "g14", "project": "alpha-project", "representative": "Investigate theta_counter double-count regression.", "instances": [{"file": "n14.md", "line": 1, "text": "Investigate theta_counter double-count regression.", "mtime": 1747353600.0}]},
+    {"group_id": "g15", "project": "alpha-project", "representative": "Resolve iota_pager divergence in queries.", "instances": [{"file": "n15.md", "line": 1, "text": "Resolve iota_pager divergence in queries.", "mtime": 1747353600.0}]},
+    {"group_id": "g16", "project": "alpha-project", "representative": "Pull zeta_widget from changelog into release notes.", "instances": [{"file": "n16.md", "line": 1, "text": "Pull zeta_widget from changelog into release notes.", "mtime": 1747353600.0}]},
+    {"group_id": "g17", "project": "alpha-project", "representative": "Audit eta_pipeline release-zone migration.", "instances": [{"file": "n17.md", "line": 1, "text": "Audit eta_pipeline release-zone migration.", "mtime": 1747353600.0}]},
+    {"group_id": "g18", "project": "alpha-project", "representative": "Address feedback from #50 review.", "instances": [{"file": "n18.md", "line": 1, "text": "Address feedback from #50 review.", "mtime": 1747353600.0}]},
+    {"group_id": "g19", "project": "alpha-project", "representative": "Backport abc1234 to release branch.", "instances": [{"file": "n19.md", "line": 1, "text": "Backport abc1234 to release branch.", "mtime": 1747353600.0}]},
+    {"group_id": "g20", "project": "alpha-project", "representative": "Cross-check #39 closure against cache layer.", "instances": [{"file": "n20.md", "line": 1, "text": "Cross-check #39 closure against cache layer.", "mtime": 1747353600.0}]},
+    {"group_id": "g21", "project": "alpha-project", "representative": "Verify f1e2d3c rename did not break callers.", "instances": [{"file": "n21.md", "line": 1, "text": "Verify f1e2d3c rename did not break callers.", "mtime": 1747353600.0}]}
+  ]
+}
