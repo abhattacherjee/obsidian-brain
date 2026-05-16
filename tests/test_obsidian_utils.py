@@ -1890,13 +1890,28 @@ def test_get_session_id_fast_slow_path_returns_without_writing(tmp_path, monkeyp
 
 
 class TestUpgradeBatch:
-    """Tests for upgrade_batch() — GH #69.
+    """Tests for upgrade_batch() — GH #69, instrumentation GH #74.
 
     `upgrade_unsummarized_note` is monkeypatched with fast fakes so none of
     these tests touch the filesystem, load a vault config, or shell out to
     `claude -p`. That isolation also means the `vault_path`/`sessions_folder`
     args are inert placeholder strings.
+
+    upgrade_batch() now returns list[dict] with keys: path, status, elapsed_s,
+    model_used, fallback_reason.
     """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_summarizer_sink(self, tmp_path, monkeypatch):
+        """Prevent the upgrade_batch test class from writing to ~/.claude."""
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+        import summarizer_metrics
+        monkeypatch.setattr(
+            summarizer_metrics, "METRICS_PATH",
+            tmp_path / "test-metrics.jsonl",
+        )
 
     def test_upgrade_batch_empty_list_returns_empty(self, monkeypatch):
         """Empty input: return [] immediately and never invoke the wrapped fn."""
@@ -1915,7 +1930,7 @@ class TestUpgradeBatch:
         assert calls == []
 
     def test_upgrade_batch_n1(self, monkeypatch):
-        """Single path: single (path, status) tuple returned."""
+        """Single path: single dict with path and status returned."""
         def fake_impl(note_path, *args, **kwargs):
             return f"Summarized: {os.path.basename(note_path)}", 0.1, "haiku-4.5", None
 
@@ -1924,7 +1939,9 @@ class TestUpgradeBatch:
         result = obsidian_utils.upgrade_batch(
             ["/vault/sessions/one.md"], "/vault", "sessions", "proj",
         )
-        assert result == [("/vault/sessions/one.md", "Summarized: one.md")]
+        assert len(result) == 1
+        assert result[0]["path"] == "/vault/sessions/one.md"
+        assert result[0]["status"] == "Summarized: one.md"
 
     def test_upgrade_batch_n5_preserves_input_order(self, monkeypatch):
         """5 paths with variable sleeps: return order matches input, not completion order."""
@@ -1949,8 +1966,8 @@ class TestUpgradeBatch:
         result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
 
         assert len(result) == 5
-        assert [p for p, _ in result] == paths, "input order must be preserved"
-        assert [status for _, status in result] == [
+        assert [r["path"] for r in result] == paths, "input order must be preserved"
+        assert [r["status"] for r in result] == [
             "done:a.md", "done:b.md", "done:c.md", "done:d.md", "done:e.md",
         ]
 
@@ -1976,7 +1993,7 @@ class TestUpgradeBatch:
             paths, "/vault", "sessions", "proj", max_workers=N,
         )
         assert len(results) == N
-        assert all(s.startswith("Upgraded ") for _, s in results)
+        assert all(r["status"].startswith("Upgraded ") for r in results)
 
     def test_upgrade_batch_captures_exceptions_per_note(self, monkeypatch):
         """One raising impl does not kill the batch; failure becomes a status string."""
@@ -1992,12 +2009,13 @@ class TestUpgradeBatch:
         result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
 
         assert len(result) == 5
-        assert [p for p, _ in result] == paths
-        assert result[0][1] == "ok:one.md"
-        assert result[1][1] == "ok:two.md"
-        assert result[2] == ("/vault/sessions/three.md", "Failed: RuntimeError: boom")
-        assert result[3][1] == "ok:four.md"
-        assert result[4][1] == "ok:five.md"
+        assert [r["path"] for r in result] == paths
+        assert result[0]["status"] == "ok:one.md"
+        assert result[1]["status"] == "ok:two.md"
+        assert result[2]["path"] == "/vault/sessions/three.md"
+        assert result[2]["status"] == "Failed: RuntimeError: boom"
+        assert result[3]["status"] == "ok:four.md"
+        assert result[4]["status"] == "ok:five.md"
 
     def test_upgrade_batch_max_workers_caps_at_input_size(self, monkeypatch):
         """N=3 < max_workers=10: min() guard still yields real parallelism.
@@ -2021,7 +2039,7 @@ class TestUpgradeBatch:
             paths, "/vault", "sessions", "proj", max_workers=10,
         )
         assert len(results) == N
-        assert all(s.startswith("Upgraded ") for _, s in results)
+        assert all(r["status"].startswith("Upgraded ") for r in results)
 
     def test_upgrade_batch_forwards_model_and_timeout(self, monkeypatch):
         received = {}
@@ -2041,7 +2059,9 @@ class TestUpgradeBatch:
             summary_model="claude-3-5-haiku",
             summary_timeout=30,
         )
-        assert results == [("/vault/sessions/a.md", "ok:a.md")]
+        assert len(results) == 1
+        assert results[0]["path"] == "/vault/sessions/a.md"
+        assert results[0]["status"] == "ok:a.md"
         assert received == {"model": "claude-3-5-haiku", "timeout": 30}
 
     def test_upgrade_batch_rejects_invalid_max_workers(self, monkeypatch):
@@ -2057,10 +2077,11 @@ class TestUpgradeBatch:
                 )
 
     def test_upgrade_batch_skill_md_json_round_trip(self, monkeypatch):
-        """Pins the exact expression used in skills/recall/SKILL.md Phase 1.
+        """Verifies that path and status are accessible by dict key.
 
-        If the tuple contract ever changes (e.g. to list[dict]), this test
-        fails BEFORE production /recall breaks.
+        The shape has migrated from (path, status) tuples to list[dict].
+        Serialization using the new dict-key access pattern is verified here;
+        SKILL.md Step 2 will be updated in Task 9 to match.
         """
         import json
 
@@ -2075,8 +2096,8 @@ class TestUpgradeBatch:
         ]
         results = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
 
-        # This is the exact expression from skills/recall/SKILL.md line ~117
-        serialized = json.dumps([{"path": p, "status": s} for p, s in results])
+        # Serialize using dict-key access (new shape)
+        serialized = json.dumps([{"path": r["path"], "status": r["status"]} for r in results])
         parsed = json.loads(serialized)
         assert parsed == [
             {"path": "/vault/sessions/a.md", "status": "Upgraded a.md (source: JSONL)"},
@@ -2142,9 +2163,9 @@ class TestUpgradeBatch:
         )
 
         assert len(results) == 1
-        path_result, status = results[0]
-        assert path_result == str(note_path)
-        assert status.startswith("Upgraded "), f"expected success, got: {status}"
+        assert set(results[0].keys()) == {"path", "status", "elapsed_s", "model_used", "fallback_reason"}
+        assert results[0]["path"] == str(note_path)
+        assert results[0]["status"].startswith("Upgraded "), f"expected success, got: {results[0]['status']}"
 
         # Verify the note was actually rewritten with a summary
         updated = note_path.read_text()

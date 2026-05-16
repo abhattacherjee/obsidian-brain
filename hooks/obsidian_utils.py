@@ -4364,27 +4364,29 @@ def upgrade_batch(
     max_workers: int = 10,
     summary_model: str = "haiku",
     summary_timeout: int | None = None,
-) -> list[tuple[str, str]]:
+) -> list[dict]:
     """Fan out upgrade_unsummarized_note() concurrently.
 
-    Returns a list of (path, status_string) tuples IN THE SAME ORDER AS `paths`
-    (not completion order), so callers that zipped inputs with outputs still work.
-    Individual-call exceptions are caught and converted to
-    "Failed: <exc_type>: <exc_msg>" status strings so one bad note never kills
-    the batch.
+    Returns a list of per-note dicts IN THE SAME ORDER AS ``paths`` (not
+    completion order). Each dict has the keys:
 
-    Raises ``ValueError`` if ``max_workers < 1`` — surface caller config bugs
-    at the boundary rather than silently normalizing to a single worker.
+      * ``path``  — vault note path (echoes input)
+      * ``status`` — one-line status string; success starts with ``"Upgraded "``
+      * ``elapsed_s`` — wall-time inside the worker, rounded to 2 dp
+      * ``model_used`` — see ``upgrade_unsummarized_note`` docstring
+      * ``fallback_reason`` — see ``upgrade_unsummarized_note`` docstring
 
-    Return contract: each ``(path, status)`` tuple carries the same per-entry
-    contract as ``upgrade_unsummarized_note`` — success statuses begin with
-    ``"Upgraded "``; anything else (including ``"Failed: ..."`` or unexpected
-    prefixes) indicates failure. See that function's docstring for details.
+    Side effect: appends one record per call to
+    ``~/.claude/obsidian-brain-summarizer-metrics.jsonl`` via
+    ``summarizer_metrics.append_metrics_record`` (issue #74). The sink never
+    raises, so telemetry failures cannot break this function.
 
-    `claude -p --model haiku` is subprocess-bound, so threads release the GIL
-    during the wait and achieve real parallelism. This lets a single Bash tool
-    call fan out N summaries without the Claude Code shell-pool serialization
-    that would otherwise linearize the work.
+    Per-note exceptions are caught and converted to dicts with
+    ``status="Failed: <exc_type>: <exc_msg>"``, ``elapsed_s=0.0``,
+    ``model_used=None``, ``fallback_reason=None`` so one bad note never
+    kills the batch.
+
+    Raises ``ValueError`` if ``max_workers < 1``.
     """
     if not paths:
         return []
@@ -4392,12 +4394,17 @@ def upgrade_batch(
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
 
-    # Lazy-import so the module stays importable in environments where
-    # concurrent.futures might be stubbed (it's stdlib, so this should always
-    # succeed in CPython, but the lazy import also keeps hook startup cost low).
     from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timezone
+
+    _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+    if _hooks_dir not in sys.path:
+        sys.path.insert(0, _hooks_dir)
+    import summarizer_metrics
 
     workers = min(max_workers, len(paths))
+    _wall_t0 = time.monotonic()
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [
             ex.submit(
@@ -4411,13 +4418,29 @@ def upgrade_batch(
             )
             for p in paths
         ]
-        results: list[tuple[str, str]] = []
+        results: list[dict] = []
         for p, fut in zip(paths, futs):
             try:
-                # Task 7 rewrites this loop to the dict shape; for now unpack
-                # the 4-tuple and preserve the existing (path, status) contract.
-                status, _elapsed, _model, _reason = fut.result()
-                results.append((p, status))
+                status, elapsed_s, model_used, fallback_reason = fut.result()
             except Exception as exc:  # noqa: BLE001 — per-note isolation
-                results.append((p, f"Failed: {type(exc).__name__}: {exc}"))
-        return results
+                status = f"Failed: {type(exc).__name__}: {exc}"
+                elapsed_s, model_used, fallback_reason = 0.0, None, None
+            results.append({
+                "path": p,
+                "status": status,
+                "elapsed_s": elapsed_s,
+                "model_used": model_used,
+                "fallback_reason": fallback_reason,
+            })
+
+    wall_s = round(time.monotonic() - _wall_t0, 2)
+
+    summarizer_metrics.append_metrics_record({
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "project": project,
+        "n_notes": len(results),
+        "wall_s": wall_s,
+        "notes": results,
+    })
+
+    return results
