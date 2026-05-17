@@ -4227,7 +4227,10 @@ def upgrade_unsummarized_note(
         with open(note_path, 'r', encoding='utf-8') as f:
             raw_lines = f.readlines()
     except OSError as exc:
-        return _ret(f"Failed: cannot read {os.path.basename(note_path)}: {exc}")
+        return _ret(
+            f"Failed: cannot read {os.path.basename(note_path)}: {exc}",
+            fallback_reason="unreadable_note",
+        )
 
     # Extract session_id from frontmatter
     session_id = None
