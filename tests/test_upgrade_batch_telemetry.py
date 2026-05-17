@@ -112,3 +112,29 @@ def test_upgrade_batch_per_note_failure_captured_with_reason(monkeypatch, tmp_pa
 
     rec = json.loads(metrics_path.read_text(encoding="utf-8").splitlines()[0])
     assert rec["notes"][0]["fallback_reason"] == "haiku_timeout"
+
+
+def test_single_element_batch_emits_record(monkeypatch, tmp_path, fake_note):
+    """The /standup call shape — upgrade_batch([single_path], ...) — emits exactly one record with n_notes=1."""
+    metrics_path = tmp_path / "metrics.jsonl"
+    monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
+
+    def fake_uun(path, *a, **kw):
+        return (f"Upgraded {os.path.basename(path)}", 0.3, "haiku", None)
+    monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_uun)
+
+    p1 = fake_note("standup-note.md", "s-standup")
+    result = obsidian_utils.upgrade_batch(
+        [str(p1)], str(tmp_path), "claude-sessions", "obsidian-brain",
+    )
+
+    assert len(result) == 1
+    assert result[0]["status"].startswith("Upgraded ")
+    assert result[0]["path"] == str(p1)
+
+    lines = metrics_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["project"] == "obsidian-brain"
+    assert rec["n_notes"] == 1
+    assert len(rec["notes"]) == 1

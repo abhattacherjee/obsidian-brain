@@ -192,15 +192,15 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
-from obsidian_utils import upgrade_unsummarized_note
-status, *_ = upgrade_unsummarized_note(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
-print(status)
+from obsidian_utils import upgrade_batch
+results = upgrade_batch([sys.argv[1]], sys.argv[2], sys.argv[3], sys.argv[4])
+print(results[0]["status"])
 ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-The function returns a one-line status. If the status starts with `Failed:`, note the failure and fall back to the manual procedure below for that note. Collect results from all sub-agents before proceeding.
+The snippet prints a one-line status from `results[0]["status"]`. If that printed status starts with `Failed:`, note the failure and fall back to the manual procedure below for that note. Collect results from all sub-agents before proceeding.
 
-For each file in `UNSUMMARIZED`, if `upgrade_unsummarized_note()` is unavailable or returns a `Failed:` status, fall back to the manual upgrade procedure:
+For each file in `UNSUMMARIZED`, if `upgrade_batch()` is unavailable or the printed `results[0]["status"]` starts with `Failed:`, fall back to the manual upgrade procedure:
 
 1. **Read the full file** using the Read tool.
 2. **Extract frontmatter** — preserve it exactly as-is (everything between the opening `---` and closing `---`).

@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback_reason). `model_used` reflects the resolved `summary_model` parameter
   (default `"haiku"`); `None` on failure paths. `sonnet-4.6` / `opus-*` tags
   reserved for Phase 3 (#165).
+- `upgrade_and_collect_corpus` and the `/standup` summarizer path now route
+  through `upgrade_batch`, so each Haiku summarization is included in a
+  metrics record written to `~/.claude/obsidian-brain-summarizer-metrics.jsonl`
+  (one JSONL record per `upgrade_batch` call, with `n_notes` reflecting the
+  group size — the corpus pass groups by project, `/standup` is `n_notes=1`).
+  Closes telemetry gap from #182 (follow-up to #74).
 
 ## [2.5.1] - 2026-05-16
 

@@ -3076,7 +3076,9 @@ def upgrade_and_collect_corpus(
     """Upgrade unsummarized notes then collect corpus in a single pass.
 
     1. Scan sessions folder for notes with ``status: auto-logged`` within
-       the date window and attempt ``upgrade_unsummarized_note()`` on each.
+       the date window, group by frontmatter ``project``, and dispatch each
+       group through ``upgrade_batch()`` (which writes one telemetry record
+       per call to the summarizer metrics sink).
     2. Call ``collect_vault_corpus()`` to build the full corpus (including
        freshly upgraded notes).  ``include_types`` / ``exclude_types`` are
        forwarded verbatim — see ``collect_vault_corpus`` docstring for details.
@@ -3090,23 +3092,22 @@ def upgrade_and_collect_corpus(
     upgraded = 0
     failed = 0
 
-    # --- Phase 1: upgrade unsummarized notes ---
+    # --- Phase 1: upgrade unsummarized notes (group-by-project + batch) ---
+    from collections import defaultdict
+    candidates_by_project: dict[str, list[tuple[str, str]]] = defaultdict(list)
+
     sessions_dir = vault_root / sessions_folder
     if sessions_dir.is_dir():
+        # Pass A: collect candidates, grouped by frontmatter project
         for md_file in sessions_dir.iterdir():
             if md_file.suffix != ".md":
                 continue
-
-            # Path containment
             resolved = md_file.resolve()
             if not resolved.is_relative_to(vault_root):
                 continue
-
             meta = read_note_metadata(str(md_file))
             if not meta:
                 continue
-
-            # Date filter
             date_str = meta.get("date", "")
             if not date_str:
                 continue
@@ -3116,29 +3117,34 @@ def upgrade_and_collect_corpus(
                 continue
             if note_date < cutoff:
                 continue
-
-            # Only upgrade auto-logged notes
             if meta.get("status") != "auto-logged":
                 continue
+            candidates_by_project[meta.get("project", "")].append(
+                (str(md_file), meta.get("session_id", ""))
+            )
 
-            try:
-                status, _elapsed, _model, _reason = upgrade_unsummarized_note(
-                    note_path=str(md_file),
-                    vault_path=vault_path,
-                    sessions_folder=sessions_folder,
-                    project=meta.get("project", ""),
-                )
-                if not status.startswith("Failed"):
+        # Pass B: one upgrade_batch call per project group.
+        # max_workers=1: dedup_note_open_items runs after each note write and
+        # scans sibling notes; parallel workers in the same project could each
+        # see the other's freshly written open item as a duplicate and both
+        # remove their copy. Serial dispatch preserves the pre-#182 semantics.
+        for project_name, group in candidates_by_project.items():
+            paths = [p for p, _ in group]
+            results = upgrade_batch(
+                paths, vault_path, sessions_folder, project_name,
+                max_workers=1,
+            )
+            for (path, session_id), result in zip(group, results):
+                if result["status"].startswith("Upgraded "):
                     upgraded += 1
-                    # Bust metadata cache for this note
-                    session_id = meta.get("session_id", "")
                     if session_id:
                         cache_invalidate(session_id)
                 else:
+                    print(
+                        f"[obsidian-brain] upgrade failed for {path}: {result['status']}",
+                        file=sys.stderr,
+                    )
                     failed += 1
-            except Exception as exc:
-                failed += 1
-                print(f"[obsidian-brain] upgrade failed for {md_file.name}: {exc}", file=sys.stderr)
 
     # --- Phase 2: collect corpus (now includes freshly upgraded notes) ---
     corpus_json = collect_vault_corpus(
