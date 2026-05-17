@@ -3134,12 +3134,16 @@ def upgrade_and_collect_corpus(
                 paths, vault_path, sessions_folder, project_name,
                 max_workers=1,
             )
-            for (_path, session_id), result in zip(group, results):
+            for (path, session_id), result in zip(group, results):
                 if result["status"].startswith("Upgraded "):
                     upgraded += 1
                     if session_id:
                         cache_invalidate(session_id)
                 else:
+                    print(
+                        f"[obsidian-brain] upgrade failed for {path}: {result['status']}",
+                        file=sys.stderr,
+                    )
                     failed += 1
 
     # --- Phase 2: collect corpus (now includes freshly upgraded notes) ---
