@@ -56,3 +56,33 @@ def test_no_session_id_sets_fallback_reason(tmp_path):
     assert status.startswith("Failed: no session_id"), status
     assert fallback_reason == "no_session_id"
     assert model_used is None
+
+
+def test_no_conversation_content_sets_fallback_reason(tmp_path, monkeypatch):
+    """Valid frontmatter but no extractable messages -> fallback_reason='no_conversation_content'."""
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    note_path = sessions / "2026-05-17-empty-convo.md"
+    note_path.write_text(
+        "---\n"
+        "session_id: test-sid-001\n"
+        "project: test-proj\n"
+        "status: auto-logged\n"
+        "date: 2026-05-17\n"
+        "---\n"
+        "\n"
+        "Some prose body with no conversation section at all.\n",
+        encoding="utf-8",
+    )
+
+    # Force the JSONL lookup to return None so the function falls through to
+    # raw-note extraction (which finds no `## Conversation (raw)` section).
+    monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+    status, elapsed_s, model_used, fallback_reason = upgrade_unsummarized_note(
+        str(note_path), str(tmp_path), "claude-sessions", "test-proj",
+    )
+
+    assert status.startswith("Failed: no conversation content"), status
+    assert fallback_reason == "no_conversation_content"
+    assert model_used is None

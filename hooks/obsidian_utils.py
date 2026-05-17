@@ -4308,7 +4308,10 @@ def upgrade_unsummarized_note(
                     assistant_msgs.append(stripped[14:].strip())
 
     if not user_msgs and not assistant_msgs:
-        return _ret(f"Failed: no conversation content in {os.path.basename(note_path)}")
+        return _ret(
+            f"Failed: no conversation content in {os.path.basename(note_path)}",
+            fallback_reason="no_conversation_content",
+        )
 
     # Build metadata for generate_summary
     metadata: dict = {"project": project, "vault_path": vault_path, "sessions_folder": sessions_folder}
