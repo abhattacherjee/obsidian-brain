@@ -670,4 +670,4 @@ class TestUpgradeErrorLogging:
         with patch("obsidian_utils.upgrade_unsummarized_note", side_effect=RuntimeError("haiku timeout")):
             status = obsidian_utils.upgrade_and_collect_corpus(
                 str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))
-        assert ":1" in status
+        assert status == "OK:1:0:1"

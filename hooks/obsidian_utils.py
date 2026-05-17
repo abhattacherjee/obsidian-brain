@@ -3123,16 +3123,19 @@ def upgrade_and_collect_corpus(
                 (str(md_file), meta.get("session_id", ""))
             )
 
-        # Pass B: one upgrade_batch call per project group
+        # Pass B: one upgrade_batch call per project group.
+        # max_workers=1: dedup_note_open_items runs after each note write and
+        # scans sibling notes; parallel workers in the same project could each
+        # see the other's freshly written open item as a duplicate and both
+        # remove their copy. Serial dispatch preserves the pre-#182 semantics.
         for project_name, group in candidates_by_project.items():
-            if not group:
-                continue
             paths = [p for p, _ in group]
             results = upgrade_batch(
                 paths, vault_path, sessions_folder, project_name,
+                max_workers=1,
             )
             for (_path, session_id), result in zip(group, results):
-                if not result["status"].startswith("Failed"):
+                if result["status"].startswith("Upgraded "):
                     upgraded += 1
                     if session_id:
                         cache_invalidate(session_id)

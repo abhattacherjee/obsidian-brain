@@ -198,9 +198,9 @@ print(results[0]["status"])
 ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-The function returns a one-line status. If the status starts with `Failed:`, note the failure and fall back to the manual procedure below for that note. Collect results from all sub-agents before proceeding.
+The snippet prints a one-line status from `results[0]["status"]`. If that printed status starts with `Failed:`, note the failure and fall back to the manual procedure below for that note. Collect results from all sub-agents before proceeding.
 
-For each file in `UNSUMMARIZED`, if `upgrade_batch()` is unavailable or returns a `Failed:` status, fall back to the manual upgrade procedure:
+For each file in `UNSUMMARIZED`, if `upgrade_batch()` is unavailable or the printed `results[0]["status"]` starts with `Failed:`, fall back to the manual upgrade procedure:
 
 1. **Read the full file** using the Read tool.
 2. **Extract frontmatter** — preserve it exactly as-is (everything between the opening `---` and closing `---`).
