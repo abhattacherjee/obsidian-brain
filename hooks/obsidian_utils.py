@@ -3090,23 +3090,22 @@ def upgrade_and_collect_corpus(
     upgraded = 0
     failed = 0
 
-    # --- Phase 1: upgrade unsummarized notes ---
+    # --- Phase 1: upgrade unsummarized notes (group-by-project + batch) ---
+    from collections import defaultdict
+    candidates_by_project: dict[str, list[tuple[str, str]]] = defaultdict(list)
+
     sessions_dir = vault_root / sessions_folder
     if sessions_dir.is_dir():
+        # Pass A: collect candidates, grouped by frontmatter project
         for md_file in sessions_dir.iterdir():
             if md_file.suffix != ".md":
                 continue
-
-            # Path containment
             resolved = md_file.resolve()
             if not resolved.is_relative_to(vault_root):
                 continue
-
             meta = read_note_metadata(str(md_file))
             if not meta:
                 continue
-
-            # Date filter
             date_str = meta.get("date", "")
             if not date_str:
                 continue
@@ -3116,29 +3115,27 @@ def upgrade_and_collect_corpus(
                 continue
             if note_date < cutoff:
                 continue
-
-            # Only upgrade auto-logged notes
             if meta.get("status") != "auto-logged":
                 continue
+            candidates_by_project[meta.get("project", "")].append(
+                (str(md_file), meta.get("session_id", ""))
+            )
 
-            try:
-                status, _elapsed, _model, _reason = upgrade_unsummarized_note(
-                    note_path=str(md_file),
-                    vault_path=vault_path,
-                    sessions_folder=sessions_folder,
-                    project=meta.get("project", ""),
-                )
-                if not status.startswith("Failed"):
+        # Pass B: one upgrade_batch call per project group
+        for project_name, group in candidates_by_project.items():
+            if not group:
+                continue
+            paths = [p for p, _ in group]
+            results = upgrade_batch(
+                paths, vault_path, sessions_folder, project_name,
+            )
+            for (_path, session_id), result in zip(group, results):
+                if not result["status"].startswith("Failed"):
                     upgraded += 1
-                    # Bust metadata cache for this note
-                    session_id = meta.get("session_id", "")
                     if session_id:
                         cache_invalidate(session_id)
                 else:
                     failed += 1
-            except Exception as exc:
-                failed += 1
-                print(f"[obsidian-brain] upgrade failed for {md_file.name}: {exc}", file=sys.stderr)
 
     # --- Phase 2: collect corpus (now includes freshly upgraded notes) ---
     corpus_json = collect_vault_corpus(

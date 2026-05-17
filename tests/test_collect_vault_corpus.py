@@ -1,5 +1,6 @@
 """Tests for collect_vault_corpus() — vault data collection for /emerge."""
 
+import datetime
 import json
 import os
 import sys
@@ -565,19 +566,108 @@ class TestUpgradeAndCollectCorpus:
         assert parts[3] == "0"  # failed
 
 
-class TestUpgradeErrorLogging:
-    def test_failed_upgrade_logged_to_stderr(self, tmp_vault, tmp_path, capsys):
-        """upgrade_and_collect_corpus logs failed upgrade to stderr."""
+    def test_corpus_pass_emits_one_record_per_project_group(self, tmp_vault, tmp_path, monkeypatch):
+        """Three auto-logged notes in window, all project=foo → one batch record, n_notes=3."""
+        import summarizer_metrics
+        metrics_path = tmp_path / "metrics.jsonl"
+        monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
+
+        def fake_uun(path, *a, **kw):
+            return (f"Upgraded {os.path.basename(path)}", 0.4, "haiku", None)
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_uun)
+
         sess = tmp_vault / "claude-sessions"
-        # Write an auto-logged note that will trigger upgrade
+        for i in range(3):
+            _write_note(
+                sess / f"{_today_str()}-foo-{i:04x}.md",
+                {"date": _today_str(), "project": "foo", "type": "claude-session",
+                 "status": "auto-logged", "session_id": f"sid-{i}"},
+                f"# T{i}\n\n## Summary\nAI summary unavailable",
+            )
+        old_date = (datetime.date.today() - datetime.timedelta(days=365)).isoformat()
+        _write_note(
+            sess / f"{old_date}-foo-stale.md",
+            {"date": old_date, "project": "foo", "type": "claude-session",
+             "status": "auto-logged", "session_id": "sid-stale"},
+            "# Stale\n\n## Summary\nAI summary unavailable",
+        )
+
+        output = tmp_path / "corpus.json"
+        status = obsidian_utils.upgrade_and_collect_corpus(
+            str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))
+
+        assert status.startswith("OK:")
+        assert ":3:0" in status
+
+        lines = metrics_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1, f"expected 1 sink record, got {len(lines)}"
+        rec = json.loads(lines[0])
+        assert rec["project"] == "foo"
+        assert rec["n_notes"] == 3
+
+    def test_corpus_pass_emits_separate_records_per_project(self, tmp_vault, tmp_path, monkeypatch):
+        """Two notes for project=foo + two for project=bar → two sink records."""
+        import summarizer_metrics
+        metrics_path = tmp_path / "metrics.jsonl"
+        monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
+
+        def fake_uun(path, *a, **kw):
+            return (f"Upgraded {os.path.basename(path)}", 0.4, "haiku", None)
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_uun)
+
+        sess = tmp_vault / "claude-sessions"
+        for proj in ("foo", "bar"):
+            for i in range(2):
+                _write_note(
+                    sess / f"{_today_str()}-{proj}-{i:04x}.md",
+                    {"date": _today_str(), "project": proj, "type": "claude-session",
+                     "status": "auto-logged", "session_id": f"{proj}-sid-{i}"},
+                    f"# {proj.upper()}{i}\n\n## Summary\nAI summary unavailable",
+                )
+
+        output = tmp_path / "corpus.json"
+        obsidian_utils.upgrade_and_collect_corpus(
+            str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))
+
+        lines = metrics_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        recs = sorted([json.loads(L) for L in lines], key=lambda r: r["project"])
+        assert recs[0]["project"] == "bar"
+        assert recs[0]["n_notes"] == 2
+        assert recs[1]["project"] == "foo"
+        assert recs[1]["n_notes"] == 2
+
+    def test_corpus_pass_no_candidates_emits_no_record(self, tmp_vault, tmp_path, monkeypatch):
+        """All notes already summarized → no upgrade_batch call → no sink record."""
+        import summarizer_metrics
+        metrics_path = tmp_path / "metrics.jsonl"
+        monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
+
+        sess = tmp_vault / "claude-sessions"
+        _write_note(
+            sess / f"{_today_str()}-done-0001.md",
+            {"date": _today_str(), "project": "foo", "type": "claude-session",
+             "status": "summarized"},
+            "# Done\n\n## Summary\nReal summary present.",
+        )
+
+        output = tmp_path / "corpus.json"
+        obsidian_utils.upgrade_and_collect_corpus(
+            str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))
+
+        assert not metrics_path.exists() or metrics_path.read_text(encoding="utf-8") == ""
+
+
+class TestUpgradeErrorLogging:
+    def test_failed_upgrade_surfaces_as_failed_status(self, tmp_vault, tmp_path):
+        """upgrade_and_collect_corpus surfaces worker exception as Failed: status (was stderr before #182)."""
+        sess = tmp_vault / "claude-sessions"
         _write_note(sess / f"{_today_str()}-fail-0001.md",
-            {"date": _today_str(), "project": "p", "type": "claude-session", "status": "auto-logged"},
+            {"date": _today_str(), "project": "p", "type": "claude-session",
+             "status": "auto-logged", "session_id": "fail-sid"},
             "# Fail\n\n## Summary\nAI summary unavailable")
         output = tmp_path / "corpus.json"
-        # Mock upgrade to raise
         with patch("obsidian_utils.upgrade_unsummarized_note", side_effect=RuntimeError("haiku timeout")):
             status = obsidian_utils.upgrade_and_collect_corpus(
                 str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))
-        assert ":1" in status  # 1 failed
-        captured = capsys.readouterr()
-        assert "haiku timeout" in captured.err
+        assert ":1" in status
