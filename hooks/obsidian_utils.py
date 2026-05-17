@@ -3076,7 +3076,9 @@ def upgrade_and_collect_corpus(
     """Upgrade unsummarized notes then collect corpus in a single pass.
 
     1. Scan sessions folder for notes with ``status: auto-logged`` within
-       the date window and attempt ``upgrade_unsummarized_note()`` on each.
+       the date window, group by frontmatter ``project``, and dispatch each
+       group through ``upgrade_batch()`` (which writes one telemetry record
+       per call to the summarizer metrics sink).
     2. Call ``collect_vault_corpus()`` to build the full corpus (including
        freshly upgraded notes).  ``include_types`` / ``exclude_types`` are
        forwarded verbatim — see ``collect_vault_corpus`` docstring for details.
