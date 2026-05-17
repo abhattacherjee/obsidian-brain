@@ -4240,7 +4240,10 @@ def upgrade_unsummarized_note(
             session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
             break
     if not session_id:
-        return _ret(f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}")
+        return _ret(
+            f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}",
+            fallback_reason="no_session_id",
+        )
 
     # Find and parse the JSONL transcript
     jsonl_path = find_transcript_jsonl(session_id)
