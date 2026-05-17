@@ -596,8 +596,7 @@ class TestUpgradeAndCollectCorpus:
         status = obsidian_utils.upgrade_and_collect_corpus(
             str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))
 
-        assert status.startswith("OK:")
-        assert ":3:0" in status
+        assert status == "OK:3:3:0"
 
         lines = metrics_path.read_text(encoding="utf-8").splitlines()
         assert len(lines) == 1, f"expected 1 sink record, got {len(lines)}"
