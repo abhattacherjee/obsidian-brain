@@ -4203,12 +4203,31 @@ def upgrade_unsummarized_note(
       success (default ``"haiku"``), or ``None`` on failure paths that never
       reached summarization. Sonnet/Opus tags are reserved for Phase 3 #165.
     - **fallback_reason** (*str | None*) — non-``None`` when summarization
-      failed or ``upgrade_batch``'s per-note worker caught an exception.
-      Day-one values: ``"haiku_timeout"``, ``"haiku_subprocess_error"``,
-      ``"empty_output"``, ``"unknown_failure"`` (from generate functions);
-      ``"worker_exception"`` (set by ``upgrade_batch`` when the future raises).
-      Threaded through from ``generate_summary`` / ``generate_snapshot_summary``
-      unchanged on normal failure paths.
+      failed or a worker / pre-summarization check caught a problem.
+      ``None`` only on the success path. Full taxonomy:
+
+      Pre-summarization (this function, before any model call):
+        ``"unreadable_note"``         — OSError reading the note (perms, encoding, ENOENT)
+        ``"no_session_id"``           — frontmatter is missing the ``session_id:`` field
+        ``"no_conversation_content"`` — neither JSONL nor raw-note section yielded messages
+
+      Haiku pipeline (set inside ``generate_summary`` / ``generate_snapshot_summary``):
+        ``"haiku_timeout"``           — ``claude -p`` exceeded the per-call timeout
+        ``"haiku_subprocess_error"``  — ``claude -p`` returned non-zero or unexpected I/O
+        ``"empty_output"``            — model returned empty / whitespace-only text
+        ``"unknown_failure"``         — defensive default when no specific reason was captured
+
+      Worker wrapper (set by ``upgrade_batch`` when a future raises):
+        ``"worker_exception"``        — per-note worker raised an uncaught exception
+
+      Reserved for the Phase 2 validator (#167) — declared here for stability,
+      not yet emitted by this function:
+        ``"missing_section"``         — summary lacks a required H2 section
+        ``"importance_missing"``      — IMPORTANCE: N line absent or unparseable
+        ``"schema_loose"``            — summary structurally valid but fails strict schema
+
+      Callers MUST treat any non-``None`` value as a failure classifier. Adding a
+      new value requires updating both this docstring and the validator (#167).
 
     Adding any new return prefix to the ``status`` field requires an audit
     of routing call sites.
