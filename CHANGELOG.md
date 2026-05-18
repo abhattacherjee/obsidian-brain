@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The `/recall` status line now reports total wall time and a per-model breakdown
   (e.g., `Step 2: upgraded 7 note(s) in 12.4s wall (5 haiku / 2 fallback)`). Foundation
   for the cost-reduction work tracked in #169. (#74)
-- `fallback_reason` populated on pre-summarization failures in `upgrade_unsummarized_note`: `unreadable_note`, `no_session_id`, `no_conversation_content`. Full taxonomy (8 active + 3 reserved Phase 2 validator values, #167) now documented in the function's docstring. Closes #183.
+- `fallback_reason` populated on pre-summarization failures in `upgrade_unsummarized_note`: `unreadable_note`, `no_session_id`, `no_conversation_content`. Full taxonomy (including Phase 2 validator reserved values, #167/#84) documented in the function's docstring. Closes #183.
 
 ### Changed
 - **`upgrade_batch()` return shape** — was `list[tuple[path, status]]`, now

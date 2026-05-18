@@ -1,11 +1,8 @@
 """Unit tests for the three pre-summarization fallback_reason values
 in upgrade_unsummarized_note (issue #183)."""
 
-import os
 import sys
 from pathlib import Path
-
-import pytest
 
 HOOKS = Path(__file__).resolve().parent.parent / "hooks"
 sys.path.insert(0, str(HOOKS))
@@ -78,6 +75,10 @@ def test_no_conversation_content_sets_fallback_reason(tmp_path, monkeypatch):
     # Force the JSONL lookup to return None so the function falls through to
     # raw-note extraction (which finds no `## Conversation (raw)` section).
     monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+    # Guard: verify the monkeypatch actually intercepted the lookup. A future
+    # refactor that switches to `from .other import find_transcript_jsonl`
+    # would silently bypass this patch.
+    assert obsidian_utils.find_transcript_jsonl("test-sid-001") is None
 
     status, elapsed_s, model_used, fallback_reason = upgrade_unsummarized_note(
         str(note_path), str(tmp_path), "claude-sessions", "test-proj",
@@ -85,4 +86,21 @@ def test_no_conversation_content_sets_fallback_reason(tmp_path, monkeypatch):
 
     assert status.startswith("Failed: no conversation content"), status
     assert fallback_reason == "no_conversation_content"
+    assert model_used is None
+
+
+def test_unreadable_note_encoding_error_sets_fallback_reason(tmp_path):
+    """Invalid UTF-8 in a note -> fallback_reason='unreadable_note' (encoding case)."""
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    note_path = sessions / "2026-05-17-bad-encoding.md"
+    # Latin-1 / mixed garbage bytes that cannot be decoded as UTF-8
+    note_path.write_bytes(b"---\nproject: test-proj\n---\n\xff\xfe garbage \xc3\x28\n")
+
+    status, elapsed_s, model_used, fallback_reason = upgrade_unsummarized_note(
+        str(note_path), str(tmp_path), "claude-sessions", "test-proj",
+    )
+
+    assert status.startswith("Failed: cannot read"), status
+    assert fallback_reason == "unreadable_note"
     assert model_used is None
