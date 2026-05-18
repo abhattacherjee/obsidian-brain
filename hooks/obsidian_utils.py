@@ -4204,11 +4204,18 @@ def upgrade_unsummarized_note(
       success (default ``"haiku"``), or ``None`` on failure paths that never
       reached summarization. Sonnet/Opus tags are reserved for Phase 3 #165.
     - **fallback_reason** (*str | None*) — non-``None`` when summarization
-      failed or a worker / pre-summarization check caught a problem.
-      ``None`` only on the success path. Full taxonomy:
+      itself failed or a worker / pre-summarization check caught a problem.
+      ``None`` indicates that summarization succeeded; it does NOT by itself
+      confirm overall success. Callers MUST also check
+      ``status.startswith("Upgraded ")`` — ``upgrade_note_with_summary`` can
+      still return a ``"Failed: ..."`` status (malformed summary, atomic write
+      error, post-write verification failure, etc.) even after the model
+      returned a result, and those post-summarization failures currently flow
+      through with ``fallback_reason=None``. Classifying them is tracked as a
+      Phase 2 prep follow-up. Full taxonomy of populated values:
 
       Pre-summarization (this function, before any model call):
-        ``"unreadable_note"``         — OSError reading the note (perms, encoding, ENOENT)
+        ``"unreadable_note"``         — OSError or UnicodeDecodeError reading the note (perms, encoding, ENOENT, bad UTF-8)
         ``"no_session_id"``           — frontmatter is missing the ``session_id:`` field
         ``"no_conversation_content"`` — neither JSONL nor raw-note section yielded messages
 
