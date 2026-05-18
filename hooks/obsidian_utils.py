@@ -2000,7 +2000,8 @@ def generate_summary(
       * On success: ``(text, None)``
       * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output" | "unknown_failure")``
 
-    Reserved future reasons (populated by Phase 2 #167 validator, not here):
+    Reserved future reasons (will be populated downstream by the Phase 2 #167/#84
+    validator, not returned by this function):
       ``"missing_section"``, ``"importance_missing"``, ``"schema_loose"``.
 
     Samples first 10 + last 10 messages for large sessions.
@@ -4203,12 +4204,38 @@ def upgrade_unsummarized_note(
       success (default ``"haiku"``), or ``None`` on failure paths that never
       reached summarization. Sonnet/Opus tags are reserved for Phase 3 #165.
     - **fallback_reason** (*str | None*) — non-``None`` when summarization
-      failed or ``upgrade_batch``'s per-note worker caught an exception.
-      Day-one values: ``"haiku_timeout"``, ``"haiku_subprocess_error"``,
-      ``"empty_output"``, ``"unknown_failure"`` (from generate functions);
-      ``"worker_exception"`` (set by ``upgrade_batch`` when the future raises).
-      Threaded through from ``generate_summary`` / ``generate_snapshot_summary``
-      unchanged on normal failure paths.
+      itself failed or a worker / pre-summarization check caught a problem.
+      ``None`` indicates that summarization succeeded; it does NOT by itself
+      confirm overall success. Callers MUST also check
+      ``status.startswith("Upgraded ")`` — ``upgrade_note_with_summary`` can
+      still return a ``"Failed: ..."`` status (malformed summary, atomic write
+      error, post-write verification failure, etc.) even after the model
+      returned a result, and those post-summarization failures currently flow
+      through with ``fallback_reason=None``. Classifying them is tracked as a
+      Phase 2 prep follow-up. Full taxonomy of populated values:
+
+      Pre-summarization (this function, before any model call):
+        ``"unreadable_note"``         — OSError or UnicodeDecodeError reading the note (perms, encoding, ENOENT, bad UTF-8)
+        ``"no_session_id"``           — frontmatter is missing the ``session_id:`` field
+        ``"no_conversation_content"`` — neither JSONL nor raw-note section yielded messages
+
+      Summarizer subprocess (set inside ``generate_summary`` / ``generate_snapshot_summary``):
+        ``"haiku_timeout"``           — ``claude -p`` exceeded the per-call timeout
+        ``"haiku_subprocess_error"``  — ``claude -p`` returned non-zero or unexpected I/O
+        ``"empty_output"``            — model returned empty / whitespace-only text
+        ``"unknown_failure"``         — defensive default returned by ``generate_summary`` / ``generate_snapshot_summary`` when the retry loop exits without setting ``last_reason`` (should be unreachable)
+
+      Worker wrapper (set by ``upgrade_batch`` when a future raises):
+        ``"worker_exception"``        — per-note worker raised an uncaught exception
+
+      Reserved for the Phase 2 validator (#167/#84) — declared here for stability,
+      not yet emitted by this function:
+        ``"missing_section"``         — summary lacks a required H2 section
+        ``"importance_missing"``      — IMPORTANCE: N line absent or unparseable
+        ``"schema_loose"``            — summary structurally valid but fails strict schema
+
+      Callers MUST treat any non-``None`` value as a failure classifier. Adding a
+      new value requires updating both this docstring and the validator (#167/#84).
 
     Adding any new return prefix to the ``status`` field requires an audit
     of routing call sites.
@@ -4226,8 +4253,11 @@ def upgrade_unsummarized_note(
     try:
         with open(note_path, 'r', encoding='utf-8') as f:
             raw_lines = f.readlines()
-    except OSError as exc:
-        return _ret(f"Failed: cannot read {os.path.basename(note_path)}: {exc}")
+    except (OSError, UnicodeDecodeError) as exc:
+        return _ret(
+            f"Failed: cannot read {os.path.basename(note_path)}: {exc}",
+            fallback_reason="unreadable_note",
+        )
 
     # Extract session_id from frontmatter
     session_id = None
@@ -4237,7 +4267,10 @@ def upgrade_unsummarized_note(
             session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
             break
     if not session_id:
-        return _ret(f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}")
+        return _ret(
+            f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}",
+            fallback_reason="no_session_id",
+        )
 
     # Find and parse the JSONL transcript
     jsonl_path = find_transcript_jsonl(session_id)
@@ -4302,7 +4335,10 @@ def upgrade_unsummarized_note(
                     assistant_msgs.append(stripped[14:].strip())
 
     if not user_msgs and not assistant_msgs:
-        return _ret(f"Failed: no conversation content in {os.path.basename(note_path)}")
+        return _ret(
+            f"Failed: no conversation content in {os.path.basename(note_path)}",
+            fallback_reason="no_conversation_content",
+        )
 
     # Build metadata for generate_summary
     metadata: dict = {"project": project, "vault_path": vault_path, "sessions_folder": sessions_folder}
