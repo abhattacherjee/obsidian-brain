@@ -34,10 +34,11 @@ print("VAULT=" + c["vault_path"])
 print("SESS=" + c.get("sessions_folder", "claude-sessions"))
 print("INS=" + c.get("insights_folder", "claude-insights"))
 print("PROJECT=" + project)
+print("PIPELINE=" + c.get("summary_pipeline", "auto"))
 '
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`.
+Parse each output line as KEY=VALUE, splitting on the first `=`. Also capture PIPELINE (defaults to "auto").
 
 If the user passed a project name argument (e.g. `/recall my-project`), override `PROJECT` with that value.
 
@@ -92,6 +93,8 @@ Update task #1 to completed. Update task #2 subject to `Summarize N unsummarized
 Update task #2 subject to `No unsummarized notes found` and set to `completed`. Skip to Step 3.
 
 #### Path B: N>=1 (parallel Haiku pipelines with sub-agent fallback)
+
+> **Config escape hatch (#84):** If `PIPELINE=subagent`, SKIP Phase 1 (the `upgrade_batch` Haiku `claude -p` pipeline) entirely and treat ALL N notes as the Phase 2 fallback list — route every note directly to the sub-agent path in Phase 2. This is for machines where `claude -p` cold-start latency exceeds the timeout budget (the Haiku pipeline would waste ~2-4 min/note on doomed timeouts). When `PIPELINE=auto` (default), proceed with Phase 1 as written below.
 
 **Task management threshold:** If N <= 5, create a sub-task per note. If N > 5, skip per-note sub-tasks — use a single progress update on task #2 instead. This saves ~15-20s of parent round-trip overhead at large N.
 
