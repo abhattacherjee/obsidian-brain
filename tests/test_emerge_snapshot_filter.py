@@ -1,21 +1,23 @@
 import json
 from pathlib import Path
+from datetime import date, timedelta
 
 from hooks.obsidian_utils import collect_vault_corpus
 
 
 def _setup(tmp_path):
+    recent = (date.today() - timedelta(days=2)).isoformat()
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"
     ins = vault / "claude-insights"
     sess.mkdir(parents=True); ins.mkdir()
-    (sess / "2026-04-18-demo-aa.md").write_text(
-        "---\ntype: claude-session\ndate: 2026-04-18\nsession_id: s1\nproject: demo\n"
+    (sess / f"{recent}-demo-aa.md").write_text(
+        f"---\ntype: claude-session\ndate: {recent}\nsession_id: s1\nproject: demo\n"
         "tags: [claude/session]\n---\n\n# S\n\n## Summary\nSession body.\n",
         encoding="utf-8",
     )
-    (sess / "2026-04-18-demo-aa-snapshot-140000.md").write_text(
-        "---\ntype: claude-snapshot\ndate: 2026-04-18\nsession_id: s1\nproject: demo\n"
+    (sess / f"{recent}-demo-aa-snapshot-140000.md").write_text(
+        f"---\ntype: claude-snapshot\ndate: {recent}\nsession_id: s1\nproject: demo\n"
         "tags: [claude/snapshot]\n---\n\n# Snap\n\n## Summary\nSnapshot body.\n",
         encoding="utf-8",
     )
