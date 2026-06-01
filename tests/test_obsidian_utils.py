@@ -1156,6 +1156,32 @@ class TestGenerateSummarySampling:
         assert len(prompt) < 30000  # generous upper bound; key check is it's bounded
 
 
+class TestSummarizerTimeoutBudget:
+    """#84 — claude -p first-attempt timeout raised 30s→120s for slow-start CC builds."""
+
+    def _capture_timeout_run(self, captured: dict):
+        def fake_run(cmd, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return type("Result", (), {"returncode": 0, "stdout": "## Summary\nDone.\n", "stderr": ""})()
+        return fake_run
+
+    def test_generate_summary_first_attempt_timeout_is_120(self, monkeypatch):
+        captured: dict = {}
+        monkeypatch.setattr("subprocess.run", self._capture_timeout_run(captured))
+        obsidian_utils.generate_summary(["u"], ["a"], {"project": "t", "files_touched": []})
+        assert captured.get("timeout") == 120
+
+    def test_generate_snapshot_summary_first_attempt_timeout_is_120(self, monkeypatch):
+        captured: dict = {}
+        monkeypatch.setattr("subprocess.run", self._capture_timeout_run(captured))
+        obsidian_utils.generate_snapshot_summary(["u"], ["a"], {"project": "t"})
+        assert captured.get("timeout") == 120
+
+
+def test_summary_pipeline_default_is_auto():
+    assert obsidian_utils._DEFAULTS.get("summary_pipeline") == "auto"
+
+
 # ===========================================================================
 # Section 7: build_context_brief — sort order and duration
 # ===========================================================================

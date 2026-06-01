@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`summary_pipeline` config key** (`"auto"` default | `"subagent"`) — set to `"subagent"` in `~/.claude/obsidian-brain-config.json` to skip the Haiku `claude -p` summarizer pipeline entirely on machines with slow CLI cold-start, routing all notes straight to the sub-agent fallback. (#84)
 - **`/recall` telemetry** — `upgrade_batch()` now returns per-note `elapsed_s`,
   `model_used`, and `fallback_reason`, and appends one record per call to
   `~/.claude/obsidian-brain-summarizer-metrics.jsonl` (100 KB rotation, owner-only).
@@ -17,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fallback_reason` populated on pre-summarization failures in `upgrade_unsummarized_note`: `unreadable_note`, `no_session_id`, `no_conversation_content`. Full taxonomy (including Phase 2 validator reserved values, #167/#84) documented in the function's docstring. Closes #183.
 
 ### Changed
+- **Summarizer timeout budget** — `generate_summary` / `generate_snapshot_summary` first-attempt `claude -p` timeout raised from 30s to 120s (retry from 60s to 240s) to accommodate slow-start CC builds where cold-start alone can take ~46s. Fixes the 100% Haiku-pipeline failure rate on affected installs. (#84)
 - **`upgrade_batch()` return shape** — was `list[tuple[path, status]]`, now
   `list[dict]` with 5 keys (`path`, `status`, `elapsed_s`, `model_used`,
   `fallback_reason`). Backward-incompatible for direct callers; in-tree

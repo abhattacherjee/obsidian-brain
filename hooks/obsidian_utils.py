@@ -913,6 +913,7 @@ _DEFAULTS: dict = {
     "min_messages": 3,
     "min_duration_minutes": 2,
     "summary_model": "haiku",
+    "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline (escape hatch for slow-start CC builds, #84)
     "auto_log_enabled": True,
     "snapshot_on_compact": True,
     "snapshot_on_clear": True,
@@ -1926,7 +1927,7 @@ def generate_snapshot_summary(
     assistant_msgs: list[str],
     metadata: dict,
     model: str = "haiku",
-    timeout: int = 30,
+    timeout: int = 120,
 ) -> tuple[str | None, str | None]:
     """Call ``claude -p --model <model>`` with the snapshot-specific prompt.
 
@@ -1992,7 +1993,7 @@ def generate_summary(
     assistant_msgs: list[str],
     metadata: dict,
     model: str = "haiku",
-    timeout: int = 30,
+    timeout: int = 120,
 ) -> tuple[str | None, str | None]:
     """Call ``claude -p --model <model>`` to summarize the session.
 
