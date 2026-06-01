@@ -2716,3 +2716,191 @@ class TestUpgradeUnsummarizedNoteReturnsTuple:
         assert elapsed_s >= 0
         assert model_used == "haiku"
         assert fallback_reason is None
+
+
+# ===========================================================================
+# Section: model-escalation chain (#165) — in-process Haiku→Sonnet→Opus
+# ===========================================================================
+
+
+class TestModelEscalationChain:
+    """upgrade_unsummarized_note escalates through Haiku→Sonnet→Opus in-process.
+
+    Fixture strategy: monkeypatch generate_summary (module-attribute form) to a
+    scripted fake that inspects the ``model`` kwarg and returns a canned
+    (text, reason) pair per model. Also monkeypatch find_transcript_jsonl to
+    None (raw-note fallback) and upgrade_note_with_summary to avoid real I/O
+    on the vault write. This matches the pattern used by
+    TestUpgradeUnsummarizedNoteReturnsTuple, which is the lightest complete
+    driver for the escalation loop.
+    """
+
+    # ------------------------------------------------------------------
+    # Shared note factory
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_session_note(tmp_path: Path) -> Path:
+        """Write a minimal valid session note to tmp_path and return its path."""
+        note = tmp_path / "2026-06-01-escalation-test-abcd.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-06-01\n"
+            "session_id: escalation-test-session-id-0000-0000-000000000000\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "---\n\n"
+            "## Conversation (raw)\n"
+            "**User:** hello\n"
+            "**Assistant:** hi there\n",
+            encoding="utf-8",
+        )
+        return note
+
+    # ------------------------------------------------------------------
+    # Helpers for common monkeypatching
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _patch_common(monkeypatch, tmp_path: Path):
+        """Patch pieces that are the same across all escalation tests."""
+        import obsidian_utils
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+        monkeypatch.setattr(
+            obsidian_utils,
+            "upgrade_note_with_summary",
+            lambda note_path, summary_text, *a, **kw: f"Upgraded {os.path.basename(note_path)} (source: raw note)",
+        )
+
+    # ------------------------------------------------------------------
+    # Tests
+    # ------------------------------------------------------------------
+
+    def test_escalates_to_sonnet_on_empty_output(self, monkeypatch, tmp_path):
+        """When haiku returns (None, 'empty_output'), escalate to sonnet."""
+        import obsidian_utils
+
+        self._patch_common(monkeypatch, tmp_path)
+        note = self._write_session_note(tmp_path)
+
+        def fake_generate_summary(*args, **kwargs):
+            model = kwargs.get("model", "haiku")
+            if model == "haiku":
+                return None, "empty_output"
+            if model == "sonnet":
+                return (
+                    "## Summary\nDid a thing.\n\n"
+                    "## Key Decisions\n- None noted.\n\n"
+                    "## Changes Made\n- None noted.\n\n"
+                    "## Errors Encountered\n- None.\n\n"
+                    "## Open Questions / Next Steps\n- [ ] None.\n\n"
+                    "IMPORTANCE: 5\n"
+                ), None
+            return None, "empty_output"
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+
+        status, elapsed_s, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note), str(tmp_path), "claude-sessions", "test-project",
+        )
+
+        assert status.startswith("Upgraded "), f"expected success, got: {status}"
+        assert model_used == "sonnet"
+        assert fallback_reason is None
+
+    def test_escalates_haiku_to_opus_when_sonnet_also_empty(self, monkeypatch, tmp_path):
+        """When haiku and sonnet both return (None, 'empty_output'), opus is tried."""
+        import obsidian_utils
+
+        self._patch_common(monkeypatch, tmp_path)
+        note = self._write_session_note(tmp_path)
+
+        def fake_generate_summary(*args, **kwargs):
+            model = kwargs.get("model", "haiku")
+            if model == "opus":
+                return (
+                    "## Summary\nOpus summary.\n\n"
+                    "## Key Decisions\n- None noted.\n\n"
+                    "## Changes Made\n- None noted.\n\n"
+                    "## Errors Encountered\n- None.\n\n"
+                    "## Open Questions / Next Steps\n- [ ] None.\n\n"
+                    "IMPORTANCE: 7\n"
+                ), None
+            # haiku and sonnet both fail with empty_output
+            return None, "empty_output"
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+
+        status, elapsed_s, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note), str(tmp_path), "claude-sessions", "test-project",
+        )
+
+        assert status.startswith("Upgraded "), f"expected success, got: {status}"
+        assert model_used == "opus"
+        assert fallback_reason is None
+
+    def test_no_escalation_on_timeout(self, monkeypatch, tmp_path):
+        """When haiku returns (None, 'haiku_timeout'), do NOT escalate — timeout
+        means the CLI is slow; a bigger model would only make it slower (#84).
+        """
+        import obsidian_utils
+
+        self._patch_common(monkeypatch, tmp_path)
+        note = self._write_session_note(tmp_path)
+
+        models_attempted: list[str] = []
+
+        def fake_generate_summary(*args, **kwargs):
+            model = kwargs.get("model", "haiku")
+            models_attempted.append(model)
+            return None, "haiku_timeout"
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+
+        status, elapsed_s, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note), str(tmp_path), "claude-sessions", "test-project",
+        )
+
+        # Should have tried haiku once and stopped immediately
+        assert models_attempted == ["haiku"], (
+            f"expected only haiku to be attempted, got: {models_attempted}"
+        )
+        assert not status.startswith("Upgraded "), f"expected failure, got: {status}"
+        assert model_used is None
+        assert fallback_reason == "haiku_timeout"
+
+    def test_happy_path_uses_primary_model_only(self, monkeypatch, tmp_path):
+        """When haiku succeeds on the first call, no escalation occurs."""
+        import obsidian_utils
+
+        self._patch_common(monkeypatch, tmp_path)
+        note = self._write_session_note(tmp_path)
+
+        models_attempted: list[str] = []
+
+        def fake_generate_summary(*args, **kwargs):
+            model = kwargs.get("model", "haiku")
+            models_attempted.append(model)
+            return (
+                "## Summary\nHaiku success.\n\n"
+                "## Key Decisions\n- None noted.\n\n"
+                "## Changes Made\n- None noted.\n\n"
+                "## Errors Encountered\n- None.\n\n"
+                "## Open Questions / Next Steps\n- [ ] None.\n\n"
+                "IMPORTANCE: 4\n"
+            ), None
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+
+        status, elapsed_s, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note), str(tmp_path), "claude-sessions", "test-project",
+        )
+
+        assert models_attempted == ["haiku"], (
+            f"expected only haiku to be attempted, got: {models_attempted}"
+        )
+        assert status.startswith("Upgraded "), f"expected success, got: {status}"
+        assert model_used == "haiku"
+        assert fallback_reason is None

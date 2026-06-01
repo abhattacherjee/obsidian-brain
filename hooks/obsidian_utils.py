@@ -1922,6 +1922,20 @@ OUTPUT EXACTLY these two sections with no preamble, no commentary:
 """
 
 
+# Model-escalation chain for the summarizer (#165). After the primary model
+# (summary_model, default "haiku") fails with a *quality* reason, retry with a
+# more capable model. Sonnet is the first fallback (~3x cost) before Opus (~5x),
+# replacing the old behavior where the recall Phase-2 sub-agent fell straight to
+# Opus. CLI aliases passed to `claude -p --model`.
+_SUMMARY_FALLBACK_CHAIN = ("sonnet", "opus")
+# Only these generate_summary failure reasons warrant escalating to a more
+# capable model. Timeouts (haiku_timeout) are NOT escalated — a larger model is
+# slower and would worsen the slow-CLI problem (#84). Subprocess errors
+# (haiku_subprocess_error: CLI missing / non-zero rc) are NOT escalated — a
+# different model won't fix an environment problem.
+_MODEL_ESCALATION_REASONS = frozenset({"empty_output"})
+
+
 def generate_snapshot_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
@@ -4201,9 +4215,11 @@ def upgrade_unsummarized_note(
       notably ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the
       ``"Upgraded "`` prefix as the positive path.
     - **elapsed_s** (*float*) — wall-clock seconds rounded to 2 decimal places.
-    - **model_used** (*str | None*) — the resolved ``summary_model`` value on
-      success (default ``"haiku"``), or ``None`` on failure paths that never
-      reached summarization. Sonnet/Opus tags are reserved for Phase 3 #165.
+    - **model_used** (*str | None*) — the CLI alias of the model that produced
+      the accepted summary (``"haiku"`` on the common path; ``"sonnet"`` or
+      ``"opus"`` when the escalation chain fired on an ``"empty_output"`` from
+      the primary model, per #165), or ``None`` on failure paths that never
+      reached summarization.
     - **fallback_reason** (*str | None*) — non-``None`` when summarization
       itself failed or a worker / pre-summarization check caught a problem.
       ``None`` indicates that summarization succeeded; it does NOT by itself
@@ -4365,16 +4381,13 @@ def upgrade_unsummarized_note(
             note_type = line.split(":", 1)[1].strip().strip('"').strip("'")
             break
 
-    gen_kwargs: dict = {"model": summary_model}
-    if summary_timeout is not None:
-        gen_kwargs["timeout"] = summary_timeout
-
+    # Select generator and prepare per-type input. The snapshot cohesion
+    # preamble (session path only) is computed ONCE here, before the
+    # escalation loop, so it is reused across model retries.
     if note_type == "claude-snapshot":
-        summary_text, fallback_reason = generate_snapshot_summary(
-            user_msgs, assistant_msgs, metadata, **gen_kwargs,
-        )
+        gen_fn = generate_snapshot_summary
     else:
-        # Session — augment with snapshot bodies for cohesion.
+        gen_fn = generate_summary
         date_str = ""
         for line in raw_lines[:20]:
             if line.strip().startswith("date:"):
@@ -4389,9 +4402,30 @@ def upgrade_unsummarized_note(
             # prepend it to its sampled transcript. New optional key; existing
             # callers unaffected (absent key → no-op).
             metadata["snapshot_preamble"] = preamble
-        summary_text, fallback_reason = generate_summary(
+
+    # Model-escalation chain (#165): try the primary model, then escalate to
+    # Sonnet, then Opus, but ONLY when the failure is a quality reason
+    # (empty_output). Timeouts / subprocess errors break immediately — a more
+    # capable model won't fix a slow CLI cold-start or a missing binary.
+    models_to_try = [summary_model] + [
+        m for m in _SUMMARY_FALLBACK_CHAIN if m != summary_model
+    ]
+    summary_text = None
+    fallback_reason = None
+    model_used = None
+    for _model in models_to_try:
+        gen_kwargs: dict = {"model": _model}
+        if summary_timeout is not None:
+            gen_kwargs["timeout"] = summary_timeout
+        summary_text, fallback_reason = gen_fn(
             user_msgs, assistant_msgs, metadata, **gen_kwargs,
         )
+        if summary_text:
+            model_used = _model
+            break
+        if fallback_reason not in _MODEL_ESCALATION_REASONS:
+            # timeout / subprocess error — escalating model won't help
+            break
 
     if not summary_text:
         return _ret(
@@ -4404,9 +4438,9 @@ def upgrade_unsummarized_note(
         note_path, summary_text, vault_path, sessions_folder, project,
         source=source, warnings=warnings,
     )
-    # summary_model is the CLI alias passed to claude -p --model;
-    # at Phase 1 this is always "haiku" but Phase 3 (#165) will widen the chain.
-    return _ret(status, model_used=summary_model, fallback_reason=None)
+    # model_used is the CLI alias of the model that produced the accepted
+    # summary — "haiku" on the common path, "sonnet"/"opus" when escalated (#165).
+    return _ret(status, model_used=model_used, fallback_reason=None)
 
 
 def upgrade_batch(
