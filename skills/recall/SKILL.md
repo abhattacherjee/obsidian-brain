@@ -133,7 +133,7 @@ except Exception as exc:
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-Parse the returned JSON. If the top-level object contains an `"error"` key, `upgrade_batch` itself failed — treat all notes as failed and fall back to the Phase 2 sub-agent path for each. Otherwise, parse the array normally. Each result dict has: `path`, `status`, `elapsed_s`, `model_used` (`haiku-4.5` on success, `None` on failure; `sonnet-4.6` / `opus-*` reserved for Phase 3 #165), `fallback_reason` (`haiku_timeout` | `empty_output` | `haiku_subprocess_error` | `None`). For each entry:
+Parse the returned JSON. If the top-level object contains an `"error"` key, `upgrade_batch` itself failed — treat all notes as failed and fall back to the Phase 2 sub-agent path for each. Otherwise, parse the array normally. Each result dict has: `path`, `status`, `elapsed_s`, `model_used` (`haiku-4.5` on success, `None` on failure; `sonnet-4.6` / `opus-*` reserved for Phase 3 #165), `fallback_reason` (`haiku_timeout` | `empty_output` | `haiku_subprocess_error` | `None`). Note: `upgrade_batch` now groups session notes into batches (default 3 per spawn, config key `summary_batch_size`; set to 1 to disable) and summarizes each group in a single `claude -p` spawn to amortize CLI startup cost (#166). Per-note parse failures (`missing_section`) and whole-spawn failures fall through to the per-note solo path automatically before any result reaches Phase 2. For each entry:
 - `status` starts with `Upgraded ` → mark as succeeded
 - anything else (including `Failed: ...`, empty, or unexpected prefix) → add to the Phase 2 fallback list
 

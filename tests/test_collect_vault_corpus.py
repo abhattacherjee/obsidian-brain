@@ -575,6 +575,9 @@ class TestUpgradeAndCollectCorpus:
         def fake_uun(path, *a, **kw):
             return (f"Upgraded {os.path.basename(path)}", 0.4, "haiku", None)
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_uun)
+        # Pin to legacy per-note fan-out so upgrade_unsummarized_note is called directly
+        # (these notes lack conversation content; batch prep would fail before reaching it).
+        monkeypatch.setattr(obsidian_utils, "load_config", lambda: {"summary_batch_size": 1})
 
         sess = tmp_vault / "claude-sessions"
         for i in range(3):
@@ -658,7 +661,7 @@ class TestUpgradeAndCollectCorpus:
 
 
 class TestUpgradeErrorLogging:
-    def test_failed_upgrade_surfaces_as_failed_status_and_stderr(self, tmp_vault, tmp_path, capsys):
+    def test_failed_upgrade_surfaces_as_failed_status_and_stderr(self, tmp_vault, tmp_path, capsys, monkeypatch):
         """upgrade_and_collect_corpus surfaces worker exception as Failed: status AND logs to stderr."""
         sess = tmp_vault / "claude-sessions"
         _write_note(sess / f"{_today_str()}-fail-0001.md",
@@ -666,6 +669,9 @@ class TestUpgradeErrorLogging:
              "status": "auto-logged", "session_id": "fail-sid"},
             "# Fail\n\n## Summary\nAI summary unavailable")
         output = tmp_path / "corpus.json"
+        # Pin to legacy per-note fan-out so the RuntimeError from upgrade_unsummarized_note
+        # is visible as a worker_exception in the result dict, not lost in prep routing.
+        monkeypatch.setattr(obsidian_utils, "load_config", lambda: {"summary_batch_size": 1})
         with patch("obsidian_utils.upgrade_unsummarized_note", side_effect=RuntimeError("haiku timeout")):
             status = obsidian_utils.upgrade_and_collect_corpus(
                 str(tmp_vault), "claude-sessions", "claude-insights", 30, str(output))

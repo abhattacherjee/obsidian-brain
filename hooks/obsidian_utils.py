@@ -914,6 +914,7 @@ _DEFAULTS: dict = {
     "min_duration_minutes": 2,
     "summary_model": "haiku",
     "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline. Consumed by /recall SKILL.md Step 2 (summarization is deferred to /recall), #84
+    "summary_batch_size": 3,  # notes per claude -p spawn in upgrade_batch (#166); 1 = legacy per-note fan-out
     "auto_log_enabled": True,
     "snapshot_on_compact": True,
     "snapshot_on_clear": True,
@@ -4194,6 +4195,176 @@ def prepare_summary_input(note_path: str) -> str:
         return f"RAW_OK:{note_path}"
 
 
+def _prepare_note_for_summary(
+    note_path: str,
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+) -> dict:
+    """Prepare a session/snapshot note for AI summarization (the pre-model stage).
+
+    Reads the raw note, extracts session_id, parses the JSONL transcript (with
+    raw-note fallback), builds summarizer metadata, determines note_type, and
+    (for sessions) computes the snapshot cohesion preamble into metadata.
+
+    Returns a dict. On failure: {"ok": False, "status": <one-line "Failed: ..." string>,
+    "fallback_reason": <classifier>}. On success: {"ok": True, "raw_lines": [...],
+    "session_id": str, "user_msgs": [...], "assistant_msgs": [...], "metadata": {...},
+    "note_type": str, "source": str, "warnings": [...]}.
+
+    Extracted from upgrade_unsummarized_note (#166) so the multi-note batch path
+    can reuse identical preparation. Pure: no model calls, no writes.
+    """
+    # Read the raw note
+    try:
+        with open(note_path, 'r', encoding='utf-8') as f:
+            raw_lines = f.readlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        return {
+            "ok": False,
+            "status": f"Failed: cannot read {os.path.basename(note_path)}: {exc}",
+            "fallback_reason": "unreadable_note",
+        }
+
+    # Extract session_id from frontmatter
+    session_id = None
+    for line in raw_lines[:20]:
+        stripped = line.strip()
+        if stripped.startswith('session_id:'):
+            session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+            break
+    if not session_id:
+        return {
+            "ok": False,
+            "status": f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}",
+            "fallback_reason": "no_session_id",
+        }
+
+    # Find and parse the JSONL transcript
+    jsonl_path = find_transcript_jsonl(session_id)
+    parsed: dict = {}
+    warnings: list[str] = []
+    user_msgs: list[str] = []
+    assistant_msgs: list[str] = []
+    source = "raw note"
+
+    if jsonl_path:
+        parsed = parse_full_transcript(jsonl_path)
+        user_msgs = parsed.get("user_msgs", [])
+        assistant_msgs = parsed.get("assistant_msgs", [])
+        warnings = parsed.get("warnings", [])
+
+        # Decide which source to use
+        raw_note_would_truncate = parsed.get("raw_note_would_truncate", False)
+        truncated = parsed.get("truncated", False)
+
+        # Data always comes from JSONL when found — label accurately
+        if truncated:
+            source = "JSONL transcript (head+tail, middle truncated)"
+        elif raw_note_would_truncate:
+            source = "JSONL transcript (raw note would have truncated)"
+        else:
+            source = "JSONL transcript (full, raw note also sufficient)"
+    else:
+        # Fall back to raw note content for summarization
+        source = "raw note (JSONL not found)"
+        # Extract user/assistant messages from raw note conversation section.
+        # Supports both session notes (## Conversation (raw)) and snapshot notes
+        # (## Last messages (raw)).
+        in_conversation = False
+        for line in raw_lines:
+            stripped = line.strip()
+            if stripped in ('## Conversation (raw)', '## Last messages (raw)'):
+                in_conversation = True
+                continue
+            if in_conversation:
+                if stripped.startswith('## '):
+                    break
+                if stripped.startswith('**User:**'):
+                    user_msgs.append(stripped[9:].strip())
+                elif stripped.startswith('**Assistant:**'):
+                    assistant_msgs.append(stripped[14:].strip())
+
+    # Fall back to raw note if JSONL yielded empty messages (corrupted/empty JSONL)
+    if jsonl_path and not user_msgs and not assistant_msgs:
+        source = "raw note (JSONL found but empty)"
+        in_conversation = False
+        for line in raw_lines:
+            stripped = line.strip()
+            if stripped in ('## Conversation (raw)', '## Last messages (raw)'):
+                in_conversation = True
+                continue
+            if in_conversation:
+                if stripped.startswith('## '):
+                    break
+                if stripped.startswith('**User:**'):
+                    user_msgs.append(stripped[9:].strip())
+                elif stripped.startswith('**Assistant:**'):
+                    assistant_msgs.append(stripped[14:].strip())
+
+    if not user_msgs and not assistant_msgs:
+        return {
+            "ok": False,
+            "status": f"Failed: no conversation content in {os.path.basename(note_path)}",
+            "fallback_reason": "no_conversation_content",
+        }
+
+    # Build metadata for generate_summary
+    metadata: dict = {"project": project, "vault_path": vault_path, "sessions_folder": sessions_folder}
+    for line in raw_lines[:20]:
+        stripped = line.strip()
+        if stripped.startswith('git_branch:'):
+            metadata["git_branch"] = stripped.split(':', 1)[1].strip().strip('"')
+        elif stripped.startswith('duration_minutes:'):
+            try:
+                metadata["duration_minutes"] = float(stripped.split(':', 1)[1].strip())
+            except ValueError:
+                pass
+
+    # Add files_touched and errors from parsed transcript if available
+    if jsonl_path and parsed:
+        metadata["files_touched"] = parsed.get("files_touched", [])
+        metadata["errors"] = parsed.get("errors", [])
+
+    # Route by note type — snapshots use a shorter, focused prompt.
+    note_type = ""
+    for line in raw_lines[:20]:
+        if line.strip().startswith("type:"):
+            note_type = line.split(":", 1)[1].strip().strip('"').strip("'")
+            break
+
+    # Select generator and prepare per-type input. The snapshot cohesion
+    # preamble (session path only) is computed ONCE here, before the
+    # escalation loop, so it is reused across model retries.
+    if note_type != "claude-snapshot":
+        date_str = ""
+        for line in raw_lines[:20]:
+            if line.strip().startswith("date:"):
+                date_str = line.split(":", 1)[1].strip().strip('"').strip("'")
+                break
+        sessions_dir_path = Path(vault_path) / sessions_folder
+        preamble = _augment_session_input_with_snapshots(
+            "", sessions_dir_path, session_id, date_str, project,
+        )
+        if preamble:
+            # Stash the snapshot preamble into metadata so generate_summary can
+            # prepend it to its sampled transcript. New optional key; existing
+            # callers unaffected (absent key → no-op).
+            metadata["snapshot_preamble"] = preamble
+
+    return {
+        "ok": True,
+        "raw_lines": raw_lines,
+        "session_id": session_id,
+        "user_msgs": user_msgs,
+        "assistant_msgs": assistant_msgs,
+        "metadata": metadata,
+        "note_type": note_type,
+        "source": source,
+        "warnings": warnings,
+    }
+
+
 def upgrade_unsummarized_note(
     note_path: str,
     vault_path: str,
@@ -4266,142 +4437,17 @@ def upgrade_unsummarized_note(
     ) -> tuple[str, float, str | None, str | None]:
         return status, round(time.monotonic() - _t0, 2), model_used, fallback_reason
 
-    # Read the raw note
-    try:
-        with open(note_path, 'r', encoding='utf-8') as f:
-            raw_lines = f.readlines()
-    except (OSError, UnicodeDecodeError) as exc:
-        return _ret(
-            f"Failed: cannot read {os.path.basename(note_path)}: {exc}",
-            fallback_reason="unreadable_note",
-        )
+    prep = _prepare_note_for_summary(note_path, vault_path, sessions_folder, project)
+    if not prep["ok"]:
+        return _ret(prep["status"], fallback_reason=prep["fallback_reason"])
+    user_msgs = prep["user_msgs"]
+    assistant_msgs = prep["assistant_msgs"]
+    metadata = prep["metadata"]
+    note_type = prep["note_type"]
+    source = prep["source"]
+    warnings = prep["warnings"]
 
-    # Extract session_id from frontmatter
-    session_id = None
-    for line in raw_lines[:20]:
-        stripped = line.strip()
-        if stripped.startswith('session_id:'):
-            session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
-            break
-    if not session_id:
-        return _ret(
-            f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}",
-            fallback_reason="no_session_id",
-        )
-
-    # Find and parse the JSONL transcript
-    jsonl_path = find_transcript_jsonl(session_id)
-    parsed: dict = {}
-    warnings: list[str] = []
-    user_msgs: list[str] = []
-    assistant_msgs: list[str] = []
-    source = "raw note"
-
-    if jsonl_path:
-        parsed = parse_full_transcript(jsonl_path)
-        user_msgs = parsed.get("user_msgs", [])
-        assistant_msgs = parsed.get("assistant_msgs", [])
-        warnings = parsed.get("warnings", [])
-
-        # Decide which source to use
-        raw_note_would_truncate = parsed.get("raw_note_would_truncate", False)
-        truncated = parsed.get("truncated", False)
-
-        # Data always comes from JSONL when found — label accurately
-        if truncated:
-            source = "JSONL transcript (head+tail, middle truncated)"
-        elif raw_note_would_truncate:
-            source = "JSONL transcript (raw note would have truncated)"
-        else:
-            source = "JSONL transcript (full, raw note also sufficient)"
-    else:
-        # Fall back to raw note content for summarization
-        source = "raw note (JSONL not found)"
-        # Extract user/assistant messages from raw note conversation section.
-        # Supports both session notes (## Conversation (raw)) and snapshot notes
-        # (## Last messages (raw)).
-        in_conversation = False
-        for line in raw_lines:
-            stripped = line.strip()
-            if stripped in ('## Conversation (raw)', '## Last messages (raw)'):
-                in_conversation = True
-                continue
-            if in_conversation:
-                if stripped.startswith('## '):
-                    break
-                if stripped.startswith('**User:**'):
-                    user_msgs.append(stripped[9:].strip())
-                elif stripped.startswith('**Assistant:**'):
-                    assistant_msgs.append(stripped[14:].strip())
-
-    # Fall back to raw note if JSONL yielded empty messages (corrupted/empty JSONL)
-    if jsonl_path and not user_msgs and not assistant_msgs:
-        source = "raw note (JSONL found but empty)"
-        in_conversation = False
-        for line in raw_lines:
-            stripped = line.strip()
-            if stripped in ('## Conversation (raw)', '## Last messages (raw)'):
-                in_conversation = True
-                continue
-            if in_conversation:
-                if stripped.startswith('## '):
-                    break
-                if stripped.startswith('**User:**'):
-                    user_msgs.append(stripped[9:].strip())
-                elif stripped.startswith('**Assistant:**'):
-                    assistant_msgs.append(stripped[14:].strip())
-
-    if not user_msgs and not assistant_msgs:
-        return _ret(
-            f"Failed: no conversation content in {os.path.basename(note_path)}",
-            fallback_reason="no_conversation_content",
-        )
-
-    # Build metadata for generate_summary
-    metadata: dict = {"project": project, "vault_path": vault_path, "sessions_folder": sessions_folder}
-    for line in raw_lines[:20]:
-        stripped = line.strip()
-        if stripped.startswith('git_branch:'):
-            metadata["git_branch"] = stripped.split(':', 1)[1].strip().strip('"')
-        elif stripped.startswith('duration_minutes:'):
-            try:
-                metadata["duration_minutes"] = float(stripped.split(':', 1)[1].strip())
-            except ValueError:
-                pass
-
-    # Add files_touched and errors from parsed transcript if available
-    if jsonl_path and parsed:
-        metadata["files_touched"] = parsed.get("files_touched", [])
-        metadata["errors"] = parsed.get("errors", [])
-
-    # Route by note type — snapshots use a shorter, focused prompt.
-    note_type = ""
-    for line in raw_lines[:20]:
-        if line.strip().startswith("type:"):
-            note_type = line.split(":", 1)[1].strip().strip('"').strip("'")
-            break
-
-    # Select generator and prepare per-type input. The snapshot cohesion
-    # preamble (session path only) is computed ONCE here, before the
-    # escalation loop, so it is reused across model retries.
-    if note_type == "claude-snapshot":
-        gen_fn = generate_snapshot_summary
-    else:
-        gen_fn = generate_summary
-        date_str = ""
-        for line in raw_lines[:20]:
-            if line.strip().startswith("date:"):
-                date_str = line.split(":", 1)[1].strip().strip('"').strip("'")
-                break
-        sessions_dir_path = Path(vault_path) / sessions_folder
-        preamble = _augment_session_input_with_snapshots(
-            "", sessions_dir_path, session_id, date_str, project,
-        )
-        if preamble:
-            # Stash the snapshot preamble into metadata so generate_summary can
-            # prepend it to its sampled transcript. New optional key; existing
-            # callers unaffected (absent key → no-op).
-            metadata["snapshot_preamble"] = preamble
+    gen_fn = generate_snapshot_summary if note_type == "claude-snapshot" else generate_summary
 
     # Model-escalation chain (#165): try the primary model, then escalate to
     # Sonnet, then Opus, but ONLY when the failure is a quality reason
@@ -4443,6 +4489,209 @@ def upgrade_unsummarized_note(
     return _ret(status, model_used=model_used, fallback_reason=None)
 
 
+def generate_summaries_batch(
+    prepared_notes: list[dict],
+    model: str = "haiku",
+    timeout: int = 120,
+    project: str = "unknown",
+    vault_path: str = "",
+    sessions_folder: str = "",
+) -> list[tuple[str | None, str | None]]:
+    """Summarize N SESSION notes in ONE ``claude -p --model <model>`` spawn.
+
+    ``prepared_notes`` is a list of ok=True session-note prep dicts (caller
+    guarantees: not snapshots, not prep failures).  Returns a list of
+    ``(summary_text|None, fallback_reason|None)`` ALIGNED to ``prepared_notes``
+    order.
+
+    Failure reasons returned for all notes on whole-spawn failure:
+      ``"haiku_timeout"``           — TimeoutExpired (retried once)
+      ``"haiku_subprocess_error"``  — rc != 0, FileNotFoundError, or other error (no retry)
+      ``"empty_output"``            — subprocess rc==0 but stdout empty (no retry)
+
+    Per-note parse failures on success path:
+      ``"missing_section"``         — block absent or lacks ``## Summary``
+
+    (#166)
+    """
+    n = len(prepared_notes)
+    if n == 0:
+        return []
+
+    # ---- Build multi-note prompt -----------------------------------------------
+    # Collect open items once for all notes (same project).
+    existing_items: list = []
+    try:
+        _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+        if _hooks_dir not in sys.path:
+            sys.path.insert(0, _hooks_dir)
+        from open_item_dedup import collect_open_items as _collect_open_items
+        existing_items = _collect_open_items(vault_path, sessions_folder, project, max_sessions=10)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[obsidian-brain] open item collection failed (non-fatal): {exc}", file=sys.stderr)
+
+    def _sample_msgs(user_msgs: list[str], assistant_msgs: list[str]) -> tuple[str, str]:
+        if len(user_msgs) > 20:
+            sampled_user: list[str] = (
+                user_msgs[:10] + ["[... middle messages omitted ...]"] + user_msgs[-10:]
+            )
+        else:
+            sampled_user = user_msgs
+        if len(assistant_msgs) > 20:
+            sampled_asst: list[str] = (
+                assistant_msgs[:10] + ["[... middle messages omitted ...]"] + assistant_msgs[-10:]
+            )
+        else:
+            sampled_asst = assistant_msgs
+        return "\n---\n".join(sampled_user)[:12000], "\n---\n".join(sampled_asst)[:12000]
+
+    prompt_parts: list[str] = [
+        f"You are a technical summarizer. You will be given {n} session transcript(s) below.\n"
+        f"Each transcript is delimited by a line '===== NOTE k =====' where k is the note number.\n"
+        "For EACH note, output its summary starting with a line '===== SUMMARY k =====' on its own line,\n"
+        "followed by EXACTLY these markdown sections:\n"
+        "## Summary / ## Key Decisions / ## Changes Made / ## Errors Encountered / ## Open Questions / Next Steps / ## Importance\n"
+        f"Output blocks for ALL {n} notes, in order. NO commentary outside the delimited blocks.\n"
+        "Do NOT respond conversationally. Do NOT ask questions. Just output the summaries.\n\n"
+        "For ## Importance: Rate 1-10. 1-3: trivial. 4-6: standard. 7-8: key decisions. 9-10: major.\n"
+    ]
+
+    for k, prep in enumerate(prepared_notes, start=1):
+        user_sample, asst_sample = _sample_msgs(prep["user_msgs"], prep["assistant_msgs"])
+        meta = prep["metadata"]
+        preamble = meta.get("snapshot_preamble", "")
+        files_str = ", ".join(meta.get("files_touched", [])[:15]) or "none detected"
+        meta_line = (
+            f"NOTE {k} METADATA: project={meta.get('project', 'unknown')} "
+            f"branch={meta.get('git_branch', 'unknown')} "
+            f"files_touched={files_str}"
+        )
+        prompt_parts.append(f"===== NOTE {k} =====\n")
+        prompt_parts.append(f"{meta_line}\n")
+        if preamble:
+            prompt_parts.append(
+                f"{preamble}\n"
+                "Some earlier context may come from pre-compact snapshots — "
+                "synthesize the whole arc into a cohesive narrative.\n"
+            )
+        prompt_parts.append(
+            f"SESSION TRANSCRIPT:\n{user_sample}\n\n---\n\n{asst_sample}\n\n"
+        )
+        prompt_parts.append(
+            "OUTPUT EXACTLY these markdown sections with no preamble, no commentary:\n\n"
+            "## Summary\n1-3 sentence overview of what was accomplished.\n\n"
+            "## Key Decisions\n- Bullet list. Write \"None noted.\" if none.\n\n"
+            "## Changes Made\n- Bullet list. Write \"None noted.\" if none.\n\n"
+            "## Errors Encountered\n- Bullet list. Write \"None.\" if none.\n\n"
+            "## Open Questions / Next Steps\n- [ ] Checkbox list. Write \"None.\" if none.\n\n"
+            "## Importance\nRate 1-10. Output ONLY the number.\n\n"
+        )
+
+    if existing_items:
+        prompt_parts.append("## Existing Open Items for This Project (DO NOT DUPLICATE)\n")
+        prompt_parts.append(
+            "The following items are already tracked in older session notes. Do NOT include any item\n"
+            "that is semantically equivalent to these — same PR, same branch, same task, same file.\n"
+            "Only add genuinely NEW open items from this session's conversation.\n\n"
+        )
+        for _, _, item_text in existing_items:
+            prompt_parts.append(f"- {item_text}\n")
+
+    prompt = "".join(prompt_parts)
+
+    # ---- Subprocess with retry on timeout -------------------------------------
+    attempts = (timeout, timeout * 2)
+    last_reason: str | None = None
+    stdout_text: str | None = None
+
+    for i, attempt_timeout in enumerate(attempts):
+        try:
+            result = subprocess.run(
+                ["claude", "-p", "--model", model],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=attempt_timeout,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                stdout_text = result.stdout.strip()
+                break
+            if result.returncode != 0:
+                last_reason = "haiku_subprocess_error"
+                print(
+                    f"[obsidian-brain] claude -p batch failed (rc={result.returncode}): "
+                    f"{result.stderr[:200]}",
+                    file=sys.stderr,
+                )
+                break
+            # rc==0 but empty stdout
+            last_reason = "empty_output"
+            print("[obsidian-brain] claude -p batch returned empty stdout", file=sys.stderr)
+            break
+        except FileNotFoundError:
+            last_reason = "haiku_subprocess_error"
+            print("[obsidian-brain] claude CLI not found, batch summarization unavailable", file=sys.stderr)
+            break
+        except subprocess.TimeoutExpired:
+            last_reason = "haiku_timeout"
+            if i < len(attempts) - 1:
+                print(
+                    f"[obsidian-brain] claude -p batch timed out at {attempt_timeout}s, retrying...",
+                    file=sys.stderr,
+                )
+                continue
+            print(
+                f"[obsidian-brain] claude -p batch timed out at {attempt_timeout}s, giving up",
+                file=sys.stderr,
+            )
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_reason = "haiku_subprocess_error"
+            print(f"[obsidian-brain] claude -p batch error ({type(exc).__name__}): {exc}", file=sys.stderr)
+            break
+
+    # Whole-spawn failure — return same reason for all notes.
+    if stdout_text is None:
+        reason = last_reason or "haiku_subprocess_error"
+        return [(None, reason)] * n
+
+    # ---- Parse delimited output ------------------------------------------------
+    try:
+        _summary_header_re = re.compile(
+            r"^=====\s*SUMMARY\s+(\d+)\s*=====\s*$", re.MULTILINE
+        )
+        parts_split = _summary_header_re.split(stdout_text)
+        # parts_split alternates: [preamble, k1, block1, k2, block2, ...]
+        parsed_blocks: dict[int, str] = {}
+        it = iter(parts_split)
+        next(it, None)  # skip preamble before first header
+        for k_str, block in zip(it, it):
+            try:
+                parsed_blocks[int(k_str)] = block
+            except ValueError:
+                pass
+
+        _has_summary_re = re.compile(r"^## Summary", re.MULTILINE)
+
+        results: list[tuple[str | None, str | None]] = []
+        for i_note, prep in enumerate(prepared_notes):
+            k = i_note + 1
+            if k in parsed_blocks:
+                block_text = parsed_blocks[k].strip()
+                if _has_summary_re.search(block_text):
+                    if existing_items:
+                        block_text = _dedup_summary_open_items(block_text, existing_items)
+                    results.append((block_text, None))
+                else:
+                    results.append((None, "missing_section"))
+            else:
+                results.append((None, "missing_section"))
+        return results
+    except Exception as exc:  # noqa: BLE001
+        print(f"[obsidian-brain] batch parse error ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return [(None, "missing_section")] * n
+
+
 def upgrade_batch(
     paths: list[str],
     vault_path: str,
@@ -4451,8 +4700,9 @@ def upgrade_batch(
     max_workers: int = 10,
     summary_model: str = "haiku",
     summary_timeout: int | None = None,
+    summary_batch_size: int | None = None,
 ) -> list[dict]:
-    """Fan out upgrade_unsummarized_note() concurrently.
+    """Fan out upgrade_unsummarized_note() concurrently, with optional batching.
 
     Returns a list of per-note dicts IN THE SAME ORDER AS ``paths`` (not
     completion order). Each dict has the keys:
@@ -4462,6 +4712,19 @@ def upgrade_batch(
       * ``elapsed_s`` — wall-time inside the worker, rounded to 2 dp
       * ``model_used`` — see ``upgrade_unsummarized_note`` docstring
       * ``fallback_reason`` — see ``upgrade_unsummarized_note`` docstring
+
+    ``summary_batch_size`` controls note grouping for the ``claude -p`` spawn:
+      * ``None`` (default) — read from ``load_config()`` (config key
+        ``summary_batch_size``, default 3).
+      * ``1`` — legacy per-note fan-out via ThreadPoolExecutor (unchanged
+        behavior; use to pin legacy-contract tests).
+      * ``>=2`` — batched path: session notes are grouped into batches of up
+        to ``summary_batch_size`` and summarized in a single ``claude -p``
+        spawn per group, amortizing CLI startup cost (~70% startup-overhead
+        reduction vs. per-note). Snapshots always go through the solo path.
+        Per-note parse failures (``missing_section``) and whole-spawn failures
+        fall through to ``upgrade_unsummarized_note`` (the solo path), so the
+        Phase 2 sub-agent in SKILL.md still catches anything both paths fail.
 
     Side effect: appends one record per call to
     ``~/.claude/obsidian-brain-summarizer-metrics.jsonl`` via
@@ -4485,40 +4748,236 @@ def upgrade_batch(
     from concurrent.futures import ThreadPoolExecutor
     from datetime import datetime, timezone
 
-    workers = min(max_workers, len(paths))
+    # Resolve batch size.
+    if summary_batch_size is None:
+        try:
+            summary_batch_size = int(load_config().get("summary_batch_size", 3))
+        except Exception:  # noqa: BLE001
+            summary_batch_size = 3
+    else:
+        summary_batch_size = int(summary_batch_size)
+    summary_batch_size = max(1, summary_batch_size)
+
     _wall_t0 = time.monotonic()
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [
-            ex.submit(
-                upgrade_unsummarized_note,
-                p,
-                vault_path,
-                sessions_folder,
-                project,
-                summary_model,
-                summary_timeout,
+    # ---- Legacy per-note fan-out path (batch_size <= 1) ----------------------
+    if summary_batch_size <= 1:
+        workers = min(max_workers, len(paths))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [
+                ex.submit(
+                    upgrade_unsummarized_note,
+                    p,
+                    vault_path,
+                    sessions_folder,
+                    project,
+                    summary_model,
+                    summary_timeout,
+                )
+                for p in paths
+            ]
+            results: list[dict] = []
+            for p, fut in zip(paths, futs):
+                try:
+                    status, elapsed_s, model_used, fallback_reason = fut.result()
+                except Exception as exc:  # noqa: BLE001 — per-note isolation
+                    exc_str = str(exc)[:500]
+                    status = f"Failed: {type(exc).__name__}: {exc_str}"
+                    elapsed_s, model_used, fallback_reason = 0.0, None, "worker_exception"
+                results.append({
+                    "path": p,
+                    "status": status,
+                    "elapsed_s": elapsed_s,
+                    "model_used": model_used,
+                    "fallback_reason": fallback_reason,
+                })
+
+        wall_s = round(time.monotonic() - _wall_t0, 2)
+        try:
+            _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+            if _hooks_dir not in sys.path:
+                sys.path.insert(0, _hooks_dir)
+            import summarizer_metrics
+            summarizer_metrics.append_metrics_record({
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "project": project,
+                "n_notes": len(results),
+                "wall_s": wall_s,
+                "notes": results,
+            })
+        except Exception as exc:  # noqa: BLE001 — telemetry must never break recall
+            print(
+                f"[obsidian-brain] metrics sink unavailable ({type(exc).__name__}): {exc}",
+                file=sys.stderr,
             )
-            for p in paths
-        ]
-        results: list[dict] = []
-        for p, fut in zip(paths, futs):
+        return results
+
+    # ---- Batched path (batch_size >= 2) ---------------------------------------
+
+    # Step 1: Prepare all notes concurrently.
+    workers = min(max_workers, len(paths))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        prep_futs = {p: ex.submit(_prepare_note_for_summary, p, vault_path, sessions_folder, project)
+                     for p in paths}
+    preps: dict[str, dict] = {}
+    for p, fut in prep_futs.items():
+        try:
+            preps[p] = fut.result()
+        except Exception as exc:  # noqa: BLE001
+            preps[p] = {
+                "ok": False,
+                "status": f"Failed: worker error preparing {os.path.basename(p)}: {str(exc)[:200]}",
+                "fallback_reason": "worker_exception",
+            }
+
+    results_by_path: dict[str, dict] = {}
+
+    # Step 2: Route prep failures immediately.
+    failed_prep_paths = [p for p in paths if not preps[p]["ok"]]
+    for p in failed_prep_paths:
+        prep = preps[p]
+        results_by_path[p] = {
+            "path": p,
+            "status": prep["status"],
+            "elapsed_s": 0.0,
+            "model_used": None,
+            "fallback_reason": prep.get("fallback_reason"),
+        }
+
+    # Step 3: Route snapshots to solo path.
+    snapshot_paths = [p for p in paths if preps[p].get("ok") and preps[p].get("note_type") == "claude-snapshot"]
+    session_paths = [p for p in paths if preps[p].get("ok") and preps[p].get("note_type") != "claude-snapshot"]
+
+    if snapshot_paths:
+        snap_workers = min(max_workers, len(snapshot_paths))
+        with ThreadPoolExecutor(max_workers=snap_workers) as ex:
+            snap_futs = {
+                p: ex.submit(upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
+                for p in snapshot_paths
+            }
+        for p, fut in snap_futs.items():
             try:
                 status, elapsed_s, model_used, fallback_reason = fut.result()
-            except Exception as exc:  # noqa: BLE001 — per-note isolation
+            except Exception as exc:  # noqa: BLE001
                 exc_str = str(exc)[:500]
                 status = f"Failed: {type(exc).__name__}: {exc_str}"
                 elapsed_s, model_used, fallback_reason = 0.0, None, "worker_exception"
-            results.append({
+            results_by_path[p] = {
                 "path": p,
                 "status": status,
                 "elapsed_s": elapsed_s,
                 "model_used": model_used,
                 "fallback_reason": fallback_reason,
-            })
+            }
+
+    # Step 4: Group session notes into size/char-aware batches.
+    _CHAR_CAP = 60000
+
+    groups: list[list[str]] = []
+    current_group: list[str] = []
+    current_chars = 0
+
+    for p in session_paths:
+        prep = preps[p]
+        u_est = min(len("\n---\n".join(prep["user_msgs"])), 12000)
+        a_est = min(len("\n---\n".join(prep["assistant_msgs"])), 12000)
+        note_chars = u_est + a_est
+        if current_group and (len(current_group) >= summary_batch_size or current_chars + note_chars > _CHAR_CAP):
+            groups.append(current_group)
+            current_group = [p]
+            current_chars = note_chars
+        else:
+            current_group.append(p)
+            current_chars += note_chars
+    if current_group:
+        groups.append(current_group)
+
+    # Step 5: Process each group.
+    for group_paths in groups:
+        group_preps = [preps[p] for p in group_paths]
+        g_t0 = time.monotonic()
+
+        # Try primary model, escalate on whole-group empty_output.
+        models_to_try = [summary_model] + [m for m in _SUMMARY_FALLBACK_CHAIN if m != summary_model]
+        group_results: list[tuple[str | None, str | None]] | None = None
+        used_model = summary_model
+
+        for _model in models_to_try:
+            batch_out = generate_summaries_batch(
+                group_preps,
+                model=_model,
+                timeout=(summary_timeout or 120),
+                project=project,
+                vault_path=vault_path,
+                sessions_folder=sessions_folder,
+            )
+            # Escalate at group level only on whole-spawn empty_output.
+            if all(text is None and reason == "empty_output" for text, reason in batch_out):
+                if _model != models_to_try[-1]:
+                    continue  # try next model
+            used_model = _model
+            group_results = batch_out
+            break
+
+        if group_results is None:
+            group_results = [(None, "empty_output")] * len(group_paths)
+
+        g_wall = time.monotonic() - g_t0
+        per_note_elapsed = round(g_wall / len(group_paths), 2)
+
+        # Solo fallback paths for notes that need it.
+        solo_fallback_paths: list[str] = []
+
+        for p, (summary_text, parse_reason) in zip(group_paths, group_results):
+            if summary_text is not None:
+                # Attempt write-back.
+                prep = preps[p]
+                write_status = upgrade_note_with_summary(
+                    p, summary_text, vault_path, sessions_folder, project,
+                    source=prep["source"], warnings=prep["warnings"],
+                )
+                if write_status.startswith("Upgraded "):
+                    results_by_path[p] = {
+                        "path": p,
+                        "status": write_status,
+                        "elapsed_s": per_note_elapsed,
+                        "model_used": used_model,
+                        "fallback_reason": None,
+                    }
+                else:
+                    # Write-back failed — route to solo fallback.
+                    solo_fallback_paths.append(p)
+            else:
+                # No usable summary — route to solo fallback.
+                solo_fallback_paths.append(p)
+
+        # Run solo fallback for all notes that need it in this group.
+        if solo_fallback_paths:
+            solo_workers = min(max_workers, len(solo_fallback_paths))
+            with ThreadPoolExecutor(max_workers=solo_workers) as ex:
+                solo_futs = {
+                    p: ex.submit(upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
+                    for p in solo_fallback_paths
+                }
+            for p, fut in solo_futs.items():
+                try:
+                    status, elapsed_s, model_used, fallback_reason = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    exc_str = str(exc)[:500]
+                    status = f"Failed: {type(exc).__name__}: {exc_str}"
+                    elapsed_s, model_used, fallback_reason = 0.0, None, "worker_exception"
+                results_by_path[p] = {
+                    "path": p,
+                    "status": status,
+                    "elapsed_s": elapsed_s,
+                    "model_used": model_used,
+                    "fallback_reason": fallback_reason,
+                }
+
+    # Step 6: Assemble in input order.
+    results = [results_by_path[p] for p in paths]
 
     wall_s = round(time.monotonic() - _wall_t0, 2)
-
     try:
         _hooks_dir = os.path.dirname(os.path.abspath(__file__))
         if _hooks_dir not in sys.path:
@@ -4536,5 +4995,4 @@ def upgrade_batch(
             f"[obsidian-brain] metrics sink unavailable ({type(exc).__name__}): {exc}",
             file=sys.stderr,
         )
-
     return results

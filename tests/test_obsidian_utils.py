@@ -1995,6 +1995,7 @@ class TestUpgradeBatch:
 
         result = obsidian_utils.upgrade_batch(
             ["/vault/sessions/one.md"], "/vault", "sessions", "proj",
+            summary_batch_size=1,
         )
         assert len(result) == 1
         assert result[0]["path"] == "/vault/sessions/one.md"
@@ -2020,7 +2021,8 @@ class TestUpgradeBatch:
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
 
         paths = [f"/vault/sessions/{name}" for name in ("a.md", "b.md", "c.md", "d.md", "e.md")]
-        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
+        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj",
+                                              summary_batch_size=1)
 
         assert len(result) == 5
         assert [r["path"] for r in result] == paths, "input order must be preserved"
@@ -2048,6 +2050,7 @@ class TestUpgradeBatch:
         paths = [f"/vault/sessions/note{i}.md" for i in range(N)]
         results = obsidian_utils.upgrade_batch(
             paths, "/vault", "sessions", "proj", max_workers=N,
+            summary_batch_size=1,
         )
         assert len(results) == N
         assert all(r["status"].startswith("Upgraded ") for r in results)
@@ -2063,7 +2066,8 @@ class TestUpgradeBatch:
 
         paths = [f"/vault/sessions/{n}" for n in
                  ("one.md", "two.md", "three.md", "four.md", "five.md")]
-        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
+        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj",
+                                              summary_batch_size=1)
 
         assert len(result) == 5
         assert [r["path"] for r in result] == paths
@@ -2094,6 +2098,7 @@ class TestUpgradeBatch:
         paths = [f"/vault/sessions/a{i}.md" for i in range(N)]
         results = obsidian_utils.upgrade_batch(
             paths, "/vault", "sessions", "proj", max_workers=10,
+            summary_batch_size=1,
         )
         assert len(results) == N
         assert all(r["status"].startswith("Upgraded ") for r in results)
@@ -2115,6 +2120,7 @@ class TestUpgradeBatch:
             "proj",
             summary_model="claude-3-5-haiku",
             summary_timeout=30,
+            summary_batch_size=1,
         )
         assert len(results) == 1
         assert results[0]["path"] == "/vault/sessions/a.md"
@@ -2131,6 +2137,7 @@ class TestUpgradeBatch:
                 obsidian_utils.upgrade_batch(
                     ["/vault/sessions/a.md"], "/vault", "sessions", "proj",
                     max_workers=bad,
+                    summary_batch_size=1,
                 )
 
     def test_upgrade_batch_skill_md_json_round_trip(self, monkeypatch):
@@ -2151,7 +2158,8 @@ class TestUpgradeBatch:
             "/vault/sessions/b.md",
             "/vault/sessions/c.md",
         ]
-        results = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
+        results = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj",
+                                               summary_batch_size=1)
 
         # Serialize using dict-key access (new shape)
         serialized = json.dumps([{"path": r["path"], "status": r["status"]} for r in results])
@@ -2217,6 +2225,7 @@ class TestUpgradeBatch:
 
         results = obsidian_utils.upgrade_batch(
             [str(note_path)], str(vault), "sessions", "test-project",
+            summary_batch_size=1,
         )
 
         assert len(results) == 1
@@ -2294,6 +2303,328 @@ class TestUpgradeBatch:
             f"expected no 'timeout' kwarg when summary_timeout=None, "
             f"but got kwargs={captured_gen_kwargs!r}"
         )
+
+
+# ===========================================================================
+# Section N-1: TestUpgradeBatchBatching — GH #166 batched upgrade_batch path
+# ===========================================================================
+
+
+class TestUpgradeBatchBatching:
+    """Tests for the batched (summary_batch_size >= 2) path in upgrade_batch().
+
+    Exercises generate_summaries_batch integration, fallthrough to the solo
+    path, snapshot routing, and output ordering. Monkeypatches the subprocess
+    so no ``claude -p`` calls are made.
+    """
+
+    # ---- helpers ----------------------------------------------------------------
+
+    def _write_session_note(self, sessions_dir: Path, name: str, session_id: str | None = None) -> Path:
+        """Write a minimal real session note to ``sessions_dir``."""
+        sid = session_id or f"test-batch-session-{name.replace('.md', '')}-0000-0000-000000000000"
+        note = sessions_dir / name
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-20\n"
+            f"session_id: {sid}\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "tags:\n"
+            "  - claude/session\n"
+            "  - claude/project/test-project\n"
+            "---\n\n"
+            "# Session: test-project\n\n"
+            "## Conversation (raw)\n"
+            "**User:** describe what you did\n"
+            "**Assistant:** I implemented the feature.\n",
+            encoding="utf-8",
+        )
+        return note
+
+    def _write_snapshot_note(self, sessions_dir: Path, name: str) -> Path:
+        """Write a minimal snapshot note to ``sessions_dir``."""
+        sid = f"test-snap-session-{name.replace('.md', '')}-0000-0000-000000000000"
+        note = sessions_dir / name
+        note.write_text(
+            "---\n"
+            "type: claude-snapshot\n"
+            "date: 2026-04-20\n"
+            f"session_id: {sid}\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "tags:\n"
+            "  - claude/snapshot\n"
+            "---\n\n"
+            "## Last messages (raw)\n"
+            "**User:** context\n"
+            "**Assistant:** snapshot content\n",
+            encoding="utf-8",
+        )
+        return note
+
+    def _fake_good_summary(self) -> str:
+        return (
+            "## Summary\nDid a thing.\n\n"
+            "## Key Decisions\n- None noted.\n\n"
+            "## Changes Made\n- None noted.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n"
+            "## Importance\n5\n"
+        )
+
+    # ---- tests ------------------------------------------------------------------
+
+    def test_batch_of_5_one_malformed_routes_to_fallback(self, monkeypatch, tmp_path):
+        """Mandated fixture: 4 valid summaries + 1 missing_section → malformed goes to solo fallback."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        note_names = [f"note{i}.md" for i in range(5)]
+        paths = [str(self._write_session_note(sessions_dir, name)) for name in note_names]
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        batch_calls: list[list[dict]] = []
+        # Return good summaries for notes 0-3, missing_section for note 4.
+        def fake_generate_summaries_batch(prepared_notes, **kwargs):
+            batch_calls.append(prepared_notes)
+            results = []
+            for i, _ in enumerate(prepared_notes):
+                if i == len(prepared_notes) - 1:
+                    results.append((None, "missing_section"))
+                else:
+                    results.append((self._fake_good_summary(), None))
+            return results
+
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch", fake_generate_summaries_batch)
+
+        # upgrade_note_with_summary returns success for all batch-written notes
+        def fake_upgrade_note_with_summary(path, summary, *args, **kwargs):
+            return f"Upgraded {os.path.basename(path)} (source: batch)"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_note_with_summary", fake_upgrade_note_with_summary)
+
+        # Solo fallback records which paths it was called with
+        solo_fallback_called: list[str] = []
+        def fake_upgrade_unsummarized_note(path, *args, **kwargs):
+            solo_fallback_called.append(path)
+            return f"Upgraded {os.path.basename(path)} (source: solo-fallback)", 0.1, "haiku", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_upgrade_unsummarized_note)
+
+        results = obsidian_utils.upgrade_batch(
+            paths, str(tmp_path), "sessions", "test-project",
+            summary_batch_size=5,
+        )
+
+        # 5 results in input order
+        assert len(results) == 5
+        assert [r["path"] for r in results] == paths
+
+        # All 5 have the expected keys
+        for r in results:
+            assert set(r.keys()) == {"path", "status", "elapsed_s", "model_used", "fallback_reason"}
+
+        # First 4 upgraded via batch path
+        for i in range(4):
+            assert results[i]["status"].startswith("Upgraded "), (
+                f"note {i} should be Upgraded, got: {results[i]['status']!r}"
+            )
+            assert results[i]["model_used"] == "haiku"
+
+        # Note 4 (malformed) routed to solo fallback
+        assert paths[4] in solo_fallback_called, (
+            f"malformed note {paths[4]!r} should have gone to solo fallback; "
+            f"solo_fallback_called={solo_fallback_called!r}"
+        )
+        assert results[4]["status"].startswith("Upgraded "), (
+            f"solo fallback note should still succeed, got: {results[4]['status']!r}"
+        )
+
+    def test_batch_size_1_uses_solo_path(self, monkeypatch, tmp_path):
+        """batch_size=1: legacy fan-out fires for every note; generate_summaries_batch never called."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        paths = [str(self._write_session_note(sessions_dir, f"note{i}.md")) for i in range(3)]
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        def batch_must_not_be_called(*args, **kwargs):
+            raise AssertionError("generate_summaries_batch must NOT be called with batch_size=1")
+
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch", batch_must_not_be_called)
+
+        solo_calls: list[str] = []
+        def fake_solo(path, *args, **kwargs):
+            solo_calls.append(path)
+            return f"Upgraded {os.path.basename(path)} (source: solo)", 0.1, "haiku", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_solo)
+
+        results = obsidian_utils.upgrade_batch(
+            paths, str(tmp_path), "sessions", "test-project",
+            summary_batch_size=1,
+        )
+
+        assert len(results) == 3
+        # Each path was processed by solo
+        assert sorted(solo_calls) == sorted(paths)
+
+    def test_whole_spawn_timeout_falls_back_to_solo(self, monkeypatch, tmp_path):
+        """Whole-spawn timeout: every note routed to solo fallback."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        n = 3
+        paths = [str(self._write_session_note(sessions_dir, f"t{i}.md")) for i in range(n)]
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        def fake_batch_timeout(prepared_notes, **kwargs):
+            return [(None, "haiku_timeout")] * len(prepared_notes)
+
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch", fake_batch_timeout)
+
+        solo_calls: list[str] = []
+        def fake_solo(path, *args, **kwargs):
+            solo_calls.append(path)
+            return f"Upgraded {os.path.basename(path)} (source: solo-fallback)", 0.2, "haiku", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_solo)
+
+        results = obsidian_utils.upgrade_batch(
+            paths, str(tmp_path), "sessions", "test-project",
+            summary_batch_size=5,
+        )
+
+        assert len(results) == n
+        assert [r["path"] for r in results] == paths
+        assert sorted(solo_calls) == sorted(paths), (
+            f"all notes should go to solo fallback on timeout; got: {solo_calls!r}"
+        )
+        for r in results:
+            assert r["status"].startswith("Upgraded "), (
+                f"solo fallback should produce Upgraded, got: {r['status']!r}"
+            )
+
+    def test_results_in_input_order_mixed_session_and_snapshot(self, monkeypatch, tmp_path):
+        """Mixed session + snapshot notes: snapshot goes to solo, order preserved."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+
+        session_a = self._write_session_note(sessions_dir, "session-a.md")
+        snapshot_b = self._write_snapshot_note(sessions_dir, "snapshot-b.md")
+        session_c = self._write_session_note(sessions_dir, "session-c.md")
+        paths = [str(session_a), str(snapshot_b), str(session_c)]
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        batch_paths_seen: list[str] = []
+        def fake_batch(prepared_notes, **kwargs):
+            for p in prepared_notes:
+                # We record via metadata to know which note was batched.
+                batch_paths_seen.append(p.get("metadata", {}).get("project", "?"))
+            return [(self._fake_good_summary(), None)] * len(prepared_notes)
+
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch", fake_batch)
+
+        def fake_upgrade_note_with_summary(path, summary, *args, **kwargs):
+            return f"Upgraded {os.path.basename(path)} (source: batch)"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_note_with_summary", fake_upgrade_note_with_summary)
+
+        solo_calls: list[str] = []
+        def fake_solo(path, *args, **kwargs):
+            solo_calls.append(path)
+            return f"Upgraded {os.path.basename(path)} (source: solo)", 0.1, "haiku", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_solo)
+
+        results = obsidian_utils.upgrade_batch(
+            paths, str(tmp_path), "sessions", "test-project",
+            summary_batch_size=5,
+        )
+
+        # Correct count and order preserved
+        assert len(results) == 3
+        assert [r["path"] for r in results] == paths
+
+        # Snapshot went to solo
+        assert str(snapshot_b) in solo_calls, (
+            f"snapshot note should route to solo path; solo_calls={solo_calls!r}"
+        )
+        # Session notes NOT in solo (they went batch)
+        assert str(session_a) not in solo_calls
+        assert str(session_c) not in solo_calls
+
+        # All have Upgraded status
+        for r in results:
+            assert r["status"].startswith("Upgraded "), (
+                f"all notes should be Upgraded, got: {r['status']!r}"
+            )
+
+    def test_generate_summaries_batch_parses_delimited_output(self, monkeypatch, tmp_path):
+        """Unit-test the parser: well-formed block 1, missing ## Summary block 2."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        # Two minimal prep dicts (simulate ok=True preps with messages).
+        prep1 = {
+            "ok": True,
+            "user_msgs": ["hello"],
+            "assistant_msgs": ["hi"],
+            "metadata": {"project": "test", "vault_path": "", "sessions_folder": ""},
+            "note_type": "claude-session",
+            "source": "raw note",
+            "warnings": [],
+        }
+        prep2 = dict(prep1)  # same shape
+
+        good_block = (
+            "## Summary\nDid a thing.\n\n"
+            "## Key Decisions\n- None.\n\n"
+            "## Changes Made\n- None.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n"
+            "## Importance\n5\n"
+        )
+        bad_block = "Just some text without the required sections.\n"
+
+        stdout_text = (
+            f"===== SUMMARY 1 =====\n{good_block}"
+            f"===== SUMMARY 2 =====\n{bad_block}"
+        )
+
+        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+            class _Res:
+                returncode = 0
+                stdout = stdout_text
+                stderr = ""
+            return _Res()
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_subprocess_run)
+
+        results = obsidian_utils.generate_summaries_batch(
+            [prep1, prep2],
+            model="haiku",
+            timeout=30,
+            project="test",
+            vault_path="",
+            sessions_folder="",
+        )
+
+        assert len(results) == 2
+        text1, reason1 = results[0]
+        text2, reason2 = results[1]
+
+        assert reason1 is None, f"block 1 should be accepted; reason={reason1!r}"
+        assert text1 is not None
+        assert "## Summary" in text1
+
+        assert text2 is None, f"block 2 should be rejected (missing ## Summary)"
+        assert reason2 == "missing_section"
 
 
 # ===========================================================================
