@@ -913,7 +913,7 @@ _DEFAULTS: dict = {
     "min_messages": 3,
     "min_duration_minutes": 2,
     "summary_model": "haiku",
-    "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline (escape hatch for slow-start CC builds, #84)
+    "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline. Consumed by /recall SKILL.md Step 2 (summarization is deferred to /recall), #84
     "auto_log_enabled": True,
     "snapshot_on_compact": True,
     "snapshot_on_clear": True,

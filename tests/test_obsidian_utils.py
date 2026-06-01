@@ -76,6 +76,31 @@ class TestLoadConfig:
         assert obsidian_utils.get_project_name("/home/user/my-project") == "my-project"
         assert obsidian_utils.get_project_name("") == "unknown"
 
+    def test_load_config_summary_pipeline_user_override(self, tmp_path, monkeypatch):
+        """User config with summary_pipeline=subagent must surface through load_config."""
+        config_file = tmp_path / "obsidian-brain-config.json"
+        config_file.write_text(json.dumps({"summary_pipeline": "subagent"}), encoding="utf-8")
+
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+        # Use a unique sid per call so the session-scoped config cache never
+        # bleeds between test invocations (mirrors the pattern used throughout
+        # this class — see _get_session_id_fast mock above).
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        cfg = obsidian_utils.load_config()
+        assert cfg["summary_pipeline"] == "subagent"
+
+    def test_load_config_summary_pipeline_default_is_auto(self, tmp_path, monkeypatch):
+        """No user override → summary_pipeline defaults to 'auto'."""
+        config_file = tmp_path / "obsidian-brain-config.json"
+        config_file.write_text(json.dumps({"vault_path": str(tmp_path)}), encoding="utf-8")
+
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        cfg = obsidian_utils.load_config()
+        assert cfg["summary_pipeline"] == "auto"
+
 
 class TestGetWorkspaceRoots:
     """Tests for the get_workspace_roots() helper (R13 C5 — config-driven workspace roots)."""
@@ -1167,15 +1192,28 @@ class TestSummarizerTimeoutBudget:
 
     def test_generate_summary_first_attempt_timeout_is_120(self, monkeypatch):
         captured: dict = {}
-        monkeypatch.setattr("subprocess.run", self._capture_timeout_run(captured))
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", self._capture_timeout_run(captured))
         obsidian_utils.generate_summary(["u"], ["a"], {"project": "t", "files_touched": []})
         assert captured.get("timeout") == 120
 
     def test_generate_snapshot_summary_first_attempt_timeout_is_120(self, monkeypatch):
         captured: dict = {}
-        monkeypatch.setattr("subprocess.run", self._capture_timeout_run(captured))
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", self._capture_timeout_run(captured))
         obsidian_utils.generate_snapshot_summary(["u"], ["a"], {"project": "t"})
         assert captured.get("timeout") == 120
+
+    def test_generate_summary_retry_uses_double_timeout(self, monkeypatch):
+        """Both attempts must time out; second attempt must use timeout * 2 == 240."""
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        result = obsidian_utils.generate_summary(["u"], ["a"], {"project": "t", "files_touched": []})
+        assert seen == [120, 240]
+        assert result == (None, "haiku_timeout")
 
 
 def test_summary_pipeline_default_is_auto():
@@ -2191,6 +2229,71 @@ class TestUpgradeBatch:
         assert "status: summarized" in updated
         assert "## Summary" in updated
         assert "Did a thing." in updated
+
+    def test_upgrade_unsummarized_note_default_timeout_reaches_generate_summary(
+        self, monkeypatch, tmp_path
+    ):
+        """When summary_timeout=None (the default), generate_summary must be called WITHOUT
+        a timeout kwarg so its own default of 120 applies. This pins the propagation
+        path upgrade_unsummarized_note(summary_timeout=None) → gen_kwargs has no
+        'timeout' key → generate_summary uses its default parameter (120).
+
+        Approach: monkeypatch generate_summary to capture kwargs; drive one real
+        note through upgrade_unsummarized_note without passing summary_timeout.
+        Assert 'timeout' is absent from captured kwargs (so the 120 default applies).
+        """
+        vault = tmp_path / "vault"
+        sessions_dir = vault / "sessions"
+        sessions_dir.mkdir(parents=True)
+
+        note_path = sessions_dir / "2026-04-20-default-timeout-test-abcd.md"
+        note_path.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-20\n"
+            "session_id: default-timeout-session-id-0000-0000-000000000000\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "tags:\n"
+            "  - claude/session\n"
+            "---\n\n"
+            "## Conversation (raw)\n"
+            "**User:** hello\n"
+            "**Assistant:** hi there\n",
+            encoding="utf-8",
+        )
+
+        captured_gen_kwargs: dict = {}
+
+        def fake_generate_summary(*args, **kwargs):
+            captured_gen_kwargs.update(kwargs)
+            return (
+                "## Summary\nDid a thing.\n\n"
+                "## Key Decisions\n- None noted.\n\n"
+                "## Changes Made\n- None noted.\n\n"
+                "## Errors Encountered\n- None.\n\n"
+                "## Open Questions / Next Steps\n- [ ] None.\n\n"
+                "IMPORTANCE: 5\n"
+            ), None
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda session_id: None)
+
+        # Call without summary_timeout — default None path
+        status, elapsed_s, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note_path),
+            str(vault),
+            "sessions",
+            "test-project",
+        )
+
+        assert status.startswith("Upgraded "), f"expected Upgraded, got: {status!r}"
+        # 'timeout' must NOT be in kwargs: the default (120) should come from
+        # generate_summary's own parameter default, not a forwarded value.
+        assert "timeout" not in captured_gen_kwargs, (
+            f"expected no 'timeout' kwarg when summary_timeout=None, "
+            f"but got kwargs={captured_gen_kwargs!r}"
+        )
 
 
 # ===========================================================================
