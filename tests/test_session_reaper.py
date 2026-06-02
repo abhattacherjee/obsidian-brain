@@ -800,9 +800,6 @@ def test_session_hint_does_not_invoke_reaper_when_disabled(reaper_env, monkeypat
     # Patch find_latest_session on the hint module directly
     monkeypatch.setattr(hint_mod, "find_latest_session", lambda *_a, **_kw: None)
 
-    # Bypass the dedup guard — these tests exercise reaper wiring, not dedup.
-    monkeypatch.setattr(hint_mod, "claim_hook_run", lambda *a, **kw: True)
-
     # Redirect stdin
     monkeypatch.setattr("sys.stdin", io.StringIO(_make_hint_stdin(reaper_env)))
 
@@ -846,9 +843,6 @@ def test_session_hint_invokes_reaper_by_default(reaper_env, monkeypatch):
 
     monkeypatch.setattr(hint_mod, "find_latest_session", lambda *_a, **_kw: None)
 
-    # Bypass the dedup guard — these tests exercise reaper wiring, not dedup.
-    monkeypatch.setattr(hint_mod, "claim_hook_run", lambda *a, **kw: True)
-
     monkeypatch.setattr("sys.stdin", io.StringIO(_make_hint_stdin(reaper_env)))
 
     hint_mod._run()
@@ -873,9 +867,6 @@ def test_session_hint_reaper_failure_does_not_propagate(reaper_env, monkeypatch)
     monkeypatch.setattr(hint_mod, "load_config", lambda: config)
 
     monkeypatch.setattr(hint_mod, "find_latest_session", lambda *_a, **_kw: None)
-
-    # Bypass the dedup guard — these tests exercise reaper wiring, not dedup.
-    monkeypatch.setattr(hint_mod, "claim_hook_run", lambda *a, **kw: True)
 
     monkeypatch.setattr("sys.stdin", io.StringIO(_make_hint_stdin(reaper_env)))
 
