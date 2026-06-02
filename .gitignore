@@ -4,3 +4,6 @@ __pycache__/
 .claude/scheduled_tasks.lock
 .coverage
 .pytest_cache/
+
+# superpowers working docs (specs/plans) — not tracked
+docs/superpowers/
