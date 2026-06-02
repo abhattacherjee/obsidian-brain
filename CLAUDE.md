@@ -84,3 +84,21 @@ When writing new hooks, skills, or scripts, follow these rules:
 - Releases branch from `develop`, merge to both `main` and `develop`
 - Hotfixes branch from `main`, merge to both `main` and `develop`
 - Run `./scripts/commit-preflight.sh` before every commit
+
+## Distribution & Release
+
+obsidian-brain is distributed as a **standalone marketplace from this repo**
+(`abhattacherjee/obsidian-brain`). The repo's `.claude-plugin/marketplace.json`
+(`source: "./"`) is authoritative — there is **no longer a sync step to the
+claude-code-skills monorepo**.
+
+Release flow (Git Flow):
+1. `release/*` branch from `develop`; run `scripts/bump-version.sh <part>` to
+   bump `plugin.json` and `.claude-plugin/marketplace.json` in lockstep.
+2. Update `CHANGELOG.md`.
+3. Merge to `main`, tag `vX.Y.Z`, publish a GitHub Release.
+4. Back-merge `main` into `develop`.
+
+Users update via `/plugin marketplace update`. Local dev testing uses
+`/dev-test install` (which calls `scripts/test-dev-skill.sh`, now
+source-agnostic about the cache directory).
