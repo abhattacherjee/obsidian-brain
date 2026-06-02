@@ -915,6 +915,7 @@ _DEFAULTS: dict = {
     "summary_model": "haiku",
     "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline. Consumed by /recall SKILL.md Step 2 (summarization is deferred to /recall), #84
     "summary_batch_size": 3,  # notes per claude -p spawn in upgrade_batch (#166); 1 = legacy per-note fan-out
+    "summary_recovery": True,  # #167: post-process loose summaries (heading normalization, synth missing sections, default importance) before escalating/falling back. Set false to disable.
     "auto_log_enabled": True,
     "snapshot_on_compact": True,
     "snapshot_on_clear": True,
@@ -1947,6 +1948,175 @@ def _escalation_models(primary: str) -> list[str]:
     sonnet -> [sonnet, opus]; opus -> [opus]."""
     base = _MODEL_RANK.get(primary, 0)
     return [primary] + [m for m in _SUMMARY_FALLBACK_CHAIN if _MODEL_RANK.get(m, 0) > base]
+
+
+# ---------------------------------------------------------------------------
+# Summary recovery (#167)
+# ---------------------------------------------------------------------------
+#
+# Escalation / fallback decision matrix for structurally-loose summaries:
+#
+#   empty_output           (whitespace-only or no text)         -> ESCALATE (a)
+#                           handled by the #165 chain in upgrade_unsummarized_note
+#
+#   haiku_timeout          (subprocess.TimeoutExpired)          -> do NOT escalate
+#                           a larger model is slower; falls to solo/sub-agent
+#
+#   haiku_subprocess_error (CLI missing / rc != 0)              -> do NOT escalate
+#                           different model won't fix the env; falls back
+#
+#   schema-loose but non-empty                                  -> RECOVER (b)
+#       (missing/variant headings, missing sections,
+#        missing ## Importance)
+#       -> apply _normalize_summary, do NOT escalate or fall back
+#
+# _normalize_summary implements RECOVER (b).  It is conservative: it never
+# fabricates Summary *content*.  If no recognisable Summary heading is found,
+# the text is returned unchanged so the downstream ## Summary check still
+# fails and the note escalates / falls back as before.
+
+
+_CANONICAL_SECTIONS: list[str] = [
+    "Summary",
+    "Key Decisions",
+    "Changes Made",
+    "Errors Encountered",
+    "Open Questions / Next Steps",
+    "Importance",
+]
+
+# Pre-compiled per-section heading-normalization patterns (case-insensitive,
+# multiline).  Built once at import time; re-used across calls.
+_HEADING_NORM_PATTERNS: list[tuple[re.Pattern, str]] = []
+for _sec in _CANONICAL_SECTIONS:
+    _esc = re.escape(_sec)
+    # Matches ATX headings NOT at level 2 (#{1}(?!#) = level-1 only;
+    # #{3,6} = levels 3-6), bold-markdown, or bare "Name:" forms.
+    # Deliberately excludes "## <Name>" so already-correct headings are
+    # left unchanged (idempotent — re-running on a well-formed summary
+    # must produce zero recovery_notes).
+    _pat = re.compile(
+        r"(?m)^(?:#{1}(?!#)\s*" + _esc + r"\s*|"
+        r"#{3,6}\s*" + _esc + r"\s*|"
+        r"\*\*\s*" + _esc + r"\s*\*\*\s*:?\s*|"
+        + _esc + r"\s*:\s*)$",
+        re.IGNORECASE,
+    )
+    _HEADING_NORM_PATTERNS.append((_pat, f"## {_sec}"))
+del _sec, _esc, _pat  # clean up loop variables from module namespace
+
+# Pre-compiled per-section presence regexes for Step-3 section synthesis.
+# Built once at import time alongside _HEADING_NORM_PATTERNS.
+_SECTION_PRESENCE_RES: dict[str, re.Pattern] = {
+    name: re.compile(rf"^## {re.escape(name)}\s*$", re.MULTILINE)
+    for name in _CANONICAL_SECTIONS
+}
+
+# The one regex that upgrade_note_with_summary uses as its gating check.
+_SUMMARY_SECTION_RE = re.compile(r"^## Summary\s*$", re.MULTILINE)
+
+
+def _normalize_summary(text: str) -> tuple[str, list[str]]:
+    """Recover a structurally-loose AI summary so it passes the downstream
+    ``## Summary`` check and section parsing, instead of escalating to a
+    costlier model or falling through to the sub-agent (#167).
+
+    Returns ``(normalized_text, recovery_notes)``.  CONSERVATIVE: it only
+    acts on recognizable structure and NEVER fabricates Summary *content* —
+    if no recognizable summary heading exists, the original text is returned
+    unchanged so the note still fails and escalates/falls back.
+
+    Recoveries (each appended to ``recovery_notes`` when applied):
+      - heading variant normalization: ``# Summary``, ``### Summary``,
+        ``**Summary**``, ``Summary:`` (bare) -> ``## Summary``, for each
+        canonical section name (case-insensitive on the section name).
+      - synthesize a missing NON-summary section as ``## <Name>\\nNone.``
+        (only Key Decisions / Changes Made / Errors Encountered /
+        Open Questions / Next Steps — NOT Summary).
+      - if neither a ``## Importance`` heading nor an ``IMPORTANCE:`` line
+        is present, append ``## Importance\\n5`` (default importance).
+    """
+    recovery_notes: list[str] = []
+
+    # Step 1: heading normalization — replace variant headings with canonical
+    # ## forms.  Operates LINE-BY-LINE to skip fenced code blocks, so a line
+    # like `# Summary` inside a ``` or ~~~ fence is left unchanged (idempotency
+    # fix: well-formed summaries that contain code blocks are not mutated).
+    #
+    # Implementation note: the patterns use MULTILINE `$` which matches before
+    # `\n` but does NOT consume it.  When applied via subn() to an individual
+    # line that ends with `\n`, the match covers everything up to (not including)
+    # the `\n`, so the replacement text lacks the trailing newline.  We therefore
+    # split with keepends=True but strip/restore the line ending ourselves so the
+    # substitution result is re-joined correctly.
+    lines = text.splitlines(keepends=True)
+    in_fence = False
+    out_lines: list[str] = []
+    # Track which section names were recovered so we can build recovery_notes
+    # after the line loop (one note per section, regardless of line count).
+    recovered_sections: set[str] = set()
+    for line in lines:
+        stripped = line.rstrip("\n").rstrip()
+        # Toggle fence state on opening/closing fence markers.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            out_lines.append(line)
+            continue
+        if in_fence:
+            # Inside a code fence — pass through unchanged.
+            out_lines.append(line)
+            continue
+        # Outside a fence — apply heading-normalization patterns.
+        # Work on the bare content (no trailing newline) so the replacement is
+        # not affected by the `$`-before-`\n` consumption, then restore the eol.
+        eol = line[len(line.rstrip("\n")):]  # "\n" or "" for last line
+        bare = line.rstrip("\n")
+        new_bare = bare
+        for pattern, replacement in _HEADING_NORM_PATTERNS:
+            sec_name = replacement[3:]  # strip leading "## "
+            result, n_subs = pattern.subn(replacement, new_bare)
+            if n_subs:
+                new_bare = result
+                recovered_sections.add(sec_name)
+        out_lines.append(new_bare + eol)
+    normalized = "".join(out_lines)
+    for sec_name in recovered_sections:
+        recovery_notes.append(f"normalized heading: {sec_name}")
+
+    # Step 2: if the gating regex still doesn't match after normalization,
+    # recovery cannot succeed — return the ORIGINAL text unchanged so the
+    # downstream ## Summary check fails and the note escalates/falls back.
+    if not _SUMMARY_SECTION_RE.search(normalized):
+        return text, []
+
+    # Step 3: synthesize missing non-Summary, non-Importance sections.
+    # Uses pre-compiled _SECTION_PRESENCE_RES — built once at import time.
+    for sec_name in _CANONICAL_SECTIONS:
+        if sec_name in ("Summary", "Importance"):
+            continue
+        if not _SECTION_PRESENCE_RES[sec_name].search(normalized):
+            normalized = normalized.rstrip("\n") + f"\n\n## {sec_name}\nNone."
+            recovery_notes.append(f"synthesized section: {sec_name}")
+
+    # Step 4: default importance when both ## Importance and IMPORTANCE: N are absent.
+    has_importance_heading = re.search(r"^## Importance", normalized, re.MULTILINE)
+    has_importance_line = re.search(r"^\s*IMPORTANCE:\s*\d+", normalized, re.MULTILINE)
+    if not has_importance_heading and not has_importance_line:
+        normalized = normalized.rstrip("\n") + "\n\n## Importance\n5"
+        recovery_notes.append("defaulted importance")
+
+    return normalized, recovery_notes
+
+
+def _summary_recovery_enabled() -> bool:
+    """Return True when summary_recovery is enabled in config (default True).
+
+    Config errors must not break summarization — returns True on any exception.
+    """
+    try:
+        return bool(load_config().get("summary_recovery", True))
+    except Exception:  # noqa: BLE001 — config errors must not break summarization
+        return True
 
 
 def generate_snapshot_summary(
@@ -4477,6 +4647,10 @@ def upgrade_unsummarized_note(
             user_msgs, assistant_msgs, metadata, **gen_kwargs,
         )
         if summary_text:
+            if _summary_recovery_enabled():
+                summary_text, _rec = _normalize_summary(summary_text)
+                if _rec:
+                    warnings = warnings + [f"summary recovered (#167): {', '.join(_rec)}"]
             model_used = _model
             break
         if fallback_reason not in _MODEL_ESCALATION_REASONS:
@@ -4684,12 +4858,24 @@ def generate_summaries_batch(
                 parsed_blocks[k_int] = block
 
         _has_summary_re = re.compile(r"^## Summary", re.MULTILINE)
+        _recovery_enabled = _summary_recovery_enabled()
 
         results: list[tuple[str | None, str | None]] = []
         for i_note, prep in enumerate(prepared_notes):
             k = i_note + 1
             if k in parsed_blocks:
                 block_text = parsed_blocks[k].strip()
+                # #167: normalize heading variants / synth missing sections BEFORE
+                # the ## Summary check so recoverable blocks pass instead of
+                # becoming (None, "missing_section").
+                if _recovery_enabled:
+                    block_text, _rec = _normalize_summary(block_text)
+                    if _rec:
+                        print(
+                            f"[obsidian-brain] batch summary recovered (#167) for note {k}: "
+                            f"{', '.join(_rec)}",
+                            file=sys.stderr,
+                        )
                 if _has_summary_re.search(block_text):
                     if existing_items:
                         try:
