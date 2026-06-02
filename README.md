@@ -53,10 +53,12 @@ marketplace, switching is seamless — your config and vault are untouched, so
 
 1. `/plugin marketplace add abhattacherjee/obsidian-brain`
 2. `/plugin install obsidian-brain@obsidian-brain-repo`
-3. `/plugin uninstall obsidian-brain@claude-code-skills` to remove the old monorepo copy.
+3. **Disable or uninstall the old copy** — `/plugin uninstall obsidian-brain@claude-code-skills` — so only one version is enabled.
 
-During the brief window where both are installed, a built-in guard ensures each
-session is logged only once (no duplicate notes or snapshots).
+> **Run only one version at a time.** Keeping both the monorepo and standalone
+> plugins enabled simultaneously double-registers the session hooks. A built-in
+> guard still prevents duplicate notes if both are ever briefly active, but the
+> supported configuration is a single enabled version.
 
 ### Prerequisites
 
