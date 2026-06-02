@@ -57,8 +57,9 @@ marketplace, switching is seamless — your config and vault are untouched, so
 
 > **Run only one version at a time.** Keeping both the monorepo and standalone
 > plugins enabled simultaneously double-registers the session hooks. A built-in
-> guard still prevents duplicate notes if both are ever briefly active, but the
-> supported configuration is a single enabled version.
+> guard reduces duplicate notes if both are ever briefly active — it errs toward
+> suppressing a duplicate rather than writing two — but the supported
+> configuration is a single enabled version.
 
 ### Prerequisites
 

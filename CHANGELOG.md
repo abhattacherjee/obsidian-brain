@@ -22,10 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`summary_recovery` config key (#167)** (default `true`) — new `_normalize_summary` post-processor recovers structurally-loose Haiku summaries (heading variants like `# Summary` / `**Summary**` / `Summary:`, missing canonical sections, missing `## Importance`) before they reach `upgrade_note_with_summary`'s validation gate, cutting the fallback rate without escalating to Sonnet/Opus or the Phase-2 sub-agent. Set to `false` in `~/.claude/obsidian-brain-config.json` to disable. Applied in both the solo path (`upgrade_unsummarized_note`) and the batch path (`generate_summaries_batch`).
 - Standalone marketplace distribution: obsidian-brain installs directly from
   `abhattacherjee/obsidian-brain` (`/plugin marketplace add abhattacherjee/obsidian-brain`).
-- Cross-plugin hook dedup guard (`claim_hook_run`): when both the monorepo and
-  standalone plugins are installed, each session is logged exactly once
-  (SessionEnd / SessionStart / PreCompact). New `SKIPPED_DEDUP` outcome in the
-  hook log.
+- Cross-plugin hook dedup guard (`claim_hook_run` / `release_hook_run`): when
+  both the monorepo and standalone plugins are installed, each session is logged
+  exactly once (SessionEnd / SessionStart / PreCompact). New `SKIPPED_DEDUP`
+  outcome in the hook log, now emitted by SessionStart as well as SessionEnd. If
+  a claimed SessionEnd fails to write its note, the dedup lock is released so a
+  sibling copy or a re-fire can still produce it — a transient write error never
+  silently drops a session note.
 
 ### Changed
 - **Summarizer timeout budget** — `generate_summary` / `generate_snapshot_summary` first-attempt `claude -p` timeout raised from 30s to 120s (retry from 60s to 240s) to accommodate slow-start CC builds where cold-start alone can take ~46s. Fixes the 100% Haiku-pipeline failure rate on affected installs. (#84)

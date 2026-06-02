@@ -235,3 +235,162 @@ def test_two_concurrent_sessionend_fires_dedup_to_one_claim(tmp_path):
     assert outs.count("CLAIMED") == 1, f"expected exactly one CLAIMED, got {outs}"
     lock_dir = home / ".claude" / "obsidian-brain" / "locks"
     assert sorted(p.name for p in lock_dir.iterdir()) == ["race-sid-SessionEnd"]
+
+
+# ---------------------------------------------------------------------------
+# release_hook_run + fail-open branch coverage + telemetry (PR #197 review)
+# ---------------------------------------------------------------------------
+
+
+def test_release_hook_run_allows_reclaim_within_ttl(lock_dir):
+    assert obsidian_utils.claim_hook_run("SessionEnd", "abc123") is True
+    # Within TTL a second claim is normally blocked...
+    assert obsidian_utils.claim_hook_run("SessionEnd", "abc123") is False
+    # ...but releasing the lock lets the next fire re-claim immediately.
+    obsidian_utils.release_hook_run("SessionEnd", "abc123")
+    assert obsidian_utils.claim_hook_run("SessionEnd", "abc123") is True
+
+
+def test_release_hook_run_empty_sid_is_noop(lock_dir):
+    # No key to release; must not raise.
+    obsidian_utils.release_hook_run("SessionEnd", "")
+
+
+def test_release_hook_run_missing_lock_is_noop(lock_dir):
+    # Releasing a never-claimed trigger is a safe no-op.
+    obsidian_utils.release_hook_run("SessionEnd", "never-claimed")
+
+
+def test_claim_fail_open_when_open_raises_oserror(lock_dir, monkeypatch):
+    """The outer `except OSError` around _create() must fail open (return True)
+    on a non-FileExistsError filesystem error, so a real FS fault never
+    silently drops a hook."""
+    import errno
+    real_open = os.open
+
+    def boom(path, *a, **kw):
+        if isinstance(path, str) and path.startswith(lock_dir):
+            raise OSError(errno.EMFILE, "too many open files")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(obsidian_utils.os, "open", boom)
+    assert obsidian_utils.claim_hook_run("SessionEnd", "abc123") is True
+
+
+def test_stale_reclaim_fail_open_when_recreate_raises(lock_dir, monkeypatch):
+    """A stale lock whose unlink succeeds but whose re-create hits a non-
+    FileExistsError OSError must fail open (return True) — exercises the
+    re-claim OSError branch, not the outer one."""
+    import errno
+    assert obsidian_utils.claim_hook_run("SessionEnd", "abc123", ttl_seconds=1) is True
+    lock_path = os.path.join(lock_dir, "abc123-SessionEnd")
+    old = time.time() - 5
+    os.utime(lock_path, (old, old))  # make the lock stale
+
+    real_open = os.open
+    calls = {"n": 0}
+
+    def boom(path, *a, **kw):
+        if path == lock_path:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # first attempt: lock still present -> natural FileExistsError
+                return real_open(path, *a, **kw)
+            raise OSError(errno.EACCES, "denied")  # post-unlink re-create fails
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(obsidian_utils.os, "open", boom)
+    assert obsidian_utils.claim_hook_run("SessionEnd", "abc123", ttl_seconds=1) is True
+
+
+def test_lock_dir_isolated_from_real_home_during_tests():
+    """The autouse conftest fixture must keep _LOCK_DIR out of the real
+    ~/.claude so no test ever writes a dedup lock to the user's home.
+    Self-defends the isolation against future refactors."""
+    real_claude = os.path.realpath(os.path.expanduser("~/.claude"))
+    assert not os.path.realpath(obsidian_utils._LOCK_DIR).startswith(real_claude), \
+        obsidian_utils._LOCK_DIR
+
+
+def test_sessionend_releases_lock_on_write_failure(tmp_path, monkeypatch):
+    """Regression (PR #197 H1): a winning SessionEnd whose vault write fails
+    must RELEASE the dedup lock so a sibling install (or re-fire) can still
+    produce the note. Otherwise a transient write error turns a suppressed
+    sibling into a permanently lost session note."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import obsidian_session_log
+    importlib.reload(obsidian_utils)
+    importlib.reload(obsidian_session_log)
+
+    cc_slug = "-myproj"
+    proj = tmp_path / ".claude" / "projects" / cc_slug
+    proj.mkdir(parents=True)
+    transcript = proj / "sid-wf-1234.jsonl"
+    _make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
+
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    cfg = {
+        "vault_path": str(vault),
+        "sessions_folder": "claude-sessions",
+        "auto_log_enabled": True,
+        "min_messages": 3,
+        "min_duration_minutes": 2,
+    }
+    (tmp_path / ".claude" / "obsidian-brain-config.json").write_text(
+        json.dumps(cfg), encoding="utf-8")
+
+    # Real guard claims the lock (winner); the write then fails.
+    monkeypatch.setattr(obsidian_session_log, "write_vault_note",
+                        lambda *a, **kw: "disk full")
+
+    payload = json.dumps({
+        "cwd": str(tmp_path),
+        "session_id": "sid-wf-1234",
+        "transcript_path": str(transcript),
+    })
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    with pytest.raises(SystemExit) as exc_info:
+        obsidian_session_log.main()
+    assert exc_info.value.code == 0
+
+    # WRITE_FAILED was logged...
+    log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+    lines = [ln for ln in log_path.read_text(encoding="utf-8").splitlines()
+             if "SessionEnd" in ln]
+    assert any("outcome=WRITE_FAILED" in ln for ln in lines), lines
+
+    # ...and the lock was released, so a re-fire can re-claim immediately.
+    assert obsidian_utils.claim_hook_run("SessionEnd", "sid-wf-1234") is True
+
+    monkeypatch.undo()
+    importlib.reload(obsidian_utils)
+    importlib.reload(obsidian_session_log)
+
+
+def test_sessionstart_dedup_skip_logs_outcome(tmp_path, monkeypatch):
+    """A SessionStart suppressed by the dedup guard must emit an
+    outcome=SKIPPED_DEDUP line to the hook log (the documented diagnostic
+    surface), not vanish silently (PR #197 M2)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import obsidian_session_hint
+    importlib.reload(obsidian_utils)
+    importlib.reload(obsidian_session_hint)
+
+    monkeypatch.setattr(obsidian_session_hint, "claim_hook_run", lambda *a, **kw: False)
+    payload = json.dumps({"cwd": str(tmp_path), "session_id": "sid-ss-1234"})
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    with pytest.raises(SystemExit) as exc_info:
+        obsidian_session_hint.main()
+    assert exc_info.value.code == 0
+
+    log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+    assert log_path.exists(), "hook log not created on dedup-skip"
+    lines = [ln for ln in log_path.read_text(encoding="utf-8").splitlines()
+             if "SessionStart" in ln]
+    assert len(lines) == 1, lines
+    assert "outcome=SKIPPED_DEDUP" in lines[0], lines[0]
+
+    monkeypatch.undo()
+    importlib.reload(obsidian_utils)
+    importlib.reload(obsidian_session_hint)
