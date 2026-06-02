@@ -14,8 +14,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PLUGIN_NAME="obsidian-brain"
 
-# Discover the latest installed cache version (highest semver directory)
-CACHE_BASE="${HOME}/.claude/plugins/cache/claude-code-skills/${PLUGIN_NAME}"
+# Discover the plugin cache dir regardless of which marketplace installed it.
+# Matches ~/.claude/plugins/cache/<marketplace>/obsidian-brain ; newest wins.
+CACHE_BASE="$(ls -dt "${HOME}/.claude/plugins/cache/"*/"${PLUGIN_NAME}" 2>/dev/null | head -1 || true)"
+if [[ -z "$CACHE_BASE" ]]; then
+    echo "ERROR: No installed ${PLUGIN_NAME} plugin cache found under ~/.claude/plugins/cache/*/${PLUGIN_NAME}"
+    exit 1
+fi
+# Pick the highest installed semver under that cache dir (excluding .bak backups).
 PLUGIN_VERSION=$(ls -1 "$CACHE_BASE" 2>/dev/null | grep -v '\.bak$' | sort -V | tail -1)
 if [[ -z "$PLUGIN_VERSION" ]]; then
     echo "ERROR: No cached version found at $CACHE_BASE"
