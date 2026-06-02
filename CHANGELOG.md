@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **`summary_pipeline` config key** (`"auto"` default | `"subagent"`) — set to `"subagent"` in `~/.claude/obsidian-brain-config.json` to skip the Haiku `claude -p` summarizer pipeline entirely on machines with slow CLI cold-start, routing all notes straight to the sub-agent fallback. (#84)
+- **In-process Haiku→Sonnet→Opus escalation chain (#165)** — `upgrade_unsummarized_note` now retries with a more capable model when the primary model returns empty output (`empty_output` reason only; timeouts and subprocess errors do not escalate). Fallback model chain is now Sonnet first, then Opus (replaces prior direct-to-Opus behavior). `model_used` in metrics is populated with the model that produced the accepted summary.
+- **`summary_batch_size` config key (#166)** (default `3`) — `upgrade_batch` now groups session notes into batches of up to `summary_batch_size` and summarizes each group in a single `claude -p` spawn, amortizing CLI startup overhead (~70% reduction vs. per-note fan-out). Set to `1` in `~/.claude/obsidian-brain-config.json` to restore legacy per-note behavior. Per-note parse failures and whole-spawn failures fall through automatically to the per-note solo path, and then to the Phase 2 sub-agent.
 - **`/recall` telemetry** — `upgrade_batch()` now returns per-note `elapsed_s`,
   `model_used`, and `fallback_reason`, and appends one record per call to
   `~/.claude/obsidian-brain-summarizer-metrics.jsonl` (100 KB rotation, owner-only).
@@ -19,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Summarizer timeout budget** — `generate_summary` / `generate_snapshot_summary` first-attempt `claude -p` timeout raised from 30s to 120s (retry from 60s to 240s) to accommodate slow-start CC builds where cold-start alone can take ~46s. Fixes the 100% Haiku-pipeline failure rate on affected installs. (#84)
+- **`upgrade_batch()` gains `summary_batch_size` param** — new optional keyword argument (default reads from config, falls back to 3). When `>= 2`, uses the batched path via `generate_summaries_batch`; when `1`, preserves the legacy per-note `ThreadPoolExecutor` fan-out exactly. Existing callers without the param get batching by default.
 - **`upgrade_batch()` return shape** — was `list[tuple[path, status]]`, now
   `list[dict]` with 5 keys (`path`, `status`, `elapsed_s`, `model_used`,
   `fallback_reason`). Backward-incompatible for direct callers; in-tree
