@@ -184,3 +184,10 @@ def test_sessionend_loser_path_logs_dedup_and_skips_write(tmp_path, monkeypatch)
     monkeypatch.undo()
     importlib.reload(obsidian_utils)
     importlib.reload(obsidian_session_log)
+
+
+def test_sessionstart_guard_importable_and_single_install_proceeds(lock_dir):
+    import obsidian_session_hint
+    assert hasattr(obsidian_session_hint, "claim_hook_run")
+    # Single-install: first claim wins -> caller proceeds.
+    assert obsidian_session_hint.claim_hook_run("SessionStart", "sid-x") is True

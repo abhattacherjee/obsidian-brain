@@ -25,6 +25,7 @@ from obsidian_utils import (  # noqa: E402
     _HOOK_LOG_MAX_BYTES,
     _HOOK_LOG_NAME,
     _sanitize_log_field,
+    claim_hook_run,
     find_latest_session,
     get_project_name,
     load_config,
@@ -128,10 +129,15 @@ def _run() -> None:
     # see canonical_project_name().
     project = get_project_name(cwd)
 
-    # 2a. Refresh the bootstrap file with the authoritative session_id from stdin.
-    # This runs regardless of vault configuration so the bootstrap stays current
-    # even when obsidian-brain is not fully configured.
+    # 2a. Guard first: when both the monorepo and standalone plugins are
+    # installed, only the winning copy acts on this SessionStart trigger.
     session_id = hook_input.get("session_id", "")
+    if not claim_hook_run("SessionStart", session_id):
+        return  # sibling plugin copy already wrote the bootstrap + emitted the hint
+    # Refresh the bootstrap file with the authoritative session_id from stdin
+    # (winner only; the loser short-circuits above). Runs regardless of vault
+    # configuration so the bootstrap stays current even when obsidian-brain is
+    # not fully configured.
     bootstrap_updated = False
     if session_id:
         bootstrap_updated = _write_bootstrap_atomic(project, session_id)
