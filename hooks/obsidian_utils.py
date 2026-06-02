@@ -916,6 +916,8 @@ _DEFAULTS: dict = {
     "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline. Consumed by /recall SKILL.md Step 2 (summarization is deferred to /recall), #84
     "summary_batch_size": 3,  # notes per claude -p spawn in upgrade_batch (#166); 1 = legacy per-note fan-out
     "summary_recovery": True,  # #167: post-process loose summaries (heading normalization, synth missing sections, default importance) before escalating/falling back. Set false to disable.
+    "aged_summarize_threshold_days": 90,  # #168: notes whose file mtime is older than this AND have no inbound vault links AND no pin tag are deferred (skipped) by /recall
+    "summary_pin_tags": ["claude/keep", "claude/permanent"],  # #168: notes carrying any of these frontmatter tags are never deferred
     "auto_log_enabled": True,
     "snapshot_on_compact": True,
     "snapshot_on_clear": True,
@@ -2548,10 +2550,44 @@ def find_latest_session(
     return None
 
 
+def _note_has_inbound_links(basename_stem: str, db_path: str | None = None) -> bool:
+    """Return True if any vault note body references ``[[<basename_stem>]]`` (#168).
+
+    Queries the existing vault index DB (read-only) via a body LIKE lookup —
+    no full-vault file rescan. CONSERVATIVE on failure: if the index is missing
+    or the query errors, returns True (assume referenced) so the note is NOT
+    deferred — deferral is an optimization and must never drop a referenced note.
+    Over-matching (prefix) also errs toward True (safe).
+    """
+    try:
+        if db_path is None:
+            if _vault_index is not None:
+                db_path = _vault_index._default_db_path()
+            else:
+                # Fall back to the known default path string directly
+                db_path = os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
+        if not os.path.exists(db_path):
+            return True  # conservative: assume referenced
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            pattern = f"%[[{basename_stem}%"
+            row = conn.execute(
+                "SELECT 1 FROM notes WHERE body LIKE ? LIMIT 1", (pattern,)
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        return True  # conservative: assume referenced on any error
+
+
 def find_unsummarized_notes(
     vault_path: str,
     sessions_folder: str,
     project: str,
+    aged_threshold_days: int | None = None,
+    include_aged: bool = False,
+    pin_tags: tuple | list | None = None,
 ) -> str:
     """Find unsummarized session notes for a project, with defense-in-depth.
 
@@ -2563,13 +2599,53 @@ def find_unsummarized_notes(
     other typed notes (e.g. ``claude-insight``). Legacy notes without a
     ``type:`` field are accepted for backward compatibility.
 
-    Returns JSON string: {"unsummarized": [paths], "auto_fixed": N}
+    Aged-note deferral (#168): notes are *deferred* (skipped, not lost) when
+    ALL three conditions hold:
+      1. File mtime is older than ``aged_threshold_days`` (default from config
+         key ``aged_summarize_threshold_days``, built-in default 90 days).
+      2. No inbound ``[[wikilink]]`` references found in the vault index DB.
+      3. No pin tag (tags matching ``summary_pin_tags``, default
+         ``["claude/keep", "claude/permanent"]``) in the note's frontmatter.
+
+    Deferred notes are returned in ``skipped_aged`` and can be forced into
+    ``unsummarized`` by passing ``include_aged=True`` or invoking
+    ``/recall --include-aged``.
+
+    Args:
+        vault_path: Obsidian vault root.
+        sessions_folder: Folder name (relative to vault) containing sessions.
+        project: Project slug to filter on.
+        aged_threshold_days: Override the config-backed deferral threshold (days).
+            None (default) reads from config key ``aged_summarize_threshold_days``.
+        include_aged: If True, bypass deferral — all qualifying notes go into
+            ``unsummarized`` regardless of age/link/pin status.
+        pin_tags: Override the config-backed pin-tag list. None (default) reads
+            from config key ``summary_pin_tags``.
+
+    Returns JSON string:
+        {"unsummarized": [paths], "auto_fixed": N, "skipped_aged": [paths]}
     """
+    # Resolve config-backed defaults once.
+    if aged_threshold_days is None:
+        try:
+            aged_threshold_days = int(load_config().get("aged_summarize_threshold_days", 90))
+        except Exception:
+            aged_threshold_days = 90
+    if pin_tags is None:
+        try:
+            pin_tags = list(load_config().get("summary_pin_tags", ["claude/keep", "claude/permanent"]))
+        except Exception:
+            pin_tags = ["claude/keep", "claude/permanent"]
+
+    now = time.time()
+    cutoff_seconds = aged_threshold_days * 86400
+
     sessions_dir = Path(vault_path) / sessions_folder
     if not sessions_dir.is_dir():
-        return json.dumps({"unsummarized": [], "auto_fixed": 0})
+        return json.dumps({"unsummarized": [], "auto_fixed": 0, "skipped_aged": []})
 
     unsummarized: list[str] = []
+    skipped_aged: list[str] = []
     auto_fixed = 0
 
     for f in sorted(sessions_dir.iterdir(), reverse=True):
@@ -2648,6 +2724,27 @@ def find_unsummarized_notes(
                 pass
             continue
 
+        # Aged-note deferral (#168): skip notes that are old, unreferenced,
+        # and not pinned — deferral is an optimization, never a permanent drop.
+        if not include_aged:
+            file_age = now - f.stat().st_mtime
+            if file_age > cutoff_seconds:
+                # AGE condition met — check pin tags next.
+                note_tags_raw = parse_frontmatter_field(frontmatter, "tags")
+                note_tags: list[str] = []
+                if note_tags_raw:
+                    # tags may be a YAML inline list "[a, b]" or comma-separated
+                    # scalar "a, b". Strip brackets, split on commas/whitespace.
+                    cleaned = note_tags_raw.strip().lstrip("[").rstrip("]")
+                    note_tags = [t.strip().strip('"').strip("'")
+                                 for t in re.split(r"[,\s]+", cleaned) if t.strip()]
+                pinned = any(pt in note_tags for pt in pin_tags)
+                if not pinned:
+                    # INBOUND-LINK check — conservative: assume linked on error.
+                    if not _note_has_inbound_links(f.stem):
+                        skipped_aged.append(str(f))
+                        continue
+
         unsummarized.append(str(f))
 
     # Ordering bias: within a session_id group, snapshots sort first so the
@@ -2675,7 +2772,7 @@ def find_unsummarized_notes(
         return (sid, 0 if typ == "claude-snapshot" else 1, name)
 
     unsummarized.sort(key=_bias_key)
-    return json.dumps({"unsummarized": unsummarized, "auto_fixed": auto_fixed})
+    return json.dumps({"unsummarized": unsummarized, "auto_fixed": auto_fixed, "skipped_aged": skipped_aged})
 
 
 def build_context_brief(

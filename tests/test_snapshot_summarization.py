@@ -1,8 +1,10 @@
 import json
+import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
-from hooks.obsidian_utils import find_unsummarized_notes, upgrade_unsummarized_note, _augment_session_input_with_snapshots
+from hooks.obsidian_utils import find_unsummarized_notes, upgrade_unsummarized_note, _augment_session_input_with_snapshots, _note_has_inbound_links
 
 
 def _fixture(sess_dir: Path, name: str, type_: str, status: str, session_id: str, body: str = ""):
@@ -326,3 +328,139 @@ def test_find_unsummarized_keeps_notes_with_empty_type_field(tmp_path):
         f"Note with empty `type:` should be kept as legacy but was skipped; "
         f"returned: {names}"
     )
+
+
+# ---------------------------------------------------------------------------
+# TestAgedNoteDeferral — #168: defer aged-out, unreferenced session notes
+# ---------------------------------------------------------------------------
+
+def _aged_fixture(sess_dir: Path, name: str, mtime_offset_days: float,
+                  tags: str = "", extra_frontmatter: str = "") -> Path:
+    """Write a minimal auto-logged session note and set its mtime."""
+    tags_line = f"tags: {tags}\n" if tags else ""
+    p = sess_dir / name
+    p.write_text(
+        f"---\ntype: claude-session\ndate: 2026-01-01\nsession_id: aged-sid\n"
+        f"project: demo\nstatus: auto-logged\n{tags_line}{extra_frontmatter}"
+        f"---\n\n# {name}\n\n## Conversation (raw)\n**User:** hi\n**Assistant:** hey\n",
+        encoding="utf-8",
+    )
+    mtime = time.time() - mtime_offset_days * 86400
+    os.utime(p, (mtime, mtime))
+    return p
+
+
+class TestAgedNoteDeferral:
+    """Tests for the aged-note deferral heuristic added in #168."""
+
+    def test_fresh_and_linked_aged_summarized_unlinked_aged_skipped(self, tmp_path):
+        """A (fresh) and C (aged, has inbound link) appear in unsummarized;
+        B (aged, no link) is deferred to skipped_aged."""
+        vault = tmp_path / "v"
+        sess = vault / "claude-sessions"
+        sess.mkdir(parents=True)
+
+        note_a = _aged_fixture(sess, "2026-01-01-demo-note-a.md", mtime_offset_days=1)
+        note_b = _aged_fixture(sess, "2026-01-01-demo-note-b.md", mtime_offset_days=120)
+        note_c = _aged_fixture(sess, "2026-01-01-demo-note-c.md", mtime_offset_days=120)
+
+        def fake_inbound(stem, db_path=None):
+            # B has no links; C does
+            return stem == note_c.stem
+
+        with patch("hooks.obsidian_utils._note_has_inbound_links", side_effect=fake_inbound):
+            result = json.loads(
+                find_unsummarized_notes(str(vault), "claude-sessions", "demo",
+                                        aged_threshold_days=90)
+            )
+
+        unsummarized_names = {Path(p).name for p in result["unsummarized"]}
+        skipped_names = {Path(p).name for p in result["skipped_aged"]}
+
+        assert note_a.name in unsummarized_names, "fresh note A must be in unsummarized"
+        assert note_c.name in unsummarized_names, "aged-but-linked note C must be in unsummarized"
+        assert note_b.name in skipped_names, "aged-unlinked note B must be in skipped_aged"
+        assert note_b.name not in unsummarized_names, "note B must NOT appear in unsummarized"
+
+    def test_include_aged_bypasses_deferral(self, tmp_path):
+        """With include_aged=True, all notes appear in unsummarized regardless of age."""
+        vault = tmp_path / "v"
+        sess = vault / "claude-sessions"
+        sess.mkdir(parents=True)
+
+        note_b = _aged_fixture(sess, "2026-01-01-demo-note-b2.md", mtime_offset_days=120)
+
+        def fake_inbound(stem, db_path=None):
+            return False  # no links
+
+        with patch("hooks.obsidian_utils._note_has_inbound_links", side_effect=fake_inbound):
+            result = json.loads(
+                find_unsummarized_notes(str(vault), "claude-sessions", "demo",
+                                        aged_threshold_days=90, include_aged=True)
+            )
+
+        unsummarized_names = {Path(p).name for p in result["unsummarized"]}
+        assert note_b.name in unsummarized_names, "B must be in unsummarized when include_aged=True"
+        assert result["skipped_aged"] == [], "skipped_aged must be empty when include_aged=True"
+
+    def test_pinned_aged_note_not_deferred(self, tmp_path):
+        """An aged note with a pin tag is never deferred, even without inbound links."""
+        vault = tmp_path / "v"
+        sess = vault / "claude-sessions"
+        sess.mkdir(parents=True)
+
+        note_pinned = _aged_fixture(sess, "2026-01-01-demo-note-pinned.md",
+                                    mtime_offset_days=120, tags="[claude/keep]")
+
+        def fake_inbound(stem, db_path=None):
+            return False  # no links
+
+        with patch("hooks.obsidian_utils._note_has_inbound_links", side_effect=fake_inbound):
+            result = json.loads(
+                find_unsummarized_notes(str(vault), "claude-sessions", "demo",
+                                        aged_threshold_days=90,
+                                        pin_tags=["claude/keep", "claude/permanent"])
+            )
+
+        unsummarized_names = {Path(p).name for p in result["unsummarized"]}
+        skipped_names = {Path(p).name for p in result["skipped_aged"]}
+        assert note_pinned.name in unsummarized_names, "pinned note must be in unsummarized"
+        assert note_pinned.name not in skipped_names, "pinned note must NOT be in skipped_aged"
+
+    def test_max_age_days_override(self, tmp_path):
+        """aged_threshold_days param overrides the default threshold."""
+        vault = tmp_path / "v"
+        sess = vault / "claude-sessions"
+        sess.mkdir(parents=True)
+
+        # 30 days old — within default 90d threshold, but beyond a 14d override
+        note = _aged_fixture(sess, "2026-01-01-demo-note-30d.md", mtime_offset_days=30)
+
+        def fake_inbound(stem, db_path=None):
+            return False
+
+        with patch("hooks.obsidian_utils._note_has_inbound_links", side_effect=fake_inbound):
+            # With default threshold (90d): 30d note is NOT aged → in unsummarized
+            result_default = json.loads(
+                find_unsummarized_notes(str(vault), "claude-sessions", "demo",
+                                        aged_threshold_days=90)
+            )
+            # With 14d threshold: 30d note IS aged → in skipped_aged
+            result_tight = json.loads(
+                find_unsummarized_notes(str(vault), "claude-sessions", "demo",
+                                        aged_threshold_days=14)
+            )
+
+        assert note.name in {Path(p).name for p in result_default["unsummarized"]}, \
+            "30d note should be in unsummarized with default 90d threshold"
+        assert note.name in {Path(p).name for p in result_tight["skipped_aged"]}, \
+            "30d note should be in skipped_aged with 14d threshold"
+        assert note.name not in {Path(p).name for p in result_tight["unsummarized"]}, \
+            "30d note must NOT be in unsummarized with 14d threshold"
+
+    def test_inbound_link_helper_conservative_on_missing_index(self):
+        """_note_has_inbound_links returns True (conservative) when DB doesn't exist."""
+        import uuid
+        missing_db = f"/tmp/does-not-exist-{uuid.uuid4().hex}.db"
+        result = _note_has_inbound_links("nonexistent-stem", db_path=missing_db)
+        assert result is True, "must return True (conservative) when index DB is missing"
