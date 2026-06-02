@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from obsidian_utils import (  # noqa: E402
+    claim_hook_run,
     extract_assistant_messages,
     extract_session_metadata,
     extract_user_messages,
@@ -203,6 +204,10 @@ def _run() -> None:
 
     if not session_id or not transcript_path:
         print("[obsidian-brain] missing session_id or transcript_path, skipping", file=sys.stderr)
+        return
+
+    if not claim_hook_run("PreCompact", session_id):
+        print("[obsidian-brain] snapshot skipped: sibling plugin already handled this compact", file=sys.stderr)
         return
 
     # 2. Load config
