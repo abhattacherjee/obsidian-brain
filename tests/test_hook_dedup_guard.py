@@ -5,8 +5,11 @@ import io
 import json
 import os
 import stat
+import subprocess
+import sys as _sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -191,3 +194,44 @@ def test_sessionstart_guard_importable_and_single_install_proceeds(lock_dir):
     assert hasattr(obsidian_session_hint, "claim_hook_run")
     # Single-install: first claim wins -> caller proceeds.
     assert obsidian_session_hint.claim_hook_run("SessionStart", "sid-x") is True
+
+
+# ---------------------------------------------------------------------------
+# Cross-process dedup simulation (two-process double-install scenario)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _dual_install_env(home: Path) -> dict:
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["PYTHONPATH"] = f"{_REPO_ROOT / 'hooks'}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def test_two_concurrent_sessionend_fires_dedup_to_one_claim(tmp_path):
+    """Two processes sharing HOME race on the same SessionEnd trigger; the
+    lock under ~/.claude/obsidian-brain/locks/ must let exactly one proceed.
+
+    We assert on the lock directory rather than a vault note so the test does
+    not depend on a configured vault: both processes run claim_hook_run against
+    the same shared HOME, and exactly one lock file ends up present.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    env = _dual_install_env(home)
+    code = (
+        "import obsidian_utils, sys; "
+        "print('CLAIMED' if obsidian_utils.claim_hook_run('SessionEnd', 'race-sid') else 'SKIPPED')"
+    )
+    procs = [
+        subprocess.Popen([_sys.executable, "-c", code], env=env,
+                         stdout=subprocess.PIPE, text=True)
+        for _ in range(2)
+    ]
+    outs = [p.communicate()[0].strip() for p in procs]
+    assert outs.count("CLAIMED") == 1, f"expected exactly one CLAIMED, got {outs}"
+    lock_dir = home / ".claude" / "obsidian-brain" / "locks"
+    assert sorted(p.name for p in lock_dir.iterdir()) == ["race-sid-SessionEnd"]
