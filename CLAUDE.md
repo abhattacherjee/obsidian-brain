@@ -60,7 +60,7 @@ All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight
 - **Commits:** Use conventional commit format — `feat(obsidian-brain):`, `fix:`, `chore:`, `docs:`
 - **Python:** stdlib only, no pip dependencies. All hooks must be deterministic and safe to run at session boundaries.
 - **Atomic writes:** All vault writes must use temp file + rename pattern (see `write_vault_note()` in `obsidian_utils.py`).
-- **Version:** Bump in both `.claude-plugin/plugin.json` and update `CHANGELOG.md` for releases.
+- **Version:** Bump `plugin.json` and `.claude-plugin/marketplace.json` in lockstep (use `scripts/bump-version.sh`), and update `CHANGELOG.md` for releases.
 - **Branching:** Never commit directly to develop/main — use feature branches.
 
 ## Security Patterns

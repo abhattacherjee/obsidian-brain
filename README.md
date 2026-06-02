@@ -53,7 +53,7 @@ marketplace, switching is seamless — your config and vault are untouched, so
 
 1. `/plugin marketplace add abhattacherjee/obsidian-brain`
 2. `/plugin install obsidian-brain@obsidian-brain-repo`
-3. `/plugin uninstall` the old monorepo copy.
+3. `/plugin uninstall obsidian-brain@claude-code-skills` to remove the old monorepo copy.
 
 During the brief window where both are installed, a built-in guard ensures each
 session is logged only once (no duplicate notes or snapshots).
