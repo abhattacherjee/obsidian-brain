@@ -13,8 +13,18 @@ class TestSecureDirectory:
     """C1: All temp/cache files use ~/.claude/obsidian-brain/ instead of /tmp."""
 
     def test_secure_dir_constant_points_to_claude_dir(self):
-        from obsidian_utils import _SECURE_DIR
-        assert _SECURE_DIR == os.path.expanduser("~/.claude/obsidian-brain")
+        # Read the source to verify the constant is defined as the real path.
+        # We check the source rather than the live module attribute because the
+        # global _isolate_secure_dir_globally autouse fixture patches _SECURE_DIR
+        # to a per-test tmp dir; the invariant we care about is the *definition*
+        # in source, not the runtime value under test isolation.
+        import inspect
+        import obsidian_utils
+        src = inspect.getsource(obsidian_utils)
+        expected_def = '_SECURE_DIR = os.path.expanduser("~/.claude/obsidian-brain")'
+        assert expected_def in src, (
+            f"_SECURE_DIR definition not found in source; expected:\n  {expected_def!r}"
+        )
 
     def test_cache_prefix_under_secure_dir(self):
         from obsidian_utils import _CACHE_PREFIX, _SECURE_DIR

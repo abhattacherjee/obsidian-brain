@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fallback_reason` populated on pre-summarization failures in `upgrade_unsummarized_note`: `unreadable_note`, `no_session_id`, `no_conversation_content`. Full taxonomy (including Phase 2 validator reserved values, #167/#84) documented in the function's docstring. Closes #183.
 - **Aged-note deferral in `/recall` (#168)** — `find_unsummarized_notes` now defers notes whose file mtime is older than `aged_summarize_threshold_days` (default `90` days), have no `[[wikilink]]` inbound references in the vault index, and carry no `summary_pin_tags` tag (default `["claude/keep", "claude/permanent"]`). Deferred notes are reported separately (`skipped_aged`) with a count and escape-hatch hint (`/recall --include-aged`). Deferral is conservative: any index query error or missing DB causes the note to be treated as referenced (not deferred). New config keys: `aged_summarize_threshold_days` (int, days) and `summary_pin_tags` (list of tag strings). Closes #168.
 - **`summary_recovery` config key (#167)** (default `true`) — new `_normalize_summary` post-processor recovers structurally-loose Haiku summaries (heading variants like `# Summary` / `**Summary**` / `Summary:`, missing canonical sections, missing `## Importance`) before they reach `upgrade_note_with_summary`'s validation gate, cutting the fallback rate without escalating to Sonnet/Opus or the Phase-2 sub-agent. Set to `false` in `~/.claude/obsidian-brain-config.json` to disable. Applied in both the solo path (`upgrade_unsummarized_note`) and the batch path (`generate_summaries_batch`).
+- **Standalone marketplace distribution** — obsidian-brain installs directly from
+  `abhattacherjee/obsidian-brain` (`/plugin marketplace add abhattacherjee/obsidian-brain`).
+- **Cross-plugin hook dedup guard** (`claim_hook_run` / `release_hook_run`) — when
+  both the monorepo and standalone plugins are installed, each session is logged
+  exactly once (SessionEnd / SessionStart / PreCompact). New `SKIPPED_DEDUP`
+  outcome in the hook log, now emitted by SessionStart as well as SessionEnd. If
+  a claimed SessionEnd fails to write its note, the dedup lock is released so a
+  sibling copy or a re-fire can still produce it — a transient write error never
+  silently drops a session note.
 
 ### Changed
 - **Summarizer timeout budget** — `generate_summary` / `generate_snapshot_summary` first-attempt `claude -p` timeout raised from 30s to 120s (retry from 60s to 240s) to accommodate slow-start CC builds where cold-start alone can take ~46s. Fixes the 100% Haiku-pipeline failure rate on affected installs. (#84)
@@ -42,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (one JSONL record per `upgrade_batch` call, with `n_notes` reflecting the
   group size — the corpus pass groups by project, `/standup` is `n_notes=1`).
   Closes telemetry gap from #182 (follow-up to #74).
+- Release flow is now "tag this repo" — the claude-code-skills monorepo is no
+  longer a publish target.
+- `scripts/test-dev-skill.sh` discovers the plugin cache directory
+  source-agnostically (no longer hardcodes the `claude-code-skills` marketplace).
 
 ## [2.5.1] - 2026-05-16
 

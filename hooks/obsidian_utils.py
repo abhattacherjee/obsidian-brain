@@ -434,6 +434,136 @@ def _ensure_secure_dir() -> str:
     return _SECURE_DIR
 
 
+# --- Cross-plugin hook dedup guard (standalone-marketplace migration) ---
+# When both the monorepo and standalone obsidian-brain plugins are installed,
+# every lifecycle hook fires once per installed plugin copy. These coordinate
+# via a lock file under the install-source-independent secure dir so only one
+# copy acts.
+
+_LOCK_DIR = os.path.join(_SECURE_DIR, "locks")
+_HOOK_DEDUP_TTL_SECONDS = 15
+_LOCK_CLEANUP_MAX_AGE_SECONDS = 2 * 24 * 3600  # prune lock files older than 2 days
+
+
+def _cleanup_stale_locks(max_age_seconds: int = _LOCK_CLEANUP_MAX_AGE_SECONDS) -> None:
+    """Best-effort prune of lock files older than max_age_seconds. Never raises."""
+    try:
+        now = time.time()
+        for name in os.listdir(_LOCK_DIR):
+            p = os.path.join(_LOCK_DIR, name)
+            try:
+                if now - os.stat(p).st_mtime > max_age_seconds:
+                    os.unlink(p)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def _lock_path(event_type: str, session_id: str) -> str:
+    """Composed lock-file path for a (event_type, session_id) trigger.
+
+    Sanitizes both components so they cannot escape _LOCK_DIR. Shared by
+    claim_hook_run() and release_hook_run() so the two never drift."""
+    safe_sid = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)[:64]
+    safe_event = re.sub(r"[^A-Za-z0-9_-]", "_", event_type)[:32]
+    return os.path.join(_LOCK_DIR, f"{safe_sid}-{safe_event}")
+
+
+def claim_hook_run(event_type: str, session_id: str,
+                   ttl_seconds: int = _HOOK_DEDUP_TTL_SECONDS) -> bool:
+    """Return True if THIS process should handle the (event_type, session_id)
+    trigger; False if a sibling plugin copy already claimed it within ttl_seconds.
+
+    Coordinates the double-install case (monorepo + standalone both present) via
+    an O_EXCL lock file under _SECURE_DIR/locks/, a fixed path shared by every
+    install source. Simultaneous duplicate fires land within the TTL window and
+    the loser returns False; legitimate later fires (e.g. a second SessionStart)
+    are outside the window and re-claim.
+
+    Taking over a stale lock (a legitimate later fire past the TTL) is not
+    atomic: two processes can both observe the stale lock, but the unlink +
+    re-create race resolves to one winner and the loser returns False, so the
+    failure direction is always "suppress", never "duplicate".
+
+    Fail-open: an empty session_id (no key to dedup on) or any filesystem error
+    returns True — a permissions quirk must never silently drop a hook.
+    """
+    if not session_id:
+        return True
+    try:
+        os.makedirs(_LOCK_DIR, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        print(f"[obsidian-brain] dedup lock dir unavailable, proceeding: {exc}", file=sys.stderr)
+        return True
+
+    lock_path = _lock_path(event_type, session_id)
+
+    payload = f"{os.getpid()} {time.time():.3f}\n".encode("utf-8")
+
+    def _create() -> bool:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        _cleanup_stale_locks()  # only the winner scans the locks dir
+        return True
+
+    try:
+        return _create()
+    except FileExistsError:
+        try:
+            age = time.time() - os.stat(lock_path).st_mtime
+        except OSError:
+            return True  # fail open
+        if age < ttl_seconds:
+            return False  # a sibling plugin copy owns this trigger
+        # Stale lock -> a legitimate later fire. Take it over.
+        try:
+            os.unlink(lock_path)
+            return _create()
+        except FileExistsError:
+            return False  # lost the re-claim race
+        except OSError as exc:
+            print(f"[obsidian-brain] dedup re-claim failed, proceeding: {exc}", file=sys.stderr)
+            return True
+    except OSError as exc:
+        print(f"[obsidian-brain] dedup claim failed, proceeding: {exc}", file=sys.stderr)
+        return True
+
+
+def release_hook_run(event_type: str, session_id: str) -> None:
+    """Release a dedup lock previously taken by claim_hook_run() so a sibling
+    plugin copy (or a re-fire of the same trigger) can still handle it.
+
+    Call this when the work AFTER a successful claim fails — e.g. the vault
+    write errors or the hook raises. Without it, a transient failure on the
+    winning copy would convert a suppressed sibling into a permanently lost
+    note. Do NOT call it on success: the lock must persist for its TTL so a
+    near-simultaneous sibling fire is still deduplicated. Never raises."""
+    if not session_id:
+        return
+    lock_path = _lock_path(event_type, session_id)
+    try:
+        # Only release a lock THIS process still owns. claim_hook_run wrote our
+        # PID into the payload; if a legitimate later fire took over our stale
+        # lock (>TTL), the PID won't match and unlinking its fresh lock would
+        # let a sibling re-claim and write a duplicate. On any read/parse error
+        # fall through to the unconditional unlink so a transient glitch never
+        # strands a claimed-but-failed run (a lost note is worse than a rare dup).
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                owner_pid = int(f.read().split(None, 1)[0])
+            if owner_pid != os.getpid():
+                return  # taken over by another process — not ours to release
+        except (OSError, ValueError, IndexError):
+            pass  # unreadable / unparseable — fall through to best-effort unlink
+        os.unlink(lock_path)
+    except OSError:
+        pass  # already gone / never created / unwritable — nothing to undo
+
+
 # --- Session-scoped cache ---
 # Avoids repeated vault scans when multiple skills run in one session.
 

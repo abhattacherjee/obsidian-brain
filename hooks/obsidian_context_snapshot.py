@@ -21,12 +21,14 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from obsidian_utils import (  # noqa: E402
+    claim_hook_run,
     extract_assistant_messages,
     extract_session_metadata,
     extract_user_messages,
     load_config,
     make_filename,
     read_transcript,
+    release_hook_run,
     scrub_secrets,
     slugify,
     write_vault_note,
@@ -205,6 +207,10 @@ def _run() -> None:
         print("[obsidian-brain] missing session_id or transcript_path, skipping", file=sys.stderr)
         return
 
+    if not claim_hook_run("PreCompact", session_id):
+        print("[obsidian-brain] snapshot skipped: sibling plugin already handled this compact", file=sys.stderr)
+        return
+
     # 2. Load config
     config = load_config()
     vault_path = config.get("vault_path", "")
@@ -255,11 +261,21 @@ def _run() -> None:
     # collisions between multiple /compact invocations in the same day).
     filename = make_filename(date_str, project_slug, session_id, suffix=f"-snapshot-{hhmmss}")
 
-    result = write_vault_note(vault_path, sessions_folder, filename, content)
-    if result is None:
-        print(f"[obsidian-brain] snapshot written: {filename}", file=sys.stderr)
-    else:
-        print(f"[obsidian-brain] failed to write snapshot: {result}", file=sys.stderr)
+    snapshot_written = False
+    try:
+        result = write_vault_note(vault_path, sessions_folder, filename, content)
+        if result is None:
+            snapshot_written = True
+            print(f"[obsidian-brain] snapshot written: {filename}", file=sys.stderr)
+        else:
+            print(f"[obsidian-brain] failed to write snapshot: {result}", file=sys.stderr)
+    finally:
+        # Release the dedup lock if the snapshot did not land, so a sibling
+        # install or a re-fire can still produce it — a transient write error
+        # must not let the suppressed sibling's claim strand the snapshot for
+        # the TTL window. Mirrors the SessionEnd release-on-failure guarantee.
+        if not snapshot_written:
+            release_hook_run("PreCompact", session_id)
 
 
 if __name__ == "__main__":

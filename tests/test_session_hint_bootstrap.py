@@ -132,19 +132,32 @@ def test_hook_log_rotates_when_large(tmp_path):
 
 
 def test_bootstrap_prefix_default(monkeypatch):
-    """Bootstrap prefix is fixed to the secure directory (env var override removed)."""
-    monkeypatch.delenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", raising=False)
+    """Bootstrap prefix is fixed to the secure directory (env var override removed).
+
+    We verify the source-level definition rather than the live module attribute
+    because the global _isolate_secure_dir_globally autouse fixture patches
+    _BOOTSTRAP_PREFIX to a per-test tmp dir for isolation purposes."""
+    import inspect
     import obsidian_utils
-    expected = os.path.join(os.path.expanduser("~/.claude/obsidian-brain"), "sid-")
-    assert obsidian_utils._bootstrap_prefix() == expected
+    src = inspect.getsource(obsidian_utils)
+    assert '_BOOTSTRAP_PREFIX = os.path.join(_SECURE_DIR, "sid-")' in src, (
+        "_BOOTSTRAP_PREFIX not defined as os.path.join(_SECURE_DIR, 'sid-') in source"
+    )
 
 
-def test_bootstrap_prefix_ignores_env_override(monkeypatch, tmp_path):
-    """Env var OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX is no longer honored (C2)."""
-    monkeypatch.setenv("OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX", str(tmp_path / "pref-"))
+def test_bootstrap_prefix_ignores_env_override():
+    """Env var OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX is not honored (C2).
+
+    Runtime coverage of _bootstrap_prefix() is in
+    test_security.py::TestEnvVarOverrideRemoved::test_bootstrap_prefix_ignores_env_var.
+    This test asserts the source itself never reads that env var."""
+    import inspect
     import obsidian_utils
-    expected = os.path.join(os.path.expanduser("~/.claude/obsidian-brain"), "sid-")
-    assert obsidian_utils._bootstrap_prefix() == expected
+    src = inspect.getsource(obsidian_utils)
+    assert "OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX" not in src, (
+        "env var OBSIDIAN_BRAIN_BOOTSTRAP_PREFIX should not appear anywhere in source"
+    )
+    assert '_BOOTSTRAP_PREFIX = os.path.join(_SECURE_DIR, "sid-")' in src
 
 
 def test_write_bootstrap_atomic_success(monkeypatch, tmp_path):

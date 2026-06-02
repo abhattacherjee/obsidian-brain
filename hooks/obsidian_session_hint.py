@@ -25,6 +25,7 @@ from obsidian_utils import (  # noqa: E402
     _HOOK_LOG_MAX_BYTES,
     _HOOK_LOG_NAME,
     _sanitize_log_field,
+    claim_hook_run,
     find_latest_session,
     get_project_name,
     load_config,
@@ -70,8 +71,14 @@ def _write_bootstrap_atomic(project: str, session_id: str) -> bool:
                 pass
 
 
-def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool) -> None:
-    """Append a one-line audit record; rotate the log when it exceeds the cap."""
+def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool,
+                     dedup_skipped: bool = False) -> None:
+    """Append a one-line audit record; rotate the log when it exceeds the cap.
+
+    When dedup_skipped is True, records an outcome=SKIPPED_DEDUP line instead of
+    the normal bootstrap record, so a SessionStart suppressed by the cross-plugin
+    guard stays visible on the hook-log diagnostic surface (otherwise a deduped
+    SessionStart is indistinguishable from the hook never firing)."""
     log_dir = os.path.join(os.path.expanduser("~"), ".claude")
     log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
     try:
@@ -85,10 +92,16 @@ def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool) -> 
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         short_sid = _sanitize_log_field((session_id or "unknown")[:8]).replace(" ", "_")
         safe_project = _sanitize_log_field(project, "unknown").replace(" ", "_")
-        line = (
-            f"{timestamp} SessionStart project={safe_project} sid={short_sid} "
-            f"bootstrap_updated={'true' if bootstrap_updated else 'false'}\n"
-        )
+        if dedup_skipped:
+            line = (
+                f"{timestamp} SessionStart project={safe_project} sid={short_sid} "
+                f"outcome=SKIPPED_DEDUP\n"
+            )
+        else:
+            line = (
+                f"{timestamp} SessionStart project={safe_project} sid={short_sid} "
+                f"bootstrap_updated={'true' if bootstrap_updated else 'false'}\n"
+            )
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line)
         try:
@@ -128,10 +141,18 @@ def _run() -> None:
     # see canonical_project_name().
     project = get_project_name(cwd)
 
-    # 2a. Refresh the bootstrap file with the authoritative session_id from stdin.
-    # This runs regardless of vault configuration so the bootstrap stays current
-    # even when obsidian-brain is not fully configured.
+    # 2a. Guard first: when both the monorepo and standalone plugins are
+    # installed, only the winning copy acts on this SessionStart trigger.
     session_id = hook_input.get("session_id", "")
+    if not claim_hook_run("SessionStart", session_id):
+        # sibling plugin copy already wrote the bootstrap + emitted the hint;
+        # record the suppression so it is visible in the hook log.
+        _append_hook_log(project, session_id, False, dedup_skipped=True)
+        return
+    # Refresh the bootstrap file with the authoritative session_id from stdin
+    # (winner only; the loser short-circuits above). Runs regardless of vault
+    # configuration so the bootstrap stays current even when obsidian-brain is
+    # not fully configured.
     bootstrap_updated = False
     if session_id:
         bootstrap_updated = _write_bootstrap_atomic(project, session_id)

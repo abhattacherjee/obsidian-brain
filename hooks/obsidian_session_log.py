@@ -26,6 +26,7 @@ import obsidian_utils  # noqa: E402  — used for _first_seen_date qualified cal
 from obsidian_utils import (  # noqa: E402
     _append_sessionend_log,
     build_raw_fallback,
+    claim_hook_run,
     extract_assistant_messages,
     extract_session_metadata,
     extract_tool_uses,
@@ -35,6 +36,7 @@ from obsidian_utils import (  # noqa: E402
     load_config,
     make_filename,
     read_transcript,
+    release_hook_run,
     should_skip_session,
     slugify,
     write_vault_note,
@@ -56,6 +58,7 @@ class _Outcome:
     SKIPPED_AUTO_LOG_OFF = "SKIPPED_AUTO_LOG_OFF"
     SKIPPED_INVALID_INPUT = "SKIPPED_INVALID_INPUT"
     SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS = "SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS"
+    SKIPPED_DEDUP = "SKIPPED_DEDUP"
     WRITE_FAILED = "WRITE_FAILED"
     EXCEPTION = "EXCEPTION"
 
@@ -417,31 +420,56 @@ def _run() -> None:
         project_slug = slugify(metadata.get("project", "session"))
         filename = make_filename(date_str, project_slug, session_id)
 
-        # 9. Extract tool usage details and write raw note FIRST
-        tool_uses = extract_tool_uses(messages)
-        raw_body = build_raw_fallback(user_msgs, metadata, assistant_msgs=assistant_msgs, tool_uses=tool_uses, config=config)
-        raw_content = _build_note(session_id, metadata, raw_body, resumed=resumed)
-        write_err = write_vault_note(vault_path, sessions_folder, filename, raw_content)
-        if write_err is not None:
-            print(f"[obsidian-brain] failed to write raw note: {write_err}", file=sys.stderr)
+        # 9. Cross-plugin dedup guard — if a sibling install already claimed
+        # this (SessionEnd, session_id) trigger, skip before doing the
+        # expensive raw-body build (up to ~120 turns) on the loser path.
+        if not claim_hook_run("SessionEnd", session_id):
             _append_sessionend_log(
                 project=metadata.get("project") or _project_slug_for_log(cwd),
                 session_id=session_id,
-                outcome=_Outcome.WRITE_FAILED,
+                outcome=_Outcome.SKIPPED_DEDUP,
                 msgs=len(user_msgs),
                 dur_min=float(metadata.get("duration_minutes", 0.0)),
-                detail=f"{write_err}; target={Path(vault_path) / sessions_folder / filename}",
+                detail="dedup skip",
             )
             return
-        print("[obsidian-brain] raw note written (summarization deferred to /recall)", file=sys.stderr)
-        _append_sessionend_log(
-            project=metadata.get("project") or _project_slug_for_log(cwd),
-            session_id=session_id,
-            outcome=_Outcome.OK_RAW_NOTE_ONLY,
-            msgs=len(user_msgs),
-            dur_min=float(metadata.get("duration_minutes", 0.0)),
-            detail="snapshot-bypass" if (was_threshold_skipped and snapshots) else "",
-        )
+
+        # 10. Extract tool usage details and write raw note FIRST. If anything
+        # after the dedup claim fails (write error or exception), release the
+        # lock so a sibling install or a re-fire can still produce the note —
+        # a claimed-but-failed run must not turn a suppressed sibling into a
+        # lost note. The lock is intentionally NOT released on success: it must
+        # persist for its TTL to dedup a near-simultaneous sibling fire.
+        note_written = False
+        try:
+            tool_uses = extract_tool_uses(messages)
+            raw_body = build_raw_fallback(user_msgs, metadata, assistant_msgs=assistant_msgs, tool_uses=tool_uses, config=config)
+            raw_content = _build_note(session_id, metadata, raw_body, resumed=resumed)
+            write_err = write_vault_note(vault_path, sessions_folder, filename, raw_content)
+            if write_err is not None:
+                print(f"[obsidian-brain] failed to write raw note: {write_err}", file=sys.stderr)
+                _append_sessionend_log(
+                    project=metadata.get("project") or _project_slug_for_log(cwd),
+                    session_id=session_id,
+                    outcome=_Outcome.WRITE_FAILED,
+                    msgs=len(user_msgs),
+                    dur_min=float(metadata.get("duration_minutes", 0.0)),
+                    detail=f"{write_err}; target={Path(vault_path) / sessions_folder / filename}",
+                )
+                return
+            note_written = True
+            print("[obsidian-brain] raw note written (summarization deferred to /recall)", file=sys.stderr)
+            _append_sessionend_log(
+                project=metadata.get("project") or _project_slug_for_log(cwd),
+                session_id=session_id,
+                outcome=_Outcome.OK_RAW_NOTE_ONLY,
+                msgs=len(user_msgs),
+                dur_min=float(metadata.get("duration_minutes", 0.0)),
+                detail="snapshot-bypass" if (was_threshold_skipped and snapshots) else "",
+            )
+        finally:
+            if not note_written:
+                release_hook_run("SessionEnd", session_id)
     finally:
         # Run cache cleanup regardless of how _run() exits so /tmp does not
         # accumulate stale cache files on any SessionEnd outcome — including
