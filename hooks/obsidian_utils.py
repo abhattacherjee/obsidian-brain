@@ -1936,6 +1936,18 @@ _SUMMARY_FALLBACK_CHAIN = ("sonnet", "opus")
 # different model won't fix an environment problem.
 _MODEL_ESCALATION_REASONS = frozenset({"empty_output"})
 
+# Capability rank for escalation: only escalate to a MORE capable model than the
+# primary. Prevents a backwards chain when summary_model is explicitly "opus"/"sonnet".
+_MODEL_RANK = {"haiku": 0, "sonnet": 1, "opus": 2}
+
+
+def _escalation_models(primary: str) -> list[str]:
+    """Ordered model list: the primary, then any fallback-chain model strictly
+    more capable than the primary (#165). e.g. haiku -> [haiku, sonnet, opus];
+    sonnet -> [sonnet, opus]; opus -> [opus]."""
+    base = _MODEL_RANK.get(primary, 0)
+    return [primary] + [m for m in _SUMMARY_FALLBACK_CHAIN if _MODEL_RANK.get(m, 0) > base]
+
 
 def generate_snapshot_summary(
     user_msgs: list[str],
@@ -4453,9 +4465,7 @@ def upgrade_unsummarized_note(
     # Sonnet, then Opus, but ONLY when the failure is a quality reason
     # (empty_output). Timeouts / subprocess errors break immediately — a more
     # capable model won't fix a slow CLI cold-start or a missing binary.
-    models_to_try = [summary_model] + [
-        m for m in _SUMMARY_FALLBACK_CHAIN if m != summary_model
-    ]
+    models_to_try = _escalation_models(summary_model)
     summary_text = None
     fallback_reason = None
     model_used = None
@@ -4667,9 +4677,11 @@ def generate_summaries_batch(
         next(it, None)  # skip preamble before first header
         for k_str, block in zip(it, it):
             try:
-                parsed_blocks[int(k_str)] = block
+                k_int = int(k_str)
             except ValueError:
-                pass
+                continue
+            if k_int not in parsed_blocks:  # first-occurrence-wins (#165 Fix 1)
+                parsed_blocks[k_int] = block
 
         _has_summary_re = re.compile(r"^## Summary", re.MULTILINE)
 
@@ -4680,7 +4692,14 @@ def generate_summaries_batch(
                 block_text = parsed_blocks[k].strip()
                 if _has_summary_re.search(block_text):
                     if existing_items:
-                        block_text = _dedup_summary_open_items(block_text, existing_items)
+                        try:
+                            block_text = _dedup_summary_open_items(block_text, existing_items)
+                        except Exception as exc:  # noqa: BLE001 — dedup is best-effort, never fail the note
+                            print(
+                                f"[obsidian-brain] batch open-item dedup failed (non-fatal) "
+                                f"({type(exc).__name__}): {exc}",
+                                file=sys.stderr,
+                            )
                     results.append((block_text, None))
                 else:
                     results.append((None, "missing_section"))
@@ -4752,7 +4771,12 @@ def upgrade_batch(
     if summary_batch_size is None:
         try:
             summary_batch_size = int(load_config().get("summary_batch_size", 3))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[obsidian-brain] invalid summary_batch_size in config "
+                f"({type(exc).__name__}): {exc}; using 3",
+                file=sys.stderr,
+            )
             summary_batch_size = 3
     else:
         summary_batch_size = int(summary_batch_size)
@@ -4898,7 +4922,7 @@ def upgrade_batch(
         g_t0 = time.monotonic()
 
         # Try primary model, escalate on whole-group empty_output.
-        models_to_try = [summary_model] + [m for m in _SUMMARY_FALLBACK_CHAIN if m != summary_model]
+        models_to_try = _escalation_models(summary_model)
         group_results: list[tuple[str | None, str | None]] | None = None
         used_model = summary_model
 
@@ -4920,6 +4944,10 @@ def upgrade_batch(
             break
 
         if group_results is None:
+            print(
+                "[obsidian-brain] BUG: group_results unset after escalation loop (empty models_to_try?)",
+                file=sys.stderr,
+            )
             group_results = [(None, "empty_output")] * len(group_paths)
 
         g_wall = time.monotonic() - g_t0
@@ -4929,26 +4957,34 @@ def upgrade_batch(
         solo_fallback_paths: list[str] = []
 
         for p, (summary_text, parse_reason) in zip(group_paths, group_results):
-            if summary_text is not None:
-                # Attempt write-back.
-                prep = preps[p]
-                write_status = upgrade_note_with_summary(
-                    p, summary_text, vault_path, sessions_folder, project,
-                    source=prep["source"], warnings=prep["warnings"],
-                )
-                if write_status.startswith("Upgraded "):
-                    results_by_path[p] = {
-                        "path": p,
-                        "status": write_status,
-                        "elapsed_s": per_note_elapsed,
-                        "model_used": used_model,
-                        "fallback_reason": None,
-                    }
+            try:
+                if summary_text is not None:
+                    # Attempt write-back.
+                    prep = preps[p]
+                    write_status = upgrade_note_with_summary(
+                        p, summary_text, vault_path, sessions_folder, project,
+                        source=prep["source"], warnings=prep["warnings"],
+                    )
+                    if write_status.startswith("Upgraded "):
+                        results_by_path[p] = {
+                            "path": p,
+                            "status": write_status,
+                            "elapsed_s": per_note_elapsed,
+                            "model_used": used_model,
+                            "fallback_reason": None,
+                        }
+                    else:
+                        # Write-back failed — route to solo fallback.
+                        solo_fallback_paths.append(p)
                 else:
-                    # Write-back failed — route to solo fallback.
+                    # No usable summary — route to solo fallback.
                     solo_fallback_paths.append(p)
-            else:
-                # No usable summary — route to solo fallback.
+            except Exception as exc:  # noqa: BLE001 — never let one note crash the batch
+                print(
+                    f"[obsidian-brain] write-back raised unexpectedly for "
+                    f"{os.path.basename(p)} ({type(exc).__name__}): {exc}",
+                    file=sys.stderr,
+                )
                 solo_fallback_paths.append(p)
 
         # Run solo fallback for all notes that need it in this group.

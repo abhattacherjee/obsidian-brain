@@ -2626,6 +2626,213 @@ class TestUpgradeBatchBatching:
         assert text2 is None, f"block 2 should be rejected (missing ## Summary)"
         assert reason2 == "missing_section"
 
+    def test_duplicate_summary_delimiter_first_wins(self, monkeypatch, tmp_path):
+        """Fix 1: first-occurrence-wins — a repeated ===== SUMMARY k ===== delimiter
+        in model output must NOT overwrite the valid first block with the junk repeat."""
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        prep1 = {
+            "ok": True,
+            "user_msgs": ["hello"],
+            "assistant_msgs": ["hi"],
+            "metadata": {"project": "test", "vault_path": "", "sessions_folder": ""},
+            "note_type": "claude-session",
+            "source": "raw note",
+            "warnings": [],
+        }
+        prep2 = dict(prep1)
+
+        valid_block_1 = (
+            "## Summary\nDid a thing.\n\n"
+            "## Key Decisions\n- None noted.\n\n"
+            "## Changes Made\n- None noted.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n"
+            "## Importance\n5\n"
+        )
+        junk_fragment_1 = "Oops this is extra repeated output without Summary section.\n"
+        valid_block_2 = (
+            "## Summary\nSecond note done.\n\n"
+            "## Key Decisions\n- None noted.\n\n"
+            "## Changes Made\n- None noted.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n"
+            "## Importance\n4\n"
+        )
+
+        # Model repeats the SUMMARY 1 delimiter — the junk block lacks ## Summary.
+        stdout_text = (
+            f"===== SUMMARY 1 =====\n{valid_block_1}"
+            f"===== SUMMARY 1 =====\n{junk_fragment_1}"
+            f"===== SUMMARY 2 =====\n{valid_block_2}"
+        )
+
+        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+            class _Res:
+                returncode = 0
+                stdout = stdout_text
+                stderr = ""
+            return _Res()
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_subprocess_run)
+
+        results = obsidian_utils.generate_summaries_batch(
+            [prep1, prep2],
+            model="haiku",
+            timeout=30,
+            project="test",
+            vault_path="",
+            sessions_folder="",
+        )
+
+        assert len(results) == 2
+        text1, reason1 = results[0]
+        text2, reason2 = results[1]
+
+        # Block 1: first occurrence (valid) must win; the junk repeat must be ignored.
+        assert reason1 is None, (
+            f"block 1 should be accepted (first-occurrence-wins); reason={reason1!r}"
+        )
+        assert text1 is not None, "block 1 text should not be None"
+        assert "## Summary" in text1, "block 1 should contain the valid ## Summary section"
+        assert "Oops" not in (text1 or ""), (
+            "junk fragment must not appear in block 1 result"
+        )
+
+        # Block 2 should also be valid.
+        assert reason2 is None, f"block 2 should be accepted; reason={reason2!r}"
+        assert text2 is not None
+
+    def test_writeback_exception_routes_to_solo_fallback(self, monkeypatch, tmp_path):
+        """Fix 3: if upgrade_note_with_summary raises for one note, that note is
+        routed to solo fallback and NO exception propagates out of upgrade_batch."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        note_names = [f"note{i}.md" for i in range(3)]
+        paths = [str(self._write_session_note(sessions_dir, name)) for name in note_names]
+        bad_path = paths[1]  # index 1 will raise on write-back
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        def fake_generate_summaries_batch(prepared_notes, **kwargs):
+            return [(self._fake_good_summary(), None)] * len(prepared_notes)
+
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch", fake_generate_summaries_batch)
+
+        def fake_upgrade_note_with_summary(path, summary, *args, **kwargs):
+            if path == bad_path:
+                raise RuntimeError("simulated write-back failure")
+            return f"Upgraded {os.path.basename(path)} (source: batch)"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_note_with_summary", fake_upgrade_note_with_summary)
+
+        solo_fallback_called: list[str] = []
+        def fake_upgrade_unsummarized_note(path, *args, **kwargs):
+            solo_fallback_called.append(path)
+            return f"Upgraded {os.path.basename(path)} (source: solo-fallback)", 0.1, "haiku", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_upgrade_unsummarized_note)
+
+        # Must not raise even though write-back raises for bad_path.
+        results = obsidian_utils.upgrade_batch(
+            paths, str(tmp_path), "sessions", "test-project",
+            summary_batch_size=5,
+        )
+
+        # All 3 results present in input order, no KeyError.
+        assert len(results) == 3
+        assert [r["path"] for r in results] == paths
+
+        # bad_path was routed to solo fallback.
+        assert bad_path in solo_fallback_called, (
+            f"raising path should have gone to solo fallback; solo_fallback_called={solo_fallback_called!r}"
+        )
+
+        # All results have Upgraded status (solo succeeded for the bad path).
+        for r in results:
+            assert r["status"].startswith("Upgraded "), (
+                f"all notes should be Upgraded, got: {r['status']!r}"
+            )
+
+    def test_dedup_failure_does_not_fail_note(self, monkeypatch, tmp_path):
+        """Fix 2: if _dedup_summary_open_items raises, the note is still accepted
+        with the undeduped block_text — result is (text, None), NOT (None, 'missing_section')."""
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        prep1 = {
+            "ok": True,
+            "user_msgs": ["hello"],
+            "assistant_msgs": ["hi"],
+            "metadata": {"project": "test", "vault_path": "", "sessions_folder": ""},
+            "note_type": "claude-session",
+            "source": "raw note",
+            "warnings": [],
+        }
+
+        valid_block = (
+            "## Summary\nDedup failure test.\n\n"
+            "## Key Decisions\n- None noted.\n\n"
+            "## Changes Made\n- None noted.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n"
+            "## Importance\n3\n"
+        )
+        stdout_text = f"===== SUMMARY 1 =====\n{valid_block}"
+
+        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+            class _Res:
+                returncode = 0
+                stdout = stdout_text
+                stderr = ""
+            return _Res()
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_subprocess_run)
+
+        # Make _dedup_summary_open_items raise.
+        monkeypatch.setattr(
+            obsidian_utils,
+            "_dedup_summary_open_items",
+            lambda block_text, existing_items: (_ for _ in ()).throw(RuntimeError("dedup boom")),
+        )
+
+        # Patch the import inside generate_summaries_batch so existing_items is non-empty.
+        # Save and restore the real module (if already loaded) to avoid contaminating
+        # other tests that use open_item_dedup (test-ordering safety).
+        import types
+        import sys as _sys
+
+        fake_oid_module = types.ModuleType("open_item_dedup")
+        fake_oid_module.collect_open_items = lambda *a, **kw: [("s", "t", "existing item 1")]
+
+        _orig_oid = _sys.modules.get("open_item_dedup")
+        _sys.modules["open_item_dedup"] = fake_oid_module
+
+        try:
+            results = obsidian_utils.generate_summaries_batch(
+                [prep1],
+                model="haiku",
+                timeout=30,
+                project="test",
+                vault_path="",
+                sessions_folder="",
+            )
+        finally:
+            # Restore the original module (or remove if it wasn't present before).
+            if _orig_oid is not None:
+                _sys.modules["open_item_dedup"] = _orig_oid
+            else:
+                _sys.modules.pop("open_item_dedup", None)
+
+        assert len(results) == 1
+        text1, reason1 = results[0]
+
+        # Must be accepted (not failed) even though dedup raised.
+        assert reason1 is None, (
+            f"dedup failure should not fail the note; reason={reason1!r}"
+        )
+        assert text1 is not None, "text should not be None when dedup fails"
+        assert "## Summary" in text1
+
 
 # ===========================================================================
 # Section N: canonical_project_name — worktree-aware project name derivation
@@ -3235,3 +3442,40 @@ class TestModelEscalationChain:
         assert status.startswith("Upgraded "), f"expected success, got: {status}"
         assert model_used == "haiku"
         assert fallback_reason is None
+
+
+# ===========================================================================
+# TestEscalationModels — unit tests for _escalation_models helper (Fix 4)
+# ===========================================================================
+
+
+class TestEscalationModels:
+    """Unit tests for the _escalation_models() capability-ranked helper (#165 Fix 4).
+
+    Ensures the escalation list only goes UP in capability, never backwards, so
+    that passing summary_model="sonnet" does not produce ["sonnet", "haiku", "opus"].
+    """
+
+    def test_haiku_escalates_through_full_chain(self):
+        """haiku -> [haiku, sonnet, opus]: all models tried in capability order."""
+        import obsidian_utils
+        result = obsidian_utils._escalation_models("haiku")
+        assert result == ["haiku", "sonnet", "opus"], (
+            f"haiku should escalate through full chain; got: {result!r}"
+        )
+
+    def test_sonnet_escalates_only_to_opus(self):
+        """sonnet -> [sonnet, opus]: haiku (less capable) is excluded."""
+        import obsidian_utils
+        result = obsidian_utils._escalation_models("sonnet")
+        assert result == ["sonnet", "opus"], (
+            f"sonnet should only escalate to opus; got: {result!r}"
+        )
+
+    def test_opus_no_escalation(self):
+        """opus -> [opus]: already at max capability, nothing to escalate to."""
+        import obsidian_utils
+        result = obsidian_utils._escalation_models("opus")
+        assert result == ["opus"], (
+            f"opus should have no escalation targets; got: {result!r}"
+        )
