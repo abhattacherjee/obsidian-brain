@@ -26,6 +26,7 @@ import obsidian_utils  # noqa: E402  — used for _first_seen_date qualified cal
 from obsidian_utils import (  # noqa: E402
     _append_sessionend_log,
     build_raw_fallback,
+    claim_hook_run,
     extract_assistant_messages,
     extract_session_metadata,
     extract_tool_uses,
@@ -56,6 +57,7 @@ class _Outcome:
     SKIPPED_AUTO_LOG_OFF = "SKIPPED_AUTO_LOG_OFF"
     SKIPPED_INVALID_INPUT = "SKIPPED_INVALID_INPUT"
     SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS = "SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS"
+    SKIPPED_DEDUP = "SKIPPED_DEDUP"
     WRITE_FAILED = "WRITE_FAILED"
     EXCEPTION = "EXCEPTION"
 
@@ -417,7 +419,21 @@ def _run() -> None:
         project_slug = slugify(metadata.get("project", "session"))
         filename = make_filename(date_str, project_slug, session_id)
 
-        # 9. Extract tool usage details and write raw note FIRST
+        # 9. Cross-plugin dedup guard — if a sibling install already claimed
+        # this (SessionEnd, session_id) trigger, skip before doing the
+        # expensive raw-body build (up to ~120 turns) on the loser path.
+        if not claim_hook_run("SessionEnd", session_id):
+            _append_sessionend_log(
+                project=metadata.get("project") or _project_slug_for_log(cwd),
+                session_id=session_id,
+                outcome=_Outcome.SKIPPED_DEDUP,
+                msgs=len(user_msgs),
+                dur_min=float(metadata.get("duration_minutes", 0.0)),
+                detail="dedup skip",
+            )
+            return
+
+        # 10. Extract tool usage details and write raw note FIRST
         tool_uses = extract_tool_uses(messages)
         raw_body = build_raw_fallback(user_msgs, metadata, assistant_msgs=assistant_msgs, tool_uses=tool_uses, config=config)
         raw_content = _build_note(session_id, metadata, raw_body, resumed=resumed)

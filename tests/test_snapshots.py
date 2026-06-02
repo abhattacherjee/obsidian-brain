@@ -203,6 +203,7 @@ def test_session_log_writes_anchor_when_snapshots_exist_despite_low_messages(tmp
         "transcript_path": str(transcript),
     })
     monkeypatch.setattr("sys.stdin", io.StringIO(stdin_json))
+    monkeypatch.setattr(sesslog, "claim_hook_run", lambda *a, **kw: True)
 
     sesslog._run()
 
@@ -271,6 +272,7 @@ def test_early_skip_bypass_is_independently_exercised(tmp_path, monkeypatch):
         "transcript_path": str(transcript),
     })
     monkeypatch.setattr("sys.stdin", io.StringIO(stdin_json))
+    monkeypatch.setattr(sesslog, "claim_hook_run", lambda *a, **kw: True)
 
     sesslog._run()
 
@@ -337,6 +339,7 @@ def test_session_log_finds_yesterday_snapshot_across_midnight(tmp_path, monkeypa
         "transcript_path": str(transcript),
     })
     monkeypatch.setattr("sys.stdin", io.StringIO(stdin_json))
+    monkeypatch.setattr(sesslog, "claim_hook_run", lambda *a, **kw: True)
 
     sesslog._run()
 
