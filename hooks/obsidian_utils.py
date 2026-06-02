@@ -2005,6 +2005,13 @@ for _sec in _CANONICAL_SECTIONS:
     _HEADING_NORM_PATTERNS.append((_pat, f"## {_sec}"))
 del _sec, _esc, _pat  # clean up loop variables from module namespace
 
+# Pre-compiled per-section presence regexes for Step-3 section synthesis.
+# Built once at import time alongside _HEADING_NORM_PATTERNS.
+_SECTION_PRESENCE_RES: dict[str, re.Pattern] = {
+    name: re.compile(rf"^## {re.escape(name)}\s*$", re.MULTILINE)
+    for name in _CANONICAL_SECTIONS
+}
+
 # The one regex that upgrade_note_with_summary uses as its gating check.
 _SUMMARY_SECTION_RE = re.compile(r"^## Summary\s*$", re.MULTILINE)
 
@@ -2032,14 +2039,49 @@ def _normalize_summary(text: str) -> tuple[str, list[str]]:
     recovery_notes: list[str] = []
 
     # Step 1: heading normalization — replace variant headings with canonical
-    # ## forms.  We iterate all sections so a single pass handles all of them.
-    normalized = text
-    for pattern, replacement in _HEADING_NORM_PATTERNS:
-        sec_name = replacement[3:]  # strip leading "## "
-        new_text, n_subs = pattern.subn(replacement, normalized)
-        if n_subs:
-            normalized = new_text
-            recovery_notes.append(f"normalized heading: {sec_name}")
+    # ## forms.  Operates LINE-BY-LINE to skip fenced code blocks, so a line
+    # like `# Summary` inside a ``` or ~~~ fence is left unchanged (idempotency
+    # fix: well-formed summaries that contain code blocks are not mutated).
+    #
+    # Implementation note: the patterns use MULTILINE `$` which matches before
+    # `\n` but does NOT consume it.  When applied via subn() to an individual
+    # line that ends with `\n`, the match covers everything up to (not including)
+    # the `\n`, so the replacement text lacks the trailing newline.  We therefore
+    # split with keepends=True but strip/restore the line ending ourselves so the
+    # substitution result is re-joined correctly.
+    lines = text.splitlines(keepends=True)
+    in_fence = False
+    out_lines: list[str] = []
+    # Track which section names were recovered so we can build recovery_notes
+    # after the line loop (one note per section, regardless of line count).
+    recovered_sections: set[str] = set()
+    for line in lines:
+        stripped = line.rstrip("\n").rstrip()
+        # Toggle fence state on opening/closing fence markers.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            out_lines.append(line)
+            continue
+        if in_fence:
+            # Inside a code fence — pass through unchanged.
+            out_lines.append(line)
+            continue
+        # Outside a fence — apply heading-normalization patterns.
+        # Work on the bare content (no trailing newline) so the replacement is
+        # not affected by the `$`-before-`\n` consumption, then restore the eol.
+        eol = line[len(line.rstrip("\n")):]  # "\n" or "" for last line
+        bare = line.rstrip("\n")
+        new_bare = bare
+        for pattern, replacement in _HEADING_NORM_PATTERNS:
+            sec_name = replacement[3:]  # strip leading "## "
+            result, n_subs = pattern.subn(replacement, new_bare)
+            if n_subs:
+                new_bare = result
+                recovered_sections.add(sec_name)
+        out_lines.append(new_bare + eol)
+    normalized = "".join(out_lines)
+    for sec_name in recovered_sections:
+        recovery_notes.append(f"normalized heading: {sec_name}")
 
     # Step 2: if the gating regex still doesn't match after normalization,
     # recovery cannot succeed — return the ORIGINAL text unchanged so the
@@ -2048,11 +2090,11 @@ def _normalize_summary(text: str) -> tuple[str, list[str]]:
         return text, []
 
     # Step 3: synthesize missing non-Summary, non-Importance sections.
+    # Uses pre-compiled _SECTION_PRESENCE_RES — built once at import time.
     for sec_name in _CANONICAL_SECTIONS:
         if sec_name in ("Summary", "Importance"):
             continue
-        section_re = re.compile(r"^## " + re.escape(sec_name) + r"\s*$", re.MULTILINE)
-        if not section_re.search(normalized):
+        if not _SECTION_PRESENCE_RES[sec_name].search(normalized):
             normalized = normalized.rstrip("\n") + f"\n\n## {sec_name}\nNone."
             recovery_notes.append(f"synthesized section: {sec_name}")
 
@@ -4607,6 +4649,8 @@ def upgrade_unsummarized_note(
         if summary_text:
             if _summary_recovery_enabled():
                 summary_text, _rec = _normalize_summary(summary_text)
+                if _rec:
+                    warnings = warnings + [f"summary recovered (#167): {', '.join(_rec)}"]
             model_used = _model
             break
         if fallback_reason not in _MODEL_ESCALATION_REASONS:
@@ -4826,6 +4870,12 @@ def generate_summaries_batch(
                 # becoming (None, "missing_section").
                 if _recovery_enabled:
                     block_text, _rec = _normalize_summary(block_text)
+                    if _rec:
+                        print(
+                            f"[obsidian-brain] batch summary recovered (#167) for note {k}: "
+                            f"{', '.join(_rec)}",
+                            file=sys.stderr,
+                        )
                 if _has_summary_re.search(block_text):
                     if existing_items:
                         try:

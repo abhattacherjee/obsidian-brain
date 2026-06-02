@@ -3617,6 +3617,61 @@ class TestNormalizeSummary:
         )
         assert "9" in out2, "existing IMPORTANCE score must be preserved"
 
+    def test_idempotent_with_code_block(self):
+        """A well-formed summary containing a fenced code block with a '# Summary'
+        line inside the fence is returned UNCHANGED — idempotency fix (#167 Fix 1)."""
+        text = (
+            "## Summary\n"
+            "Implemented feature Z.\n\n"
+            "## Changes Made\n"
+            "Added helper:\n\n"
+            "```python\n"
+            "# Summary\n"
+            "def summarize(text):\n"
+            "    return text[:100]\n"
+            "```\n\n"
+            "## Key Decisions\n"
+            "- Kept it simple.\n\n"
+            "## Errors Encountered\n"
+            "None.\n\n"
+            "## Open Questions / Next Steps\n"
+            "None.\n\n"
+            "## Importance\n"
+            "6\n"
+        )
+        out, notes = obsidian_utils._normalize_summary(text)
+        assert out == text, (
+            "well-formed summary with code block containing '# Summary' must be "
+            f"returned unchanged; diff: {set(out.splitlines()) ^ set(text.splitlines())}"
+        )
+        assert notes == [], (
+            f"no recovery notes expected for already-correct summary; got: {notes!r}"
+        )
+
+    def test_normalizes_open_questions_variant(self):
+        """'# Open Questions / Next Steps' (single-hash variant) is normalized to
+        '## Open Questions / Next Steps'."""
+        text = (
+            "## Summary\n"
+            "Did a thing.\n\n"
+            "## Key Decisions\n"
+            "None.\n\n"
+            "## Changes Made\n"
+            "None.\n\n"
+            "## Errors Encountered\n"
+            "None.\n\n"
+            "# Open Questions / Next Steps\n"
+            "- Check later.\n\n"
+            "## Importance\n"
+            "5\n"
+        )
+        out, notes = obsidian_utils._normalize_summary(text)
+        assert re.search(r"^## Open Questions / Next Steps\s*$", out, re.MULTILINE), (
+            "# Open Questions / Next Steps should be rewritten to "
+            "## Open Questions / Next Steps"
+        )
+        assert "normalized heading: Open Questions / Next Steps" in notes
+
 
 # ===========================================================================
 # TestRecoveryIntegration — solo-path integration for _normalize_summary (#167)
@@ -3784,4 +3839,142 @@ class TestRecoveryIntegration:
         )
         assert not status_off.startswith("Upgraded "), (
             f"recovery disabled: expected failure (malformed summary), got: {status_off!r}"
+        )
+
+
+# ===========================================================================
+# TestBatchRecovery — batch-path recovery tests (#167 Fix 4, tests 3 & 4)
+# ===========================================================================
+
+
+class TestBatchRecovery:
+    """Tests for _normalize_summary wired into generate_summaries_batch (#167)."""
+
+    # Minimal prep dict used by batch tests (no JSONL path needed).
+    _BASE_PREP: dict = {
+        "ok": True,
+        "user_msgs": ["hello"],
+        "assistant_msgs": ["hi"],
+        "metadata": {"project": "test", "vault_path": "", "sessions_folder": ""},
+        "note_type": "claude-session",
+        "source": "raw note",
+        "warnings": [],
+    }
+
+    @staticmethod
+    def _make_stdout(loose_block: str, good_block: str) -> str:
+        """Build ===== SUMMARY k ===== delimited stdout with 2 blocks."""
+        return (
+            f"===== SUMMARY 1 =====\n{loose_block}"
+            f"===== SUMMARY 2 =====\n{good_block}"
+        )
+
+    @staticmethod
+    def _good_block() -> str:
+        return (
+            "## Summary\nDid something.\n\n"
+            "## Key Decisions\n- None.\n\n"
+            "## Changes Made\n- None.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- None.\n\n"
+            "## Importance\n5\n"
+        )
+
+    @staticmethod
+    def _loose_block() -> str:
+        """Block with # Summary (single-hash) — recoverable by _normalize_summary."""
+        return (
+            "# Summary\n"
+            "Implemented the widget.\n\n"
+            "## Key Decisions\n"
+            "- Used pattern X.\n"
+        )
+
+    def test_batch_recovers_loose_block(self, monkeypatch):
+        """generate_summaries_batch: loose # Summary block is recovered (default enabled).
+
+        With recovery enabled (default), the first block's '# Summary' heading is
+        normalized to '## Summary' and the result is (text_with_##Summary, None),
+        NOT (None, 'missing_section').
+        """
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        stdout_text = self._make_stdout(self._loose_block(), self._good_block())
+
+        def fake_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+            class _R:
+                returncode = 0
+                stdout = stdout_text
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+
+        prep1 = dict(self._BASE_PREP)
+        prep2 = dict(self._BASE_PREP)
+
+        results = obsidian_utils.generate_summaries_batch(
+            [prep1, prep2], model="haiku", timeout=30,
+            project="test", vault_path="", sessions_folder="",
+        )
+
+        assert len(results) == 2
+        text1, reason1 = results[0]
+        assert reason1 is None, (
+            f"recovery enabled: block 1 should be accepted; reason={reason1!r}"
+        )
+        assert text1 is not None, "recovery enabled: block 1 text must not be None"
+        assert re.search(r"^## Summary\s*$", text1, re.MULTILINE), (
+            f"recovered block must contain ^## Summary$; got:\n{text1!r}"
+        )
+        # Block 2 was already well-formed — must still pass.
+        _, reason2 = results[1]
+        assert reason2 is None, f"block 2 (well-formed) should also be accepted; {reason2!r}"
+
+    def test_batch_recovery_disabled_yields_missing_section(self, monkeypatch):
+        """generate_summaries_batch: with summary_recovery=False, a loose # Summary
+        block returns (None, 'missing_section') instead of being recovered.
+
+        Monkeypatches obsidian_utils.load_config (the function _summary_recovery_enabled
+        calls directly) so the flag flip is exercised through the real wire-up path,
+        not by stubbing the helper itself.
+        """
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        stdout_text = self._make_stdout(self._loose_block(), self._good_block())
+
+        def fake_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+            class _R:
+                returncode = 0
+                stdout = stdout_text
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+
+        # Disable recovery via load_config — _summary_recovery_enabled() reads
+        # load_config().get("summary_recovery", True), so patching here exercises
+        # the real wire-up without bypassing _summary_recovery_enabled itself.
+        def fake_load_config():
+            cfg = dict(obsidian_utils._DEFAULTS)
+            cfg["summary_recovery"] = False
+            return cfg
+
+        monkeypatch.setattr(obsidian_utils, "load_config", fake_load_config)
+
+        prep1 = dict(self._BASE_PREP)
+        prep2 = dict(self._BASE_PREP)
+
+        results = obsidian_utils.generate_summaries_batch(
+            [prep1, prep2], model="haiku", timeout=30,
+            project="test", vault_path="", sessions_folder="",
+        )
+
+        assert len(results) == 2
+        text1, reason1 = results[0]
+        assert text1 is None, (
+            f"recovery disabled: loose block should be rejected; text={text1!r}"
+        )
+        assert reason1 == "missing_section", (
+            f"recovery disabled: expected 'missing_section', got {reason1!r}"
         )
