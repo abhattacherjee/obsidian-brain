@@ -92,6 +92,10 @@ def test_cleanup_removes_old_locks(lock_dir):
     # A fresh claim for a different key triggers opportunistic cleanup.
     obsidian_utils.claim_hook_run("SessionEnd", "new-sid")
     assert not os.path.exists(stale)
+    # ...but a recent lock (the one the triggering claim just created) must be
+    # preserved — a regression that pruned ALL locks would fail this assertion.
+    recent = os.path.join(lock_dir, "new-sid-SessionEnd")
+    assert os.path.exists(recent)
 
 
 def test_sessionend_has_dedup_outcome_constant():
