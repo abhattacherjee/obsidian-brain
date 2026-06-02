@@ -78,11 +78,23 @@ print(find_unsummarized_notes(sys.argv[1], sys.argv[2], sys.argv[3]))
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-Parse the JSON output: `{"unsummarized": ["/path/to/note1.md", ...], "auto_fixed": N}`.
+**Optional flags (#168 aged-note deferral):**
+- If the user passed `--include-aged`, call with `include_aged=True` to include aged-out deferred notes:
+  ```python
+  find_unsummarized_notes(vault, sessions_folder, project, include_aged=True)
+  ```
+- If the user passed `--max-age-days N`, call with `aged_threshold_days=N` to override the config threshold:
+  ```python
+  find_unsummarized_notes(vault, sessions_folder, project, aged_threshold_days=N)
+  ```
+
+Parse the JSON output: `{"unsummarized": ["/path/to/note1.md", ...], "auto_fixed": N, "skipped_aged": [...]}`.
 
 The function handles project filtering, defense-in-depth (skips notes with real `## Summary` but stale `auto-logged` status, auto-fixes them), and returns only genuinely unsummarized note paths.
 
 If `auto_fixed > 0`, report: `Auto-fixed N note(s) with stale status.`
+
+If `skipped_aged` is non-empty, report: `Skipped <len> aged-out unreferenced note(s) (>90d, no inbound links, not pinned). Run \`/recall --include-aged\` to summarize them anyway.` (Use the actual configured threshold from `aged_summarize_threshold_days`, default 90d.) This is the #168 deferral.
 
 Store the length of `unsummarized` as `N`.
 
