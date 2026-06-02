@@ -2550,6 +2550,45 @@ def find_latest_session(
     return None
 
 
+def _parse_note_tags(frontmatter: str) -> list[str]:
+    """Parse note tags from frontmatter, handling both YAML forms (#168).
+
+    Supports:
+    - Inline list:  ``tags: [claude/session, claude/keep]``
+    - Block list::
+        tags:
+          - claude/session
+          - claude/keep
+
+    Returns a list of stripped tag strings, or [] when no tags are found.
+    """
+    # Try inline form first: tags: [a, b] or tags: a, b
+    inline_raw = parse_frontmatter_field(frontmatter, "tags")
+    if inline_raw:
+        cleaned = inline_raw.strip().lstrip("[").rstrip("]")
+        tags = [t.strip().strip('"').strip("'")
+                for t in re.split(r"[,\s]+", cleaned) if t.strip()]
+        if tags:
+            return tags
+
+    # Try YAML block-list form:
+    #   tags:
+    #     - claude/session
+    #     - claude/keep
+    block_match = re.search(
+        r'^tags:\s*\n((?:[ \t]+-[ \t]+.+\n?)+)', frontmatter, re.MULTILINE
+    )
+    if block_match:
+        block = block_match.group(1)
+        tags = [t.strip().strip('"').strip("'")
+                for t in re.findall(r'^[ \t]+-[ \t]+(.+)$', block, re.MULTILINE)
+                if t.strip()]
+        if tags:
+            return tags
+
+    return []
+
+
 def _note_has_inbound_links(basename_stem: str, db_path: str | None = None) -> bool:
     """Return True if any vault note body references ``[[<basename_stem>]]`` (#168).
 
@@ -2570,9 +2609,12 @@ def _note_has_inbound_links(basename_stem: str, db_path: str | None = None) -> b
             return True  # conservative: assume referenced
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
         try:
-            pattern = f"%[[{basename_stem}%"
+            # Escape LIKE wildcards in the stem so that `_` (common in project
+            # slugs) is treated as a literal character, not a single-char wildcard.
+            esc = basename_stem.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%[[{esc}%"
             row = conn.execute(
-                "SELECT 1 FROM notes WHERE body LIKE ? LIMIT 1", (pattern,)
+                "SELECT 1 FROM notes WHERE body LIKE ? ESCAPE '\\' LIMIT 1", (pattern,)
             ).fetchone()
             return row is not None
         finally:
@@ -2730,14 +2772,10 @@ def find_unsummarized_notes(
             file_age = now - f.stat().st_mtime
             if file_age > cutoff_seconds:
                 # AGE condition met — check pin tags next.
-                note_tags_raw = parse_frontmatter_field(frontmatter, "tags")
-                note_tags: list[str] = []
-                if note_tags_raw:
-                    # tags may be a YAML inline list "[a, b]" or comma-separated
-                    # scalar "a, b". Strip brackets, split on commas/whitespace.
-                    cleaned = note_tags_raw.strip().lstrip("[").rstrip("]")
-                    note_tags = [t.strip().strip('"').strip("'")
-                                 for t in re.split(r"[,\s]+", cleaned) if t.strip()]
+                # Use _parse_note_tags to handle both inline and block-list YAML
+                # forms; parse_frontmatter_field alone misses the block-list form
+                # used by obsidian_session_log.py (#168 PR review fix).
+                note_tags: list[str] = _parse_note_tags(frontmatter)
                 pinned = any(pt in note_tags for pt in pin_tags)
                 if not pinned:
                     # INBOUND-LINK check — conservative: assume linked on error.
