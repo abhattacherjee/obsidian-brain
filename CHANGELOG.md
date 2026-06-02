@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (e.g., `Step 2: upgraded 7 note(s) in 12.4s wall (5 haiku / 2 fallback)`). Foundation
   for the cost-reduction work tracked in #169. (#74)
 - `fallback_reason` populated on pre-summarization failures in `upgrade_unsummarized_note`: `unreadable_note`, `no_session_id`, `no_conversation_content`. Full taxonomy (including Phase 2 validator reserved values, #167/#84) documented in the function's docstring. Closes #183.
+- **`summary_recovery` config key (#167)** (default `true`) — new `_normalize_summary` post-processor recovers structurally-loose Haiku summaries (heading variants like `# Summary` / `**Summary**` / `Summary:`, missing canonical sections, missing `## Importance`) before they reach `upgrade_note_with_summary`'s validation gate, cutting the fallback rate without escalating to Sonnet/Opus or the Phase-2 sub-agent. Set to `false` in `~/.claude/obsidian-brain-config.json` to disable. Applied in both the solo path (`upgrade_unsummarized_note`) and the batch path (`generate_summaries_batch`).
 
 ### Changed
 - **Summarizer timeout budget** — `generate_summary` / `generate_snapshot_summary` first-attempt `claude -p` timeout raised from 30s to 120s (retry from 60s to 240s) to accommodate slow-start CC builds where cold-start alone can take ~46s. Fixes the 100% Haiku-pipeline failure rate on affected installs. (#84)
