@@ -544,8 +544,22 @@ def release_hook_run(event_type: str, session_id: str) -> None:
     near-simultaneous sibling fire is still deduplicated. Never raises."""
     if not session_id:
         return
+    lock_path = _lock_path(event_type, session_id)
     try:
-        os.unlink(_lock_path(event_type, session_id))
+        # Only release a lock THIS process still owns. claim_hook_run wrote our
+        # PID into the payload; if a legitimate later fire took over our stale
+        # lock (>TTL), the PID won't match and unlinking its fresh lock would
+        # let a sibling re-claim and write a duplicate. On any read/parse error
+        # fall through to the unconditional unlink so a transient glitch never
+        # strands a claimed-but-failed run (a lost note is worse than a rare dup).
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                owner_pid = int(f.read().split(None, 1)[0])
+            if owner_pid != os.getpid():
+                return  # taken over by another process — not ours to release
+        except (OSError, ValueError, IndexError):
+            pass  # unreadable / unparseable — fall through to best-effort unlink
+        os.unlink(lock_path)
     except OSError:
         pass  # already gone / never created / unwritable — nothing to undo
 

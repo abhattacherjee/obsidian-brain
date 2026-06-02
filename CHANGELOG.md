@@ -20,9 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fallback_reason` populated on pre-summarization failures in `upgrade_unsummarized_note`: `unreadable_note`, `no_session_id`, `no_conversation_content`. Full taxonomy (including Phase 2 validator reserved values, #167/#84) documented in the function's docstring. Closes #183.
 - **Aged-note deferral in `/recall` (#168)** — `find_unsummarized_notes` now defers notes whose file mtime is older than `aged_summarize_threshold_days` (default `90` days), have no `[[wikilink]]` inbound references in the vault index, and carry no `summary_pin_tags` tag (default `["claude/keep", "claude/permanent"]`). Deferred notes are reported separately (`skipped_aged`) with a count and escape-hatch hint (`/recall --include-aged`). Deferral is conservative: any index query error or missing DB causes the note to be treated as referenced (not deferred). New config keys: `aged_summarize_threshold_days` (int, days) and `summary_pin_tags` (list of tag strings). Closes #168.
 - **`summary_recovery` config key (#167)** (default `true`) — new `_normalize_summary` post-processor recovers structurally-loose Haiku summaries (heading variants like `# Summary` / `**Summary**` / `Summary:`, missing canonical sections, missing `## Importance`) before they reach `upgrade_note_with_summary`'s validation gate, cutting the fallback rate without escalating to Sonnet/Opus or the Phase-2 sub-agent. Set to `false` in `~/.claude/obsidian-brain-config.json` to disable. Applied in both the solo path (`upgrade_unsummarized_note`) and the batch path (`generate_summaries_batch`).
-- Standalone marketplace distribution: obsidian-brain installs directly from
+- **Standalone marketplace distribution** — obsidian-brain installs directly from
   `abhattacherjee/obsidian-brain` (`/plugin marketplace add abhattacherjee/obsidian-brain`).
-- Cross-plugin hook dedup guard (`claim_hook_run` / `release_hook_run`): when
+- **Cross-plugin hook dedup guard** (`claim_hook_run` / `release_hook_run`) — when
   both the monorepo and standalone plugins are installed, each session is logged
   exactly once (SessionEnd / SessionStart / PreCompact). New `SKIPPED_DEDUP`
   outcome in the hook log, now emitted by SessionStart as well as SessionEnd. If

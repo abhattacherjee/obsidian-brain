@@ -398,3 +398,90 @@ def test_sessionstart_dedup_skip_logs_outcome(tmp_path, monkeypatch):
     monkeypatch.undo()
     importlib.reload(obsidian_utils)
     importlib.reload(obsidian_session_hint)
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review follow-ups: PID-ownership release (C-003) + PreCompact
+# release-on-write-failure (C-001)
+# ---------------------------------------------------------------------------
+
+
+def test_release_hook_run_skips_lock_owned_by_other_pid(lock_dir):
+    """C-003: release_hook_run must NOT unlink a lock whose payload PID is not
+    this process — that lock was re-claimed by a legitimate later fire, and
+    unlinking it would let a sibling re-claim and write a duplicate."""
+    assert obsidian_utils.claim_hook_run("SessionEnd", "abc123") is True
+    lock_path = os.path.join(lock_dir, "abc123-SessionEnd")
+    # Simulate takeover by a different process (rewrite payload PID).
+    with open(lock_path, "w", encoding="utf-8") as f:
+        f.write(f"{os.getpid() + 1234567} 1700000000.000\n")
+    obsidian_utils.release_hook_run("SessionEnd", "abc123")
+    assert os.path.exists(lock_path), "must not unlink a lock owned by another PID"
+
+
+def test_release_hook_run_unlinks_own_lock(lock_dir):
+    """Sanity counterpart to the PID-ownership guard: a lock created by THIS
+    process is released normally."""
+    assert obsidian_utils.claim_hook_run("SessionEnd", "abc123") is True
+    lock_path = os.path.join(lock_dir, "abc123-SessionEnd")
+    obsidian_utils.release_hook_run("SessionEnd", "abc123")
+    assert not os.path.exists(lock_path)
+
+
+def test_release_hook_run_unparseable_payload_falls_through_to_unlink(lock_dir):
+    """If the lock payload is unreadable/unparseable, fall through to the
+    best-effort unlink (lost note is worse than a rare duplicate)."""
+    assert obsidian_utils.claim_hook_run("SessionEnd", "abc123") is True
+    lock_path = os.path.join(lock_dir, "abc123-SessionEnd")
+    with open(lock_path, "w", encoding="utf-8") as f:
+        f.write("not-a-pid\n")
+    obsidian_utils.release_hook_run("SessionEnd", "abc123")
+    assert not os.path.exists(lock_path)
+
+
+def test_precompact_releases_lock_on_write_failure(tmp_path, monkeypatch):
+    """C-001: a winning PreCompact whose snapshot write fails must release the
+    dedup lock so a sibling install (or re-fire) can still produce the snapshot
+    — mirrors the SessionEnd release-on-failure guarantee."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import obsidian_context_snapshot
+    importlib.reload(obsidian_utils)
+    importlib.reload(obsidian_context_snapshot)
+
+    cc_slug = "-myproj"
+    proj = tmp_path / ".claude" / "projects" / cc_slug
+    proj.mkdir(parents=True)
+    transcript = proj / "sid-pc-1234.jsonl"
+    _make_jsonl(transcript, n_user_msgs=10, duration_sec=600)
+
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    cfg = {
+        "vault_path": str(vault),
+        "sessions_folder": "claude-sessions",
+        "snapshot_on_compact": True,
+    }
+    (tmp_path / ".claude" / "obsidian-brain-config.json").write_text(
+        json.dumps(cfg), encoding="utf-8")
+
+    # Winning copy claims the lock; the snapshot write then fails.
+    monkeypatch.setattr(obsidian_context_snapshot, "write_vault_note",
+                        lambda *a, **kw: "disk full")
+
+    payload = json.dumps({
+        "cwd": str(tmp_path),
+        "session_id": "sid-pc-1234",
+        "transcript_path": str(transcript),
+        "source": "compact",
+    })
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    with pytest.raises(SystemExit) as exc_info:
+        obsidian_context_snapshot.main()
+    assert exc_info.value.code == 0
+
+    # Lock released -> a re-fire can re-claim immediately.
+    assert obsidian_utils.claim_hook_run("PreCompact", "sid-pc-1234") is True
+
+    monkeypatch.undo()
+    importlib.reload(obsidian_utils)
+    importlib.reload(obsidian_context_snapshot)
