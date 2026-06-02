@@ -36,16 +36,27 @@ All data flows are **one-directional filesystem writes** — no MCP server, no R
 
 ## Installation
 
-```bash
-# Add the marketplace (if not already added)
-/plugin marketplace add abhattacherjee/claude-code-skills
+### Install
 
-# Install the plugin
-/plugin install obsidian-brain@claude-code-skills
-
-# First-run setup
-/obsidian-setup
 ```
+/plugin marketplace add abhattacherjee/obsidian-brain
+/plugin install obsidian-brain@obsidian-brain-repo
+```
+
+Then run `/obsidian-setup` once to point the plugin at your Obsidian vault.
+
+#### Migrating from the claude-code-skills version
+
+If you previously installed obsidian-brain from the `claude-code-skills`
+marketplace, switching is seamless — your config and vault are untouched, so
+**no `/obsidian-setup` is needed**:
+
+1. `/plugin marketplace add abhattacherjee/obsidian-brain`
+2. `/plugin install obsidian-brain@obsidian-brain-repo`
+3. `/plugin uninstall` the old monorepo copy.
+
+During the brief window where both are installed, a built-in guard ensures each
+session is logged only once (no duplicate notes or snapshots).
 
 ### Prerequisites
 
