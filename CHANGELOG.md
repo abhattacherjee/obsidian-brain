@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-06-02
+
 ### Added
 - **`summary_pipeline` config key** (`"auto"` default | `"subagent"`) — set to `"subagent"` in `~/.claude/obsidian-brain-config.json` to skip the Haiku `claude -p` summarizer pipeline entirely on machines with slow CLI cold-start, routing all notes straight to the sub-agent fallback. (#84)
 - **In-process Haiku→Sonnet→Opus escalation chain (#165)** — `upgrade_unsummarized_note` now retries with a more capable model when the primary model returns empty output (`empty_output` reason only; timeouts and subprocess errors do not escalate). Fallback model chain is now Sonnet first, then Opus (replaces prior direct-to-Opus behavior). `model_used` in metrics is populated with the model that produced the accepted summary.
