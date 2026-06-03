@@ -1,9 +1,12 @@
 # tests/conftest.py
 """Shared fixtures for obsidian-brain test suite."""
 
+from __future__ import annotations
+
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -170,3 +173,44 @@ def sample_jsonl(tmp_path):
         encoding="utf-8",
     )
     return jsonl_path
+
+
+@pytest.fixture(autouse=True)
+def _isolate_summarizer_sink_globally(tmp_path_factory, monkeypatch):
+    """Belt-and-suspenders: redirect summarizer_metrics.METRICS_PATH to a tmp
+    path for every test in the suite. Prevents accidental pollution of
+    ~/.claude/obsidian-brain-summarizer-metrics.jsonl when a future test
+    forgets the per-class fixture."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+    try:
+        import summarizer_metrics
+    except ImportError:
+        return  # sink module not present in some test contexts
+    safe_path = tmp_path_factory.mktemp("metrics") / "summarizer-metrics.jsonl"
+    monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", safe_path)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_secure_dir_globally(tmp_path_factory, monkeypatch):
+    """Point obsidian-brain's secure dir (and its lock subdir) at a throwaway
+    per-test location so no test writes to the real ~/.claude/obsidian-brain/
+    (notably the cross-plugin dedup lock files written by claim_hook_run).
+
+    Tests that already monkeypatch _SECURE_DIR/_LOCK_DIR themselves (e.g. the
+    lock_dir fixture in test_hook_dedup_guard.py, test_security.py) are
+    unaffected: their explicit setattr runs after autouse and simply re-points
+    both attributes to their own tmp — last setattr wins, both are tmp.
+
+    Subprocess tests (test_snapshot_e2e.py, two-process test in
+    test_hook_dedup_guard.py) spawn child processes that re-import obsidian_utils
+    fresh; they are already isolated via HOME redirection and are unaffected by
+    this in-process monkeypatch.
+
+    _CACHE_PREFIX and _BOOTSTRAP_PREFIX are also patched to consistent tmp-based
+    paths so that tests checking `x.startswith(_SECURE_DIR)` still hold."""
+    import obsidian_utils
+    secure = tmp_path_factory.mktemp("ob-secure")
+    monkeypatch.setattr(obsidian_utils, "_SECURE_DIR", str(secure))
+    monkeypatch.setattr(obsidian_utils, "_LOCK_DIR", str(secure / "locks"))
+    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(secure / "cache-"))
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(secure / "sid-"))

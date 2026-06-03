@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import uuid
@@ -75,6 +76,31 @@ class TestLoadConfig:
         """Test get_project_name with a path and with empty string."""
         assert obsidian_utils.get_project_name("/home/user/my-project") == "my-project"
         assert obsidian_utils.get_project_name("") == "unknown"
+
+    def test_load_config_summary_pipeline_user_override(self, tmp_path, monkeypatch):
+        """User config with summary_pipeline=subagent must surface through load_config."""
+        config_file = tmp_path / "obsidian-brain-config.json"
+        config_file.write_text(json.dumps({"summary_pipeline": "subagent"}), encoding="utf-8")
+
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+        # Use a unique sid per call so the session-scoped config cache never
+        # bleeds between test invocations (mirrors the pattern used throughout
+        # this class — see _get_session_id_fast mock above).
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        cfg = obsidian_utils.load_config()
+        assert cfg["summary_pipeline"] == "subagent"
+
+    def test_load_config_summary_pipeline_default_is_auto(self, tmp_path, monkeypatch):
+        """No user override → summary_pipeline defaults to 'auto'."""
+        config_file = tmp_path / "obsidian-brain-config.json"
+        config_file.write_text(json.dumps({"vault_path": str(tmp_path)}), encoding="utf-8")
+
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        cfg = obsidian_utils.load_config()
+        assert cfg["summary_pipeline"] == "auto"
 
 
 class TestGetWorkspaceRoots:
@@ -1156,6 +1182,45 @@ class TestGenerateSummarySampling:
         assert len(prompt) < 30000  # generous upper bound; key check is it's bounded
 
 
+class TestSummarizerTimeoutBudget:
+    """#84 — claude -p first-attempt timeout raised 30s→120s for slow-start CC builds."""
+
+    def _capture_timeout_run(self, captured: dict):
+        def fake_run(cmd, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return type("Result", (), {"returncode": 0, "stdout": "## Summary\nDone.\n", "stderr": ""})()
+        return fake_run
+
+    def test_generate_summary_first_attempt_timeout_is_120(self, monkeypatch):
+        captured: dict = {}
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", self._capture_timeout_run(captured))
+        obsidian_utils.generate_summary(["u"], ["a"], {"project": "t", "files_touched": []})
+        assert captured.get("timeout") == 120
+
+    def test_generate_snapshot_summary_first_attempt_timeout_is_120(self, monkeypatch):
+        captured: dict = {}
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", self._capture_timeout_run(captured))
+        obsidian_utils.generate_snapshot_summary(["u"], ["a"], {"project": "t"})
+        assert captured.get("timeout") == 120
+
+    def test_generate_summary_retry_uses_double_timeout(self, monkeypatch):
+        """Both attempts must time out; second attempt must use timeout * 2 == 240."""
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        result = obsidian_utils.generate_summary(["u"], ["a"], {"project": "t", "files_touched": []})
+        assert seen == [120, 240]
+        assert result == (None, "haiku_timeout")
+
+
+def test_summary_pipeline_default_is_auto():
+    assert obsidian_utils._DEFAULTS.get("summary_pipeline") == "auto"
+
+
 # ===========================================================================
 # Section 7: build_context_brief — sort order and duration
 # ===========================================================================
@@ -1890,16 +1955,19 @@ def test_get_session_id_fast_slow_path_returns_without_writing(tmp_path, monkeyp
 
 
 class TestUpgradeBatch:
-    """Tests for upgrade_batch() — GH #69.
+    """Tests for upgrade_batch() — GH #69, instrumentation GH #74.
 
     `upgrade_unsummarized_note` is monkeypatched with fast fakes so none of
     these tests touch the filesystem, load a vault config, or shell out to
     `claude -p`. That isolation also means the `vault_path`/`sessions_folder`
     args are inert placeholder strings.
+
+    upgrade_batch() now returns list[dict] with keys: path, status, elapsed_s,
+    model_used, fallback_reason.
     """
 
-    def test_upgrade_batch_empty_list_returns_empty(self, monkeypatch):
-        """Empty input: return [] immediately and never invoke the wrapped fn."""
+    def test_upgrade_batch_empty_list_returns_empty(self, monkeypatch, tmp_path):
+        """Empty input: return [] immediately and never invoke the wrapped fn or the sink."""
         calls = []
 
         def fake_impl(*args, **kwargs):
@@ -1908,23 +1976,31 @@ class TestUpgradeBatch:
 
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
 
+        metrics_path = tmp_path / "test-metrics.jsonl"
+        import summarizer_metrics
+        monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
+
         result = obsidian_utils.upgrade_batch(
             [], "/vault", "sessions", "proj",
         )
         assert result == []
         assert calls == []
+        assert not metrics_path.exists(), "empty batch must not write a sink record"
 
     def test_upgrade_batch_n1(self, monkeypatch):
-        """Single path: single (path, status) tuple returned."""
+        """Single path: single dict with path and status returned."""
         def fake_impl(note_path, *args, **kwargs):
-            return f"Summarized: {os.path.basename(note_path)}"
+            return f"Summarized: {os.path.basename(note_path)}", 0.1, "haiku", None
 
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
 
         result = obsidian_utils.upgrade_batch(
             ["/vault/sessions/one.md"], "/vault", "sessions", "proj",
+            summary_batch_size=1,
         )
-        assert result == [("/vault/sessions/one.md", "Summarized: one.md")]
+        assert len(result) == 1
+        assert result[0]["path"] == "/vault/sessions/one.md"
+        assert result[0]["status"] == "Summarized: one.md"
 
     def test_upgrade_batch_n5_preserves_input_order(self, monkeypatch):
         """5 paths with variable sleeps: return order matches input, not completion order."""
@@ -1941,16 +2017,17 @@ class TestUpgradeBatch:
 
         def fake_impl(note_path, *args, **kwargs):
             _time.sleep(sleeps[os.path.basename(note_path)])
-            return f"done:{os.path.basename(note_path)}"
+            return f"done:{os.path.basename(note_path)}", 0.1, "haiku", None
 
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
 
         paths = [f"/vault/sessions/{name}" for name in ("a.md", "b.md", "c.md", "d.md", "e.md")]
-        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
+        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj",
+                                              summary_batch_size=1)
 
         assert len(result) == 5
-        assert [p for p, _ in result] == paths, "input order must be preserved"
-        assert [status for _, status in result] == [
+        assert [r["path"] for r in result] == paths, "input order must be preserved"
+        assert [r["status"] for r in result] == [
             "done:a.md", "done:b.md", "done:c.md", "done:d.md", "done:e.md",
         ]
 
@@ -1968,36 +2045,39 @@ class TestUpgradeBatch:
 
         def fake_impl(note_path, *args, **kwargs):
             barrier.wait()  # raises BrokenBarrierError if < N threads ever gather
-            return f"Upgraded {os.path.basename(note_path)} (source: JSONL)"
+            return f"Upgraded {os.path.basename(note_path)} (source: JSONL)", 0.1, "haiku-4.5", None
 
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
         paths = [f"/vault/sessions/note{i}.md" for i in range(N)]
         results = obsidian_utils.upgrade_batch(
             paths, "/vault", "sessions", "proj", max_workers=N,
+            summary_batch_size=1,
         )
         assert len(results) == N
-        assert all(s.startswith("Upgraded ") for _, s in results)
+        assert all(r["status"].startswith("Upgraded ") for r in results)
 
     def test_upgrade_batch_captures_exceptions_per_note(self, monkeypatch):
         """One raising impl does not kill the batch; failure becomes a status string."""
         def fake_impl(note_path, *args, **kwargs):
             if os.path.basename(note_path) == "three.md":
                 raise RuntimeError("boom")
-            return f"ok:{os.path.basename(note_path)}"
+            return f"ok:{os.path.basename(note_path)}", 0.1, "haiku-4.5", None
 
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
 
         paths = [f"/vault/sessions/{n}" for n in
                  ("one.md", "two.md", "three.md", "four.md", "five.md")]
-        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
+        result = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj",
+                                              summary_batch_size=1)
 
         assert len(result) == 5
-        assert [p for p, _ in result] == paths
-        assert result[0][1] == "ok:one.md"
-        assert result[1][1] == "ok:two.md"
-        assert result[2] == ("/vault/sessions/three.md", "Failed: RuntimeError: boom")
-        assert result[3][1] == "ok:four.md"
-        assert result[4][1] == "ok:five.md"
+        assert [r["path"] for r in result] == paths
+        assert result[0]["status"] == "ok:one.md"
+        assert result[1]["status"] == "ok:two.md"
+        assert result[2]["path"] == "/vault/sessions/three.md"
+        assert result[2]["status"] == "Failed: RuntimeError: boom"
+        assert result[3]["status"] == "ok:four.md"
+        assert result[4]["status"] == "ok:five.md"
 
     def test_upgrade_batch_max_workers_caps_at_input_size(self, monkeypatch):
         """N=3 < max_workers=10: min() guard still yields real parallelism.
@@ -2013,15 +2093,16 @@ class TestUpgradeBatch:
 
         def fake_impl(note_path, *args, **kwargs):
             barrier.wait()
-            return f"Upgraded {os.path.basename(note_path)} (source: JSONL)"
+            return f"Upgraded {os.path.basename(note_path)} (source: JSONL)", 0.1, "haiku-4.5", None
 
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
         paths = [f"/vault/sessions/a{i}.md" for i in range(N)]
         results = obsidian_utils.upgrade_batch(
             paths, "/vault", "sessions", "proj", max_workers=10,
+            summary_batch_size=1,
         )
         assert len(results) == N
-        assert all(s.startswith("Upgraded ") for _, s in results)
+        assert all(r["status"].startswith("Upgraded ") for r in results)
 
     def test_upgrade_batch_forwards_model_and_timeout(self, monkeypatch):
         received = {}
@@ -2030,7 +2111,7 @@ class TestUpgradeBatch:
                       summary_model, summary_timeout):
             received["model"] = summary_model
             received["timeout"] = summary_timeout
-            return f"ok:{os.path.basename(note_path)}"
+            return f"ok:{os.path.basename(note_path)}", 0.1, "haiku-4.5", None
 
         monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_impl)
         results = obsidian_utils.upgrade_batch(
@@ -2040,43 +2121,49 @@ class TestUpgradeBatch:
             "proj",
             summary_model="claude-3-5-haiku",
             summary_timeout=30,
+            summary_batch_size=1,
         )
-        assert results == [("/vault/sessions/a.md", "ok:a.md")]
+        assert len(results) == 1
+        assert results[0]["path"] == "/vault/sessions/a.md"
+        assert results[0]["status"] == "ok:a.md"
         assert received == {"model": "claude-3-5-haiku", "timeout": 30}
 
     def test_upgrade_batch_rejects_invalid_max_workers(self, monkeypatch):
         monkeypatch.setattr(
             obsidian_utils, "upgrade_unsummarized_note",
-            lambda *a, **k: "Upgraded test.md (source: ...)",
+            lambda *a, **k: ("Upgraded test.md (source: ...)", 0.1, "haiku-4.5", None),
         )
         for bad in (0, -1, -100):
             with pytest.raises(ValueError, match="max_workers must be >= 1"):
                 obsidian_utils.upgrade_batch(
                     ["/vault/sessions/a.md"], "/vault", "sessions", "proj",
                     max_workers=bad,
+                    summary_batch_size=1,
                 )
 
     def test_upgrade_batch_skill_md_json_round_trip(self, monkeypatch):
-        """Pins the exact expression used in skills/recall/SKILL.md Phase 1.
+        """Verifies that path and status are accessible by dict key.
 
-        If the tuple contract ever changes (e.g. to list[dict]), this test
-        fails BEFORE production /recall breaks.
+        The shape has migrated from (path, status) tuples to list[dict].
+        Serialization using the new dict-key access pattern is verified here;
+        SKILL.md Step 2 will be updated in Task 9 to match.
         """
         import json
 
         monkeypatch.setattr(
             obsidian_utils, "upgrade_unsummarized_note",
-            lambda note_path, *a, **k: f"Upgraded {os.path.basename(note_path)} (source: JSONL)",
+            lambda note_path, *a, **k: (f"Upgraded {os.path.basename(note_path)} (source: JSONL)", 0.1, "haiku-4.5", None),
         )
         paths = [
             "/vault/sessions/a.md",
             "/vault/sessions/b.md",
             "/vault/sessions/c.md",
         ]
-        results = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj")
+        results = obsidian_utils.upgrade_batch(paths, "/vault", "sessions", "proj",
+                                               summary_batch_size=1)
 
-        # This is the exact expression from skills/recall/SKILL.md line ~117
-        serialized = json.dumps([{"path": p, "status": s} for p, s in results])
+        # Serialize using dict-key access (new shape)
+        serialized = json.dumps([{"path": r["path"], "status": r["status"]} for r in results])
         parsed = json.loads(serialized)
         assert parsed == [
             {"path": "/vault/sessions/a.md", "status": "Upgraded a.md (source: JSONL)"},
@@ -2126,7 +2213,7 @@ class TestUpgradeBatch:
                 "## Errors Encountered\n- None.\n\n"
                 "## Open Questions / Next Steps\n- [ ] None.\n\n"
                 "IMPORTANCE: 5\n"
-            )
+            ), None
 
         monkeypatch.setattr(
             obsidian_utils, "generate_summary", fake_generate_summary
@@ -2139,18 +2226,613 @@ class TestUpgradeBatch:
 
         results = obsidian_utils.upgrade_batch(
             [str(note_path)], str(vault), "sessions", "test-project",
+            summary_batch_size=1,
         )
 
         assert len(results) == 1
-        path_result, status = results[0]
-        assert path_result == str(note_path)
-        assert status.startswith("Upgraded "), f"expected success, got: {status}"
+        assert set(results[0].keys()) == {"path", "status", "elapsed_s", "model_used", "fallback_reason"}
+        assert results[0]["path"] == str(note_path)
+        assert results[0]["status"].startswith("Upgraded "), f"expected success, got: {results[0]['status']}"
 
         # Verify the note was actually rewritten with a summary
         updated = note_path.read_text()
         assert "status: summarized" in updated
         assert "## Summary" in updated
         assert "Did a thing." in updated
+
+    def test_upgrade_unsummarized_note_default_timeout_reaches_generate_summary(
+        self, monkeypatch, tmp_path
+    ):
+        """When summary_timeout=None (the default), generate_summary must be called WITHOUT
+        a timeout kwarg so its own default of 120 applies. This pins the propagation
+        path upgrade_unsummarized_note(summary_timeout=None) → gen_kwargs has no
+        'timeout' key → generate_summary uses its default parameter (120).
+
+        Approach: monkeypatch generate_summary to capture kwargs; drive one real
+        note through upgrade_unsummarized_note without passing summary_timeout.
+        Assert 'timeout' is absent from captured kwargs (so the 120 default applies).
+        """
+        vault = tmp_path / "vault"
+        sessions_dir = vault / "sessions"
+        sessions_dir.mkdir(parents=True)
+
+        note_path = sessions_dir / "2026-04-20-default-timeout-test-abcd.md"
+        note_path.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-20\n"
+            "session_id: default-timeout-session-id-0000-0000-000000000000\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "tags:\n"
+            "  - claude/session\n"
+            "---\n\n"
+            "## Conversation (raw)\n"
+            "**User:** hello\n"
+            "**Assistant:** hi there\n",
+            encoding="utf-8",
+        )
+
+        captured_gen_kwargs: dict = {}
+
+        def fake_generate_summary(*args, **kwargs):
+            captured_gen_kwargs.update(kwargs)
+            return (
+                "## Summary\nDid a thing.\n\n"
+                "## Key Decisions\n- None noted.\n\n"
+                "## Changes Made\n- None noted.\n\n"
+                "## Errors Encountered\n- None.\n\n"
+                "## Open Questions / Next Steps\n- [ ] None.\n\n"
+                "IMPORTANCE: 5\n"
+            ), None
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda session_id: None)
+
+        # Call without summary_timeout — default None path
+        status, elapsed_s, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note_path),
+            str(vault),
+            "sessions",
+            "test-project",
+        )
+
+        assert status.startswith("Upgraded "), f"expected Upgraded, got: {status!r}"
+        # 'timeout' must NOT be in kwargs: the default (120) should come from
+        # generate_summary's own parameter default, not a forwarded value.
+        assert "timeout" not in captured_gen_kwargs, (
+            f"expected no 'timeout' kwarg when summary_timeout=None, "
+            f"but got kwargs={captured_gen_kwargs!r}"
+        )
+
+
+# ===========================================================================
+# Section N-1: TestUpgradeBatchBatching — GH #166 batched upgrade_batch path
+# ===========================================================================
+
+
+class TestUpgradeBatchBatching:
+    """Tests for the batched (summary_batch_size >= 2) path in upgrade_batch().
+
+    Exercises generate_summaries_batch integration, fallthrough to the solo
+    path, snapshot routing, and output ordering. Monkeypatches the subprocess
+    so no ``claude -p`` calls are made.
+    """
+
+    # ---- helpers ----------------------------------------------------------------
+
+    def _write_session_note(self, sessions_dir: Path, name: str, session_id: str | None = None) -> Path:
+        """Write a minimal real session note to ``sessions_dir``."""
+        sid = session_id or f"test-batch-session-{name.replace('.md', '')}-0000-0000-000000000000"
+        note = sessions_dir / name
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-04-20\n"
+            f"session_id: {sid}\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "tags:\n"
+            "  - claude/session\n"
+            "  - claude/project/test-project\n"
+            "---\n\n"
+            "# Session: test-project\n\n"
+            "## Conversation (raw)\n"
+            "**User:** describe what you did\n"
+            "**Assistant:** I implemented the feature.\n",
+            encoding="utf-8",
+        )
+        return note
+
+    def _write_snapshot_note(self, sessions_dir: Path, name: str) -> Path:
+        """Write a minimal snapshot note to ``sessions_dir``."""
+        sid = f"test-snap-session-{name.replace('.md', '')}-0000-0000-000000000000"
+        note = sessions_dir / name
+        note.write_text(
+            "---\n"
+            "type: claude-snapshot\n"
+            "date: 2026-04-20\n"
+            f"session_id: {sid}\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "tags:\n"
+            "  - claude/snapshot\n"
+            "---\n\n"
+            "## Last messages (raw)\n"
+            "**User:** context\n"
+            "**Assistant:** snapshot content\n",
+            encoding="utf-8",
+        )
+        return note
+
+    def _fake_good_summary(self) -> str:
+        return (
+            "## Summary\nDid a thing.\n\n"
+            "## Key Decisions\n- None noted.\n\n"
+            "## Changes Made\n- None noted.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n"
+            "## Importance\n5\n"
+        )
+
+    # ---- tests ------------------------------------------------------------------
+
+    def test_batch_of_5_one_malformed_routes_to_fallback(self, monkeypatch, tmp_path):
+        """Mandated fixture: 4 valid summaries + 1 missing_section → malformed goes to solo fallback."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        note_names = [f"note{i}.md" for i in range(5)]
+        paths = [str(self._write_session_note(sessions_dir, name)) for name in note_names]
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        batch_calls: list[list[dict]] = []
+        # Return good summaries for notes 0-3, missing_section for note 4.
+        def fake_generate_summaries_batch(prepared_notes, **kwargs):
+            batch_calls.append(prepared_notes)
+            results = []
+            for i, _ in enumerate(prepared_notes):
+                if i == len(prepared_notes) - 1:
+                    results.append((None, "missing_section"))
+                else:
+                    results.append((self._fake_good_summary(), None))
+            return results
+
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch", fake_generate_summaries_batch)
+
+        # upgrade_note_with_summary returns success for all batch-written notes
+        def fake_upgrade_note_with_summary(path, summary, *args, **kwargs):
+            return f"Upgraded {os.path.basename(path)} (source: batch)"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_note_with_summary", fake_upgrade_note_with_summary)
+
+        # Solo fallback records which paths it was called with
+        solo_fallback_called: list[str] = []
+        def fake_upgrade_unsummarized_note(path, *args, **kwargs):
+            solo_fallback_called.append(path)
+            return f"Upgraded {os.path.basename(path)} (source: solo-fallback)", 0.1, "haiku", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_upgrade_unsummarized_note)
+
+        results = obsidian_utils.upgrade_batch(
+            paths, str(tmp_path), "sessions", "test-project",
+            summary_batch_size=5,
+        )
+
+        # 5 results in input order
+        assert len(results) == 5
+        assert [r["path"] for r in results] == paths
+
+        # All 5 have the expected keys
+        for r in results:
+            assert set(r.keys()) == {"path", "status", "elapsed_s", "model_used", "fallback_reason"}
+
+        # First 4 upgraded via batch path
+        for i in range(4):
+            assert results[i]["status"].startswith("Upgraded "), (
+                f"note {i} should be Upgraded, got: {results[i]['status']!r}"
+            )
+            assert results[i]["model_used"] == "haiku"
+
+        # Note 4 (malformed) routed to solo fallback
+        assert paths[4] in solo_fallback_called, (
+            f"malformed note {paths[4]!r} should have gone to solo fallback; "
+            f"solo_fallback_called={solo_fallback_called!r}"
+        )
+        assert results[4]["status"].startswith("Upgraded "), (
+            f"solo fallback note should still succeed, got: {results[4]['status']!r}"
+        )
+
+    def test_batch_size_1_uses_solo_path(self, monkeypatch, tmp_path):
+        """batch_size=1: legacy fan-out fires for every note; generate_summaries_batch never called."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        paths = [str(self._write_session_note(sessions_dir, f"note{i}.md")) for i in range(3)]
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        def batch_must_not_be_called(*args, **kwargs):
+            raise AssertionError("generate_summaries_batch must NOT be called with batch_size=1")
+
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch", batch_must_not_be_called)
+
+        solo_calls: list[str] = []
+        def fake_solo(path, *args, **kwargs):
+            solo_calls.append(path)
+            return f"Upgraded {os.path.basename(path)} (source: solo)", 0.1, "haiku", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_solo)
+
+        results = obsidian_utils.upgrade_batch(
+            paths, str(tmp_path), "sessions", "test-project",
+            summary_batch_size=1,
+        )
+
+        assert len(results) == 3
+        # Each path was processed by solo
+        assert sorted(solo_calls) == sorted(paths)
+
+    def test_whole_spawn_timeout_falls_back_to_solo(self, monkeypatch, tmp_path):
+        """Whole-spawn timeout: every note routed to solo fallback."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        n = 3
+        paths = [str(self._write_session_note(sessions_dir, f"t{i}.md")) for i in range(n)]
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        def fake_batch_timeout(prepared_notes, **kwargs):
+            return [(None, "haiku_timeout")] * len(prepared_notes)
+
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch", fake_batch_timeout)
+
+        solo_calls: list[str] = []
+        def fake_solo(path, *args, **kwargs):
+            solo_calls.append(path)
+            return f"Upgraded {os.path.basename(path)} (source: solo-fallback)", 0.2, "haiku", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_solo)
+
+        results = obsidian_utils.upgrade_batch(
+            paths, str(tmp_path), "sessions", "test-project",
+            summary_batch_size=5,
+        )
+
+        assert len(results) == n
+        assert [r["path"] for r in results] == paths
+        assert sorted(solo_calls) == sorted(paths), (
+            f"all notes should go to solo fallback on timeout; got: {solo_calls!r}"
+        )
+        for r in results:
+            assert r["status"].startswith("Upgraded "), (
+                f"solo fallback should produce Upgraded, got: {r['status']!r}"
+            )
+
+    def test_results_in_input_order_mixed_session_and_snapshot(self, monkeypatch, tmp_path):
+        """Mixed session + snapshot notes: snapshot goes to solo, order preserved."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+
+        session_a = self._write_session_note(sessions_dir, "session-a.md")
+        snapshot_b = self._write_snapshot_note(sessions_dir, "snapshot-b.md")
+        session_c = self._write_session_note(sessions_dir, "session-c.md")
+        paths = [str(session_a), str(snapshot_b), str(session_c)]
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        batch_paths_seen: list[str] = []
+        def fake_batch(prepared_notes, **kwargs):
+            for p in prepared_notes:
+                # We record via metadata to know which note was batched.
+                batch_paths_seen.append(p.get("metadata", {}).get("project", "?"))
+            return [(self._fake_good_summary(), None)] * len(prepared_notes)
+
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch", fake_batch)
+
+        def fake_upgrade_note_with_summary(path, summary, *args, **kwargs):
+            return f"Upgraded {os.path.basename(path)} (source: batch)"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_note_with_summary", fake_upgrade_note_with_summary)
+
+        solo_calls: list[str] = []
+        def fake_solo(path, *args, **kwargs):
+            solo_calls.append(path)
+            return f"Upgraded {os.path.basename(path)} (source: solo)", 0.1, "haiku", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_solo)
+
+        results = obsidian_utils.upgrade_batch(
+            paths, str(tmp_path), "sessions", "test-project",
+            summary_batch_size=5,
+        )
+
+        # Correct count and order preserved
+        assert len(results) == 3
+        assert [r["path"] for r in results] == paths
+
+        # Snapshot went to solo
+        assert str(snapshot_b) in solo_calls, (
+            f"snapshot note should route to solo path; solo_calls={solo_calls!r}"
+        )
+        # Session notes NOT in solo (they went batch)
+        assert str(session_a) not in solo_calls
+        assert str(session_c) not in solo_calls
+
+        # All have Upgraded status
+        for r in results:
+            assert r["status"].startswith("Upgraded "), (
+                f"all notes should be Upgraded, got: {r['status']!r}"
+            )
+
+    def test_generate_summaries_batch_parses_delimited_output(self, monkeypatch, tmp_path):
+        """Unit-test the parser: well-formed block 1, missing ## Summary block 2."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        # Two minimal prep dicts (simulate ok=True preps with messages).
+        prep1 = {
+            "ok": True,
+            "user_msgs": ["hello"],
+            "assistant_msgs": ["hi"],
+            "metadata": {"project": "test", "vault_path": "", "sessions_folder": ""},
+            "note_type": "claude-session",
+            "source": "raw note",
+            "warnings": [],
+        }
+        prep2 = dict(prep1)  # same shape
+
+        good_block = (
+            "## Summary\nDid a thing.\n\n"
+            "## Key Decisions\n- None.\n\n"
+            "## Changes Made\n- None.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n"
+            "## Importance\n5\n"
+        )
+        bad_block = "Just some text without the required sections.\n"
+
+        stdout_text = (
+            f"===== SUMMARY 1 =====\n{good_block}"
+            f"===== SUMMARY 2 =====\n{bad_block}"
+        )
+
+        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+            class _Res:
+                returncode = 0
+                stdout = stdout_text
+                stderr = ""
+            return _Res()
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_subprocess_run)
+
+        results = obsidian_utils.generate_summaries_batch(
+            [prep1, prep2],
+            model="haiku",
+            timeout=30,
+            project="test",
+            vault_path="",
+            sessions_folder="",
+        )
+
+        assert len(results) == 2
+        text1, reason1 = results[0]
+        text2, reason2 = results[1]
+
+        assert reason1 is None, f"block 1 should be accepted; reason={reason1!r}"
+        assert text1 is not None
+        assert "## Summary" in text1
+
+        assert text2 is None, f"block 2 should be rejected (missing ## Summary)"
+        assert reason2 == "missing_section"
+
+    def test_duplicate_summary_delimiter_first_wins(self, monkeypatch, tmp_path):
+        """Fix 1: first-occurrence-wins — a repeated ===== SUMMARY k ===== delimiter
+        in model output must NOT overwrite the valid first block with the junk repeat."""
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        prep1 = {
+            "ok": True,
+            "user_msgs": ["hello"],
+            "assistant_msgs": ["hi"],
+            "metadata": {"project": "test", "vault_path": "", "sessions_folder": ""},
+            "note_type": "claude-session",
+            "source": "raw note",
+            "warnings": [],
+        }
+        prep2 = dict(prep1)
+
+        valid_block_1 = (
+            "## Summary\nDid a thing.\n\n"
+            "## Key Decisions\n- None noted.\n\n"
+            "## Changes Made\n- None noted.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n"
+            "## Importance\n5\n"
+        )
+        junk_fragment_1 = "Oops this is extra repeated output without Summary section.\n"
+        valid_block_2 = (
+            "## Summary\nSecond note done.\n\n"
+            "## Key Decisions\n- None noted.\n\n"
+            "## Changes Made\n- None noted.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n"
+            "## Importance\n4\n"
+        )
+
+        # Model repeats the SUMMARY 1 delimiter — the junk block lacks ## Summary.
+        stdout_text = (
+            f"===== SUMMARY 1 =====\n{valid_block_1}"
+            f"===== SUMMARY 1 =====\n{junk_fragment_1}"
+            f"===== SUMMARY 2 =====\n{valid_block_2}"
+        )
+
+        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+            class _Res:
+                returncode = 0
+                stdout = stdout_text
+                stderr = ""
+            return _Res()
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_subprocess_run)
+
+        results = obsidian_utils.generate_summaries_batch(
+            [prep1, prep2],
+            model="haiku",
+            timeout=30,
+            project="test",
+            vault_path="",
+            sessions_folder="",
+        )
+
+        assert len(results) == 2
+        text1, reason1 = results[0]
+        text2, reason2 = results[1]
+
+        # Block 1: first occurrence (valid) must win; the junk repeat must be ignored.
+        assert reason1 is None, (
+            f"block 1 should be accepted (first-occurrence-wins); reason={reason1!r}"
+        )
+        assert text1 is not None, "block 1 text should not be None"
+        assert "## Summary" in text1, "block 1 should contain the valid ## Summary section"
+        assert "Oops" not in (text1 or ""), (
+            "junk fragment must not appear in block 1 result"
+        )
+
+        # Block 2 should also be valid.
+        assert reason2 is None, f"block 2 should be accepted; reason={reason2!r}"
+        assert text2 is not None
+
+    def test_writeback_exception_routes_to_solo_fallback(self, monkeypatch, tmp_path):
+        """Fix 3: if upgrade_note_with_summary raises for one note, that note is
+        routed to solo fallback and NO exception propagates out of upgrade_batch."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        note_names = [f"note{i}.md" for i in range(3)]
+        paths = [str(self._write_session_note(sessions_dir, name)) for name in note_names]
+        bad_path = paths[1]  # index 1 will raise on write-back
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        def fake_generate_summaries_batch(prepared_notes, **kwargs):
+            return [(self._fake_good_summary(), None)] * len(prepared_notes)
+
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch", fake_generate_summaries_batch)
+
+        def fake_upgrade_note_with_summary(path, summary, *args, **kwargs):
+            if path == bad_path:
+                raise RuntimeError("simulated write-back failure")
+            return f"Upgraded {os.path.basename(path)} (source: batch)"
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_note_with_summary", fake_upgrade_note_with_summary)
+
+        solo_fallback_called: list[str] = []
+        def fake_upgrade_unsummarized_note(path, *args, **kwargs):
+            solo_fallback_called.append(path)
+            return f"Upgraded {os.path.basename(path)} (source: solo-fallback)", 0.1, "haiku", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", fake_upgrade_unsummarized_note)
+
+        # Must not raise even though write-back raises for bad_path.
+        results = obsidian_utils.upgrade_batch(
+            paths, str(tmp_path), "sessions", "test-project",
+            summary_batch_size=5,
+        )
+
+        # All 3 results present in input order, no KeyError.
+        assert len(results) == 3
+        assert [r["path"] for r in results] == paths
+
+        # bad_path was routed to solo fallback.
+        assert bad_path in solo_fallback_called, (
+            f"raising path should have gone to solo fallback; solo_fallback_called={solo_fallback_called!r}"
+        )
+
+        # All results have Upgraded status (solo succeeded for the bad path).
+        for r in results:
+            assert r["status"].startswith("Upgraded "), (
+                f"all notes should be Upgraded, got: {r['status']!r}"
+            )
+
+    def test_dedup_failure_does_not_fail_note(self, monkeypatch, tmp_path):
+        """Fix 2: if _dedup_summary_open_items raises, the note is still accepted
+        with the undeduped block_text — result is (text, None), NOT (None, 'missing_section')."""
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        prep1 = {
+            "ok": True,
+            "user_msgs": ["hello"],
+            "assistant_msgs": ["hi"],
+            "metadata": {"project": "test", "vault_path": "", "sessions_folder": ""},
+            "note_type": "claude-session",
+            "source": "raw note",
+            "warnings": [],
+        }
+
+        valid_block = (
+            "## Summary\nDedup failure test.\n\n"
+            "## Key Decisions\n- None noted.\n\n"
+            "## Changes Made\n- None noted.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- [ ] None.\n\n"
+            "## Importance\n3\n"
+        )
+        stdout_text = f"===== SUMMARY 1 =====\n{valid_block}"
+
+        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+            class _Res:
+                returncode = 0
+                stdout = stdout_text
+                stderr = ""
+            return _Res()
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_subprocess_run)
+
+        # Make _dedup_summary_open_items raise.
+        monkeypatch.setattr(
+            obsidian_utils,
+            "_dedup_summary_open_items",
+            lambda block_text, existing_items: (_ for _ in ()).throw(RuntimeError("dedup boom")),
+        )
+
+        # Patch the import inside generate_summaries_batch so existing_items is non-empty.
+        # Save and restore the real module (if already loaded) to avoid contaminating
+        # other tests that use open_item_dedup (test-ordering safety).
+        import types
+        import sys as _sys
+
+        fake_oid_module = types.ModuleType("open_item_dedup")
+        fake_oid_module.collect_open_items = lambda *a, **kw: [("s", "t", "existing item 1")]
+
+        _orig_oid = _sys.modules.get("open_item_dedup")
+        _sys.modules["open_item_dedup"] = fake_oid_module
+
+        try:
+            results = obsidian_utils.generate_summaries_batch(
+                [prep1],
+                model="haiku",
+                timeout=30,
+                project="test",
+                vault_path="",
+                sessions_folder="",
+            )
+        finally:
+            # Restore the original module (or remove if it wasn't present before).
+            if _orig_oid is not None:
+                _sys.modules["open_item_dedup"] = _orig_oid
+            else:
+                _sys.modules.pop("open_item_dedup", None)
+
+        assert len(results) == 1
+        text1, reason1 = results[0]
+
+        # Must be accepted (not failed) even though dedup raised.
+        assert reason1 is None, (
+            f"dedup failure should not fail the note; reason={reason1!r}"
+        )
+        assert text1 is not None, "text should not be None when dedup fails"
+        assert "## Summary" in text1
 
 
 # ===========================================================================
@@ -2429,3 +3111,870 @@ def test_get_session_context_cache_key_isolates_distinct_worktrees(tmp_path, mon
     )
     # And canonical project naming must agree on both calls
     assert ctx1["project"] == ctx2["project"] == "obsidian-brain"
+
+
+# ===========================================================================
+# Task 4: generate_summary returns (text, fallback_reason)
+# ===========================================================================
+
+
+class TestGenerateSummaryReturnsFallbackReason:
+    """generate_summary returns (summary, fallback_reason); reason populated only on failure."""
+
+    def test_success_returns_summary_and_none_reason(self, monkeypatch):
+        import obsidian_utils
+
+        class FakeResult:
+            returncode = 0
+            stdout = "## Summary\nOK\n## Importance\n5\n"
+            stderr = ""
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+
+        summary, reason = obsidian_utils.generate_summary(
+            ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=30,
+        )
+        assert summary.startswith("## Summary")
+        assert reason is None
+
+    def test_timeout_returns_none_and_haiku_timeout(self, monkeypatch):
+        import obsidian_utils
+
+        def fake_run(*a, **kw):
+            raise obsidian_utils.subprocess.TimeoutExpired(cmd=a, timeout=kw["timeout"])
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        summary, reason = obsidian_utils.generate_summary(
+            ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=1,
+        )
+        assert summary is None
+        assert reason == "haiku_timeout"
+
+    def test_nonzero_rc_returns_none_and_subprocess_error(self, monkeypatch):
+        import obsidian_utils
+
+        class FakeResult:
+            returncode = 2
+            stdout = ""
+            stderr = "boom"
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+        summary, reason = obsidian_utils.generate_summary(
+            ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=30,
+        )
+        assert summary is None
+        assert reason == "haiku_subprocess_error"
+
+    def test_empty_stdout_returns_none_and_empty_output(self, monkeypatch):
+        import obsidian_utils
+
+        class FakeResult:
+            returncode = 0
+            stdout = "   "
+            stderr = ""
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+        summary, reason = obsidian_utils.generate_summary(
+            ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=30,
+        )
+        assert summary is None
+        assert reason == "empty_output"
+
+
+# ===========================================================================
+# Task 5: generate_snapshot_summary returns (text, fallback_reason)
+# ===========================================================================
+
+
+class TestGenerateSnapshotSummaryReturnsFallbackReason:
+    def test_success_returns_summary_and_none_reason(self, monkeypatch):
+        import obsidian_utils
+
+        class FakeResult:
+            returncode = 0
+            stdout = "snapshot OK"
+            stderr = ""
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+        summary, reason = obsidian_utils.generate_snapshot_summary(
+            ["u"], ["a"], {"project": "t"}, model="haiku", timeout=30,
+        )
+        assert summary == "snapshot OK"
+        assert reason is None
+
+    def test_timeout_returns_none_and_haiku_timeout(self, monkeypatch):
+        import obsidian_utils
+
+        def fake_run(*a, **kw):
+            raise obsidian_utils.subprocess.TimeoutExpired(cmd=a, timeout=kw["timeout"])
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        summary, reason = obsidian_utils.generate_snapshot_summary(
+            ["u"], ["a"], {"project": "t"}, model="haiku", timeout=1,
+        )
+        assert summary is None
+        assert reason == "haiku_timeout"
+
+
+# ===========================================================================
+# Section: upgrade_unsummarized_note — 4-tuple return contract
+# ===========================================================================
+
+
+class TestUpgradeUnsummarizedNoteReturnsTuple:
+    """upgrade_unsummarized_note returns (status, elapsed_s, model_used, fallback_reason)."""
+
+    def test_success_returns_full_tuple(self, monkeypatch, tmp_path):
+        import obsidian_utils
+
+        # Stub the heavy lifting — we're testing wiring, not generation
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+        monkeypatch.setattr(
+            obsidian_utils, "generate_summary",
+            lambda *a, **kw: ("## Summary\nOK", None),
+        )
+        monkeypatch.setattr(
+            obsidian_utils, "upgrade_note_with_summary",
+            lambda *a, **kw: "Upgraded test.md (source: raw note)",
+        )
+
+        # Minimal valid note
+        note = tmp_path / "test.md"
+        note.write_text(
+            "---\nsession_id: abc123\n---\n"
+            "## Conversation (raw)\n**User:** hi\n**Assistant:** hello\n"
+        )
+
+        result = obsidian_utils.upgrade_unsummarized_note(
+            str(note), str(tmp_path), "claude-sessions", "obsidian-brain",
+        )
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+        status, elapsed_s, model_used, fallback_reason = result
+        assert status.startswith("Upgraded ")
+        assert elapsed_s >= 0
+        assert model_used == "haiku"
+        assert fallback_reason is None
+
+
+# ===========================================================================
+# Section: model-escalation chain (#165) — in-process Haiku→Sonnet→Opus
+# ===========================================================================
+
+
+class TestModelEscalationChain:
+    """upgrade_unsummarized_note escalates through Haiku→Sonnet→Opus in-process.
+
+    Fixture strategy: monkeypatch generate_summary (module-attribute form) to a
+    scripted fake that inspects the ``model`` kwarg and returns a canned
+    (text, reason) pair per model. Also monkeypatch find_transcript_jsonl to
+    None (raw-note fallback) and upgrade_note_with_summary to avoid real I/O
+    on the vault write. This matches the pattern used by
+    TestUpgradeUnsummarizedNoteReturnsTuple, which is the lightest complete
+    driver for the escalation loop.
+    """
+
+    # ------------------------------------------------------------------
+    # Shared note factory
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_session_note(tmp_path: Path) -> Path:
+        """Write a minimal valid session note to tmp_path and return its path."""
+        note = tmp_path / "2026-06-01-escalation-test-abcd.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-06-01\n"
+            "session_id: escalation-test-session-id-0000-0000-000000000000\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "---\n\n"
+            "## Conversation (raw)\n"
+            "**User:** hello\n"
+            "**Assistant:** hi there\n",
+            encoding="utf-8",
+        )
+        return note
+
+    # ------------------------------------------------------------------
+    # Helpers for common monkeypatching
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _patch_common(monkeypatch, tmp_path: Path):
+        """Patch pieces that are the same across all escalation tests."""
+        import obsidian_utils
+
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+        monkeypatch.setattr(
+            obsidian_utils,
+            "upgrade_note_with_summary",
+            lambda note_path, summary_text, *a, **kw: f"Upgraded {os.path.basename(note_path)} (source: raw note)",
+        )
+
+    # ------------------------------------------------------------------
+    # Tests
+    # ------------------------------------------------------------------
+
+    def test_escalates_to_sonnet_on_empty_output(self, monkeypatch, tmp_path):
+        """When haiku returns (None, 'empty_output'), escalate to sonnet."""
+        import obsidian_utils
+
+        self._patch_common(monkeypatch, tmp_path)
+        note = self._write_session_note(tmp_path)
+
+        def fake_generate_summary(*args, **kwargs):
+            model = kwargs.get("model", "haiku")
+            if model == "haiku":
+                return None, "empty_output"
+            if model == "sonnet":
+                return (
+                    "## Summary\nDid a thing.\n\n"
+                    "## Key Decisions\n- None noted.\n\n"
+                    "## Changes Made\n- None noted.\n\n"
+                    "## Errors Encountered\n- None.\n\n"
+                    "## Open Questions / Next Steps\n- [ ] None.\n\n"
+                    "IMPORTANCE: 5\n"
+                ), None
+            return None, "empty_output"
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+
+        status, elapsed_s, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note), str(tmp_path), "claude-sessions", "test-project",
+        )
+
+        assert status.startswith("Upgraded "), f"expected success, got: {status}"
+        assert model_used == "sonnet"
+        assert fallback_reason is None
+
+    def test_escalates_haiku_to_opus_when_sonnet_also_empty(self, monkeypatch, tmp_path):
+        """When haiku and sonnet both return (None, 'empty_output'), opus is tried."""
+        import obsidian_utils
+
+        self._patch_common(monkeypatch, tmp_path)
+        note = self._write_session_note(tmp_path)
+
+        def fake_generate_summary(*args, **kwargs):
+            model = kwargs.get("model", "haiku")
+            if model == "opus":
+                return (
+                    "## Summary\nOpus summary.\n\n"
+                    "## Key Decisions\n- None noted.\n\n"
+                    "## Changes Made\n- None noted.\n\n"
+                    "## Errors Encountered\n- None.\n\n"
+                    "## Open Questions / Next Steps\n- [ ] None.\n\n"
+                    "IMPORTANCE: 7\n"
+                ), None
+            # haiku and sonnet both fail with empty_output
+            return None, "empty_output"
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+
+        status, elapsed_s, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note), str(tmp_path), "claude-sessions", "test-project",
+        )
+
+        assert status.startswith("Upgraded "), f"expected success, got: {status}"
+        assert model_used == "opus"
+        assert fallback_reason is None
+
+    def test_no_escalation_on_timeout(self, monkeypatch, tmp_path):
+        """When haiku returns (None, 'haiku_timeout'), do NOT escalate — timeout
+        means the CLI is slow; a bigger model would only make it slower (#84).
+        """
+        import obsidian_utils
+
+        self._patch_common(monkeypatch, tmp_path)
+        note = self._write_session_note(tmp_path)
+
+        models_attempted: list[str] = []
+
+        def fake_generate_summary(*args, **kwargs):
+            model = kwargs.get("model", "haiku")
+            models_attempted.append(model)
+            return None, "haiku_timeout"
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+
+        status, elapsed_s, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note), str(tmp_path), "claude-sessions", "test-project",
+        )
+
+        # Should have tried haiku once and stopped immediately
+        assert models_attempted == ["haiku"], (
+            f"expected only haiku to be attempted, got: {models_attempted}"
+        )
+        assert not status.startswith("Upgraded "), f"expected failure, got: {status}"
+        assert model_used is None
+        assert fallback_reason == "haiku_timeout"
+
+    def test_happy_path_uses_primary_model_only(self, monkeypatch, tmp_path):
+        """When haiku succeeds on the first call, no escalation occurs."""
+        import obsidian_utils
+
+        self._patch_common(monkeypatch, tmp_path)
+        note = self._write_session_note(tmp_path)
+
+        models_attempted: list[str] = []
+
+        def fake_generate_summary(*args, **kwargs):
+            model = kwargs.get("model", "haiku")
+            models_attempted.append(model)
+            return (
+                "## Summary\nHaiku success.\n\n"
+                "## Key Decisions\n- None noted.\n\n"
+                "## Changes Made\n- None noted.\n\n"
+                "## Errors Encountered\n- None.\n\n"
+                "## Open Questions / Next Steps\n- [ ] None.\n\n"
+                "IMPORTANCE: 4\n"
+            ), None
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+
+        status, elapsed_s, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note), str(tmp_path), "claude-sessions", "test-project",
+        )
+
+        assert models_attempted == ["haiku"], (
+            f"expected only haiku to be attempted, got: {models_attempted}"
+        )
+        assert status.startswith("Upgraded "), f"expected success, got: {status}"
+        assert model_used == "haiku"
+        assert fallback_reason is None
+
+
+# ===========================================================================
+# TestEscalationModels — unit tests for _escalation_models helper (Fix 4)
+# ===========================================================================
+
+
+class TestEscalationModels:
+    """Unit tests for the _escalation_models() capability-ranked helper (#165 Fix 4).
+
+    Ensures the escalation list only goes UP in capability, never backwards, so
+    that passing summary_model="sonnet" does not produce ["sonnet", "haiku", "opus"].
+    """
+
+    def test_haiku_escalates_through_full_chain(self):
+        """haiku -> [haiku, sonnet, opus]: all models tried in capability order."""
+        import obsidian_utils
+        result = obsidian_utils._escalation_models("haiku")
+        assert result == ["haiku", "sonnet", "opus"], (
+            f"haiku should escalate through full chain; got: {result!r}"
+        )
+
+    def test_sonnet_escalates_only_to_opus(self):
+        """sonnet -> [sonnet, opus]: haiku (less capable) is excluded."""
+        import obsidian_utils
+        result = obsidian_utils._escalation_models("sonnet")
+        assert result == ["sonnet", "opus"], (
+            f"sonnet should only escalate to opus; got: {result!r}"
+        )
+
+    def test_opus_no_escalation(self):
+        """opus -> [opus]: already at max capability, nothing to escalate to."""
+        import obsidian_utils
+        result = obsidian_utils._escalation_models("opus")
+        assert result == ["opus"], (
+            f"opus should have no escalation targets; got: {result!r}"
+        )
+
+
+# ===========================================================================
+# TestNormalizeSummary — unit tests for _normalize_summary (#167)
+# ===========================================================================
+
+
+class TestNormalizeSummary:
+    """Unit tests for the _normalize_summary() post-processing helper (#167).
+
+    Exercises heading normalization, section synthesis, default importance,
+    idempotency, and the no-op path when no recognisable Summary heading exists.
+    """
+
+    def test_normalizes_heading_variants(self):
+        """Variant headings for any canonical section are rewritten to ## form."""
+        loose = (
+            "# Summary\n"
+            "Did a thing.\n\n"
+            "**Key Decisions**\n"
+            "- Used pattern X.\n\n"
+            "Changes Made:\n"
+            "- file.py\n\n"
+            "## Errors Encountered\n"
+            "None.\n\n"
+            "## Open Questions / Next Steps\n"
+            "None.\n\n"
+            "## Importance\n"
+            "6\n"
+        )
+        out, notes = obsidian_utils._normalize_summary(loose)
+        assert re.search(r"^## Summary\s*$", out, re.MULTILINE), (
+            "# Summary should be rewritten to ## Summary"
+        )
+        assert re.search(r"^## Key Decisions\s*$", out, re.MULTILINE), (
+            "**Key Decisions** should be rewritten to ## Key Decisions"
+        )
+        assert re.search(r"^## Changes Made\s*$", out, re.MULTILINE), (
+            "Changes Made: should be rewritten to ## Changes Made"
+        )
+        assert "normalized heading: Summary" in notes
+        assert "normalized heading: Key Decisions" in notes
+        assert "normalized heading: Changes Made" in notes
+
+    def test_no_summary_heading_returns_unchanged(self):
+        """Prose with no recognisable Summary heading is returned verbatim."""
+        prose = (
+            "This is just some text about the session.\n"
+            "No headings at all — not even a malformed one.\n"
+        )
+        out, notes = obsidian_utils._normalize_summary(prose)
+        assert out == prose, "text without any Summary heading must be returned unchanged"
+        assert notes == [], "no recovery notes should be produced when nothing was recovered"
+        # Confirm the downstream check would still reject it.
+        assert not re.search(r"^## Summary\s*$", out, re.MULTILINE)
+
+    def test_synthesizes_missing_sections_and_default_importance(self):
+        """A summary with only ## Summary gets all other sections synthesized."""
+        minimal = "## Summary\nDid X.\n"
+        out, notes = obsidian_utils._normalize_summary(minimal)
+
+        for sec in ["Key Decisions", "Changes Made", "Errors Encountered",
+                    "Open Questions / Next Steps"]:
+            assert re.search(r"^## " + re.escape(sec) + r"\s*$", out, re.MULTILINE), (
+                f"section '## {sec}' should be synthesized"
+            )
+            # Synthesized body must be "None."
+            # Find the section and check next non-blank line.
+            sec_match = re.search(
+                r"^## " + re.escape(sec) + r"\s*\n(.*?)(?=\n## |\Z)",
+                out, re.MULTILINE | re.DOTALL,
+            )
+            assert sec_match and "None." in sec_match.group(1), (
+                f"synthesized body for '{sec}' should contain 'None.'"
+            )
+
+        assert re.search(r"^## Importance\s*$", out, re.MULTILINE), (
+            "## Importance should be appended when absent"
+        )
+        assert re.search(r"^## Importance\s*\n5", out, re.MULTILINE), (
+            "defaulted Importance must be 5"
+        )
+        assert "synthesized section: Key Decisions" in notes
+        assert "synthesized section: Changes Made" in notes
+        assert "synthesized section: Errors Encountered" in notes
+        assert "synthesized section: Open Questions / Next Steps" in notes
+        assert "defaulted importance" in notes
+
+    def test_idempotent(self):
+        """A well-formed summary is unchanged; double application yields same result."""
+        full = (
+            "## Summary\n"
+            "Implemented feature Y.\n\n"
+            "## Key Decisions\n"
+            "- Chose approach A.\n\n"
+            "## Changes Made\n"
+            "- src/y.py\n\n"
+            "## Errors Encountered\n"
+            "None.\n\n"
+            "## Open Questions / Next Steps\n"
+            "None.\n\n"
+            "## Importance\n"
+            "7\n"
+        )
+        out1, notes1 = obsidian_utils._normalize_summary(full)
+        out2, notes2 = obsidian_utils._normalize_summary(out1)
+        assert out1 == full, "a well-formed summary should pass through unchanged"
+        assert notes1 == [], "no recovery notes for an already-correct summary"
+        assert out2 == out1, "double application must be idempotent"
+        assert notes2 == []
+
+    def test_existing_importance_line_preserved(self):
+        """An existing ## Importance or IMPORTANCE: N line is not overwritten."""
+        # Case 1: ## Importance section already present with score 8
+        with_heading = (
+            "## Summary\nDid Z.\n\n"
+            "## Importance\n8\n"
+        )
+        out, notes = obsidian_utils._normalize_summary(with_heading)
+        # Score must still be 8, not 5
+        imp_match = re.search(r"^## Importance\s*\n(\d+)", out, re.MULTILINE)
+        assert imp_match and imp_match.group(1) == "8", (
+            f"existing ## Importance score should be preserved; got: {out!r}"
+        )
+        assert "defaulted importance" not in notes
+
+        # Case 2: IMPORTANCE: N line present (sub-agent style)
+        with_legacy = (
+            "## Summary\nDid W.\n\n"
+            "IMPORTANCE: 9\n"
+        )
+        out2, notes2 = obsidian_utils._normalize_summary(with_legacy)
+        assert "defaulted importance" not in notes2, (
+            "IMPORTANCE: N line should prevent default-importance injection"
+        )
+        assert "9" in out2, "existing IMPORTANCE score must be preserved"
+
+    def test_idempotent_with_code_block(self):
+        """A well-formed summary containing a fenced code block with a '# Summary'
+        line inside the fence is returned UNCHANGED — idempotency fix (#167 Fix 1)."""
+        text = (
+            "## Summary\n"
+            "Implemented feature Z.\n\n"
+            "## Changes Made\n"
+            "Added helper:\n\n"
+            "```python\n"
+            "# Summary\n"
+            "def summarize(text):\n"
+            "    return text[:100]\n"
+            "```\n\n"
+            "## Key Decisions\n"
+            "- Kept it simple.\n\n"
+            "## Errors Encountered\n"
+            "None.\n\n"
+            "## Open Questions / Next Steps\n"
+            "None.\n\n"
+            "## Importance\n"
+            "6\n"
+        )
+        out, notes = obsidian_utils._normalize_summary(text)
+        assert out == text, (
+            "well-formed summary with code block containing '# Summary' must be "
+            f"returned unchanged; diff: {set(out.splitlines()) ^ set(text.splitlines())}"
+        )
+        assert notes == [], (
+            f"no recovery notes expected for already-correct summary; got: {notes!r}"
+        )
+
+    def test_normalizes_open_questions_variant(self):
+        """'# Open Questions / Next Steps' (single-hash variant) is normalized to
+        '## Open Questions / Next Steps'."""
+        text = (
+            "## Summary\n"
+            "Did a thing.\n\n"
+            "## Key Decisions\n"
+            "None.\n\n"
+            "## Changes Made\n"
+            "None.\n\n"
+            "## Errors Encountered\n"
+            "None.\n\n"
+            "# Open Questions / Next Steps\n"
+            "- Check later.\n\n"
+            "## Importance\n"
+            "5\n"
+        )
+        out, notes = obsidian_utils._normalize_summary(text)
+        assert re.search(r"^## Open Questions / Next Steps\s*$", out, re.MULTILINE), (
+            "# Open Questions / Next Steps should be rewritten to "
+            "## Open Questions / Next Steps"
+        )
+        assert "normalized heading: Open Questions / Next Steps" in notes
+
+
+# ===========================================================================
+# TestRecoveryIntegration — solo-path integration for _normalize_summary (#167)
+# ===========================================================================
+
+
+class TestRecoveryIntegration:
+    """Integration tests confirming _normalize_summary is wired into the
+    production paths (upgrade_unsummarized_note solo path, generate_summaries_batch
+    batch path).
+
+    Approach: because the existing fixtures monkeypatch generate_summary to return
+    a well-formed summary, we test recovery via two complementary angles:
+
+      (a) Direct: verify that _normalize_summary turns a # Summary input into text
+          that passes re.search(r"^## Summary\\s*$", ..., re.M), and that
+          upgrade_note_with_summary accepts the normalized form but rejects the raw form.
+      (b) Solo path: drive upgrade_unsummarized_note end-to-end with a
+          monkeypatched generate_summary that returns a # Summary (single-hash)
+          summary.  With recovery enabled the note is Upgraded; with recovery
+          disabled (summary_recovery=False) the malformed text reaches
+          upgrade_note_with_summary and the note fails.
+    """
+
+    # ---- helpers ----------------------------------------------------------------
+
+    @staticmethod
+    def _loose_summary_text() -> str:
+        """A structurally-loose summary: # Summary (single-hash), missing sections."""
+        return (
+            "# Summary\n"
+            "Implemented the new feature.\n\n"
+            "## Key Decisions\n"
+            "- Used pattern X.\n"
+        )
+
+    @staticmethod
+    def _write_session_note(sessions_dir: Path, note_name: str) -> Path:
+        sid = f"recovery-integ-session-{note_name.replace('.md', '')}-0000"
+        note = sessions_dir / note_name
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-06-01\n"
+            f"session_id: {sid}\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "tags:\n"
+            "  - claude/session\n"
+            "---\n\n"
+            "## Conversation (raw)\n"
+            "**User:** hello\n"
+            "**Assistant:** hi there\n",
+            encoding="utf-8",
+        )
+        return note
+
+    # ---- (a) Direct angle -------------------------------------------------------
+
+    def test_normalize_turns_single_hash_into_passing_text(self):
+        """_normalize_summary on # Summary input produces text that passes
+        upgrade_note_with_summary's ## Summary gate."""
+        raw = self._loose_summary_text()
+        # Raw form fails the gate.
+        assert not re.search(r"^## Summary\s*$", raw, re.MULTILINE), (
+            "raw fixture should NOT have ## Summary (it uses # Summary)"
+        )
+        normalized, notes = obsidian_utils._normalize_summary(raw)
+        assert re.search(r"^## Summary\s*$", normalized, re.MULTILINE), (
+            "normalized text must contain ^## Summary$ for upgrade_note_with_summary"
+        )
+        assert "normalized heading: Summary" in notes
+
+    def test_upgrade_note_with_summary_accepts_normalized_rejects_raw(
+        self, tmp_vault, monkeypatch
+    ):
+        """upgrade_note_with_summary accepts normalized text, rejects raw # Summary."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        sessions_dir = tmp_vault / "claude-sessions"
+        note = self._write_session_note(sessions_dir, "recovery-accept-reject-test.md")
+
+        raw = self._loose_summary_text()
+        normalized, _ = obsidian_utils._normalize_summary(raw)
+
+        # Raw form must fail.
+        result_raw = obsidian_utils.upgrade_note_with_summary(
+            str(note), raw, str(tmp_vault), "claude-sessions", "test-project",
+        )
+        assert result_raw.startswith("Failed:"), (
+            f"raw # Summary should fail upgrade_note_with_summary; got: {result_raw!r}"
+        )
+
+        # Reset note to auto-logged status for the accept test.
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "date: 2026-06-01\n"
+            "session_id: recovery-integ-session-recovery-accept-reject-test-0000\n"
+            "project: test-project\n"
+            "status: auto-logged\n"
+            "tags:\n"
+            "  - claude/session\n"
+            "---\n\n"
+            "## Conversation (raw)\n"
+            "**User:** hello\n"
+            "**Assistant:** hi there\n",
+            encoding="utf-8",
+        )
+
+        # Normalized form must succeed.
+        result_norm = obsidian_utils.upgrade_note_with_summary(
+            str(note), normalized, str(tmp_vault), "claude-sessions", "test-project",
+        )
+        assert result_norm.startswith("Upgraded "), (
+            f"normalized summary should be accepted; got: {result_norm!r}"
+        )
+
+    # ---- (b) Solo path end-to-end -----------------------------------------------
+
+    def test_solo_path_recovers_loose_summary(self, tmp_path, monkeypatch):
+        """upgrade_unsummarized_note with a # Summary output (loose Haiku):
+        recovery enabled -> note is Upgraded; disabled -> note fails write-back."""
+        vault = tmp_path / "vault"
+        sessions_dir = vault / "claude-sessions"
+        sessions_dir.mkdir(parents=True)
+
+        # Unique session IDs so load_config cache doesn't interfere.
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        def _make_note(name: str) -> Path:
+            return self._write_session_note(sessions_dir, name)
+
+        # generate_summary returns a structurally-loose # Summary text.
+        def fake_generate_summary(*args, **kwargs):
+            return self._loose_summary_text(), None
+
+        monkeypatch.setattr(obsidian_utils, "generate_summary", fake_generate_summary)
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda session_id: None)
+
+        # --- recovery ENABLED (default) ---
+        note_on = _make_note("recovery-on.md")
+        status, _, model_used, fallback_reason = obsidian_utils.upgrade_unsummarized_note(
+            str(note_on), str(vault), "claude-sessions", "test-project",
+        )
+        assert status.startswith("Upgraded "), (
+            f"recovery enabled: expected Upgraded, got: {status!r}"
+        )
+        assert fallback_reason is None
+
+        # --- recovery DISABLED (summary_recovery=False in config) ---
+        note_off = _make_note("recovery-off.md")
+
+        def fake_load_config_no_recovery():
+            cfg = dict(obsidian_utils._DEFAULTS)
+            cfg["summary_recovery"] = False
+            return cfg
+
+        # Patch load_config for the disabled check; _summary_recovery_enabled
+        # calls load_config() directly.
+        monkeypatch.setattr(obsidian_utils, "load_config", fake_load_config_no_recovery)
+
+        status_off, _, _, _ = obsidian_utils.upgrade_unsummarized_note(
+            str(note_off), str(vault), "claude-sessions", "test-project",
+        )
+        assert not status_off.startswith("Upgraded "), (
+            f"recovery disabled: expected failure (malformed summary), got: {status_off!r}"
+        )
+
+
+# ===========================================================================
+# TestBatchRecovery — batch-path recovery tests (#167 Fix 4, tests 3 & 4)
+# ===========================================================================
+
+
+class TestBatchRecovery:
+    """Tests for _normalize_summary wired into generate_summaries_batch (#167)."""
+
+    # Minimal prep dict used by batch tests (no JSONL path needed).
+    _BASE_PREP: dict = {
+        "ok": True,
+        "user_msgs": ["hello"],
+        "assistant_msgs": ["hi"],
+        "metadata": {"project": "test", "vault_path": "", "sessions_folder": ""},
+        "note_type": "claude-session",
+        "source": "raw note",
+        "warnings": [],
+    }
+
+    @staticmethod
+    def _make_stdout(loose_block: str, good_block: str) -> str:
+        """Build ===== SUMMARY k ===== delimited stdout with 2 blocks."""
+        return (
+            f"===== SUMMARY 1 =====\n{loose_block}"
+            f"===== SUMMARY 2 =====\n{good_block}"
+        )
+
+    @staticmethod
+    def _good_block() -> str:
+        return (
+            "## Summary\nDid something.\n\n"
+            "## Key Decisions\n- None.\n\n"
+            "## Changes Made\n- None.\n\n"
+            "## Errors Encountered\n- None.\n\n"
+            "## Open Questions / Next Steps\n- None.\n\n"
+            "## Importance\n5\n"
+        )
+
+    @staticmethod
+    def _loose_block() -> str:
+        """Block with # Summary (single-hash) — recoverable by _normalize_summary."""
+        return (
+            "# Summary\n"
+            "Implemented the widget.\n\n"
+            "## Key Decisions\n"
+            "- Used pattern X.\n"
+        )
+
+    def test_batch_recovers_loose_block(self, monkeypatch):
+        """generate_summaries_batch: loose # Summary block is recovered (default enabled).
+
+        With recovery enabled (default), the first block's '# Summary' heading is
+        normalized to '## Summary' and the result is (text_with_##Summary, None),
+        NOT (None, 'missing_section').
+        """
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        stdout_text = self._make_stdout(self._loose_block(), self._good_block())
+
+        def fake_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+            class _R:
+                returncode = 0
+                stdout = stdout_text
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+
+        prep1 = dict(self._BASE_PREP)
+        prep2 = dict(self._BASE_PREP)
+
+        results = obsidian_utils.generate_summaries_batch(
+            [prep1, prep2], model="haiku", timeout=30,
+            project="test", vault_path="", sessions_folder="",
+        )
+
+        assert len(results) == 2
+        text1, reason1 = results[0]
+        assert reason1 is None, (
+            f"recovery enabled: block 1 should be accepted; reason={reason1!r}"
+        )
+        assert text1 is not None, "recovery enabled: block 1 text must not be None"
+        assert re.search(r"^## Summary\s*$", text1, re.MULTILINE), (
+            f"recovered block must contain ^## Summary$; got:\n{text1!r}"
+        )
+        # Block 2 was already well-formed — must still pass.
+        _, reason2 = results[1]
+        assert reason2 is None, f"block 2 (well-formed) should also be accepted; {reason2!r}"
+
+    def test_batch_recovery_disabled_yields_missing_section(self, monkeypatch):
+        """generate_summaries_batch: with summary_recovery=False, a loose # Summary
+        block returns (None, 'missing_section') instead of being recovered.
+
+        Monkeypatches obsidian_utils.load_config (the function _summary_recovery_enabled
+        calls directly) so the flag flip is exercised through the real wire-up path,
+        not by stubbing the helper itself.
+        """
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+
+        stdout_text = self._make_stdout(self._loose_block(), self._good_block())
+
+        def fake_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+            class _R:
+                returncode = 0
+                stdout = stdout_text
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+
+        # Disable recovery via load_config — _summary_recovery_enabled() reads
+        # load_config().get("summary_recovery", True), so patching here exercises
+        # the real wire-up without bypassing _summary_recovery_enabled itself.
+        def fake_load_config():
+            cfg = dict(obsidian_utils._DEFAULTS)
+            cfg["summary_recovery"] = False
+            return cfg
+
+        monkeypatch.setattr(obsidian_utils, "load_config", fake_load_config)
+
+        prep1 = dict(self._BASE_PREP)
+        prep2 = dict(self._BASE_PREP)
+
+        results = obsidian_utils.generate_summaries_batch(
+            [prep1, prep2], model="haiku", timeout=30,
+            project="test", vault_path="", sessions_folder="",
+        )
+
+        assert len(results) == 2
+        text1, reason1 = results[0]
+        assert text1 is None, (
+            f"recovery disabled: loose block should be rejected; text={text1!r}"
+        )
+        assert reason1 == "missing_section", (
+            f"recovery disabled: expected 'missing_section', got {reason1!r}"
+        )

@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -431,6 +432,136 @@ def _ensure_secure_dir() -> str:
     if st.st_mode & 0o077:
         os.chmod(_SECURE_DIR, 0o700)
     return _SECURE_DIR
+
+
+# --- Cross-plugin hook dedup guard (standalone-marketplace migration) ---
+# When both the monorepo and standalone obsidian-brain plugins are installed,
+# every lifecycle hook fires once per installed plugin copy. These coordinate
+# via a lock file under the install-source-independent secure dir so only one
+# copy acts.
+
+_LOCK_DIR = os.path.join(_SECURE_DIR, "locks")
+_HOOK_DEDUP_TTL_SECONDS = 15
+_LOCK_CLEANUP_MAX_AGE_SECONDS = 2 * 24 * 3600  # prune lock files older than 2 days
+
+
+def _cleanup_stale_locks(max_age_seconds: int = _LOCK_CLEANUP_MAX_AGE_SECONDS) -> None:
+    """Best-effort prune of lock files older than max_age_seconds. Never raises."""
+    try:
+        now = time.time()
+        for name in os.listdir(_LOCK_DIR):
+            p = os.path.join(_LOCK_DIR, name)
+            try:
+                if now - os.stat(p).st_mtime > max_age_seconds:
+                    os.unlink(p)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def _lock_path(event_type: str, session_id: str) -> str:
+    """Composed lock-file path for a (event_type, session_id) trigger.
+
+    Sanitizes both components so they cannot escape _LOCK_DIR. Shared by
+    claim_hook_run() and release_hook_run() so the two never drift."""
+    safe_sid = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)[:64]
+    safe_event = re.sub(r"[^A-Za-z0-9_-]", "_", event_type)[:32]
+    return os.path.join(_LOCK_DIR, f"{safe_sid}-{safe_event}")
+
+
+def claim_hook_run(event_type: str, session_id: str,
+                   ttl_seconds: int = _HOOK_DEDUP_TTL_SECONDS) -> bool:
+    """Return True if THIS process should handle the (event_type, session_id)
+    trigger; False if a sibling plugin copy already claimed it within ttl_seconds.
+
+    Coordinates the double-install case (monorepo + standalone both present) via
+    an O_EXCL lock file under _SECURE_DIR/locks/, a fixed path shared by every
+    install source. Simultaneous duplicate fires land within the TTL window and
+    the loser returns False; legitimate later fires (e.g. a second SessionStart)
+    are outside the window and re-claim.
+
+    Taking over a stale lock (a legitimate later fire past the TTL) is not
+    atomic: two processes can both observe the stale lock, but the unlink +
+    re-create race resolves to one winner and the loser returns False, so the
+    failure direction is always "suppress", never "duplicate".
+
+    Fail-open: an empty session_id (no key to dedup on) or any filesystem error
+    returns True — a permissions quirk must never silently drop a hook.
+    """
+    if not session_id:
+        return True
+    try:
+        os.makedirs(_LOCK_DIR, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        print(f"[obsidian-brain] dedup lock dir unavailable, proceeding: {exc}", file=sys.stderr)
+        return True
+
+    lock_path = _lock_path(event_type, session_id)
+
+    payload = f"{os.getpid()} {time.time():.3f}\n".encode("utf-8")
+
+    def _create() -> bool:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        _cleanup_stale_locks()  # only the winner scans the locks dir
+        return True
+
+    try:
+        return _create()
+    except FileExistsError:
+        try:
+            age = time.time() - os.stat(lock_path).st_mtime
+        except OSError:
+            return True  # fail open
+        if age < ttl_seconds:
+            return False  # a sibling plugin copy owns this trigger
+        # Stale lock -> a legitimate later fire. Take it over.
+        try:
+            os.unlink(lock_path)
+            return _create()
+        except FileExistsError:
+            return False  # lost the re-claim race
+        except OSError as exc:
+            print(f"[obsidian-brain] dedup re-claim failed, proceeding: {exc}", file=sys.stderr)
+            return True
+    except OSError as exc:
+        print(f"[obsidian-brain] dedup claim failed, proceeding: {exc}", file=sys.stderr)
+        return True
+
+
+def release_hook_run(event_type: str, session_id: str) -> None:
+    """Release a dedup lock previously taken by claim_hook_run() so a sibling
+    plugin copy (or a re-fire of the same trigger) can still handle it.
+
+    Call this when the work AFTER a successful claim fails — e.g. the vault
+    write errors or the hook raises. Without it, a transient failure on the
+    winning copy would convert a suppressed sibling into a permanently lost
+    note. Do NOT call it on success: the lock must persist for its TTL so a
+    near-simultaneous sibling fire is still deduplicated. Never raises."""
+    if not session_id:
+        return
+    lock_path = _lock_path(event_type, session_id)
+    try:
+        # Only release a lock THIS process still owns. claim_hook_run wrote our
+        # PID into the payload; if a legitimate later fire took over our stale
+        # lock (>TTL), the PID won't match and unlinking its fresh lock would
+        # let a sibling re-claim and write a duplicate. On any read/parse error
+        # fall through to the unconditional unlink so a transient glitch never
+        # strands a claimed-but-failed run (a lost note is worse than a rare dup).
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                owner_pid = int(f.read().split(None, 1)[0])
+            if owner_pid != os.getpid():
+                return  # taken over by another process — not ours to release
+        except (OSError, ValueError, IndexError):
+            pass  # unreadable / unparseable — fall through to best-effort unlink
+        os.unlink(lock_path)
+    except OSError:
+        pass  # already gone / never created / unwritable — nothing to undo
 
 
 # --- Session-scoped cache ---
@@ -912,6 +1043,11 @@ _DEFAULTS: dict = {
     "min_messages": 3,
     "min_duration_minutes": 2,
     "summary_model": "haiku",
+    "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline. Consumed by /recall SKILL.md Step 2 (summarization is deferred to /recall), #84
+    "summary_batch_size": 3,  # notes per claude -p spawn in upgrade_batch (#166); 1 = legacy per-note fan-out
+    "summary_recovery": True,  # #167: post-process loose summaries (heading normalization, synth missing sections, default importance) before escalating/falling back. Set false to disable.
+    "aged_summarize_threshold_days": 90,  # #168: notes whose file mtime is older than this AND have no inbound vault links AND no pin tag are deferred (skipped) by /recall
+    "summary_pin_tags": ["claude/keep", "claude/permanent"],  # #168: notes carrying any of these frontmatter tags are never deferred
     "auto_log_enabled": True,
     "snapshot_on_compact": True,
     "snapshot_on_clear": True,
@@ -1920,18 +2056,222 @@ OUTPUT EXACTLY these two sections with no preamble, no commentary:
 """
 
 
+# Model-escalation chain for the summarizer (#165). After the primary model
+# (summary_model, default "haiku") fails with a *quality* reason, retry with a
+# more capable model. Sonnet is the first fallback (~3x cost) before Opus (~5x),
+# replacing the old behavior where the recall Phase-2 sub-agent fell straight to
+# Opus. CLI aliases passed to `claude -p --model`.
+_SUMMARY_FALLBACK_CHAIN = ("sonnet", "opus")
+# Only these generate_summary failure reasons warrant escalating to a more
+# capable model. Timeouts (haiku_timeout) are NOT escalated — a larger model is
+# slower and would worsen the slow-CLI problem (#84). Subprocess errors
+# (haiku_subprocess_error: CLI missing / non-zero rc) are NOT escalated — a
+# different model won't fix an environment problem.
+_MODEL_ESCALATION_REASONS = frozenset({"empty_output"})
+
+# Capability rank for escalation: only escalate to a MORE capable model than the
+# primary. Prevents a backwards chain when summary_model is explicitly "opus"/"sonnet".
+_MODEL_RANK = {"haiku": 0, "sonnet": 1, "opus": 2}
+
+
+def _escalation_models(primary: str) -> list[str]:
+    """Ordered model list: the primary, then any fallback-chain model strictly
+    more capable than the primary (#165). e.g. haiku -> [haiku, sonnet, opus];
+    sonnet -> [sonnet, opus]; opus -> [opus]."""
+    base = _MODEL_RANK.get(primary, 0)
+    return [primary] + [m for m in _SUMMARY_FALLBACK_CHAIN if _MODEL_RANK.get(m, 0) > base]
+
+
+# ---------------------------------------------------------------------------
+# Summary recovery (#167)
+# ---------------------------------------------------------------------------
+#
+# Escalation / fallback decision matrix for structurally-loose summaries:
+#
+#   empty_output           (whitespace-only or no text)         -> ESCALATE (a)
+#                           handled by the #165 chain in upgrade_unsummarized_note
+#
+#   haiku_timeout          (subprocess.TimeoutExpired)          -> do NOT escalate
+#                           a larger model is slower; falls to solo/sub-agent
+#
+#   haiku_subprocess_error (CLI missing / rc != 0)              -> do NOT escalate
+#                           different model won't fix the env; falls back
+#
+#   schema-loose but non-empty                                  -> RECOVER (b)
+#       (missing/variant headings, missing sections,
+#        missing ## Importance)
+#       -> apply _normalize_summary, do NOT escalate or fall back
+#
+# _normalize_summary implements RECOVER (b).  It is conservative: it never
+# fabricates Summary *content*.  If no recognisable Summary heading is found,
+# the text is returned unchanged so the downstream ## Summary check still
+# fails and the note escalates / falls back as before.
+
+
+_CANONICAL_SECTIONS: list[str] = [
+    "Summary",
+    "Key Decisions",
+    "Changes Made",
+    "Errors Encountered",
+    "Open Questions / Next Steps",
+    "Importance",
+]
+
+# Pre-compiled per-section heading-normalization patterns (case-insensitive,
+# multiline).  Built once at import time; re-used across calls.
+_HEADING_NORM_PATTERNS: list[tuple[re.Pattern, str]] = []
+for _sec in _CANONICAL_SECTIONS:
+    _esc = re.escape(_sec)
+    # Matches ATX headings NOT at level 2 (#{1}(?!#) = level-1 only;
+    # #{3,6} = levels 3-6), bold-markdown, or bare "Name:" forms.
+    # Deliberately excludes "## <Name>" so already-correct headings are
+    # left unchanged (idempotent — re-running on a well-formed summary
+    # must produce zero recovery_notes).
+    _pat = re.compile(
+        r"(?m)^(?:#{1}(?!#)\s*" + _esc + r"\s*|"
+        r"#{3,6}\s*" + _esc + r"\s*|"
+        r"\*\*\s*" + _esc + r"\s*\*\*\s*:?\s*|"
+        + _esc + r"\s*:\s*)$",
+        re.IGNORECASE,
+    )
+    _HEADING_NORM_PATTERNS.append((_pat, f"## {_sec}"))
+del _sec, _esc, _pat  # clean up loop variables from module namespace
+
+# Pre-compiled per-section presence regexes for Step-3 section synthesis.
+# Built once at import time alongside _HEADING_NORM_PATTERNS.
+_SECTION_PRESENCE_RES: dict[str, re.Pattern] = {
+    name: re.compile(rf"^## {re.escape(name)}\s*$", re.MULTILINE)
+    for name in _CANONICAL_SECTIONS
+}
+
+# The one regex that upgrade_note_with_summary uses as its gating check.
+_SUMMARY_SECTION_RE = re.compile(r"^## Summary\s*$", re.MULTILINE)
+
+
+def _normalize_summary(text: str) -> tuple[str, list[str]]:
+    """Recover a structurally-loose AI summary so it passes the downstream
+    ``## Summary`` check and section parsing, instead of escalating to a
+    costlier model or falling through to the sub-agent (#167).
+
+    Returns ``(normalized_text, recovery_notes)``.  CONSERVATIVE: it only
+    acts on recognizable structure and NEVER fabricates Summary *content* —
+    if no recognizable summary heading exists, the original text is returned
+    unchanged so the note still fails and escalates/falls back.
+
+    Recoveries (each appended to ``recovery_notes`` when applied):
+      - heading variant normalization: ``# Summary``, ``### Summary``,
+        ``**Summary**``, ``Summary:`` (bare) -> ``## Summary``, for each
+        canonical section name (case-insensitive on the section name).
+      - synthesize a missing NON-summary section as ``## <Name>\\nNone.``
+        (only Key Decisions / Changes Made / Errors Encountered /
+        Open Questions / Next Steps — NOT Summary).
+      - if neither a ``## Importance`` heading nor an ``IMPORTANCE:`` line
+        is present, append ``## Importance\\n5`` (default importance).
+    """
+    recovery_notes: list[str] = []
+
+    # Step 1: heading normalization — replace variant headings with canonical
+    # ## forms.  Operates LINE-BY-LINE to skip fenced code blocks, so a line
+    # like `# Summary` inside a ``` or ~~~ fence is left unchanged (idempotency
+    # fix: well-formed summaries that contain code blocks are not mutated).
+    #
+    # Implementation note: the patterns use MULTILINE `$` which matches before
+    # `\n` but does NOT consume it.  When applied via subn() to an individual
+    # line that ends with `\n`, the match covers everything up to (not including)
+    # the `\n`, so the replacement text lacks the trailing newline.  We therefore
+    # split with keepends=True but strip/restore the line ending ourselves so the
+    # substitution result is re-joined correctly.
+    lines = text.splitlines(keepends=True)
+    in_fence = False
+    out_lines: list[str] = []
+    # Track which section names were recovered so we can build recovery_notes
+    # after the line loop (one note per section, regardless of line count).
+    recovered_sections: set[str] = set()
+    for line in lines:
+        stripped = line.rstrip("\n").rstrip()
+        # Toggle fence state on opening/closing fence markers.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            out_lines.append(line)
+            continue
+        if in_fence:
+            # Inside a code fence — pass through unchanged.
+            out_lines.append(line)
+            continue
+        # Outside a fence — apply heading-normalization patterns.
+        # Work on the bare content (no trailing newline) so the replacement is
+        # not affected by the `$`-before-`\n` consumption, then restore the eol.
+        eol = line[len(line.rstrip("\n")):]  # "\n" or "" for last line
+        bare = line.rstrip("\n")
+        new_bare = bare
+        for pattern, replacement in _HEADING_NORM_PATTERNS:
+            sec_name = replacement[3:]  # strip leading "## "
+            result, n_subs = pattern.subn(replacement, new_bare)
+            if n_subs:
+                new_bare = result
+                recovered_sections.add(sec_name)
+        out_lines.append(new_bare + eol)
+    normalized = "".join(out_lines)
+    for sec_name in recovered_sections:
+        recovery_notes.append(f"normalized heading: {sec_name}")
+
+    # Step 2: if the gating regex still doesn't match after normalization,
+    # recovery cannot succeed — return the ORIGINAL text unchanged so the
+    # downstream ## Summary check fails and the note escalates/falls back.
+    if not _SUMMARY_SECTION_RE.search(normalized):
+        return text, []
+
+    # Step 3: synthesize missing non-Summary, non-Importance sections.
+    # Uses pre-compiled _SECTION_PRESENCE_RES — built once at import time.
+    for sec_name in _CANONICAL_SECTIONS:
+        if sec_name in ("Summary", "Importance"):
+            continue
+        if not _SECTION_PRESENCE_RES[sec_name].search(normalized):
+            normalized = normalized.rstrip("\n") + f"\n\n## {sec_name}\nNone."
+            recovery_notes.append(f"synthesized section: {sec_name}")
+
+    # Step 4: default importance when both ## Importance and IMPORTANCE: N are absent.
+    has_importance_heading = re.search(r"^## Importance", normalized, re.MULTILINE)
+    has_importance_line = re.search(r"^\s*IMPORTANCE:\s*\d+", normalized, re.MULTILINE)
+    if not has_importance_heading and not has_importance_line:
+        normalized = normalized.rstrip("\n") + "\n\n## Importance\n5"
+        recovery_notes.append("defaulted importance")
+
+    return normalized, recovery_notes
+
+
+def _summary_recovery_enabled() -> bool:
+    """Return True when summary_recovery is enabled in config (default True).
+
+    Config errors must not break summarization — returns True on any exception.
+    """
+    try:
+        return bool(load_config().get("summary_recovery", True))
+    except Exception:  # noqa: BLE001 — config errors must not break summarization
+        return True
+
+
 def generate_snapshot_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
     metadata: dict,
     model: str = "haiku",
-    timeout: int = 30,
-) -> str | None:
+    timeout: int = 120,
+) -> tuple[str | None, str | None]:
     """Call ``claude -p --model <model>`` with the snapshot-specific prompt.
 
-    Returns None on failure. Reuses the retry/timeout pattern of
-    generate_summary but with a tighter scope (no open-item dedup, no
-    importance scoring — snapshots don't carry those structural fields).
+    Returns ``(summary_text, fallback_reason)``:
+      * On success: ``(text, None)``
+      * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output" | "unknown_failure")``
+
+    Reuses the retry/timeout pattern of generate_summary but with a tighter
+    scope (no open-item dedup, no importance scoring — snapshots don't carry
+    those structural fields).
+
+    Note: snapshot summaries are out of scope for the Phase 2 #167 validator
+    (which targets structured session summaries); reserved reasons such as
+    ``"missing_section"`` / ``"importance_missing"`` / ``"schema_loose"`` do
+    not apply here.
     """
     sampled_user = user_msgs[-10:] if len(user_msgs) > 10 else user_msgs
     sampled_asst = assistant_msgs[-10:] if len(assistant_msgs) > 10 else assistant_msgs
@@ -1942,6 +2282,7 @@ def generate_snapshot_summary(
     prompt = SNAPSHOT_SUMMARY_PROMPT.format(transcript=transcript)
 
     attempts = (timeout, timeout * 2)
+    last_reason: str | None = None
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
@@ -1949,14 +2290,20 @@ def generate_snapshot_summary(
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
             )
             if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
+                return result.stdout.strip(), None
+            if result.returncode != 0:
+                last_reason = "haiku_subprocess_error"
+            else:
+                last_reason = "empty_output"
             print(f"[obsidian-brain] claude -p (snapshot) failed (rc={result.returncode})",
                   file=sys.stderr)
             break
         except FileNotFoundError:
+            last_reason = "haiku_subprocess_error"
             print("[obsidian-brain] claude CLI not found", file=sys.stderr)
             break
         except subprocess.TimeoutExpired:
+            last_reason = "haiku_timeout"
             if i < len(attempts) - 1:
                 print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s, retrying...",
                       file=sys.stderr)
@@ -1964,9 +2311,10 @@ def generate_snapshot_summary(
             print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s",
                   file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
+            last_reason = "haiku_subprocess_error"
             print(f"[obsidian-brain] claude -p (snapshot) error: {exc}", file=sys.stderr)
             break
-    return None
+    return None, last_reason or "unknown_failure"
 
 
 def generate_summary(
@@ -1974,12 +2322,19 @@ def generate_summary(
     assistant_msgs: list[str],
     metadata: dict,
     model: str = "haiku",
-    timeout: int = 30,
-) -> str | None:
+    timeout: int = 120,
+) -> tuple[str | None, str | None]:
     """Call ``claude -p --model <model>`` to summarize the session.
 
+    Returns ``(summary_text, fallback_reason)``:
+      * On success: ``(text, None)``
+      * On failure: ``(None, "haiku_timeout" | "haiku_subprocess_error" | "empty_output" | "unknown_failure")``
+
+    Reserved future reasons (will be populated downstream by the Phase 2 #167/#84
+    validator, not returned by this function):
+      ``"missing_section"``, ``"importance_missing"``, ``"schema_loose"``.
+
     Samples first 10 + last 10 messages for large sessions.
-    Returns None on failure.
     """
     # Sample messages for large sessions
     if len(user_msgs) > 20:
@@ -2074,6 +2429,7 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
             prompt += f"- {item_text}\n"
 
     attempts = (timeout, timeout * 2)  # escalate on first timeout
+    last_reason: str | None = None
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
@@ -2088,30 +2444,42 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
                 # Layer 2: Post-generation dedup pass (string-based, pre-write)
                 if existing_items:
                     summary_text = _dedup_summary_open_items(summary_text, existing_items)
-                return summary_text
+                return summary_text, None
+            if result.returncode != 0:
+                last_reason = "haiku_subprocess_error"
+                print(
+                    f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
+                    f"{result.stderr[:200]}",
+                    file=sys.stderr,
+                )
+                break  # non-timeout failure, don't retry
+            last_reason = "empty_output"
             print(
                 f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
                 f"{result.stderr[:200]}",
                 file=sys.stderr,
             )
-            break  # non-timeout failure, don't retry
+            break  # empty stdout, don't retry
         except FileNotFoundError:
+            last_reason = "haiku_subprocess_error"
             print(
                 "[obsidian-brain] claude CLI not found, summarization unavailable",
                 file=sys.stderr,
             )
             break  # won't succeed on retry
         except subprocess.TimeoutExpired as exc:
+            last_reason = "haiku_timeout"
             stderr_snippet = f" stderr: {exc.stderr[:200]}" if exc.stderr else ""
             if i < len(attempts) - 1:
                 print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, retrying with {attempts[i+1]}s{stderr_snippet}", file=sys.stderr)
                 continue
             print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, giving up{stderr_snippet}", file=sys.stderr)
         except Exception as exc:
+            last_reason = "haiku_subprocess_error"
             print(f"[obsidian-brain] claude -p error ({type(exc).__name__}): {exc}", file=sys.stderr)
             break  # unknown error, don't retry
 
-    return None
+    return None, last_reason or "unknown_failure"
 
 
 # ---------------------------------------------------------------------------
@@ -2312,10 +2680,86 @@ def find_latest_session(
     return None
 
 
+def _parse_note_tags(frontmatter: str) -> list[str]:
+    """Parse note tags from frontmatter, handling both YAML forms (#168).
+
+    Supports:
+    - Inline list:  ``tags: [claude/session, claude/keep]``
+    - Block list::
+        tags:
+          - claude/session
+          - claude/keep
+
+    Returns a list of stripped tag strings, or [] when no tags are found.
+    """
+    # Try inline form first: tags: [a, b] or tags: a, b
+    inline_raw = parse_frontmatter_field(frontmatter, "tags")
+    if inline_raw:
+        cleaned = inline_raw.strip().lstrip("[").rstrip("]")
+        tags = [t.strip().strip('"').strip("'")
+                for t in re.split(r"[,\s]+", cleaned) if t.strip()]
+        if tags:
+            return tags
+
+    # Try YAML block-list form:
+    #   tags:
+    #     - claude/session
+    #     - claude/keep
+    block_match = re.search(
+        r'^tags:\s*\n((?:[ \t]+-[ \t]+.+\n?)+)', frontmatter, re.MULTILINE
+    )
+    if block_match:
+        block = block_match.group(1)
+        tags = [t.strip().strip('"').strip("'")
+                for t in re.findall(r'^[ \t]+-[ \t]+(.+)$', block, re.MULTILINE)
+                if t.strip()]
+        if tags:
+            return tags
+
+    return []
+
+
+def _note_has_inbound_links(basename_stem: str, db_path: str | None = None) -> bool:
+    """Return True if any vault note body references ``[[<basename_stem>]]`` (#168).
+
+    Queries the existing vault index DB (read-only) via a body LIKE lookup —
+    no full-vault file rescan. CONSERVATIVE on failure: if the index is missing
+    or the query errors, returns True (assume referenced) so the note is NOT
+    deferred — deferral is an optimization and must never drop a referenced note.
+    Over-matching (prefix) also errs toward True (safe).
+    """
+    try:
+        if db_path is None:
+            if _vault_index is not None:
+                db_path = _vault_index._default_db_path()
+            else:
+                # Fall back to the known default path string directly
+                db_path = os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
+        if not os.path.exists(db_path):
+            return True  # conservative: assume referenced
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            # Escape LIKE wildcards in the stem so that `_` (common in project
+            # slugs) is treated as a literal character, not a single-char wildcard.
+            esc = basename_stem.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%[[{esc}%"
+            row = conn.execute(
+                "SELECT 1 FROM notes WHERE body LIKE ? ESCAPE '\\' LIMIT 1", (pattern,)
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        return True  # conservative: assume referenced on any error
+
+
 def find_unsummarized_notes(
     vault_path: str,
     sessions_folder: str,
     project: str,
+    aged_threshold_days: int | None = None,
+    include_aged: bool = False,
+    pin_tags: tuple | list | None = None,
 ) -> str:
     """Find unsummarized session notes for a project, with defense-in-depth.
 
@@ -2327,13 +2771,53 @@ def find_unsummarized_notes(
     other typed notes (e.g. ``claude-insight``). Legacy notes without a
     ``type:`` field are accepted for backward compatibility.
 
-    Returns JSON string: {"unsummarized": [paths], "auto_fixed": N}
+    Aged-note deferral (#168): notes are *deferred* (skipped, not lost) when
+    ALL three conditions hold:
+      1. File mtime is older than ``aged_threshold_days`` (default from config
+         key ``aged_summarize_threshold_days``, built-in default 90 days).
+      2. No inbound ``[[wikilink]]`` references found in the vault index DB.
+      3. No pin tag (tags matching ``summary_pin_tags``, default
+         ``["claude/keep", "claude/permanent"]``) in the note's frontmatter.
+
+    Deferred notes are returned in ``skipped_aged`` and can be forced into
+    ``unsummarized`` by passing ``include_aged=True`` or invoking
+    ``/recall --include-aged``.
+
+    Args:
+        vault_path: Obsidian vault root.
+        sessions_folder: Folder name (relative to vault) containing sessions.
+        project: Project slug to filter on.
+        aged_threshold_days: Override the config-backed deferral threshold (days).
+            None (default) reads from config key ``aged_summarize_threshold_days``.
+        include_aged: If True, bypass deferral — all qualifying notes go into
+            ``unsummarized`` regardless of age/link/pin status.
+        pin_tags: Override the config-backed pin-tag list. None (default) reads
+            from config key ``summary_pin_tags``.
+
+    Returns JSON string:
+        {"unsummarized": [paths], "auto_fixed": N, "skipped_aged": [paths]}
     """
+    # Resolve config-backed defaults once.
+    if aged_threshold_days is None:
+        try:
+            aged_threshold_days = int(load_config().get("aged_summarize_threshold_days", 90))
+        except Exception:
+            aged_threshold_days = 90
+    if pin_tags is None:
+        try:
+            pin_tags = list(load_config().get("summary_pin_tags", ["claude/keep", "claude/permanent"]))
+        except Exception:
+            pin_tags = ["claude/keep", "claude/permanent"]
+
+    now = time.time()
+    cutoff_seconds = aged_threshold_days * 86400
+
     sessions_dir = Path(vault_path) / sessions_folder
     if not sessions_dir.is_dir():
-        return json.dumps({"unsummarized": [], "auto_fixed": 0})
+        return json.dumps({"unsummarized": [], "auto_fixed": 0, "skipped_aged": []})
 
     unsummarized: list[str] = []
+    skipped_aged: list[str] = []
     auto_fixed = 0
 
     for f in sorted(sessions_dir.iterdir(), reverse=True):
@@ -2412,6 +2896,23 @@ def find_unsummarized_notes(
                 pass
             continue
 
+        # Aged-note deferral (#168): skip notes that are old, unreferenced,
+        # and not pinned — deferral is an optimization, never a permanent drop.
+        if not include_aged:
+            file_age = now - f.stat().st_mtime
+            if file_age > cutoff_seconds:
+                # AGE condition met — check pin tags next.
+                # Use _parse_note_tags to handle both inline and block-list YAML
+                # forms; parse_frontmatter_field alone misses the block-list form
+                # used by obsidian_session_log.py (#168 PR review fix).
+                note_tags: list[str] = _parse_note_tags(frontmatter)
+                pinned = any(pt in note_tags for pt in pin_tags)
+                if not pinned:
+                    # INBOUND-LINK check — conservative: assume linked on error.
+                    if not _note_has_inbound_links(f.stem):
+                        skipped_aged.append(str(f))
+                        continue
+
         unsummarized.append(str(f))
 
     # Ordering bias: within a session_id group, snapshots sort first so the
@@ -2439,7 +2940,7 @@ def find_unsummarized_notes(
         return (sid, 0 if typ == "claude-snapshot" else 1, name)
 
     unsummarized.sort(key=_bias_key)
-    return json.dumps({"unsummarized": unsummarized, "auto_fixed": auto_fixed})
+    return json.dumps({"unsummarized": unsummarized, "auto_fixed": auto_fixed, "skipped_aged": skipped_aged})
 
 
 def build_context_brief(
@@ -3039,7 +3540,9 @@ def upgrade_and_collect_corpus(
     """Upgrade unsummarized notes then collect corpus in a single pass.
 
     1. Scan sessions folder for notes with ``status: auto-logged`` within
-       the date window and attempt ``upgrade_unsummarized_note()`` on each.
+       the date window, group by frontmatter ``project``, and dispatch each
+       group through ``upgrade_batch()`` (which writes one telemetry record
+       per call to the summarizer metrics sink).
     2. Call ``collect_vault_corpus()`` to build the full corpus (including
        freshly upgraded notes).  ``include_types`` / ``exclude_types`` are
        forwarded verbatim — see ``collect_vault_corpus`` docstring for details.
@@ -3053,23 +3556,22 @@ def upgrade_and_collect_corpus(
     upgraded = 0
     failed = 0
 
-    # --- Phase 1: upgrade unsummarized notes ---
+    # --- Phase 1: upgrade unsummarized notes (group-by-project + batch) ---
+    from collections import defaultdict
+    candidates_by_project: dict[str, list[tuple[str, str]]] = defaultdict(list)
+
     sessions_dir = vault_root / sessions_folder
     if sessions_dir.is_dir():
+        # Pass A: collect candidates, grouped by frontmatter project
         for md_file in sessions_dir.iterdir():
             if md_file.suffix != ".md":
                 continue
-
-            # Path containment
             resolved = md_file.resolve()
             if not resolved.is_relative_to(vault_root):
                 continue
-
             meta = read_note_metadata(str(md_file))
             if not meta:
                 continue
-
-            # Date filter
             date_str = meta.get("date", "")
             if not date_str:
                 continue
@@ -3079,29 +3581,34 @@ def upgrade_and_collect_corpus(
                 continue
             if note_date < cutoff:
                 continue
-
-            # Only upgrade auto-logged notes
             if meta.get("status") != "auto-logged":
                 continue
+            candidates_by_project[meta.get("project", "")].append(
+                (str(md_file), meta.get("session_id", ""))
+            )
 
-            try:
-                result = upgrade_unsummarized_note(
-                    note_path=str(md_file),
-                    vault_path=vault_path,
-                    sessions_folder=sessions_folder,
-                    project=meta.get("project", ""),
-                )
-                if result and not result.startswith("Failed"):
+        # Pass B: one upgrade_batch call per project group.
+        # max_workers=1: dedup_note_open_items runs after each note write and
+        # scans sibling notes; parallel workers in the same project could each
+        # see the other's freshly written open item as a duplicate and both
+        # remove their copy. Serial dispatch preserves the pre-#182 semantics.
+        for project_name, group in candidates_by_project.items():
+            paths = [p for p, _ in group]
+            results = upgrade_batch(
+                paths, vault_path, sessions_folder, project_name,
+                max_workers=1,
+            )
+            for (path, session_id), result in zip(group, results):
+                if result["status"].startswith("Upgraded "):
                     upgraded += 1
-                    # Bust metadata cache for this note
-                    session_id = meta.get("session_id", "")
                     if session_id:
                         cache_invalidate(session_id)
                 else:
+                    print(
+                        f"[obsidian-brain] upgrade failed for {path}: {result['status']}",
+                        file=sys.stderr,
+                    )
                     failed += 1
-            except Exception as exc:
-                failed += 1
-                print(f"[obsidian-brain] upgrade failed for {md_file.name}: {exc}", file=sys.stderr)
 
     # --- Phase 2: collect corpus (now includes freshly upgraded notes) ---
     corpus_json = collect_vault_corpus(
@@ -4135,34 +4642,36 @@ def prepare_summary_input(note_path: str) -> str:
         return f"RAW_OK:{note_path}"
 
 
-def upgrade_unsummarized_note(
+def _prepare_note_for_summary(
     note_path: str,
     vault_path: str,
     sessions_folder: str,
     project: str,
-    summary_model: str = "haiku",
-    summary_timeout: int | None = None,
-) -> str:
-    """Upgrade an unsummarized session note with an AI summary.
+) -> dict:
+    """Prepare a session/snapshot note for AI summarization (the pre-model stage).
 
-    Orchestrates: find JSONL → parse transcript → decide source →
-    generate summary → dedup open items → atomic write.
+    Reads the raw note, extracts session_id, parses the JSONL transcript (with
+    raw-note fallback), builds summarizer metadata, determines note_type, and
+    (for sessions) computes the snapshot cohesion preamble into metadata.
 
-    Returns a one-line status string for the model to relay.
+    Returns a dict. On failure: {"ok": False, "status": <one-line "Failed: ..." string>,
+    "fallback_reason": <classifier>}. On success: {"ok": True, "raw_lines": [...],
+    "session_id": str, "user_msgs": [...], "assistant_msgs": [...], "metadata": {...},
+    "note_type": str, "source": str, "warnings": [...]}.
 
-    Return contract: success strings begin with ``"Upgraded "``; all other
-    return values (including ``"Failed: ..."``, empty, or any unexpected
-    prefix) indicate failure. Callers routing on return value — notably
-    ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the ``"Upgraded "``
-    prefix as the positive path. Adding any new return prefix to this
-    function requires an audit of routing call sites.
+    Extracted from upgrade_unsummarized_note (#166) so the multi-note batch path
+    can reuse identical preparation. Pure: no model calls, no writes.
     """
     # Read the raw note
     try:
         with open(note_path, 'r', encoding='utf-8') as f:
             raw_lines = f.readlines()
-    except OSError as exc:
-        return f"Failed: cannot read {os.path.basename(note_path)}: {exc}"
+    except (OSError, UnicodeDecodeError) as exc:
+        return {
+            "ok": False,
+            "status": f"Failed: cannot read {os.path.basename(note_path)}: {exc}",
+            "fallback_reason": "unreadable_note",
+        }
 
     # Extract session_id from frontmatter
     session_id = None
@@ -4172,7 +4681,11 @@ def upgrade_unsummarized_note(
             session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
             break
     if not session_id:
-        return f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}"
+        return {
+            "ok": False,
+            "status": f"Failed: no session_id in frontmatter of {os.path.basename(note_path)}",
+            "fallback_reason": "no_session_id",
+        }
 
     # Find and parse the JSONL transcript
     jsonl_path = find_transcript_jsonl(session_id)
@@ -4237,7 +4750,11 @@ def upgrade_unsummarized_note(
                     assistant_msgs.append(stripped[14:].strip())
 
     if not user_msgs and not assistant_msgs:
-        return f"Failed: no conversation content in {os.path.basename(note_path)}"
+        return {
+            "ok": False,
+            "status": f"Failed: no conversation content in {os.path.basename(note_path)}",
+            "fallback_reason": "no_conversation_content",
+        }
 
     # Build metadata for generate_summary
     metadata: dict = {"project": project, "vault_path": vault_path, "sessions_folder": sessions_folder}
@@ -4263,16 +4780,10 @@ def upgrade_unsummarized_note(
             note_type = line.split(":", 1)[1].strip().strip('"').strip("'")
             break
 
-    gen_kwargs: dict = {"model": summary_model}
-    if summary_timeout is not None:
-        gen_kwargs["timeout"] = summary_timeout
-
-    if note_type == "claude-snapshot":
-        summary_text = generate_snapshot_summary(
-            user_msgs, assistant_msgs, metadata, **gen_kwargs,
-        )
-    else:
-        # Session — augment with snapshot bodies for cohesion.
+    # Select generator and prepare per-type input. The snapshot cohesion
+    # preamble (session path only) is computed ONCE here, before the
+    # escalation loop, so it is reused across model retries.
+    if note_type != "claude-snapshot":
         date_str = ""
         for line in raw_lines[:20]:
             if line.strip().startswith("date:"):
@@ -4287,17 +4798,368 @@ def upgrade_unsummarized_note(
             # prepend it to its sampled transcript. New optional key; existing
             # callers unaffected (absent key → no-op).
             metadata["snapshot_preamble"] = preamble
-        summary_text = generate_summary(
+
+    return {
+        "ok": True,
+        "raw_lines": raw_lines,
+        "session_id": session_id,
+        "user_msgs": user_msgs,
+        "assistant_msgs": assistant_msgs,
+        "metadata": metadata,
+        "note_type": note_type,
+        "source": source,
+        "warnings": warnings,
+    }
+
+
+def upgrade_unsummarized_note(
+    note_path: str,
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+    summary_model: str = "haiku",
+    summary_timeout: int | None = None,
+) -> tuple[str, float, str | None, str | None]:
+    """Upgrade an unsummarized session note with an AI summary.
+
+    Orchestrates: find JSONL → parse transcript → decide source →
+    generate summary → dedup open items → atomic write.
+
+    Returns a 4-tuple ``(status, elapsed_s, model_used, fallback_reason)``:
+
+    - **status** (*str*) — one-line status string for the model to relay.
+      Success strings begin with ``"Upgraded "``; all other values (including
+      ``"Failed: ..."``) indicate failure. Callers routing on return value —
+      notably ``skills/recall/SKILL.md`` Step 2 Phase 1 — MUST check the
+      ``"Upgraded "`` prefix as the positive path.
+    - **elapsed_s** (*float*) — wall-clock seconds rounded to 2 decimal places.
+    - **model_used** (*str | None*) — the CLI alias of the model that produced
+      the accepted summary (``"haiku"`` on the common path; ``"sonnet"`` or
+      ``"opus"`` when the escalation chain fired on an ``"empty_output"`` from
+      the primary model, per #165), or ``None`` on failure paths that never
+      reached summarization.
+    - **fallback_reason** (*str | None*) — non-``None`` when summarization
+      itself failed or a worker / pre-summarization check caught a problem.
+      ``None`` indicates that summarization succeeded; it does NOT by itself
+      confirm overall success. Callers MUST also check
+      ``status.startswith("Upgraded ")`` — ``upgrade_note_with_summary`` can
+      still return a ``"Failed: ..."`` status (malformed summary, atomic write
+      error, post-write verification failure, etc.) even after the model
+      returned a result, and those post-summarization failures currently flow
+      through with ``fallback_reason=None``. Classifying them is tracked as a
+      Phase 2 prep follow-up. Full taxonomy of populated values:
+
+      Pre-summarization (this function, before any model call):
+        ``"unreadable_note"``         — OSError or UnicodeDecodeError reading the note (perms, encoding, ENOENT, bad UTF-8)
+        ``"no_session_id"``           — frontmatter is missing the ``session_id:`` field
+        ``"no_conversation_content"`` — neither JSONL nor raw-note section yielded messages
+
+      Summarizer subprocess (set inside ``generate_summary`` / ``generate_snapshot_summary``):
+        ``"haiku_timeout"``           — ``claude -p`` exceeded the per-call timeout
+        ``"haiku_subprocess_error"``  — ``claude -p`` returned non-zero or unexpected I/O
+        ``"empty_output"``            — model returned empty / whitespace-only text
+        ``"unknown_failure"``         — defensive default returned by ``generate_summary`` / ``generate_snapshot_summary`` when the retry loop exits without setting ``last_reason`` (should be unreachable)
+
+      Worker wrapper (set by ``upgrade_batch`` when a future raises):
+        ``"worker_exception"``        — per-note worker raised an uncaught exception
+
+      Reserved for the Phase 2 validator (#167/#84) — declared here for stability,
+      not yet emitted by this function:
+        ``"missing_section"``         — summary lacks a required H2 section
+        ``"importance_missing"``      — IMPORTANCE: N line absent or unparseable
+        ``"schema_loose"``            — summary structurally valid but fails strict schema
+
+      Callers MUST treat any non-``None`` value as a failure classifier. Adding a
+      new value requires updating both this docstring and the validator (#167/#84).
+
+    Adding any new return prefix to the ``status`` field requires an audit
+    of routing call sites.
+    """
+    _t0 = time.monotonic()
+
+    def _ret(
+        status: str,
+        model_used: str | None = None,
+        fallback_reason: str | None = None,
+    ) -> tuple[str, float, str | None, str | None]:
+        return status, round(time.monotonic() - _t0, 2), model_used, fallback_reason
+
+    prep = _prepare_note_for_summary(note_path, vault_path, sessions_folder, project)
+    if not prep["ok"]:
+        return _ret(prep["status"], fallback_reason=prep["fallback_reason"])
+    user_msgs = prep["user_msgs"]
+    assistant_msgs = prep["assistant_msgs"]
+    metadata = prep["metadata"]
+    note_type = prep["note_type"]
+    source = prep["source"]
+    warnings = prep["warnings"]
+
+    gen_fn = generate_snapshot_summary if note_type == "claude-snapshot" else generate_summary
+
+    # Model-escalation chain (#165): try the primary model, then escalate to
+    # Sonnet, then Opus, but ONLY when the failure is a quality reason
+    # (empty_output). Timeouts / subprocess errors break immediately — a more
+    # capable model won't fix a slow CLI cold-start or a missing binary.
+    models_to_try = _escalation_models(summary_model)
+    summary_text = None
+    fallback_reason = None
+    model_used = None
+    for _model in models_to_try:
+        gen_kwargs: dict = {"model": _model}
+        if summary_timeout is not None:
+            gen_kwargs["timeout"] = summary_timeout
+        summary_text, fallback_reason = gen_fn(
             user_msgs, assistant_msgs, metadata, **gen_kwargs,
         )
+        if summary_text:
+            if _summary_recovery_enabled():
+                summary_text, _rec = _normalize_summary(summary_text)
+                if _rec:
+                    warnings = warnings + [f"summary recovered (#167): {', '.join(_rec)}"]
+            model_used = _model
+            break
+        if fallback_reason not in _MODEL_ESCALATION_REASONS:
+            # timeout / subprocess error — escalating model won't help
+            break
 
     if not summary_text:
-        return f"Failed: AI summarization returned empty for {os.path.basename(note_path)}"
+        return _ret(
+            f"Failed: AI summarization returned empty for {os.path.basename(note_path)}",
+            model_used=None,
+            fallback_reason=fallback_reason,
+        )
 
-    return upgrade_note_with_summary(
+    status = upgrade_note_with_summary(
         note_path, summary_text, vault_path, sessions_folder, project,
         source=source, warnings=warnings,
     )
+    # model_used is the CLI alias of the model that produced the accepted
+    # summary — "haiku" on the common path, "sonnet"/"opus" when escalated (#165).
+    return _ret(status, model_used=model_used, fallback_reason=None)
+
+
+def generate_summaries_batch(
+    prepared_notes: list[dict],
+    model: str = "haiku",
+    timeout: int = 120,
+    project: str = "unknown",
+    vault_path: str = "",
+    sessions_folder: str = "",
+) -> list[tuple[str | None, str | None]]:
+    """Summarize N SESSION notes in ONE ``claude -p --model <model>`` spawn.
+
+    ``prepared_notes`` is a list of ok=True session-note prep dicts (caller
+    guarantees: not snapshots, not prep failures).  Returns a list of
+    ``(summary_text|None, fallback_reason|None)`` ALIGNED to ``prepared_notes``
+    order.
+
+    Failure reasons returned for all notes on whole-spawn failure:
+      ``"haiku_timeout"``           — TimeoutExpired (retried once)
+      ``"haiku_subprocess_error"``  — rc != 0, FileNotFoundError, or other error (no retry)
+      ``"empty_output"``            — subprocess rc==0 but stdout empty (no retry)
+
+    Per-note parse failures on success path:
+      ``"missing_section"``         — block absent or lacks ``## Summary``
+
+    (#166)
+    """
+    n = len(prepared_notes)
+    if n == 0:
+        return []
+
+    # ---- Build multi-note prompt -----------------------------------------------
+    # Collect open items once for all notes (same project).
+    existing_items: list = []
+    try:
+        _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+        if _hooks_dir not in sys.path:
+            sys.path.insert(0, _hooks_dir)
+        from open_item_dedup import collect_open_items as _collect_open_items
+        existing_items = _collect_open_items(vault_path, sessions_folder, project, max_sessions=10)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[obsidian-brain] open item collection failed (non-fatal): {exc}", file=sys.stderr)
+
+    def _sample_msgs(user_msgs: list[str], assistant_msgs: list[str]) -> tuple[str, str]:
+        if len(user_msgs) > 20:
+            sampled_user: list[str] = (
+                user_msgs[:10] + ["[... middle messages omitted ...]"] + user_msgs[-10:]
+            )
+        else:
+            sampled_user = user_msgs
+        if len(assistant_msgs) > 20:
+            sampled_asst: list[str] = (
+                assistant_msgs[:10] + ["[... middle messages omitted ...]"] + assistant_msgs[-10:]
+            )
+        else:
+            sampled_asst = assistant_msgs
+        return "\n---\n".join(sampled_user)[:12000], "\n---\n".join(sampled_asst)[:12000]
+
+    prompt_parts: list[str] = [
+        f"You are a technical summarizer. You will be given {n} session transcript(s) below.\n"
+        f"Each transcript is delimited by a line '===== NOTE k =====' where k is the note number.\n"
+        "For EACH note, output its summary starting with a line '===== SUMMARY k =====' on its own line,\n"
+        "followed by EXACTLY these markdown sections:\n"
+        "## Summary / ## Key Decisions / ## Changes Made / ## Errors Encountered / ## Open Questions / Next Steps / ## Importance\n"
+        f"Output blocks for ALL {n} notes, in order. NO commentary outside the delimited blocks.\n"
+        "Do NOT respond conversationally. Do NOT ask questions. Just output the summaries.\n\n"
+        "For ## Importance: Rate 1-10. 1-3: trivial. 4-6: standard. 7-8: key decisions. 9-10: major.\n"
+    ]
+
+    for k, prep in enumerate(prepared_notes, start=1):
+        user_sample, asst_sample = _sample_msgs(prep["user_msgs"], prep["assistant_msgs"])
+        meta = prep["metadata"]
+        preamble = meta.get("snapshot_preamble", "")
+        files_str = ", ".join(meta.get("files_touched", [])[:15]) or "none detected"
+        meta_line = (
+            f"NOTE {k} METADATA: project={meta.get('project', 'unknown')} "
+            f"branch={meta.get('git_branch', 'unknown')} "
+            f"files_touched={files_str}"
+        )
+        prompt_parts.append(f"===== NOTE {k} =====\n")
+        prompt_parts.append(f"{meta_line}\n")
+        if preamble:
+            prompt_parts.append(
+                f"{preamble}\n"
+                "Some earlier context may come from pre-compact snapshots — "
+                "synthesize the whole arc into a cohesive narrative.\n"
+            )
+        prompt_parts.append(
+            f"SESSION TRANSCRIPT:\n{user_sample}\n\n---\n\n{asst_sample}\n\n"
+        )
+        prompt_parts.append(
+            "OUTPUT EXACTLY these markdown sections with no preamble, no commentary:\n\n"
+            "## Summary\n1-3 sentence overview of what was accomplished.\n\n"
+            "## Key Decisions\n- Bullet list. Write \"None noted.\" if none.\n\n"
+            "## Changes Made\n- Bullet list. Write \"None noted.\" if none.\n\n"
+            "## Errors Encountered\n- Bullet list. Write \"None.\" if none.\n\n"
+            "## Open Questions / Next Steps\n- [ ] Checkbox list. Write \"None.\" if none.\n\n"
+            "## Importance\nRate 1-10. Output ONLY the number.\n\n"
+        )
+
+    if existing_items:
+        prompt_parts.append("## Existing Open Items for This Project (DO NOT DUPLICATE)\n")
+        prompt_parts.append(
+            "The following items are already tracked in older session notes. Do NOT include any item\n"
+            "that is semantically equivalent to these — same PR, same branch, same task, same file.\n"
+            "Only add genuinely NEW open items from this session's conversation.\n\n"
+        )
+        for _, _, item_text in existing_items:
+            prompt_parts.append(f"- {item_text}\n")
+
+    prompt = "".join(prompt_parts)
+
+    # ---- Subprocess with retry on timeout -------------------------------------
+    attempts = (timeout, timeout * 2)
+    last_reason: str | None = None
+    stdout_text: str | None = None
+
+    for i, attempt_timeout in enumerate(attempts):
+        try:
+            result = subprocess.run(
+                ["claude", "-p", "--model", model],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=attempt_timeout,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                stdout_text = result.stdout.strip()
+                break
+            if result.returncode != 0:
+                last_reason = "haiku_subprocess_error"
+                print(
+                    f"[obsidian-brain] claude -p batch failed (rc={result.returncode}): "
+                    f"{result.stderr[:200]}",
+                    file=sys.stderr,
+                )
+                break
+            # rc==0 but empty stdout
+            last_reason = "empty_output"
+            print("[obsidian-brain] claude -p batch returned empty stdout", file=sys.stderr)
+            break
+        except FileNotFoundError:
+            last_reason = "haiku_subprocess_error"
+            print("[obsidian-brain] claude CLI not found, batch summarization unavailable", file=sys.stderr)
+            break
+        except subprocess.TimeoutExpired:
+            last_reason = "haiku_timeout"
+            if i < len(attempts) - 1:
+                print(
+                    f"[obsidian-brain] claude -p batch timed out at {attempt_timeout}s, retrying...",
+                    file=sys.stderr,
+                )
+                continue
+            print(
+                f"[obsidian-brain] claude -p batch timed out at {attempt_timeout}s, giving up",
+                file=sys.stderr,
+            )
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_reason = "haiku_subprocess_error"
+            print(f"[obsidian-brain] claude -p batch error ({type(exc).__name__}): {exc}", file=sys.stderr)
+            break
+
+    # Whole-spawn failure — return same reason for all notes.
+    if stdout_text is None:
+        reason = last_reason or "haiku_subprocess_error"
+        return [(None, reason)] * n
+
+    # ---- Parse delimited output ------------------------------------------------
+    try:
+        _summary_header_re = re.compile(
+            r"^=====\s*SUMMARY\s+(\d+)\s*=====\s*$", re.MULTILINE
+        )
+        parts_split = _summary_header_re.split(stdout_text)
+        # parts_split alternates: [preamble, k1, block1, k2, block2, ...]
+        parsed_blocks: dict[int, str] = {}
+        it = iter(parts_split)
+        next(it, None)  # skip preamble before first header
+        for k_str, block in zip(it, it):
+            try:
+                k_int = int(k_str)
+            except ValueError:
+                continue
+            if k_int not in parsed_blocks:  # first-occurrence-wins (#165 Fix 1)
+                parsed_blocks[k_int] = block
+
+        _has_summary_re = re.compile(r"^## Summary", re.MULTILINE)
+        _recovery_enabled = _summary_recovery_enabled()
+
+        results: list[tuple[str | None, str | None]] = []
+        for i_note, prep in enumerate(prepared_notes):
+            k = i_note + 1
+            if k in parsed_blocks:
+                block_text = parsed_blocks[k].strip()
+                # #167: normalize heading variants / synth missing sections BEFORE
+                # the ## Summary check so recoverable blocks pass instead of
+                # becoming (None, "missing_section").
+                if _recovery_enabled:
+                    block_text, _rec = _normalize_summary(block_text)
+                    if _rec:
+                        print(
+                            f"[obsidian-brain] batch summary recovered (#167) for note {k}: "
+                            f"{', '.join(_rec)}",
+                            file=sys.stderr,
+                        )
+                if _has_summary_re.search(block_text):
+                    if existing_items:
+                        try:
+                            block_text = _dedup_summary_open_items(block_text, existing_items)
+                        except Exception as exc:  # noqa: BLE001 — dedup is best-effort, never fail the note
+                            print(
+                                f"[obsidian-brain] batch open-item dedup failed (non-fatal) "
+                                f"({type(exc).__name__}): {exc}",
+                                file=sys.stderr,
+                            )
+                    results.append((block_text, None))
+                else:
+                    results.append((None, "missing_section"))
+            else:
+                results.append((None, "missing_section"))
+        return results
+    except Exception as exc:  # noqa: BLE001
+        print(f"[obsidian-brain] batch parse error ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return [(None, "missing_section")] * n
 
 
 def upgrade_batch(
@@ -4308,27 +5170,44 @@ def upgrade_batch(
     max_workers: int = 10,
     summary_model: str = "haiku",
     summary_timeout: int | None = None,
-) -> list[tuple[str, str]]:
-    """Fan out upgrade_unsummarized_note() concurrently.
+    summary_batch_size: int | None = None,
+) -> list[dict]:
+    """Fan out upgrade_unsummarized_note() concurrently, with optional batching.
 
-    Returns a list of (path, status_string) tuples IN THE SAME ORDER AS `paths`
-    (not completion order), so callers that zipped inputs with outputs still work.
-    Individual-call exceptions are caught and converted to
-    "Failed: <exc_type>: <exc_msg>" status strings so one bad note never kills
-    the batch.
+    Returns a list of per-note dicts IN THE SAME ORDER AS ``paths`` (not
+    completion order). Each dict has the keys:
 
-    Raises ``ValueError`` if ``max_workers < 1`` — surface caller config bugs
-    at the boundary rather than silently normalizing to a single worker.
+      * ``path``  — vault note path (echoes input)
+      * ``status`` — one-line status string; success starts with ``"Upgraded "``
+      * ``elapsed_s`` — wall-time inside the worker, rounded to 2 dp
+      * ``model_used`` — see ``upgrade_unsummarized_note`` docstring
+      * ``fallback_reason`` — see ``upgrade_unsummarized_note`` docstring
 
-    Return contract: each ``(path, status)`` tuple carries the same per-entry
-    contract as ``upgrade_unsummarized_note`` — success statuses begin with
-    ``"Upgraded "``; anything else (including ``"Failed: ..."`` or unexpected
-    prefixes) indicates failure. See that function's docstring for details.
+    ``summary_batch_size`` controls note grouping for the ``claude -p`` spawn:
+      * ``None`` (default) — read from ``load_config()`` (config key
+        ``summary_batch_size``, default 3).
+      * ``1`` — legacy per-note fan-out via ThreadPoolExecutor (unchanged
+        behavior; use to pin legacy-contract tests).
+      * ``>=2`` — batched path: session notes are grouped into batches of up
+        to ``summary_batch_size`` and summarized in a single ``claude -p``
+        spawn per group, amortizing CLI startup cost (~70% startup-overhead
+        reduction vs. per-note). Snapshots always go through the solo path.
+        Per-note parse failures (``missing_section``) and whole-spawn failures
+        fall through to ``upgrade_unsummarized_note`` (the solo path), so the
+        Phase 2 sub-agent in SKILL.md still catches anything both paths fail.
 
-    `claude -p --model haiku` is subprocess-bound, so threads release the GIL
-    during the wait and achieve real parallelism. This lets a single Bash tool
-    call fan out N summaries without the Claude Code shell-pool serialization
-    that would otherwise linearize the work.
+    Side effect: appends one record per call to
+    ``~/.claude/obsidian-brain-summarizer-metrics.jsonl`` via
+    ``summarizer_metrics.append_metrics_record`` (issue #74). The sink never
+    raises, so telemetry failures cannot break this function.
+
+    Per-note exceptions are caught and converted to dicts with
+    ``status="Failed: <exc_type>: <exc_msg>"``, ``elapsed_s=0.0``,
+    ``model_used=None``, ``fallback_reason="worker_exception"`` so one bad
+    note never kills the batch. The exception message is truncated to 500
+    characters to avoid JSONL blow-out.
+
+    Raises ``ValueError`` if ``max_workers < 1``.
     """
     if not paths:
         return []
@@ -4336,29 +5215,271 @@ def upgrade_batch(
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
 
-    # Lazy-import so the module stays importable in environments where
-    # concurrent.futures might be stubbed (it's stdlib, so this should always
-    # succeed in CPython, but the lazy import also keeps hook startup cost low).
     from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timezone
 
+    # Resolve batch size.
+    if summary_batch_size is None:
+        try:
+            summary_batch_size = int(load_config().get("summary_batch_size", 3))
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[obsidian-brain] invalid summary_batch_size in config "
+                f"({type(exc).__name__}): {exc}; using 3",
+                file=sys.stderr,
+            )
+            summary_batch_size = 3
+    else:
+        summary_batch_size = int(summary_batch_size)
+    summary_batch_size = max(1, summary_batch_size)
+
+    _wall_t0 = time.monotonic()
+
+    # ---- Legacy per-note fan-out path (batch_size <= 1) ----------------------
+    if summary_batch_size <= 1:
+        workers = min(max_workers, len(paths))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [
+                ex.submit(
+                    upgrade_unsummarized_note,
+                    p,
+                    vault_path,
+                    sessions_folder,
+                    project,
+                    summary_model,
+                    summary_timeout,
+                )
+                for p in paths
+            ]
+            results: list[dict] = []
+            for p, fut in zip(paths, futs):
+                try:
+                    status, elapsed_s, model_used, fallback_reason = fut.result()
+                except Exception as exc:  # noqa: BLE001 — per-note isolation
+                    exc_str = str(exc)[:500]
+                    status = f"Failed: {type(exc).__name__}: {exc_str}"
+                    elapsed_s, model_used, fallback_reason = 0.0, None, "worker_exception"
+                results.append({
+                    "path": p,
+                    "status": status,
+                    "elapsed_s": elapsed_s,
+                    "model_used": model_used,
+                    "fallback_reason": fallback_reason,
+                })
+
+        wall_s = round(time.monotonic() - _wall_t0, 2)
+        try:
+            _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+            if _hooks_dir not in sys.path:
+                sys.path.insert(0, _hooks_dir)
+            import summarizer_metrics
+            summarizer_metrics.append_metrics_record({
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "project": project,
+                "n_notes": len(results),
+                "wall_s": wall_s,
+                "notes": results,
+            })
+        except Exception as exc:  # noqa: BLE001 — telemetry must never break recall
+            print(
+                f"[obsidian-brain] metrics sink unavailable ({type(exc).__name__}): {exc}",
+                file=sys.stderr,
+            )
+        return results
+
+    # ---- Batched path (batch_size >= 2) ---------------------------------------
+
+    # Step 1: Prepare all notes concurrently.
     workers = min(max_workers, len(paths))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [
-            ex.submit(
-                upgrade_unsummarized_note,
-                p,
-                vault_path,
-                sessions_folder,
-                project,
-                summary_model,
-                summary_timeout,
-            )
-            for p in paths
-        ]
-        results: list[tuple[str, str]] = []
-        for p, fut in zip(paths, futs):
+        prep_futs = {p: ex.submit(_prepare_note_for_summary, p, vault_path, sessions_folder, project)
+                     for p in paths}
+    preps: dict[str, dict] = {}
+    for p, fut in prep_futs.items():
+        try:
+            preps[p] = fut.result()
+        except Exception as exc:  # noqa: BLE001
+            preps[p] = {
+                "ok": False,
+                "status": f"Failed: worker error preparing {os.path.basename(p)}: {str(exc)[:200]}",
+                "fallback_reason": "worker_exception",
+            }
+
+    results_by_path: dict[str, dict] = {}
+
+    # Step 2: Route prep failures immediately.
+    failed_prep_paths = [p for p in paths if not preps[p]["ok"]]
+    for p in failed_prep_paths:
+        prep = preps[p]
+        results_by_path[p] = {
+            "path": p,
+            "status": prep["status"],
+            "elapsed_s": 0.0,
+            "model_used": None,
+            "fallback_reason": prep.get("fallback_reason"),
+        }
+
+    # Step 3: Route snapshots to solo path.
+    snapshot_paths = [p for p in paths if preps[p].get("ok") and preps[p].get("note_type") == "claude-snapshot"]
+    session_paths = [p for p in paths if preps[p].get("ok") and preps[p].get("note_type") != "claude-snapshot"]
+
+    if snapshot_paths:
+        snap_workers = min(max_workers, len(snapshot_paths))
+        with ThreadPoolExecutor(max_workers=snap_workers) as ex:
+            snap_futs = {
+                p: ex.submit(upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
+                for p in snapshot_paths
+            }
+        for p, fut in snap_futs.items():
             try:
-                results.append((p, fut.result()))
-            except Exception as exc:  # noqa: BLE001 — per-note isolation
-                results.append((p, f"Failed: {type(exc).__name__}: {exc}"))
-        return results
+                status, elapsed_s, model_used, fallback_reason = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                exc_str = str(exc)[:500]
+                status = f"Failed: {type(exc).__name__}: {exc_str}"
+                elapsed_s, model_used, fallback_reason = 0.0, None, "worker_exception"
+            results_by_path[p] = {
+                "path": p,
+                "status": status,
+                "elapsed_s": elapsed_s,
+                "model_used": model_used,
+                "fallback_reason": fallback_reason,
+            }
+
+    # Step 4: Group session notes into size/char-aware batches.
+    _CHAR_CAP = 60000
+
+    groups: list[list[str]] = []
+    current_group: list[str] = []
+    current_chars = 0
+
+    for p in session_paths:
+        prep = preps[p]
+        u_est = min(len("\n---\n".join(prep["user_msgs"])), 12000)
+        a_est = min(len("\n---\n".join(prep["assistant_msgs"])), 12000)
+        note_chars = u_est + a_est
+        if current_group and (len(current_group) >= summary_batch_size or current_chars + note_chars > _CHAR_CAP):
+            groups.append(current_group)
+            current_group = [p]
+            current_chars = note_chars
+        else:
+            current_group.append(p)
+            current_chars += note_chars
+    if current_group:
+        groups.append(current_group)
+
+    # Step 5: Process each group.
+    for group_paths in groups:
+        group_preps = [preps[p] for p in group_paths]
+        g_t0 = time.monotonic()
+
+        # Try primary model, escalate on whole-group empty_output.
+        models_to_try = _escalation_models(summary_model)
+        group_results: list[tuple[str | None, str | None]] | None = None
+        used_model = summary_model
+
+        for _model in models_to_try:
+            batch_out = generate_summaries_batch(
+                group_preps,
+                model=_model,
+                timeout=(summary_timeout or 120),
+                project=project,
+                vault_path=vault_path,
+                sessions_folder=sessions_folder,
+            )
+            # Escalate at group level only on whole-spawn empty_output.
+            if all(text is None and reason == "empty_output" for text, reason in batch_out):
+                if _model != models_to_try[-1]:
+                    continue  # try next model
+            used_model = _model
+            group_results = batch_out
+            break
+
+        if group_results is None:
+            print(
+                "[obsidian-brain] BUG: group_results unset after escalation loop (empty models_to_try?)",
+                file=sys.stderr,
+            )
+            group_results = [(None, "empty_output")] * len(group_paths)
+
+        g_wall = time.monotonic() - g_t0
+        per_note_elapsed = round(g_wall / len(group_paths), 2)
+
+        # Solo fallback paths for notes that need it.
+        solo_fallback_paths: list[str] = []
+
+        for p, (summary_text, parse_reason) in zip(group_paths, group_results):
+            try:
+                if summary_text is not None:
+                    # Attempt write-back.
+                    prep = preps[p]
+                    write_status = upgrade_note_with_summary(
+                        p, summary_text, vault_path, sessions_folder, project,
+                        source=prep["source"], warnings=prep["warnings"],
+                    )
+                    if write_status.startswith("Upgraded "):
+                        results_by_path[p] = {
+                            "path": p,
+                            "status": write_status,
+                            "elapsed_s": per_note_elapsed,
+                            "model_used": used_model,
+                            "fallback_reason": None,
+                        }
+                    else:
+                        # Write-back failed — route to solo fallback.
+                        solo_fallback_paths.append(p)
+                else:
+                    # No usable summary — route to solo fallback.
+                    solo_fallback_paths.append(p)
+            except Exception as exc:  # noqa: BLE001 — never let one note crash the batch
+                print(
+                    f"[obsidian-brain] write-back raised unexpectedly for "
+                    f"{os.path.basename(p)} ({type(exc).__name__}): {exc}",
+                    file=sys.stderr,
+                )
+                solo_fallback_paths.append(p)
+
+        # Run solo fallback for all notes that need it in this group.
+        if solo_fallback_paths:
+            solo_workers = min(max_workers, len(solo_fallback_paths))
+            with ThreadPoolExecutor(max_workers=solo_workers) as ex:
+                solo_futs = {
+                    p: ex.submit(upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
+                    for p in solo_fallback_paths
+                }
+            for p, fut in solo_futs.items():
+                try:
+                    status, elapsed_s, model_used, fallback_reason = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    exc_str = str(exc)[:500]
+                    status = f"Failed: {type(exc).__name__}: {exc_str}"
+                    elapsed_s, model_used, fallback_reason = 0.0, None, "worker_exception"
+                results_by_path[p] = {
+                    "path": p,
+                    "status": status,
+                    "elapsed_s": elapsed_s,
+                    "model_used": model_used,
+                    "fallback_reason": fallback_reason,
+                }
+
+    # Step 6: Assemble in input order.
+    results = [results_by_path[p] for p in paths]
+
+    wall_s = round(time.monotonic() - _wall_t0, 2)
+    try:
+        _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+        if _hooks_dir not in sys.path:
+            sys.path.insert(0, _hooks_dir)
+        import summarizer_metrics
+        summarizer_metrics.append_metrics_record({
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "project": project,
+            "n_notes": len(results),
+            "wall_s": wall_s,
+            "notes": results,
+        })
+    except Exception as exc:  # noqa: BLE001 — telemetry must never break recall
+        print(
+            f"[obsidian-brain] metrics sink unavailable ({type(exc).__name__}): {exc}",
+            file=sys.stderr,
+        )
+    return results

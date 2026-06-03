@@ -286,9 +286,10 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
 
     monkeypatch.setattr("obsidian_utils.subprocess.run", fake_run)
 
-    status = obsidian_utils.upgrade_unsummarized_note(
+    _status_tuple = obsidian_utils.upgrade_unsummarized_note(
         str(session_path), str(vault), "claude-sessions", PROJECT
     )
+    status = _status_tuple[0]
     assert status.startswith("Upgraded "), (
         f"upgrade_unsummarized_note did not succeed: {status!r}"
     )
@@ -311,9 +312,10 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     # snapshots through generate_snapshot_summary (a distinct code path from
     # the generate_summary used for sessions above). Without this, the
     # snapshot-type routing branch is never exercised by the E2E test.
-    snap_status = obsidian_utils.upgrade_unsummarized_note(
+    _snap_status_tuple = obsidian_utils.upgrade_unsummarized_note(
         str(snapshot_path), str(vault), "claude-sessions", PROJECT
     )
+    snap_status = _snap_status_tuple[0]
     assert snap_status.startswith("Upgraded "), (
         f"upgrade_unsummarized_note on snapshot did not succeed: {snap_status!r}"
     )

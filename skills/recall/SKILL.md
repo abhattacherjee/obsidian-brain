@@ -34,10 +34,11 @@ print("VAULT=" + c["vault_path"])
 print("SESS=" + c.get("sessions_folder", "claude-sessions"))
 print("INS=" + c.get("insights_folder", "claude-insights"))
 print("PROJECT=" + project)
+print("PIPELINE=" + c.get("summary_pipeline", "auto"))
 '
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`.
+Parse each output line as KEY=VALUE, splitting on the first `=`. Also capture PIPELINE (defaults to "auto").
 
 If the user passed a project name argument (e.g. `/recall my-project`), override `PROJECT` with that value.
 
@@ -77,11 +78,23 @@ print(find_unsummarized_notes(sys.argv[1], sys.argv[2], sys.argv[3]))
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-Parse the JSON output: `{"unsummarized": ["/path/to/note1.md", ...], "auto_fixed": N}`.
+**Optional flags (#168 aged-note deferral):**
+- If the user passed `--include-aged`, call with `include_aged=True` to include aged-out deferred notes:
+  ```python
+  find_unsummarized_notes(vault, sessions_folder, project, include_aged=True)
+  ```
+- If the user passed `--max-age-days N`, call with `aged_threshold_days=N` to override the config threshold:
+  ```python
+  find_unsummarized_notes(vault, sessions_folder, project, aged_threshold_days=N)
+  ```
+
+Parse the JSON output: `{"unsummarized": ["/path/to/note1.md", ...], "auto_fixed": N, "skipped_aged": [...]}`.
 
 The function handles project filtering, defense-in-depth (skips notes with real `## Summary` but stale `auto-logged` status, auto-fixes them), and returns only genuinely unsummarized note paths.
 
 If `auto_fixed > 0`, report: `Auto-fixed N note(s) with stale status.`
+
+If `skipped_aged` is non-empty, report: `Skipped <len> aged-out unreferenced note(s) (>90d, no inbound links, not pinned). Run \`/recall --include-aged\` to summarize them anyway.` (Use the actual configured threshold from `aged_summarize_threshold_days`, default 90d.) This is the #168 deferral.
 
 Store the length of `unsummarized` as `N`.
 
@@ -92,6 +105,8 @@ Update task #1 to completed. Update task #2 subject to `Summarize N unsummarized
 Update task #2 subject to `No unsummarized notes found` and set to `completed`. Skip to Step 3.
 
 #### Path B: N>=1 (parallel Haiku pipelines with sub-agent fallback)
+
+> **Config escape hatch (#84):** If `PIPELINE=subagent`, SKIP Phase 1 (the `upgrade_batch` Haiku `claude -p` pipeline) entirely and treat ALL N notes as the Phase 2 fallback list — route every note directly to the sub-agent path in Phase 2. This is for machines where `claude -p` cold-start latency exceeds the timeout budget (the Haiku pipeline would waste ~2-4 min/note on doomed timeouts). When `PIPELINE=auto` (default), proceed with Phase 1 as written below.
 
 **Task management threshold:** If N <= 5, create a sub-task per note. If N > 5, skip per-note sub-tasks — use a single progress update on task #2 instead. This saves ~15-20s of parent round-trip overhead at large N.
 
@@ -105,17 +120,36 @@ If N <= 5, create a sub-task for each note (subject `"Upgrade: <basename>"`, act
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '%s' "$UNSUMMARIZED_PATHS_JSON" | python3 -c '
 import sys, os, json
+from collections import Counter
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 from obsidian_utils import upgrade_batch
+import time
 paths = json.loads(sys.stdin.read())
-results = upgrade_batch(paths, sys.argv[1], sys.argv[2], sys.argv[3])
-print(json.dumps([{"path": p, "status": s} for p, s in results]))
+_t0 = time.monotonic()
+try:
+    results = upgrade_batch(paths, sys.argv[1], sys.argv[2], sys.argv[3])
+    # results is list[dict] with keys: path, status, elapsed_s, model_used, fallback_reason
+    wall_s = round(time.monotonic() - _t0, 1)
+    model_counts = Counter()
+    for r in results:
+        tag = r["model_used"] or "fallback"
+        model_counts[tag] += 1
+    DASH = chr(45)
+    breakdown = " / ".join(f"{n} {m.split(DASH)[0]}" for m, n in model_counts.most_common())
+    print(json.dumps(results))
+    print(f"[obsidian-brain] Step 2: upgraded {len(results)} note(s) in {wall_s}s wall ({breakdown})", file=sys.stderr)
+except Exception as exc:
+    print(json.dumps({"error": f"{type(exc).__name__}: {exc}", "results": []}))
+    print(f"[obsidian-brain] upgrade_batch failed: {exc}", file=sys.stderr)
+    sys.exit(1)
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
-Parse the returned JSON array. For each entry:
+Parse the returned JSON. If the top-level object contains an `"error"` key, `upgrade_batch` itself failed — treat all notes as failed and fall back to the Phase 2 sub-agent path for each. Otherwise, parse the array normally. Each result dict has: `path`, `status`, `elapsed_s`, `model_used` (`haiku-4.5` on success, `None` on failure; `sonnet-4.6` / `opus-*` reserved for Phase 3 #165), `fallback_reason` (`haiku_timeout` | `empty_output` | `haiku_subprocess_error` | `None`). Note: `upgrade_batch` now groups session notes into batches (default 3 per spawn, config key `summary_batch_size`; set to 1 to disable) and summarizes each group in a single `claude -p` spawn to amortize CLI startup cost (#166). Per-note parse failures (`missing_section`) and whole-spawn failures fall through to the per-note solo path automatically before any result reaches Phase 2. For each entry:
 - `status` starts with `Upgraded ` → mark as succeeded
 - anything else (including `Failed: ...`, empty, or unexpected prefix) → add to the Phase 2 fallback list
+
+The stderr line emits a per-model breakdown visible in the tool trace (e.g. `Step 2: upgraded 7 note(s) in 2.8s wall (5 haiku / 2 fallback)`).
 
 If N <= 5: update each sub-task accordingly (succeeded or `Failed: <basename>`).
 If N > 5: update task #2 subject to `Upgrade N notes: M succeeded, F pending fallback`.

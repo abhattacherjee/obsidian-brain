@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-06-02
+
+### Added
+- **`summary_pipeline` config key** (`"auto"` default | `"subagent"`) — set to `"subagent"` in `~/.claude/obsidian-brain-config.json` to skip the Haiku `claude -p` summarizer pipeline entirely on machines with slow CLI cold-start, routing all notes straight to the sub-agent fallback. (#84)
+- **In-process Haiku→Sonnet→Opus escalation chain (#165)** — `upgrade_unsummarized_note` now retries with a more capable model when the primary model returns empty output (`empty_output` reason only; timeouts and subprocess errors do not escalate). Fallback model chain is now Sonnet first, then Opus (replaces prior direct-to-Opus behavior). `model_used` in metrics is populated with the model that produced the accepted summary.
+- **`summary_batch_size` config key (#166)** (default `3`) — `upgrade_batch` now groups session notes into batches of up to `summary_batch_size` and summarizes each group in a single `claude -p` spawn, amortizing CLI startup overhead (~70% reduction vs. per-note fan-out). Set to `1` in `~/.claude/obsidian-brain-config.json` to restore legacy per-note behavior. Per-note parse failures and whole-spawn failures fall through automatically to the per-note solo path, and then to the Phase 2 sub-agent.
+- **`/recall` telemetry** — `upgrade_batch()` now returns per-note `elapsed_s`,
+  `model_used`, and `fallback_reason`, and appends one record per call to
+  `~/.claude/obsidian-brain-summarizer-metrics.jsonl` (100 KB rotation, owner-only).
+  The `/recall` status line now reports total wall time and a per-model breakdown
+  (e.g., `Step 2: upgraded 7 note(s) in 12.4s wall (5 haiku / 2 fallback)`). Foundation
+  for the cost-reduction work tracked in #169. (#74)
+- `fallback_reason` populated on pre-summarization failures in `upgrade_unsummarized_note`: `unreadable_note`, `no_session_id`, `no_conversation_content`. Full taxonomy (including Phase 2 validator reserved values, #167/#84) documented in the function's docstring. Closes #183.
+- **Aged-note deferral in `/recall` (#168)** — `find_unsummarized_notes` now defers notes whose file mtime is older than `aged_summarize_threshold_days` (default `90` days), have no `[[wikilink]]` inbound references in the vault index, and carry no `summary_pin_tags` tag (default `["claude/keep", "claude/permanent"]`). Deferred notes are reported separately (`skipped_aged`) with a count and escape-hatch hint (`/recall --include-aged`). Deferral is conservative: any index query error or missing DB causes the note to be treated as referenced (not deferred). New config keys: `aged_summarize_threshold_days` (int, days) and `summary_pin_tags` (list of tag strings). Closes #168.
+- **`summary_recovery` config key (#167)** (default `true`) — new `_normalize_summary` post-processor recovers structurally-loose Haiku summaries (heading variants like `# Summary` / `**Summary**` / `Summary:`, missing canonical sections, missing `## Importance`) before they reach `upgrade_note_with_summary`'s validation gate, cutting the fallback rate without escalating to Sonnet/Opus or the Phase-2 sub-agent. Set to `false` in `~/.claude/obsidian-brain-config.json` to disable. Applied in both the solo path (`upgrade_unsummarized_note`) and the batch path (`generate_summaries_batch`).
+- **Standalone marketplace distribution** — obsidian-brain installs directly from
+  `abhattacherjee/obsidian-brain` (`/plugin marketplace add abhattacherjee/obsidian-brain`).
+- **Cross-plugin hook dedup guard** (`claim_hook_run` / `release_hook_run`) — when
+  both the monorepo and standalone plugins are installed, each session is logged
+  exactly once (SessionEnd / SessionStart / PreCompact). New `SKIPPED_DEDUP`
+  outcome in the hook log, now emitted by SessionStart as well as SessionEnd. If
+  a claimed SessionEnd fails to write its note, the dedup lock is released so a
+  sibling copy or a re-fire can still produce it — a transient write error never
+  silently drops a session note.
+
+### Changed
+- **Summarizer timeout budget** — `generate_summary` / `generate_snapshot_summary` first-attempt `claude -p` timeout raised from 30s to 120s (retry from 60s to 240s) to accommodate slow-start CC builds where cold-start alone can take ~46s. Fixes the 100% Haiku-pipeline failure rate on affected installs. (#84)
+- **`upgrade_batch()` gains `summary_batch_size` param** — new optional keyword argument (default reads from config, falls back to 3). When `>= 2`, uses the batched path via `generate_summaries_batch`; when `1`, preserves the legacy per-note `ThreadPoolExecutor` fan-out exactly. Existing callers without the param get batching by default.
+- **`upgrade_batch()` return shape** — was `list[tuple[path, status]]`, now
+  `list[dict]` with 5 keys (`path`, `status`, `elapsed_s`, `model_used`,
+  `fallback_reason`). Backward-incompatible for direct callers; in-tree
+  callers (`skills/recall/SKILL.md`, `TestUpgradeBatch` suite) migrated in the same PR.
+- **`generate_summary` / `generate_snapshot_summary`** — now return
+  `tuple[str | None, str | None]` (text + fallback_reason). Reason is non-None
+  only on failure: `haiku_timeout`, `haiku_subprocess_error`, or `empty_output`.
+- **`upgrade_unsummarized_note`** — now returns
+  `tuple[str, float, str | None, str | None]` (status, elapsed_s, model_used,
+  fallback_reason). `model_used` reflects the resolved `summary_model` parameter
+  (default `"haiku"`); `None` on failure paths. `sonnet-4.6` / `opus-*` tags
+  reserved for Phase 3 (#165).
+- `upgrade_and_collect_corpus` and the `/standup` summarizer path now route
+  through `upgrade_batch`, so each Haiku summarization is included in a
+  metrics record written to `~/.claude/obsidian-brain-summarizer-metrics.jsonl`
+  (one JSONL record per `upgrade_batch` call, with `n_notes` reflecting the
+  group size — the corpus pass groups by project, `/standup` is `n_notes=1`).
+  Closes telemetry gap from #182 (follow-up to #74).
+- Release flow is now "tag this repo" — the claude-code-skills monorepo is no
+  longer a publish target.
+- `scripts/test-dev-skill.sh` discovers the plugin cache directory
+  source-agnostically (no longer hardcodes the `claude-code-skills` marketplace).
+
 ## [2.5.1] - 2026-05-16
 
 ### Changed
