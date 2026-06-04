@@ -698,8 +698,8 @@ def _parent_session_for_snapshot(note_path: str, db_path: str) -> str | None:
     if note_path in _PARENT_CACHE:
         return _PARENT_CACHE[note_path]
     resolved: str | None = None
+    conn = _connect(db_path)  # guard may raise RuntimeError — let it propagate
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
         try:
             row = conn.execute(
                 "SELECT type FROM notes WHERE path = ?", (note_path,),
@@ -761,20 +761,19 @@ def log_access(db_path: str, note_path: str, context_type: str, project: str | N
     if parent:
         paths.append(parent)
 
+    conn = _connect(db_path)  # guard may raise RuntimeError — let it propagate
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
-        try:
-            now = time.time()
-            conn.executemany(
-                "INSERT INTO access_log (note_path, timestamp, context_type, project) "
-                "VALUES (?, ?, ?, ?)",
-                [(p, now, context_type, project) for p in paths],
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        now = time.time()
+        conn.executemany(
+            "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+            "VALUES (?, ?, ?, ?)",
+            [(p, now, context_type, project) for p in paths],
+        )
+        conn.commit()
     except Exception as exc:
         print(f"[vault-index] log_access failed for {note_path!r}: {exc}", file=sys.stderr)
+    finally:
+        conn.close()
 
 
 def _batch_log_access(
@@ -831,35 +830,34 @@ def batch_activations(
 
     result: dict[str, float] = {p: 0.0 for p in note_paths}
 
+    conn = _connect(db_path)  # guard may raise — propagate, do not swallow
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
-        try:
-            now = time.time()
-            placeholders = ",".join("?" for _ in note_paths)
-            rows = conn.execute(
-                f"SELECT note_path, timestamp FROM access_log "
-                f"WHERE note_path IN ({placeholders})",
-                note_paths,
-            ).fetchall()
+        now = time.time()
+        placeholders = ",".join("?" for _ in note_paths)
+        rows = conn.execute(
+            f"SELECT note_path, timestamp FROM access_log "
+            f"WHERE note_path IN ({placeholders})",
+            note_paths,
+        ).fetchall()
 
-            # Group timestamps by note_path
-            accesses: dict[str, list[float]] = defaultdict(list)
-            for row in rows:
-                accesses[row[0]].append(row[1])
+        # Group timestamps by note_path
+        accesses: dict[str, list[float]] = defaultdict(list)
+        for row in rows:
+            accesses[row[0]].append(row[1])
 
-            for path, timestamps in accesses.items():
-                summation = 0.0
-                for ts in timestamps:
-                    dt = max(now - ts, 0.001)  # clamp to 1ms minimum
-                    summation += dt ** (-decay)
-                if summation > 0.0:
-                    result[path] = math.log(summation)
-        finally:
-            conn.close()
+        for path, timestamps in accesses.items():
+            summation = 0.0
+            for ts in timestamps:
+                dt = max(now - ts, 0.001)  # clamp to 1ms minimum
+                summation += dt ** (-decay)
+            if summation > 0.0:
+                result[path] = math.log(summation)
     except Exception as exc:
         print(f"[vault-index] batch_activations failed ({len(note_paths)} paths): {exc}",
               file=sys.stderr)
         return result
+    finally:
+        conn.close()
 
     return result
 

@@ -50,3 +50,20 @@ def test_connect_allows_isolated_path(tmp_path):
         assert db.exists()
     finally:
         conn.close()
+
+
+def test_log_access_routes_through_connect():
+    with pytest.raises(RuntimeError, match="refusing to open production index DB"):
+        vault_index.log_access(
+            vault_index._REAL_PROD_DB, "/some/note.md", "recall", "proj"
+        )
+
+
+def test_batch_activations_routes_through_connect():
+    with pytest.raises(RuntimeError, match="refusing to open production index DB"):
+        vault_index.batch_activations(vault_index._REAL_PROD_DB, ["/some/note.md"])
+
+
+def test_parent_session_routes_through_connect():
+    with pytest.raises(RuntimeError, match="refusing to open production index DB"):
+        vault_index._parent_session_for_snapshot("/some/snap.md", vault_index._REAL_PROD_DB)
