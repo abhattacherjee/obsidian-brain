@@ -224,7 +224,7 @@ def _isolate_vault_index_db_globally(tmp_path_factory, monkeypatch):
     backstop; this fixture is the belt (#192).
 
     Tests that pass an explicit db_path are unaffected (they ignore the env).
-    Subprocess tests inherit OBSIDIAN_BRAIN_DB via the environment.
+    Subprocess tests inherit OBSIDIAN_BRAIN_DB when they copy the parent environment (os.environ.copy()), which the existing subprocess tests do.
     """
     db = tmp_path_factory.mktemp("vidx") / "test-vault.db"
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(db))

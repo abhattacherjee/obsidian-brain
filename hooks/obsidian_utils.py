@@ -2737,7 +2737,7 @@ def _note_has_inbound_links(basename_stem: str, db_path: str | None = None) -> b
                 db_path = os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
         if not os.path.exists(db_path):
             return True  # conservative: assume referenced
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)  # noqa: vault-db-connect — read-only URI mode; cannot use _connect (WAL pragma incompatible with mode=ro)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)  # noqa: vault-db-connect — opens via uri=True (file:...?mode=ro) which _connect() does not accept (plain-path connect + realpath guard can't parse a URI); read-only, so it cannot pollute
         try:
             # Escape LIKE wildcards in the stem so that `_` (common in project
             # slugs) is treated as a literal character, not a single-char wildcard.

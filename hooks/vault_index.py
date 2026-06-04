@@ -131,16 +131,18 @@ def _default_db_path() -> str:
 
 
 # Hardcoded real production DB path, resolved once at import. The guard in
-# _connect() compares against THIS (not _default_db_path(), which the env
-# override/monkeypatch may redirect) so isolation cannot defeat the guard (#192).
+# _connect() compares against THIS (not _default_db_path(), which the
+# OBSIDIAN_BRAIN_DB env override redirects), so test isolation cannot defeat
+# the guard (#192).
 _REAL_PROD_DB = os.path.realpath(
     os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
 )
 
 
 def _in_test_ctx() -> bool:
-    """True when running under pytest (set automatically, inherited by
-    subprocesses spawned during a test). Production never sets this."""
+    """True when running under pytest. PYTEST_CURRENT_TEST is set automatically
+    by pytest and inherited by subprocesses that copy the parent environment
+    (os.environ.copy()). Production never sets this."""
     return "PYTEST_CURRENT_TEST" in os.environ
 
 
