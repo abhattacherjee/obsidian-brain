@@ -1,7 +1,6 @@
 """Regression tests for the #192 production-index-DB pollution guard."""
 from __future__ import annotations
 
-import importlib
 import os
 import sqlite3
 

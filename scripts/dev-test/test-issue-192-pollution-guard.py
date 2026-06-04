@@ -42,13 +42,13 @@ FAIL = 0
 def pass_(msg: str) -> None:
     global PASS
     PASS += 1
-    print(f"✅ {msg}")
+    print(f"  ✅ {msg}")
 
 
 def fail_(msg: str) -> None:
     global FAIL
     FAIL += 1
-    print(f"❌ {msg}")
+    print(f"  ❌ {msg}")
 
 
 def _make_vault(root: Path, n: int) -> Path:

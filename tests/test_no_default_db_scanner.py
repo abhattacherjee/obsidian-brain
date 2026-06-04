@@ -16,29 +16,32 @@ def _load_scanner():
     return mod
 
 
+_SCANNER = _load_scanner()
+
+
 def test_flags_raw_connect_in_non_allowed_function():
-    mod = _load_scanner()
+    mod = _SCANNER
     src = "import sqlite3\n\ndef open_db(p):\n    return sqlite3.connect(p)\n"
     violations = mod.audit_raw_connect("hooks/other.py", src)
     assert violations, "expected a raw sqlite3.connect violation"
 
 
 def test_allows_raw_connect_in_allowlisted_connect():
-    mod = _load_scanner()
+    mod = _SCANNER
     src = "import sqlite3\n\ndef _connect(p):\n    return sqlite3.connect(p, timeout=5.0)\n"
     violations = mod.audit_raw_connect("hooks/vault_index.py", src)
     assert violations == [], "vault_index._connect must be allowlisted"
 
 
 def test_noqa_suppresses_violation():
-    mod = _load_scanner()
+    mod = _SCANNER
     src = "import sqlite3\n\ndef f(p):\n    return sqlite3.connect(p)  # noqa: vault-db-connect\n"
     violations = mod.audit_raw_connect("hooks/other.py", src)
     assert violations == [], "# noqa: vault-db-connect must suppress"
 
 
 def test_extract_fenced_blocks_returns_python_block():
-    mod = _load_scanner()
+    mod = _SCANNER
     md = "text\n```python\nimport sqlite3\nsqlite3.connect('x')\n```\nmore\n"
     blocks = mod._extract_fenced_blocks(md)
     assert any(lang in {"py", "python", "python3"} and "sqlite3.connect" in src
@@ -46,7 +49,7 @@ def test_extract_fenced_blocks_returns_python_block():
 
 
 def test_audit_flags_raw_connect_in_extracted_markdown_block():
-    mod = _load_scanner()
+    mod = _SCANNER
     md = "prose\n```python\nimport sqlite3\nsqlite3.connect(p)\n```\n"
     found = []
     for start, lang, block in mod._extract_fenced_blocks(md):
@@ -56,7 +59,7 @@ def test_audit_flags_raw_connect_in_extracted_markdown_block():
 
 
 def test_allowlist_is_function_scoped_not_file_scoped():
-    mod = _load_scanner()
+    mod = _SCANNER
     # In an allowlisted FILE, only the allowlisted FUNCTION (_connect) may call
     # sqlite3.connect — any other function in that file must still be flagged.
     src = "import sqlite3\n\ndef other(p):\n    return sqlite3.connect(p)\n"
@@ -65,7 +68,7 @@ def test_allowlist_is_function_scoped_not_file_scoped():
 
 
 def test_extract_fenced_blocks_preserves_source_line_numbers():
-    mod = _load_scanner()
+    mod = _SCANNER
     md = (
         "# Title\n"                       # line 1
         "prose line\n"                    # line 2
@@ -83,7 +86,7 @@ def test_extract_fenced_blocks_preserves_source_line_numbers():
 
 
 def test_audit_shell_raw_connect_flags_heredoc():
-    mod = _load_scanner()
+    mod = _SCANNER
     sh = (
         "#!/usr/bin/env bash\n"
         "python3 - <<'PY'\n"
@@ -97,7 +100,7 @@ def test_audit_shell_raw_connect_flags_heredoc():
 
 
 def test_audit_shell_raw_connect_respects_noqa():
-    mod = _load_scanner()
+    mod = _SCANNER
     sh = (
         "python3 - <<'PY'\n"
         "conn = sqlite3.connect(db)  # noqa: vault-db-connect\n"
@@ -108,7 +111,7 @@ def test_audit_shell_raw_connect_respects_noqa():
 
 
 def test_one_malformed_block_does_not_suppress_later_blocks():
-    mod = _load_scanner()
+    mod = _SCANNER
     md = (
         "```python\n"                       # 1
         "def f(  # unterminated paren\n"    # 2  -> SyntaxError in this block
@@ -127,7 +130,7 @@ def test_one_malformed_block_does_not_suppress_later_blocks():
 
 
 def test_noqa_honored_on_closing_line_of_multiline_call():
-    mod = _load_scanner()
+    mod = _SCANNER
     src = (
         "import sqlite3\n"
         "def f(p):\n"
@@ -140,7 +143,7 @@ def test_noqa_honored_on_closing_line_of_multiline_call():
 
 
 def test_extract_scans_py_and_info_string_fences():
-    mod = _load_scanner()
+    mod = _SCANNER
     md = (
         "```py\nconn = sqlite3.connect(p)\n```\n\n"
         "```python title=example.py\nconn = sqlite3.connect(q)\n```\n"
@@ -153,7 +156,7 @@ def test_extract_scans_py_and_info_string_fences():
 
 
 def test_bash_block_heredoc_flagged():
-    mod = _load_scanner()
+    mod = _SCANNER
     md = "```bash\npython3 - <<'PY'\nconn = sqlite3.connect(db)\nPY\n```\n"
     hits = []
     for start, lang, block in mod._extract_fenced_blocks(md):
