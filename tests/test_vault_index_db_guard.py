@@ -67,3 +67,26 @@ def test_batch_activations_routes_through_connect():
 def test_parent_session_routes_through_connect():
     with pytest.raises(RuntimeError, match="refusing to open production index DB"):
         vault_index._parent_session_for_snapshot("/some/snap.md", vault_index._REAL_PROD_DB)
+
+
+def test_indirect_ensure_index_lands_in_isolated_db(tmp_path, monkeypatch):
+    # Simulate the indirect leak path: call ensure_index with NO db_path.
+    # The autouse fixture has pointed OBSIDIAN_BRAIN_DB at a tmp file; override
+    # it here to a path we control so we can assert rows landed there.
+    iso_db = tmp_path / "iso.db"
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(iso_db))
+
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "2026-06-03-demo-aaaa.md").write_text(
+        "---\ntype: claude-session\nproject: demo\n---\n\n# Demo\nbody text\n",
+        encoding="utf-8",
+    )
+
+    returned = vault_index.ensure_index(str(vault), ["claude-sessions"])  # noqa: no-default-db — intentional: guards the indirect (no db_path) leak path
+    assert returned == str(iso_db)
+    assert iso_db.exists()
+
+    # The real prod DB must be untouched (guard would have raised otherwise).
+    assert os.path.realpath(str(iso_db)) != vault_index._REAL_PROD_DB
