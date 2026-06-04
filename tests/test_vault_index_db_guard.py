@@ -22,3 +22,11 @@ def test_default_db_path_falls_back_without_env(monkeypatch):
 def test_in_test_ctx_true_under_pytest():
     # pytest always sets PYTEST_CURRENT_TEST while a test runs.
     assert vault_index._in_test_ctx() is True
+
+
+def test_autouse_fixture_redirects_default_db(tmp_path):
+    # Under the autouse fixture, OBSIDIAN_BRAIN_DB is set to a per-test tmp path,
+    # so an un-isolated default call never resolves to the real prod DB.
+    resolved = vault_index._default_db_path()
+    assert resolved != vault_index._REAL_PROD_DB
+    assert "OBSIDIAN_BRAIN_DB" in os.environ
