@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import importlib
 import os
+import sqlite3
+
+import pytest
 
 import vault_index
 
@@ -30,11 +33,6 @@ def test_autouse_fixture_redirects_default_db(tmp_path):
     resolved = vault_index._default_db_path()
     assert resolved != vault_index._REAL_PROD_DB
     assert "OBSIDIAN_BRAIN_DB" in os.environ
-
-
-import sqlite3
-
-import pytest
 
 
 def test_connect_raises_on_real_prod_path_under_test():
