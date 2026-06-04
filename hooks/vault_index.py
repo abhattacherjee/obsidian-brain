@@ -145,7 +145,17 @@ def _in_test_ctx() -> bool:
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
-    """Open a WAL-mode connection with 5s timeout."""
+    """Open a WAL-mode connection with 5s timeout.
+
+    Guard (#192): under a pytest context, refuse to open the REAL production
+    index DB. Any test that reaches this path is leaking; fail loudly instead of
+    silently polluting ~/.claude/obsidian-brain-vault.db.
+    """
+    if _in_test_ctx() and os.path.realpath(db_path) == _REAL_PROD_DB:
+        raise RuntimeError(
+            f"refusing to open production index DB under test context: {db_path}. "
+            "Pass an isolated db_path or set OBSIDIAN_BRAIN_DB."
+        )
     conn = sqlite3.connect(db_path, timeout=5.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row

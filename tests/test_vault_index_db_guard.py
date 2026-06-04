@@ -30,3 +30,23 @@ def test_autouse_fixture_redirects_default_db(tmp_path):
     resolved = vault_index._default_db_path()
     assert resolved != vault_index._REAL_PROD_DB
     assert "OBSIDIAN_BRAIN_DB" in os.environ
+
+
+import sqlite3
+
+import pytest
+
+
+def test_connect_raises_on_real_prod_path_under_test():
+    with pytest.raises(RuntimeError, match="refusing to open production index DB"):
+        vault_index._connect(vault_index._REAL_PROD_DB)
+
+
+def test_connect_allows_isolated_path(tmp_path):
+    db = tmp_path / "isolated.db"
+    conn = vault_index._connect(str(db))
+    try:
+        assert isinstance(conn, sqlite3.Connection)
+        assert db.exists()
+    finally:
+        conn.close()
