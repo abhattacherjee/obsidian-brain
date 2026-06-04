@@ -168,7 +168,7 @@ def scan_raw_connect() -> list[str]:
             rel = path.relative_to(REPO_ROOT).as_posix()
             md = path.read_text(encoding="utf-8", errors="replace")
             blocks = _extract_python_blocks(md)
-            if not blocks:
+            if not blocks.strip():
                 continue
             for lineno, msg in audit_raw_connect(rel, blocks):
                 out.append(f"{rel}:{lineno}: {msg} (embedded python)")
