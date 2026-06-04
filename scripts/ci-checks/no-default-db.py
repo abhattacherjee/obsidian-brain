@@ -30,6 +30,7 @@ Known limitations:
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -40,6 +41,102 @@ GUARDED_FUNCS = frozenset({
 })
 NOQA_MARKER = "# noqa: no-default-db"
 TESTS_DIR = Path(__file__).resolve().parent.parent.parent / "tests"
+
+# --- #192: forbid raw sqlite3.connect bypasses of vault_index._connect ---
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Dirs scanned for raw-connect bypasses (relative to repo root).
+RAW_CONNECT_SCAN_DIRS = ("hooks", "skills", "scripts")
+
+# rel_path -> set of function names permitted to call sqlite3.connect directly.
+RAW_CONNECT_ALLOWLIST = {
+    "hooks/vault_index.py": {"_connect"},
+}
+
+_PY_FENCE = re.compile(r"```python\n(.*?)```", re.DOTALL)
+
+
+def _extract_python_blocks(md_source: str) -> str:
+    """Concatenate the bodies of ```python fenced blocks in a markdown string."""
+    return "\n".join(_PY_FENCE.findall(md_source))
+
+
+def _is_sqlite_connect(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "connect"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "sqlite3"
+    )
+
+
+def audit_raw_connect(rel_path: str, source: str) -> list[tuple[int, str]]:
+    """Return (lineno, message) for raw sqlite3.connect calls outside the
+    allowlisted function for rel_path, unless suppressed by
+    '# noqa: vault-db-connect' on the call's line. SyntaxError -> no findings
+    (best-effort for partial SKILL.md snippets)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    allowed = RAW_CONNECT_ALLOWLIST.get(rel_path, set())
+    lines = source.splitlines()
+    findings: list[tuple[int, str]] = []
+
+    class _V(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.stack: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if _is_sqlite_connect(node):
+                enclosing = self.stack[-1] if self.stack else "<module>"
+                line = lines[node.lineno - 1] if 0 <= node.lineno - 1 < len(lines) else ""
+                if enclosing not in allowed and "noqa: vault-db-connect" not in line:
+                    findings.append(
+                        (
+                            node.lineno,
+                            f"raw sqlite3.connect in {enclosing}() — route through "
+                            f"vault_index._connect() or add '# noqa: vault-db-connect'",
+                        )
+                    )
+            self.generic_visit(node)
+
+    _V().visit(tree)
+    return findings
+
+
+def scan_raw_connect() -> list[str]:
+    """Scan RAW_CONNECT_SCAN_DIRS for bypass violations. Returns formatted lines."""
+    out: list[str] = []
+    for d in RAW_CONNECT_SCAN_DIRS:
+        base = REPO_ROOT / d
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            src = path.read_text(encoding="utf-8", errors="replace")
+            for lineno, msg in audit_raw_connect(rel, src):
+                out.append(f"{rel}:{lineno}: {msg}")
+        for path in sorted(base.rglob("SKILL.md")):
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            md = path.read_text(encoding="utf-8", errors="replace")
+            blocks = _extract_python_blocks(md)
+            if not blocks:
+                continue
+            for lineno, msg in audit_raw_connect(rel, blocks):
+                out.append(f"{rel} (embedded python): {msg}")
+    return out
 
 
 def _call_name(node: ast.Call) -> str | None:
@@ -140,8 +237,19 @@ def main(argv: list[str]) -> int:
             "polluting the user's live ~/.claude/obsidian-brain-vault.db.",
             file=sys.stderr,
         )
-        return 1
-    return 0
+
+    raw_connect_violations = scan_raw_connect()
+    for v in raw_connect_violations:
+        print(f"RAW-CONNECT BYPASS: {v}")
+    if raw_connect_violations:
+        print(
+            f"\n{len(raw_connect_violations)} raw sqlite3.connect bypass(es) in "
+            "hooks/skills/scripts. Route through vault_index._connect() or add "
+            "'# noqa: vault-db-connect' with a brief reason.",
+            file=sys.stderr,
+        )
+
+    return 1 if (total_violations or raw_connect_violations) else 0
 
 
 if __name__ == "__main__":

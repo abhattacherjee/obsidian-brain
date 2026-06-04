@@ -295,7 +295,7 @@ def test_assign_theme_idempotent(tmpdir: Path) -> None:
     vault_index.ensure_index(str(vault), ["claude-sessions"], db_path=db_path)
 
     # Seed a theme matching the note's vector
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path)  # noqa: vault-db-connect — dev validation script, direct DB read for numerical/behavioral checks
     conn.row_factory = sqlite3.Row
     vec = json.loads(conn.execute(
         "SELECT tfidf_vector FROM notes WHERE path = ?", (str(note_path),)
@@ -316,7 +316,7 @@ def test_assign_theme_idempotent(tmpdir: Path) -> None:
         fail_("first assign_to_theme returned None")
         return
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path)  # noqa: vault-db-connect — dev validation script, direct DB read for numerical/behavioral checks
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT note_count, centroid FROM themes WHERE id = ?", (theme_id,)
@@ -335,7 +335,7 @@ def test_assign_theme_idempotent(tmpdir: Path) -> None:
         fail_("second assign_to_theme returned None")
         return
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path)  # noqa: vault-db-connect — dev validation script, direct DB read for numerical/behavioral checks
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT note_count, centroid FROM themes WHERE id = ?", (theme_id,)
@@ -384,7 +384,7 @@ def test_reindex_invariance(tmpdir: Path) -> None:
     vault_index.ensure_index(str(vault), ["claude-sessions"], db_path=db_path)
 
     def snapshot_df() -> dict[str, int]:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path)  # noqa: vault-db-connect — dev validation script, direct DB read for numerical/behavioral checks
         try:
             return dict(conn.execute("SELECT term, df FROM term_df").fetchall())
         finally:
@@ -445,7 +445,7 @@ def test_delete_unfolds_centroid(tmpdir: Path) -> None:
     vault_index.ensure_index(str(vault), ["claude-sessions"], db_path=db_path)
 
     # Hand-build theme with A+B running-avg centroid
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path)  # noqa: vault-db-connect — dev validation script, direct DB read for numerical/behavioral checks
     conn.row_factory = sqlite3.Row
     vec_a = json.loads(conn.execute("SELECT tfidf_vector FROM notes WHERE path=?", (str(a_path),)).fetchone()["tfidf_vector"])
     vec_b = json.loads(conn.execute("SELECT tfidf_vector FROM notes WHERE path=?", (str(b_path),)).fetchone()["tfidf_vector"])
@@ -475,7 +475,7 @@ def test_delete_unfolds_centroid(tmpdir: Path) -> None:
     finally:
         conn.close()
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path)  # noqa: vault-db-connect — dev validation script, direct DB read for numerical/behavioral checks
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT note_count, centroid FROM themes WHERE id=?", (theme_id,)).fetchone()
     if row is None:

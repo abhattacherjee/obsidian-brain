@@ -199,7 +199,7 @@ def compute_stats(db_path: str, project: str) -> str:
 
     conn = None
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
+        conn = sqlite3.connect(db_path, timeout=5.0)  # noqa: vault-db-connect — stats reader; db_path is always caller-supplied (never default-resolved here)
         conn.row_factory = sqlite3.Row
     except (sqlite3.Error, OSError) as exc:
         if conn is not None:
