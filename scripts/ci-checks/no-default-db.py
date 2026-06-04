@@ -30,7 +30,6 @@ Known limitations:
 from __future__ import annotations
 
 import ast
-import re
 import sys
 from pathlib import Path
 
@@ -54,12 +53,28 @@ RAW_CONNECT_ALLOWLIST = {
     "hooks/vault_index.py": {"_connect"},
 }
 
-_PY_FENCE = re.compile(r"```python\n(.*?)```", re.DOTALL)
-
-
 def _extract_python_blocks(md_source: str) -> str:
-    """Concatenate the bodies of ```python fenced blocks in a markdown string."""
-    return "\n".join(_PY_FENCE.findall(md_source))
+    """Return a line-aligned projection of md_source containing only the bodies
+    of ```python fenced blocks; every other line (prose and the fence markers)
+    is blanked. Line numbers are PRESERVED — the returned string has the same
+    line count as the source — so audit findings report the true source line
+    rather than an offset into concatenated blocks (#192 follow-up)."""
+    lines = md_source.splitlines()
+    out = [""] * len(lines)
+    in_block = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not in_block:
+            if stripped == "```python":
+                in_block = True
+            # the opening-fence line itself stays blank
+        else:
+            if stripped == "```":
+                in_block = False
+                # the closing-fence line itself stays blank
+            else:
+                out[i] = line
+    return "\n".join(out)
 
 
 def _is_sqlite_connect(node: ast.AST) -> bool:
@@ -114,6 +129,27 @@ def audit_raw_connect(rel_path: str, source: str) -> list[tuple[int, str]]:
     return findings
 
 
+def audit_shell_raw_connect(rel_path: str, source: str) -> list[tuple[int, str]]:
+    """Line-based scan of a shell script for raw sqlite3.connect( calls
+    (typically inside a python heredoc or `python3 -c`). Heredoc python often
+    interpolates shell vars and would not parse as standalone Python, so this is
+    intentionally a text scan, not AST. Shell scripts never define
+    vault_index._connect, so any occurrence is a bypass unless the line carries
+    '# noqa: vault-db-connect' (#192 follow-up: .sh files were previously
+    unscanned)."""
+    findings: list[tuple[int, str]] = []
+    for i, line in enumerate(source.splitlines(), start=1):
+        if "sqlite3.connect(" in line and "noqa: vault-db-connect" not in line:
+            findings.append(
+                (
+                    i,
+                    "raw sqlite3.connect in shell script — route through "
+                    "vault_index._connect() or add '# noqa: vault-db-connect'",
+                )
+            )
+    return findings
+
+
 def scan_raw_connect() -> list[str]:
     """Scan RAW_CONNECT_SCAN_DIRS for bypass violations. Returns formatted lines."""
     out: list[str] = []
@@ -135,7 +171,12 @@ def scan_raw_connect() -> list[str]:
             if not blocks:
                 continue
             for lineno, msg in audit_raw_connect(rel, blocks):
-                out.append(f"{rel} (embedded python): {msg}")
+                out.append(f"{rel}:{lineno}: {msg} (embedded python)")
+        for path in sorted(base.rglob("*.sh")):
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            src = path.read_text(encoding="utf-8", errors="replace")
+            for lineno, msg in audit_shell_raw_connect(rel, src):
+                out.append(f"{rel}:{lineno}: {msg}")
     return out
 
 

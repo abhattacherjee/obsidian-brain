@@ -64,3 +64,44 @@ def test_allowlist_is_function_scoped_not_file_scoped():
     src = "import sqlite3\n\ndef other(p):\n    return sqlite3.connect(p)\n"
     violations = mod.audit_raw_connect("hooks/vault_index.py", src)
     assert violations, "allowlist must be function-scoped, not file-scoped"
+
+
+def test_extract_python_blocks_preserves_source_line_numbers():
+    mod = _load_scanner()
+    md = (
+        "# Title\n"                       # line 1
+        "prose line\n"                    # line 2
+        "```python\n"                     # line 3
+        "import sqlite3\n"                 # line 4
+        "conn = sqlite3.connect('x')\n"   # line 5
+        "```\n"                           # line 6
+    )
+    blocks = mod._extract_python_blocks(md)
+    violations = mod.audit_raw_connect("skills/x/SKILL.md", blocks)
+    assert violations, "expected a finding for the raw connect in the python block"
+    assert violations[0][0] == 5, f"lineno should map to source line 5, got {violations[0][0]}"
+
+
+def test_audit_shell_raw_connect_flags_heredoc():
+    mod = _load_scanner()
+    sh = (
+        "#!/usr/bin/env bash\n"
+        "python3 - <<'PY'\n"
+        "import sqlite3\n"
+        "conn = sqlite3.connect(db)\n"
+        "PY\n"
+    )
+    violations = mod.audit_shell_raw_connect("scripts/dev-test/x.sh", sh)
+    assert violations, "raw sqlite3.connect in a shell heredoc must be flagged"
+    assert violations[0][0] == 4, f"lineno should be the shell line 4, got {violations[0][0]}"
+
+
+def test_audit_shell_raw_connect_respects_noqa():
+    mod = _load_scanner()
+    sh = (
+        "python3 - <<'PY'\n"
+        "conn = sqlite3.connect(db)  # noqa: vault-db-connect\n"
+        "PY\n"
+    )
+    violations = mod.audit_shell_raw_connect("scripts/dev-test/x.sh", sh)
+    assert violations == [], "# noqa: vault-db-connect must suppress the shell finding"
