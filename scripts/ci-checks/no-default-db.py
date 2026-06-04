@@ -53,28 +53,47 @@ RAW_CONNECT_ALLOWLIST = {
     "hooks/vault_index.py": {"_connect"},
 }
 
-def _extract_python_blocks(md_source: str) -> str:
-    """Return a line-aligned projection of md_source containing only the bodies
-    of ```python fenced blocks; every other line (prose and the fence markers)
-    is blanked. Line numbers are PRESERVED — the returned string has the same
-    line count as the source — so audit findings report the true source line
-    rather than an offset into concatenated blocks (#192 follow-up)."""
+# Fence info-string language tokens treated as Python / shell when scanning
+# embedded code blocks in SKILL.md files.
+_PYTHON_LANGS = frozenset({"py", "python", "python3"})
+_SHELL_LANGS = frozenset({"sh", "bash", "shell", "console"})
+
+
+def _extract_fenced_blocks(md_source: str) -> list[tuple[int, str, str]]:
+    """Return (start_lineno, lang, block_source) for each fenced code block.
+
+    start_lineno is the 1-based source line of the block's FIRST body line, so a
+    finding's in-block line can be mapped back to the true file line. `lang` is
+    the lowercased first token of the fence info string (e.g. ```python title=x
+    -> "python"). Each block is returned SEPARATELY so a SyntaxError in one
+    partial snippet cannot suppress detection in the others — the previous
+    whole-file merge let one malformed block hide raw connects in every later
+    block (#192 follow-up)."""
+    blocks: list[tuple[int, str, str]] = []
     lines = md_source.splitlines()
-    out = [""] * len(lines)
     in_block = False
-    for i, line in enumerate(lines):
+    cur: list[str] = []
+    start = 0
+    lang = ""
+    for i, line in enumerate(lines, start=1):
         stripped = line.strip()
         if not in_block:
-            if stripped == "```python":
+            if stripped.startswith("```"):
+                info = stripped[3:].strip()
+                lang = info.split(maxsplit=1)[0].lower() if info else ""
                 in_block = True
-            # the opening-fence line itself stays blank
+                cur = []
+                start = i + 1  # first body line is the next line
         else:
             if stripped == "```":
                 in_block = False
-                # the closing-fence line itself stays blank
+                if cur:
+                    blocks.append((start, lang, "\n".join(cur)))
             else:
-                out[i] = line
-    return "\n".join(out)
+                cur.append(line)
+    if in_block and cur:  # unterminated block runs to EOF
+        blocks.append((start, lang, "\n".join(cur)))
+    return blocks
 
 
 def _is_sqlite_connect(node: ast.AST) -> bool:
@@ -114,8 +133,10 @@ def audit_raw_connect(rel_path: str, source: str) -> list[tuple[int, str]]:
         def visit_Call(self, node: ast.Call) -> None:
             if _is_sqlite_connect(node):
                 enclosing = self.stack[-1] if self.stack else "<module>"
-                line = lines[node.lineno - 1] if 0 <= node.lineno - 1 < len(lines) else ""
-                if enclosing not in allowed and "noqa: vault-db-connect" not in line:
+                end = getattr(node, "end_lineno", node.lineno) or node.lineno
+                span = lines[node.lineno - 1 : end]  # every physical line of the call
+                suppressed = any("noqa: vault-db-connect" in ln for ln in span)
+                if enclosing not in allowed and not suppressed:
                     findings.append(
                         (
                             node.lineno,
@@ -167,11 +188,13 @@ def scan_raw_connect() -> list[str]:
         for path in sorted(base.rglob("SKILL.md")):
             rel = path.relative_to(REPO_ROOT).as_posix()
             md = path.read_text(encoding="utf-8", errors="replace")
-            blocks = _extract_python_blocks(md)
-            if not blocks.strip():
-                continue
-            for lineno, msg in audit_raw_connect(rel, blocks):
-                out.append(f"{rel}:{lineno}: {msg} (embedded python)")
+            for start, lang, block in _extract_fenced_blocks(md):
+                if lang in _PYTHON_LANGS:
+                    for lineno, msg in audit_raw_connect(rel, block):
+                        out.append(f"{rel}:{start - 1 + lineno}: {msg} (embedded python)")
+                elif lang in _SHELL_LANGS:
+                    for lineno, msg in audit_shell_raw_connect(rel, block):
+                        out.append(f"{rel}:{start - 1 + lineno}: {msg} (embedded shell)")
         for path in sorted(base.rglob("*.sh")):
             rel = path.relative_to(REPO_ROOT).as_posix()
             src = path.read_text(encoding="utf-8", errors="replace")
