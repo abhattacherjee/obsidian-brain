@@ -688,7 +688,8 @@ def _parent_session_for_snapshot(note_path: str, db_path: str) -> str | None:
          resolve to <sessions_folder>/<stem>.md. If the file exists, cache
          and return it. If not, cache None and return None.
 
-    Swallows all exceptions — logging is observability, not a blocker.
+    Swallows sqlite3.Error; propagates RuntimeError from the #192 pollution
+    guard — logging is observability, not a blocker.
 
     Cache entries are NOT invalidated when a snapshot is re-indexed; a
     corrected ``source_session_note`` won't take effect until the next process
@@ -698,7 +699,12 @@ def _parent_session_for_snapshot(note_path: str, db_path: str) -> str | None:
     if note_path in _PARENT_CACHE:
         return _PARENT_CACHE[note_path]
     resolved: str | None = None
-    conn = _connect(db_path)  # guard may raise RuntimeError — let it propagate
+    try:
+        conn = _connect(db_path)  # guard RuntimeError propagates; sqlite3.Error degrades as before
+    except sqlite3.Error as exc:
+        print(f"[vault-index] parent-resolve DB error for {note_path!r}: {exc}",
+              file=sys.stderr)
+        return None
     try:
         try:
             row = conn.execute(
@@ -761,7 +767,11 @@ def log_access(db_path: str, note_path: str, context_type: str, project: str | N
     if parent:
         paths.append(parent)
 
-    conn = _connect(db_path)  # guard may raise RuntimeError — let it propagate
+    try:
+        conn = _connect(db_path)  # guard RuntimeError propagates; sqlite3.Error degrades as before
+    except sqlite3.Error as exc:
+        print(f"[vault-index] log_access failed for {note_path!r}: {exc}", file=sys.stderr)
+        return
     try:
         now = time.time()
         conn.executemany(
@@ -830,7 +840,12 @@ def batch_activations(
 
     result: dict[str, float] = {p: 0.0 for p in note_paths}
 
-    conn = _connect(db_path)  # guard may raise — propagate, do not swallow
+    try:
+        conn = _connect(db_path)  # guard RuntimeError propagates; sqlite3.Error degrades as before
+    except sqlite3.Error as exc:
+        print(f"[vault-index] batch_activations failed ({len(note_paths)} paths): {exc}",
+              file=sys.stderr)
+        return result
     try:
         now = time.time()
         placeholders = ",".join("?" for _ in note_paths)
