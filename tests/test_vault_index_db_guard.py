@@ -126,3 +126,20 @@ def test_default_db_path_empty_env_falls_back(monkeypatch):
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", "")
     expected = os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
     assert vault_index._default_db_path() == expected
+
+
+@pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unsupported on this platform")
+def test_connect_blocks_hardlink_to_prod_db(tmp_path, monkeypatch):
+    # A hard link shares the target's inode but has its own path, so realpath
+    # does NOT resolve it back to the prod DB — only the samefile/inode check
+    # catches it. Use a stand-in prod DB (never the real one) to test safely.
+    fake_prod = tmp_path / "prod.db"
+    fake_prod.write_text("")  # must exist to be hard-linked
+    monkeypatch.setattr(vault_index, "_REAL_PROD_DB", os.path.realpath(str(fake_prod)))
+    link = tmp_path / "hardlink.db"
+    try:
+        os.link(str(fake_prod), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("could not create a hard link")
+    with pytest.raises(RuntimeError, match="refusing to open production index DB"):
+        vault_index._connect(str(link))

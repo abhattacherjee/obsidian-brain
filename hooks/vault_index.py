@@ -151,13 +151,24 @@ def _connect(db_path: str) -> sqlite3.Connection:
 
     Guard (#192): under a pytest context, refuse to open the REAL production
     index DB. Any test that reaches this path is leaking; fail loudly instead of
-    silently polluting ~/.claude/obsidian-brain-vault.db.
+    silently polluting ~/.claude/obsidian-brain-vault.db. Both path-equality
+    (realpath, catching symlinks) and inode-equality (samefile, catching hard
+    links) are checked.
     """
-    if _in_test_ctx() and os.path.realpath(db_path) == _REAL_PROD_DB:
-        raise RuntimeError(
-            f"refusing to open production index DB under test context: {db_path}. "
-            "Pass an isolated db_path or set OBSIDIAN_BRAIN_DB."
-        )
+    if _in_test_ctx():
+        try:
+            same_inode = (
+                os.path.exists(db_path)
+                and os.path.exists(_REAL_PROD_DB)
+                and os.path.samefile(db_path, _REAL_PROD_DB)
+            )
+        except OSError:
+            same_inode = False
+        if os.path.realpath(db_path) == _REAL_PROD_DB or same_inode:
+            raise RuntimeError(
+                f"refusing to open production index DB under test context: {db_path}. "
+                "Pass an isolated db_path or set OBSIDIAN_BRAIN_DB."
+            )
     conn = sqlite3.connect(db_path, timeout=5.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
