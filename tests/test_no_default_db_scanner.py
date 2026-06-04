@@ -42,3 +42,25 @@ def test_extract_python_blocks_from_markdown():
     md = "text\n```python\nimport sqlite3\nsqlite3.connect('x')\n```\nmore\n"
     blocks = mod._extract_python_blocks(md)
     assert "sqlite3.connect" in blocks
+
+
+def test_audit_flags_raw_connect_in_extracted_markdown_block():
+    mod = _load_scanner()
+    md = (
+        "Some skill prose.\n\n```python\n"
+        "import sqlite3\n\n"
+        "def opendb(p):\n    return sqlite3.connect(p)\n"
+        "```\n\nmore prose\n"
+    )
+    blocks = mod._extract_python_blocks(md)
+    violations = mod.audit_raw_connect("skills/foo/SKILL.md", blocks)
+    assert violations, "raw sqlite3.connect inside an extracted SKILL.md python block must be flagged"
+
+
+def test_allowlist_is_function_scoped_not_file_scoped():
+    mod = _load_scanner()
+    # In an allowlisted FILE, only the allowlisted FUNCTION (_connect) may call
+    # sqlite3.connect — any other function in that file must still be flagged.
+    src = "import sqlite3\n\ndef other(p):\n    return sqlite3.connect(p)\n"
+    violations = mod.audit_raw_connect("hooks/vault_index.py", src)
+    assert violations, "allowlist must be function-scoped, not file-scoped"

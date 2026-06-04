@@ -88,3 +88,41 @@ def test_indirect_ensure_index_lands_in_isolated_db(tmp_path, monkeypatch):
 
     # The real prod DB must be untouched (guard would have raised otherwise).
     assert os.path.realpath(str(iso_db)) != vault_index._REAL_PROD_DB
+
+
+def test_log_access_degrades_on_sqlite_error(tmp_path):
+    # A non-prod path that sqlite3 cannot open (a directory) triggers a
+    # connect-phase sqlite3.Error — log_access must degrade (return None), NOT raise.
+    bad = tmp_path / "a-directory.db"
+    bad.mkdir()
+    assert vault_index.log_access(str(bad), "/some/note.md", "recall", "demo") is None
+
+
+def test_batch_activations_degrades_on_sqlite_error(tmp_path):
+    # Same connect-phase sqlite3.Error path: batch_activations must degrade to the
+    # zero-filled result dict, NOT raise.
+    bad = tmp_path / "a-directory.db"
+    bad.mkdir()
+    note = "/some/note.md"
+    result = vault_index.batch_activations(str(bad), [note])
+    assert result == {note: 0.0}
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unsupported on this platform")
+def test_connect_blocks_symlink_to_prod_db(tmp_path):
+    # A symlink whose realpath resolves to the real prod DB must NOT evade the guard.
+    link = tmp_path / "sneaky.db"
+    try:
+        os.symlink(vault_index._REAL_PROD_DB, str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("could not create symlink")
+    with pytest.raises(RuntimeError, match="refusing to open production index DB"):
+        vault_index._connect(str(link))
+
+
+def test_default_db_path_empty_env_falls_back(monkeypatch):
+    # OBSIDIAN_BRAIN_DB="" is falsy → the `or` must fall back to the real default
+    # (regression guard against refactoring to os.environ.get(key, default)).
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", "")
+    expected = os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
+    assert vault_index._default_db_path() == expected
