@@ -119,8 +119,29 @@ def _is_under(child: Path, parent: Path) -> bool:
 
 
 def _default_db_path() -> str:
-    """Return default DB path: ~/.claude/obsidian-brain-vault.db."""
-    return os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
+    """Return default DB path: ~/.claude/obsidian-brain-vault.db.
+
+    Overridable via the OBSIDIAN_BRAIN_DB env var so tests, dev-test scripts,
+    and subprocesses can isolate the index DB without threading db_path through
+    every call site (#192).
+    """
+    return os.environ.get("OBSIDIAN_BRAIN_DB") or os.path.join(
+        os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db"
+    )
+
+
+# Hardcoded real production DB path, resolved once at import. The guard in
+# _connect() compares against THIS (not _default_db_path(), which the env
+# override/monkeypatch may redirect) so isolation cannot defeat the guard (#192).
+_REAL_PROD_DB = os.path.realpath(
+    os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
+)
+
+
+def _in_test_ctx() -> bool:
+    """True when running under pytest (set automatically, inherited by
+    subprocesses spawned during a test). Production never sets this."""
+    return "PYTEST_CURRENT_TEST" in os.environ
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
