@@ -290,7 +290,7 @@ try:
     conn.commit()
 finally:
     conn.close()
-saved_access = sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
+saved_access = sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM access_log").fetchone()[0]  # noqa: vault-db-connect — dev smoke-test, direct verification read
 
 try:
     reindex(db)
@@ -308,7 +308,7 @@ except Exception as e:
         fail_(f"unexpected exception type: {type(e).__name__}: {e}")
 
 # Verify access_log is intact (the abort prevented the destructive fall-through)
-n_after = sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
+n_after = sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM access_log").fetchone()[0]  # noqa: vault-db-connect — dev smoke-test, direct verification read
 if n_after == saved_access:
     pass_("access_log preserved after abort")
 else:
@@ -316,7 +316,7 @@ else:
 
 # Now run with explicit consent — should succeed and wipe.
 stats = reindex(db, allow_fallthrough=True)
-n_final = sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
+n_final = sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM access_log").fetchone()[0]  # noqa: vault-db-connect — dev smoke-test, direct verification read
 if stats.get("mode") == "full" and n_final == 0:
     pass_("--allow-fallthrough opted-in and wiped access_log as expected")
 else:
@@ -333,15 +333,15 @@ insert_note_row(db, str(canonical), canonical.stat().st_mtime)
 insert_note_row(db, "/private/tmp/foreign.md", time.time())  # would-be foreign prune target
 insert_access(db, "/private/tmp/foreign.md")  # would-be orphan
 before = {
-    "notes": sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM notes").fetchone()[0],
-    "access_log": sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM access_log").fetchone()[0],
+    "notes": sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM notes").fetchone()[0],  # noqa: vault-db-connect — dev smoke-test, direct verification read
+    "access_log": sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM access_log").fetchone()[0],  # noqa: vault-db-connect — dev smoke-test, direct verification read
 }
 audit_before = set((HOME_FIX / ".claude" / "obsidian-brain").glob("reindex-prune-*.log"))
 backup_before = set(FIXTURE.glob("p17.db.bak-*"))
 stats = reindex(db, dry_run=True)
 after = {
-    "notes": sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM notes").fetchone()[0],
-    "access_log": sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM access_log").fetchone()[0],
+    "notes": sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM notes").fetchone()[0],  # noqa: vault-db-connect — dev smoke-test, direct verification read
+    "access_log": sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM access_log").fetchone()[0],  # noqa: vault-db-connect — dev smoke-test, direct verification read
 }
 audit_after = set((HOME_FIX / ".claude" / "obsidian-brain").glob("reindex-prune-*.log"))
 backup_after = set(FIXTURE.glob("p17.db.bak-*"))
@@ -369,7 +369,7 @@ canonical = write_note(
 )
 try:
     stats = reindex(db)
-    if db.exists() and sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM notes").fetchone()[0] >= 1:
+    if db.exists() and sqlite3.connect(str(db)).execute("SELECT COUNT(*) FROM notes").fetchone()[0] >= 1:  # noqa: vault-db-connect — dev smoke-test, direct verification read
         pass_(f"missing-DB fall-through created index ({stats.get('mode')}, inserted={stats.get('inserted')})")
     else:
         fail_(f"missing-DB fall-through ran but DB still empty: {stats}")
@@ -393,7 +393,7 @@ recovered = [
     "2026-04-27-obsidian-brain-2b78.md",
     "2026-04-29-knowledge-base-ui-59bb.md",
 ]
-conn = sqlite3.connect(str(real_db_path))
+conn = sqlite3.connect(str(real_db_path))  # noqa: vault-db-connect — dev smoke-test, direct verification read against real vault DB
 try:
     found = 0
     for fn in recovered:
@@ -409,7 +409,7 @@ else:
 
 # 2.2 — access_log canonical
 print("  2.2  access_log all canonical")
-conn = sqlite3.connect(str(real_db_path))
+conn = sqlite3.connect(str(real_db_path))  # noqa: vault-db-connect — dev smoke-test, direct verification read against real vault DB
 try:
     n_total = conn.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
     n_canonical = conn.execute(
@@ -427,7 +427,7 @@ else:
 # 2.3 — dry-run on real vault is non-destructive
 print("  2.3  dry-run on real vault is non-destructive")
 real_before = {}
-conn = sqlite3.connect(str(real_db_path))
+conn = sqlite3.connect(str(real_db_path))  # noqa: vault-db-connect — dev smoke-test, direct verification read against real vault DB
 try:
     for tbl in ("notes", "access_log", "themes", "theme_members"):
         real_before[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
@@ -444,7 +444,7 @@ try:
 finally:
     pass
 real_after = {}
-conn = sqlite3.connect(str(real_db_path))
+conn = sqlite3.connect(str(real_db_path))  # noqa: vault-db-connect — dev smoke-test, direct verification read against real vault DB
 try:
     for tbl in ("notes", "access_log", "themes", "theme_members"):
         real_after[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
