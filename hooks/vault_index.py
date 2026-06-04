@@ -780,7 +780,7 @@ def log_access(db_path: str, note_path: str, context_type: str, project: str | N
             [(p, now, context_type, project) for p in paths],
         )
         conn.commit()
-    except Exception as exc:
+    except sqlite3.Error as exc:
         print(f"[vault-index] log_access failed for {note_path!r}: {exc}", file=sys.stderr)
     finally:
         conn.close()
@@ -867,7 +867,7 @@ def batch_activations(
                 summation += dt ** (-decay)
             if summation > 0.0:
                 result[path] = math.log(summation)
-    except Exception as exc:
+    except sqlite3.Error as exc:
         print(f"[vault-index] batch_activations failed ({len(note_paths)} paths): {exc}",
               file=sys.stderr)
         return result

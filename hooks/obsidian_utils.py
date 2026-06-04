@@ -2749,7 +2749,8 @@ def _note_has_inbound_links(basename_stem: str, db_path: str | None = None) -> b
             return row is not None
         finally:
             conn.close()
-    except Exception:
+    except Exception as exc:
+        print(f"[obsidian-utils] inbound-link check failed for {basename_stem!r}: {exc}", file=sys.stderr)
         return True  # conservative: assume referenced on any error
 
 
