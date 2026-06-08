@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-06-07
+
 ### Fixed
 - Test/dev-test suite no longer pollutes the production index DB
   (`~/.claude/obsidian-brain-vault.db`). `_default_db_path()` now honors
