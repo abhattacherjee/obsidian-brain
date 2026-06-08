@@ -343,7 +343,7 @@ _PARENT_CACHE.clear()
 snap_path = "$FIXTURE/v/claude-sessions/2026-04-18-demo-abcd-snapshot-140000.md"
 log_access(db, snap_path, "search", "demo")
 
-conn = sqlite3.connect(db)
+conn = sqlite3.connect(db)  # noqa: vault-db-connect — manual dev test: read on the isolated $FIXTURE_DB tmp index, not the prod DB
 rows = conn.execute("SELECT note_path FROM access_log").fetchall()
 conn.close()
 paths = sorted({r[0] for r in rows})

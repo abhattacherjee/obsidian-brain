@@ -119,12 +119,56 @@ def _is_under(child: Path, parent: Path) -> bool:
 
 
 def _default_db_path() -> str:
-    """Return default DB path: ~/.claude/obsidian-brain-vault.db."""
-    return os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
+    """Return default DB path: ~/.claude/obsidian-brain-vault.db.
+
+    Overridable via the OBSIDIAN_BRAIN_DB env var so tests, dev-test scripts,
+    and subprocesses can isolate the index DB without threading db_path through
+    every call site (#192).
+    """
+    return os.environ.get("OBSIDIAN_BRAIN_DB") or os.path.join(
+        os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db"
+    )
+
+
+# Hardcoded real production DB path, resolved once at import. The guard in
+# _connect() compares against THIS (not _default_db_path(), which the
+# OBSIDIAN_BRAIN_DB env override redirects), so test isolation cannot defeat
+# the guard (#192).
+_REAL_PROD_DB = os.path.realpath(
+    os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
+)
+
+
+def _in_test_ctx() -> bool:
+    """True when running under pytest. PYTEST_CURRENT_TEST is set automatically
+    by pytest and inherited by subprocesses that copy the parent environment
+    (os.environ.copy()). Production never sets this."""
+    return "PYTEST_CURRENT_TEST" in os.environ
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
-    """Open a WAL-mode connection with 5s timeout."""
+    """Open a WAL-mode connection with 5s timeout.
+
+    Guard (#192): under a pytest context, refuse to open the REAL production
+    index DB. Any test that reaches this path is leaking; fail loudly instead of
+    silently polluting ~/.claude/obsidian-brain-vault.db. Both path-equality
+    (realpath, catching symlinks) and inode-equality (samefile, catching hard
+    links) are checked.
+    """
+    if _in_test_ctx():
+        try:
+            same_inode = (
+                os.path.exists(db_path)
+                and os.path.exists(_REAL_PROD_DB)
+                and os.path.samefile(db_path, _REAL_PROD_DB)
+            )
+        except OSError:
+            same_inode = False
+        if os.path.realpath(db_path) == _REAL_PROD_DB or same_inode:
+            raise RuntimeError(
+                f"refusing to open production index DB under test context: {db_path}. "
+                "Pass an isolated db_path or set OBSIDIAN_BRAIN_DB."
+            )
     conn = sqlite3.connect(db_path, timeout=5.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
@@ -657,7 +701,8 @@ def _parent_session_for_snapshot(note_path: str, db_path: str) -> str | None:
          resolve to <sessions_folder>/<stem>.md. If the file exists, cache
          and return it. If not, cache None and return None.
 
-    Swallows all exceptions — logging is observability, not a blocker.
+    Swallows sqlite3.Error; propagates RuntimeError from the #192 pollution
+    guard — logging is observability, not a blocker.
 
     Cache entries are NOT invalidated when a snapshot is re-indexed; a
     corrected ``source_session_note`` won't take effect until the next process
@@ -668,7 +713,12 @@ def _parent_session_for_snapshot(note_path: str, db_path: str) -> str | None:
         return _PARENT_CACHE[note_path]
     resolved: str | None = None
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
+        conn = _connect(db_path)  # guard RuntimeError propagates; sqlite3.Error degrades as before
+    except sqlite3.Error as exc:
+        print(f"[vault-index] parent-resolve DB error for {note_path!r}: {exc}",
+              file=sys.stderr)
+        return None
+    try:
         try:
             row = conn.execute(
                 "SELECT type FROM notes WHERE path = ?", (note_path,),
@@ -731,19 +781,22 @@ def log_access(db_path: str, note_path: str, context_type: str, project: str | N
         paths.append(parent)
 
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
-        try:
-            now = time.time()
-            conn.executemany(
-                "INSERT INTO access_log (note_path, timestamp, context_type, project) "
-                "VALUES (?, ?, ?, ?)",
-                [(p, now, context_type, project) for p in paths],
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as exc:
+        conn = _connect(db_path)  # guard RuntimeError propagates; sqlite3.Error degrades as before
+    except sqlite3.Error as exc:
         print(f"[vault-index] log_access failed for {note_path!r}: {exc}", file=sys.stderr)
+        return
+    try:
+        now = time.time()
+        conn.executemany(
+            "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+            "VALUES (?, ?, ?, ?)",
+            [(p, now, context_type, project) for p in paths],
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        print(f"[vault-index] log_access failed for {note_path!r}: {exc}", file=sys.stderr)
+    finally:
+        conn.close()
 
 
 def _batch_log_access(
@@ -801,34 +854,38 @@ def batch_activations(
     result: dict[str, float] = {p: 0.0 for p in note_paths}
 
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
-        try:
-            now = time.time()
-            placeholders = ",".join("?" for _ in note_paths)
-            rows = conn.execute(
-                f"SELECT note_path, timestamp FROM access_log "
-                f"WHERE note_path IN ({placeholders})",
-                note_paths,
-            ).fetchall()
-
-            # Group timestamps by note_path
-            accesses: dict[str, list[float]] = defaultdict(list)
-            for row in rows:
-                accesses[row[0]].append(row[1])
-
-            for path, timestamps in accesses.items():
-                summation = 0.0
-                for ts in timestamps:
-                    dt = max(now - ts, 0.001)  # clamp to 1ms minimum
-                    summation += dt ** (-decay)
-                if summation > 0.0:
-                    result[path] = math.log(summation)
-        finally:
-            conn.close()
-    except Exception as exc:
+        conn = _connect(db_path)  # guard RuntimeError propagates; sqlite3.Error degrades as before
+    except sqlite3.Error as exc:
         print(f"[vault-index] batch_activations failed ({len(note_paths)} paths): {exc}",
               file=sys.stderr)
         return result
+    try:
+        now = time.time()
+        placeholders = ",".join("?" for _ in note_paths)
+        rows = conn.execute(
+            f"SELECT note_path, timestamp FROM access_log "
+            f"WHERE note_path IN ({placeholders})",
+            note_paths,
+        ).fetchall()
+
+        # Group timestamps by note_path
+        accesses: dict[str, list[float]] = defaultdict(list)
+        for row in rows:
+            accesses[row[0]].append(row[1])
+
+        for path, timestamps in accesses.items():
+            summation = 0.0
+            for ts in timestamps:
+                dt = max(now - ts, 0.001)  # clamp to 1ms minimum
+                summation += dt ** (-decay)
+            if summation > 0.0:
+                result[path] = math.log(summation)
+    except sqlite3.Error as exc:
+        print(f"[vault-index] batch_activations failed ({len(note_paths)} paths): {exc}",
+              file=sys.stderr)
+        return result
+    finally:
+        conn.close()
 
     return result
 

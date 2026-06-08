@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-06-07
+
+### Fixed
+- Test/dev-test suite no longer pollutes the production index DB
+  (`~/.claude/obsidian-brain-vault.db`). `_default_db_path()` now honors
+  `OBSIDIAN_BRAIN_DB`; `_connect()` is the single guarded DB chokepoint that
+  refuses to open the real production DB under a pytest context; an autouse
+  fixture isolates each test's DB; and `no-default-db.py` now forbids raw
+  `sqlite3.connect` bypasses across `hooks/`, `skills/`, and `scripts/` (Python
+  files, `SKILL.md` python blocks, and shell heredocs, with accurate source line
+  numbers). (#192)
+
 ## [2.6.0] - 2026-06-02
 
 ### Added
