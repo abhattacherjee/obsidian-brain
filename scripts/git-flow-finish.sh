@@ -435,8 +435,18 @@ else
     fi
   fi
 
-  # Stage version file changes and CHANGELOG (avoid git add -A which could stage unintended files)
-  git add .claude-plugin/plugin.json package.json pyproject.toml Cargo.toml version.txt CHANGELOG.md 2>/dev/null || true
+  # Stage version file changes and CHANGELOG. Stage each path individually: a
+  # multi-pathspec `git add` is atomic and aborts (staging NOTHING) if any single
+  # path is missing — e.g. package.json/pyproject.toml/Cargo.toml in a repo that
+  # has none of them. That silent no-op left develop half-bumped every release
+  # (issue #75). marketplace.json must be included — bump-version.sh updates it in
+  # lockstep with plugin.json, and it was previously absent from this list.
+  for vf in .claude-plugin/plugin.json .claude-plugin/marketplace.json \
+            package.json pyproject.toml Cargo.toml version.txt CHANGELOG.md; do
+    if [[ -f "$vf" ]]; then
+      git add "$vf"
+    fi
+  done
   if ! git diff --cached --quiet; then
     git commit -m "$(cat <<EOF
 chore(develop): bump version for next development cycle
@@ -449,6 +459,16 @@ EOF
     log_ok "Bumped to next patch and committed"
   else
     log_skip "No version files changed"
+  fi
+
+  # Fail-loud safety net (issue #75): the VERIFICATION phase only compares pushed
+  # state and cannot see a dirty working tree, so a bump that did not get fully
+  # committed would otherwise pass with a green check. If anything remains
+  # uncommitted here, surface it and abort rather than leaving develop dirty.
+  if ! git diff --quiet; then
+    log "Uncommitted changes remaining after version bump:"
+    git status --short
+    die "Version bump left uncommitted changes in the working tree (issue #75). Stage + commit + push them manually, then re-run verification."
   fi
 fi
 
