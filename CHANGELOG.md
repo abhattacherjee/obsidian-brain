@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.2] - 2026-06-08
+
 ### Fixed
 - **`scripts/git-flow-finish.sh` now reliably commits the post-release dev-cycle
   version bump (#75).** The bump phase used a single multi-pathspec `git add`
