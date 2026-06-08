@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.2] - 2026-06-08
+
+### Fixed
+- **`scripts/git-flow-finish.sh` now reliably commits the post-release dev-cycle
+  version bump (#75).** The bump phase used a single multi-pathspec `git add`
+  (`plugin.json package.json pyproject.toml Cargo.toml version.txt CHANGELOG.md`);
+  because `git add` is atomic, a missing pathspec (e.g. `package.json` in this
+  Python repo) aborted the whole command and staged **nothing**, so the bump landed
+  in the working tree but was never committed or pushed — leaving `develop`
+  half-bumped after every release. Files are now staged individually (skipping
+  absent ones), `.claude-plugin/marketplace.json` (which `bump-version.sh` updates
+  in lockstep) is now included, and a fail-loud guard aborts if any change remains
+  uncommitted after the bump.
+
 ## [2.6.1] - 2026-06-07
 
 ### Fixed
