@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Fixture-vault dev-test for issue #106 — source-sessions UUID-first taxonomy.
 
+Tracked by #152; validates the #106 taxonomy.
+
 Run when: editing scripts/vault_doctor_checks/source_sessions.py OR when
 editing the --json serializer (_issue_row) in scripts/vault_doctor.py.
 
@@ -72,16 +74,22 @@ VAULT_DOCTOR = _REPO_ROOT / "scripts" / "vault_doctor.py"
 if not VAULT_DOCTOR.exists():
     sys.exit(f"❌ vault_doctor.py not found at {VAULT_DOCTOR}; run from the repo root.")
 
-# ─── Deterministic UUIDs for each signal class ───────────────────────────
-# UUIDs must be valid hex strings that look like real session IDs. Using
-# fixed values makes the test reproducible and the fixture notes grep-able.
+# ─── Deterministic SIDs for each signal class ────────────────────────────
+# The scanner does NO UUID-format validation — session IDs are opaque
+# strings matched by exact filename/frontmatter equality. These fixture SIDs
+# deliberately contain non-hex segments ("stale", "mism", ...) so they are
+# grep-able and obviously synthetic; fixed values keep the test reproducible.
 
 SID_STALE   = "aaaaaaaa-stale-0000-0000-000000000001"   # uuid-basename-stale
 SID_MISMATCH = "bbbbbbbb-mism-0000-0000-000000000002"   # uuid-day-mismatch
 SID_MISSING  = "cccccccc-miss-0000-0000-000000000003"   # missing-session-note
-# date-window-hint: note has NO source_session UUID; JSONL is seeded under
-# a different SID so the day-overlap matcher fires.
-SID_HINT_JSONL = "dddddddd-hint-0000-0000-000000000004"  # the JSONL that matches
+# date-window-hint: the hint insight has NO source_session UUID, so Phase 2
+# day-overlap matching fires. NOTE: the matcher picks the LARGEST-overlap
+# window among session-note-backed JSONLs — that is SID_STALE's JSONL
+# (aaaaaaaa, first_ts = start+1000, earliest start → biggest overlap with
+# today), NOT this one. SID_HINT_JSONL exists to add a second today-window
+# candidate; the hint row's proposed_sid is aaaaaaaa.
+SID_HINT_JSONL = "dddddddd-hint-0000-0000-000000000004"
 # unresolved: no UUID, no JSONL window at all.
 
 PROJECT = "fixture-project"
@@ -503,13 +511,15 @@ apply_result = run_doctor("--apply", "--yes")
 if apply_result.returncode not in (0, 1, 2):
     fail_(f"--apply --yes exited with unexpected code {apply_result.returncode}")
 else:
+    # All Phase-2 assertions live inside this else: they only make sense
+    # when the apply subprocess exited with a sane code.
     stale_after = STALE_NOTE.read_bytes()
     if stale_before == stale_after:
         fail_("uuid-basename-stale note was NOT mutated by --apply (expected it to be repaired)")
     else:
         pass_("uuid-basename-stale note was mutated by --apply")
 
-# Verify all other notes are byte-identical
+    # Verify all other notes are byte-identical
     snapshot_ok = True
     for note, snapshot in _pre_apply_snapshots.items():
         after_bytes = note.read_bytes()
@@ -539,7 +549,8 @@ if FAIL == 0:
     print("All assertions passed. Cleanup will run via atexit.")
 else:
     print("Some assertions FAILED. See output above for details.")
-    print("Fixture preserved for inspection; cleanup will still run at exit.")
+    print("Note: the fixture dir is deleted at exit (atexit); comment out the")
+    print("atexit.register(_cleanup) line to preserve it for inspection.")
 print(f"  Fixture: {FIXTURE_DIR}")
 print()
 print("CI follow-up (not implemented): wire into a job triggered on PRs")
