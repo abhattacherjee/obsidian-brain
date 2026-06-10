@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`vault-doctor --check audit-historic-repairs` (#95)** — one-shot, opt-in audit
+  of historic source-sessions repairs. Walks the doctor backup runs under
+  `~/.claude/obsidian-brain-doctor-backup/`, diffs each backed-up note's
+  `source_session`/`source_session_note` against the note's current state
+  (oldest backup wins — it is the true pre-doctor original), and classifies
+  every historic repair by date agreement: **A** restore (original matched the
+  note date, current doesn't — mtime-bug corruption), **B** keep (legit fix),
+  **C** same-day ambiguous, **D** both-wrong. Only category A is applied on
+  `fix`; restores are themselves backed up under
+  `<run>/audit-historic-repairs/` and re-runs are drift-stable. Excluded from
+  the default all-checks sweep via the new registry `OPT_IN` attribute.
+
+### Fixed
+- Date-rollover test flakiness (#205): 12 test call sites scanned hardcoded
+  April-2026 fixtures with 60-day windows, so the suite started failing once
+  the wall clock reached 2026-06-09 (CI was green the day before). Widened to
+  the established `days=10000` convention.
+
 ## [2.6.2] - 2026-06-08
 
 ### Fixed

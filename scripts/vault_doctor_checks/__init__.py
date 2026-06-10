@@ -81,5 +81,10 @@ def get_check(name: str):
 
 
 def all_checks() -> list:
+    """All registered checks minus opt-in ones (``OPT_IN = True``).
+
+    Opt-in checks (e.g. one-shot audit tools like audit-historic-repairs)
+    only run when explicitly named via get_check() / --check.
+    """
     _discover()
-    return list(_CHECKS.values())
+    return [m for m in _CHECKS.values() if not getattr(m, "OPT_IN", False)]
