@@ -6,6 +6,8 @@ Each check module in this package must export:
   - DEFAULT_WINDOW_DAYS: int
   - scan(vault_path, sessions_folder, insights_folder, days, project=None) -> list[Issue]
   - apply(issues, backup_root) -> list[Result]
+  - OPT_IN: bool (optional, default False) — True excludes the check from the
+    default all-checks sweep; it only runs when named via --check
 
 The registry auto-discovers modules in this package directory on first access.
 """
@@ -81,5 +83,19 @@ def get_check(name: str):
 
 
 def all_checks() -> list:
+    """All registered checks minus opt-in ones (``OPT_IN = True``).
+
+    Opt-in checks (e.g. one-shot audit tools like audit-historic-repairs)
+    only run when explicitly named via get_check() / --check.
+    """
     _discover()
-    return list(_CHECKS.values())
+    result = []
+    for m in _CHECKS.values():
+        flag = getattr(m, "OPT_IN", False)
+        if not isinstance(flag, bool):
+            raise TypeError(
+                f"{getattr(m, 'NAME', m)}: OPT_IN must be bool, got {flag!r}"
+            )
+        if not flag:
+            result.append(m)
+    return result

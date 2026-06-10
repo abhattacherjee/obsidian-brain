@@ -18,6 +18,7 @@ Audit and repair the Obsidian vault. Ships with one check initially (`source-ses
 - `/vault-doctor --check source-sessions` — run one specific check
 - `/vault-doctor --check snapshot-integrity` — snapshot orphans, broken backlinks, stale/missing session snapshot lists, status/summary mismatches
 - `/vault-doctor --check snapshot-migration` — migrate pre-spec snapshots (legacy filenames, missing status/backlink fields, missing session snapshot lists). Runs 4 ordered sub-checks; idempotent.
+- `/vault-doctor --check audit-historic-repairs` — one-shot audit of historic source-sessions repairs: diffs doctor backups against current notes, classifies each repair (A restore / B keep / C ambiguous / D both-wrong) by date agreement, and restores category-A mtime-bug corruptions on `fix`. **Opt-in** — excluded from the default all-checks sweep; must be named via `--check`. `--days` bounds backup-run age (default 180).
 - `/vault-doctor --days 14` — override default window (default: 7 days)
 - `/vault-doctor --project obsidian-brain` — limit to one project
 - `/vault-doctor fix --check source-sessions --days 7` — combine flags
