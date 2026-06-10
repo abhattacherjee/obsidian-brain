@@ -6,6 +6,8 @@ Each check module in this package must export:
   - DEFAULT_WINDOW_DAYS: int
   - scan(vault_path, sessions_folder, insights_folder, days, project=None) -> list[Issue]
   - apply(issues, backup_root) -> list[Result]
+  - OPT_IN: bool (optional, default False) — True excludes the check from the
+    default all-checks sweep; it only runs when named via --check
 
 The registry auto-discovers modules in this package directory on first access.
 """

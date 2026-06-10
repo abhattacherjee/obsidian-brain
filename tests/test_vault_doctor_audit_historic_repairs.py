@@ -304,7 +304,7 @@ def test_opt_in_reachable_via_get_check():
     assert mod is ahr
 
 
-# ---------------------------------------------------------------- new tests (FIX 2-7 coverage)
+# ------------------------------------- drift variants, CLI e2e, apply errors
 
 def test_sid_only_drift_detected(audit_env):
     """T2: same source_session_note backlink (same-day) but different sids → 1 issue, cat C."""
@@ -329,7 +329,7 @@ def test_backlink_only_drift_detected(audit_env):
 
 
 def test_category_a_without_orig_sid_is_unresolved(audit_env):
-    """T4 (FIX 6): backup has source_session_note (same-day) but NO source_session → cat A, unresolved."""
+    """T4: backup has source_session_note (same-day) but NO source_session → cat A, unresolved (no restore data)."""
     basename = "2026-04-09-foo-t4t4.md"
     date = "2026-04-09"
     run_dir = audit_env["backups"] / _run_dirname(_days_ago(30)) / "proj1" / "claude-insights"
@@ -550,7 +550,7 @@ def test_scan_emits_coverage_summary(audit_env, capsys):
 
 
 def test_opt_in_non_bool_raises():
-    """T11 (FIX 7): OPT_IN with a non-bool value raises TypeError from all_checks()."""
+    """T11: OPT_IN with a non-bool value raises TypeError from all_checks()."""
     fake_mod = types.SimpleNamespace(
         NAME="fake-optin",
         scan=lambda *a, **kw: [],
@@ -568,11 +568,11 @@ def test_opt_in_non_bool_raises():
         vault_doctor_checks._CHECKS.update(original)
 
 
-# ------------------------------------------------------- round-2: unreadable path (R2-1/R2-2)
+# ------------------------------------------- unreadable notes + coverage summary
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
 def test_unreadable_note_emits_unresolved_issue(audit_env):
-    """R2-4(a): unreadable current note → unresolved historic-unreadable issue (project=None)."""
+    """Unreadable current note → unresolved historic-unreadable issue (project=None)."""
     basename = "2026-04-09-foo-r2a.md"
     _seed(audit_env, basename, _days_ago(30),
           "sid-orig", "2026-04-09-proj1-aaaa",
@@ -592,7 +592,7 @@ def test_unreadable_note_emits_unresolved_issue(audit_env):
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
 def test_unreadable_note_emitted_under_project_filter(audit_env):
-    """R2-4(b): with --project set, the unreadable issue is STILL emitted (R2-1)."""
+    """With --project set, the unreadable issue is STILL emitted — the filter must not hide audit failures."""
     basename = "2026-04-09-foo-r2b.md"
     _seed(audit_env, basename, _days_ago(30),
           "sid-orig", "2026-04-09-proj1-aaaa",
@@ -610,7 +610,7 @@ def test_unreadable_note_emitted_under_project_filter(audit_env):
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
 def test_coverage_summary_partitions(audit_env, capsys):
-    """R2-4(c): summary buckets partition the audited count; classified excludes unreadable."""
+    """Summary buckets partition the audited count; classified excludes unreadable."""
     # 1 classified (category A)
     _seed(audit_env, "2026-04-09-foo-r2c1.md", _days_ago(30),
           "sid-orig", "2026-04-09-proj1-aaaa",
@@ -647,3 +647,53 @@ def test_coverage_summary_partitions(audit_env, capsys):
     assert unreadable == 1
     assert no_drift == 1
     assert classified + missing + non_src + no_drift + unreadable + proj_filt == audited
+
+
+# --------------------------------------------- cross-folder basename collisions
+
+def test_cross_folder_collision_pairs_correctly(audit_env):
+    """Same basename in two note folders → two independent audit entries,
+    each backup paired with the note in ITS OWN folder (never the other's)."""
+    basename = "2026-04-09-foo-coll.md"
+    date = "2026-04-09"
+    decisions = audit_env["vault"] / "claude-decisions"
+    decisions.mkdir()
+
+    # Current notes: same basename in claude-insights AND claude-decisions,
+    # both drifted (different-day backlinks).
+    (audit_env["insights"] / basename).write_text(
+        _insight_text(date, "sid-curr-ins", "2026-04-10-proj1-ins-curr"),
+        encoding="utf-8")
+    (decisions / basename).write_text(
+        _insight_text(date, "sid-curr-dec", "2026-04-11-proj1-dec-curr"),
+        encoding="utf-8")
+
+    # One backup run with a folder-qualified backup under EACH folder dir,
+    # both same-day originals (category A) with distinct orig sids.
+    run_root = audit_env["backups"] / _run_dirname(_days_ago(30)) / "proj1"
+    for folder, orig_sid, orig_link in (
+        ("claude-insights", "sid-orig-ins", "2026-04-09-proj1-ins-orig"),
+        ("claude-decisions", "sid-orig-dec", "2026-04-09-proj1-dec-orig"),
+    ):
+        bdir = run_root / folder
+        bdir.mkdir(parents=True, exist_ok=True)
+        (bdir / basename).write_text(
+            _insight_text(date, orig_sid, orig_link), encoding="utf-8")
+
+    issues = _scan(audit_env)
+    assert len(issues) == 2, [i.note_path for i in issues]
+
+    expected_orig_sid = {
+        "claude-insights": "sid-orig-ins",
+        "claude-decisions": "sid-orig-dec",
+    }
+    seen_folders = set()
+    for i in issues:
+        note_folder = Path(i.note_path).parent.name
+        backup_folder = Path(i.extra["backup_path"]).parent.name
+        assert note_folder == backup_folder, \
+            f"backup from {backup_folder} paired with note in {note_folder}"
+        assert i.extra["orig_sid"] == expected_orig_sid[note_folder]
+        assert i.extra["category"] == "A"
+        seen_folders.add(note_folder)
+    assert seen_folders == {"claude-insights", "claude-decisions"}

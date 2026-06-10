@@ -155,11 +155,26 @@ def scan(
     now = datetime.now(timezone.utc).timestamp()
     cutoff = now - days * 86400
 
-    # basename -> (run_ts, backup_path); keep the OLDEST backup per note —
-    # it is the true pre-doctor original. Intermediate backups are
-    # vault-doctor iterations on vault-doctor.
+    # Resolve each backup to its current note FIRST, then key `oldest` on the
+    # RESOLVED target path — not the bare basename. A bare-basename key would
+    # collapse cross-folder basename collisions (e.g. an insight and a
+    # decision both named 2026-04-10-foo.md) into one entry, silently
+    # dropping one note from the audit and potentially pairing a backup with
+    # the WRONG note (which apply() would then "restore" into an uncorrupted
+    # note). Modern backup runs nest each note under its source folder
+    # (<run>/<project>/<folder>/<basename>), so the backup's parent dir name
+    # is used as a folder hint when it matches a known note folder.
+    known_folders = set(_candidate_folders(sessions_folder, insights_folder))
+
+    # resolved target path (str) -> (run_ts, backup_path); the OLDEST run per
+    # target wins — it is the true pre-doctor original. Intermediate backups
+    # are vault-doctor iterations on vault-doctor.
     oldest: dict[str, tuple[float, Path]] = {}
-    skipped_old_runs = 0  # FIX 3: count run dirs excluded by --days cutoff
+    # Distinct backups whose current note cannot be found (deleted/renamed
+    # since). Tracked separately so the coverage summary still partitions the
+    # full audited population.
+    missing: set[str] = set()
+    skipped_old_runs = 0  # parseable run dirs excluded by the --days cutoff
     for run_dir in sorted(root.iterdir()):
         if not run_dir.is_dir():
             continue
@@ -167,18 +182,36 @@ def scan(
         if run_ts is None:
             continue
         if run_ts < cutoff:
-            skipped_old_runs += 1  # FIX 3: parseable but aged-out
+            skipped_old_runs += 1
             continue
         for md in run_dir.rglob("*.md"):
             # Skip this check's own restore backups — re-running the audit
             # must not treat its own output as a historic repair.
             if NAME in md.relative_to(run_dir).parts:
                 continue
-            existing = oldest.get(md.name)
+            folder_hint = md.parent.name if md.parent.name in known_folders else None
+            if folder_hint:
+                candidate = vault / folder_hint / md.name
+                target = candidate if candidate.is_file() else None
+            else:
+                # Legacy-layout backups (<run>/<project>/<basename>) carry no
+                # folder information; fall back to the ordered folder search.
+                # A cross-folder basename collision can still mis-resolve
+                # here — no folder info exists to disambiguate — but
+                # reachability is near-zero in practice.
+                target = _find_current_note(
+                    vault, md.name, sessions_folder, insights_folder
+                )
+            if target is None:
+                missing.add(f"{folder_hint or '?'}/{md.name}")
+                continue
+            key = str(target)
+            existing = oldest.get(key)
             if existing is None or run_ts < existing[0]:
-                oldest[md.name] = (run_ts, md)
+                oldest[key] = (run_ts, md)
 
-    # FIX 3: warn if aged-out run dirs were skipped
+    # The 'oldest backup wins' premise breaks if older runs were age-filtered
+    # out — surface that to the operator.
     if skipped_old_runs > 0:
         print(
             f"[audit-historic-repairs] WARNING: {skipped_old_runs} backup run(s) older than"
@@ -188,31 +221,27 @@ def scan(
         )
 
     issues: list[Issue] = []
-    # FIX 5: counters for end-of-scan coverage summary
-    missing_current = 0
+    # Counters for the end-of-scan coverage summary (every audited backup
+    # lands in exactly one bucket).
     non_source = 0
     no_drift = 0
     unreadable = 0
     project_filtered = 0
 
-    for basename in sorted(oldest):
-        _, backup_path = oldest[basename]
-        current_path = _find_current_note(
-            vault, basename, sessions_folder, insights_folder
-        )
-        if current_path is None:
-            missing_current += 1  # FIX 5
-            continue  # note deleted/renamed since — nothing to audit
+    for target in sorted(oldest):
+        _, backup_path = oldest[target]
+        current_path = Path(target)
+        basename = current_path.name
 
         try:
             backup_text = backup_path.read_text(encoding="utf-8", errors="replace")
             current_text = current_path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            # FIX 2 / R2-1: don't silently drop unreadable notes. Emitted
-            # UNCONDITIONALLY — even with --project set — because an
-            # unreadable note cannot be attributed to a project, and the
-            # project filter must not suppress audit-infrastructure failures.
-            unreadable += 1  # FIX 5
+            # Don't silently drop unreadable notes. Emitted UNCONDITIONALLY —
+            # even with --project set — because an unreadable note cannot be
+            # attributed to a project, and the project filter must not
+            # suppress audit-infrastructure failures.
+            unreadable += 1
             issues.append(Issue(
                 check=NAME,
                 note_path=str(current_path),
@@ -246,7 +275,8 @@ def scan(
         # Not a source-sessions note (e.g. a session note backed up by the
         # snapshot checks) — nothing to audit.
         if not orig_sid and not orig_note:
-            # FIX 4: warn when backup has no source fields but current note does
+            # A backup without source fields whose CURRENT note has them is
+            # suspicious — the backup may be truncated/corrupted; warn.
             if curr_sid or curr_note:
                 print(
                     f"[audit-historic-repairs] WARNING: backup {backup_path} has no"
@@ -254,18 +284,18 @@ def scan(
                     f" backup may be corrupted; skipping.",
                     file=sys.stderr,
                 )
-            non_source += 1  # FIX 5
+            non_source += 1
             continue
 
         # No drift: the backlink was never rewritten (backup is from another
         # check, or a restore already ran).
         if orig_sid == curr_sid and orig_note == curr_note:
-            no_drift += 1  # FIX 5
+            no_drift += 1
             continue
 
         note_project = current_fm.get("project", "unknown") or "unknown"
         if project and note_project != project:
-            project_filtered += 1  # FIX 5
+            project_filtered += 1
             continue
 
         file_date = _note_date(basename)
@@ -274,8 +304,8 @@ def scan(
         else:
             category = _classify(file_date, _note_date(orig_note), _note_date(curr_note))
 
-        # FIX 6: category A without a complete source_session pair must not
-        # be auto-applyable — mark as unresolved so apply() never attempts it.
+        # Category A without a complete source_session pair must not be
+        # auto-applyable — mark as unresolved so apply() never attempts it.
         unresolved = category != "A"
         confidence = 0.9 if category == "A" else 0.0
         reason = f"category {category}: {_CATEGORY_REASONS[category]}"
@@ -305,14 +335,17 @@ def scan(
             },
         ))
 
-    # FIX 5 / R2-2: end-of-scan coverage summary. Buckets partition
-    # len(oldest): every unreadable note also appended an issue (R2-1), so
-    # subtract it from the classified count to avoid double-counting.
-    if oldest:
+    # End-of-scan coverage summary. The audited denominator is the resolved
+    # targets plus the distinct backups whose note no longer exists; the six
+    # buckets partition it exactly. Every unreadable note also appended an
+    # issue above, so subtract it from the classified count to avoid
+    # double-counting.
+    audited = len(oldest) + len(missing)
+    if audited:
         classified = len(issues) - unreadable
         print(
-            f"[audit-historic-repairs] audited {len(oldest)} backed-up note(s):"
-            f" {classified} classified, {missing_current} missing-current,"
+            f"[audit-historic-repairs] audited {audited} backed-up note(s):"
+            f" {classified} classified, {len(missing)} missing-current,"
             f" {non_source} non-source-session, {no_drift} no-drift,"
             f" {unreadable} unreadable, {project_filtered} project-filtered",
             file=sys.stderr,
@@ -372,8 +405,16 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
         try:
             backup_dir.mkdir(parents=True, exist_ok=True)
             backup_path = backup_dir / note_path.name
+            # Defense-in-depth (mirrors source_sessions.apply): the backup
+            # write must never escape backup_root via a hostile folder name.
+            resolved_root = Path(backup_root).resolve()
+            resolved_backup = backup_path.resolve()
+            if resolved_root not in resolved_backup.parents:
+                raise ValueError(
+                    f"backup path {backup_path} would escape backup_root {backup_root}"
+                )
             shutil.copy2(note_path, backup_path)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             results.append(Result(
                 check=NAME, note_path=issue.note_path, status="error",
                 error=f"backup failed: {exc}",
