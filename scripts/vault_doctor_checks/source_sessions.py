@@ -54,6 +54,61 @@ _WIKI_RE = re.compile(r"\[\[([^\]]+)\]\]")
 _SAFE_PROJECT_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 
+def _is_imported_note(text: str, fm: dict) -> bool:
+    """Return True when the note should be skipped because it was imported
+    from another vault.
+
+    Two complementary markers are checked — belt-and-suspenders for legacy
+    notes that only carry one of the two:
+
+    1. Frontmatter ``imported: true`` — the flat parser yields the string
+       ``"true"`` (and also handles bool ``True`` from hypothetical
+       programmatic construction). Checked case-insensitively.
+    2. ``claude/imported`` list item under the ``tags:`` key in the raw
+       frontmatter block — the flat parser skips list items, so tags: lists
+       never populate fm. The scan is scoped to the tags: block ONLY: a
+       folded scalar (e.g. ``summary: >`` wrapping the literal onto its own
+       line) or a non-tags list (e.g. ``aliases:`` containing the same
+       string) must NOT exclude a genuinely local note from the audit.
+
+    Intentionally unhandled (safe direction — the note stays in the audit
+    and at worst re-surfaces a WARN, never hides a local note): inline-flow
+    tags (``tags: [..., claude/imported]``) and YAML-1.1 boolean spellings
+    like ``imported: yes`` — the repo's templates and the vault-import
+    skill write block-style tags and the literal ``true``.
+    """
+    # Check 1: imported: true (string or bool) in parsed frontmatter
+    raw_imported = fm.get("imported", "")
+    if isinstance(raw_imported, bool):
+        if raw_imported:
+            return True
+    elif isinstance(raw_imported, str) and raw_imported.lower() == "true":
+        return True
+
+    # Check 2: claude/imported under the tags: key in the raw frontmatter
+    # block. _FRONT_RE is the module-level compiled regex. Track which
+    # top-level key we're inside: any non-indented line resets the state;
+    # only indented "- " list items while inside tags: are considered.
+    m = _FRONT_RE.match(text)
+    if m:
+        in_tags = False
+        for line in m.group(1).splitlines():
+            if line and not line[0].isspace():
+                # Top-level key line — enter/leave the tags: block.
+                key, _, _ = line.partition(":")
+                in_tags = key.strip() == "tags"
+                continue
+            if not in_tags:
+                continue
+            stripped = line.strip()
+            if not stripped.startswith("- "):
+                continue  # folded/continuation scalar line, not a list item
+            value = stripped[2:].strip().strip('"').strip("'")
+            if value == "claude/imported":
+                return True
+    return False
+
+
 def _safe_project_slug(project: str) -> str:
     """Sanitize a project name for use as a filesystem path component.
 
@@ -538,6 +593,7 @@ def scan(
     ]
 
     issues: list[Issue] = []
+    imported_skipped = 0
     session_index_cache: dict[str, dict[str, dict]] = {}
     jsonl_dir_cache: dict[str, Path | None] = {}
     global_sid_index: dict[str, dict] | None = None  # built lazily on first need
@@ -569,6 +625,16 @@ def scan(
             if not note_project:
                 continue
             if project and note_project.replace("_", "-") != project.replace("_", "-"):
+                continue
+            # Skip notes imported from another vault — their source_session UUID and
+            # source_session_note refer to the OTHER machine's vault and will never
+            # resolve locally. Surfacing them as unresolved is a known false-positive.
+            # Two markers checked: frontmatter `imported: true` (belt) and the
+            # `claude/imported` tag under tags: in the raw frontmatter (suspenders).
+            # Placed AFTER the --project filter so the reported skip count reflects
+            # the filtered scope, not the whole vault.
+            if _is_imported_note(text, fm):
+                imported_skipped += 1
                 continue
 
             # Capture-time for JSONL-window matching uses immutable signals.
@@ -891,6 +957,12 @@ def scan(
                 )
             )
 
+    if imported_skipped:
+        print(
+            f"[vault_doctor] source-sessions: skipped {imported_skipped} "
+            f"imported note(s)",
+            file=sys.stderr,
+        )
     return issues
 
 
