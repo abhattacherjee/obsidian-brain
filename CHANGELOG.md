@@ -15,16 +15,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   processes all session notes: for each `project_path:` field, runs
   `git rev-parse --git-common-dir` (cached per path) to derive the canonical
   name, then proposes rewriting `project:` and the `claude/project/<name>` tag
-  in the frontmatter block. Phase 2 processes insights/decisions/error-fixes/retros:
-  each `source_session:` UUID is looked up in the Phase-1 index (using the
-  CANONICAL value, not the note's current frontmatter) and the same rewrite is
-  proposed. Edge cases: missing `project_path`, deleted path, git
-  unavailable/timed out, or insight with no resolvable session all emit WARN
-  unresolved rows (never auto-applied). Non-git project dirs are left alone (cwd
-  basename is canonical). `confidence=0.9` for resolvable rewrites; `0.0` for
-  WARN rows. `DEFAULT_WINDOW_DAYS=9999` scans all notes. Excluded from the
-  default all-checks sweep (`OPT_IN=True`); run explicitly via
-  `--check project-name-canonicalization`.
+  in the frontmatter block. Tag rewriting targets the OBSERVED tag lines —
+  production tags are slugified (collapsed + 40-char truncated, e.g.
+  `claude/project/obsidian-brain-issue-81-duplicate-sid-co`), so the check
+  matches both the raw and slugified old forms with anchored line regexes
+  (prefix-sharing sibling tags are never mangled; leftover non-canonical tags
+  are surfaced in the apply result). Phase 2 processes
+  insights/decisions/error-fixes/retros: each `source_session:` UUID is looked
+  up in the Phase-1 index (using the CANONICAL value, not the note's current
+  frontmatter) and the same rewrite is proposed. Edge cases: missing
+  `project_path`, deleted path, git unavailable/timed out, git errors (dubious
+  ownership etc. — distinguished from a clean "not a git repository" so a
+  broken repo never promotes a stale slug to canonical), empty `project:`
+  field, or insight with no resolvable session all emit WARN unresolved rows
+  (never auto-applied). Non-git project dirs are left alone (cwd basename is
+  canonical); snapshot notes are excluded (they share the session's
+  `session_id` but are not the session note). `--project` matches either the
+  old name or the derived canonical, and filtered sessions still seed the
+  Phase-2 index. `confidence=0.9` for resolvable rewrites; `0.0` for WARN
+  rows. `DEFAULT_WINDOW_DAYS=9999` scans all notes (`--days` is ignored with
+  a notice). Excluded from the default all-checks sweep (`OPT_IN=True`); run
+  explicitly via `--check project-name-canonicalization`.
 - **`vault-doctor --check session-coverage` (#98)** — new **opt-in** check that
   detects SessionEnd-hook coverage gaps: for each `<sid>.jsonl` under
   `~/.claude/projects/`, it verifies that a corresponding session note exists in
