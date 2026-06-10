@@ -37,6 +37,8 @@ Parse the user's invocation into flags:
 - `--check <name>` → specific check only
 - `--days <N>` → window override
 - `--project <name>` → project filter
+- `--strict` → set STRICT=1 (session-coverage only: FAIL instead of WARN on referenced gaps)
+- `--reconstruct` → set RECONSTRUCT=1 (session-coverage only: mark gaps resolvable for apply)
 
 Locate the Python dispatcher via the standard plugin cache glob, with a fallback for local dev sessions where the repo is checked out as `$PWD`:
 
@@ -68,6 +70,8 @@ ARGS=()
 [[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
 [[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
 [[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
+[[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
+[[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
 ARGS+=(--json)
 python3 "$DISPATCHER" "${ARGS[@]}"
 ```
@@ -158,6 +162,8 @@ ARGS=()
 [[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
 [[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
 [[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
+[[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
+[[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
 ARGS+=(--apply)
 python3 "$DISPATCHER" "${ARGS[@]}"
 ```

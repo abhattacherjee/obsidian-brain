@@ -810,6 +810,262 @@ class TestCwdDerivation:
 
 
 # ---------------------------------------------------------------------------
+# Hook-parity message counting (flat format, multi-block entries)
+# ---------------------------------------------------------------------------
+
+class TestMessageCountingParity:
+    def test_flat_format_user_entries_count(self, sc_env):
+        """The hook's extract_user_messages also handles the FLAT fallback
+        format (role=="user", top-level content, no type field). 3 flat
+        entries spanning 10 min must clear min_messages=3 → gap fires."""
+        sid = "flat-format-sid-0001"
+        proj_dir = sc_env["projects"] / "-proj"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        jsonl = proj_dir / f"{sid}.jsonl"
+
+        lines = []
+        for i in range(3):
+            lines.append(json.dumps({
+                "role": "user",  # flat format: no "type" key
+                "timestamp": f"2026-04-24T10:{i * 5:02d}:00.000Z",
+                "cwd": "/path/to/my-proj",
+                "content": f"flat message {i}",
+            }))
+        jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        issues = _scan(sc_env)
+        assert len(issues) == 1, (
+            "flat-format (role=='user') entries must count toward thresholds "
+            "— the hook's extract_user_messages includes them."
+        )
+
+    def test_single_entry_with_three_text_blocks_counts_three(self, sc_env):
+        """should_skip_session thresholds on len(user_messages), which is a
+        count of TEXT BLOCKS (the hook's _extract_text extends per block).
+        One user entry carrying 3 text blocks therefore counts 3 → clears
+        min_messages=3 → gap-eligible. A per-entry bool counter would see 1
+        and misclassify this as below-threshold."""
+        sid = "multi-block-sid-0001"
+        proj_dir = sc_env["projects"] / "-proj"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        jsonl = proj_dir / f"{sid}.jsonl"
+
+        lines = [
+            json.dumps({
+                "type": "user",
+                "timestamp": "2026-04-24T10:00:00.000Z",
+                "cwd": "/path/to/my-proj",
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "block one"},
+                    {"type": "text", "text": "block two"},
+                    {"type": "text", "text": "block three"},
+                ]},
+            }),
+            # Second timestamped entry so duration (10 min) clears the bar.
+            json.dumps({
+                "type": "assistant",
+                "timestamp": "2026-04-24T10:10:00.000Z",
+                "cwd": "/path/to/my-proj",
+                "message": {"role": "assistant", "content": "reply"},
+            }),
+        ]
+        jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        issues = _scan(sc_env)
+        assert len(issues) == 1, (
+            "one user entry with 3 text blocks must count 3 (block-level "
+            "count, mirroring _extract_text's extend semantics)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Snapshot-anchor bypass + snapshot notes never provide coverage
+# ---------------------------------------------------------------------------
+
+def _write_snapshot_note(
+    sessions_dir: Path,
+    sid: str,
+    slug: str = "my-proj",
+    date: str = "2026-04-24",
+    hhmmss: str = "101530",
+) -> Path:
+    """Write a snapshot note exactly as obsidian_context_snapshot does:
+    make_filename(date, slug, sid, suffix=f"-snapshot-{hhmmss}") with
+    type: claude-snapshot and the session's session_id in frontmatter."""
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    basename = f"{date}-{slug}-{_sid_hash(sid)}-snapshot-{hhmmss}.md"
+    content = (
+        "---\n"
+        "type: claude-snapshot\n"
+        f"date: {date}\n"
+        f"project: {slug}\n"
+        f"session_id: {sid}\n"
+        "---\n"
+        "# Snapshot body\n"
+    )
+    (sessions_dir / basename).write_text(content, encoding="utf-8")
+    return sessions_dir / basename
+
+
+class TestSnapshotInteraction:
+    def test_snapshot_note_does_not_provide_coverage(self, sc_env):
+        """CRITICAL: a snapshot note carries the session's session_id and
+        lives in the sessions folder — it must NOT make a missing session
+        note look covered. Snapshot present + session note missing + above
+        thresholds → GAP reported."""
+        sid = "snapshot-coverage-sid-0001"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=5, duration_minutes=10)
+        _write_snapshot_note(sc_env["sessions"], sid)
+
+        issues = _scan(sc_env)
+        assert len(issues) == 1, (
+            "snapshot note wrongly provided session coverage — its "
+            "session_id/hash must be excluded from the coverage indexes."
+        )
+        assert issues[0].extra["sid"] == sid
+        # Above thresholds → the bypass flag is False on this gap.
+        assert issues[0].extra["snapshot_bypass"] is False
+
+    def test_below_threshold_with_snapshot_is_gap(self, sc_env):
+        """Snapshot-anchor bypass: the hook writes the session note DESPITE
+        thresholds when snapshots exist (obsidian_session_log:382-405), so a
+        below-threshold JSONL with a sibling snapshot is still a gap; the
+        reason mentions the bypass."""
+        sid = "snapshot-bypass-sid-0002"
+        cwd = "/path/to/my-proj"
+        # 1 user message, 0.5 min — well below both thresholds.
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=1, duration_minutes=0.5)
+        _write_snapshot_note(sc_env["sessions"], sid)
+
+        issues = _scan(sc_env)
+        assert len(issues) == 1, (
+            "below-threshold session WITH snapshots must be gap-eligible — "
+            "the hook's snapshot-anchor bypass writes the note anyway."
+        )
+        i = issues[0]
+        assert i.extra["snapshot_bypass"] is True
+        assert "snapshot-anchor bypass" in i.reason
+
+    def test_below_threshold_without_snapshot_still_skipped(self, sc_env):
+        """Sanity: the bypass only fires when a snapshot exists."""
+        sid = "snapshot-none-sid-0003"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=1, duration_minutes=0.5)
+        assert _scan(sc_env) == []
+
+    def test_snapshot_plus_real_session_note_is_covered(self, sc_env):
+        """Snapshot AND the real session note present → covered, no gap
+        (the session note provides coverage; the snapshot is ignored)."""
+        sid = "snapshot-covered-sid-0004"
+        cwd = "/path/to/my-proj"
+        date = "2026-04-24"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=5, duration_minutes=10)
+        _write_snapshot_note(sc_env["sessions"], sid)
+        _write_session_note(
+            sc_env["sessions"], _make_filename(date, "my-proj", sid),
+            session_id=sid, date=date,
+        )
+        assert _scan(sc_env) == []
+
+    def test_colliding_snapshot_does_not_bypass_other_session(self, sc_env):
+        """4-hex hash collisions between unrelated sids occur in practice
+        (observed live: hash(422de3ed-…) == hash(5215302c-…) == c3ca). A
+        snapshot whose FILENAME hash matches our sid but whose frontmatter
+        session_id belongs to ANOTHER session must NOT bypass thresholds for
+        our sid — the bypass is keyed on the snapshot's session_id, exactly
+        like the hook's find_snapshots_for_session."""
+        sid = "collision-bypass-victim-sid-0005"
+        cwd = "/path/to/my-proj"
+        # Below-threshold session.
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=1, duration_minutes=0.5)
+        # Snapshot file NAMED with our sid's hash but OWNED (frontmatter
+        # session_id) by a different session — simulates the collision.
+        h4 = _sid_hash(sid)
+        basename = f"2026-04-24-my-proj-{h4}-snapshot-101530.md"
+        (sc_env["sessions"] / basename).write_text(
+            "---\n"
+            "type: claude-snapshot\n"
+            "date: 2026-04-24\n"
+            "project: my-proj\n"
+            "session_id: completely-different-session-sid\n"
+            "---\n# Snapshot body\n",
+            encoding="utf-8",
+        )
+        assert _scan(sc_env) == [], (
+            "filename-hash collision caused a false snapshot-anchor bypass — "
+            "the bypass must match on snapshot frontmatter session_id."
+        )
+
+    def test_frontmatterless_snapshot_falls_back_to_hash_bypass(self, sc_env):
+        """A snapshot with no parsable frontmatter still triggers the bypass
+        via its filename hash4 (degraded fallback)."""
+        sid = "frontmatterless-snap-sid-0006"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=1, duration_minutes=0.5)
+        h4 = _sid_hash(sid)
+        basename = f"2026-04-24-my-proj-{h4}-snapshot-101530.md"
+        (sc_env["sessions"] / basename).write_text(
+            "# bare snapshot body, no frontmatter\n", encoding="utf-8",
+        )
+        issues = _scan(sc_env)
+        assert len(issues) == 1
+        assert issues[0].extra["snapshot_bypass"] is True
+
+
+# ---------------------------------------------------------------------------
+# Timestamp parsing parity (_parse_ts semantics: epoch seconds/millis, naive ISO)
+# ---------------------------------------------------------------------------
+
+class TestTimestampParsing:
+    def test_epoch_millis_transcript_gets_real_duration(self, sc_env):
+        """Epoch-milliseconds timestamps (JSON numbers) must yield a real
+        duration — mirrors obsidian_utils._parse_ts's epoch handling."""
+        sid = "epoch-millis-sid-0001"
+        proj_dir = sc_env["projects"] / "-proj"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        jsonl = proj_dir / f"{sid}.jsonl"
+
+        base_ms = 1_745_490_000_000  # epoch millis (2025-04-24T...Z)
+        lines = []
+        for i in range(4):
+            lines.append(json.dumps({
+                "type": "user",
+                "timestamp": base_ms + i * 200_000,  # 200s apart → 10 min span
+                "cwd": "/path/to/my-proj",
+                "message": {"role": "user", "content": f"msg {i}"},
+            }))
+        jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        metrics = sc._parse_jsonl_metrics(jsonl)
+        assert metrics is not None
+        user_count, duration_minutes, first_ts_raw, cwd = metrics
+        assert user_count == 4
+        assert abs(duration_minutes - 10.0) < 0.01, (
+            f"epoch-millis timestamps not parsed: duration={duration_minutes}"
+        )
+        assert first_ts_raw == base_ms
+        # Date derivation also works from the epoch value.
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", sc._first_seen_date_from_ts(first_ts_raw))
+
+    def test_naive_iso_timestamps_parse(self, tmp_path):
+        """Naive ISO (no Z, no offset) parses — mirrors _parse_ts's
+        '%Y-%m-%dT%H:%M:%S' format arm."""
+        jsonl = tmp_path / "naive.jsonl"
+        lines = [
+            json.dumps({"type": "user", "timestamp": "2026-04-24T10:00:00",
+                        "cwd": "/p", "message": {"role": "user", "content": "a"}}),
+            json.dumps({"type": "user", "timestamp": "2026-04-24T10:05:00",
+                        "cwd": "/p", "message": {"role": "user", "content": "b"}}),
+        ]
+        jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        metrics = sc._parse_jsonl_metrics(jsonl)
+        assert metrics is not None
+        _, duration_minutes, _, _ = metrics
+        assert abs(duration_minutes - 5.0) < 0.01
+
+
+# ---------------------------------------------------------------------------
 # Test 10: apply() behaviour (mocked subprocess)
 # ---------------------------------------------------------------------------
 

@@ -21,7 +21,11 @@ Detection strategy:
    filename hash only enters the fallback pool when the note LACKS a
    ``session_id`` (true legacy) or its read failed — modern notes are covered
    by their session_id and must not contribute 4-char collision candidates
-   that could silently hide gaps.
+   that could silently hide gaps. SNAPSHOT notes (``*-<hash4>-snapshot*.md``
+   filenames / ``type: claude-snapshot``) live in the same folder and carry
+   the session's ``session_id`` — they are EXCLUDED from both coverage
+   indexes (a snapshot is not the session note), and their hash4 values are
+   collected separately for the snapshot-anchor bypass below.
 2. Build a ``referenced_by`` index: for each note in the insights/decisions/
    error-fixes/retros folders, map ``source_session`` UUID → list of
    basenames.
@@ -29,15 +33,22 @@ Detection strategy:
    Derive the project name from the first parseable JSONL line that carries a
    ``cwd`` field (production JSONLs often start with summary/file-history
    lines without one).
-4. A JSONL is **covered** if its stem (``sid``) appears in the session_id
-   index or if ``sha256(sid).hexdigest()[:4]`` matches a legacy filename-hash.
-5. Below-threshold sessions are skipped — the hook would also have skipped
+4. Below-threshold sessions are skipped — the hook would also have skipped
    them. The user-message count mirrors the hook's
-   ``extract_user_messages``/``_extract_text`` semantics: a user entry counts
-   only if its ``message.content`` is a non-empty string or contains a
-   ``{"type": "text"}`` block with non-empty text. Entries whose content is
-   only ``tool_result`` blocks (the majority of ``type=="user"`` lines in a
-   real transcript) do NOT count.
+   ``extract_user_messages``/``_extract_text`` semantics exactly: each
+   non-empty text block in a user entry counts separately (one entry with 3
+   text blocks counts 3), the flat fallback format (``role=="user"`` with
+   top-level ``content``) is included, and ``tool_result``/``tool_use``
+   blocks never count. EXCEPTION (snapshot-anchor bypass): the hook writes
+   the session note DESPITE thresholds when the session has sibling
+   snapshots (obsidian_session_log's "snapshot-bypass" path), so a
+   below-threshold JSONL whose sid appears in a snapshot's ``session_id``
+   frontmatter (or, for frontmatter-less snapshots, whose hash4 matches the
+   snapshot filename) remains gap-eligible. The sid-exact match mirrors the
+   hook's find_snapshots_for_session and avoids 4-hex-collision false
+   bypasses between unrelated sessions.
+5. A JSONL is **covered** if its stem (``sid``) appears in the session_id
+   index or if ``sha256(sid).hexdigest()[:4]`` matches a legacy filename-hash.
 6. Otherwise emit a gap Issue with ``signal_class="session-coverage-gap"``.
 
 Project-name derivation limitation:
@@ -106,8 +117,11 @@ EXTRA_SCAN_FLAGS = ("strict", "reconstruct")
 # the reaper emits REAPED_OK. "OK" is kept for forward-compatibility.
 _SUCCESS_OUTCOMES = {"OK_RAW_NOTE_ONLY", "OK", "REAPED_OK"}
 
-# Characters not safe for a project name in a filename path component.
-# Keep in sync with obsidian_utils.slugify (we can't import hooks here).
+# Characters replaced with '-' when deriving a project slug. This is an
+# INTENTIONAL approximation of obsidian_utils.slugify (it preserves '_' and
+# '-' just like the hook's version) — not a copy that must be kept in sync.
+# Exact parity is not required: the slug only feeds the expected-filename
+# heuristic, never the coverage match (which is session_id/hash-based).
 _UNSAFE_SLUG_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 
@@ -199,101 +213,154 @@ def _load_thresholds(home: Path) -> tuple[int, float, bool]:
     return (min_messages, min_duration, auto_log)
 
 
-def _user_entry_has_text(entry: dict) -> bool:
-    """Return True if a type=="user" entry carries human-visible text.
+def _extract_texts(content) -> list[str]:
+    """Mirror of obsidian_utils._extract_text: list of non-empty text chunks.
 
-    Mirrors obsidian_utils._extract_text semantics: content counts when it is
-    a non-empty string, a non-empty string item in a list, or a
-    {"type": "text"} block with non-empty text. tool_result / tool_use blocks
-    are skipped — a user entry whose content is ONLY tool results (the
-    majority of type=="user" lines in a real transcript) does not count.
+    A string content yields one chunk; a list yields one chunk per
+    {"type": "text"} block or bare string item. tool_use / tool_result
+    blocks are skipped. Empty/whitespace-only chunks are filtered.
     """
-    msg = entry.get("message", {})
-    if not isinstance(msg, dict):
-        return False
-    content = msg.get("content", "")
+    texts: list[str] = []
     if isinstance(content, str):
-        return bool(content.strip())
-    if isinstance(content, list):
+        texts.append(content)
+    elif isinstance(content, list):
         for part in content:
             if isinstance(part, dict):
-                if part.get("type") == "text" and str(part.get("text", "")).strip():
-                    return True
-            elif isinstance(part, str) and part.strip():
-                return True
-    return False
+                if part.get("type") == "text":
+                    texts.append(str(part.get("text", "")))
+                # Skip tool_use and tool_result blocks (same as the hook).
+            elif isinstance(part, str):
+                texts.append(part)
+    return [t for t in texts if t.strip()]
+
+
+def _count_user_texts(entry: dict) -> int:
+    """Count the text chunks a transcript entry contributes to the hook's
+    ``extract_user_messages`` list.
+
+    Mirrors extract_user_messages + _extract_text semantics EXACTLY,
+    because ``should_skip_session`` thresholds on ``len(user_messages)``,
+    which is a count of text BLOCKS, not entries:
+      - canonical CC format: ``type=="user"`` → blocks from
+        ``entry["message"]["content"]`` (one entry with 3 text blocks
+        counts 3);
+      - flat fallback format: ``role=="user"`` (when type is not "user")
+        → blocks from top-level ``entry["content"]``;
+      - tool_result/tool_use-only entries contribute 0.
+    """
+    if entry.get("type") == "user":
+        msg = entry.get("message", {})
+        content = msg.get("content", "") if isinstance(msg, dict) else ""
+        return len(_extract_texts(content))
+    if entry.get("role") == "user":
+        return len(_extract_texts(entry.get("content", "")))
+    return 0
+
+
+def _parse_ts_epoch(ts) -> float | None:
+    """Parse a transcript timestamp to a POSIX float, or None.
+
+    Mirrors hooks/obsidian_utils._parse_ts semantics: ISO-8601 (Z-suffixed,
+    offset-bearing, naive, with or without fractional seconds) plus epoch
+    seconds/milliseconds (numeric values > 1e12 are treated as millis).
+    Accepts non-string values (epoch timestamps arrive as JSON numbers).
+    Naive ISO datetimes are interpreted in local time — consistent with the
+    hook, which only ever subtracts them pairwise (duration) or formats a
+    local date.
+    """
+    if ts is None:
+        return None
+    s = str(ts)
+    iso = s[:-1] + "+00:00" if s.endswith("Z") else s
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except ValueError:
+        pass
+    try:
+        val = float(s)
+    except ValueError:
+        return None
+    if val > 1e12:
+        val /= 1000.0
+    try:
+        # Round-trip through fromtimestamp to validate the range (mirrors
+        # the hook's OSError guard on out-of-range epochs).
+        return datetime.fromtimestamp(val, tz=timezone.utc).timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _parse_jsonl_metrics(
     jsonl_path: Path,
-) -> tuple[int, float, str | None, str | None] | None:
+) -> tuple[int, float, object, str | None] | None:
     """Parse a JSONL for threshold checking.
 
-    Returns (user_message_count, duration_minutes, first_ts_iso, cwd) or
+    Returns (user_message_count, duration_minutes, first_ts_raw, cwd) or
     None when the file is completely unparsable (every line fails JSON
-    decode).
+    decode) or empty.
 
-    ``user_message_count`` counts only TEXT-BEARING user entries (see
-    ``_user_entry_has_text``) — mirrors the hook's extract_user_messages.
-    ``first_ts_iso`` is the ISO-8601 timestamp of the first parseable entry
-    with a timestamp field (for date derivation); None if absent.
+    Lines are STREAMED (never read_text'd whole) so peak memory stays
+    O(longest line) even on multi-megabyte transcripts — matches the hook's
+    read_transcript discipline.
+
+    ``user_message_count`` sums TEXT BLOCKS contributed by user entries
+    (see ``_count_user_texts``) — mirrors the hook's extract_user_messages,
+    including the flat ``role=="user"`` fallback format.
+    ``first_ts_raw`` is the raw timestamp value (str or number) of the first
+    parseable entry with one (for date derivation); None if absent.
     ``cwd`` is the ``cwd`` field from the first parseable line that HAS one
     (production JSONLs often start with summary/file-history lines without
     a cwd); None if no line carries one.
 
     ``duration_minutes`` is ``(last_ts - first_ts) / 60`` in wall-clock time.
-    Returns 0.0 when fewer than two timestamp-bearing entries exist (mirrors
-    the hook's treatment of very short sessions).
+    Timestamp parsing mirrors obsidian_utils._parse_ts (ISO variants + epoch
+    seconds/millis); the timestamp key chain mirrors extract_session_metadata
+    (``timestamp`` → ``ts`` → ``created_at``). Returns 0.0 when fewer than
+    two timestamp-bearing entries exist (mirrors the hook's treatment of
+    very short sessions).
     """
-    try:
-        raw = jsonl_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-
-    lines = raw.splitlines()
-    if not lines:
-        return None
-
     user_count = 0
     first_ts: float | None = None
     last_ts: float | None = None
     first_cwd: str | None = None
-    first_ts_iso: str | None = None
+    first_ts_raw = None
     parsed_any = False
 
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(entry, dict):
-            continue
-        parsed_any = True
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                parsed_any = True
 
-        # First parseable line that HAS a cwd wins (earlier lines may lack one).
-        if first_cwd is None:
-            cwd_val = entry.get("cwd")
-            if cwd_val:
-                first_cwd = cwd_val
+                # First parseable line that HAS a cwd wins (earlier lines may
+                # lack one).
+                if first_cwd is None:
+                    cwd_val = entry.get("cwd")
+                    if cwd_val:
+                        first_cwd = cwd_val
 
-        if entry.get("type") == "user" and _user_entry_has_text(entry):
-            user_count += 1
+                user_count += _count_user_texts(entry)
 
-        ts_raw = entry.get("timestamp")
-        if ts_raw:
-            try:
-                if ts_raw.endswith("Z"):
-                    ts_raw = ts_raw[:-1] + "+00:00"
-                ts = datetime.fromisoformat(ts_raw).timestamp()
-                if first_ts is None:
-                    first_ts = ts
-                    first_ts_iso = entry.get("timestamp", "")
-                last_ts = ts
-            except ValueError:
-                pass
+                ts_value = (
+                    entry.get("timestamp") or entry.get("ts") or entry.get("created_at")
+                )
+                if ts_value is not None:
+                    ts = _parse_ts_epoch(ts_value)
+                    if ts is not None:
+                        if first_ts is None:
+                            first_ts = ts
+                            first_ts_raw = ts_value
+                        last_ts = ts
+    except OSError:
+        return None
 
     if not parsed_any:
         return None
@@ -303,10 +370,10 @@ def _parse_jsonl_metrics(
     else:
         duration_minutes = 0.0
 
-    return (user_count, duration_minutes, first_ts_iso, first_cwd)
+    return (user_count, duration_minutes, first_ts_raw, first_cwd)
 
 
-def _first_seen_date_from_ts(first_ts_iso: str | None) -> str:
+def _first_seen_date_from_ts(first_ts_raw) -> str:
     """Convert the first JSONL timestamp to a YYYY-MM-DD string in local time.
 
     The production hook calls ``obsidian_utils._first_seen_date(sid)`` which
@@ -316,26 +383,33 @@ def _first_seen_date_from_ts(first_ts_iso: str | None) -> str:
     first JSONL entry's timestamp to local time via
     ``datetime.fromtimestamp(ts)`` (no tz arg → system local timezone),
     matching the system's interpretation of "today" as the hook would have
-    seen it.
+    seen it. Parsing mirrors obsidian_utils._parse_ts (ISO variants + epoch
+    seconds/millis) via _parse_ts_epoch.
 
     Falls back to today's local date when the timestamp is absent or
     unparsable.
     """
-    if first_ts_iso:
+    epoch = _parse_ts_epoch(first_ts_raw) if first_ts_raw is not None else None
+    if epoch is not None:
         try:
-            ts_raw = first_ts_iso
-            if ts_raw.endswith("Z"):
-                ts_raw = ts_raw[:-1] + "+00:00"
-            epoch = datetime.fromisoformat(ts_raw).timestamp()
             return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d")
-        except (ValueError, OSError):
+        except (OSError, OverflowError, ValueError):
             pass
     return datetime.now().strftime("%Y-%m-%d")
 
 
+# Trailing 4-char hash of a SESSION note filename: <date>-<slug>-<hash4>.md
+_HASH_RE = re.compile(r"-([0-9a-f]{4})\.md$")
+# Snapshot note filename: <date>-<slug>-<hash4>-snapshot[-<HHMMSS>].md —
+# written by obsidian_context_snapshot via make_filename(..., suffix=
+# "-snapshot-<HHMMSS>"); the optional group also matches pre-spec
+# "-snapshot.md" names (see obsidian_utils.find_snapshots_for_session).
+_SNAPSHOT_HASH_RE = re.compile(r"-([0-9a-f]{4})-snapshot(?:-\d{6})?\.md$")
+
+
 def _index_session_notes(
     vault: Path, sessions_folder: str
-) -> tuple[set[str], set[str], int]:
+) -> tuple[set[str], set[str], set[str], set[str], int]:
     """Build coverage indexes for fast JSONL lookup.
 
     Returns:
@@ -346,24 +420,66 @@ def _index_session_notes(
                     or its read failed — modern notes are covered via sid_set
                     and must not become collision candidates that could
                     silently hide gaps behind a 4-hex-char match.
+        snapshot_sids: set of ``session_id`` frontmatter values found in
+                    SNAPSHOT notes (``*-<hash4>-snapshot*.md`` /
+                    ``type: claude-snapshot``). Snapshots live in the sessions
+                    folder and carry the session's ``session_id``, but a
+                    snapshot is NOT the session note — they are excluded from
+                    sid_set / hash_set (otherwise a missing session note would
+                    look covered by its own snapshot). These sids feed the
+                    snapshot-anchor threshold bypass in scan(); keying on
+                    session_id mirrors the hook's find_snapshots_for_session
+                    (frontmatter sid match) exactly.
+        snapshot_hashes: filename-hash4 fallback for snapshot notes whose
+                    frontmatter is unreadable or lacks ``session_id`` —
+                    degraded (collision-prone) bypass signal only.
         unreadable: count of session notes whose read failed (sid-index is
                     degraded for these; only the hash fallback covers them).
     """
     sessions_dir = vault / sessions_folder
     sid_set: set[str] = set()
     hash_set: set[str] = set()
+    snapshot_sids: set[str] = set()
+    snapshot_hashes: set[str] = set()
     unreadable = 0
 
-    # Regex to extract the trailing 4-char hash from a session note filename.
-    _hash_re = re.compile(r"-([0-9a-f]{4})\.md$")
-
     if not sessions_dir.is_dir():
-        return sid_set, hash_set, unreadable
+        return sid_set, hash_set, snapshot_sids, snapshot_hashes, unreadable
 
     for entry in sessions_dir.iterdir():
         if not entry.name.endswith(".md"):
             continue
-        m = _hash_re.search(entry.name)
+
+        snap_m = _SNAPSHOT_HASH_RE.search(entry.name)
+        if snap_m:
+            # Snapshot note: record its owning session for the threshold
+            # bypass; never let it provide session coverage. Prefer the
+            # frontmatter session_id (exact — mirrors the hook's
+            # find_snapshots_for_session, which matches on frontmatter sid);
+            # fall back to the filename hash4 when the read fails or the
+            # field is absent. The hash4 fallback is collision-prone: two
+            # unrelated sids can share a 4-hex hash (observed in practice),
+            # which would bypass thresholds for the wrong session.
+            try:
+                snap_fm = _parse_frontmatter(
+                    entry.read_text(encoding="utf-8", errors="replace"),
+                    source=str(entry),
+                )
+                snap_sid = snap_fm.get("session_id", "")
+            except OSError as exc:
+                snap_sid = ""
+                print(
+                    f"[session-coverage] WARNING: could not read snapshot note "
+                    f"{entry} ({exc}); bypass falls back to filename hash",
+                    file=sys.stderr,
+                )
+            if snap_sid:
+                snapshot_sids.add(snap_sid)
+            else:
+                snapshot_hashes.add(snap_m.group(1))
+            continue
+
+        m = _HASH_RE.search(entry.name)
 
         try:
             text = entry.read_text(encoding="utf-8", errors="replace")
@@ -382,6 +498,14 @@ def _index_session_notes(
             continue
 
         fm = _parse_frontmatter(text, source=str(entry))
+        # Defense-in-depth for renamed snapshots: even when the filename
+        # doesn't match the snapshot pattern, a claude-snapshot note must not
+        # count as session coverage (it shares the session's session_id).
+        if fm.get("type") == "claude-snapshot":
+            sid = fm.get("session_id", "")
+            if sid:
+                snapshot_sids.add(sid)
+            continue
         sid = fm.get("session_id", "")
         if sid:
             sid_set.add(sid)
@@ -389,7 +513,7 @@ def _index_session_notes(
             # True legacy note (no session_id frontmatter) — hash fallback.
             hash_set.add(m.group(1))
 
-    return sid_set, hash_set, unreadable
+    return sid_set, hash_set, snapshot_sids, snapshot_hashes, unreadable
 
 
 def _index_referenced_by(
@@ -455,7 +579,10 @@ def scan(
         reconstruct:     If True, mark issues resolvable (unresolved=False) to enable apply().
     """
     vault = Path(vault_path)
-    home = Path("~/.claude").expanduser().parent  # Path.home()
+    # Path.home() reads $HOME on POSIX (tests monkeypatch it) and falls back
+    # to pwd-database lookups when unset — sibling-module convention, more
+    # defensive than expanduser-and-walk-up.
+    home = Path.home()
     projects_root = Path("~/.claude/projects").expanduser()
 
     now = datetime.now(timezone.utc).timestamp()
@@ -475,8 +602,10 @@ def scan(
         )
         return []
 
-    # Step 1: index existing session notes.
-    sid_set, hash_set, n_unreadable_notes = _index_session_notes(vault, sessions_folder)
+    # Step 1: index existing session notes (+ snapshot sids/hashes for the bypass).
+    sid_set, hash_set, snapshot_sids, snapshot_hashes, n_unreadable_notes = (
+        _index_session_notes(vault, sessions_folder)
+    )
 
     # Step 2: index referenced_by (insights/decisions/etc pointing to a session).
     ref_index = _index_referenced_by(vault, insights_folder)
@@ -551,7 +680,7 @@ def scan(
                     dir_counted = True
                 continue
 
-            user_count, duration_minutes, first_ts_iso, cwd = metrics
+            user_count, duration_minutes, first_ts_raw, cwd = metrics
 
             # Derive project name from cwd field.
             if cwd:
@@ -571,25 +700,35 @@ def scan(
                 n_project_dirs += 1
                 dir_counted = True
 
-            # Step 3c: threshold check — skip if hook would have skipped.
+            h4 = _sid_hash(sid)
+
+            # Step 4: threshold check — skip if hook would have skipped.
             # Replicates obsidian_utils.should_skip_session semantics:
             #   skip if user_count < min_messages           (strictly less-than)
             #   skip if 0 < duration < min_duration_minutes (strictly less-than)
             # Exactly-at-threshold sessions are NOT skipped — they ARE gaps.
-            if user_count < min_messages:
-                n_below_threshold += 1
-                continue
-            if duration_minutes > 0 and duration_minutes < min_duration:
+            # EXCEPTION: when the session has sibling snapshots, the hook
+            # bypasses thresholds and writes the note anyway as a snapshot
+            # anchor (obsidian_session_log "snapshot-bypass") — so a
+            # below-threshold session WITH snapshots stays gap-eligible.
+            below_threshold = (user_count < min_messages) or (
+                duration_minutes > 0 and duration_minutes < min_duration
+            )
+            # sid-exact match mirrors the hook's find_snapshots_for_session;
+            # the hash4 set only covers frontmatter-less/unreadable snapshots.
+            snapshot_bypass = below_threshold and (
+                sid in snapshot_sids or h4 in snapshot_hashes
+            )
+            if below_threshold and not snapshot_bypass:
                 n_below_threshold += 1
                 continue
 
-            # Step 4: coverage check.
-            h4 = _sid_hash(sid)
+            # Step 5: coverage check.
             if sid in sid_set or h4 in hash_set:
                 n_covered += 1
                 continue
 
-            # Step 5: gap detected.
+            # Step 6: emit gap Issue.
             n_gaps += 1
             size = st.st_size
             mtime_iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(
@@ -600,7 +739,7 @@ def scan(
             # The hook calls _first_seen_date(sid) which returns local-date when
             # the session started. We derive that from first JSONL timestamp in
             # local time (see module docstring for the reasoning).
-            date_str = _first_seen_date_from_ts(first_ts_iso)
+            date_str = _first_seen_date_from_ts(first_ts_raw)
             expected_basename = _make_filename(date_str, derived_project, sid)
             expected_note_path = vault / sessions_folder / expected_basename
 
@@ -615,6 +754,11 @@ def scan(
                 f"{prefix} JSONL exists ({size} bytes) but session note missing;"
                 f" referenced by {ref_count} note(s)"
             )
+            if snapshot_bypass:
+                reason += (
+                    "; below thresholds but session has snapshot(s) — the "
+                    "hook's snapshot-anchor bypass would have written the note"
+                )
 
             issues.append(
                 Issue(
@@ -635,6 +779,7 @@ def scan(
                         "cwd": cwd or "",
                         "referenced_by": refs,
                         "strict_fail": strict_fail,
+                        "snapshot_bypass": snapshot_bypass,
                     },
                 )
             )
