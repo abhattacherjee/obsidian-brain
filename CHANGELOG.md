@@ -99,6 +99,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the default all-checks sweep via the new registry `OPT_IN` attribute.
 
 ### Fixed
+- **`vault-doctor source-sessions` skips imported notes (#104)** — notes carrying
+  `imported: true` in frontmatter OR the `claude/imported` tag are now silently
+  skipped by the source-sessions check. Their `source_session` UUID refers to the
+  originating vault (another machine) and can never resolve locally, so surfacing
+  them as unresolved is a known false-positive. A stderr line
+  `[source-sessions] skipped N imported note(s)` is emitted when any are skipped
+  so operators know the check ran completely. Snapshot integrity and snapshot
+  migration checks are unaffected — they operate on session/snapshot notes in the
+  sessions folder, not on insight-type notes.
 - `vault_doctor --apply` now prints each error Result's detail message (previously the per-note error string was dropped; only the status mark survived).
 - Date-rollover test flakiness (#205): 12 test call sites scanned hardcoded
   April-2026 fixtures with 60-day windows, so the suite started failing once

@@ -2247,3 +2247,282 @@ def test_unknown_literal_with_date_window_candidate_hint(doctor_vault, monkeypat
         f"date-window-hint reason should instruct operator to content-grep "
         f"the JSONL before applying. Got: {flagged[0].reason}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #104 — skip imported notes
+# ---------------------------------------------------------------------------
+
+def _write_imported_insight(
+    dir_path: Path,
+    date: str,
+    slug: str,
+    project: str,
+    src_sid: str,
+    src_note_basename: str,
+    mtime: float,
+    *,
+    imported_frontmatter: bool = True,
+    imported_tag: bool = True,
+) -> Path:
+    """Write an insight note that carries imported markers.
+
+    ``imported_frontmatter`` controls whether ``imported: true`` appears.
+    ``imported_tag`` controls whether ``claude/imported`` appears in tags.
+    At least one should be True for the note to be considered imported.
+    """
+    note = dir_path / f"{date}-{slug}.md"
+    lines = [
+        "---",
+        "type: claude-insight",
+        f"date: {date}",
+        f"source_session: {src_sid}",
+        f'source_session_note: "[[{src_note_basename}]]"',
+        f"project: {project}",
+    ]
+    if imported_frontmatter:
+        lines.append("imported: true")
+        lines.append("imported_date: 2026-04-25")
+    lines.append("tags:")
+    tags = ["claude/insight", f"claude/project/{project}"]
+    if imported_tag:
+        tags.append("claude/imported")
+    for tag in tags:
+        lines.append(f"  - {tag}")
+    lines.append("---")
+    lines.append("# Imported insight")
+    note.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.utime(note, (mtime, mtime))
+    return note
+
+
+def test_scan_skips_imported_note_with_frontmatter_field(doctor_vault, monkeypatch, capsys):
+    """Issue #104: note with ``imported: true`` in frontmatter and an
+    unresolvable source_session UUID is NOT flagged — this is the exact
+    false-positive case described in the issue.
+
+    Fail-first: removing the _is_imported_note guard must cause the test to
+    fail (the note would become an unresolved WARN).
+    """
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # No JSONL, no session note for this UUID — simulates imported-from-other-vault
+    unresolvable_sid = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    phantom_basename = "2026-04-23-personal-ws-some-session-c4e1"
+    mtime = time.time() - 3600
+
+    imported_note = _write_imported_insight(
+        v / "claude-insights",
+        "2026-04-23",
+        "haiku-summary-pipeline-error",
+        "personal-ws",
+        unresolvable_sid,
+        phantom_basename,
+        mtime,
+        imported_frontmatter=True,
+        imported_tag=True,
+    )
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=10000
+    )
+    paths = [i.note_path for i in issues]
+    assert str(imported_note) not in paths, (
+        "imported note with unresolvable source_session should be skipped, not flagged"
+    )
+
+    # Verify the stderr skip-count line was emitted
+    captured = capsys.readouterr()
+    assert "[source-sessions] skipped 1 imported note(s)" in captured.err, (
+        f"expected skip-count line on stderr, got: {captured.err!r}"
+    )
+
+
+def test_scan_skips_imported_note_with_tag_only(doctor_vault, monkeypatch, capsys):
+    """Issue #104: note with ONLY the ``claude/imported`` tag (no frontmatter
+    ``imported:`` field) is also skipped — belt-and-suspenders for legacy notes.
+    """
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    monkeypatch.setenv("HOME", str(home))
+
+    unresolvable_sid = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    mtime = time.time() - 3600
+
+    tag_only_note = _write_imported_insight(
+        v / "claude-insights",
+        "2026-04-24",
+        "tag-only-imported",
+        "personal-ws",
+        unresolvable_sid,
+        "2026-04-24-personal-ws-ghost",
+        mtime,
+        imported_frontmatter=False,  # only tag, no frontmatter field
+        imported_tag=True,
+    )
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=10000
+    )
+    paths = [i.note_path for i in issues]
+    assert str(tag_only_note) not in paths, (
+        "note with claude/imported tag should be skipped even without imported: true"
+    )
+
+    captured = capsys.readouterr()
+    assert "[source-sessions] skipped 1 imported note(s)" in captured.err
+
+
+def test_scan_regression_non_imported_note_still_flagged(doctor_vault, monkeypatch):
+    """Issue #104 regression: non-imported notes with unresolvable source_session
+    are still flagged as unresolved — the skip guard must not affect them.
+    """
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    monkeypatch.setenv("HOME", str(home))
+
+    # Normal (non-imported) note with unresolvable UUID
+    unresolvable_sid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+    mtime = time.time() - 3600
+
+    normal_note = _write_insight(
+        v / "claude-insights",
+        "2026-04-25",
+        "normal-unresolvable",
+        "proj1",
+        unresolvable_sid,
+        "2026-04-25-proj1-ghost",
+        mtime,
+    )
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=10000
+    )
+    paths = [i.note_path for i in issues]
+    assert str(normal_note) in paths, (
+        "non-imported note with unresolvable source_session must still be flagged"
+    )
+    matching = [i for i in issues if i.note_path == str(normal_note)]
+    assert matching[0].extra.get("unresolved") is True
+
+
+def test_scan_imported_false_still_scanned(doctor_vault, monkeypatch):
+    """Issue #104: ``imported: false`` must NOT trigger the skip — only
+    ``imported: true`` is treated as an imported note.
+    """
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    monkeypatch.setenv("HOME", str(home))
+
+    unresolvable_sid = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    mtime = time.time() - 3600
+
+    # Write note manually so we control imported: false exactly
+    note = v / "claude-insights" / "2026-04-26-imported-false.md"
+    note.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-04-26\n"
+        f"source_session: {unresolvable_sid}\n"
+        'source_session_note: "[[2026-04-26-ghost]]"\n'
+        "project: proj1\n"
+        "imported: false\n"
+        "tags:\n"
+        "  - claude/insight\n"
+        "---\n"
+        "# Not imported\n",
+        encoding="utf-8",
+    )
+    os.utime(note, (mtime, mtime))
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=10000
+    )
+    paths = [i.note_path for i in issues]
+    assert str(note) in paths, (
+        "note with imported: false must still be scanned and flagged"
+    )
+
+
+def test_scan_imported_skip_count_stderr(doctor_vault, monkeypatch, capsys):
+    """Issue #104: when multiple imported notes are skipped, the stderr line
+    reports the correct count.
+    """
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    monkeypatch.setenv("HOME", str(home))
+
+    mtime = time.time() - 3600
+
+    for i in range(3):
+        _write_imported_insight(
+            v / "claude-insights",
+            f"2026-05-0{i + 1}",
+            f"imported-{i}",
+            "personal-ws",
+            f"cccccccc-cccc-cccc-cccc-{i:012d}",
+            f"2026-05-0{i + 1}-personal-ws-ghost-{i}",
+            mtime - i * 60,
+            imported_frontmatter=True,
+            imported_tag=True,
+        )
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=10000
+    )
+    assert issues == [], "all three imported notes should be skipped"
+
+    captured = capsys.readouterr()
+    assert "[source-sessions] skipped 3 imported note(s)" in captured.err, (
+        f"expected skip-count=3, got: {captured.err!r}"
+    )
+
+
+def test_is_imported_note_handles_string_and_bool():
+    """Unit test for _is_imported_note: covers string 'true', bool True,
+    string 'false', bool False, and tag-only detection."""
+    import vault_doctor_checks.source_sessions as check
+
+    base_fm = {"source_session": "abc", "project": "p"}
+
+    # String 'true' (what _parse_frontmatter returns)
+    text_str_true = (
+        "---\ntype: claude-insight\nsource_session: abc\nimported: true\nproject: p\n---\n# b\n"
+    )
+    assert check._is_imported_note(text_str_true, {"imported": "true"}) is True
+
+    # Bool True (hypothetical programmatic construction)
+    assert check._is_imported_note("---\n---\n", {"imported": True}) is True
+
+    # 'false' → NOT imported
+    assert check._is_imported_note("---\n---\n", {"imported": "false"}) is False
+    assert check._is_imported_note("---\n---\n", {"imported": False}) is False
+
+    # Tag only (no imported: field)
+    text_tag_only = (
+        "---\ntype: claude-insight\nsource_session: abc\ntags:\n"
+        "  - claude/insight\n  - claude/imported\nproject: p\n---\n# b\n"
+    )
+    assert check._is_imported_note(text_tag_only, base_fm) is True
+
+    # Neither marker → not imported
+    text_clean = (
+        "---\ntype: claude-insight\nsource_session: abc\nproject: p\n---\n# b\n"
+    )
+    assert check._is_imported_note(text_clean, base_fm) is False
+
+    # Case-insensitive for string form
+    assert check._is_imported_note("---\n---\n", {"imported": "True"}) is True
+    assert check._is_imported_note("---\n---\n", {"imported": "TRUE"}) is True

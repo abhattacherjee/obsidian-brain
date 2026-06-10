@@ -54,6 +54,41 @@ _WIKI_RE = re.compile(r"\[\[([^\]]+)\]\]")
 _SAFE_PROJECT_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 
+def _is_imported_note(text: str, fm: dict) -> bool:
+    """Return True when the note should be skipped because it was imported
+    from another vault.
+
+    Two complementary markers are checked — belt-and-suspenders for legacy
+    notes that only carry one of the two:
+
+    1. Frontmatter ``imported: true`` — the flat parser yields the string
+       ``"true"`` (and also handles bool ``True`` from hypothetical
+       programmatic construction). Checked case-insensitively.
+    2. ``claude/imported`` tag in the raw frontmatter block — the flat
+       parser skips list items, so tags: lists never populate fm. We grep
+       the raw frontmatter block directly instead.
+    """
+    # Check 1: imported: true (string or bool) in parsed frontmatter
+    raw_imported = fm.get("imported", "")
+    if isinstance(raw_imported, bool):
+        if raw_imported:
+            return True
+    elif isinstance(raw_imported, str) and raw_imported.lower() == "true":
+        return True
+
+    # Check 2: claude/imported tag in the raw frontmatter block.
+    # _FRONT_RE is the module-level compiled regex.
+    m = _FRONT_RE.match(text)
+    if m:
+        fm_block = m.group(1)
+        for line in fm_block.splitlines():
+            # Match "  - claude/imported" (with or without quotes)
+            stripped = line.strip().lstrip("-").strip().strip('"').strip("'")
+            if stripped == "claude/imported":
+                return True
+    return False
+
+
 def _safe_project_slug(project: str) -> str:
     """Sanitize a project name for use as a filesystem path component.
 
@@ -538,6 +573,7 @@ def scan(
     ]
 
     issues: list[Issue] = []
+    imported_skipped = 0
     session_index_cache: dict[str, dict[str, dict]] = {}
     jsonl_dir_cache: dict[str, Path | None] = {}
     global_sid_index: dict[str, dict] | None = None  # built lazily on first need
@@ -565,6 +601,14 @@ def scan(
             fm = _parse_frontmatter(text, source=str(note))
             if "source_session" not in fm:
                 continue  # non-source-session note type (e.g., standups with source_notes[])
+            # Skip notes imported from another vault — their source_session UUID and
+            # source_session_note refer to the OTHER machine's vault and will never
+            # resolve locally. Surfacing them as unresolved is a known false-positive.
+            # Two markers checked: frontmatter `imported: true` (belt) and the
+            # `claude/imported` tag in the raw frontmatter block (suspenders).
+            if _is_imported_note(text, fm):
+                imported_skipped += 1
+                continue
             note_project = fm.get("project", "")
             if not note_project:
                 continue
@@ -891,6 +935,11 @@ def scan(
                 )
             )
 
+    if imported_skipped:
+        print(
+            f"[source-sessions] skipped {imported_skipped} imported note(s)",
+            file=sys.stderr,
+        )
     return issues
 
 
