@@ -24,6 +24,8 @@ Audit and repair the Obsidian vault. Ships with one check initially (`source-ses
 - `/vault-doctor --days 14` — override default window (default: 7 days)
 - `/vault-doctor --project obsidian-brain` — limit to one project
 - `/vault-doctor fix --check source-sessions --days 7` — combine flags
+- `/vault-doctor --min-confidence 0.9` — dry-run showing only issues with confidence >= 0.9; report header notes the active filter and dropped count
+- `/vault-doctor fix --min-confidence 0.9` — apply only the high-confidence subset (conf >= 0.9); preview matches apply scope exactly
 
 ## Procedure
 
@@ -40,6 +42,7 @@ Parse the user's invocation into flags:
 - `--project <name>` → project filter
 - `--strict` → set STRICT=1 (session-coverage only: FAIL instead of WARN on referenced gaps)
 - `--reconstruct` → set RECONSTRUCT=1 (session-coverage only: mark gaps resolvable for apply)
+- `--min-confidence <FLOAT>` → set MIN_CONFIDENCE (0.0–1.0 inclusive; default 0.0 keeps all; applies to both dry-run report and --apply); note: unresolved/WARN rows (confidence=0.0) are hidden at any threshold > 0 — drop the flag to audit them
 
 Locate the Python dispatcher via the standard plugin cache glob, with a fallback for local dev sessions where the repo is checked out as `$PWD`:
 
@@ -73,6 +76,7 @@ ARGS=()
 [[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
 [[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
 [[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
+[[ -n "${MIN_CONFIDENCE:-}" ]] && ARGS+=(--min-confidence "$MIN_CONFIDENCE")
 ARGS+=(--json)
 python3 "$DISPATCHER" "${ARGS[@]}"
 ```
@@ -165,6 +169,7 @@ ARGS=()
 [[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
 [[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
 [[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
+[[ -n "${MIN_CONFIDENCE:-}" ]] && ARGS+=(--min-confidence "$MIN_CONFIDENCE")
 ARGS+=(--apply)
 python3 "$DISPATCHER" "${ARGS[@]}"
 ```

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -93,6 +94,10 @@ def _load_config(args) -> dict:
 # matching p.add_argument below.
 _EXTRA_FLAG_NAMES = ("strict", "reconstruct")
 
+# Range for --min-confidence (inclusive on both ends)
+_MIN_CONFIDENCE_MIN = 0.0
+_MIN_CONFIDENCE_MAX = 1.0
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="vault_doctor")
@@ -121,6 +126,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "for session-coverage: mark gaps as resolvable and enable apply() to "
             "re-run the SessionEnd hook via replay-sessionend.py"
+        ),
+    )
+    p.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.0,
+        dest="min_confidence",
+        help=(
+            "keep only issues with confidence >= THRESHOLD (0.0–1.0, inclusive). "
+            "Default 0.0 keeps all issues. "
+            "1.0 excludes issues with confidence=0.99 (use >= semantics: "
+            "threshold=1.0 requires exactly 1.0). "
+            "Applies to both the dry-run report and --apply — the preview always "
+            "matches the apply scope. "
+            "Note: unresolved issues have confidence=0.0 and are filtered out "
+            "when threshold > 0.0, since their proposed repair is unknown."
         ),
     )
     return p
@@ -157,9 +178,44 @@ def _run_scan(mod, cfg: dict, days: int, project: str | None, args=None) -> list
     )
 
 
-def _print_report_human(issues_by_check: dict) -> None:
+def _confidence_passes(issue, threshold: float) -> bool:
+    """True when issue.confidence is a valid number >= threshold.
+
+    Defensive guard: a future buggy check could emit a None/NaN/non-numeric
+    confidence, and ``None >= float`` raises TypeError — a latent crash that
+    would fire only when --min-confidence is first used against that check.
+    Invalid values are warned about on stderr (naming the check and note) and
+    treated as below threshold, i.e. counted as dropped by the caller.
+    """
+    c = issue.confidence
+    if not isinstance(c, (int, float)) or math.isnan(c):
+        print(
+            f"[vault_doctor] {issue.check}: invalid confidence ({c!r}) for "
+            f"{issue.note_path}; treating as below threshold",
+            file=sys.stderr,
+        )
+        return False
+    return c >= threshold
+
+
+def _print_report_human(issues_by_check: dict, min_confidence: float = 0.0,
+                        dropped_per_check: dict | None = None,
+                        multi_check: bool = False) -> None:
+    dropped_per_check = dropped_per_check or {}
+    dropped_total = sum(dropped_per_check.values())
     total = sum(len(v) for v in issues_by_check.values())
-    print(f"\nvault_doctor report — {total} issue(s) across {len(issues_by_check)} check(s)", file=sys.stderr)
+    header = f"\nvault_doctor report — {total} issue(s) across {len(issues_by_check)} check(s)"
+    if min_confidence > 0.0:
+        header += f" [filtered: --min-confidence {min_confidence}, dropped {dropped_total}"
+        # Per-check breakdown: only when more than one check was scanned —
+        # with a single --check the global count is already unambiguous.
+        # This keeps a fully-filtered check attributable (it vanishes from
+        # issues_by_check, so the breakdown is its only trace in the header).
+        if multi_check and dropped_per_check:
+            breakdown = ", ".join(f"{k}: {v}" for k, v in dropped_per_check.items())
+            header += f" ({breakdown})"
+        header += "]"
+    print(header, file=sys.stderr)
     for check_name, issues in issues_by_check.items():
         by_project: dict[str, list] = {}
         for i in issues:
@@ -180,6 +236,13 @@ def main() -> int:
     if args.days is not None and args.days <= 0:
         print(
             f"error: --days must be positive, got {args.days}",
+            file=sys.stderr,
+        )
+        return 3
+
+    if not (_MIN_CONFIDENCE_MIN <= args.min_confidence <= _MIN_CONFIDENCE_MAX):
+        print(
+            f"error: --min-confidence must be in [0.0, 1.0], got {args.min_confidence}",
             file=sys.stderr,
         )
         return 3
@@ -219,6 +282,28 @@ def main() -> int:
         issues = _run_scan(mod, cfg, days, args.project, args=args)
         if issues:
             issues_by_check[mod.NAME] = issues
+
+    # Apply --min-confidence filter AFTER scan, per-check. Filtering happens
+    # here in main() so check authors don't have to opt in — every Issue
+    # already has a confidence field. When threshold > 0.0, unresolved issues
+    # (confidence=0.0) are filtered from both the report and --apply, which is
+    # intentional: the dry-run preview must match the apply scope exactly.
+    # Drops are attributed per check (dropped_per_check) because a fully-
+    # filtered check vanishes from issues_by_check entirely — without
+    # attribution it would be indistinguishable from a clean check.
+    dropped_by_confidence = 0
+    dropped_per_check: dict[str, int] = {}
+    if args.min_confidence > 0.0:
+        filtered: dict = {}
+        for check_name, issues in issues_by_check.items():
+            kept = [i for i in issues if _confidence_passes(i, args.min_confidence)]
+            n_dropped = len(issues) - len(kept)
+            if n_dropped:
+                dropped_per_check[check_name] = n_dropped
+                dropped_by_confidence += n_dropped
+            if kept:
+                filtered[check_name] = kept
+        issues_by_check = filtered
 
     total_issues = sum(len(v) for v in issues_by_check.values())
 
@@ -265,12 +350,35 @@ def main() -> int:
                 for issues in issues_by_check.values() for i in issues
             ],
         }
+        # Conditionally add confidence-filter metadata — only present when the
+        # flag was used (threshold > 0.0), so existing consumers are byte-identical
+        # to prior schema. Mirrors the conditional-row-extras pattern from #98.
+        # dropped_per_check attributes drops by check name — a fully-filtered
+        # check has no rows in "issues", so this map is its only trace.
+        if args.min_confidence > 0.0:
+            payload["min_confidence"] = args.min_confidence
+            payload["dropped_by_confidence"] = dropped_by_confidence
+            payload["dropped_per_check"] = dropped_per_check
         print(json.dumps(payload, indent=2))
     else:
-        _print_report_human(issues_by_check)
+        _print_report_human(issues_by_check,
+                            min_confidence=args.min_confidence,
+                            dropped_per_check=dropped_per_check,
+                            multi_check=len(modules) > 1)
 
     if total_issues == 0:
-        print("vault_doctor: clean", file=sys.stderr)
+        if dropped_by_confidence > 0:
+            # All issues were filtered out — saying just "clean" would be a
+            # literal falsehood. Exit stays 0 by decision (no new exit code);
+            # JSON consumers disambiguate via dropped_by_confidence.
+            print(
+                f"vault_doctor: clean at --min-confidence {args.min_confidence} "
+                f"({dropped_by_confidence} issue(s) below threshold — rerun "
+                f"without the flag to see them)",
+                file=sys.stderr,
+            )
+        else:
+            print("vault_doctor: clean", file=sys.stderr)
         return 0
 
     if not args.apply:
