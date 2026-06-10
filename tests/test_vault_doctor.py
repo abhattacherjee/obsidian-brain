@@ -84,7 +84,7 @@ def test_cli_dry_run_reports_issues(tmp_path):
 
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
     result = subprocess.run(
-        [sys.executable, str(script), "--check", "source-sessions", "--days", "60",
+        [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "proj1", "--json"],
         capture_output=True,
         text=True,
@@ -140,7 +140,7 @@ def test_cli_apply_with_yes(tmp_path):
 
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
     result = subprocess.run(
-        [sys.executable, str(script), "--check", "source-sessions", "--days", "60",
+        [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "proj1", "--apply", "--yes"],
         capture_output=True,
         text=True,
