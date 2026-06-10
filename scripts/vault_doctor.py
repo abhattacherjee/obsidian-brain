@@ -204,6 +204,40 @@ def _confidence_passes(issue, threshold: float) -> bool:
     return c >= threshold
 
 
+def _issue_row(i) -> dict:
+    row = {
+        "check": i.check,
+        "note_path": i.note_path,
+        "project": i.project,
+        "current_source": i.current_source,
+        "proposed_source": i.proposed_source,
+        "reason": i.reason,
+        "confidence": i.confidence,
+        "unresolved": i.extra.get("unresolved", False),
+        "signal_class": i.extra.get("signal_class", ""),
+        "capture_signal": i.extra.get("capture_signal", ""),
+        "capture_confidence": i.extra.get("capture_confidence", 0.0),
+        # convergence_warning/convergence_count are deprecated as of #106
+        # (UUID-first matching obsoleted the convergence guard). Kept in the
+        # payload as hard-coded defaults for downstream schema stability;
+        # consumers should migrate to signal_class for triage.
+        "convergence_warning": i.extra.get("convergence_warning", False),
+        "convergence_count": i.extra.get("convergence_count", 0),
+    }
+    # Conditionally surfaced extras (currently from session-coverage,
+    # #98): only added when the issue's extra dict carries them, so
+    # rows from other checks are byte-identical to the prior schema.
+    if "sid" in i.extra:
+        row["sid"] = i.extra["sid"]
+    if "strict_fail" in i.extra:
+        row["strict_fail"] = i.extra["strict_fail"]
+    if "jsonl_path" in i.extra:
+        row["jsonl_path"] = i.extra["jsonl_path"]
+    if "referenced_by" in i.extra:
+        row["referenced_by_count"] = len(i.extra.get("referenced_by", []))
+    return row
+
+
 def _print_report_human(issues_by_check: dict, min_confidence: float = 0.0,
                         dropped_per_check: dict | None = None,
                         multi_check: bool = False,
@@ -362,39 +396,6 @@ def main() -> int:
 
     # JSON output for skill consumption
     if args.json_out:
-        def _issue_row(i) -> dict:
-            row = {
-                "check": i.check,
-                "note_path": i.note_path,
-                "project": i.project,
-                "current_source": i.current_source,
-                "proposed_source": i.proposed_source,
-                "reason": i.reason,
-                "confidence": i.confidence,
-                "unresolved": i.extra.get("unresolved", False),
-                "signal_class": i.extra.get("signal_class", ""),
-                "capture_signal": i.extra.get("capture_signal", ""),
-                "capture_confidence": i.extra.get("capture_confidence", 0.0),
-                # convergence_warning/convergence_count are deprecated as of #106
-                # (UUID-first matching obsoleted the convergence guard). Kept in the
-                # payload as hard-coded defaults for downstream schema stability;
-                # consumers should migrate to signal_class for triage.
-                "convergence_warning": i.extra.get("convergence_warning", False),
-                "convergence_count": i.extra.get("convergence_count", 0),
-            }
-            # Conditionally surfaced extras (currently from session-coverage,
-            # #98): only added when the issue's extra dict carries them, so
-            # rows from other checks are byte-identical to the prior schema.
-            if "sid" in i.extra:
-                row["sid"] = i.extra["sid"]
-            if "strict_fail" in i.extra:
-                row["strict_fail"] = i.extra["strict_fail"]
-            if "jsonl_path" in i.extra:
-                row["jsonl_path"] = i.extra["jsonl_path"]
-            if "referenced_by" in i.extra:
-                row["referenced_by_count"] = len(i.extra.get("referenced_by", []))
-            return row
-
         payload = {
             "timestamp": _iso_now(),
             "total_issues": total_issues,

@@ -972,7 +972,7 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             fd, tmp = tempfile.mkstemp(
                 dir=str(note_path.parent),
                 prefix=".vd-projcanon-",
-                suffix=".tmp",
+                suffix=".md.tmp",
             )
             try:
                 os.write(fd, new_content.encode("utf-8"))

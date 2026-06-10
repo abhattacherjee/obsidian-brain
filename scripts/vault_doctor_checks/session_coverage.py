@@ -587,7 +587,7 @@ def scan(
     # to pwd-database lookups when unset — sibling-module convention, more
     # defensive than expanduser-and-walk-up.
     home = Path.home()
-    projects_root = Path("~/.claude/projects").expanduser()
+    projects_root = home / ".claude" / "projects"
 
     now = datetime.now(timezone.utc).timestamp()
     cutoff = now - days * 86400

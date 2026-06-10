@@ -16,7 +16,7 @@ subprocess, and asserts the full taxonomy invariants.
 # Spec-vs-current-code reconciliations (PRs #103 + #104, post-issue-#106):
 #
 # 1. (#103) --min-confidence flag added. Not tested here (covered by unit
-#    tests). The script passes --days=36500 (100 years) to avoid the cutoff
+#    tests). The script passes --days=10000 (wide window) to avoid the cutoff
 #    window filtering out fixture notes.
 #
 # 2. (#104) Imported notes are skipped. The fixture does NOT seed imported
@@ -334,7 +334,7 @@ def run_doctor(*extra_args: str) -> subprocess.CompletedProcess:
             "--vault", str(VAULT),
             "--sessions-folder", "claude-sessions",
             "--insights-folder", "claude-insights",
-            "--days", "36500",   # 100 years — never filters by cutoff
+            "--days", "10000",   # wide window — never filters by cutoff
             "--json",
             *extra_args,
         ],
