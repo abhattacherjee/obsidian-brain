@@ -432,3 +432,226 @@ class TestMinConfidenceCLI:
         )
         # Filter keys still appear in payload (threshold > 0.0)
         assert payload.get("min_confidence") == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Deep-review round 1 — per-check drop attribution (item 1)
+# ---------------------------------------------------------------------------
+
+def _add_spurious_wikilink_session_note(vault: Path) -> Path:
+    """Add a session note that triggers a spurious-wikilinks issue (conf=1.0)."""
+    note = vault / "claude-sessions" / "2026-04-10-proj1-wiki.md"
+    note.write_text(
+        "---\ntype: claude-session\ndate: 2026-04-10\nproject: proj1\n---\n"
+        "# Session\n"
+        "**User:** if [[ $BRANCH == feature/* ]]; then echo yes; fi\n"
+        "**Assistant:** ok\n",
+        encoding="utf-8",
+    )
+    return note
+
+
+class TestDroppedPerCheck:
+    """A fully-filtered check must remain attributable: its name + drop count
+    appear in the header breakdown and the JSON dropped_per_check map."""
+
+    def test_fully_filtered_check_named_in_json_map(self, tmp_path):
+        """Default sweep, threshold=1.0: source-sessions (conf 0.99 + 0.0) is
+        fully filtered; spurious-wikilinks (conf 1.0) survives. The JSON must
+        attribute the drops to source-sessions by name."""
+        vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
+        _add_spurious_wikilink_session_note(vault)
+        script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
+
+        r = subprocess.run(
+            [sys.executable, str(script),
+             "--days", "10000", "--project", "proj1",
+             "--min-confidence", "1.0", "--json"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 1, (
+            f"expected exit 1 (spurious-wikilinks issue survives), got {r.returncode}: {r.stderr}"
+        )
+        payload = json.loads(r.stdout)
+        # Surviving issues are spurious-wikilinks only
+        assert all(i["check"] == "spurious-wikilinks" for i in payload["issues"]), (
+            f"only spurious-wikilinks should survive threshold=1.0: {payload['issues']}"
+        )
+        # Per-check attribution: the fully-filtered check is named with its count
+        assert "dropped_per_check" in payload, "JSON must carry dropped_per_check map"
+        assert payload["dropped_per_check"] == {"source-sessions": 2}, (
+            f"expected {{'source-sessions': 2}}, got {payload['dropped_per_check']}"
+        )
+        assert payload["dropped_by_confidence"] == 2
+
+    def test_fully_filtered_check_named_in_header_breakdown(self, tmp_path):
+        """Human-mode header must carry the per-check breakdown parenthetical
+        when more than one check was scanned."""
+        vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
+        _add_spurious_wikilink_session_note(vault)
+        script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
+
+        r = subprocess.run(
+            [sys.executable, str(script),
+             "--days", "10000", "--project", "proj1",
+             "--min-confidence", "1.0"],
+            capture_output=True, text=True, env=env,
+        )
+        header_line = next(
+            (line for line in r.stderr.splitlines() if "vault_doctor report" in line),
+            None,
+        )
+        assert header_line is not None, f"header line not found in stderr: {r.stderr}"
+        assert "--min-confidence 1.0" in header_line
+        assert "dropped 2" in header_line
+        assert "(source-sessions: 2)" in header_line, (
+            f"fully-filtered check must be named in header breakdown: {header_line!r}"
+        )
+
+    def test_single_check_run_omits_breakdown_parenthetical(self, tmp_path):
+        """With --check (one check scanned), the parenthetical is redundant
+        and must be omitted — the global dropped count is unambiguous."""
+        vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
+        script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
+
+        r = subprocess.run(
+            [sys.executable, str(script),
+             "--check", "source-sessions", "--days", "10000", "--project", "proj1",
+             "--min-confidence", "0.9"],
+            capture_output=True, text=True, env=env,
+        )
+        header_line = next(
+            (line for line in r.stderr.splitlines() if "vault_doctor report" in line),
+            None,
+        )
+        assert header_line is not None
+        assert "dropped 1" in header_line
+        assert "(source-sessions" not in header_line, (
+            f"single-check run must omit the breakdown parenthetical: {header_line!r}"
+        )
+
+    def test_back_compat_no_flag_no_dropped_per_check_key(self, tmp_path):
+        """Without the flag, dropped_per_check must NOT appear in the JSON."""
+        vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
+        script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
+
+        r = subprocess.run(
+            [sys.executable, str(script),
+             "--check", "source-sessions", "--days", "10000", "--project", "proj1",
+             "--json"],
+            capture_output=True, text=True, env=env,
+        )
+        payload = json.loads(r.stdout)
+        assert "dropped_per_check" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Deep-review round 1 — honest all-filtered clean line (item 2)
+# ---------------------------------------------------------------------------
+
+class TestAllFilteredCleanLine:
+    """When every issue was dropped by the confidence filter, the clean line
+    must say so instead of claiming an unqualified 'clean'. Exit stays 0
+    (decision: no new exit code — JSON consumers disambiguate via
+    dropped_by_confidence)."""
+
+    def test_all_filtered_human_mode_qualified_clean_line(self, tmp_path):
+        """Human mode, threshold=1.0 filters everything: header shows the
+        dropped count AND the qualified clean line coexists with it."""
+        vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
+        script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
+
+        r = subprocess.run(
+            [sys.executable, str(script),
+             "--check", "source-sessions", "--days", "10000", "--project", "proj1",
+             "--min-confidence", "1.0"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0, (
+            f"all-filtered run keeps exit 0, got {r.returncode}: {r.stderr}"
+        )
+        header_line = next(
+            (line for line in r.stderr.splitlines() if "vault_doctor report" in line),
+            None,
+        )
+        assert header_line is not None, f"header missing: {r.stderr}"
+        assert "dropped 2" in header_line, (
+            f"all-filtered header must still report dropped count: {header_line!r}"
+        )
+        clean_line = next(
+            (line for line in r.stderr.splitlines() if line.startswith("vault_doctor: clean")),
+            None,
+        )
+        assert clean_line is not None, f"clean line missing: {r.stderr}"
+        assert clean_line != "vault_doctor: clean", (
+            "all-filtered run must NOT print the unqualified clean line"
+        )
+        assert "--min-confidence 1.0" in clean_line
+        assert "2 issue(s) below threshold" in clean_line
+        assert "rerun without the flag" in clean_line
+
+    def test_genuinely_clean_run_keeps_plain_clean_line(self, tmp_path):
+        """A truly clean vault with the flag active still prints the plain
+        'vault_doctor: clean' (nothing was dropped)."""
+        vault = tmp_path / "vault"
+        (vault / "claude-sessions").mkdir(parents=True)
+        (vault / "claude-insights").mkdir(parents=True)
+        env = os.environ.copy()
+        env["HOME"] = str(tmp_path)
+        env["OBSIDIAN_BRAIN_VAULT"] = str(vault)
+        env["OBSIDIAN_BRAIN_SESSIONS_FOLDER"] = "claude-sessions"
+        env["OBSIDIAN_BRAIN_INSIGHTS_FOLDER"] = "claude-insights"
+        script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
+
+        r = subprocess.run(
+            [sys.executable, str(script),
+             "--check", "source-sessions", "--min-confidence", "0.9"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 0
+        assert "vault_doctor: clean" in r.stderr
+        assert "below threshold" not in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Deep-review round 1 — None/NaN confidence guard (item 3)
+# ---------------------------------------------------------------------------
+
+class TestInvalidConfidenceGuard:
+    """A future buggy check emitting None/NaN confidence must not crash the
+    filter (None >= float raises TypeError); it is warned about and treated
+    as below threshold (counted as dropped)."""
+
+    def test_none_confidence_warns_and_drops(self, capsys):
+        import vault_doctor
+        issue = _make_issue(0.99, note_path="/tmp/none-conf.md")
+        issue.confidence = None
+        assert vault_doctor._confidence_passes(issue, 0.9) is False
+        err = capsys.readouterr().err
+        assert "invalid confidence" in err
+        assert "source-sessions" in err, "warning must name the check"
+        assert "/tmp/none-conf.md" in err, "warning must name the note_path"
+        assert "below threshold" in err
+
+    def test_nan_confidence_warns_and_drops(self, capsys):
+        import vault_doctor
+        issue = _make_issue(float("nan"), note_path="/tmp/nan-conf.md")
+        assert vault_doctor._confidence_passes(issue, 0.9) is False
+        err = capsys.readouterr().err
+        assert "invalid confidence" in err
+        assert "/tmp/nan-conf.md" in err
+
+    def test_string_confidence_warns_and_drops(self, capsys):
+        import vault_doctor
+        issue = _make_issue(0.99, note_path="/tmp/str-conf.md")
+        issue.confidence = "0.99"  # type: ignore[assignment]
+        assert vault_doctor._confidence_passes(issue, 0.9) is False
+        err = capsys.readouterr().err
+        assert "invalid confidence" in err
+
+    def test_valid_confidence_passes_silently(self, capsys):
+        import vault_doctor
+        issue = _make_issue(0.99)
+        assert vault_doctor._confidence_passes(issue, 0.9) is True
+        assert vault_doctor._confidence_passes(issue, 1.0) is False  # >= semantics
+        assert capsys.readouterr().err == ""

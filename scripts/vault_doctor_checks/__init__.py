@@ -28,6 +28,10 @@ class Issue:
     current_source: str
     proposed_source: str
     reason: str
+    # Set from literals in check modules (e.g. 0.99, 0.5, 0.0). If a check
+    # ever computes confidence arithmetically, round to 2 decimals first —
+    # vault_doctor's --min-confidence filter compares with exact >=, and a
+    # float artifact like 0.8999999999 would silently miss the threshold.
     confidence: float = 1.0
     extra: dict = field(default_factory=dict)
 

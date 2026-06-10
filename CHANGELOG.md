@@ -17,10 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are filtered out when threshold > 0.0, which is intentional: their repair is unknown
   so no apply would occur anyway. Range validated: out-of-range values exit 3.
   When active, the report header gains a `[filtered: --min-confidence N, dropped K]`
-  suffix, and the JSON payload gets `min_confidence` and `dropped_by_confidence`
-  top-level keys (omitted entirely when threshold=0.0 for back-compat schema stability
+  suffix — with a per-check breakdown parenthetical (`dropped K (check-a: X, check-b: Y)`)
+  when more than one check was scanned, so a fully-filtered check stays attributable
+  instead of silently vanishing from the report. The JSON payload gets
+  `min_confidence`, `dropped_by_confidence`, and `dropped_per_check` top-level keys
+  (omitted entirely when threshold=0.0 for back-compat schema stability
   — mirrors the conditional-row-extras pattern from #98). The filter runs in `main()`;
-  check authors do not need to opt in.
+  check authors do not need to opt in. Invalid (None/NaN/non-numeric) confidence
+  values from a buggy check are warned about on stderr and treated as below
+  threshold rather than crashing the filter.
+  Exit semantics: a run where ALL issues were filtered out still exits 0, but the
+  clean line is qualified (`vault_doctor: clean at --min-confidence N (K issue(s)
+  below threshold — rerun without the flag to see them)`); no new exit code was
+  added — JSON consumers disambiguate all-filtered from genuinely clean via the
+  `dropped_by_confidence` key.
   Resolved design question: numeric `--min-confidence` was chosen over the
   `--canonical-only` named-subset alternative proposed in the issue. Numeric is
   general across all checks (any Issue already has a confidence field) while
