@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`scripts/dev-test/test-issue-106-fixture.py` (#152)** — fixture-vault dev-test for
+  the `vault-doctor source-sessions` UUID-first taxonomy. Seeds a temp `$HOME` with one
+  insight note per signal class (`uuid-basename-stale`, `uuid-day-mismatch`,
+  `missing-session-note`, `date-window-hint`, `unresolved`), runs the real
+  `vault_doctor.py` dispatcher as a subprocess, and asserts all 7 invariant groups from
+  issue #106: `signal_class` top-level (no `extra` key), vocabulary subset, per-class
+  confidence values, `unresolved` flag, `date-window-hint` reason suffix,
+  `--apply --yes` mutates only the `uuid-basename-stale` note (byte-compares all others),
+  and deprecated `convergence_warning`/`convergence_count` defaults on every row.
+  Self-contained: deterministic against a clean `$HOME`, cleans up via `atexit`.
+  Spec reconciliations for #103 (`--min-confidence`) and #104 (imported-note skipping)
+  are documented in the script header.
 - **`vault-doctor --min-confidence FLOAT` (#103)** — new flag that filters issues by
   confidence before display and before apply. Semantics: keep issues with
   `confidence >= THRESHOLD`; default `0.0` keeps all (back-compat). Threshold
