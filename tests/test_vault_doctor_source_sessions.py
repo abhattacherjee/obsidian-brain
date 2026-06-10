@@ -2337,7 +2337,7 @@ def test_scan_skips_imported_note_with_frontmatter_field(doctor_vault, monkeypat
 
     # Verify the stderr skip-count line was emitted
     captured = capsys.readouterr()
-    assert "[source-sessions] skipped 1 imported note(s)" in captured.err, (
+    assert "[vault_doctor] source-sessions: skipped 1 imported note(s)" in captured.err, (
         f"expected skip-count line on stderr, got: {captured.err!r}"
     )
 
@@ -2376,7 +2376,7 @@ def test_scan_skips_imported_note_with_tag_only(doctor_vault, monkeypatch, capsy
     )
 
     captured = capsys.readouterr()
-    assert "[source-sessions] skipped 1 imported note(s)" in captured.err
+    assert "[vault_doctor] source-sessions: skipped 1 imported note(s)" in captured.err
 
 
 def test_scan_regression_non_imported_note_still_flagged(doctor_vault, monkeypatch):
@@ -2485,7 +2485,7 @@ def test_scan_imported_skip_count_stderr(doctor_vault, monkeypatch, capsys):
     assert issues == [], "all three imported notes should be skipped"
 
     captured = capsys.readouterr()
-    assert "[source-sessions] skipped 3 imported note(s)" in captured.err, (
+    assert "[vault_doctor] source-sessions: skipped 3 imported note(s)" in captured.err, (
         f"expected skip-count=3, got: {captured.err!r}"
     )
 
@@ -2526,3 +2526,96 @@ def test_is_imported_note_handles_string_and_bool():
     # Case-insensitive for string form
     assert check._is_imported_note("---\n---\n", {"imported": "True"}) is True
     assert check._is_imported_note("---\n---\n", {"imported": "TRUE"}) is True
+
+
+def test_scan_does_not_skip_note_with_literal_in_folded_scalar(doctor_vault, monkeypatch):
+    """Deep-review R1 probe (a): a folded-YAML scalar (``summary: >``) whose
+    continuation line happens to contain the literal ``- claude/imported``
+    must NOT exclude the note from the audit. Only list items under the
+    ``tags:`` key count as the imported marker.
+
+    Fail-first: reverting _is_imported_note to a whole-block stripped-equality
+    scan makes this note silently skipped → test dies.
+    """
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    monkeypatch.setenv("HOME", str(home))
+
+    unresolvable_sid = "abababab-abab-abab-abab-abababababab"
+    mtime = time.time() - 3600
+
+    note = v / "claude-insights" / "2026-04-27-folded-scalar.md"
+    note.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-04-27\n"
+        f"source_session: {unresolvable_sid}\n"
+        'source_session_note: "[[2026-04-27-ghost]]"\n'
+        "project: proj1\n"
+        "summary: >\n"
+        "  notes about the\n"
+        "  - claude/imported\n"
+        "  tag convention\n"
+        "tags:\n"
+        "  - claude/insight\n"
+        "---\n"
+        "# Local note discussing the imported convention\n",
+        encoding="utf-8",
+    )
+    os.utime(note, (mtime, mtime))
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=10000
+    )
+    paths = [i.note_path for i in issues]
+    assert str(note) in paths, (
+        "local note with the literal inside a folded scalar must STAY in the "
+        "audit — whole-block scan regression"
+    )
+
+
+def test_scan_does_not_skip_note_with_literal_in_non_tags_list(doctor_vault, monkeypatch):
+    """Deep-review R1 probe (b): a non-tags list (``aliases:``) containing
+    ``- claude/imported`` must NOT exclude the note from the audit. The
+    imported marker is only valid as a list item under ``tags:``.
+
+    Fail-first: reverting _is_imported_note to a whole-block stripped-equality
+    scan makes this note silently skipped → test dies.
+    """
+    import vault_doctor_checks.source_sessions as check
+
+    v = doctor_vault["vault"]
+    home = doctor_vault["home"]
+    monkeypatch.setenv("HOME", str(home))
+
+    unresolvable_sid = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd"
+    mtime = time.time() - 3600
+
+    note = v / "claude-insights" / "2026-04-28-aliases-list.md"
+    note.write_text(
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-04-28\n"
+        f"source_session: {unresolvable_sid}\n"
+        'source_session_note: "[[2026-04-28-ghost]]"\n'
+        "project: proj1\n"
+        "aliases:\n"
+        "  - claude/imported\n"
+        "tags:\n"
+        "  - claude/insight\n"
+        "---\n"
+        "# Local note with an unfortunate alias\n",
+        encoding="utf-8",
+    )
+    os.utime(note, (mtime, mtime))
+
+    issues = check.scan(
+        str(v), "claude-sessions", "claude-insights", days=10000
+    )
+    paths = [i.note_path for i in issues]
+    assert str(note) in paths, (
+        "local note with the literal in a non-tags list must STAY in the "
+        "audit — whole-block scan regression"
+    )
