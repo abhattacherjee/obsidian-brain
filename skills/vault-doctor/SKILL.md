@@ -85,7 +85,7 @@ Capture stdout as the JSON report. Exit codes:
 
 - `0` — clean vault, nothing to do
 - `1` — issues found (expected for a dry-run that finds things)
-- `2` — apply errors
+- `2` — apply errors OR one or more checks crashed (results incomplete; see `crashed_checks` in JSON)
 - `3` — usage error (bad args, missing config)
 
 If exit code is `3`, surface the stderr message directly to the user and stop.
@@ -116,6 +116,14 @@ convergence_warning/convergence_count fields are deprecated as of #106
 (UUID-first matching obsoleted the convergence guard) — they remain in the
 JSON payload as hard-coded defaults for output schema stability but should
 not drive rendering.
+
+The `crashed_checks` key is conditional — it is only present when one or
+more checks crashed during the scan or apply phase (exit code 2 on a
+dry-run). If the payload contains `crashed_checks`, tell the user which
+checks crashed and that the report is **INCOMPLETE** — do not present it
+as a complete scan. Example: "Warning: checks [source-sessions] crashed
+during this scan — results are incomplete. Re-run after the crash is
+resolved to get a full report."
 
 Example:
 
@@ -188,7 +196,10 @@ vault_doctor apply complete
 Backups saved to: ~/.claude/obsidian-brain-doctor-backup/2026-04-11T17-04-22+00-00/
 ```
 
-If any errors occurred (exit code 2), surface them prominently and recommend the user diff one of the backup files under the backup root to understand what went wrong.
+If exit code is 2, distinguish the source:
+
+- **Apply errors (fixes failed):** Surface the failed-fix lines from stderr prominently and recommend the user diff one of the backup files under the backup root to understand what went wrong.
+- **"CHECK CRASHED" or "APPLY CRASHED" on stderr:** Report which check(s) crashed by name. For an apply crash, warn that fixes for that check may be **partially applied** (backups exist under the backup root for anything that ran before the crash). For a scan crash, note that nothing was applied for that check and **no backups exist** for it.
 
 ### Step 6 — Offer next steps
 

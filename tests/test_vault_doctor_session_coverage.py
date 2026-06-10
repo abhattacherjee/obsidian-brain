@@ -699,6 +699,30 @@ class TestReconstruct:
         assert len(issues) == 1
         assert issues[0].extra["unresolved"] is True
 
+    def test_reconstruct_true_sets_confidence_0_9(self, sc_env):
+        """reconstruct=True makes the gap resolvable, so it carries an
+        applyable-repair confidence of 0.9 (consistent with canonicalization
+        proposals and audit category-A restores) — otherwise --min-confidence
+        would silently nullify --reconstruct."""
+        sid = "reconstruct-conf-sid-0003"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=5, duration_minutes=10)
+
+        issues = _scan(sc_env, reconstruct=True)
+        assert len(issues) == 1
+        assert issues[0].confidence == 0.9
+
+    def test_reconstruct_false_keeps_confidence_0_0(self, sc_env):
+        """Without reconstruct, the gap is unresolved — confidence stays 0.0
+        (no proposed repair)."""
+        sid = "reconstruct-conf-sid-0004"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=5, duration_minutes=10)
+
+        issues = _scan(sc_env, reconstruct=False)
+        assert len(issues) == 1
+        assert issues[0].confidence == 0.0
+
 
 # ---------------------------------------------------------------------------
 # Test 8: project filter
@@ -1262,6 +1286,116 @@ class TestApply:
         with pytest.raises(RuntimeError, match="refuses signal_class"):
             sc.apply([issue], str(tmp_path / "backup"))
 
+    def test_apply_non_string_outcome_is_error_not_crash(self, tmp_path, monkeypatch):
+        """A malformed replay payload with a NON-STRING outcome (e.g. a JSON
+        number) must map to a per-issue 'error' Result — not raise
+        AttributeError on outcome.startswith()."""
+        issue = self._make_issue(
+            "apply-bad-outcome-sid-0008",
+            str(tmp_path / "apply-bad-outcome-sid-0008.jsonl"),
+            "/path/to/my-proj",
+            str(tmp_path / "2026-04-24-my-proj-qqqq.md"),
+        )
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps({"outcome": 123, "vault_writes": []})
+        mock_result.stderr = ""
+        monkeypatch.setattr(subprocess, "run", MagicMock(return_value=mock_result))
+
+        results = sc.apply([issue], str(tmp_path / "backup"))
+        assert len(results) == 1
+        assert results[0].status == "error"
+        assert "123" in (results[0].error or "")
+
+    def test_apply_none_outcome_is_error_not_crash(self, tmp_path, monkeypatch):
+        """outcome: null in the replay payload → per-issue error, no crash."""
+        issue = self._make_issue(
+            "apply-null-outcome-sid-0009",
+            str(tmp_path / "apply-null-outcome-sid-0009.jsonl"),
+            "/path/to/my-proj",
+            str(tmp_path / "2026-04-24-my-proj-rrrr.md"),
+        )
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps({"outcome": None, "vault_writes": []})
+        mock_result.stderr = ""
+        monkeypatch.setattr(subprocess, "run", MagicMock(return_value=mock_result))
+
+        results = sc.apply([issue], str(tmp_path / "backup"))
+        assert len(results) == 1
+        assert results[0].status == "error"
+
+    def test_apply_non_list_vault_writes_is_error_and_sweep_continues(
+        self, tmp_path, monkeypatch
+    ):
+        """Success outcome with a NON-LIST vault_writes (broken replay
+        contract) → per-issue 'error'; the sweep continues to the next issue
+        instead of raising TypeError/IndexError."""
+        issue_bad = self._make_issue(
+            "apply-malformed-writes-sid-0010",
+            str(tmp_path / "apply-malformed-writes-sid-0010.jsonl"),
+            "/path/to/my-proj",
+            str(tmp_path / "2026-04-24-my-proj-ssss.md"),
+        )
+        issue_ok = self._make_issue(
+            "apply-malformed-writes-sid-0011",
+            str(tmp_path / "apply-malformed-writes-sid-0011.jsonl"),
+            "/path/to/my-proj",
+            str(tmp_path / "2026-04-24-my-proj-tttt.md"),
+        )
+        bad = MagicMock()
+        bad.returncode = 0
+        bad.stdout = json.dumps(
+            {"outcome": "OK_RAW_NOTE_ONLY", "vault_writes": "not-a-list"}
+        )
+        bad.stderr = ""
+        actual = str(tmp_path / "2026-06-09-my-proj-tttt.md")
+        good = _mock_replay_result("OK_RAW_NOTE_ONLY", vault_writes=[[actual, 99]])
+        monkeypatch.setattr(subprocess, "run", MagicMock(side_effect=[bad, good]))
+
+        results = sc.apply([issue_bad, issue_ok], str(tmp_path / "backup"))
+        assert len(results) == 2, "sweep must continue past the malformed payload"
+        assert results[0].status == "error"
+        assert "vault_writes" in (results[0].error or "")
+        assert results[1].status == "applied"
+        assert results[1].note_path == actual
+
+    def test_apply_empty_inner_vault_writes_entry_is_error(self, tmp_path, monkeypatch):
+        """vault_writes=[[]] (empty inner entry) → per-issue 'error', not
+        IndexError on vault_writes[0][0]."""
+        issue = self._make_issue(
+            "apply-empty-inner-sid-0012",
+            str(tmp_path / "apply-empty-inner-sid-0012.jsonl"),
+            "/path/to/my-proj",
+            str(tmp_path / "2026-04-24-my-proj-uuuu.md"),
+        )
+        monkeypatch.setattr(subprocess, "run", MagicMock(
+            return_value=_mock_replay_result("OK_RAW_NOTE_ONLY", vault_writes=[[]]),
+        ))
+        results = sc.apply([issue], str(tmp_path / "backup"))
+        assert len(results) == 1
+        assert results[0].status == "error"
+        assert "vault_writes" in (results[0].error or "")
+
+    def test_apply_empty_vault_writes_error_mentions_note_check(
+        self, tmp_path, monkeypatch
+    ):
+        """The 'wrote nothing' error guides the operator to verify the note
+        before re-running (the replay may have partially succeeded)."""
+        issue = self._make_issue(
+            "apply-empty-writes-hint-sid-0013",
+            str(tmp_path / "apply-empty-writes-hint-sid-0013.jsonl"),
+            "/path/to/my-proj",
+            str(tmp_path / "2026-04-24-my-proj-vvvv.md"),
+        )
+        monkeypatch.setattr(subprocess, "run", MagicMock(
+            return_value=_mock_replay_result("OK_RAW_NOTE_ONLY", vault_writes=[]),
+        ))
+        results = sc.apply([issue], str(tmp_path / "backup"))
+        assert len(results) == 1
+        assert results[0].status == "error"
+        assert "check whether the note now exists" in (results[0].error or "")
+
     def test_replay_script_exists_in_repo(self):
         """apply() shells out to replay-sessionend.py — pin its in-repo path
         so a rename/move breaks loudly here, not silently at apply-time."""
@@ -1369,6 +1503,15 @@ class TestSummaryPartition:
         assert bt == 1
         assert unparsable == 1
         assert gaps + covered + bt + unparsable + proj_filt == total
+
+    def test_summary_printed_even_when_nothing_scanned(self, sc_env, capsys):
+        """An empty projects root (dir exists, no project dirs) still prints
+        the end-of-scan summary with zero counts — a silent scan is
+        indistinguishable from a scan that never ran."""
+        issues = _scan(sc_env)
+        assert issues == []
+        _, err = capsys.readouterr()
+        assert "scanned 0 jsonl(s) across 0 project dir(s)" in err
 
 
 # ---------------------------------------------------------------------------
@@ -1487,6 +1630,51 @@ class TestCLIE2E:
             f"expected usage error (3), got {r.returncode}:\n{r.stderr}"
         )
         assert "--strict is only consumed by an opt-in check" in r.stderr
+
+    def test_named_non_consumer_check_with_strict_is_usage_error(self, sc_env):
+        """--check source-sessions --strict → exit 3 (the guard also fires
+        when a NAMED check doesn't consume the flag, not only on the default
+        sweep). Coverage pin for vault_doctor.py's unconsumed-flag guard."""
+        r = self._run(sc_env, "--strict", check="source-sessions")
+        assert r.returncode == 3, (
+            f"expected usage error (3), got {r.returncode}:\n{r.stderr}"
+        )
+        assert "--strict is only consumed by an opt-in check" in r.stderr
+        assert "--check session-coverage" in r.stderr
+
+    def test_reconstruct_gap_survives_min_confidence(self, sc_env):
+        """--reconstruct + --min-confidence 0.5: a resolvable gap carries
+        confidence 0.9 and must SURVIVE the filter (reported, exit 1) —
+        otherwise --min-confidence silently nullifies --reconstruct."""
+        sid = "cli-e2e-minconf-reconstruct-0001"
+        cwd = "/Users/abhishek/dev/claude_workspace/obsidian-brain"
+        _write_jsonl(sc_env["projects"], "-ob", sid, cwd, n_user=5, duration_minutes=10)
+
+        r = self._run(sc_env, "--reconstruct", "--min-confidence", "0.5")
+        assert r.returncode == 1, (
+            f"expected 1 (gap survives filter), got {r.returncode}:\n{r.stderr}"
+        )
+        payload = json.loads(r.stdout)
+        assert payload["total_issues"] == 1
+        row = payload["issues"][0]
+        assert row["confidence"] == 0.9
+        assert row["unresolved"] is False
+
+    def test_unresolved_gap_dropped_by_min_confidence(self, sc_env):
+        """Without --reconstruct the gap is unresolved (confidence 0.0) and
+        --min-confidence 0.5 drops it: qualified clean line, exit 0."""
+        sid = "cli-e2e-minconf-noreconstruct-0002"
+        cwd = "/Users/abhishek/dev/claude_workspace/obsidian-brain"
+        _write_jsonl(sc_env["projects"], "-ob", sid, cwd, n_user=5, duration_minutes=10)
+
+        r = self._run(sc_env, "--min-confidence", "0.5")
+        assert r.returncode == 0, (
+            f"expected 0 (gap filtered), got {r.returncode}:\n{r.stderr}"
+        )
+        payload = json.loads(r.stdout)
+        assert payload["total_issues"] == 0
+        assert payload["dropped_by_confidence"] == 1
+        assert "clean at --min-confidence 0.5" in r.stderr
 
     def test_full_sweep_without_extra_flags_unaffected(self, sc_env):
         """Default sweep WITHOUT --strict/--reconstruct stays on the normal

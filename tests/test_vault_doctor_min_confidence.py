@@ -41,60 +41,66 @@ def _make_issue(confidence: float, note_path: str = "/tmp/fake.md") -> Issue:
 
 
 # ---------------------------------------------------------------------------
-# Unit: filter semantics
+# Unit: filter semantics (calls the PRODUCTION predicate, vault_doctor.
+# _confidence_passes — the same function main() uses to filter issues; a
+# locally re-implemented comprehension would keep passing even if the
+# production operator regressed)
 # ---------------------------------------------------------------------------
 
 class TestMinConfidenceFilter:
-    """Verify the >= filter semantics described in the issue test plan."""
+    """Verify the >= filter semantics via the production predicate."""
 
     def test_threshold_0_9_keeps_two_of_four(self):
         """Issues with conf [0.4, 0.6, 0.99, 0.99] → threshold 0.9 keeps 2."""
+        import vault_doctor
         issues = [
             _make_issue(0.4),
             _make_issue(0.6),
             _make_issue(0.99),
             _make_issue(0.99),
         ]
-        threshold = 0.9
-        kept = [i for i in issues if i.confidence >= threshold]
+        kept = [i for i in issues if vault_doctor._confidence_passes(i, 0.9)]
         assert len(kept) == 2
-        assert all(i.confidence >= threshold for i in kept)
+        assert all(i.confidence >= 0.9 for i in kept)
 
     def test_threshold_0_0_keeps_all_four(self):
         """Issues with conf [0.4, 0.6, 0.99, 0.99] → threshold 0.0 keeps all 4."""
+        import vault_doctor
         issues = [
             _make_issue(0.4),
             _make_issue(0.6),
             _make_issue(0.99),
             _make_issue(0.99),
         ]
-        threshold = 0.0
-        kept = [i for i in issues if i.confidence >= threshold]
+        kept = [i for i in issues if vault_doctor._confidence_passes(i, 0.0)]
         assert len(kept) == 4
 
     def test_threshold_1_0_excludes_0_99(self):
-        """Threshold 1.0 uses >= semantics → confidence=0.99 must be excluded.
-
-        Fail-first discipline: mutate >= to > and the test reverses (len==2
-        instead of 0 for [0.99, 0.99]). Document the invariant.
-        """
+        """Threshold 1.0 uses >= semantics → confidence=0.99 must be excluded."""
+        import vault_doctor
         issues = [_make_issue(0.99), _make_issue(0.99)]
-        threshold = 1.0
-        kept_ge = [i for i in issues if i.confidence >= threshold]
-        assert len(kept_ge) == 0, (
+        kept = [i for i in issues if vault_doctor._confidence_passes(i, 1.0)]
+        assert len(kept) == 0, (
             "threshold=1.0 with >= semantics must exclude conf=0.99"
         )
 
     def test_threshold_1_0_keeps_exactly_1_0(self):
         """A confidence of exactly 1.0 is kept when threshold=1.0 (>= inclusive)."""
+        import vault_doctor
         issues = [_make_issue(1.0), _make_issue(0.99)]
-        threshold = 1.0
-        kept = [i for i in issues if i.confidence >= threshold]
+        kept = [i for i in issues if vault_doctor._confidence_passes(i, 1.0)]
         assert len(kept) == 1
         assert kept[0].confidence == 1.0
 
+    def test_boundary_equal_confidence_passes(self):
+        """conf == threshold passes (>= not >): a mutation to strict > in
+        _confidence_passes reverses this assertion."""
+        import vault_doctor
+        assert vault_doctor._confidence_passes(_make_issue(0.99), 0.99) is True
+
     def test_unresolved_confidence_zero_filtered_at_threshold_gt_0(self):
         """Unresolved issues have confidence=0.0; threshold > 0.0 drops them."""
+        import vault_doctor
         unresolved = Issue(
             check="source-sessions",
             note_path="/tmp/unresolved.md",
@@ -105,32 +111,7 @@ class TestMinConfidenceFilter:
             confidence=0.0,
             extra={"unresolved": True, "signal_class": "unresolved"},
         )
-        kept = [i for i in [unresolved] if i.confidence >= 0.9]
-        assert len(kept) == 0
-
-
-# ---------------------------------------------------------------------------
-# Fail-first discipline evidence
-# ---------------------------------------------------------------------------
-
-class TestFailFirst:
-    """Demonstrate that changing the filter operator from >= to > reverses the
-    threshold=1.0 test and confirms confidence=0.99 handling is correct."""
-
-    def test_mutated_gt_includes_0_99_as_control(self):
-        """Using > (not >=) for threshold=1.0 would keep 0.99 — confirming
-        our production >= is the correct, tighter semantics."""
-        issues = [_make_issue(0.99), _make_issue(0.99)]
-        threshold = 1.0
-        # Deliberately use > to show the mutation would make the test pass
-        kept_gt = [i for i in issues if i.confidence > threshold]
-        # > does NOT include 0.99 when threshold=1.0 either (0.99 > 1.0 is False)
-        # Let's use threshold=0.9 to show >= vs > difference
-        threshold_sub = 0.99
-        kept_ge = [i for i in issues if i.confidence >= threshold_sub]
-        kept_gt_sub = [i for i in issues if i.confidence > threshold_sub]
-        assert len(kept_ge) == 2, ">= 0.99 includes conf=0.99"
-        assert len(kept_gt_sub) == 0, "> 0.99 excludes conf=0.99 — mutation reverses the test"
+        assert vault_doctor._confidence_passes(unresolved, 0.9) is False
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +360,9 @@ class TestMinConfidenceCLI:
         )
         assert "dropped_by_confidence" not in payload, (
             "back-compat: dropped_by_confidence must NOT appear in JSON without the flag"
+        )
+        assert "crashed_checks" not in payload, (
+            "back-compat: crashed_checks must NOT appear in JSON on a clean run"
         )
 
     def test_apply_yes_min_confidence_0_9_modifies_only_high_conf(self, tmp_path):

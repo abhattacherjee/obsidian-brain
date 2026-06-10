@@ -15,7 +15,9 @@ Config priority:
 Exit codes:
   0 — clean, no issues
   1 — issues found (dry-run or successful apply)
-  2 — apply errors (one or more fixes failed)
+  2 — apply errors, or one or more checks crashed (scan or apply;
+      results incomplete — see crashed_checks in --json / "CHECK CRASHED"
+      on stderr)
   3 — usage error (bad args, no config)
 """
 
@@ -26,6 +28,7 @@ import json
 import math
 import os
 import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -141,7 +144,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "Applies to both the dry-run report and --apply — the preview always "
             "matches the apply scope. "
             "Note: unresolved issues have confidence=0.0 and are filtered out "
-            "when threshold > 0.0, since their proposed repair is unknown."
+            "when threshold > 0.0, since their proposed repair is unknown. "
+            "Reconstructable session-coverage gaps (--reconstruct) are "
+            "resolvable and carry confidence=0.9, so they survive thresholds "
+            "up to 0.9."
         ),
     )
     return p
@@ -198,10 +204,47 @@ def _confidence_passes(issue, threshold: float) -> bool:
     return c >= threshold
 
 
+def _issue_row(i) -> dict:
+    row = {
+        "check": i.check,
+        "note_path": i.note_path,
+        "project": i.project,
+        "current_source": i.current_source,
+        "proposed_source": i.proposed_source,
+        "reason": i.reason,
+        "confidence": i.confidence,
+        "unresolved": i.extra.get("unresolved", False),
+        "signal_class": i.extra.get("signal_class", ""),
+        "capture_signal": i.extra.get("capture_signal", ""),
+        "capture_confidence": i.extra.get("capture_confidence", 0.0),
+        # convergence_warning/convergence_count are deprecated as of #106
+        # (UUID-first matching obsoleted the convergence guard). Kept in the
+        # payload as hard-coded defaults for downstream schema stability;
+        # consumers should migrate to signal_class for triage.
+        "convergence_warning": i.extra.get("convergence_warning", False),
+        "convergence_count": i.extra.get("convergence_count", 0),
+    }
+    # Conditionally surfaced extras (currently from session-coverage,
+    # #98): only added when the issue's extra dict carries them, so
+    # rows from other checks are byte-identical to the prior schema.
+    if "sid" in i.extra:
+        row["sid"] = i.extra["sid"]
+    if "strict_fail" in i.extra:
+        row["strict_fail"] = i.extra["strict_fail"]
+    if "jsonl_path" in i.extra:
+        row["jsonl_path"] = i.extra["jsonl_path"]
+    if "referenced_by" in i.extra:
+        row["referenced_by_count"] = len(i.extra.get("referenced_by", []))
+    return row
+
+
 def _print_report_human(issues_by_check: dict, min_confidence: float = 0.0,
                         dropped_per_check: dict | None = None,
-                        multi_check: bool = False) -> None:
+                        multi_check: bool = False,
+                        dropped_per_signal_class: dict | None = None,
+                        crashed_checks: list | None = None) -> None:
     dropped_per_check = dropped_per_check or {}
+    dropped_per_signal_class = dropped_per_signal_class or {}
     dropped_total = sum(dropped_per_check.values())
     total = sum(len(v) for v in issues_by_check.values())
     header = f"\nvault_doctor report — {total} issue(s) across {len(issues_by_check)} check(s)"
@@ -214,7 +257,23 @@ def _print_report_human(issues_by_check: dict, min_confidence: float = 0.0,
         if multi_check and dropped_per_check:
             breakdown = ", ".join(f"{k}: {v}" for k, v in dropped_per_check.items())
             header += f" ({breakdown})"
+        # Signal-class attribution for dropped issues (always, including
+        # single-check runs): infrastructure rows like historic-unreadable
+        # must stay visible when swallowed by the filter.
+        if dropped_per_signal_class:
+            cls_parts = "; ".join(
+                f"{chk}: " + ", ".join(
+                    f"{n} {cls}" for cls, n in classes.items()
+                )
+                for chk, classes in dropped_per_signal_class.items()
+            )
+            header += f"; by class: {cls_parts}"
         header += "]"
+    if crashed_checks:
+        header += (
+            f" [{len(crashed_checks)} check(s) crashed:"
+            f" {', '.join(crashed_checks)} — results incomplete]"
+        )
     print(header, file=sys.stderr)
     for check_name, issues in issues_by_check.items():
         by_project: dict[str, list] = {}
@@ -277,9 +336,23 @@ def main() -> int:
             return 3
 
     issues_by_check: dict = {}
+    # Checks whose scan() or apply() raised: contained per check so one buggy
+    # check cannot take down the whole run. Any entry forces the exit-2 path
+    # — the results are incomplete and must not read as clean.
+    crashed_checks: list[str] = []
     for mod in modules:
         days = args.days if args.days is not None else getattr(mod, "DEFAULT_WINDOW_DAYS", 7)
-        issues = _run_scan(mod, cfg, days, args.project, args=args)
+        try:
+            issues = _run_scan(mod, cfg, days, args.project, args=args)
+        except Exception as exc:  # noqa: BLE001 — per-check crash containment
+            print(
+                f"[vault_doctor] CHECK CRASHED: {mod.NAME}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            traceback.print_exc(file=sys.stderr)
+            crashed_checks.append(mod.NAME)
+            continue
         if issues:
             issues_by_check[mod.NAME] = issues
 
@@ -293,10 +366,24 @@ def main() -> int:
     # attribution it would be indistinguishable from a clean check.
     dropped_by_confidence = 0
     dropped_per_check: dict[str, int] = {}
+    # Per-signal_class attribution for dropped issues (attribution only — no
+    # filter exemption): infrastructure rows (e.g. historic-unreadable) carry
+    # confidence=0.0 and would otherwise vanish indistinguishably from
+    # ordinary low-confidence proposals. Shape: {check: {signal_class: n}};
+    # dropped issues without a signal_class only count in dropped_per_check.
+    dropped_per_signal_class: dict[str, dict[str, int]] = {}
     if args.min_confidence > 0.0:
         filtered: dict = {}
         for check_name, issues in issues_by_check.items():
-            kept = [i for i in issues if _confidence_passes(i, args.min_confidence)]
+            kept = []
+            for i in issues:
+                if _confidence_passes(i, args.min_confidence):
+                    kept.append(i)
+                    continue
+                scls = i.extra.get("signal_class", "")
+                if scls:
+                    per_cls = dropped_per_signal_class.setdefault(check_name, {})
+                    per_cls[scls] = per_cls.get(scls, 0) + 1
             n_dropped = len(issues) - len(kept)
             if n_dropped:
                 dropped_per_check[check_name] = n_dropped
@@ -309,39 +396,6 @@ def main() -> int:
 
     # JSON output for skill consumption
     if args.json_out:
-        def _issue_row(i) -> dict:
-            row = {
-                "check": i.check,
-                "note_path": i.note_path,
-                "project": i.project,
-                "current_source": i.current_source,
-                "proposed_source": i.proposed_source,
-                "reason": i.reason,
-                "confidence": i.confidence,
-                "unresolved": i.extra.get("unresolved", False),
-                "signal_class": i.extra.get("signal_class", ""),
-                "capture_signal": i.extra.get("capture_signal", ""),
-                "capture_confidence": i.extra.get("capture_confidence", 0.0),
-                # convergence_warning/convergence_count are deprecated as of #106
-                # (UUID-first matching obsoleted the convergence guard). Kept in the
-                # payload as hard-coded defaults for downstream schema stability;
-                # consumers should migrate to signal_class for triage.
-                "convergence_warning": i.extra.get("convergence_warning", False),
-                "convergence_count": i.extra.get("convergence_count", 0),
-            }
-            # Conditionally surfaced extras (currently from session-coverage,
-            # #98): only added when the issue's extra dict carries them, so
-            # rows from other checks are byte-identical to the prior schema.
-            if "sid" in i.extra:
-                row["sid"] = i.extra["sid"]
-            if "strict_fail" in i.extra:
-                row["strict_fail"] = i.extra["strict_fail"]
-            if "jsonl_path" in i.extra:
-                row["jsonl_path"] = i.extra["jsonl_path"]
-            if "referenced_by" in i.extra:
-                row["referenced_by_count"] = len(i.extra.get("referenced_by", []))
-            return row
-
         payload = {
             "timestamp": _iso_now(),
             "total_issues": total_issues,
@@ -359,14 +413,34 @@ def main() -> int:
             payload["min_confidence"] = args.min_confidence
             payload["dropped_by_confidence"] = dropped_by_confidence
             payload["dropped_per_check"] = dropped_per_check
+            # Signal-class attribution: only when at least one dropped issue
+            # carried a signal_class (conditional-key convention).
+            if dropped_per_signal_class:
+                payload["dropped_per_signal_class"] = dropped_per_signal_class
+        # Crash containment: key only present when a check crashed
+        # (conditional-key convention — clean runs are byte-identical).
+        if crashed_checks:
+            payload["crashed_checks"] = crashed_checks
         print(json.dumps(payload, indent=2))
     else:
         _print_report_human(issues_by_check,
                             min_confidence=args.min_confidence,
                             dropped_per_check=dropped_per_check,
-                            multi_check=len(modules) > 1)
+                            multi_check=len(modules) > 1,
+                            dropped_per_signal_class=dropped_per_signal_class,
+                            crashed_checks=crashed_checks)
 
     if total_issues == 0:
+        if crashed_checks:
+            # NOT clean: one or more checks never finished scanning. Saying
+            # "clean" would be a literal falsehood — and exit 2 (not 0) so
+            # automation can't mistake an incomplete run for a healthy vault.
+            print(
+                f"vault_doctor: 0 issues, but {len(crashed_checks)} check(s) "
+                f"crashed — results incomplete",
+                file=sys.stderr,
+            )
+            return 2
         if dropped_by_confidence > 0:
             # All issues were filtered out — saying just "clean" would be a
             # literal falsehood. Exit stays 0 by decision (no new exit code);
@@ -382,7 +456,9 @@ def main() -> int:
         return 0
 
     if not args.apply:
-        return 1  # issues found, not applied (dry-run default)
+        # Issues found, not applied (dry-run default). A crashed check still
+        # forces exit 2 — the report above is incomplete.
+        return 2 if crashed_checks else 1
 
     # --apply: per-project confirmation
     backup_root = os.path.expanduser(
@@ -412,7 +488,24 @@ def main() -> int:
                 if answer not in ("y", "yes"):
                     print(f"  skipped {proj}", file=sys.stderr)
                     continue
-            results = mod.apply(resolvable, backup_root)
+            try:
+                results = mod.apply(resolvable, backup_root)
+            except Exception as exc:  # noqa: BLE001 — per-check crash containment
+                print(
+                    f"[vault_doctor] APPLY CRASHED: {mod.NAME}: "
+                    f"{type(exc).__name__}: {exc} — apply for this check "
+                    f"aborted mid-run; some fixes may already be applied "
+                    f"(check the backup root: {backup_root})",
+                    file=sys.stderr,
+                )
+                traceback.print_exc(file=sys.stderr)
+                if mod.NAME not in crashed_checks:
+                    crashed_checks.append(mod.NAME)
+                any_errors = True
+                # Skip this check's remaining projects (the next apply() call
+                # would most likely crash the same way) and move on to the
+                # next check.
+                break
             for r in results:
                 status_mark = {"applied": "+", "unresolved": "!", "error": "x", "skipped": "-"}.get(
                     r.status, "?"
@@ -426,7 +519,7 @@ def main() -> int:
                 if r.error:
                     print(f"      {r.error}", file=sys.stderr)
 
-    return 2 if any_errors else 1
+    return 2 if (any_errors or crashed_checks) else 1
 
 
 if __name__ == "__main__":

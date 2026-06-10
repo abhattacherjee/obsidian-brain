@@ -150,6 +150,13 @@ def scan(
     vault = Path(vault_path)
     root = _backup_root()
     if not root.is_dir():
+        # Loud no-op: a missing backup root means NOTHING was audited — a
+        # silent [] return would read as a clean bill of health.
+        print(
+            f"[audit-historic-repairs] backup root {root} not found — no "
+            f"doctor backups to audit (no-op, not a clean bill of health)",
+            file=sys.stderr,
+        )
         return []
 
     now = datetime.now(timezone.utc).timestamp()
@@ -339,17 +346,17 @@ def scan(
     # targets plus the distinct backups whose note no longer exists; the six
     # buckets partition it exactly. Every unreadable note also appended an
     # issue above, so subtract it from the classified count to avoid
-    # double-counting.
+    # double-counting. Printed UNCONDITIONALLY — an empty partition
+    # ("audited 0 backed-up note(s)") must be visible, not silent.
     audited = len(oldest) + len(missing)
-    if audited:
-        classified = len(issues) - unreadable
-        print(
-            f"[audit-historic-repairs] audited {audited} backed-up note(s):"
-            f" {classified} classified, {len(missing)} missing-current,"
-            f" {non_source} non-source-session, {no_drift} no-drift,"
-            f" {unreadable} unreadable, {project_filtered} project-filtered",
-            file=sys.stderr,
-        )
+    classified = len(issues) - unreadable
+    print(
+        f"[audit-historic-repairs] audited {audited} backed-up note(s):"
+        f" {classified} classified, {len(missing)} missing-current,"
+        f" {non_source} non-source-session, {no_drift} no-drift,"
+        f" {unreadable} unreadable, {project_filtered} project-filtered",
+        file=sys.stderr,
+    )
 
     return issues
 
@@ -432,7 +439,7 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(
-                dir=str(note_path.parent), prefix=".vd-audithist-", suffix=".tmp",
+                dir=str(note_path.parent), prefix=".vd-audithist-", suffix=".md.tmp",
             )
             try:
                 os.write(fd, new_content.encode("utf-8"))
