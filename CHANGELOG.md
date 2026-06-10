@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`vault-doctor --check project-name-canonicalization` (#99)** — new **opt-in**,
+  one-time backfill check that rewrites worktree-slug project names (e.g.,
+  `obsidian-brain--issue-81-duplicate-sid-collision`) to the canonical main-repo
+  basename (e.g., `obsidian-brain`) in session notes and insights. Phase 1
+  processes all session notes: for each `project_path:` field, runs
+  `git rev-parse --git-common-dir` (cached per path) to derive the canonical
+  name, then proposes rewriting `project:` and the `claude/project/<name>` tag
+  in the frontmatter block. Phase 2 processes insights/decisions/error-fixes/retros:
+  each `source_session:` UUID is looked up in the Phase-1 index (using the
+  CANONICAL value, not the note's current frontmatter) and the same rewrite is
+  proposed. Edge cases: missing `project_path`, deleted path, git
+  unavailable/timed out, or insight with no resolvable session all emit WARN
+  unresolved rows (never auto-applied). Non-git project dirs are left alone (cwd
+  basename is canonical). `confidence=0.9` for resolvable rewrites; `0.0` for
+  WARN rows. `DEFAULT_WINDOW_DAYS=9999` scans all notes. Excluded from the
+  default all-checks sweep (`OPT_IN=True`); run explicitly via
+  `--check project-name-canonicalization`.
 - **`vault-doctor --check session-coverage` (#98)** — new **opt-in** check that
   detects SessionEnd-hook coverage gaps: for each `<sid>.jsonl` under
   `~/.claude/projects/`, it verifies that a corresponding session note exists in
