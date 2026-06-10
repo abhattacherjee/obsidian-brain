@@ -18,6 +18,7 @@ Audit and repair the Obsidian vault. Ships with one check initially (`source-ses
 - `/vault-doctor --check source-sessions` — run one specific check
 - `/vault-doctor --check snapshot-integrity` — snapshot orphans, broken backlinks, stale/missing session snapshot lists, status/summary mismatches
 - `/vault-doctor --check snapshot-migration` — migrate pre-spec snapshots (legacy filenames, missing status/backlink fields, missing session snapshot lists). Runs 4 ordered sub-checks; idempotent.
+- `/vault-doctor --check session-coverage` — detect SessionEnd-hook coverage gaps: JSONLs in `~/.claude/projects/` with no corresponding session note. **Opt-in** — excluded from the default all-checks sweep (heavy all-projects JSONL walk); must be named via `--check`. Sessions below the configured `min_messages`/`min_duration_minutes` thresholds are excluded (the hook would also skip them; only text-bearing user messages count). Add `--strict` to emit `FAIL:` (not `WARN:`) when any note references the orphaned session via `source_session` (changes the reason prefix only, not the exit code). Add `--reconstruct` to enable `--apply` to reconstruct the missing note by re-running the SessionEnd hook via `replay-sessionend.py` (never automatic; always requires `--apply`). `--days` bounds JSONL mtime age (default 30). Note: the per-gap project name is derived from the JSONL's `cwd` basename, so `--project` expects the cwd-basename slug — worktree sessions may display a non-canonical expected note path (detection itself is session_id/hash-based and unaffected).
 - `/vault-doctor --check audit-historic-repairs` — one-shot audit of historic source-sessions repairs: diffs doctor backups against current notes, classifies each repair (A restore / B keep / C ambiguous / D both-wrong) by date agreement, and restores category-A mtime-bug corruptions on `fix`. **Opt-in** — excluded from the default all-checks sweep; must be named via `--check`. `--days` bounds backup-run age (default 180).
 - `/vault-doctor --days 14` — override default window (default: 7 days)
 - `/vault-doctor --project obsidian-brain` — limit to one project
@@ -36,6 +37,8 @@ Parse the user's invocation into flags:
 - `--check <name>` → specific check only
 - `--days <N>` → window override
 - `--project <name>` → project filter
+- `--strict` → set STRICT=1 (session-coverage only: FAIL instead of WARN on referenced gaps)
+- `--reconstruct` → set RECONSTRUCT=1 (session-coverage only: mark gaps resolvable for apply)
 
 Locate the Python dispatcher via the standard plugin cache glob, with a fallback for local dev sessions where the repo is checked out as `$PWD`:
 
@@ -67,6 +70,8 @@ ARGS=()
 [[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
 [[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
 [[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
+[[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
+[[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
 ARGS+=(--json)
 python3 "$DISPATCHER" "${ARGS[@]}"
 ```
@@ -157,6 +162,8 @@ ARGS=()
 [[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
 [[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
 [[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
+[[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
+[[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
 ARGS+=(--apply)
 python3 "$DISPATCHER" "${ARGS[@]}"
 ```

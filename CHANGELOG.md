@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`vault-doctor --check session-coverage` (#98)** — new **opt-in** check that
+  detects SessionEnd-hook coverage gaps: for each `<sid>.jsonl` under
+  `~/.claude/projects/`, it verifies that a corresponding session note exists in
+  the vault. Excluded from the default all-checks sweep (heavy all-projects JSONL
+  walk + standing-audit semantics) — run it explicitly via `--check
+  session-coverage`. Sessions below the configured
+  `min_messages`/`min_duration_minutes` thresholds are excluded using the hook's
+  own text-bearing message-count semantics (tool_result-only user entries don't
+  count), and the check is a no-op when `auto_log_enabled` is false. Reports the
+  expected note path, JSONL size, and a `referenced_by` count so orphaned
+  sessions whose insights are already in the vault are prioritized for recovery.
+  Gap rows in the `--json` payload carry additional fields: `sid`, `jsonl_path`,
+  `strict_fail`, and `referenced_by_count` (only on rows that have them — other
+  checks' rows are unchanged). New flags:
+  - **`--strict`** — emit `FAIL:` (not `WARN:`) when any note references the
+    orphaned session via `source_session`, raising priority in CI/operator
+    reports. Changes the reason prefix only — the exit code is unaffected.
+  - **`--reconstruct`** — mark gaps as resolvable and enable `--apply` to re-run
+    the SessionEnd hook via `scripts/dev-test/replay-sessionend.py`, writing the
+    missing session note. Never runs automatically — requires explicit `--apply`.
 - **`vault-doctor --check audit-historic-repairs` (#95)** — one-shot, opt-in audit
   of historic source-sessions repairs. Walks the doctor backup runs under
   `~/.claude/obsidian-brain-doctor-backup/`, diffs each backed-up note's

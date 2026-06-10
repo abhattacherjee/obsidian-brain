@@ -86,6 +86,14 @@ def _load_config(args) -> dict:
     return {"vault": vault, "sessions_folder": sessions, "insights_folder": insights}
 
 
+# Extra per-check scan flags (consumed via a module's EXTRA_SCAN_FLAGS
+# declaration). Kept as a module-level tuple NEXT TO the arg definitions in
+# _build_parser so the parser and the main() unconsumed-flag guard can't
+# drift apart: adding a new extra flag means adding it here AND adding the
+# matching p.add_argument below.
+_EXTRA_FLAG_NAMES = ("strict", "reconstruct")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="vault_doctor")
     p.add_argument("--check", dest="check", default=None, help="run only this check by name")
@@ -98,6 +106,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="assume yes for all confirmations")
     p.add_argument("--json", dest="json_out", action="store_true",
                    help="emit JSON on stdout (for skill integration)")
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "for session-coverage: emit FAIL (not WARN) when any note references "
+            "an orphaned session via source_session. Changes the issue reason "
+            "prefix only — the exit code is unaffected"
+        ),
+    )
+    p.add_argument(
+        "--reconstruct",
+        action="store_true",
+        help=(
+            "for session-coverage: mark gaps as resolvable and enable apply() to "
+            "re-run the SessionEnd hook via replay-sessionend.py"
+        ),
+    )
     return p
 
 
@@ -105,13 +130,30 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _run_scan(mod, cfg: dict, days: int, project: str | None) -> list:
+def _run_scan(mod, cfg: dict, days: int, project: str | None, args=None) -> list:
+    """Run a check module's scan(), forwarding any EXTRA_SCAN_FLAGS it declares.
+
+    Modules that declare ``EXTRA_SCAN_FLAGS = ("flag_name", ...)`` receive those
+    flags as keyword arguments, forwarded UNCONDITIONALLY (store_true flags
+    yield real bools, so there is no None case to skip). A module declaring a
+    flag with no matching argparse attribute is a contract violation — the
+    bare getattr() raises AttributeError loudly instead of silently dropping
+    the flag. Modules without ``EXTRA_SCAN_FLAGS`` are called with the
+    unchanged positional signature.
+    """
+    extra_kwargs: dict = {}
+    if args is not None:
+        for flag in getattr(mod, "EXTRA_SCAN_FLAGS", ()):
+            # No default: a declared flag without an argparse attribute must
+            # raise AttributeError (contract violation), not be dropped.
+            extra_kwargs[flag] = getattr(args, flag)
     return mod.scan(
         cfg["vault"],
         cfg["sessions_folder"],
         cfg["insights_folder"],
         days,
         project=project,
+        **extra_kwargs,
     )
 
 
@@ -157,10 +199,24 @@ def main() -> int:
         print("error: no checks registered", file=sys.stderr)
         return 3
 
+    # Guard against silently-dropped extra flags: session-coverage (the only
+    # EXTRA_SCAN_FLAGS consumer) is OPT_IN, so a default sweep with
+    # --reconstruct/--strict would otherwise evaporate the flag with zero
+    # output — the user would believe reconstruction/strict was attempted.
+    consumed = {f for m in modules for f in getattr(m, "EXTRA_SCAN_FLAGS", ())}
+    for flag in _EXTRA_FLAG_NAMES:
+        if getattr(args, flag) and flag not in consumed:
+            print(
+                f"error: --{flag} is only consumed by an opt-in check that is "
+                f"not selected; run with --check session-coverage",
+                file=sys.stderr,
+            )
+            return 3
+
     issues_by_check: dict = {}
     for mod in modules:
         days = args.days if args.days is not None else getattr(mod, "DEFAULT_WINDOW_DAYS", 7)
-        issues = _run_scan(mod, cfg, days, args.project)
+        issues = _run_scan(mod, cfg, days, args.project, args=args)
         if issues:
             issues_by_check[mod.NAME] = issues
 
@@ -168,29 +224,44 @@ def main() -> int:
 
     # JSON output for skill consumption
     if args.json_out:
+        def _issue_row(i) -> dict:
+            row = {
+                "check": i.check,
+                "note_path": i.note_path,
+                "project": i.project,
+                "current_source": i.current_source,
+                "proposed_source": i.proposed_source,
+                "reason": i.reason,
+                "confidence": i.confidence,
+                "unresolved": i.extra.get("unresolved", False),
+                "signal_class": i.extra.get("signal_class", ""),
+                "capture_signal": i.extra.get("capture_signal", ""),
+                "capture_confidence": i.extra.get("capture_confidence", 0.0),
+                # convergence_warning/convergence_count are deprecated as of #106
+                # (UUID-first matching obsoleted the convergence guard). Kept in the
+                # payload as hard-coded defaults for downstream schema stability;
+                # consumers should migrate to signal_class for triage.
+                "convergence_warning": i.extra.get("convergence_warning", False),
+                "convergence_count": i.extra.get("convergence_count", 0),
+            }
+            # Conditionally surfaced extras (currently from session-coverage,
+            # #98): only added when the issue's extra dict carries them, so
+            # rows from other checks are byte-identical to the prior schema.
+            if "sid" in i.extra:
+                row["sid"] = i.extra["sid"]
+            if "strict_fail" in i.extra:
+                row["strict_fail"] = i.extra["strict_fail"]
+            if "jsonl_path" in i.extra:
+                row["jsonl_path"] = i.extra["jsonl_path"]
+            if "referenced_by" in i.extra:
+                row["referenced_by_count"] = len(i.extra.get("referenced_by", []))
+            return row
+
         payload = {
             "timestamp": _iso_now(),
             "total_issues": total_issues,
             "issues": [
-                {
-                    "check": i.check,
-                    "note_path": i.note_path,
-                    "project": i.project,
-                    "current_source": i.current_source,
-                    "proposed_source": i.proposed_source,
-                    "reason": i.reason,
-                    "confidence": i.confidence,
-                    "unresolved": i.extra.get("unresolved", False),
-                    "signal_class": i.extra.get("signal_class", ""),
-                    "capture_signal": i.extra.get("capture_signal", ""),
-                    "capture_confidence": i.extra.get("capture_confidence", 0.0),
-                    # convergence_warning/convergence_count are deprecated as of #106
-                    # (UUID-first matching obsoleted the convergence guard). Kept in the
-                    # payload as hard-coded defaults for downstream schema stability;
-                    # consumers should migrate to signal_class for triage.
-                    "convergence_warning": i.extra.get("convergence_warning", False),
-                    "convergence_count": i.extra.get("convergence_count", 0),
-                }
+                _issue_row(i)
                 for issues in issues_by_check.values() for i in issues
             ],
         }
@@ -241,6 +312,10 @@ def main() -> int:
                 print(f"  {status_mark} {r.status}  {Path(r.note_path).name}", file=sys.stderr)
                 if r.status == "error":
                     any_errors = True
+                # Print the detail message whenever present, regardless of
+                # status — e.g. session-coverage's "skipped" Results carry the
+                # replay skip reason (SKIPPED_BELOW_THRESHOLD etc.) in error.
+                if r.error:
                     print(f"      {r.error}", file=sys.stderr)
 
     return 2 if any_errors else 1
