@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`vault-doctor --min-confidence FLOAT` (#103)** — new flag that filters issues by
+  confidence before display and before apply. Semantics: keep issues with
+  `confidence >= THRESHOLD`; default `0.0` keeps all (back-compat). Threshold
+  `1.0` excludes `conf=0.99` — the `>=` comparison is intentionally inclusive so
+  the boundary value is exact. Applies to **both** dry-run report and `--apply`
+  so the preview always matches the apply scope. Unresolved issues (`confidence=0.0`)
+  are filtered out when threshold > 0.0, which is intentional: their repair is unknown
+  so no apply would occur anyway. Range validated: out-of-range values exit 3.
+  When active, the report header gains a `[filtered: --min-confidence N, dropped K]`
+  suffix, and the JSON payload gets `min_confidence` and `dropped_by_confidence`
+  top-level keys (omitted entirely when threshold=0.0 for back-compat schema stability
+  — mirrors the conditional-row-extras pattern from #98). The filter runs in `main()`;
+  check authors do not need to opt in.
+  Resolved design question: numeric `--min-confidence` was chosen over the
+  `--canonical-only` named-subset alternative proposed in the issue. Numeric is
+  general across all checks (any Issue already has a confidence field) while
+  `--canonical-only` would be source-sessions-specific and require naming new
+  subsets as the taxonomy grows.
 - **`vault-doctor --check project-name-canonicalization` (#99)** — new **opt-in**,
   one-time backfill check that rewrites worktree-slug project names (e.g.,
   `obsidian-brain--issue-81-duplicate-sid-collision`) to the canonical main-repo

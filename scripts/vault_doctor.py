@@ -93,6 +93,10 @@ def _load_config(args) -> dict:
 # matching p.add_argument below.
 _EXTRA_FLAG_NAMES = ("strict", "reconstruct")
 
+# Range for --min-confidence (inclusive on both ends)
+_MIN_CONFIDENCE_MIN = 0.0
+_MIN_CONFIDENCE_MAX = 1.0
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="vault_doctor")
@@ -121,6 +125,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "for session-coverage: mark gaps as resolvable and enable apply() to "
             "re-run the SessionEnd hook via replay-sessionend.py"
+        ),
+    )
+    p.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.0,
+        dest="min_confidence",
+        help=(
+            "keep only issues with confidence >= THRESHOLD (0.0–1.0, inclusive). "
+            "Default 0.0 keeps all issues. "
+            "1.0 excludes issues with confidence=0.99 (use >= semantics: "
+            "threshold=1.0 requires exactly 1.0). "
+            "Applies to both the dry-run report and --apply — the preview always "
+            "matches the apply scope. "
+            "Note: unresolved issues have confidence=0.0 and are filtered out "
+            "when threshold > 0.0, since their proposed repair is unknown."
         ),
     )
     return p
@@ -157,9 +177,13 @@ def _run_scan(mod, cfg: dict, days: int, project: str | None, args=None) -> list
     )
 
 
-def _print_report_human(issues_by_check: dict) -> None:
+def _print_report_human(issues_by_check: dict, min_confidence: float = 0.0,
+                        dropped_by_confidence: int = 0) -> None:
     total = sum(len(v) for v in issues_by_check.values())
-    print(f"\nvault_doctor report — {total} issue(s) across {len(issues_by_check)} check(s)", file=sys.stderr)
+    header = f"\nvault_doctor report — {total} issue(s) across {len(issues_by_check)} check(s)"
+    if min_confidence > 0.0:
+        header += f" [filtered: --min-confidence {min_confidence}, dropped {dropped_by_confidence}]"
+    print(header, file=sys.stderr)
     for check_name, issues in issues_by_check.items():
         by_project: dict[str, list] = {}
         for i in issues:
@@ -180,6 +204,13 @@ def main() -> int:
     if args.days is not None and args.days <= 0:
         print(
             f"error: --days must be positive, got {args.days}",
+            file=sys.stderr,
+        )
+        return 3
+
+    if not (_MIN_CONFIDENCE_MIN <= args.min_confidence <= _MIN_CONFIDENCE_MAX):
+        print(
+            f"error: --min-confidence must be in [0.0, 1.0], got {args.min_confidence}",
             file=sys.stderr,
         )
         return 3
@@ -219,6 +250,21 @@ def main() -> int:
         issues = _run_scan(mod, cfg, days, args.project, args=args)
         if issues:
             issues_by_check[mod.NAME] = issues
+
+    # Apply --min-confidence filter AFTER scan, per-check. Filtering happens
+    # here in main() so check authors don't have to opt in — every Issue
+    # already has a confidence field. When threshold > 0.0, unresolved issues
+    # (confidence=0.0) are filtered from both the report and --apply, which is
+    # intentional: the dry-run preview must match the apply scope exactly.
+    dropped_by_confidence = 0
+    if args.min_confidence > 0.0:
+        filtered: dict = {}
+        for check_name, issues in issues_by_check.items():
+            kept = [i for i in issues if i.confidence >= args.min_confidence]
+            dropped_by_confidence += len(issues) - len(kept)
+            if kept:
+                filtered[check_name] = kept
+        issues_by_check = filtered
 
     total_issues = sum(len(v) for v in issues_by_check.values())
 
@@ -265,9 +311,17 @@ def main() -> int:
                 for issues in issues_by_check.values() for i in issues
             ],
         }
+        # Conditionally add confidence-filter metadata — only present when the
+        # flag was used (threshold > 0.0), so existing consumers are byte-identical
+        # to prior schema. Mirrors the conditional-row-extras pattern from #98.
+        if args.min_confidence > 0.0:
+            payload["min_confidence"] = args.min_confidence
+            payload["dropped_by_confidence"] = dropped_by_confidence
         print(json.dumps(payload, indent=2))
     else:
-        _print_report_human(issues_by_check)
+        _print_report_human(issues_by_check,
+                            min_confidence=args.min_confidence,
+                            dropped_by_confidence=dropped_by_confidence)
 
     if total_issues == 0:
         print("vault_doctor: clean", file=sys.stderr)
