@@ -7,15 +7,14 @@ Isolation strategy (mirrors test_vault_doctor_audit_historic_repairs.py):
   - The skip-logic we test (threshold, project-filter, mtime-window) requires
     real on-disk files with controlled content and timestamps.
 
-CLI e2e NOTE: We do NOT test --reconstruct's actual replay via the CLI e2e
-tests below. The monkeypatched unit tests (TestApply) exercise apply() fully
-against a fake subprocess.run. An e2e test of --reconstruct would spawn
-replay-sessionend.py against a live config + vault, requiring HOME-redirection
-at the subprocess level (HOME passed via env=) AND a valid synthetic JSONL to
-pass through hooks/obsidian_session_log._run(). The replay integration is
-already covered by tests/test_replay_cli.py; duplicating it here with a
-subprocess.run whose env dict is harder to isolate adds fragility without new
-coverage. The --strict and bare --check e2e paths are tested instead.
+CLI e2e NOTE: We do NOT e2e-test --reconstruct's actual replay via --apply.
+The monkeypatched unit tests (TestApply) exercise apply()'s outcome mapping
+against a fake subprocess.run, and TestApplyRealReplay runs apply() unmocked
+in-process (the subprocess inherits the redirected HOME from os.environ). An
+--apply e2e through the dispatcher would add a confirmation-prompt layer
+without new coverage of the replay integration, which is already covered by
+tests/test_replay_cli.py. The --reconstruct scan-only e2e (unresolved=False
+in JSON) IS tested below.
 """
 
 from __future__ import annotations
@@ -27,18 +26,23 @@ import re
 import subprocess
 import sys
 import time
+import types
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 _SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import vault_doctor  # noqa: E402
 import vault_doctor_checks  # noqa: E402
 import vault_doctor_checks.session_coverage as sc  # noqa: E402
 from vault_doctor_checks import Issue  # noqa: E402
+
+_REPO_ROOT = Path(__file__).parent.parent
+_REPLAY_SCRIPT = _REPO_ROOT / "scripts" / "dev-test" / "replay-sessionend.py"
 
 
 # ---------------------------------------------------------------------------
@@ -62,19 +66,21 @@ def _write_jsonl(
     duration_minutes: float = 10.0,
     start_ts: str = "2026-04-24T10:00:00.000Z",
     mtime_offset: float = 0,
+    n_tool_result_user: int = 0,
 ) -> Path:
     """Write a synthetic JSONL under projects_root/<project_dir_name>/<sid>.jsonl.
 
     Creates enough entries to pass/fail threshold tests:
-      n_user    — user message count
-      duration  — total window in minutes (derived from timestamp spacing)
+      n_user             — TEXT-BEARING user message count
+      duration           — total window in minutes (derived from timestamp spacing)
+      n_tool_result_user — extra type=="user" entries whose content is ONLY a
+                           tool_result block (must NOT count toward thresholds)
     """
     proj_dir = projects_root / project_dir_name
     proj_dir.mkdir(parents=True, exist_ok=True)
     jsonl = proj_dir / f"{sid}.jsonl"
 
     records = []
-    # Parse start_ts to epoch
     raw = start_ts
     if raw.endswith("Z"):
         raw = raw[:-1] + "+00:00"
@@ -100,6 +106,20 @@ def _write_jsonl(
             "timestamp": ts_iso,
             "cwd": cwd,
             "message": {"role": "assistant", "content": f"reply {i}"},
+        }))
+
+    for i in range(n_tool_result_user):
+        records.append(json.dumps({
+            "type": "user",
+            "uuid": f"22222222-0000-0000-0000-{i:012d}",
+            "timestamp": start_ts,
+            "cwd": cwd,
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": f"t{i}", "content": "ok"}
+                ],
+            },
         }))
 
     jsonl.write_text("\n".join(records) + "\n", encoding="utf-8")
@@ -179,8 +199,10 @@ def sc_env(tmp_path, monkeypatch):
         "insights_folder": "claude-insights",
         "min_messages": 3,
         "min_duration_minutes": 2.0,
+        "auto_log_enabled": True,
     }
-    (claude / "obsidian-brain-config.json").write_text(json.dumps(config))
+    config_path = claude / "obsidian-brain-config.json"
+    config_path.write_text(json.dumps(config))
 
     vault = tmp_path / "vault"
     sessions = vault / "claude-sessions"
@@ -194,6 +216,7 @@ def sc_env(tmp_path, monkeypatch):
         "vault": vault,
         "sessions": sessions,
         "insights": insights,
+        "config_path": config_path,
     }
 
 
@@ -207,6 +230,18 @@ def _scan(env, days=30, project=None, strict=False, reconstruct=False):
         strict=strict,
         reconstruct=reconstruct,
     )
+
+
+def _mock_replay_result(outcome: str, vault_writes=None, detail: str = ""):
+    """Build a MagicMock mimicking subprocess.run of replay-sessionend.py --json."""
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    payload = {"outcome": outcome, "vault_writes": vault_writes or []}
+    if detail:
+        payload["detail"] = detail
+    mock_result.stdout = json.dumps(payload)
+    mock_result.stderr = ""
+    return mock_result
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +332,31 @@ class TestCoveredViaSessionId:
             "the sid_set index is the only coverage signal for this note."
         )
 
+    def test_renamed_note_covered_by_session_id_alone(self, sc_env):
+        """A renamed note (filename hash does NOT match) whose session_id
+        frontmatter matches → covered, no gap.
+
+        This is the non-vacuous mutation killer for the sid_set arm of the
+        coverage check: the filename-hash fallback CANNOT cover this fixture
+        (the suffix is -0000, not the sid's hash), so a mutation that drops
+        the `sid in sid_set` lookup makes this test fail.
+        """
+        sid = "renamed-note-sid-9999-8888-77776666"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=5, duration_minutes=5)
+        # Renamed note: hash suffix is -0000 (mismatched), but session_id matches.
+        assert _sid_hash(sid) != "0000"
+        _write_session_note(
+            sc_env["sessions"], "2026-04-24-my-proj-0000.md",
+            session_id=sid, date="2026-04-24",
+        )
+
+        issues = _scan(sc_env)
+        assert issues == [], (
+            "session_id frontmatter alone must cover a renamed note — "
+            "if this fails, the sid_set arm of the coverage check is broken."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Test 3: covered via legacy filename-hash fallback
@@ -331,6 +391,51 @@ class TestCoveredViaLegacyHash:
         issues = _scan(sc_env)
         assert len(issues) == 1  # hash doesn't match → gap
 
+    def test_modern_note_hash_not_a_collision_candidate(self, sc_env):
+        """A MODERN note (has session_id) whose filename hash happens to equal
+        another sid's hash must NOT cover that other sid — only true-legacy
+        notes (no session_id) enter the hash fallback pool.
+        """
+        gap_sid = "collision-victim-sid-0001"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", gap_sid, cwd, n_user=5, duration_minutes=5)
+
+        # A modern note for a DIFFERENT session whose filename suffix equals
+        # gap_sid's hash (simulating a 4-hex-char collision).
+        h4 = _sid_hash(gap_sid)
+        _write_session_note(
+            sc_env["sessions"], f"2026-04-24-my-proj-{h4}.md",
+            session_id="some-other-modern-sid", date="2026-04-24",
+        )
+
+        issues = _scan(sc_env)
+        assert len(issues) == 1, (
+            "Modern note's filename hash must not enter the legacy fallback "
+            "pool — the colliding gap would be silently hidden otherwise."
+        )
+        assert issues[0].extra["sid"] == gap_sid
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    def test_unreadable_note_falls_back_to_hash_and_warns(self, sc_env, capsys):
+        """Unreadable session note → hash fallback still covers; stderr warns
+        'sid-index degraded' and the unreadable counter appears in the summary."""
+        sid = "unreadable-note-sid-0001"
+        cwd = "/path/to/my-proj"
+        date = "2026-04-24"
+        h4 = _sid_hash(sid)
+        basename = f"{date}-my-proj-{h4}.md"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=5, duration_minutes=5)
+        note = _write_session_note(sc_env["sessions"], basename, session_id=sid, date=date)
+        note.chmod(0o000)
+        try:
+            issues = _scan(sc_env)
+        finally:
+            note.chmod(0o600)
+        assert issues == []  # hash fallback covers it
+        _, err = capsys.readouterr()
+        assert "sid-index degraded" in err
+        assert "1 unreadable session note(s)" in err
+
 
 # ---------------------------------------------------------------------------
 # Test 4: below-threshold JSONL
@@ -358,12 +463,29 @@ class TestBelowThreshold:
         issues = _scan(sc_env)
         assert issues == []
 
-    def test_drop_threshold_logic_makes_gap_fire(self, sc_env):
-        """Fail-first: without threshold skip, below-threshold JSONL would incorrectly fire.
+    def test_tool_result_only_user_entries_do_not_count(self, sc_env):
+        """type=="user" entries whose content is only tool_result blocks must
+        NOT count toward min_messages — mirrors the hook's
+        extract_user_messages/_extract_text semantics. 1 text-bearing + 5
+        tool_result-only entries is BELOW the threshold of 3.
+        """
+        sid = "tool-result-user-sid-0001"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(
+            sc_env["projects"], "-proj", sid, cwd,
+            n_user=1, duration_minutes=10, n_tool_result_user=5,
+        )
+        issues = _scan(sc_env)
+        assert issues == [], (
+            "tool_result-only user entries counted toward the threshold — "
+            "this is the raw-count bug that produced the dogfood false gaps."
+        )
 
-        We verify this by directly calling sc.scan with a monkeypatched
-        _load_thresholds that returns (0, 0.0) — effectively disabling
-        thresholds. The below-threshold JSONL now appears as a gap.
+    def test_drop_threshold_logic_makes_gap_fire(self, sc_env):
+        """Fail-first (behavioral): with thresholds disabled IN THE CONFIG
+        (min_messages: 0, min_duration_minutes: 0), the below-threshold JSONL
+        surfaces as a gap — proving the threshold skip is config-driven and
+        load-bearing, without patching any internals.
         """
         sid = "no-thresh-test-0003"
         cwd = "/path/to/my-proj"
@@ -372,16 +494,114 @@ class TestBelowThreshold:
         # Normal: no gap (below threshold)
         assert _scan(sc_env) == []
 
-        # Monkeypatch thresholds to (0, 0.0) — any JSONL passes
-        original = sc._load_thresholds
-        sc._load_thresholds = lambda home: (0, 0.0)
-        try:
-            issues = _scan(sc_env)
-            assert len(issues) == 1, (
-                "Without threshold filtering, a 1-message JSONL should surface as a gap."
-            )
-        finally:
-            sc._load_thresholds = original
+        # Behavioral mutation: write zeroed thresholds into the seeded config.
+        cfg = json.loads(sc_env["config_path"].read_text())
+        cfg["min_messages"] = 0
+        cfg["min_duration_minutes"] = 0
+        sc_env["config_path"].write_text(json.dumps(cfg))
+
+        issues = _scan(sc_env)
+        assert len(issues) == 1, (
+            "Without threshold filtering, a 1-message JSONL should surface as a gap."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Threshold boundary semantics (operators are <, not <=)
+# ---------------------------------------------------------------------------
+
+class TestThresholdBoundary:
+    def test_exactly_at_thresholds_is_a_gap(self, sc_env):
+        """Exactly 3 text-bearing user messages AND duration exactly 2.0 min →
+        NOT skipped (should_skip_session uses strict <) → IS a gap.
+
+        Kills off-by-one mutations: `user_count <= min_messages` or
+        `duration <= min_duration` would wrongly classify this fixture as
+        below-threshold and fail this test.
+        """
+        sid = "boundary-exact-sid-0001"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=3, duration_minutes=2.0)
+
+        issues = _scan(sc_env)
+        assert len(issues) == 1, (
+            "exactly-at-threshold session must be a gap — the hook's "
+            "should_skip_session uses strict less-than, not <=."
+        )
+
+    def test_one_below_message_threshold_is_skipped(self, sc_env):
+        """2 text-bearing user messages (one below min_messages=3) → skipped."""
+        sid = "boundary-below-msgs-sid-0002"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=2, duration_minutes=10)
+        assert _scan(sc_env) == []
+
+    def test_just_below_duration_threshold_is_skipped(self, sc_env):
+        """Duration 1.9 min (just below 2.0) with enough messages → skipped."""
+        sid = "boundary-below-dur-sid-0003"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=5, duration_minutes=1.9)
+        assert _scan(sc_env) == []
+
+
+# ---------------------------------------------------------------------------
+# auto_log_enabled gate
+# ---------------------------------------------------------------------------
+
+class TestAutoLogGate:
+    def test_auto_log_disabled_returns_empty_with_note(self, sc_env, capsys):
+        """auto_log_enabled: false → scan() returns [] immediately and notes
+        why on stderr (the hook intentionally writes nothing; every gap would
+        be a false positive)."""
+        cfg = json.loads(sc_env["config_path"].read_text())
+        cfg["auto_log_enabled"] = False
+        sc_env["config_path"].write_text(json.dumps(cfg))
+
+        sid = "autolog-off-sid-0001"
+        cwd = "/path/to/my-proj"
+        _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=5, duration_minutes=10)
+
+        issues = _scan(sc_env)
+        assert issues == []
+        _, err = capsys.readouterr()
+        assert "auto_log_enabled is false" in err
+
+
+# ---------------------------------------------------------------------------
+# Config robustness (_load_thresholds)
+# ---------------------------------------------------------------------------
+
+class TestLoadThresholds:
+    def test_bad_min_messages_keeps_good_min_duration(self, sc_env, capsys):
+        """One bad key must not discard the others: bad min_messages falls
+        back to 3 (with a warning) while a custom min_duration is honored."""
+        cfg = json.loads(sc_env["config_path"].read_text())
+        cfg["min_messages"] = "not-a-number"
+        cfg["min_duration_minutes"] = 7.5
+        sc_env["config_path"].write_text(json.dumps(cfg))
+
+        mm, md, al = sc._load_thresholds(sc_env["tmp_path"])
+        assert mm == 3       # default after coercion failure
+        assert md == 7.5     # custom value survives
+        assert al is True
+        _, err = capsys.readouterr()
+        assert "bad min_messages" in err
+
+    def test_missing_config_is_silent(self, sc_env, capsys):
+        """A missing config file applies defaults without warning (matches hook)."""
+        sc_env["config_path"].unlink()
+        mm, md, al = sc._load_thresholds(sc_env["tmp_path"])
+        assert (mm, md, al) == (3, 2.0, True)
+        _, err = capsys.readouterr()
+        assert "WARNING" not in err
+
+    def test_corrupt_config_warns(self, sc_env, capsys):
+        """A corrupt (non-JSON) config warns to stderr and applies defaults."""
+        sc_env["config_path"].write_text("{not json")
+        mm, md, al = sc._load_thresholds(sc_env["tmp_path"])
+        assert (mm, md, al) == (3, 2.0, True)
+        _, err = capsys.readouterr()
+        assert "could not read config" in err
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +775,42 @@ class TestMtimeWindow:
 
 
 # ---------------------------------------------------------------------------
-# Test 10: apply() behaviour
+# cwd derivation: first parseable line that HAS a cwd
+# ---------------------------------------------------------------------------
+
+class TestCwdDerivation:
+    def test_cwd_from_first_line_that_has_one(self, sc_env):
+        """Production JSONLs often start with summary/file-history lines that
+        carry no cwd. Project derivation must use the first parseable line
+        that HAS a cwd: malformed line 1, cwd-less line 2, valid line 3."""
+        sid = "cwd-derivation-sid-0001"
+        proj_dir = sc_env["projects"] / "-proj"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        jsonl = proj_dir / f"{sid}.jsonl"
+
+        lines = ["{malformed json line"]
+        # cwd-less but parseable summary line
+        lines.append(json.dumps({
+            "type": "summary", "summary": "compacted context",
+        }))
+        # valid user lines with cwd, enough to pass thresholds
+        for i in range(5):
+            lines.append(json.dumps({
+                "type": "user",
+                "timestamp": f"2026-04-24T10:{i * 3:02d}:00.000Z",
+                "cwd": "/Users/abhishek/dev/real-project",
+                "message": {"role": "user", "content": f"msg {i}"},
+            }))
+        jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        issues = _scan(sc_env)
+        assert len(issues) == 1
+        assert issues[0].project == "real-project"
+        assert issues[0].extra["cwd"] == "/Users/abhishek/dev/real-project"
+
+
+# ---------------------------------------------------------------------------
+# Test 10: apply() behaviour (mocked subprocess)
 # ---------------------------------------------------------------------------
 
 class TestApply:
@@ -581,8 +836,10 @@ class TestApply:
             },
         )
 
-    def test_apply_ok_outcome_returns_applied(self, tmp_path):
-        """Monkeypatched subprocess returns outcome=OK → status 'applied'."""
+    def test_apply_success_outcome_returns_applied(self, tmp_path, monkeypatch):
+        """Mocked subprocess returns outcome=OK_RAW_NOTE_ONLY (the real hook
+        success outcome — "OK" is reserved, never emitted today) with
+        non-empty vault_writes → status 'applied' with the ACTUAL written path."""
         issue = self._make_issue(
             "apply-ok-sid-0001",
             str(tmp_path / "apply-ok-sid-0001.jsonl"),
@@ -590,23 +847,43 @@ class TestApply:
             str(tmp_path / "2026-04-24-my-proj-xxxx.md"),
         )
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = json.dumps({"outcome": "OK", "vault_writes": []})
-        mock_result.stderr = ""
+        actual = str(tmp_path / "vault" / "claude-sessions" / "2026-06-09-my-proj-xxxx.md")
+        mock_run = MagicMock(return_value=_mock_replay_result(
+            "OK_RAW_NOTE_ONLY", vault_writes=[[actual, 1234]],
+        ))
+        monkeypatch.setattr(subprocess, "run", mock_run)
 
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
-            results = sc.apply([issue], str(tmp_path / "backup"))
+        results = sc.apply([issue], str(tmp_path / "backup"))
 
         assert len(results) == 1
         assert results[0].status == "applied"
+        # Result carries the ACTUAL written path (ground truth), not the
+        # scan-predicted one — _first_seen_date can shift the date.
+        assert results[0].note_path == actual
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
         assert "--jsonl" in cmd
         assert "--json" in cmd
 
-    def test_apply_skipped_outcome_returns_skipped(self, tmp_path):
-        """Monkeypatched subprocess returns outcome=SKIPPED_THRESHOLD → status 'skipped'."""
+    def test_apply_success_with_empty_vault_writes_is_error(self, tmp_path, monkeypatch):
+        """Success outcome but EMPTY vault_writes → broken contract → 'error'."""
+        issue = self._make_issue(
+            "apply-empty-writes-sid-0006",
+            str(tmp_path / "apply-empty-writes-sid-0006.jsonl"),
+            "/path/to/my-proj",
+            str(tmp_path / "2026-04-24-my-proj-wwww.md"),
+        )
+
+        monkeypatch.setattr(subprocess, "run", MagicMock(
+            return_value=_mock_replay_result("OK_RAW_NOTE_ONLY", vault_writes=[]),
+        ))
+        results = sc.apply([issue], str(tmp_path / "backup"))
+        assert len(results) == 1
+        assert results[0].status == "error"
+        assert "wrote nothing" in (results[0].error or "")
+
+    def test_apply_skipped_outcome_returns_skipped(self, tmp_path, monkeypatch):
+        """Mocked subprocess returns outcome=SKIPPED_BELOW_THRESHOLD → status 'skipped'."""
         issue = self._make_issue(
             "apply-skip-sid-0002",
             str(tmp_path / "apply-skip-sid-0002.jsonl"),
@@ -614,24 +891,20 @@ class TestApply:
             str(tmp_path / "2026-04-24-my-proj-yyyy.md"),
         )
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = json.dumps({
-            "outcome": "SKIPPED_THRESHOLD",
-            "detail": "too few messages",
-        })
-        mock_result.stderr = ""
-
-        with patch("subprocess.run", return_value=mock_result):
-            results = sc.apply([issue], str(tmp_path / "backup"))
+        monkeypatch.setattr(subprocess, "run", MagicMock(
+            return_value=_mock_replay_result(
+                "SKIPPED_BELOW_THRESHOLD", detail="too few messages",
+            ),
+        ))
+        results = sc.apply([issue], str(tmp_path / "backup"))
 
         assert len(results) == 1
         r = results[0]
         assert r.status == "skipped"
-        assert "SKIPPED_THRESHOLD" in (r.error or "")
+        assert "SKIPPED_BELOW_THRESHOLD" in (r.error or "")
 
-    def test_apply_non_ok_non_skipped_returns_error(self, tmp_path):
-        """Any non-OK, non-SKIPPED_* outcome → status 'error'."""
+    def test_apply_non_ok_non_skipped_returns_error(self, tmp_path, monkeypatch):
+        """Any non-success, non-SKIPPED_* outcome → status 'error'."""
         issue = self._make_issue(
             "apply-err-sid-0003",
             str(tmp_path / "apply-err-sid-0003.jsonl"),
@@ -639,22 +912,16 @@ class TestApply:
             str(tmp_path / "2026-04-24-my-proj-zzzz.md"),
         )
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = json.dumps({
-            "outcome": "EXCEPTION",
-            "detail": "something blew up",
-        })
-        mock_result.stderr = ""
-
-        with patch("subprocess.run", return_value=mock_result):
-            results = sc.apply([issue], str(tmp_path / "backup"))
+        monkeypatch.setattr(subprocess, "run", MagicMock(
+            return_value=_mock_replay_result("EXCEPTION", detail="something blew up"),
+        ))
+        results = sc.apply([issue], str(tmp_path / "backup"))
 
         assert len(results) == 1
         r = results[0]
         assert r.status == "error"
 
-    def test_apply_unresolved_issue_returns_unresolved(self, tmp_path):
+    def test_apply_unresolved_issue_returns_unresolved(self, tmp_path, monkeypatch):
         """Unresolved issue → status 'unresolved', subprocess never called."""
         issue = self._make_issue(
             "apply-unresolved-sid-0004",
@@ -664,14 +931,15 @@ class TestApply:
         )
         issue.extra["unresolved"] = True
 
-        with patch("subprocess.run") as mock_run:
-            results = sc.apply([issue], str(tmp_path / "backup"))
+        mock_run = MagicMock()
+        monkeypatch.setattr(subprocess, "run", mock_run)
+        results = sc.apply([issue], str(tmp_path / "backup"))
 
         assert len(results) == 1
         assert results[0].status == "unresolved"
         mock_run.assert_not_called()
 
-    def test_apply_note_already_exists_returns_skipped(self, tmp_path):
+    def test_apply_note_already_exists_returns_skipped(self, tmp_path, monkeypatch):
         """If the expected note already exists on disk, skip without calling replay."""
         note_path = tmp_path / "2026-04-24-my-proj-aaaa.md"
         note_path.write_text("---\ntype: claude-session\n---\n")
@@ -683,11 +951,33 @@ class TestApply:
             str(note_path),
         )
 
-        with patch("subprocess.run") as mock_run:
-            results = sc.apply([issue], str(tmp_path / "backup"))
+        mock_run = MagicMock()
+        monkeypatch.setattr(subprocess, "run", mock_run)
+        results = sc.apply([issue], str(tmp_path / "backup"))
 
         assert len(results) == 1
         assert results[0].status == "skipped"
+        mock_run.assert_not_called()
+
+    def test_apply_no_cwd_returns_error_without_fabricating(self, tmp_path, monkeypatch):
+        """A gap with no recorded cwd must NOT fabricate --cwd — return a
+        clear error with guidance, never launch the replay."""
+        issue = self._make_issue(
+            "apply-no-cwd-sid-0007",
+            str(tmp_path / "apply-no-cwd-sid-0007.jsonl"),
+            "",  # no cwd recorded
+            str(tmp_path / "2026-04-24-unknown-vvvv.md"),
+        )
+
+        mock_run = MagicMock()
+        monkeypatch.setattr(subprocess, "run", mock_run)
+        results = sc.apply([issue], str(tmp_path / "backup"))
+
+        assert len(results) == 1
+        r = results[0]
+        assert r.status == "error"
+        assert "no recorded cwd" in (r.error or "")
+        assert "replay-sessionend.py" in (r.error or "")
         mock_run.assert_not_called()
 
     def test_apply_wrong_signal_class_raises_runtime_error(self, tmp_path):
@@ -716,6 +1006,62 @@ class TestApply:
         with pytest.raises(RuntimeError, match="refuses signal_class"):
             sc.apply([issue], str(tmp_path / "backup"))
 
+    def test_replay_script_exists_in_repo(self):
+        """apply() shells out to replay-sessionend.py — pin its in-repo path
+        so a rename/move breaks loudly here, not silently at apply-time."""
+        assert _REPLAY_SCRIPT.exists(), (
+            f"replay-sessionend.py missing at {_REPLAY_SCRIPT} — "
+            f"session_coverage.apply() depends on this path."
+        )
+
+
+# ---------------------------------------------------------------------------
+# apply() against the REAL replay script (no mocking)
+# ---------------------------------------------------------------------------
+
+class TestApplyRealReplay:
+    def test_apply_real_replay_writes_note(self, sc_env, monkeypatch):
+        """Integration: scan(reconstruct=True) → apply() unmocked → the real
+        replay-sessionend.py runs the production SessionEnd hook code path and
+        writes a raw session note (fast — no claude -p; summarization is
+        deferred by design). Asserts status 'applied' and the note exists at
+        the vault_writes-reported path.
+
+        The subprocess inherits the redirected HOME from os.environ
+        (monkeypatch.setenv mutates os.environ), so the replay's config read,
+        projects-containment check, hook log, and vault writes all land under
+        tmp_path. _REAL_VAULT_GUARD adds the production-vault sentinel.
+        """
+        monkeypatch.setenv("_REAL_VAULT_GUARD", "1")
+
+        sid = "real-replay-sid-0001"
+        cwd = "/Users/abhishek/dev/claude_workspace/obsidian-brain"
+        # Stage the JSONL inside the redirected ~/.claude/projects so the
+        # hook's transcript-containment check passes without re-staging.
+        _write_jsonl(
+            sc_env["projects"],
+            "-Users-abhishek-dev-claude_workspace-obsidian-brain",
+            sid, cwd, n_user=5, duration_minutes=10,
+        )
+
+        issues = _scan(sc_env, reconstruct=True)
+        assert len(issues) == 1
+        assert issues[0].extra["unresolved"] is False
+
+        results = sc.apply(issues, str(sc_env["tmp_path"] / "backup"))
+        assert len(results) == 1
+        r = results[0]
+        assert r.status == "applied", f"expected applied, got {r.status}: {r.error}"
+        # The applied Result carries the ACTUAL written path (from
+        # vault_writes) — assert the note really exists on disk.
+        written = Path(r.note_path)
+        assert written.exists(), f"note not on disk: {written}"
+        assert written.parent == sc_env["sessions"], (
+            f"note written outside the seeded sessions folder: {written}"
+        )
+        # And a re-scan shows the gap as covered now.
+        assert _scan(sc_env) == []
+
 
 # ---------------------------------------------------------------------------
 # Test 11: summary partition
@@ -723,7 +1069,8 @@ class TestApply:
 
 class TestSummaryPartition:
     def test_summary_counts_sum_to_scanned(self, sc_env, capsys):
-        """Mixed fixture: gaps + covered + below-threshold → all counts sum correctly."""
+        """Mixed fixture: gap + covered + below-threshold + unparsable →
+        all counts sum to the scanned total."""
         cwd = "/path/to/my-proj"
 
         # 1 gap (above threshold, no note)
@@ -741,6 +1088,13 @@ class TestSummaryPartition:
         sid_bt = "summary-bt-sid-0003"
         _write_jsonl(sc_env["projects"], "-proj3", sid_bt, cwd, n_user=1, duration_minutes=5)
 
+        # 1 completely unparsable (no line is valid JSON)
+        unparsable_dir = sc_env["projects"] / "-proj4"
+        unparsable_dir.mkdir(parents=True, exist_ok=True)
+        (unparsable_dir / "summary-unparsable-sid-0004.jsonl").write_text(
+            "not json at all\n{broken\n", encoding="utf-8"
+        )
+
         issues = _scan(sc_env)
         assert len(issues) == 1  # only the gap
 
@@ -757,6 +1111,7 @@ class TestSummaryPartition:
         assert gaps == 1
         assert covered == 1
         assert bt == 1
+        assert unparsable == 1
         assert gaps + covered + bt + unparsable + proj_filt == total
 
 
@@ -769,15 +1124,17 @@ class TestCLIE2E:
 
     _SCRIPT = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-    def _run(self, env, *args: str) -> subprocess.CompletedProcess:
+    def _run(self, env, *args: str, check: str | None = "session-coverage") -> subprocess.CompletedProcess:
         cmd = [
             sys.executable, str(self._SCRIPT),
             "--vault", str(env["vault"]),
             "--sessions-folder", "claude-sessions",
             "--insights-folder", "claude-insights",
-            "--check", "session-coverage",
             "--json",
-        ] + list(args)
+        ]
+        if check:
+            cmd += ["--check", check]
+        cmd += list(args)
         proc_env = {
             **os.environ,
             "HOME": str(env["tmp_path"]),
@@ -799,6 +1156,11 @@ class TestCLIE2E:
         assert payload["total_issues"] == 1
         row = payload["issues"][0]
         assert row["signal_class"] == "session-coverage-gap"
+        # Conditionally-surfaced extras: present for session-coverage rows.
+        assert row["sid"] == sid
+        assert row["jsonl_path"].endswith(f"{sid}.jsonl")
+        assert row["strict_fail"] is False
+        assert row["referenced_by_count"] == 0
 
     def test_strict_flag_makes_reason_start_with_fail(self, sc_env):
         """--strict + referenced JSONL → top-level signal_class still session-coverage-gap,
@@ -816,6 +1178,21 @@ class TestCLIE2E:
         row = payload["issues"][0]
         assert row["signal_class"] == "session-coverage-gap"
         assert row["reason"].startswith("FAIL:")
+        assert row["strict_fail"] is True
+        assert row["referenced_by_count"] == 1
+
+    def test_reconstruct_flag_marks_issue_resolvable(self, sc_env):
+        """--reconstruct (scan-only, no --apply) → issues[0].unresolved is False."""
+        sid = "cli-e2e-reconstruct-sid-0003"
+        cwd = "/Users/abhishek/dev/claude_workspace/obsidian-brain"
+        _write_jsonl(sc_env["projects"], "-ob", sid, cwd, n_user=5, duration_minutes=10)
+
+        r = self._run(sc_env, "--reconstruct")
+        assert r.returncode == 1, f"expected 1, got {r.returncode}:\n{r.stderr}"
+
+        payload = json.loads(r.stdout)
+        assert payload["total_issues"] == 1
+        assert payload["issues"][0]["unresolved"] is False
 
     def test_clean_vault_exit_0(self, sc_env):
         """No JSONLs → exit 0."""
@@ -835,15 +1212,95 @@ class TestCLIE2E:
         r = self._run(sc_env)
         assert r.returncode == 0, f"expected 0, got {r.returncode}:\n{r.stderr}"
 
+    def test_full_sweep_with_reconstruct_is_usage_error(self, sc_env):
+        """Default sweep (no --check) + --reconstruct → exit 3 with a clear
+        usage error. session-coverage (the only EXTRA_SCAN_FLAGS consumer) is
+        OPT_IN, so without this guard the flag would silently evaporate and
+        the user would believe reconstruction was attempted."""
+        r = self._run(sc_env, "--reconstruct", check=None)
+        assert r.returncode == 3, (
+            f"expected usage error (3), got {r.returncode}:\n{r.stderr}"
+        )
+        assert "--reconstruct is only consumed by an opt-in check" in r.stderr
+        assert "--check session-coverage" in r.stderr
+
+    def test_full_sweep_with_strict_is_usage_error(self, sc_env):
+        """Default sweep (no --check) + --strict → exit 3 (same guard)."""
+        r = self._run(sc_env, "--strict", check=None)
+        assert r.returncode == 3, (
+            f"expected usage error (3), got {r.returncode}:\n{r.stderr}"
+        )
+        assert "--strict is only consumed by an opt-in check" in r.stderr
+
+    def test_full_sweep_without_extra_flags_unaffected(self, sc_env):
+        """Default sweep WITHOUT --strict/--reconstruct stays on the normal
+        exit contract (0 clean / 1 issues) and never tracebacks — the guard
+        only fires on truthy unconsumed flags."""
+        r = self._run(sc_env, check=None)
+        assert r.returncode in (0, 1), (
+            f"default sweep regressed: exit {r.returncode}\n{r.stderr}"
+        )
+        assert "Traceback" not in r.stderr
+
 
 # ---------------------------------------------------------------------------
-# Test: registry (not opt-in)
+# Dispatcher EXTRA_SCAN_FLAGS contract
 # ---------------------------------------------------------------------------
 
-def test_session_coverage_in_default_sweep():
-    """session-coverage is NOT opt-in — it must appear in the default all-checks sweep."""
+class TestExtraScanFlagsContract:
+    def test_declared_flag_without_argparse_attr_raises(self, tmp_path):
+        """A module declaring an EXTRA_SCAN_FLAGS entry with no matching
+        argparse attribute is a contract violation → AttributeError, not a
+        silent drop."""
+        fake_mod = types.SimpleNamespace(
+            NAME="fake-flags",
+            EXTRA_SCAN_FLAGS=("bogus_flag",),
+            scan=lambda *a, **kw: [],
+            apply=lambda *a, **kw: [],
+        )
+        args = vault_doctor._build_parser().parse_args([])
+        cfg = {
+            "vault": str(tmp_path),
+            "sessions_folder": "claude-sessions",
+            "insights_folder": "claude-insights",
+        }
+        with pytest.raises(AttributeError):
+            vault_doctor._run_scan(fake_mod, cfg, 30, None, args=args)
+
+    def test_declared_flags_forwarded_unconditionally(self, tmp_path):
+        """Declared flags reach scan() as real bools even when False."""
+        received = {}
+
+        def _fake_scan(vault, sf, inf, days, project=None, strict=None, reconstruct=None):
+            received["strict"] = strict
+            received["reconstruct"] = reconstruct
+            return []
+
+        fake_mod = types.SimpleNamespace(
+            NAME="fake-flags-2",
+            EXTRA_SCAN_FLAGS=("strict", "reconstruct"),
+            scan=_fake_scan,
+            apply=lambda *a, **kw: [],
+        )
+        args = vault_doctor._build_parser().parse_args([])  # both default False
+        cfg = {
+            "vault": str(tmp_path),
+            "sessions_folder": "claude-sessions",
+            "insights_folder": "claude-insights",
+        }
+        vault_doctor._run_scan(fake_mod, cfg, 30, None, args=args)
+        assert received == {"strict": False, "reconstruct": False}
+
+
+# ---------------------------------------------------------------------------
+# Test: registry (opt-in)
+# ---------------------------------------------------------------------------
+
+def test_session_coverage_excluded_from_default_sweep():
+    """session-coverage is OPT-IN — excluded from the default all-checks sweep
+    (heavy ~/.claude/projects walk + standing-audit semantics)."""
     names = [m.NAME for m in vault_doctor_checks.all_checks()]
-    assert sc.NAME in names
+    assert sc.NAME not in names
 
 
 def test_session_coverage_reachable_via_get_check():
