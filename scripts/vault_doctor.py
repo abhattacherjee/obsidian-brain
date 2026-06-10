@@ -98,6 +98,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="assume yes for all confirmations")
     p.add_argument("--json", dest="json_out", action="store_true",
                    help="emit JSON on stdout (for skill integration)")
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "for session-coverage: emit FAIL (not WARN) when any note references "
+            "an orphaned session via source_session"
+        ),
+    )
+    p.add_argument(
+        "--reconstruct",
+        action="store_true",
+        help=(
+            "for session-coverage: mark gaps as resolvable and enable apply() to "
+            "re-run the SessionEnd hook via replay-sessionend.py"
+        ),
+    )
     return p
 
 
@@ -105,13 +121,26 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _run_scan(mod, cfg: dict, days: int, project: str | None) -> list:
+def _run_scan(mod, cfg: dict, days: int, project: str | None, args=None) -> list:
+    """Run a check module's scan(), forwarding any EXTRA_SCAN_FLAGS it declares.
+
+    Modules that declare ``EXTRA_SCAN_FLAGS = ("flag_name", ...)`` receive those
+    flags as keyword arguments if they are present in ``args``. Modules without
+    ``EXTRA_SCAN_FLAGS`` are called with the unchanged positional signature.
+    """
+    extra_kwargs: dict = {}
+    if args is not None:
+        for flag in getattr(mod, "EXTRA_SCAN_FLAGS", ()):
+            val = getattr(args, flag, None)
+            if val is not None:
+                extra_kwargs[flag] = val
     return mod.scan(
         cfg["vault"],
         cfg["sessions_folder"],
         cfg["insights_folder"],
         days,
         project=project,
+        **extra_kwargs,
     )
 
 
@@ -160,7 +189,7 @@ def main() -> int:
     issues_by_check: dict = {}
     for mod in modules:
         days = args.days if args.days is not None else getattr(mod, "DEFAULT_WINDOW_DAYS", 7)
-        issues = _run_scan(mod, cfg, days, args.project)
+        issues = _run_scan(mod, cfg, days, args.project, args=args)
         if issues:
             issues_by_check[mod.NAME] = issues
 
