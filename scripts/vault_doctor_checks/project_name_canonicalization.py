@@ -40,13 +40,15 @@ as ``claude/project/foo-extra`` is never mangled).
 The REWRITE is deliberately line-format-only: it handles the block-list tag
 form the hooks write (``- claude/project/<name>`` list items) and does not
 attempt inline-array (``tags: [a, b]``) or scalar forms. The post-rewrite
-LEFTOVER detection is deliberately WIDER: it token-scans the whole
-frontmatter block for ``claude/project/*`` occurrences in ANY format and
-reports every token that differs from the expected new tag in the applied
-Result's error detail — so an unhandled tag format degrades to a visible
-"applied with detail" instead of a silent no-op. Identical claude/project
-tag LINES left behind by the rewrite (old form rewritten next to an
-already-correct new tag) are deduped.
+LEFTOVER detection is deliberately WIDER: it token-scans the frontmatter's
+TAG-CONTEXT lines (stripped form starting with ``-`` or ``tags``) for
+``claude/project/*`` occurrences in ANY format and reports every token that
+differs from the expected new tag in the applied Result's error detail — so
+an unhandled tag format degrades to a visible "applied with detail" instead
+of a silent no-op, while ``claude/project/`` substrings inside unrelated
+values (e.g. a ``source_url:`` path) are never flagged. Identical
+claude/project tag LINES left behind by the rewrite (old form rewritten next
+to an already-correct new tag) are deduped.
 
 **Phase 2 — Insights (downstream, incl. _EXTRA_INSIGHT_FOLDERS)**
 
@@ -72,6 +74,10 @@ For each insight note with a ``source_session:`` UUID:
 |                                          |   frontmatter — prevents backwards   |
 |                                          |   Phase-2 proposals                  |
 | OSError / timeout from git               | WARN row; unresolved=True            |
+| git exits 0 but prints nothing, or the   | WARN row ("empty-output" /           |
+|   parent basename is empty               |   "resolve-failed"); unresolved=True |
+| relative common-dir path fails to        | WARN row ("resolve-failed");         |
+|   resolve against project_path (OSError) |   unresolved=True                    |
 | ``project:`` field empty but path        | WARN row ("cannot rewrite in place") |
 |   resolves                               |   — canonical still seeds Phase 2    |
 | Insight whose source_session UUID doesn't| WARN row; unresolved=True            |
@@ -136,6 +142,17 @@ OPT_IN = True  # excluded from the default all-checks sweep
 # Timeout (seconds) for each git subprocess call.
 _GIT_TIMEOUT = 5
 
+# Ambient git env vars that OVERRIDE `git -C <path>` repo discovery — they
+# must never leak into the canonical-derivation subprocess (see
+# _derive_canonical).
+_GIT_ENV_SCRUB = (
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+)
+
 # Anchored tag-line matcher for `- claude/project/<name>` frontmatter list
 # items (optionally quoted). Anchoring start/end of line means a
 # prefix-sharing sibling tag (claude/project/foo-extra vs claude/project/foo)
@@ -148,7 +165,9 @@ _TAG_LINE_RE = re.compile(
 # claude/project tags in ANY frontmatter form (block list, inline array
 # `tags: [a, b]`, scalar, flow map) so an unhandled format degrades to a
 # visible "applied with detail" instead of reproducing the silent tag no-op.
-# Deliberately WIDER than the line-anchored rewrite regex above.
+# Deliberately WIDER than the line-anchored rewrite regex above, but applied
+# to TAG-CONTEXT lines only (see apply()) so claude/project/ substrings in
+# unrelated values (URLs etc.) are never flagged.
 _TAG_TOKEN_RE = re.compile(r"claude/project/[^\s,\]\"'}]+")
 
 
@@ -236,12 +255,19 @@ def _derive_canonical(project_path: str) -> tuple[str | None, str, str]:
     if not p.exists():
         return (None, "not-found", "")
 
+    # Scrub ambient git env vars: GIT_DIR / GIT_COMMON_DIR (and friends)
+    # OVERRIDE `-C <path>` — with GIT_DIR set, every probe exits 0 with the
+    # SAME common-dir, deriving one bogus canonical for the whole vault as
+    # confident 0.9 proposals (and a self-certifying re-scan). The repo must
+    # be discovered from project_path alone.
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_SCRUB}
     try:
         result = subprocess.run(
             ["git", "-C", project_path, "rev-parse", "--git-common-dir"],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError):
         # SubprocessError covers TimeoutExpired — matches the exception set
@@ -738,12 +764,14 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
     is line-format-only (block-list tag items); identical claude/project tag
     lines left behind by the rewrite are deduped (first occurrence kept).
     The post-rewrite leftover check is deliberately WIDER than the rewrite:
-    it token-scans the whole frontmatter block (any tag format — inline
-    array, scalar, flow map) and, if any ``claude/project/*`` token differing
-    from the expected new tag remains, the Result is still ``"applied"`` but
-    its error field carries a "tag not rewritten" detail so the residue is
+    it token-scans the frontmatter's tag-context lines (stripped form
+    starting with ``-`` or ``tags``; any tag format — inline array, scalar,
+    flow map) and, if any ``claude/project/*`` token differing from the
+    expected new tag remains, the Result is still ``"applied"`` but its
+    error field carries a "tag not rewritten" detail so the residue is
     visible (unhandled tag format, scan/apply drift, or a genuinely
-    multi-project note).
+    multi-project note). ``claude/project/`` substrings inside non-tag
+    values (e.g. URLs) are never flagged.
 
     Skipped Results always carry a reason in the error field ("no
     frontmatter", "unterminated frontmatter", or "project: line not found for
@@ -892,12 +920,19 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
         new_fm = "".join(kept_lines)
 
         # Post-rewrite visibility check — deliberately WIDER than the
-        # rewrite: token-scan the whole frontmatter block so claude/project
-        # tags in ANY format (inline array, scalar, flow map) that still
-        # differ from the expected new tag are surfaced (NOT silently left).
-        leftover = sorted(
-            {t for t in _TAG_TOKEN_RE.findall(new_fm) if t != new_tag}
-        )
+        # rewrite: token-scan claude/project tags in ANY format (inline
+        # array, scalar, flow map) so an unhandled tag format is surfaced
+        # (NOT silently left). Scoped to TAG-CONTEXT lines only (stripped
+        # form starts with "-" or "tags") so claude/project/ substrings
+        # inside unrelated frontmatter values (e.g. a source_url:
+        # https://.../claude/project/foo path) don't produce spurious
+        # "tag not rewritten" details on a successful apply.
+        leftover_tokens: set[str] = set()
+        for line in new_fm.splitlines():
+            stripped_line = line.lstrip()
+            if stripped_line.startswith("-") or stripped_line.startswith("tags"):
+                leftover_tokens.update(_TAG_TOKEN_RE.findall(line))
+        leftover = sorted(t for t in leftover_tokens if t != new_tag)
         tag_detail = None
         if leftover:
             tag_detail = (

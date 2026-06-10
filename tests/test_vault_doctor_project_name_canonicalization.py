@@ -37,6 +37,7 @@ _REQUIRES_GIT = pytest.mark.skipif(
     not _GIT_AVAILABLE, reason="git binary not available on PATH"
 )
 
+import vault_doctor_checks  # noqa: E402 (must follow sys.path setup)
 import vault_doctor_checks.project_name_canonicalization as check  # noqa: E402
 from vault_doctor_checks import Issue  # noqa: E402
 
@@ -1647,7 +1648,7 @@ def test_snapshot_does_not_steal_index_slot(canon_vault, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# N1: leftover detection is format-agnostic (wider than the rewrite)
+# Leftover detection is format-agnostic (wider than the rewrite)
 # ---------------------------------------------------------------------------
 
 @_REQUIRES_GIT
@@ -1703,7 +1704,7 @@ def test_inline_array_tag_surfaced_as_leftover(canon_vault, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# S-N1: identical claude/project tag lines deduped after rewrite
+# Identical claude/project tag lines deduped after rewrite
 # ---------------------------------------------------------------------------
 
 @_REQUIRES_GIT
@@ -1755,7 +1756,7 @@ def test_duplicate_tag_lines_deduped_after_rewrite(canon_vault, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# S-N3: vendored _slugify parity with hooks/obsidian_utils.slugify
+# Vendored _slugify parity with hooks/obsidian_utils.slugify
 # ---------------------------------------------------------------------------
 
 def test_vendored_slugify_parity_with_hooks():
@@ -1785,3 +1786,102 @@ def test_vendored_slugify_parity_with_hooks():
             f"vendored _slugify drifted from hooks slugify for {text!r}: "
             f"{check._slugify(text)!r} != {obsidian_utils.slugify(text)!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Ambient git env vars must not override per-path repo discovery
+# ---------------------------------------------------------------------------
+
+@_REQUIRES_GIT
+def test_ambient_git_dir_does_not_poison_derivation(canon_vault, tmp_path, monkeypatch):
+    """GIT_DIR/GIT_COMMON_DIR in the environment OVERRIDE `git -C <path>`:
+    without scrubbing, every probe exits 0 with the SAME common-dir, deriving
+    one bogus canonical for the whole vault as confident 0.9 proposals. The
+    subprocess env must be scrubbed so the repo is discovered from
+    project_path alone."""
+    # The repo the note actually belongs to (via its worktree)
+    repo = tmp_path / "true-repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    worktree = tmp_path / "true-repo--feat"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/env", str(worktree)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # An UNRELATED repo whose .git we leak through the ambient environment
+    other = tmp_path / "poison-repo"
+    other.mkdir()
+    _init_git_repo(other)
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+
+    note = canon_vault["sessions"] / "2026-04-13-env-poison.md"
+    note.write_text(
+        _session_note("true-repo--feat", project_path=str(worktree)),
+        encoding="utf-8",
+    )
+
+    issues = _scan(canon_vault)
+    proposals = [i for i in issues if i.note_path == str(note)]
+    assert len(proposals) == 1
+    assert proposals[0].extra["new_project"] == "true-repo", (
+        f"ambient GIT_DIR poisoned the derivation: "
+        f"new_project={proposals[0].extra['new_project']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Leftover scan ignores claude/project/ substrings in non-tag values
+# ---------------------------------------------------------------------------
+
+@_REQUIRES_GIT
+def test_url_value_not_flagged_as_leftover_tag(canon_vault, tmp_path):
+    """A claude/project/ substring inside an unrelated frontmatter value
+    (e.g. source_url) must not produce a spurious "tag not rewritten" detail
+    on a successful apply — the token scan is scoped to tag-context lines."""
+    repo = tmp_path / "url-proj"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    worktree = tmp_path / "url-proj--feat"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/url", str(worktree)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    note = canon_vault["sessions"] / "2026-04-13-url-value.md"
+    note.write_text(
+        "---\n"
+        "type: claude-session\n"
+        "project: url-proj--feat\n"
+        f'project_path: "{str(worktree)}"\n'
+        "session_id: url-sid\n"
+        "source_url: https://example.com/claude/project/url-proj--feat/issues/1\n"
+        "tags:\n"
+        "  - claude/session\n"
+        "  - claude/project/url-proj--feat\n"
+        "---\n\nBody.\n",
+        encoding="utf-8",
+    )
+
+    issues = _scan(canon_vault)
+    proposals = [i for i in issues if i.note_path == str(note)]
+    assert len(proposals) == 1
+
+    results = check.apply(proposals, str(canon_vault["backups"]))
+    assert results[0].status == "applied"
+    assert results[0].error is None, (
+        f"URL substring flagged as leftover tag: {results[0].error}"
+    )
+
+    new_content = note.read_text(encoding="utf-8")
+    # Real tag rewritten; URL value untouched
+    assert "  - claude/project/url-proj\n" in new_content
+    assert (
+        "source_url: https://example.com/claude/project/url-proj--feat/issues/1"
+        in new_content
+    )

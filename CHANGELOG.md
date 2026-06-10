@@ -34,8 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old name or the derived canonical, and filtered sessions still seed the
   Phase-2 index. `confidence=0.9` for resolvable rewrites; `0.0` for WARN
   rows. `DEFAULT_WINDOW_DAYS=9999` scans all notes (`--days` is ignored with
-  a notice). Excluded from the default all-checks sweep (`OPT_IN=True`); run
-  explicitly via `--check project-name-canonicalization`.
+  a notice). Conceptually run after `--check project-name-normalization`
+  (underscore → hyphen) so `project:` fields are already hyphen-normalized
+  before the canonical comparison. Excluded from the default all-checks sweep
+  (`OPT_IN=True`); run explicitly via `--check project-name-canonicalization`.
 - **`vault-doctor --check session-coverage` (#98)** — new **opt-in** check that
   detects SessionEnd-hook coverage gaps: for each `<sid>.jsonl` under
   `~/.claude/projects/`, it verifies that a corresponding session note exists in
