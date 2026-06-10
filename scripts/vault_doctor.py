@@ -241,6 +241,7 @@ def main() -> int:
                 print(f"  {status_mark} {r.status}  {Path(r.note_path).name}", file=sys.stderr)
                 if r.status == "error":
                     any_errors = True
+                    print(f"      {r.error}", file=sys.stderr)
 
     return 2 if any_errors else 1
 

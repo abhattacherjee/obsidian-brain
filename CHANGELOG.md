@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the default all-checks sweep via the new registry `OPT_IN` attribute.
 
 ### Fixed
+- `vault_doctor --apply` now prints each error Result's detail message (previously the per-note error string was dropped; only the status mark survived).
 - Date-rollover test flakiness (#205): 12 test call sites scanned hardcoded
   April-2026 fixtures with 60-day windows, so the suite started failing once
   the wall clock reached 2026-06-09 (CI was green the day before). Widened to

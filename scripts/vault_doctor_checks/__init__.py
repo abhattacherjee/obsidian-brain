@@ -87,4 +87,13 @@ def all_checks() -> list:
     only run when explicitly named via get_check() / --check.
     """
     _discover()
-    return [m for m in _CHECKS.values() if not getattr(m, "OPT_IN", False)]
+    result = []
+    for m in _CHECKS.values():
+        flag = getattr(m, "OPT_IN", False)
+        if not isinstance(flag, bool):
+            raise TypeError(
+                f"{getattr(m, 'NAME', m)}: OPT_IN must be bool, got {flag!r}"
+            )
+        if not flag:
+            result.append(m)
+    return result

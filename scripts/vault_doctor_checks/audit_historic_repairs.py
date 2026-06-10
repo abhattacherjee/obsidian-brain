@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,7 +60,7 @@ OPT_IN = True  # excluded from the default all-checks sweep
 
 _CATEGORY_REASONS = {
     "A": "original backlink matches note date; current does not — mtime-drift corruption, restore original",
-    "B": "current backlink matches note date; original did not — historic repair was legitimate, keeping",
+    "B": "current backlink matches note date; original did not — likely a legitimate repair (verify manually if the session spanned midnight)",
     "C": "original and current backlinks are both same-day as the note — ambiguous, needs JSONL-window or human review",
     "D": "neither original nor current backlink matches the note date — unresolved, needs human review",
 }
@@ -158,11 +159,15 @@ def scan(
     # it is the true pre-doctor original. Intermediate backups are
     # vault-doctor iterations on vault-doctor.
     oldest: dict[str, tuple[float, Path]] = {}
+    skipped_old_runs = 0  # FIX 3: count run dirs excluded by --days cutoff
     for run_dir in sorted(root.iterdir()):
         if not run_dir.is_dir():
             continue
         run_ts = _parse_run_ts(run_dir.name)
-        if run_ts is None or run_ts < cutoff:
+        if run_ts is None:
+            continue
+        if run_ts < cutoff:
+            skipped_old_runs += 1  # FIX 3: parseable but aged-out
             continue
         for md in run_dir.rglob("*.md"):
             # Skip this check's own restore backups — re-running the audit
@@ -173,19 +178,61 @@ def scan(
             if existing is None or run_ts < existing[0]:
                 oldest[md.name] = (run_ts, md)
 
+    # FIX 3: warn if aged-out run dirs were skipped
+    if skipped_old_runs > 0:
+        print(
+            f"[audit-historic-repairs] WARNING: {skipped_old_runs} backup run(s) older than"
+            f" --days={days} were excluded; 'oldest backup' may not be the true"
+            f" pre-doctor original. Re-run with a larger --days.",
+            file=sys.stderr,
+        )
+
     issues: list[Issue] = []
+    # FIX 5: counters for end-of-scan coverage summary
+    missing_current = 0
+    non_source = 0
+    no_drift = 0
+    unreadable = 0
+    project_filtered = 0
+
     for basename in sorted(oldest):
         _, backup_path = oldest[basename]
         current_path = _find_current_note(
             vault, basename, sessions_folder, insights_folder
         )
         if current_path is None:
+            missing_current += 1  # FIX 5
             continue  # note deleted/renamed since — nothing to audit
 
         try:
             backup_text = backup_path.read_text(encoding="utf-8", errors="replace")
             current_text = current_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except OSError as exc:
+            # FIX 2 / R2-1: don't silently drop unreadable notes. Emitted
+            # UNCONDITIONALLY — even with --project set — because an
+            # unreadable note cannot be attributed to a project, and the
+            # project filter must not suppress audit-infrastructure failures.
+            unreadable += 1  # FIX 5
+            issues.append(Issue(
+                check=NAME,
+                note_path=str(current_path),
+                project="unknown",
+                current_source="(unreadable)",
+                proposed_source="",
+                reason=(
+                    f"could not read note or backup for audit (note could not"
+                    f" be attributed to a project): {exc}"
+                ),
+                confidence=0.0,
+                extra={
+                    "category": "D",
+                    "signal_class": "historic-unreadable",
+                    "unresolved": True,
+                    "orig_sid": "",
+                    "orig_basename": "",
+                    "backup_path": str(backup_path),
+                },
+            ))
             continue
 
         backup_fm = _parse_frontmatter(backup_text, source=str(backup_path))
@@ -199,15 +246,26 @@ def scan(
         # Not a source-sessions note (e.g. a session note backed up by the
         # snapshot checks) — nothing to audit.
         if not orig_sid and not orig_note:
+            # FIX 4: warn when backup has no source fields but current note does
+            if curr_sid or curr_note:
+                print(
+                    f"[audit-historic-repairs] WARNING: backup {backup_path} has no"
+                    f" parsable source_session frontmatter but current note does —"
+                    f" backup may be corrupted; skipping.",
+                    file=sys.stderr,
+                )
+            non_source += 1  # FIX 5
             continue
 
         # No drift: the backlink was never rewritten (backup is from another
         # check, or a restore already ran).
         if orig_sid == curr_sid and orig_note == curr_note:
+            no_drift += 1  # FIX 5
             continue
 
         note_project = current_fm.get("project", "unknown") or "unknown"
         if project and note_project != project:
+            project_filtered += 1  # FIX 5
             continue
 
         file_date = _note_date(basename)
@@ -216,29 +274,60 @@ def scan(
         else:
             category = _classify(file_date, _note_date(orig_note), _note_date(curr_note))
 
+        # FIX 6: category A without a complete source_session pair must not
+        # be auto-applyable — mark as unresolved so apply() never attempts it.
+        unresolved = category != "A"
+        confidence = 0.9 if category == "A" else 0.0
+        reason = f"category {category}: {_CATEGORY_REASONS[category]}"
+        if category == "A" and (not orig_sid or not orig_note):
+            unresolved = True
+            confidence = 0.0
+            reason = (
+                "category A: original backlink matches note date but backup lacks"
+                " a complete source_session pair — manual restore needed"
+            )
+
         issues.append(Issue(
             check=NAME,
             note_path=str(current_path),
             project=note_project,
             current_source=f"[[{curr_note}]]" if curr_note else "(missing)",
             proposed_source=f"[[{orig_note}]]" if category == "A" else "",
-            reason=f"category {category}: {_CATEGORY_REASONS[category]}",
-            confidence=0.9 if category == "A" else 0.0,
+            reason=reason,
+            confidence=confidence,
             extra={
                 "category": category,
                 "signal_class": _CATEGORY_SIGNALS[category],
-                "unresolved": category != "A",
+                "unresolved": unresolved,
                 "orig_sid": orig_sid,
                 "orig_basename": orig_note,
                 "backup_path": str(backup_path),
             },
         ))
 
+    # FIX 5 / R2-2: end-of-scan coverage summary. Buckets partition
+    # len(oldest): every unreadable note also appended an issue (R2-1), so
+    # subtract it from the classified count to avoid double-counting.
+    if oldest:
+        classified = len(issues) - unreadable
+        print(
+            f"[audit-historic-repairs] audited {len(oldest)} backed-up note(s):"
+            f" {classified} classified, {missing_current} missing-current,"
+            f" {non_source} non-source-session, {no_drift} no-drift,"
+            f" {unreadable} unreadable, {project_filtered} project-filtered",
+            file=sys.stderr,
+        )
+
     return issues
 
 
 def apply(issues: list[Issue], backup_root: str) -> list[Result]:
-    """Restore category-A notes to their original source_session backlink."""
+    """Restore category-A notes to their original source_session backlink.
+
+    Note: the OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT override only affects which
+    backups scan() reads; apply() always writes its restore-backups under the
+    dispatcher-provided backup_root.
+    """
     results: list[Result] = []
 
     for issue in issues:

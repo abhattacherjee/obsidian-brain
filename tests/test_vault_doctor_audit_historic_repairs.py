@@ -1,6 +1,11 @@
 """Tests for the audit-historic-repairs vault_doctor check module (#95)."""
 
+import json
+import os
+import re
+import subprocess
 import sys
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -157,15 +162,35 @@ def test_missing_current_note_skipped(audit_env):
     assert _scan(audit_env) == []
 
 
-def test_non_source_session_backup_skipped(audit_env):
-    """Backups from other checks (e.g. session notes) have no source_session."""
+def test_non_source_session_backup_skipped(audit_env, capsys):
+    """T1(a): backup and current both lack source fields → no issues, no corrupt warning."""
     basename = "2026-04-09-proj1-9999.md"
     run_dir = audit_env["backups"] / _run_dirname(_days_ago(30)) / "snapshot-integrity"
     run_dir.mkdir(parents=True)
     text = "---\ntype: claude-session\ndate: 2026-04-09\nproject: proj1\n---\n# S\n"
     (run_dir / basename).write_text(text, encoding="utf-8")
     (audit_env["sessions"] / basename).write_text(text, encoding="utf-8")
-    assert _scan(audit_env) == []
+    issues = _scan(audit_env)
+    assert issues == []
+    _, err = capsys.readouterr()
+    assert "may be corrupted" not in err
+
+
+def test_corrupt_backup_warns(audit_env, capsys):
+    """T1(b): backup with NO frontmatter; current WITH source fields → no issues, stderr warns."""
+    basename = "2026-04-09-proj1-corrupt.md"
+    run_dir = audit_env["backups"] / _run_dirname(_days_ago(30)) / "snapshot-integrity"
+    run_dir.mkdir(parents=True)
+    # Backup has no frontmatter at all
+    (run_dir / basename).write_text("# just body\nsome content here\n", encoding="utf-8")
+    # Current note has both source fields
+    (audit_env["sessions"] / basename).write_text(
+        _insight_text("2026-04-09", "sid-curr", "2026-04-09-proj1-xxxx"),
+        encoding="utf-8")
+    issues = _scan(audit_env)
+    assert issues == []
+    _, err = capsys.readouterr()
+    assert "may be corrupted" in err
 
 
 def test_own_output_dir_excluded(audit_env):
@@ -277,3 +302,348 @@ def test_opt_in_excluded_from_default_sweep():
 def test_opt_in_reachable_via_get_check():
     mod = vault_doctor_checks.get_check(ahr.NAME)
     assert mod is ahr
+
+
+# ---------------------------------------------------------------- new tests (FIX 2-7 coverage)
+
+def test_sid_only_drift_detected(audit_env):
+    """T2: same source_session_note backlink (same-day) but different sids → 1 issue, cat C."""
+    _seed(audit_env, "2026-04-09-foo-t2t2.md", _days_ago(30),
+          "sid-orig", "2026-04-09-proj1-aaaa",  # same-day backlink
+          "sid-curr", "2026-04-09-proj1-aaaa")   # same backlink, different sid
+    issues = _scan(audit_env)
+    assert len(issues) == 1
+    assert issues[0].extra["category"] == "C"
+
+
+def test_backlink_only_drift_detected(audit_env):
+    """T3: same sid both sides; orig backlink same-day, curr different-day → cat A, not unresolved."""
+    _seed(audit_env, "2026-04-09-foo-t3t3.md", _days_ago(30),
+          "sid-same", "2026-04-09-proj1-aaaa",  # orig: same-day backlink
+          "sid-same", "2026-04-10-proj1-bbbb")   # curr: different-day (drift)
+    issues = _scan(audit_env)
+    assert len(issues) == 1
+    i = issues[0]
+    assert i.extra["category"] == "A"
+    assert i.extra["unresolved"] is False
+
+
+def test_category_a_without_orig_sid_is_unresolved(audit_env):
+    """T4 (FIX 6): backup has source_session_note (same-day) but NO source_session → cat A, unresolved."""
+    basename = "2026-04-09-foo-t4t4.md"
+    date = "2026-04-09"
+    run_dir = audit_env["backups"] / _run_dirname(_days_ago(30)) / "proj1" / "claude-insights"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # Backup: has source_session_note (same-day) but NO source_session field
+    backup_text = (
+        f"---\n"
+        f"type: claude-insight\n"
+        f"date: {date}\n"
+        f'source_session_note: "[[{date}-proj1-aaaa]]"\n'
+        f"project: proj1\n"
+        f"---\n"
+        f"# body\n"
+    )
+    (run_dir / basename).write_text(backup_text, encoding="utf-8")
+    # Current note has both fields, but backlink is different-day (drift)
+    (audit_env["insights"] / basename).write_text(
+        _insight_text(date, "sid-curr", "2026-04-10-proj1-bbbb"),
+        encoding="utf-8")
+    issues = _scan(audit_env)
+    assert len(issues) == 1
+    i = issues[0]
+    assert i.extra["category"] == "A"
+    assert i.extra["unresolved"] is True
+    assert i.confidence == 0.0
+
+
+def test_cli_end_to_end_scan_apply_rescan(tmp_path):
+    """T5: subprocess test for full scan → apply → rescan lifecycle."""
+    # --- Build vault ---
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    (vault / "claude-insights").mkdir(parents=True)
+
+    backup_root = tmp_path / ".claude" / "obsidian-brain-doctor-backup"
+    backup_root.mkdir(parents=True)
+
+    # Seed a category-A fixture in a run INSIDE the backup_root
+    basename = "2026-04-09-proj1-t5t5.md"
+    date = "2026-04-09"
+    run_dir = backup_root / _run_dirname(_days_ago(30)) / "proj1" / "claude-insights"
+    run_dir.mkdir(parents=True)
+    (run_dir / basename).write_text(
+        _insight_text(date, "sid-orig-t5", "2026-04-09-proj1-t5orig"),
+        encoding="utf-8")
+    # Current note: drifted (different-day backlink)
+    (vault / "claude-insights" / basename).write_text(
+        _insight_text(date, "sid-curr-t5", "2026-04-10-proj1-t5curr"),
+        encoding="utf-8")
+
+    script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
+    env = {
+        "HOME": str(tmp_path),
+        "OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT": str(backup_root),
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+    }
+
+    # Step 1: scan with --check → exit 1; 1 issue with signal_class historic-restore; no "extra" top-level key
+    r = subprocess.run(
+        [sys.executable, str(script),
+         "--check", "audit-historic-repairs",
+         "--json",
+         "--vault", str(vault),
+         "--sessions-folder", "claude-sessions",
+         "--insights-folder", "claude-insights"],
+        capture_output=True, text=True, env=env,
+    )
+    assert r.returncode == 1, f"step1 exit: expected 1, got {r.returncode}:\n{r.stderr}"
+    payload = json.loads(r.stdout)
+    assert payload["total_issues"] == 1
+    row = payload["issues"][0]
+    assert row["signal_class"] == "historic-restore"
+    assert "extra" not in row
+
+    # Step 2: full sweep (no --check) → OPT_IN exclusion, no audit-historic-repairs rows
+    r2 = subprocess.run(
+        [sys.executable, str(script),
+         "--json",
+         "--vault", str(vault),
+         "--sessions-folder", "claude-sessions",
+         "--insights-folder", "claude-insights"],
+        capture_output=True, text=True, env=env,
+    )
+    assert r2.returncode in (0, 1), r2.stderr
+    p2 = json.loads(r2.stdout)
+    for row2 in p2.get("issues", []):
+        assert row2.get("check") != "audit-historic-repairs", \
+            "OPT_IN check must not appear in default sweep"
+
+    # Step 3: apply with --yes → exit 1; note content restored
+    r3 = subprocess.run(
+        [sys.executable, str(script),
+         "--check", "audit-historic-repairs",
+         "--apply", "--yes",
+         "--vault", str(vault),
+         "--sessions-folder", "claude-sessions",
+         "--insights-folder", "claude-insights"],
+        capture_output=True, text=True, env=env,
+    )
+    assert r3.returncode in (0, 1), f"step3 exit: got {r3.returncode}:\n{r3.stderr}"
+    restored = (vault / "claude-insights" / basename).read_text(encoding="utf-8")
+    assert "source_session: sid-orig-t5" in restored
+    assert "2026-04-09-proj1-t5orig" in restored
+
+    # Step 4: rescan → clean (exit 0); own restore backups under audit-historic-repairs/ not re-audited
+    r4 = subprocess.run(
+        [sys.executable, str(script),
+         "--check", "audit-historic-repairs",
+         "--json",
+         "--vault", str(vault),
+         "--sessions-folder", "claude-sessions",
+         "--insights-folder", "claude-insights"],
+        capture_output=True, text=True, env=env,
+    )
+    assert r4.returncode == 0, f"step4 exit: expected 0 (clean), got {r4.returncode}:\n{r4.stderr}"
+
+
+def test_apply_errors_on_frontmatterless_note(tmp_path):
+    """T6: category-A Issue whose note_path has no frontmatter → error result, file unchanged."""
+    note = tmp_path / "2026-04-09-proj1-t6t6.md"
+    note.write_text("# just body\nno frontmatter here\n", encoding="utf-8")
+    original = note.read_text(encoding="utf-8")
+
+    issue = Issue(
+        check=ahr.NAME,
+        note_path=str(note),
+        project="proj1",
+        current_source="[[2026-04-10-proj1-curr]]",
+        proposed_source="[[2026-04-09-proj1-orig]]",
+        reason="category A: ...",
+        confidence=0.9,
+        extra={
+            "category": "A",
+            "signal_class": "historic-restore",
+            "unresolved": False,
+            "orig_sid": "sid-orig-t6",
+            "orig_basename": "2026-04-09-proj1-orig",
+            "backup_path": str(tmp_path / "backup.md"),
+        },
+    )
+    apply_root = tmp_path / "apply-backup"
+    results = ahr.apply([issue], str(apply_root))
+    assert len(results) == 1
+    r = results[0]
+    assert r.status == "error"
+    assert "frontmatter" in r.error.lower()
+    assert note.read_text(encoding="utf-8") == original  # file unchanged
+    # backup file should exist (written before the rewrite attempt)
+    backup = apply_root / ahr.NAME / note.parent.name / note.name
+    assert backup.is_file()
+
+
+def test_dateless_note_basename_is_category_d(audit_env):
+    """T7: backed-up note with no date prefix and drift → 1 issue, category D."""
+    basename = "nodate-note.md"
+    run_dir = audit_env["backups"] / _run_dirname(_days_ago(30)) / "proj1" / "claude-insights"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / basename).write_text(
+        "---\ntype: claude-insight\ndate: 2026-04-09\n"
+        "source_session: sid-orig\n"
+        'source_session_note: "[[2026-04-09-proj1-orig]]"\n'
+        "project: proj1\n---\n# body\n",
+        encoding="utf-8")
+    (audit_env["insights"] / basename).write_text(
+        "---\ntype: claude-insight\ndate: 2026-04-09\n"
+        "source_session: sid-curr\n"
+        'source_session_note: "[[2026-04-10-proj1-curr]]"\n'
+        "project: proj1\n---\n# body\n",
+        encoding="utf-8")
+    issues = _scan(audit_env)
+    assert len(issues) == 1
+    assert issues[0].extra["category"] == "D"
+
+
+def test_missing_current_backlink_renders_missing(audit_env):
+    """T8: current note has source_session but NO source_session_note → current_source == '(missing)', cat D."""
+    basename = "2026-04-09-foo-t8t8.md"
+    date = "2026-04-09"
+    run_dir = audit_env["backups"] / _run_dirname(_days_ago(30)) / "proj1" / "claude-insights"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # Backup has both fields
+    (run_dir / basename).write_text(
+        _insight_text(date, "sid-orig", "2026-04-09-proj1-orig"),
+        encoding="utf-8")
+    # Current note has source_session but NO source_session_note
+    (audit_env["insights"] / basename).write_text(
+        f"---\ntype: claude-insight\ndate: {date}\n"
+        f"source_session: sid-curr\n"
+        f"project: proj1\n---\n# body\n",
+        encoding="utf-8")
+    issues = _scan(audit_env)
+    assert len(issues) == 1
+    i = issues[0]
+    assert i.current_source == "(missing)"
+    assert i.extra["category"] == "D"
+
+
+def test_excluded_old_run_warns(audit_env, capsys):
+    """T9: only aged-out run (200 days old), scan days=180 → no issues, warns about older runs."""
+    _seed(audit_env, "2026-04-09-foo-t9t9.md", _days_ago(200),
+          "sid-orig", "2026-04-09-proj1-aaaa",
+          "sid-curr", "2026-04-10-proj1-bbbb")
+    issues = _scan(audit_env, days=180)
+    assert issues == []
+    _, err = capsys.readouterr()
+    assert "older than --days=180" in err
+
+
+def test_scan_emits_coverage_summary(audit_env, capsys):
+    """T10: any seeded fixture → stderr contains 'audited' and 'classified'."""
+    _seed(audit_env, "2026-04-09-foo-t10.md", _days_ago(30),
+          "sid-orig", "2026-04-09-proj1-aaaa",
+          "sid-curr", "2026-04-10-proj1-bbbb")
+    _scan(audit_env)
+    _, err = capsys.readouterr()
+    assert "audited" in err
+    assert "classified" in err
+
+
+def test_opt_in_non_bool_raises():
+    """T11 (FIX 7): OPT_IN with a non-bool value raises TypeError from all_checks()."""
+    fake_mod = types.SimpleNamespace(
+        NAME="fake-optin",
+        scan=lambda *a, **kw: [],
+        apply=lambda *a, **kw: [],
+        OPT_IN="true",  # string, not bool
+    )
+    vault_doctor_checks._discover()  # ensure _CHECKS is populated
+    original = vault_doctor_checks._CHECKS.copy()
+    try:
+        vault_doctor_checks._CHECKS["fake-optin"] = fake_mod
+        with pytest.raises(TypeError, match="OPT_IN must be bool"):
+            vault_doctor_checks.all_checks()
+    finally:
+        vault_doctor_checks._CHECKS.clear()
+        vault_doctor_checks._CHECKS.update(original)
+
+
+# ------------------------------------------------------- round-2: unreadable path (R2-1/R2-2)
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_unreadable_note_emits_unresolved_issue(audit_env):
+    """R2-4(a): unreadable current note → unresolved historic-unreadable issue (project=None)."""
+    basename = "2026-04-09-foo-r2a.md"
+    _seed(audit_env, basename, _days_ago(30),
+          "sid-orig", "2026-04-09-proj1-aaaa",
+          "sid-curr", "2026-04-10-proj1-bbbb")
+    current = audit_env["insights"] / basename
+    current.chmod(0o000)
+    try:
+        issues = _scan(audit_env)
+    finally:
+        current.chmod(0o600)  # restore so tmp_path cleanup works everywhere
+    assert len(issues) == 1
+    i = issues[0]
+    assert i.extra["signal_class"] == "historic-unreadable"
+    assert i.extra["unresolved"] is True
+    assert i.project == "unknown"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_unreadable_note_emitted_under_project_filter(audit_env):
+    """R2-4(b): with --project set, the unreadable issue is STILL emitted (R2-1)."""
+    basename = "2026-04-09-foo-r2b.md"
+    _seed(audit_env, basename, _days_ago(30),
+          "sid-orig", "2026-04-09-proj1-aaaa",
+          "sid-curr", "2026-04-10-proj1-bbbb")
+    current = audit_env["insights"] / basename
+    current.chmod(0o000)
+    try:
+        issues = _scan(audit_env, project="proj1")
+    finally:
+        current.chmod(0o600)
+    assert len(issues) == 1
+    assert issues[0].extra["signal_class"] == "historic-unreadable"
+    assert issues[0].extra["unresolved"] is True
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_coverage_summary_partitions(audit_env, capsys):
+    """R2-4(c): summary buckets partition the audited count; classified excludes unreadable."""
+    # 1 classified (category A)
+    _seed(audit_env, "2026-04-09-foo-r2c1.md", _days_ago(30),
+          "sid-orig", "2026-04-09-proj1-aaaa",
+          "sid-curr", "2026-04-10-proj1-bbbb")
+    # 1 unreadable
+    _seed(audit_env, "2026-04-09-foo-r2c2.md", _days_ago(30),
+          "sid-orig", "2026-04-09-proj1-cccc",
+          "sid-curr", "2026-04-10-proj1-dddd")
+    unreadable_note = audit_env["insights"] / "2026-04-09-foo-r2c2.md"
+    unreadable_note.chmod(0o000)
+    # 1 no-drift
+    _seed(audit_env, "2026-04-09-foo-r2c3.md", _days_ago(30),
+          "sid-same", "2026-04-09-proj1-eeee",
+          "sid-same", "2026-04-09-proj1-eeee")
+    try:
+        issues = _scan(audit_env)
+    finally:
+        unreadable_note.chmod(0o600)
+    # issues: 1 classified + 1 unreadable
+    assert len(issues) == 2
+
+    _, err = capsys.readouterr()
+    m = re.search(
+        r"audited (\d+) backed-up note\(s\): (\d+) classified, (\d+) missing-current,"
+        r" (\d+) non-source-session, (\d+) no-drift, (\d+) unreadable,"
+        r" (\d+) project-filtered",
+        err,
+    )
+    assert m, f"summary line not found in stderr:\n{err}"
+    audited, classified, missing, non_src, no_drift, unreadable, proj_filt = map(
+        int, m.groups())
+    assert audited == 3
+    assert classified == 1
+    assert unreadable == 1
+    assert no_drift == 1
+    assert classified + missing + non_src + no_drift + unreadable + proj_filt == audited
