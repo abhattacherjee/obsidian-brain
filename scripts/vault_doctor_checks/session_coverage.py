@@ -81,8 +81,10 @@ Flags:
   ``--strict``      emit FAIL (not WARN) when any note references the orphaned
                     session via ``source_session``. Changes the reason prefix
                     only — not the exit code.
-  ``--reconstruct`` mark issues as resolvable (``unresolved=False``) and enable
-                    ``apply()``.
+  ``--reconstruct`` mark issues as resolvable (``unresolved=False``,
+                    ``confidence=0.9`` — consistent with other applyable
+                    repairs) and enable ``apply()``. Without it, gaps are
+                    unresolved and carry ``confidence=0.0``.
 """
 
 from __future__ import annotations
@@ -576,7 +578,9 @@ def scan(
         project:         If set, only surface gaps for this project name
                          (cwd-basename slug — see module docstring).
         strict:          If True, emit FAIL prefix when any insight references the gap.
-        reconstruct:     If True, mark issues resolvable (unresolved=False) to enable apply().
+        reconstruct:     If True, mark issues resolvable (unresolved=False,
+                         confidence=0.9) to enable apply(). Otherwise gaps are
+                         unresolved with confidence=0.0.
     """
     vault = Path(vault_path)
     # Path.home() reads $HOME on POSIX (tests monkeypatch it) and falls back
@@ -768,7 +772,13 @@ def scan(
                     current_source=f"{sid}.jsonl ({size} bytes)",
                     proposed_source=f"[[{expected_basename[:-3]}]]",  # strip .md
                     reason=reason,
-                    confidence=0.0,
+                    # Resolvable gaps (reconstruct mode) carry 0.9 — the
+                    # repair is known and applyable, consistent with other
+                    # applyable repairs (canonicalization proposals, audit
+                    # category-A restores). Unresolved gaps stay 0.0 so a
+                    # --min-confidence threshold > 0 filters them, and never
+                    # silently nullifies --reconstruct.
+                    confidence=0.9 if reconstruct else 0.0,
                     extra={
                         "unresolved": not reconstruct,
                         "signal_class": "session-coverage-gap",
@@ -786,19 +796,20 @@ def scan(
 
     # Step 7: end-of-scan stderr summary. The five buckets partition the
     # scanned JSONLs exactly; unreadable session notes are an index-side
-    # (note-side) counter appended for operator visibility.
+    # (note-side) counter appended for operator visibility. Printed
+    # UNCONDITIONALLY (even when nothing was scanned) — a silent scan is
+    # indistinguishable from a scan that never ran.
     total_scanned = n_gaps + n_covered + n_below_threshold + n_unparsable + n_project_filtered
-    if total_scanned > 0 or n_project_dirs > 0:
-        print(
-            f"[session-coverage] scanned {total_scanned} jsonl(s) across"
-            f" {n_project_dirs} project dir(s):"
-            f" {n_gaps} gaps, {n_covered} covered,"
-            f" {n_below_threshold} below-threshold,"
-            f" {n_unparsable} unparsable,"
-            f" {n_project_filtered} project-filtered;"
-            f" {n_unreadable_notes} unreadable session note(s)",
-            file=sys.stderr,
-        )
+    print(
+        f"[session-coverage] scanned {total_scanned} jsonl(s) across"
+        f" {n_project_dirs} project dir(s):"
+        f" {n_gaps} gaps, {n_covered} covered,"
+        f" {n_below_threshold} below-threshold,"
+        f" {n_unparsable} unparsable,"
+        f" {n_project_filtered} project-filtered;"
+        f" {n_unreadable_notes} unreadable session note(s)",
+        file=sys.stderr,
+    )
 
     return issues
 
@@ -953,17 +964,44 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             )
             continue
 
-        outcome = out.get("outcome", "UNKNOWN")
+        # Coerce outcome to str defensively: a malformed replay payload with
+        # a non-string outcome (number, null) must fall through to the
+        # per-issue error path below, not raise AttributeError on
+        # .startswith() and abort the whole sweep.
+        outcome = str(out.get("outcome", "UNKNOWN"))
         if outcome in _SUCCESS_OUTCOMES:
             # vault_writes is the replay's ground truth for what was written
             # (the predicted issue.note_path may differ in date — see docstring:
             # the hook's _first_seen_date returns TODAY for never-written
             # sessions, while the scan predicted from the JSONL first timestamp).
+            # Shape-guard the [path, bytes] entries: a malformed payload
+            # (non-list outer, empty/non-list inner) becomes a per-issue
+            # error Result instead of a TypeError/IndexError crash.
             vault_writes = out.get("vault_writes", [])
-            if vault_writes:
-                actual_path = vault_writes[0][0]
+            first_entry = None
+            if isinstance(vault_writes, list) and vault_writes:
+                candidate = vault_writes[0]
+                if isinstance(candidate, (list, tuple)) and candidate:
+                    first_entry = candidate
+            if first_entry is not None:
+                actual_path = str(first_entry[0])
                 results.append(
                     Result(check=NAME, note_path=actual_path, status="applied")
+                )
+            elif vault_writes:
+                results.append(
+                    Result(
+                        check=NAME,
+                        note_path=issue.note_path,
+                        status="error",
+                        error=(
+                            f"replay reported success ({outcome}) but its "
+                            f"vault_writes is malformed "
+                            f"({str(vault_writes)[:120]!r}); "
+                            f"check whether the note now exists before "
+                            f"re-running"
+                        ),
+                    )
                 )
             else:
                 results.append(
@@ -973,7 +1011,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
                         status="error",
                         error=(
                             f"replay reported success ({outcome}) but wrote "
-                            f"nothing (vault_writes empty)"
+                            f"nothing (vault_writes empty); check whether "
+                            f"the note now exists before re-running"
                         ),
                     )
                 )

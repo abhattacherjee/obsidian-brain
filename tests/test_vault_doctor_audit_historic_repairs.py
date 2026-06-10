@@ -649,6 +649,182 @@ def test_coverage_summary_partitions(audit_env, capsys):
     assert classified + missing + non_src + no_drift + unreadable + proj_filt == audited
 
 
+# --------------------------------- missing/empty backup root must not be silent
+
+def test_missing_backup_root_warns_not_silent(tmp_path, monkeypatch, capsys):
+    """A nonexistent backup root must print a stderr notice — an early []
+    return with no output reads as a clean bill of health when it actually
+    means 'nothing was audited'."""
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    (vault / "claude-sessions").mkdir(parents=True)
+    missing_root = tmp_path / "does-not-exist"
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT", str(missing_root))
+
+    issues = ahr.scan(str(vault), "claude-sessions", "claude-insights", 180)
+    assert issues == []
+    _, err = capsys.readouterr()
+    assert "backup root" in err
+    assert str(missing_root) in err
+    assert "not found" in err
+    assert "no-op, not a clean bill of health" in err
+
+
+def test_empty_backup_root_prints_zero_audited_summary(audit_env, capsys):
+    """Backup root exists but contains no runs → the coverage summary still
+    prints, with 'audited 0 backed-up note(s)' (no silent empty partition)."""
+    issues = _scan(audit_env)
+    assert issues == []
+    _, err = capsys.readouterr()
+    assert "audited 0 backed-up note(s)" in err
+
+
+# ----------------------- --min-confidence interplay (attribution + apply scope)
+
+def _build_min_conf_env(tmp_path, with_unreadable=False):
+    """Vault + backup root with one category-A (conf 0.9) and one category-B
+    (historic-keep, conf 0.0) fixture; optionally one unreadable current note
+    (historic-unreadable, conf 0.0). Returns (vault, env, note_a, note_b,
+    note_unreadable_or_None)."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    (vault / "claude-insights").mkdir(parents=True)
+    backup_root = tmp_path / "doctor-backup"
+    run_dir = backup_root / _run_dirname(_days_ago(30)) / "proj1" / "claude-insights"
+    run_dir.mkdir(parents=True)
+
+    # Category A: original same-day, current drifted → conf 0.9, applyable.
+    basename_a = "2026-04-09-proj1-mca.md"
+    (run_dir / basename_a).write_text(
+        _insight_text("2026-04-09", "sid-orig-a", "2026-04-09-proj1-aorig"),
+        encoding="utf-8")
+    note_a = vault / "claude-insights" / basename_a
+    note_a.write_text(
+        _insight_text("2026-04-09", "sid-curr-a", "2026-04-10-proj1-acurr"),
+        encoding="utf-8")
+
+    # Category B: original wrong-day, current same-day → historic-keep, conf 0.0.
+    basename_b = "2026-04-09-proj1-mcb.md"
+    (run_dir / basename_b).write_text(
+        _insight_text("2026-04-09", "sid-orig-b", "2026-04-08-proj1-borig"),
+        encoding="utf-8")
+    note_b = vault / "claude-insights" / basename_b
+    note_b.write_text(
+        _insight_text("2026-04-09", "sid-curr-b", "2026-04-09-proj1-bcurr"),
+        encoding="utf-8")
+
+    note_u = None
+    if with_unreadable:
+        basename_u = "2026-04-09-proj1-mcu.md"
+        (run_dir / basename_u).write_text(
+            _insight_text("2026-04-09", "sid-orig-u", "2026-04-09-proj1-uorig"),
+            encoding="utf-8")
+        note_u = vault / "claude-insights" / basename_u
+        note_u.write_text(
+            _insight_text("2026-04-09", "sid-curr-u", "2026-04-10-proj1-ucurr"),
+            encoding="utf-8")
+        note_u.chmod(0o000)
+
+    env = {
+        "HOME": str(tmp_path),
+        "OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT": str(backup_root),
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "OBSIDIAN_BRAIN_VAULT": str(vault),
+        "OBSIDIAN_BRAIN_SESSIONS_FOLDER": "claude-sessions",
+        "OBSIDIAN_BRAIN_INSIGHTS_FOLDER": "claude-insights",
+    }
+    return vault, env, note_a, note_b, note_u
+
+
+_SCRIPT = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_min_confidence_drop_attribution_by_signal_class(tmp_path):
+    """Dropped infrastructure rows must stay attributable: --min-confidence 0.5
+    drops the cat-B (historic-keep) and unreadable (historic-unreadable) rows;
+    the JSON payload carries a per-signal_class breakdown and the human header
+    names the classes."""
+    vault, env, note_a, note_b, note_u = _build_min_conf_env(
+        tmp_path, with_unreadable=True)
+    try:
+        r = subprocess.run(
+            [sys.executable, str(_SCRIPT),
+             "--check", "audit-historic-repairs",
+             "--min-confidence", "0.5", "--json"],
+            capture_output=True, text=True, env=env,
+        )
+        assert r.returncode == 1, f"cat-A survives → exit 1; got {r.returncode}:\n{r.stderr}"
+        payload = json.loads(r.stdout)
+        assert payload["total_issues"] == 1
+        assert payload["issues"][0]["signal_class"] == "historic-restore"
+        assert payload["dropped_per_check"] == {"audit-historic-repairs": 2}
+        assert payload["dropped_per_signal_class"] == {
+            "audit-historic-repairs": {
+                "historic-keep": 1,
+                "historic-unreadable": 1,
+            }
+        }, f"signal-class attribution missing/wrong: {payload}"
+
+        # Human header carries the class names too.
+        r2 = subprocess.run(
+            [sys.executable, str(_SCRIPT),
+             "--check", "audit-historic-repairs",
+             "--min-confidence", "0.5"],
+            capture_output=True, text=True, env=env,
+        )
+        header_line = next(
+            (line for line in r2.stderr.splitlines()
+             if "vault_doctor report" in line), None)
+        assert header_line is not None, f"header missing:\n{r2.stderr}"
+        assert "historic-keep" in header_line, header_line
+        assert "historic-unreadable" in header_line, header_line
+    finally:
+        if note_u is not None:
+            note_u.chmod(0o600)
+
+
+def test_min_confidence_no_signal_class_key_without_flag(tmp_path):
+    """Back-compat: without --min-confidence the dropped_per_signal_class key
+    must NOT appear in the JSON payload."""
+    vault, env, note_a, note_b, _ = _build_min_conf_env(tmp_path)
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT),
+         "--check", "audit-historic-repairs", "--json"],
+        capture_output=True, text=True, env=env,
+    )
+    assert r.returncode == 1, r.stderr
+    payload = json.loads(r.stdout)
+    assert "dropped_per_signal_class" not in payload
+
+
+def test_min_confidence_apply_restores_only_category_a(tmp_path):
+    """--min-confidence 0.5 --apply --yes: only the cat-A (conf 0.9) note is
+    restored; the cat-B (conf 0.0) note is byte-identical; the dry-run report
+    (emitted before apply) carries the dropped attribution."""
+    vault, env, note_a, note_b, _ = _build_min_conf_env(tmp_path)
+    original_b = note_b.read_text(encoding="utf-8")
+
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT),
+         "--check", "audit-historic-repairs",
+         "--min-confidence", "0.5", "--apply", "--yes", "--json"],
+        capture_output=True, text=True, env=env,
+    )
+    assert r.returncode == 1, f"expected 1 (successful apply), got {r.returncode}:\n{r.stderr}"
+
+    payload = json.loads(r.stdout)
+    assert payload["dropped_by_confidence"] == 1
+    assert payload["dropped_per_check"] == {"audit-historic-repairs": 1}
+
+    restored = note_a.read_text(encoding="utf-8")
+    assert "source_session: sid-orig-a" in restored, "cat-A note must be restored"
+    assert "2026-04-09-proj1-aorig" in restored
+    assert note_b.read_text(encoding="utf-8") == original_b, (
+        "cat-B note (conf 0.0, dropped by filter) must be untouched"
+    )
+
+
 # --------------------------------------------- cross-folder basename collisions
 
 def test_cross_folder_collision_pairs_correctly(audit_env):

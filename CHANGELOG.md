@@ -111,6 +111,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the default all-checks sweep via the new registry `OPT_IN` attribute.
 
 ### Fixed
+- **Reconstructable session-coverage gaps now carry confidence 0.9 (#215)** —
+  `vault-doctor --check session-coverage --reconstruct` previously emitted every
+  gap with `confidence=0.0`, so any `--min-confidence` threshold > 0 silently
+  nullified `--reconstruct` (the gaps were filtered out before apply). Resolvable
+  gaps (reconstruct mode) now carry `confidence=0.9`, consistent with other
+  applyable repairs (canonicalization proposals, audit category-A restores);
+  unresolved gaps keep `0.0`. The `--min-confidence` help text was updated to
+  match.
+- **`audit-historic-repairs` is no longer silent on a missing/empty backup root
+  (#215)** — a nonexistent backup root now prints a stderr notice
+  (`backup root <path> not found — no doctor backups to audit (no-op, not a
+  clean bill of health)`), and the end-of-scan coverage summary prints
+  unconditionally, so an empty audit shows `audited 0 backed-up note(s)`
+  instead of nothing.
+- **Per-check crash containment in the `vault_doctor` dispatcher (#215)** — a
+  check whose `scan()` or `apply()` raises no longer takes down the whole run.
+  The crash is printed to stderr with a full traceback, the check is recorded
+  in a new `crashed_checks` JSON key (present only when non-empty) and in the
+  human report header, and the remaining checks still run and report. A run
+  with crashed checks always exits 2; with 0 issues it prints
+  `vault_doctor: 0 issues, but N check(s) crashed — results incomplete`
+  instead of the plain clean line. An `apply()` crash additionally warns that
+  some fixes may already be applied (pointing at the backup root).
+- **`--min-confidence` drop attribution by signal class (#215)** — dropped
+  issues that carry a `signal_class` (e.g. the audit's `historic-keep` /
+  `historic-unreadable` infrastructure rows) are now broken out per class in
+  the human header (`; by class: audit-historic-repairs: 1 historic-keep,
+  1 historic-unreadable`) and in a new conditional `dropped_per_signal_class`
+  JSON key, so filtered-out infrastructure failures stay visible. Attribution
+  only — no filter exemption.
+- **Unconditional end-of-scan summaries (#215)** — `session-coverage` and
+  `project-name-canonicalization` now print their end-of-scan summary lines
+  even when nothing was scanned (zero counts visible); a silent scan was
+  indistinguishable from a scan that never ran. The check registry also warns
+  on stderr when a module loads but does not expose the check interface,
+  instead of silently skipping it.
 - **`vault-doctor source-sessions` skips imported notes (#104)** — notes carrying
   `imported: true` in frontmatter OR a `claude/imported` list item under the
   `tags:` key are now silently skipped by the source-sessions check (the tag

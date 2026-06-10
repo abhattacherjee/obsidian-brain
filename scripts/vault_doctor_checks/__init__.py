@@ -54,6 +54,8 @@ def _discover() -> None:
     Per-module exceptions (ImportError, SyntaxError, etc.) are logged to
     stderr and the offending module is skipped, so one broken check cannot
     take down the whole dispatcher. This keeps the system pluggable.
+    Modules that import cleanly but do not expose the check interface
+    (NAME + callable scan/apply) are also warned about on stderr.
     """
     if _CHECKS:
         return
@@ -72,6 +74,15 @@ def _discover() -> None:
         name = getattr(mod, "NAME", None)
         if name and callable(getattr(mod, "scan", None)) and callable(getattr(mod, "apply", None)):
             _CHECKS[name] = mod
+        else:
+            # A module that imports fine but lacks the interface (typo'd
+            # NAME/scan/apply, helper accidentally dropped into the package)
+            # must not vanish silently — its check would simply never run.
+            print(
+                f"[vault_doctor] module {mod_info.name} loaded but does not "
+                f"expose the check interface; skipped",
+                file=_sys.stderr,
+            )
 
 
 def list_checks() -> list[str]:

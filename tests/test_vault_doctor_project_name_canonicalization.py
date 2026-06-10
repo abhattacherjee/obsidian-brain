@@ -792,6 +792,16 @@ def test_stderr_summary_partition(canon_vault, tmp_path, capsys):
     assert "proposed" in captured.err
 
 
+def test_summary_printed_even_when_nothing_scanned(canon_vault, capsys):
+    """Empty vault folders → both phase summaries still print with zero
+    counts; a silent scan is indistinguishable from a scan that never ran."""
+    issues = _scan(canon_vault)
+    assert issues == []
+    captured = capsys.readouterr()
+    assert "[project-name-canonicalization] phase1 (sessions): 0 scanned" in captured.err
+    assert "[project-name-canonicalization] phase2 (insights): 0 scanned" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # OPT_IN and NAME
 # ---------------------------------------------------------------------------
@@ -801,6 +811,19 @@ def test_module_opt_in_and_name():
     assert check.NAME == "project-name-canonicalization"
     assert check.OPT_IN is True
     assert check.DEFAULT_WINDOW_DAYS == 9999
+
+
+def test_registry_excluded_from_default_sweep():
+    """Registry-level OPT_IN assertion (matches the audit/session-coverage
+    pattern): the check must NOT appear in the default all-checks sweep —
+    OPT_IN=True on the module alone is not enough if all_checks() regressed."""
+    names = [m.NAME for m in vault_doctor_checks.all_checks()]
+    assert check.NAME not in names
+
+
+def test_registry_reachable_via_get_check():
+    """...but it must stay reachable when explicitly named via --check."""
+    assert vault_doctor_checks.get_check(check.NAME) is check
 
 
 # ---------------------------------------------------------------------------

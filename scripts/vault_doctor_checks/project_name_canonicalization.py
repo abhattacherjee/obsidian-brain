@@ -429,6 +429,9 @@ def scan(
 
             note_project = fm.get("project", "") or ""
             session_id = fm.get("session_id", "") or ""
+            # NOTE: _parse_frontmatter already strips surrounding quotes from
+            # values; this extra strip is belt-and-suspenders (harmless on
+            # already-clean values, protective if the parser ever changes).
             project_path_raw = (fm.get("project_path", "") or "").strip('"').strip("'")
 
             # -- derive outcome (always, BEFORE the project filter) ---------
@@ -718,31 +721,32 @@ def scan(
         + p2_warn_empty_project + p2_no_source_session
         + p2_project_filtered + p2_unreadable
     )
-    if p1_total > 0 or p2_total > 0:
-        print(
-            f"[{NAME}] phase1 (sessions): {p1_total} scanned:"
-            f" {p1_already_canonical} already-canonical, {p1_proposed} proposed,"
-            f" {p1_warn_no_project_path} warn-no-project-path,"
-            f" {p1_warn_not_found} warn-path-not-found,"
-            f" {p1_warn_unavailable} warn-git-unavailable,"
-            f" {p1_warn_git_error} warn-git-error,"
-            f" {p1_warn_empty_project} warn-empty-project,"
-            f" {p1_left_alone_not_a_repo} left-alone-non-git,"
-            f" {p1_project_filtered} project-filtered,"
-            f" {p1_unreadable} unreadable,"
-            f" {p1_snapshots_skipped} snapshots-skipped",
-            file=sys.stderr,
-        )
-        print(
-            f"[{NAME}] phase2 (insights): {p2_total} scanned:"
-            f" {p2_already_canonical} already-canonical, {p2_proposed} proposed,"
-            f" {p2_warn_unresolved_session} warn-unresolved-session,"
-            f" {p2_warn_empty_project} warn-empty-project,"
-            f" {p2_no_source_session} no-source-session,"
-            f" {p2_project_filtered} project-filtered,"
-            f" {p2_unreadable} unreadable",
-            file=sys.stderr,
-        )
+    # Printed UNCONDITIONALLY (even when both phases scanned nothing) — a
+    # silent scan is indistinguishable from a scan that never ran.
+    print(
+        f"[{NAME}] phase1 (sessions): {p1_total} scanned:"
+        f" {p1_already_canonical} already-canonical, {p1_proposed} proposed,"
+        f" {p1_warn_no_project_path} warn-no-project-path,"
+        f" {p1_warn_not_found} warn-path-not-found,"
+        f" {p1_warn_unavailable} warn-git-unavailable,"
+        f" {p1_warn_git_error} warn-git-error,"
+        f" {p1_warn_empty_project} warn-empty-project,"
+        f" {p1_left_alone_not_a_repo} left-alone-non-git,"
+        f" {p1_project_filtered} project-filtered,"
+        f" {p1_unreadable} unreadable,"
+        f" {p1_snapshots_skipped} snapshots-skipped",
+        file=sys.stderr,
+    )
+    print(
+        f"[{NAME}] phase2 (insights): {p2_total} scanned:"
+        f" {p2_already_canonical} already-canonical, {p2_proposed} proposed,"
+        f" {p2_warn_unresolved_session} warn-unresolved-session,"
+        f" {p2_warn_empty_project} warn-empty-project,"
+        f" {p2_no_source_session} no-source-session,"
+        f" {p2_project_filtered} project-filtered,"
+        f" {p2_unreadable} unreadable",
+        file=sys.stderr,
+    )
 
     return issues
 
