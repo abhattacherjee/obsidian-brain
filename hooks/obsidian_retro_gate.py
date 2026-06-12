@@ -34,15 +34,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from obsidian_utils import (  # noqa: E402
+    RETRO_GATE_TTL_SECONDS,
     clear_retro_classification_pending,
     get_retro_classification_pending,
 )
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-RETRO_GATE_TTL_SECONDS = 7200  # 2 hours
 
 _BLOCK_REASON = (
     "You wrote a retro this session but Step 7.5 classification is not yet complete. "

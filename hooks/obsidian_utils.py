@@ -202,10 +202,43 @@ def _first_seen_date(sid: str) -> str:
 # Sanitize session_id to safe filename characters.
 _RETRO_SID_SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
+# Single source of truth for the retro-gate TTL. Imported by
+# hooks/obsidian_retro_gate.py so the value is never duplicated.
+RETRO_GATE_TTL_SECONDS = 7200  # 2 hours
+
 
 def _retro_gate_dir() -> Path:
     """Return the retro-gate sentinel directory, computed at call time."""
     return Path.home() / ".claude" / "obsidian-brain" / "retro-gate"
+
+
+def _reap_stale_retro_sentinels() -> int:
+    """Delete retro-gate sentinels whose mtime is older than RETRO_GATE_TTL_SECONDS.
+
+    Uses mtime (not JSON content) so corrupt or foreign files are handled safely.
+    Best-effort: never raises — any OSError is swallowed.  Returns the count of
+    files reaped (0 when the gate dir is absent or no files qualify).
+    """
+    try:
+        gate_dir = _retro_gate_dir()
+        if not gate_dir.exists():
+            return 0
+        cutoff = time.time() - RETRO_GATE_TTL_SECONDS
+        reaped = 0
+        try:
+            candidates = list(gate_dir.glob("*.json"))
+        except OSError:
+            return 0
+        for f in candidates:
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    reaped += 1
+            except OSError:
+                continue
+        return reaped
+    except Exception:
+        return 0
 
 
 def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
@@ -234,6 +267,13 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
         print(f"[obsidian-brain] mark_retro_classification_pending: cannot create gate dir: {exc}",
               file=sys.stderr)
         return ""
+
+    # Opportunistically reap stale orphaned sentinels. Wrapped in its own
+    # try/except so a reap failure can never break the mark operation.
+    try:
+        _reap_stale_retro_sentinels()
+    except Exception:
+        pass
 
     sentinel = gate_dir / f"{sanitized}.json"
 

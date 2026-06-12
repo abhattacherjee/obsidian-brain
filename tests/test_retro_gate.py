@@ -242,3 +242,62 @@ class TestRetroGateHelpers:
         data = obsidian_utils.get_retro_classification_pending(sid_with_specials)
         assert data is not None
         assert data["session_id"] == sid_with_specials
+
+    def test_mark_reaps_stale_orphan(self):
+        """mark_ removes orphaned sentinels older than RETRO_GATE_TTL_SECONDS."""
+        orphan_sid = "orphan-stale-session-xyz"
+        new_sid = "new-session-abc456"
+        # Write the orphan sentinel manually into the gate dir.
+        gate_dir = self._gate_dir()
+        gate_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        orphan_file = gate_dir / f"{orphan_sid}.json"
+        orphan_file.write_text(
+            json.dumps({"session_id": orphan_sid, "retro_path": "/v/r.md",
+                        "created_at": time.time() - (obsidian_utils.RETRO_GATE_TTL_SECONDS + 600)}),
+            encoding="utf-8",
+        )
+        orphan_file.chmod(0o600)
+        # Age it via mtime so the reaper's mtime check fires.
+        old_ts = time.time() - (obsidian_utils.RETRO_GATE_TTL_SECONDS + 600)
+        os.utime(orphan_file, (old_ts, old_ts))
+        assert orphan_file.exists()
+
+        # mark_ for a new sid triggers the opportunistic reap.
+        new_path = obsidian_utils.mark_retro_classification_pending(new_sid, "/vault/new.md")
+
+        assert new_path, "mark_ should return a non-empty path"
+        assert not orphan_file.exists(), "Stale orphan sentinel should have been reaped"
+        assert Path(new_path).exists(), "New sentinel must still exist after reap"
+
+    def test_mark_keeps_fresh_orphan(self):
+        """mark_ does NOT reap sentinels whose mtime is within RETRO_GATE_TTL_SECONDS."""
+        orphan_sid = "orphan-fresh-session-xyz"
+        new_sid = "new-session-def789"
+        # Write the orphan with a fresh mtime (just now).
+        gate_dir = self._gate_dir()
+        gate_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        orphan_file = gate_dir / f"{orphan_sid}.json"
+        orphan_file.write_text(
+            json.dumps({"session_id": orphan_sid, "retro_path": "/v/r.md",
+                        "created_at": time.time()}),
+            encoding="utf-8",
+        )
+        orphan_file.chmod(0o600)
+        # mtime is current — file is fresh, should NOT be reaped.
+        assert orphan_file.exists()
+
+        new_path = obsidian_utils.mark_retro_classification_pending(new_sid, "/vault/new.md")
+
+        assert new_path, "mark_ should return a non-empty path"
+        assert orphan_file.exists(), "Fresh orphan sentinel must NOT be reaped"
+        assert Path(new_path).exists(), "New sentinel must exist"
+
+    def test_reap_handles_missing_dir(self):
+        """_reap_stale_retro_sentinels returns 0 and does not raise when the gate dir is absent."""
+        # HOME is redirected by the autouse fixture; gate dir was never created.
+        gate_dir = self._gate_dir()
+        assert not gate_dir.exists(), "Pre-condition: gate dir should not exist"
+
+        result = obsidian_utils._reap_stale_retro_sentinels()
+
+        assert result == 0
