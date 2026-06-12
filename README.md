@@ -332,6 +332,8 @@ Replace `/Users/you` with your actual home directory (run `echo $HOME` to find i
 
 ## Architecture
 
+📐 **[Interactive architecture page](https://abhattacherjee.github.io/obsidian-brain/architecture/architecture.html)** — explore the layers, named data flows (as sequence diagrams), key types, and design tradeoffs in your browser (served via GitHub Pages).
+
 - **Integration pattern:** Direct filesystem writes (no MCP, no REST API, no Obsidian plugins needed)
 - **Hook scripts:** Pure Python (stdlib only), deterministic behavior
 - **Summarization:** Best-effort at SessionEnd, deferred to `/recall` for reliable upgrade

@@ -2,7 +2,7 @@
 name: retro
 description: "Generates honest session retrospectives analyzing what worked, what didn't, key learnings, and actionable process improvements. Use when: (1) /retro command at end of session, (2) user wants to reflect on session quality and outcomes."
 metadata:
-  version: 1.1.0
+  version: 1.2.0
 ---
 
 # Retro — Generate Honest Session Retrospective
@@ -285,6 +285,45 @@ Then set permissions:
 chmod 644 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-retro-<hash>.md"
 ```
 
+**Arm the classification gate.** Immediately after writing the note, mark classification as pending. This arms the `obsidian_retro_gate.py` **Stop** hook, which blocks the turn from ending until Step 7.5 clears the gate — so classification can no longer be silently skipped:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys, os, glob
+sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from obsidian_utils import mark_retro_classification_pending
+print(mark_retro_classification_pending(sys.argv[1], sys.argv[2]))
+' "<current-session-id>" "$VAULT_PATH/$INSIGHTS_FOLDER/<filename>"
+```
+
+(`<current-session-id>` is the value derived in Step 5. The gate is keyed on it and fails open: if the id can't be resolved the gate stays inactive — never blocking the session.)
+
+### Step 7.5 — Classify and file process improvements (DO THIS BEFORE Step 8)
+
+The retro is **not done** when the file is written. The literal next action after the `chmod 644` is to act on what the retro surfaced — **do not print the "saved" confirmation until this step is complete.** Step 7 armed a Stop-hook gate that blocks the turn from ending until you clear it here, so this is enforced, not merely advised.
+
+1. **Extract** every item from the just-written **Process Improvements** and **Key Learnings** sections.
+2. **Classify** each item into exactly one bucket:
+   - **Concrete deliverable** — a code change, doc edit, new flag, or SKILL.md section with a definable "done" state. If this project tracks work in an issue tracker, file it there (with `gh issue create`, sub-classified by target repo); otherwise record it wherever the project tracks TODOs.
+   - **Behavioral discipline** — a do/don't-next-time rule ("verify before claiming X", "grep before citing Y"). Trackers don't enforce behavior; durable notes do. If a persistent memory index is available (e.g. Claude Code's `MEMORY.md`), add or extend an entry there — prefer an `## Update (date)` section on an existing entry over a duplicate; otherwise capture it as a vault insight with `/compress`.
+   - **Skip / already covered** — informational learnings that aren't actionable, plus anything already tracked elsewhere (cite the artifact). Most **Key Learnings** belong here unless genuinely actionable; do not manufacture issues from informational insights.
+3. **Confirm via an in-turn tool, then file.** Surface the proposed classification (each item → bucket → target) and get the user's go-ahead **using `AskUserQuestion`** — do *not* end your turn to ask, because the Step 7 gate will block a turn-end before classification is done. In a non-interactive / auto-run context, file the clear-cut items directly and surface only judgment calls (which repo, which priority) for a one-line confirm; never skip tracking. After filing **2 or more** issues, run `/github-issue-triage` (when available) for labels/priority.
+4. **Clear the gate.** Once every item is filed — or the user declined, or there were no actionable items — clear the gate so the turn can end:
+
+   ```bash
+   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+   python3 -c '
+   import sys, os, glob
+   sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+   from obsidian_utils import clear_retro_classification_pending
+   print("cleared" if clear_retro_classification_pending(sys.argv[1]) else "no-gate")
+   ' "<current-session-id>"
+   ```
+5. Only after the gate is cleared **and** the filed actions are reflected in the user-facing summary do you proceed to Step 8.
+
+**Hard-fail signal:** if you are about to print "Retrospective saved!" with the gate still armed, you have skipped this step. The Stop hook will catch it — but classify proactively rather than relying on the block.
+
 ### Step 8 — Confirm
 
 Print:
@@ -292,4 +331,5 @@ Print:
 > **Retrospective saved!**
 > - File: `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`
 > - Tags: `claude/retro`, `claude/project/<name>`
+> - Filed from Process Improvements / Key Learnings: `<N>` GH issue(s), `<M>` memory entr(ies) (or "none — no actionable items")
 > - Open in Obsidian to review and track process improvements over time.
