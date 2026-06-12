@@ -56,9 +56,25 @@ case "$cmd" in
 
         echo "Installing dev versions..."
 
-        # Copy hooks (Python files)
+        # Copy hooks (Python files + registration manifest)
         cp "$REPO_ROOT/hooks/"*.py "$CACHE_DIR/hooks/"
         echo "  hooks/*.py -> cache"
+        if [[ -f "$REPO_ROOT/hooks/hooks.json" ]]; then
+            cp "$REPO_ROOT/hooks/hooks.json" "$CACHE_DIR/hooks/"
+            echo "  hooks/hooks.json -> cache"
+        fi
+
+        # Copy plugin manifests so version/metadata changes propagate
+        if [[ -d "$CACHE_DIR/.claude-plugin" ]]; then
+            if [[ -f "$REPO_ROOT/.claude-plugin/plugin.json" ]]; then
+                cp "$REPO_ROOT/.claude-plugin/plugin.json" "$CACHE_DIR/.claude-plugin/"
+                echo "  .claude-plugin/plugin.json -> cache"
+            fi
+            if [[ -f "$REPO_ROOT/.claude-plugin/marketplace.json" ]]; then
+                cp "$REPO_ROOT/.claude-plugin/marketplace.json" "$CACHE_DIR/.claude-plugin/"
+                echo "  .claude-plugin/marketplace.json -> cache"
+            fi
+        fi
 
         # Copy skills
         for skill_dir in "$REPO_ROOT/skills/"*/; do

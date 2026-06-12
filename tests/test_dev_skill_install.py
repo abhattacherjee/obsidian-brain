@@ -30,6 +30,7 @@ def _stage_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     (repo / "hooks").mkdir(parents=True)
     (repo / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
+    (repo / "hooks" / "hooks.json").write_text('{"hooks": {"SessionEnd": []}}\n')
 
     (repo / "skills" / "test-skill").mkdir(parents=True)
     (repo / "skills" / "test-skill" / "SKILL.md").write_text("# fake skill\n")
@@ -163,3 +164,25 @@ def test_install_refuses_when_backup_already_exists(tmp_path: Path) -> None:
     assert "Backup already exists" in proc.stdout
     # Existing backup untouched
     assert (backup / "marker").read_text() == "pre-existing"
+
+
+def test_install_copies_hooks_json(tmp_path: Path) -> None:
+    """Regression (#227): hooks/hooks.json must be synced to the cache on install."""
+    proc = _run_install(tmp_path)
+    assert proc.returncode == 0, f"install failed: {proc.stderr}"
+    cache_hooks_json = (
+        tmp_path
+        / "home"
+        / ".claude"
+        / "plugins"
+        / "cache"
+        / "claude-code-skills"
+        / "obsidian-brain"
+        / "2.3.0"
+        / "hooks"
+        / "hooks.json"
+    )
+    assert cache_hooks_json.is_file(), "hooks/hooks.json was not copied to cache"
+    import json
+    cached = json.loads(cache_hooks_json.read_text(encoding="utf-8"))
+    assert cached == {"hooks": {"SessionEnd": []}}

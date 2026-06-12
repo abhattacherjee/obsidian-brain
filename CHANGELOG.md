@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `scripts/test-dev-skill.sh install` now also syncs `hooks/hooks.json` (and the `.claude-plugin/` manifests) into the plugin cache. Previously only `hooks/*.py` and skill dirs were copied, so a newly **registered** hook (e.g. a new `Stop` event) had its script copied but was never registered — it silently never fired after `/dev-test install`. Closes #227.
+
 ## [2.7.1] - 2026-06-12
 
 ### Added
