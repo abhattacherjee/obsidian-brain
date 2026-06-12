@@ -285,6 +285,23 @@ Then set permissions:
 chmod 644 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-retro-<hash>.md"
 ```
 
+### Step 7.5 — Classify and file process improvements (DO THIS BEFORE Step 8)
+
+The retro is **not done** when the file is written. The literal next action after the `chmod 644` is to act on what the retro surfaced — **do not print the "saved" confirmation until this step is complete.** The save is the *start* of the classification phase, not the end of the workflow.
+
+1. **Extract** every item from the just-written **Process Improvements** and **Key Learnings** sections.
+2. **Classify** each item into exactly one bucket:
+   - **GH issue** — a concrete deliverable with a definable "done" state (code change, doc edit, new flag, SKILL.md section). Sub-classify by target repo.
+   - **Memory entry** — behavioral discipline ("verify before claiming X", "grep before citing Y"). Trackers don't enforce behavior; memory does. Check existing memories for overlap first; prefer extending an existing memory with an `## Update (date)` section over creating a duplicate.
+   - **Skip / already covered** — cite the existing artifact (issue, memory, skill) it duplicates.
+3. **File now, inline:**
+   - Create the GH issues (`gh issue create`); in auto mode surface title/repo for a one-line confirm, but do not skip tracking.
+   - Write the memory entries and update each project's `MEMORY.md` index.
+   - After filing **≥2 issues** in the batch, run `/github-issue-triage` for labels/priority.
+4. Only after the filed-and-saved actions are done **and reflected in the user-facing summary** do you proceed to Step 8.
+
+**Hard-fail signal:** if you are about to print "Retrospective saved!" without having classified, you have skipped this step.
+
 ### Step 8 — Confirm
 
 Print:
@@ -292,4 +309,5 @@ Print:
 > **Retrospective saved!**
 > - File: `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`
 > - Tags: `claude/retro`, `claude/project/<name>`
+> - Filed from Process Improvements: `<N>` GH issue(s), `<M>` memory entr(ies) (or "none — no actionable items")
 > - Open in Obsidian to review and track process improvements over time.

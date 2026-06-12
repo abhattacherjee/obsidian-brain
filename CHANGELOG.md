@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Deep architecture reference page** (`docs/architecture/architecture.json` + self-contained `docs/architecture/architecture.html`) — layer/flow/design views with data flows rendered as inline-SVG sequence diagrams. Generated via the `architecture-page` skill and verified against live source.
 - README links to the live [interactive architecture page](https://abhattacherjee.github.io/obsidian-brain/architecture/architecture.html) on GitHub Pages.
+- `skills/retro/SKILL.md`: new **Step 7.5 classification gate** — after writing a retro, extract every Process Improvements / Key Learnings item, classify into GH issue / memory entry / already-covered, and file inline **before** the "saved" confirmation (Step 8 now surfaces what was filed). Turns a frequently-skipped post-retro discipline into a sequenced, enforced step. Closes #223.
 
 ### Fixed
 - **GitHub Pages** — add `docs/.nojekyll` so the legacy Jekyll build stops failing on every `develop` push (the `docs/` tree holds internal specs/plans, not a Jekyll site) and so the static architecture page serves verbatim.
