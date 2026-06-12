@@ -7,6 +7,170 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-06-11
+
+### Added
+- **`scripts/dev-test/test-issue-106-fixture.py` (#152)** — fixture-vault dev-test for
+  the `vault-doctor source-sessions` UUID-first taxonomy. Seeds a temp `$HOME` with one
+  insight note per signal class (`uuid-basename-stale`, `uuid-day-mismatch`,
+  `missing-session-note`, `date-window-hint`, `unresolved`), runs the real
+  `vault_doctor.py` dispatcher as a subprocess, and asserts all 7 invariant groups from
+  issue #106: `signal_class` top-level (no `extra` key), vocabulary subset, per-class
+  confidence values, `unresolved` flag, `date-window-hint` reason suffix,
+  `--apply --yes` mutates only the `uuid-basename-stale` note (byte-compares all others),
+  and deprecated `convergence_warning`/`convergence_count` defaults on every row.
+  Self-contained: deterministic against a clean `$HOME`, cleans up via `atexit`.
+  Spec reconciliations for #103 (`--min-confidence`) and #104 (imported-note skipping)
+  are documented in the script header.
+- **`vault-doctor --min-confidence FLOAT` (#103)** — new flag that filters issues by
+  confidence before display and before apply. Semantics: keep issues with
+  `confidence >= THRESHOLD`; default `0.0` keeps all (back-compat). Threshold
+  `1.0` excludes `conf=0.99` — the `>=` comparison is intentionally inclusive so
+  the boundary value is exact. Applies to **both** dry-run report and `--apply`
+  so the preview always matches the apply scope. Unresolved issues (`confidence=0.0`)
+  are filtered out when threshold > 0.0, which is intentional: their repair is unknown
+  so no apply would occur anyway. Range validated: out-of-range values exit 3.
+  When active, the report header gains a `[filtered: --min-confidence N, dropped K]`
+  suffix — with a per-check breakdown parenthetical (`dropped K (check-a: X, check-b: Y)`)
+  when more than one check was scanned, so a fully-filtered check stays attributable
+  instead of silently vanishing from the report. The JSON payload gets
+  `min_confidence`, `dropped_by_confidence`, and `dropped_per_check` top-level keys
+  (omitted entirely when threshold=0.0 for back-compat schema stability
+  — mirrors the conditional-row-extras pattern from #98). The filter runs in `main()`;
+  check authors do not need to opt in. Invalid (None/NaN/non-numeric) confidence
+  values from a buggy check are warned about on stderr and treated as below
+  threshold rather than crashing the filter.
+  Exit semantics: a run where ALL issues were filtered out still exits 0, but the
+  clean line is qualified (`vault_doctor: clean at --min-confidence N (K issue(s)
+  below threshold — rerun without the flag to see them)`); no new exit code was
+  added — JSON consumers disambiguate all-filtered from genuinely clean via the
+  `dropped_by_confidence` key.
+  Resolved design question: numeric `--min-confidence` was chosen over the
+  `--canonical-only` named-subset alternative proposed in the issue. Numeric is
+  general across all checks (any Issue already has a confidence field) while
+  `--canonical-only` would be source-sessions-specific and require naming new
+  subsets as the taxonomy grows.
+- **`vault-doctor --check project-name-canonicalization` (#99)** — new **opt-in**,
+  one-time backfill check that rewrites worktree-slug project names (e.g.,
+  `obsidian-brain--issue-81-duplicate-sid-collision`) to the canonical main-repo
+  basename (e.g., `obsidian-brain`) in session notes and insights. Phase 1
+  processes all session notes: for each `project_path:` field, runs
+  `git rev-parse --git-common-dir` (cached per path) to derive the canonical
+  name, then proposes rewriting `project:` and the `claude/project/<name>` tag
+  in the frontmatter block. Tag rewriting targets the OBSERVED tag lines —
+  production tags are slugified (collapsed + 40-char truncated, e.g.
+  `claude/project/obsidian-brain-issue-81-duplicate-sid-co`), so the check
+  matches both the raw and slugified old forms with anchored line regexes
+  (prefix-sharing sibling tags are never mangled; leftover non-canonical tags
+  are surfaced in the apply result). Phase 2 processes
+  insights/decisions/error-fixes/retros: each `source_session:` UUID is looked
+  up in the Phase-1 index (using the CANONICAL value, not the note's current
+  frontmatter) and the same rewrite is proposed. Edge cases: missing
+  `project_path`, deleted path, git unavailable/timed out, git errors (dubious
+  ownership etc. — distinguished from a clean "not a git repository" so a
+  broken repo never promotes a stale slug to canonical), empty `project:`
+  field, or insight with no resolvable session all emit WARN unresolved rows
+  (never auto-applied). Non-git project dirs are left alone (cwd basename is
+  canonical); snapshot notes are excluded (they share the session's
+  `session_id` but are not the session note). `--project` matches either the
+  old name or the derived canonical, and filtered sessions still seed the
+  Phase-2 index. `confidence=0.9` for resolvable rewrites; `0.0` for WARN
+  rows. `DEFAULT_WINDOW_DAYS=9999` scans all notes (`--days` is ignored with
+  a notice). Conceptually run after `--check project-name-normalization`
+  (underscore → hyphen) so `project:` fields are already hyphen-normalized
+  before the canonical comparison. Excluded from the default all-checks sweep
+  (`OPT_IN=True`); run explicitly via `--check project-name-canonicalization`.
+- **`vault-doctor --check session-coverage` (#98)** — new **opt-in** check that
+  detects SessionEnd-hook coverage gaps: for each `<sid>.jsonl` under
+  `~/.claude/projects/`, it verifies that a corresponding session note exists in
+  the vault. Excluded from the default all-checks sweep (heavy all-projects JSONL
+  walk + standing-audit semantics) — run it explicitly via `--check
+  session-coverage`. Sessions below the configured
+  `min_messages`/`min_duration_minutes` thresholds are excluded using the hook's
+  own text-bearing message-count semantics (tool_result-only user entries don't
+  count), and the check is a no-op when `auto_log_enabled` is false. Reports the
+  expected note path, JSONL size, and a `referenced_by` count so orphaned
+  sessions whose insights are already in the vault are prioritized for recovery.
+  Gap rows in the `--json` payload carry additional fields: `sid`, `jsonl_path`,
+  `strict_fail`, and `referenced_by_count` (only on rows that have them — other
+  checks' rows are unchanged). New flags:
+  - **`--strict`** — emit `FAIL:` (not `WARN:`) when any note references the
+    orphaned session via `source_session`, raising priority in CI/operator
+    reports. Changes the reason prefix only — the exit code is unaffected.
+  - **`--reconstruct`** — mark gaps as resolvable and enable `--apply` to re-run
+    the SessionEnd hook via `scripts/dev-test/replay-sessionend.py`, writing the
+    missing session note. Never runs automatically — requires explicit `--apply`.
+- **`vault-doctor --check audit-historic-repairs` (#95)** — one-shot, opt-in audit
+  of historic source-sessions repairs. Walks the doctor backup runs under
+  `~/.claude/obsidian-brain-doctor-backup/`, diffs each backed-up note's
+  `source_session`/`source_session_note` against the note's current state
+  (oldest backup wins — it is the true pre-doctor original), and classifies
+  every historic repair by date agreement: **A** restore (original matched the
+  note date, current doesn't — mtime-bug corruption), **B** keep (legit fix),
+  **C** same-day ambiguous, **D** both-wrong. Only category A is applied on
+  `fix`; restores are themselves backed up under
+  `<run>/audit-historic-repairs/` and re-runs are drift-stable. Excluded from
+  the default all-checks sweep via the new registry `OPT_IN` attribute.
+
+### Fixed
+- **Reconstructable session-coverage gaps now carry confidence 0.9 (#215)** —
+  `vault-doctor --check session-coverage --reconstruct` previously emitted every
+  gap with `confidence=0.0`, so any `--min-confidence` threshold > 0 silently
+  nullified `--reconstruct` (the gaps were filtered out before apply). Resolvable
+  gaps (reconstruct mode) now carry `confidence=0.9`, consistent with other
+  applyable repairs (canonicalization proposals, audit category-A restores);
+  unresolved gaps keep `0.0`. The `--min-confidence` help text was updated to
+  match.
+- **`audit-historic-repairs` is no longer silent on a missing/empty backup root
+  (#215)** — a nonexistent backup root now prints a stderr notice
+  (`backup root <path> not found — no doctor backups to audit (no-op, not a
+  clean bill of health)`), and the end-of-scan coverage summary prints
+  unconditionally, so an empty audit shows `audited 0 backed-up note(s)`
+  instead of nothing.
+- **Per-check crash containment in the `vault_doctor` dispatcher (#215)** — a
+  check whose `scan()` or `apply()` raises no longer takes down the whole run.
+  The crash is printed to stderr with a full traceback, the check is recorded
+  in a new `crashed_checks` JSON key (present only when non-empty) and in the
+  human report header, and the remaining checks still run and report. A run
+  with crashed checks always exits 2; with 0 issues it prints
+  `vault_doctor: 0 issues, but N check(s) crashed — results incomplete`
+  instead of the plain clean line. An `apply()` crash additionally warns that
+  some fixes may already be applied (pointing at the backup root).
+- **`--min-confidence` drop attribution by signal class (#215)** — dropped
+  issues that carry a `signal_class` (e.g. the audit's `historic-keep` /
+  `historic-unreadable` infrastructure rows) are now broken out per class in
+  the human header (`; by class: audit-historic-repairs: 1 historic-keep,
+  1 historic-unreadable`) and in a new conditional `dropped_per_signal_class`
+  JSON key, so filtered-out infrastructure failures stay visible. Attribution
+  only — no filter exemption.
+- **Unconditional end-of-scan summaries (#215)** — `session-coverage` and
+  `project-name-canonicalization` now print their end-of-scan summary lines
+  even when nothing was scanned (zero counts visible); a silent scan was
+  indistinguishable from a scan that never ran. The check registry also warns
+  on stderr when a module loads but does not expose the check interface,
+  instead of silently skipping it.
+- **`vault-doctor source-sessions` skips imported notes (#104)** — notes carrying
+  `imported: true` in frontmatter OR a `claude/imported` list item under the
+  `tags:` key are now silently skipped by the source-sessions check (the tag
+  match is scoped to the tags: block — the same string inside a folded scalar
+  or a non-tags list such as `aliases:` does NOT exclude a local note). Their
+  `source_session` UUID refers to the originating vault (another machine) and
+  can never resolve locally, so surfacing them as unresolved is a known
+  false-positive. The skip runs after the `--project` filter, so the count
+  reflects the filtered scope. A stderr line
+  `[vault_doctor] source-sessions: skipped N imported note(s)` is emitted when
+  any are skipped so operators know the check ran completely. Snapshot
+  integrity and snapshot migration checks are unaffected — they operate on
+  session/snapshot notes in the sessions folder, not on insight-type notes.
+  audit-historic-repairs intentionally still covers imported notes — restoring
+  a historic wrong repair on one is the correct outcome (the audit is the
+  remediation path for pre-#104 wrong repairs).
+- `vault_doctor --apply` now prints each error Result's detail message (previously the per-note error string was dropped; only the status mark survived).
+- Date-rollover test flakiness (#205): 12 test call sites scanned hardcoded
+  April-2026 fixtures with 60-day windows, so the suite started failing once
+  the wall clock reached 2026-06-09 (CI was green the day before). Widened to
+  the established `days=10000` convention.
+
 ## [2.6.2] - 2026-06-08
 
 ### Fixed

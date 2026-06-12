@@ -6,6 +6,8 @@ Each check module in this package must export:
   - DEFAULT_WINDOW_DAYS: int
   - scan(vault_path, sessions_folder, insights_folder, days, project=None) -> list[Issue]
   - apply(issues, backup_root) -> list[Result]
+  - OPT_IN: bool (optional, default False) — True excludes the check from the
+    default all-checks sweep; it only runs when named via --check
 
 The registry auto-discovers modules in this package directory on first access.
 """
@@ -26,6 +28,10 @@ class Issue:
     current_source: str
     proposed_source: str
     reason: str
+    # Set from literals in check modules (e.g. 0.99, 0.5, 0.0). If a check
+    # ever computes confidence arithmetically, round to 2 decimals first —
+    # vault_doctor's --min-confidence filter compares with exact >=, and a
+    # float artifact like 0.8999999999 would silently miss the threshold.
     confidence: float = 1.0
     extra: dict = field(default_factory=dict)
 
@@ -48,6 +54,8 @@ def _discover() -> None:
     Per-module exceptions (ImportError, SyntaxError, etc.) are logged to
     stderr and the offending module is skipped, so one broken check cannot
     take down the whole dispatcher. This keeps the system pluggable.
+    Modules that import cleanly but do not expose the check interface
+    (NAME + callable scan/apply) are also warned about on stderr.
     """
     if _CHECKS:
         return
@@ -66,6 +74,15 @@ def _discover() -> None:
         name = getattr(mod, "NAME", None)
         if name and callable(getattr(mod, "scan", None)) and callable(getattr(mod, "apply", None)):
             _CHECKS[name] = mod
+        else:
+            # A module that imports fine but lacks the interface (typo'd
+            # NAME/scan/apply, helper accidentally dropped into the package)
+            # must not vanish silently — its check would simply never run.
+            print(
+                f"[vault_doctor] module {mod_info.name} loaded but does not "
+                f"expose the check interface; skipped",
+                file=_sys.stderr,
+            )
 
 
 def list_checks() -> list[str]:
@@ -81,5 +98,19 @@ def get_check(name: str):
 
 
 def all_checks() -> list:
+    """All registered checks minus opt-in ones (``OPT_IN = True``).
+
+    Opt-in checks (e.g. one-shot audit tools like audit-historic-repairs)
+    only run when explicitly named via get_check() / --check.
+    """
     _discover()
-    return list(_CHECKS.values())
+    result = []
+    for m in _CHECKS.values():
+        flag = getattr(m, "OPT_IN", False)
+        if not isinstance(flag, bool):
+            raise TypeError(
+                f"{getattr(m, 'NAME', m)}: OPT_IN must be bool, got {flag!r}"
+            )
+        if not flag:
+            result.append(m)
+    return result

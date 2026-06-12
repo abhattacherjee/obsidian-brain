@@ -209,43 +209,49 @@ def _run_sessionend(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Optionally patch write_vault_note for --dry-run.
+    # Patch write_vault_note in BOTH modes: in --dry-run the recorder
+    # suppresses the write; otherwise it records and delegates to the real
+    # function. This makes `vault_writes` in the emitted payload ground truth
+    # for what was actually written (consumed by the session-coverage check's
+    # apply() to confirm reconstruction and report the real note path, #98).
     vault_writes: list[tuple[str, int]] = []
     original = None
     original_sl = None
-    if args.dry_run:
-        import obsidian_utils  # type: ignore
-        original = obsidian_utils.write_vault_note
+    import obsidian_utils  # type: ignore
+    original = obsidian_utils.write_vault_note
 
-        def _record_call(vault_path, folder, filename, content, *a, **kw):  # noqa: ARG001
-            # Match production signature: write_vault_note(vault_path, folder, filename, content).
-            dest = str(Path(vault_path) / folder / filename)
-            vault_writes.append((dest, len(content)))
+    def _record_call(vault_path, folder, filename, content, *a, **kw):  # noqa: ARG001
+        # Match production signature: write_vault_note(vault_path, folder, filename, content).
+        dest = str(Path(vault_path) / folder / filename)
+        vault_writes.append((dest, len(content)))
+        if args.dry_run:
             return None  # None = success under Optional[str] contract (truthy True was wrong)
+        return original(vault_path, folder, filename, content, *a, **kw)
 
-        obsidian_utils.write_vault_note = _record_call  # type: ignore[assignment]
-        # Also patch in the imported namespace inside obsidian_session_log
-        # (it does `from obsidian_utils import write_vault_note`, binding
-        # the reference at import time — patching the module above isn't enough).
-        try:
-            import obsidian_session_log  # type: ignore
-            if hasattr(obsidian_session_log, "write_vault_note"):
-                original_sl = obsidian_session_log.write_vault_note
-                obsidian_session_log.write_vault_note = _record_call  # type: ignore[assignment]
-        except ImportError:
-            # Module not importable — leaves only obsidian_utils patched, which
-            # is partial protection. Surface so the user knows --dry-run is incomplete.
-            print(
-                "WARNING: --dry-run: obsidian_session_log not importable; "
-                "vault-write suppression is partial",
-                file=sys.stderr,
-            )
-        except Exception as exc:
-            print(
-                f"WARNING: --dry-run: failed to patch obsidian_session_log.write_vault_note: "
-                f"{exc.__class__.__name__}: {exc} — vault writes may not be suppressed",
-                file=sys.stderr,
-            )
+    obsidian_utils.write_vault_note = _record_call  # type: ignore[assignment]
+    # Also patch in the imported namespace inside obsidian_session_log
+    # (it does `from obsidian_utils import write_vault_note`, binding
+    # the reference at import time — patching the module above isn't enough).
+    try:
+        import obsidian_session_log  # type: ignore
+        if hasattr(obsidian_session_log, "write_vault_note"):
+            original_sl = obsidian_session_log.write_vault_note
+            obsidian_session_log.write_vault_note = _record_call  # type: ignore[assignment]
+    except ImportError:
+        # Module not importable — leaves only obsidian_utils patched, which
+        # is partial protection. Surface so the user knows recording (and in
+        # --dry-run, write suppression) is incomplete.
+        print(
+            "WARNING: obsidian_session_log not importable; "
+            "vault-write recording/suppression is partial",
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        print(
+            f"WARNING: failed to patch obsidian_session_log.write_vault_note: "
+            f"{exc.__class__.__name__}: {exc} — vault writes may not be recorded/suppressed",
+            file=sys.stderr,
+        )
 
     pre = _snapshot_log_size()
 
@@ -285,7 +291,8 @@ def _run_sessionend(args: argparse.Namespace) -> int:
         payload["outcome"] = "EXCEPTION"
         payload["detail"] = f"{exc.__class__.__name__}: {exc}"
     finally:
-        if args.dry_run and original is not None:
+        # Restore in both modes — the recorder is installed unconditionally now.
+        if original is not None:
             import obsidian_utils  # type: ignore
             obsidian_utils.write_vault_note = original  # type: ignore[assignment]
             if original_sl is not None:

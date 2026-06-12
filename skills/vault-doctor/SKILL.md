@@ -15,12 +15,17 @@ Audit and repair the Obsidian vault. Ships with one check initially (`source-ses
 
 - `/vault-doctor` — run all checks, report only (dry-run)
 - `/vault-doctor fix` — run all checks, apply after per-project confirmation
-- `/vault-doctor --check source-sessions` — run one specific check
+- `/vault-doctor --check source-sessions` — run one specific check; notes carrying `imported: true` frontmatter or the `claude/imported` tag are silently skipped (their `source_session` refers to another vault and can never resolve locally)
 - `/vault-doctor --check snapshot-integrity` — snapshot orphans, broken backlinks, stale/missing session snapshot lists, status/summary mismatches
 - `/vault-doctor --check snapshot-migration` — migrate pre-spec snapshots (legacy filenames, missing status/backlink fields, missing session snapshot lists). Runs 4 ordered sub-checks; idempotent.
+- `/vault-doctor --check project-name-canonicalization` — one-time backfill check that rewrites worktree-slug project names to the canonical main-repo basename in session notes and insights. Phase 1: for each session note with a `project_path:`, derives canonical via `git rev-parse --git-common-dir` (cached per path) and proposes rewriting `project:` + the observed `claude/project/*` tag lines (production tags are slugified/40-char-truncated — both forms matched; sibling tags never touched). Phase 2: for each insight with a `source_session:` UUID, looks up the Phase-1 canonical (not the stale frontmatter value) and proposes the same rewrite. WARN rows for: missing `project_path`, path no longer exists, git unavailable/timed out, git errors (dubious ownership etc. — never silently treated as non-repo), empty `project:` field, insight source_session not in index. Non-git project dirs left alone; snapshot notes skipped. `--project` matches the old name OR the derived canonical (filtered sessions still seed the Phase-2 index); `--days` is ignored (full-vault backfill). **Opt-in** — excluded from default all-checks sweep (`OPT_IN=True`); run via `--check project-name-canonicalization`. Conceptually run after `--check project-name-normalization` (underscore → hyphen) for clean input.
+- `/vault-doctor --check session-coverage` — detect SessionEnd-hook coverage gaps: JSONLs in `~/.claude/projects/` with no corresponding session note. **Opt-in** — excluded from the default all-checks sweep (heavy all-projects JSONL walk); must be named via `--check`. Sessions below the configured `min_messages`/`min_duration_minutes` thresholds are excluded (the hook would also skip them; only text-bearing user messages count). Add `--strict` to emit `FAIL:` (not `WARN:`) when any note references the orphaned session via `source_session` (changes the reason prefix only, not the exit code). Add `--reconstruct` to enable `--apply` to reconstruct the missing note by re-running the SessionEnd hook via `replay-sessionend.py` (never automatic; always requires `--apply`). `--days` bounds JSONL mtime age (default 30). Note: the per-gap project name is derived from the JSONL's `cwd` basename, so `--project` expects the cwd-basename slug — worktree sessions may display a non-canonical expected note path (detection itself is session_id/hash-based and unaffected).
+- `/vault-doctor --check audit-historic-repairs` — one-shot audit of historic source-sessions repairs: diffs doctor backups against current notes, classifies each repair (A restore / B keep / C ambiguous / D both-wrong) by date agreement, and restores category-A mtime-bug corruptions on `fix`. **Opt-in** — excluded from the default all-checks sweep; must be named via `--check`. `--days` bounds backup-run age (default 180).
 - `/vault-doctor --days 14` — override default window (default: 7 days)
 - `/vault-doctor --project obsidian-brain` — limit to one project
 - `/vault-doctor fix --check source-sessions --days 7` — combine flags
+- `/vault-doctor --min-confidence 0.9` — dry-run showing only issues with confidence >= 0.9; report header notes the active filter and dropped count
+- `/vault-doctor fix --min-confidence 0.9` — apply only the high-confidence subset (conf >= 0.9); preview matches apply scope exactly
 
 ## Procedure
 
@@ -35,6 +40,9 @@ Parse the user's invocation into flags:
 - `--check <name>` → specific check only
 - `--days <N>` → window override
 - `--project <name>` → project filter
+- `--strict` → set STRICT=1 (session-coverage only: FAIL instead of WARN on referenced gaps)
+- `--reconstruct` → set RECONSTRUCT=1 (session-coverage only: mark gaps resolvable for apply)
+- `--min-confidence <FLOAT>` → set MIN_CONFIDENCE (0.0–1.0 inclusive; default 0.0 keeps all; applies to both dry-run report and --apply); note: unresolved/WARN rows (confidence=0.0) are hidden at any threshold > 0 — drop the flag to audit them
 
 Locate the Python dispatcher via the standard plugin cache glob, with a fallback for local dev sessions where the repo is checked out as `$PWD`:
 
@@ -66,6 +74,9 @@ ARGS=()
 [[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
 [[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
 [[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
+[[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
+[[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
+[[ -n "${MIN_CONFIDENCE:-}" ]] && ARGS+=(--min-confidence "$MIN_CONFIDENCE")
 ARGS+=(--json)
 python3 "$DISPATCHER" "${ARGS[@]}"
 ```
@@ -74,7 +85,7 @@ Capture stdout as the JSON report. Exit codes:
 
 - `0` — clean vault, nothing to do
 - `1` — issues found (expected for a dry-run that finds things)
-- `2` — apply errors
+- `2` — apply errors OR one or more checks crashed (results incomplete; see `crashed_checks` in JSON)
 - `3` — usage error (bad args, missing config)
 
 If exit code is `3`, surface the stderr message directly to the user and stop.
@@ -105,6 +116,14 @@ convergence_warning/convergence_count fields are deprecated as of #106
 (UUID-first matching obsoleted the convergence guard) — they remain in the
 JSON payload as hard-coded defaults for output schema stability but should
 not drive rendering.
+
+The `crashed_checks` key is conditional — it is only present when one or
+more checks crashed during the scan or apply phase (exit code 2 on a
+dry-run). If the payload contains `crashed_checks`, tell the user which
+checks crashed and that the report is **INCOMPLETE** — do not present it
+as a complete scan. Example: "Warning: checks [source-sessions] crashed
+during this scan — results are incomplete. Re-run after the crash is
+resolved to get a full report."
 
 Example:
 
@@ -156,6 +175,9 @@ ARGS=()
 [[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
 [[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
 [[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
+[[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
+[[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
+[[ -n "${MIN_CONFIDENCE:-}" ]] && ARGS+=(--min-confidence "$MIN_CONFIDENCE")
 ARGS+=(--apply)
 python3 "$DISPATCHER" "${ARGS[@]}"
 ```
@@ -174,7 +196,10 @@ vault_doctor apply complete
 Backups saved to: ~/.claude/obsidian-brain-doctor-backup/2026-04-11T17-04-22+00-00/
 ```
 
-If any errors occurred (exit code 2), surface them prominently and recommend the user diff one of the backup files under the backup root to understand what went wrong.
+If exit code is 2, distinguish the source:
+
+- **Apply errors (fixes failed):** Surface the failed-fix lines from stderr prominently and recommend the user diff one of the backup files under the backup root to understand what went wrong.
+- **"CHECK CRASHED" or "APPLY CRASHED" on stderr:** Report which check(s) crashed by name. For an apply crash, warn that fixes for that check may be **partially applied** (backups exist under the backup root for anything that ran before the crash). For a scan crash, note that nothing was applied for that check and **no backups exist** for it.
 
 ### Step 6 — Offer next steps
 
