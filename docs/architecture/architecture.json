@@ -53,7 +53,8 @@
         { "id": "hook-session-hint", "name": "obsidian_session_hint.py", "kind": "module", "files": ["hooks/obsidian_session_hint.py"], "purpose": "SessionStart (matcher startup|resume|clear|compact): refreshes the bootstrap sid-file atomically, invokes the orphan reaper, and injects a read-only last-session context hint via hookSpecificOutput.additionalContext." },
         { "id": "hook-context-snapshot", "name": "obsidian_context_snapshot.py", "kind": "module", "files": ["hooks/obsidian_context_snapshot.py"], "purpose": "PreCompact: saves a context snapshot before compression. Gates on snapshot_on_compact/snapshot_on_clear, scrubs secrets, and writes a snapshot note backlinked to its parent session. Stderr-only telemetry (no hook-log line)." },
         { "id": "hook-session-reaper", "name": "obsidian_session_reaper.py", "kind": "module", "files": ["hooks/obsidian_session_reaper.py"], "purpose": "Called by SessionStart: reconstructs session notes for orphaned JSONL transcripts where SessionEnd never fired (SIGKILL, worktree teardown). Watermark-bounded, 5s budget, permission-canary guarded; writes notes tagged claude/reconstructed." },
-        { "id": "hooks-registration", "name": "hooks.json", "kind": "registration", "files": ["hooks/hooks.json"], "purpose": "Registers SessionEnd to session_log, SessionStart to session_hint, PreCompact to context_snapshot. Commands invoke python3 with the plugin-root hook path." }
+        { "id": "hook-retro-gate", "name": "obsidian_retro_gate.py", "kind": "module", "files": ["hooks/obsidian_retro_gate.py"], "purpose": "ENFORCE. Stop hook that blocks turn-end until /retro Step 7.5 classification clears the session-scoped retro-gate sentinel (returns {decision: block} with the classify-Process-Improvements reminder). Fail-open on any error; stop_hook_active re-entry and a 2h TTL both auto-clear so it can never wedge a session." },
+        { "id": "hooks-registration", "name": "hooks.json", "kind": "registration", "files": ["hooks/hooks.json"], "purpose": "Registers SessionEnd to session_log, SessionStart to session_hint, PreCompact to context_snapshot, Stop to retro_gate. Commands invoke python3 with the plugin-root hook path." }
       ]
     },
     {
@@ -72,6 +73,7 @@
         { "id": "scrub-secrets", "name": "scrub_secrets() / escape_wikilinks()", "kind": "function", "files": ["hooks/obsidian_utils.py"], "purpose": "Best-effort redaction of GitHub/AWS tokens, password/secret/api_key assignments, PEM headers and Bearer values before any user content reaches the vault; escapes double-brackets so bash test brackets do not create phantom Obsidian links." },
         { "id": "hook-dedup-lock", "name": "claim_hook_run() / release_hook_run()", "kind": "function", "files": ["hooks/obsidian_utils.py"], "purpose": "O_CREAT|O_EXCL lock files under the secure working dir (15s TTL, fail-open, PID-checked release) coordinating the double-install (monorepo + standalone) case so a hook never fires twice." },
         { "id": "gather-evidence", "name": "gather_session_evidence()", "kind": "function", "files": ["hooks/obsidian_utils.py"], "purpose": "For /retro: collects all snapshots + insights/decisions/error-fixes whose frontmatter source_session matches the active session, with discovery_errors captured rather than raised." },
+        { "id": "retro-gate-sentinel", "name": "mark_/clear_/get_retro_classification_pending()", "kind": "function", "files": ["hooks/obsidian_utils.py"], "purpose": "The retro-gate sentinel primitives backing the Stop hook: mark writes a session-scoped JSON sentinel under ~/.claude/obsidian-brain/retro-gate/ (sanitized sid, path-contained, atomic os.replace); get reads it (with created_at for TTL); clear removes it. /retro arms via mark after saving the note and disarms via clear once Step 7.5 classification is filed." },
         { "id": "telemetry-log", "name": "_append_sessionend_log() / _append_reaper_log()", "kind": "ops", "files": ["hooks/obsidian_utils.py"], "purpose": "Writes one-line key=value outcome records to the hook telemetry log, rotating at 100 KB, 0600, sanitizing newlines/tabs. Primary diagnostic surface for sessions that did not produce a vault note." }
       ]
     },
@@ -231,6 +233,18 @@
         { "from": "hook-context-snapshot", "to": "scrub-secrets", "label": "scrub secrets (redact)" },
         { "from": "hook-context-snapshot", "to": "write-vault-note", "label": "snapshot note -snapshot-HHMMSS" },
         { "from": "write-vault-note", "to": "db-vault", "label": "atomic write, backlink to parent" }
+      ]
+    },
+    {
+      "id": "retro-classification-gate",
+      "name": "/retro Step 7.5 classification gate",
+      "description": "The /retro skill arms a session-scoped sentinel after saving the note; the Stop hook reads it and blocks turn-end until classification clears it (fail-open; stop_hook_active + 2h TTL auto-clear).",
+      "steps": [
+        { "from": "sk-retro", "to": "retro-gate-sentinel", "label": "mark_retro_classification_pending after saving the note" },
+        { "from": "retro-gate-sentinel", "to": "db-secure-workdir", "label": "atomic sentinel write under retro-gate/<sid>.json" },
+        { "from": "hooks-registration", "to": "hook-retro-gate", "label": "Stop event JSON via stdin (1 MB cap)" },
+        { "from": "hook-retro-gate", "to": "retro-gate-sentinel", "label": "get pending → block (decision: block) unless stop_hook_active / TTL-stale" },
+        { "from": "sk-retro", "to": "retro-gate-sentinel", "label": "clear_retro_classification_pending once Step 7.5 is filed" }
       ]
     },
     {
