@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.1] - 2026-06-12
+
 ### Added
 - **Deep architecture reference page** (`docs/architecture/architecture.json` + self-contained `docs/architecture/architecture.html`) — layer/flow/design views with data flows rendered as inline-SVG sequence diagrams. Generated via the `architecture-page` skill and verified against live source.
 - README links to the live [interactive architecture page](https://abhattacherjee.github.io/obsidian-brain/architecture/architecture.html) on GitHub Pages.
