@@ -301,3 +301,32 @@ class TestRetroGateHelpers:
         result = obsidian_utils._reap_stale_retro_sentinels()
 
         assert result == 0
+
+    def test_reap_removes_multiple_stale_orphans(self):
+        """All stale orphans are reaped (not just the first), and the count is returned."""
+        gate_dir = self._gate_dir()
+        gate_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        old_ts = time.time() - (obsidian_utils.RETRO_GATE_TTL_SECONDS + 600)
+        orphans = []
+        for i in range(3):
+            f = gate_dir / f"stale-orphan-{i}.json"
+            f.write_text(json.dumps({"session_id": f"s{i}", "retro_path": "/v/r.md",
+                                     "created_at": old_ts}), encoding="utf-8")
+            os.utime(f, (old_ts, old_ts))
+            orphans.append(f)
+        result = obsidian_utils._reap_stale_retro_sentinels()
+        assert result == 3
+        for f in orphans:
+            assert not f.exists(), f"{f.name} should have been reaped"
+
+    def test_reap_ignores_non_json_files(self):
+        """Files not matching *.json are left untouched even when stale."""
+        gate_dir = self._gate_dir()
+        gate_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        old_ts = time.time() - (obsidian_utils.RETRO_GATE_TTL_SECONDS + 600)
+        non_json = gate_dir / "leftover.tmp"
+        non_json.write_text("junk", encoding="utf-8")
+        os.utime(non_json, (old_ts, old_ts))
+        result = obsidian_utils._reap_stale_retro_sentinels()
+        assert result == 0
+        assert non_json.exists(), ".tmp file must not be reaped"

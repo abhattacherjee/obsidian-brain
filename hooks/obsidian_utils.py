@@ -216,29 +216,26 @@ def _reap_stale_retro_sentinels() -> int:
     """Delete retro-gate sentinels whose mtime is older than RETRO_GATE_TTL_SECONDS.
 
     Uses mtime (not JSON content) so corrupt or foreign files are handled safely.
-    Best-effort: never raises — any OSError is swallowed.  Returns the count of
+    Best-effort: OSErrors on individual files are swallowed.  Returns the count of
     files reaped (0 when the gate dir is absent or no files qualify).
     """
-    try:
-        gate_dir = _retro_gate_dir()
-        if not gate_dir.exists():
-            return 0
-        cutoff = time.time() - RETRO_GATE_TTL_SECONDS
-        reaped = 0
-        try:
-            candidates = list(gate_dir.glob("*.json"))
-        except OSError:
-            return 0
-        for f in candidates:
-            try:
-                if f.stat().st_mtime < cutoff:
-                    f.unlink()
-                    reaped += 1
-            except OSError:
-                continue
-        return reaped
-    except Exception:
+    gate_dir = _retro_gate_dir()
+    if not gate_dir.exists():
         return 0
+    cutoff = time.time() - RETRO_GATE_TTL_SECONDS
+    reaped = 0
+    try:
+        candidates = list(gate_dir.glob("*.json"))
+    except OSError:
+        return 0
+    for f in candidates:
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                reaped += 1
+        except OSError:
+            continue
+    return reaped
 
 
 def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
@@ -272,8 +269,9 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
     # try/except so a reap failure can never break the mark operation.
     try:
         _reap_stale_retro_sentinels()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[obsidian-brain] mark_retro_classification_pending: reap failed (non-fatal): {exc}",
+              file=sys.stderr)
 
     sentinel = gate_dir / f"{sanitized}.json"
 
