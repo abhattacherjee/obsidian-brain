@@ -55,6 +55,20 @@ Machine-local config at `~/.claude/obsidian-brain-config.json` (outside the vaul
 
 All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight`, `claude/decision`, `claude/error-fix`, `claude/snapshot`, `claude/imported`, `claude/standup`, `claude/retro`, `claude/project/<name>`, `claude/topic/<topic>`, `claude/auto`.
 
+### Keeping the architecture page current
+
+`docs/architecture/architecture.json` is the canonical, machine-readable architecture of this plugin (rendered to `docs/architecture/architecture.html`). It is consumed by future agents, so it must not drift from the code.
+
+**Whenever a change adds, removes, or renames a hook, skill, vault-doctor check, CLI/support module, datastore, env var, or alters a data flow, update the architecture artifacts in the same PR:**
+
+- Edit `docs/architecture/architecture.json` (layers / components / flows / types / environment), keeping `lastUpdated` set to the change date and `version` in sync with `plugin.json`. Every `flows[].steps[].from`/`to` must reference a real `layers[].components[].id`, and every component `files[]` path must exist on disk.
+- Re-render the viewer: `~/.claude/skills/architecture-page/scripts/render-html.sh --json docs/architecture/architecture.json --output docs/architecture/architecture.html`
+- Validate before committing: `~/.claude/skills/architecture-page/scripts/smoke-test.sh --json docs/architecture/architecture.json` — both `[main]` and `[sparse]` must pass.
+- For a large or structural change, regenerate from scratch via the `architecture-page` skill rather than hand-editing.
+- Ground every claim in live source (run `wc -l`, read the actual file) — never copy a number or path from prose/docs that may be stale.
+
+`docs/.nojekyll` keeps GitHub Pages serving these files verbatim; do not remove it.
+
 ## Conventions
 
 - **Commits:** Use conventional commit format — `feat(obsidian-brain):`, `fix:`, `chore:`, `docs:`
