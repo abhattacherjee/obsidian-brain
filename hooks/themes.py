@@ -33,7 +33,12 @@ def assign_to_theme(
     Returns {"theme_id": int, "similarity": float} on assignment, or None
     if no theme was close enough (or the note has no vector).
     """
-    from vault_index import _connect  # local import: breaks vault_index<->themes cycle
+    # Lazy/local import breaks the vault_index<->themes import cycle. It binds the
+    # canonical *bare* `vault_index` module — the form every runtime caller uses
+    # (obsidian_utils/open_item_dedup/vault_stats all `import vault_index`), so a
+    # monkeypatch of vault_index._connect is honored. Do not switch to a package
+    # (`hooks.vault_index`) import here.
+    from vault_index import _connect
     if not os.path.isfile(db_path):
         return None
 

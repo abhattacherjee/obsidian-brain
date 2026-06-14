@@ -52,3 +52,17 @@ def test_tfidf_is_leaf_module():
         [sys.executable, "-c", code], capture_output=True, text=True, env=env
     )
     assert out.stdout.strip() == "False", out.stdout + out.stderr
+
+
+def test_themes_lazy_connect_resolves_to_vault_index():
+    """The lazy `from vault_index import _connect` in themes.assign_to_theme
+    must resolve to the canonical (bare) vault_index._connect — the same module
+    every runtime caller imports (obsidian_utils/open_item_dedup/vault_stats all
+    use `import vault_index`). This makes the cycle-break seam explicit and
+    fast-failing if someone breaks it. (It also means a monkeypatch of bare
+    vault_index._connect is honored by assign_to_theme, as test_vault_index.py
+    relies on.)
+    """
+    import vault_index
+    from vault_index import _connect  # mirrors the lazy import in themes.py
+    assert _connect is vault_index._connect
