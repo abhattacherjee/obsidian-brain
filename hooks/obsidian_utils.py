@@ -3595,7 +3595,7 @@ def build_context_brief(
     return "\n".join(output_parts)
 
 
-def recurring_themes_section(db_path, project, top_n=3):
+def recurring_themes_section(db_path: str, project: str | None, top_n: int = 3) -> str:
     """Return a '## Recurring Themes' markdown block for /recall, or '' if none."""
     try:
         import themes

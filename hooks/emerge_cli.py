@@ -181,7 +181,7 @@ def run_build_note() -> None:
         with open(analysis_path, encoding="utf-8") as f:
             analysis = f.read()
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"ERROR: could not read emerge artifacts ({exc}); re-run /emerge to regenerate",
+        print(f"ERROR could not read emerge artifacts ({exc}); re-run /emerge to regenerate",
               file=sys.stderr)
         sys.exit(1)
 
@@ -215,7 +215,7 @@ def run_build_note() -> None:
         print("---REPORT---")
         print(analysis)
     else:
-        print(f"ERROR: write failed: {result}", file=sys.stderr)
+        print(f"ERROR write failed: {result}", file=sys.stderr)
         sys.exit(1)
 
     for p in [corpus_path, analysis_path]:

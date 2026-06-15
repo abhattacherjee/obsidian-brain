@@ -575,7 +575,9 @@ def get_unassigned_notes_in_window(db_path: str, window_start: str,
                                    limit: int = 30) -> list[dict]:
     """Vectorized notes with no theme_members row and date >= window_start,
     newest first, capped at ``limit``. These are /emerge's new candidates.
-    Returns [{note_path, title, excerpt, project, date}].
+    Excludes transient ``claude-snapshot`` notes (parity with the retired
+    ``collect_vault_corpus`` default). Returns [{note_path, title, excerpt,
+    project, date}].
     """
     from vault_index import _connect
     conn = _connect(db_path)
@@ -583,6 +585,7 @@ def get_unassigned_notes_in_window(db_path: str, window_start: str,
         rows = conn.execute(
             "SELECT n.path, n.title, n.body, n.project, n.date FROM notes n "
             "WHERE n.tfidf_vector IS NOT NULL AND n.tfidf_vector != '' "
+            "AND n.type != 'claude-snapshot' "
             "AND n.date >= ? "
             "AND NOT EXISTS (SELECT 1 FROM theme_members tm WHERE tm.note_path = n.path) "
             "ORDER BY n.date DESC LIMIT ?",

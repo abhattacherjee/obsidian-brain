@@ -413,7 +413,7 @@
     ]
   },
   "testing": {
-    "unitSuite": { "tool": "pytest", "fileCount": 73, "duration": "fast (stdlib, no network)", "environments": { "python": "3.12" }, "coverage": { "lines": 90, "source": "hooks", "omits": ["obsidian_utils.py (I/O monolith)", "emerge_cli.py", "deep_cli.py"] } },
+    "unitSuite": { "tool": "pytest", "fileCount": 73, "duration": "fast (stdlib, no network)", "environments": { "python": "3.12" }, "coverage": { "lines": 90, "source": "hooks", "omits": ["obsidian_utils.py (I/O monolith)", "deep_cli.py"] } },
     "manualMatrix": { "doc": "CLAUDE.md (Development Commands)", "devices": ["hook simulation: pipe synthetic SessionEnd/SessionStart/PreCompact JSON into installed hooks", "json.load validation of hooks.json and plugin.json"], "rationale": "No build/test framework for the prompt-based skills; hooks are validated by feeding synthetic lifecycle JSON and asserting vault writes + telemetry outcomes." }
   },
   "scripts": [

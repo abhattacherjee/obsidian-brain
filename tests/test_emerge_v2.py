@@ -43,11 +43,11 @@ def _mk(conn, tid, project, members, updated_date="2026-06-14", activation=0.0):
         )
 
 
-def _mk_note(conn, path, project, title, body, ndate, vec='{"x":1.0}'):
+def _mk_note(conn, path, project, title, body, ndate, vec='{"x":1.0}', ntype="session"):
     conn.execute(
         "INSERT INTO notes (path, type, date, project, title, body, mtime, tfidf_vector) "
-        "VALUES (?, 'session', ?, ?, ?, ?, 1.0, ?)",
-        (path, ndate, project, title, body, vec),
+        "VALUES (?, ?, ?, ?, ?, ?, 1.0, ?)",
+        (path, ntype, ndate, project, title, body, vec),
     )
 
 
@@ -261,6 +261,21 @@ def test_get_unassigned_notes_excludes_themed(db):
     assert set(rows[0]) >= {"note_path", "title", "excerpt", "project", "date"}
 
 
+def test_get_unassigned_notes_excludes_snapshots(db):
+    # BH-001: transient claude-snapshot notes must not surface as /emerge
+    # New Candidates (parity with the retired collect_vault_corpus default).
+    conn = vault_index._connect(db)
+    _mk_note(conn, "snap.md", "p", "Snap", "snapshot body", "2026-06-10",
+             ntype="claude-snapshot")
+    _mk_note(conn, "normal.md", "p", "Normal", "normal body", "2026-06-10")
+    conn.commit()
+    conn.close()
+    rows = themes.get_unassigned_notes_in_window(db, "2026-06-01")
+    paths = {r["note_path"] for r in rows}
+    assert "snap.md" not in paths
+    assert "normal.md" in paths
+
+
 def test_get_unassigned_notes_window_and_limit(db):
     conn = vault_index._connect(db)
     _mk_note(conn, "old.md", "p", "Old", "body", "2026-01-01")     # out of window
@@ -411,4 +426,4 @@ def test_run_build_note_missing_artifact_exits_clean(emerge_db, tmp_vault, capsy
         emerge_cli.run_build_note()
     assert exc.value.code == 1
     err = capsys.readouterr().err
-    assert "ERROR: could not read emerge artifacts" in err
+    assert "ERROR could not read emerge artifacts" in err
