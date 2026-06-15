@@ -1,14 +1,14 @@
 {
   "name": "obsidian-brain",
   "displayName": "Obsidian Brain",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
   "lastUpdated": "2026-06-15",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
     "language": { "name": "Python", "version": "3.12", "strict": true, "notes": "stdlib only — no pip dependencies; deterministic hooks safe to run at session boundaries" },
-    "framework": { "name": "Claude Code Plugin", "version": "3.0.0", "router": "lifecycle hooks + prompt-based skills" },
+    "framework": { "name": "Claude Code Plugin", "version": "3.0.1", "router": "lifecycle hooks + prompt-based skills" },
     "runtime": { "name": "Python", "minVersion": "3.12" },
     "ui": { "library": "Obsidian Dataview", "version": "community plugin (JS + inline queries)", "notes": "dashboards only — the plugin itself requires no Obsidian plugin to write notes" },
     "persistence": { "primary": "Markdown vault (filesystem)", "secondary": ["SQLite + FTS5 search index", "JSON config", "append-only telemetry logs"] },
@@ -439,7 +439,7 @@
     ],
     "preflight": "./scripts/commit-preflight.sh — manifest-sync (always-on) + secret-scan + pytest cov>=90; required before every commit",
     "plugin": "abhattacherjee/git-flow",
-    "currentVersion": "3.0.0"
+    "currentVersion": "3.0.1"
   },
   "docs": [
     { "title": "Standalone Marketplace Distribution (plan)", "path": "docs/superpowers/plans/2026-06-01-standalone-marketplace-distribution.md", "scope": "Migration to a standalone marketplace served from this repo (no monorepo sync)." },
