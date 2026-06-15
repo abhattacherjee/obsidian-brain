@@ -4591,91 +4591,96 @@ def upgrade_note_with_summary(
     if summary_signature not in summary_block_lines:
         return f"Failed: post-write verification — summary body missing from {os.path.basename(note_path)}"
 
-    # Write importance to DB only after file write + verification succeeded,
-    # so the DB stays in sync with the on-disk note state.
+    # Connection A: upsert + importance in one BEGIN IMMEDIATE transaction.
+    # Replaces the separate importance-UPDATE connection and the index_note
+    # call (which opened its own connection). Parsing is done in-process via
+    # _parse_note so no extra I/O round-trip is needed; os.stat is cheap.
+    # Best-effort — a failure here MUST NEVER mask the successful upgrade.
+    #
+    # _index_ok tracks whether Connection A committed successfully.  The
+    # surprise-body read is intentionally OUTSIDE this try so that a read
+    # error (file removed in the commit→read race, decode error) does NOT:
+    #   (a) trigger a spurious rollback of an already-committed transaction, or
+    #   (b) log a misleading "index+importance write-back failed" message, or
+    #   (c) skip theme assignment entirely (the old coupled-read bug).
+    _index_ok: bool = False
     try:
         if _vault_index is not None:
             _db = _vault_index._default_db_path()
             if os.path.isfile(_db):
-                _conn = _vault_index._connect(_db)
-                try:
-                    _conn.execute(
-                        "UPDATE notes SET importance = ? WHERE path = ?",
-                        (importance, note_path),
-                    )
-                    _conn.commit()
-                finally:
-                    _conn.close()
+                _parsed = _vault_index._parse_note(note_path)
+                if _parsed is not None and os.path.isfile(note_path):
+                    _st = os.stat(note_path)
+                    _conn = _vault_index._connect(_db)
+                    try:
+                        _conn.execute("BEGIN IMMEDIATE")
+                        _vault_index._upsert_note(
+                            _conn, note_path, _parsed, _st.st_mtime, _st.st_size
+                        )
+                        _conn.execute(
+                            "UPDATE notes SET importance = ? WHERE path = ?",
+                            (importance, note_path),
+                        )
+                        _conn.commit()
+                        _index_ok = True
+                    except Exception as _exc:
+                        try:
+                            _conn.rollback()
+                        except Exception:
+                            pass
+                        print(f"[obsidian-brain] index+importance write-back failed for "
+                              f"{os.path.basename(note_path)}: "
+                              f"{type(_exc).__name__}: {_exc}", file=sys.stderr)
+                    finally:
+                        _conn.close()
+                else:
+                    _skip_reason = "parse failed" if _parsed is None else "note file gone"
+                    print(f"[obsidian-brain] index+importance skipped ({_skip_reason}) for "
+                          f"{os.path.basename(note_path)}", file=sys.stderr)
     except Exception as exc:
-        print(f"[obsidian-brain] importance write-back failed for "
+        print(f"[obsidian-brain] index+importance write-back failed for "
               f"{os.path.basename(note_path)}: {exc}", file=sys.stderr)
 
-    # Phase 2: Incremental theme assignment.
-    # Best-effort — runs only when vault_index is importable and the DB file
-    # exists. A failure in this block MUST NEVER mask the successful upgrade.
+    # Read the full raw file (frontmatter + body) for surprise scoring.
+    # Done AFTER Connection A, in its own try, so a read error:
+    #   - never triggers a spurious rollback of the committed transaction
+    #   - never logs a misleading "index+importance write-back failed" message
+    #   - never skips theme assignment (Connection B gates on _index_ok, not
+    #     on body-read success — assign_to_theme handles note_text=None by
+    #     writing the default surprise of 0.0 and still assigning the theme)
+    # Friston-data continuity: byte-exact parity with legacy
+    # open(note_path, "r", encoding="utf-8").read() input to detect_surprise.
+    _note_body_for_surprise: str | None = None
+    if _index_ok:
+        try:
+            with open(note_path, "r", encoding="utf-8") as _fh:
+                _note_body_for_surprise = _fh.read()
+        except OSError as _rexc:
+            print(f"[obsidian-brain] surprise-body read failed for "
+                  f"{os.path.basename(note_path)}: "
+                  f"{type(_rexc).__name__}: {_rexc}", file=sys.stderr)
+            _note_body_for_surprise = None
+
+    # Connection B: theme assignment + surprise in one transaction.
+    # assign_to_theme opens a single BEGIN IMMEDIATE internally and now also
+    # computes + writes surprise when note_text is supplied — eliminating the
+    # separate fourth connection from the old pipeline.
+    # Gates on _index_ok (not _note_body_for_surprise) so a body-read failure
+    # still allows theme assignment (with default surprise=0.0).
+    # Best-effort — a failure here MUST NEVER mask the successful upgrade.
     try:
         if _vault_index is not None:
             _db = _vault_index._default_db_path()
-            if os.path.isfile(_db):
-                # Re-index the just-written note so its tfidf_vector reflects
-                # the final summarized body, then run incremental theme assignment.
-                _reindex_ok = False
+            if os.path.isfile(_db) and _index_ok:
                 try:
-                    # index_note() signals failure by returning False, not by
-                    # raising — swallowing the exception branch alone would
-                    # still let assign_to_theme run on a stale/missing vector.
-                    _reindex_ok = bool(_vault_index.index_note(_db, note_path))
+                    _assignment = _vault_index.assign_to_theme(
+                        _db, note_path, project=project,
+                        note_text=_note_body_for_surprise,
+                    )
                 except Exception as _exc:
-                    print(f"[obsidian-brain] theme re-index failed for "
-                          f"{os.path.basename(note_path)}: {_exc}", file=sys.stderr)
-                if _reindex_ok:
-                    try:
-                        _assignment = _vault_index.assign_to_theme(
-                            _db, note_path, project=project,
-                        )
-                    except Exception as _exc:
-                        print(f"[obsidian-brain] assign_to_theme failed for "
-                              f"{os.path.basename(note_path)}: {_exc}",
-                              file=sys.stderr)
-                        _assignment = None
-
-                    if _assignment is not None:
-                        try:
-                            with open(note_path, "r", encoding="utf-8") as _f:
-                                _body = _f.read()
-                            _conn = _vault_index._connect(_db)
-                            try:
-                                _row = _conn.execute(
-                                    "SELECT tfidf_vector FROM notes WHERE path = ?",
-                                    (note_path,),
-                                ).fetchone()
-                                _note_vec = (
-                                    json.loads(_row["tfidf_vector"])
-                                    if _row and _row["tfidf_vector"] else {}
-                                )
-                                _row2 = _conn.execute(
-                                    "SELECT centroid FROM themes WHERE id = ?",
-                                    (_assignment["theme_id"],),
-                                ).fetchone()
-                                _centroid = (
-                                    json.loads(_row2["centroid"])
-                                    if _row2 and _row2["centroid"] else {}
-                                )
-                                _surprise = _vault_index.detect_surprise(
-                                    _body, _note_vec, _centroid,
-                                )
-                                _conn.execute(
-                                    "UPDATE theme_members SET surprise = ? "
-                                    "WHERE theme_id = ? AND note_path = ?",
-                                    (_surprise, _assignment["theme_id"], note_path),
-                                )
-                                _conn.commit()
-                            finally:
-                                _conn.close()
-                        except Exception as _exc:
-                            print(f"[obsidian-brain] surprise scoring failed "
-                                  f"for {os.path.basename(note_path)}: {_exc}",
-                                  file=sys.stderr)
+                    print(f"[obsidian-brain] assign_to_theme failed for "
+                          f"{os.path.basename(note_path)}: {_exc}",
+                          file=sys.stderr)
     except Exception as _exc:
         print(f"[obsidian-brain] theme pipeline unexpected error "
               f"for {os.path.basename(note_path)}: {_exc}", file=sys.stderr)

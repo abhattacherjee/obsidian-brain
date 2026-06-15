@@ -737,14 +737,19 @@ class TestUpgradeWiresThemes:
             f"upgrade must succeed even when DB is missing, got: {status}"
         )
 
-    def test_upgrade_skips_theme_assignment_when_index_note_returns_false(
+    def test_upgrade_skips_theme_assignment_when_parse_fails(
         self, tmp_vault, mock_config
     ):
-        """If index_note returns False (no exception), assign_to_theme must NOT run.
+        """If _parse_note returns None (unparsable note), assign_to_theme must NOT run.
 
-        Regression: previously the pipeline used try/except/else, so a non-
-        raising False return from index_note would still fall through to
-        assign_to_theme on a stale or missing tfidf_vector.
+        Regression guard: the consolidated pipeline (Task 4, #42) gates
+        assign_to_theme on _note_body_for_surprise being set, which requires
+        _parse_note to succeed. A parse failure must not silently fall through
+        to assign_to_theme with a stale or missing tfidf_vector.
+
+        Previously this tested index_note returning False; the refactored
+        pipeline uses _parse_note + _upsert_note directly, so the gate is
+        now _parse_note returning None.
         """
         import obsidian_utils
         import vault_index
@@ -773,14 +778,14 @@ class TestUpgradeWiresThemes:
             str(tmp_vault), ["claude-sessions"], db_path=db_path,
         )
 
-        calls: dict[str, int] = {"index_note": 0, "assign_to_theme": 0}
-        original_index = vault_index.index_note
+        calls: dict[str, int] = {"parse_note": 0, "assign_to_theme": 0}
+        original_parse = vault_index._parse_note
         original_assign = vault_index.assign_to_theme
         original_default = vault_index._default_db_path
 
-        def fake_index_note(_db, _path):
-            calls["index_note"] += 1
-            return False  # signal failure without raising
+        def fake_parse_note(path):
+            calls["parse_note"] += 1
+            return None  # signal failure without raising
 
         def fake_assign_to_theme(*args, **kwargs):
             calls["assign_to_theme"] += 1
@@ -788,7 +793,7 @@ class TestUpgradeWiresThemes:
 
         try:
             vault_index._default_db_path = lambda: db_path
-            vault_index.index_note = fake_index_note
+            vault_index._parse_note = fake_parse_note
             vault_index.assign_to_theme = fake_assign_to_theme
 
             summary = (
@@ -806,14 +811,14 @@ class TestUpgradeWiresThemes:
             )
         finally:
             vault_index._default_db_path = original_default
-            vault_index.index_note = original_index
+            vault_index._parse_note = original_parse
             vault_index.assign_to_theme = original_assign
 
         assert not status.startswith("Failed:"), (
-            f"upgrade must succeed even when reindex fails, got: {status}"
+            f"upgrade must succeed even when parse fails, got: {status}"
         )
-        assert calls["index_note"] == 1, "index_note should have been called exactly once"
+        assert calls["parse_note"] == 1, "_parse_note should have been called exactly once"
         assert calls["assign_to_theme"] == 0, (
-            "assign_to_theme ran despite index_note returning False — "
+            "assign_to_theme ran despite _parse_note returning None — "
             "reindex-failure gating regressed"
         )
