@@ -108,7 +108,7 @@ def test_consolidate_haiku_failure_uses_deterministic_fallback_name(db):
     conn = sqlite3.connect(db)
     name = conn.execute("SELECT name FROM themes").fetchone()[0]
     conn.close()
-    assert name  # non-empty deterministic fallback (top terms), theme still created
+    assert name == "alpha / beta / gamma"  # top-3 centroid terms by weight, joined by " / "
 
 
 def test_stats_reports_counts(db, capsys):
@@ -129,17 +129,23 @@ def test_merge_combines_members_and_drops_second(db):
                      "VALUES (?,?,?,?,?,?,?,?)",(tid,name,"s",json.dumps({"x":1.0}),1,"d","d","proj"))
     conn.execute("INSERT INTO theme_members VALUES (1,'a.md',0.9,0.0,'d')")
     conn.execute("INSERT INTO theme_members VALUES (2,'b.md',0.9,0.0,'d')")
-    # member vectors must exist for centroid recompute
-    for p in ["a.md","b.md"]:
-        conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
-                     "VALUES (?,'session','proj','t','b',1.0,?)",(p,json.dumps({"x":1.0})))
+    # member vectors must exist for centroid recompute — use DISTINCT terms so
+    # the merged centroid is detectable (x:0.5, y:0.5), not a collapse to one term.
+    conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                 "VALUES ('a.md','session','proj','t','b',1.0,?)", (json.dumps({"x":1.0}),))
+    conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                 "VALUES ('b.md','session','proj','t','b',1.0,?)", (json.dumps({"y":1.0}),))
     conn.commit(); conn.close()
     consolidate_cli.run_merge(1, 2)
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT COUNT(*) FROM themes WHERE id=2").fetchone()[0] == 0
     assert conn.execute("SELECT note_count FROM themes WHERE id=1").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM theme_members WHERE theme_id=1").fetchone()[0] == 2
+    # assert centroid is recomputed from both members' distinct term vectors
+    import json as _json
+    cen = _json.loads(conn.execute("SELECT centroid FROM themes WHERE id=1").fetchone()[0])
     conn.close()
+    assert cen == pytest.approx({"x": 0.5, "y": 0.5})
 
 
 def test_split_breaks_theme_into_subclusters(db):
@@ -160,6 +166,28 @@ def test_split_breaks_theme_into_subclusters(db):
     assert conn.execute("SELECT COUNT(*) FROM themes WHERE id=1").fetchone()[0] == 0  # old gone
     assert conn.execute("SELECT COUNT(*) FROM themes").fetchone()[0] == 2  # two sub-themes
     conn.close()
+
+
+def test_split_falls_back_on_haiku_failure(db):
+    """Split still produces sub-themes with non-empty fallback names when Haiku fails."""
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
+                 "VALUES (1,'Mixed','s','{}',6,'d','d','proj')")
+    grpA = [("a1.md",{"a":1.0}),("a2.md",{"a":1.0}),("a3.md",{"a":1.0})]
+    grpB = [("b1.md",{"b":1.0}),("b2.md",{"b":1.0}),("b3.md",{"b":1.0})]
+    for path, vec in grpA + grpB:
+        conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                     "VALUES (?,'session','proj','t','b',1.0,?)",(path,json.dumps(vec)))
+        conn.execute("INSERT INTO theme_members VALUES (1,?,0.9,0.0,'d')",(path,))
+    conn.commit(); conn.close()
+    with patch("consolidate_cli.generate_theme_names", lambda *a, **k: (None, "haiku_timeout")):
+        consolidate_cli.run_split(1)
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM themes WHERE id=1").fetchone()[0] == 0  # old gone
+    sub_themes = conn.execute("SELECT name FROM themes").fetchall()
+    conn.close()
+    assert len(sub_themes) == 2  # two sub-themes created
+    assert all(row[0] for row in sub_themes)  # all names are non-empty fallbacks
 
 
 def test_split_noop_when_cohesive(db, capsys):

@@ -32,9 +32,9 @@ from consolidate_cli import run_consolidate; run_consolidate(full=(len(sys.argv)
 ' "$@"
 ```
 
-Report the `UNASSIGNED=`, `CREATED=`, and `THEMES_TOTAL=` lines. If `CREATED=0`,
-tell the user no clusters of 3+ similar notes were found (themes need at least
-3 notes above the similarity threshold).
+Report the `UNASSIGNED=` (or `SCANNED=` for `--full`), `CREATED=`, and
+`THEMES_TOTAL=` lines. If `CREATED=0`, tell the user no clusters of 3+ similar
+notes were found (themes need at least 3 notes above the similarity threshold).
 
 ### Step 3 — Stats
 

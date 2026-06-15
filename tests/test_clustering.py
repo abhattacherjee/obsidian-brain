@@ -60,13 +60,44 @@ def test_empty_and_singleton_inputs():
     reason="scipy not installed",
 )
 def test_fast_path_matches_stdlib_fallback():
+    # --- Structural fixture: 3 term-disjoint groups + 2 singletons ---
+    # Intra-group cosine ≈ 1.0, inter-group cosine = 0 (disjoint vocabularies).
+    # Guarantees >=2 clusters so we prove both paths return non-trivial identical structure.
+    group_a = [(f"a{i}", {"a": 1.0, "b": 0.9}) for i in range(5)]  # 5 notes, terms a+b
+    group_b = [(f"b{i}", {"c": 1.0, "d": 0.9}) for i in range(4)]  # 4 notes, terms c+d
+    group_c = [(f"c{i}", {"e": 1.0, "f": 0.9}) for i in range(3)]  # 3 notes, terms e+f
+    singletons = [("s0", {"g": 1.0}), ("s1", {"h": 1.0})]           # 2 singletons, unique terms
+    items = group_a + group_b + group_c + singletons
+    fast = clustering.cluster_vectors(items, threshold=0.5, min_cluster_size=3, _force_stdlib=False)
+    slow = clustering.cluster_vectors(items, threshold=0.5, min_cluster_size=3, _force_stdlib=True)
+    assert fast == slow
+    assert len(fast) >= 2  # at least 2 clusters found (not a single-blob collapse)
+
+    # --- Boundary-sensitive fixture: 40 random-weight notes, many pairs near threshold ---
+    # Uses random weights so cosine similarities are scattered around 0.3; a >= vs >
+    # or threshold-drift mutation in _components_fast causes parity to break.
     import random
     rng = random.Random(7)
-    terms = [f"t{i}" for i in range(12)]
-    items = []
-    for n in range(40):
-        vec = {t: round(rng.random(), 3) for t in rng.sample(terms, 4)}
-        items.append((f"note{n:02d}", vec))
-    fast = clustering.cluster_vectors(items, threshold=0.3, min_cluster_size=3, _force_stdlib=False)
-    slow = clustering.cluster_vectors(items, threshold=0.3, min_cluster_size=3, _force_stdlib=True)
-    assert fast == slow
+    all_terms = [f"t{i}" for i in range(12)]
+    rand_items = []
+    for idx in range(40):
+        terms = rng.sample(all_terms, 4)
+        vec = {t: round(rng.random(), 3) for t in terms}
+        rand_items.append((f"r{idx}", vec))
+    fast_rand = clustering.cluster_vectors(rand_items, threshold=0.3, min_cluster_size=3, _force_stdlib=False)
+    slow_rand = clustering.cluster_vectors(rand_items, threshold=0.3, min_cluster_size=3, _force_stdlib=True)
+    assert fast_rand == slow_rand
+
+    # Analytic exact-threshold chain: each adjacent pair has cosine EXACTLY 0.5
+    # (dot=2, both norms=2 -> 2/(2*2)=0.5), so `>=` links them but `>` would not.
+    # Single-linkage chains n1-n2-n3 into one cluster of 3 under `>=`; a `>`-mutated
+    # fast path yields zero edges -> 3 dropped singletons -> empty, breaking parity.
+    exact = [
+        ("n1", {"a": 1.0, "b": 1.0, "c": 1.0, "d": 1.0}),
+        ("n2", {"a": 1.0, "b": 1.0, "e": 1.0, "f": 1.0}),  # shares a,b with n1 -> cos 0.5
+        ("n3", {"e": 1.0, "f": 1.0, "g": 1.0, "h": 1.0}),  # shares e,f with n2 -> cos 0.5
+    ]
+    ex_fast = clustering.cluster_vectors(exact, threshold=0.5, min_cluster_size=3, _force_stdlib=False)
+    ex_slow = clustering.cluster_vectors(exact, threshold=0.5, min_cluster_size=3, _force_stdlib=True)
+    assert ex_fast == ex_slow
+    assert ex_fast == [["n1", "n2", "n3"]]  # `>=` at exactly-0.5 links the chain

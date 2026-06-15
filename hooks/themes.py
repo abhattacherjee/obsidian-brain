@@ -50,13 +50,50 @@ def get_unassigned_notes(db_path: str, project: str | None = None) -> list[tuple
     finally:
         conn.close()
     out = []
+    skipped = 0
     for path, proj, vec_json in rows:
         try:
             vec = json.loads(vec_json)
         except (ValueError, TypeError):
+            skipped += 1
             continue
         if vec:
             out.append((path, proj, vec))
+    if skipped > 0:
+        print(f"[consolidate] skipped {skipped} notes with unparseable tfidf_vector", file=sys.stderr)
+    return out
+
+
+def get_all_vectorized_notes(db_path: str, project: str | None = None) -> list[tuple[str, str | None, dict]]:
+    """Notes with a non-empty tfidf_vector, regardless of theme membership. If
+    ``project`` is given, restrict to that project. Returns [(path, project, vec), ...].
+    Used by ``--full`` consolidation to read all notes after deferring the wipe."""
+    from vault_index import _connect
+    conn = _connect(db_path)
+    try:
+        sql = (
+            "SELECT path, project, tfidf_vector FROM notes "
+            "WHERE tfidf_vector IS NOT NULL AND tfidf_vector != ''"
+        )
+        params: tuple = ()
+        if project is not None:
+            sql += " AND project IS ?"
+            params = (project,)
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    out = []
+    skipped = 0
+    for path, proj, vec_json in rows:
+        try:
+            vec = json.loads(vec_json)
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+        if vec:
+            out.append((path, proj, vec))
+    if skipped > 0:
+        print(f"[consolidate] skipped {skipped} notes with unparseable tfidf_vector", file=sys.stderr)
     return out
 
 
@@ -368,13 +405,17 @@ def _theme_member_vectors(conn, theme_id):
         "JOIN notes n ON n.path = m.note_path WHERE m.theme_id = ?", (theme_id,)
     ).fetchall()
     out = []
+    skipped = 0
     for path, vec_json in rows:
         try:
             vec = json.loads(vec_json) if vec_json else {}
         except (ValueError, TypeError):
+            skipped += 1
             vec = {}
         if vec:
             out.append((path, vec))
+    if skipped > 0:
+        print(f"[consolidate] skipped {skipped} notes with unparseable tfidf_vector", file=sys.stderr)
     return out
 
 
@@ -388,6 +429,9 @@ def merge_themes(db_path: str, a: int, b: int, now_iso: str) -> bool:
         if a not in rows or b not in rows:
             return False
         conn.execute("BEGIN IMMEDIATE")
+        # OR IGNORE deduplicates overlapping members (a note in both themes);
+        # the conflicting b-row is silently dropped, then b's remaining rows
+        # are deleted to leave only a's membership intact.
         conn.execute(
             "UPDATE OR IGNORE theme_members SET theme_id = ? WHERE theme_id = ?", (a, b))
         conn.execute("DELETE FROM theme_members WHERE theme_id = ?", (b,))
