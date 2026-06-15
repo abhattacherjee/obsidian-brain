@@ -22,6 +22,7 @@ def assign_to_theme(
     note_path: str,
     project: str | None = None,
     similarity_threshold: float = _THEME_SIMILARITY_THRESHOLD,
+    note_text: str | None = None,
 ) -> dict | None:
     """Incrementally assign a summarized note to its nearest theme (if any).
 
@@ -30,8 +31,19 @@ def assign_to_theme(
     best similarity exceeds ``similarity_threshold``, adds a theme_members
     row and updates the theme's centroid via running average.
 
-    Returns {"theme_id": int, "similarity": float} on assignment, or None
-    if no theme was close enough (or the note has no vector).
+    When ``note_text`` is provided and a theme is matched, the surprise score
+    is computed via ``detect_surprise`` and written to ``theme_members.surprise``
+    inside the same ``BEGIN IMMEDIATE`` transaction — eliminating a separate
+    fourth connection from the upgrade pipeline.
+
+    The centroid passed to ``detect_surprise`` is the POST-update centroid
+    (``new_centroid`` for new members, unchanged ``centroid`` for reassignments),
+    matching the behavior of the previous separate-connection implementation
+    which re-read the centroid after ``assign_to_theme`` committed.
+
+    Returns {"theme_id": int, "similarity": float, "surprise": float,
+    "note_vec": dict, "centroid": dict} on assignment, or None if no theme
+    was close enough (or the note has no vector).
     """
     # Lazy/local import breaks the vault_index<->themes import cycle. It binds the
     # canonical *bare* `vault_index` module — the form every runtime caller uses
@@ -135,6 +147,10 @@ def assign_to_theme(
                     (json.dumps(new_centroid, separators=(",", ":")),
                      count + 1, today, theme_id),
                 )
+                # Use the post-update centroid for surprise so parity is
+                # maintained with the previous implementation that re-read
+                # themes.centroid after assign_to_theme committed.
+                effective_centroid = new_centroid
             else:
                 # Reassignment: bump updated_date but leave count/centroid
                 # alone. The member's similarity is refreshed below.
@@ -142,6 +158,8 @@ def assign_to_theme(
                     "UPDATE themes SET updated_date = ? WHERE id = ?",
                     (today, theme_id),
                 )
+                # Centroid unchanged on reassignment — same as old impl.
+                effective_centroid = centroid
 
             # Preserve surprise + added_date on reassignment — only
             # similarity is refreshed from the latest cosine computation.
@@ -153,8 +171,27 @@ def assign_to_theme(
                 "similarity = excluded.similarity",
                 (theme_id, note_path, sim, today),
             )
+
+            # Compute + persist surprise in-txn when note_text is supplied.
+            # This folds what was previously a separate fourth connection in
+            # upgrade_note_with_summary into this existing transaction.
+            surprise = 0.0
+            if note_text is not None:
+                surprise = detect_surprise(note_text, note_vec, effective_centroid)
+                conn.execute(
+                    "UPDATE theme_members SET surprise = ? "
+                    "WHERE theme_id = ? AND note_path = ?",
+                    (surprise, theme_id, note_path),
+                )
+
             conn.commit()
-            return {"theme_id": theme_id, "similarity": sim}
+            return {
+                "theme_id": theme_id,
+                "similarity": sim,
+                "surprise": surprise,
+                "note_vec": note_vec,
+                "centroid": effective_centroid,
+            }
         except Exception:
             conn.rollback()
             raise
