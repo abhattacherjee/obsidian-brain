@@ -379,7 +379,18 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
     total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
     if is_new:
         total_docs += 1  # this note is about to be inserted
-    term_df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+    # Fetch df only for this note's own terms (O(note tokens), not O(vault)).
+    # _compute_tfidf_vector reads term_df only for terms present in `tokens`.
+    term_df: dict[str, int] = {}
+    unique_terms = list(new_terms)
+    for i in range(0, len(unique_terms), 900):
+        chunk = unique_terms[i:i + 900]
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT term, df FROM term_df WHERE term IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        term_df.update(dict(rows))
     tfidf_vec = _compute_tfidf_vector(tokens, term_df, total_docs, top_k=50)
     tfidf_json = json.dumps(tfidf_vec, separators=(",", ":")) if tfidf_vec else None
 
