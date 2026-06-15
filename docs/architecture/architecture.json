@@ -15,7 +15,7 @@
     "realtime": { "protocol": "none", "endpoint": "direct filesystem writes — no MCP server, no REST API, no daemon" },
     "ai": { "provider": "Claude CLI (claude -p)", "model": "haiku default; escalates haiku to sonnet to opus on empty output (#165)", "notes": "summarization deferred from hooks to /recall" },
     "vectorSearch": { "engine": "SQLite FTS5 (BM25) + 7-signal rerank; TF-IDF cosine themes with ACT-R activation and Free-Energy surprise" },
-    "tests": { "unit": { "runner": "pytest", "count": 69, "environments": ["python3.12"], "coverage": { "lines": 90 } } },
+    "tests": { "unit": { "runner": "pytest", "count": 72, "environments": ["python3.12"], "coverage": { "lines": 90 } } },
     "packageManager": "none (stdlib only)"
   },
   "diagram": {
@@ -109,6 +109,8 @@
         { "id": "compress-guard", "name": "compress_guard.py", "kind": "module", "files": ["hooks/compress_guard.py"], "purpose": "is_high_confidence_match() predicate for /compress dedup: absolute-strength gate (top rank <= -5.0) AND rank-delta gate (top minus runner-up > 0.25), tuned against compress_rank_gap_corpus.json." },
         { "id": "deep-cli", "name": "deep_cli.py", "kind": "module", "files": ["hooks/deep_cli.py"], "purpose": "Thin CLI backing /standup deep: runs the deep pipeline, renders the presentation, and applies path-contained batch edits with a 24h acted-on store so items are not re-recommended." },
         { "id": "emerge-cli", "name": "emerge_cli.py", "kind": "module", "files": ["hooks/emerge_cli.py"], "purpose": "Thin CLI backing /emerge: collects a vault corpus over a window (snapshots excluded by default), re-collects post-upgrade, and assembles the claude-emerge note with source_notes wikilinks." },
+        { "id": "consolidate-cli", "name": "consolidate_cli.py", "kind": "module", "files": ["hooks/consolidate_cli.py"], "purpose": "Thin CLI backing /consolidate: gathers unassigned (or all, with --full) note vectors, clusters per-project, names via Haiku, persists themes + theme_members; stats/split/merge." },
+        { "id": "clustering", "name": "clustering.py", "kind": "module", "files": ["hooks/clustering.py"], "purpose": "Pure single-linkage clustering over sparse TF-IDF vectors (connected components of the cosine>=threshold graph); numpy/scipy fast path, stdlib union-find fallback." },
         { "id": "summarizer-metrics", "name": "summarizer_metrics.py", "kind": "ops", "files": ["hooks/summarizer_metrics.py"], "purpose": "Append-only JSONL telemetry for upgrade_batch() runs; rotates at 100 KB; never raises (best-effort stderr warn only)." }
       ]
     },
@@ -154,7 +156,8 @@
         { "id": "sk-vault-stats", "name": "/vault-stats", "kind": "module", "files": ["skills/vault-stats/SKILL.md"], "purpose": "MAINTENANCE. Vault health + access/importance analytics; saves a trend-tracking note via compute_stats." },
         { "id": "sk-dev-test", "name": "/dev-test", "kind": "module", "files": ["skills/dev-test/SKILL.md"], "purpose": "MAINTENANCE. Install/restore/status the dev plugin into the cache for local testing via scripts/test-dev-skill.sh." },
         { "id": "sk-check-items", "name": "/check-items", "kind": "module", "files": ["skills/check-items/SKILL.md"], "purpose": "TRIAGE. Two-pass AI triage of open items: auto-checks PR-shipped items, cache-backed, cascades sibling checkoffs. Owns partition() and classifier dispatch over the triage-pipeline modules." },
-        { "id": "sk-emerge", "name": "/emerge", "kind": "module", "files": ["skills/emerge/SKILL.md"], "purpose": "TRIAGE. Surfaces unnamed cross-note patterns over a window via a synthesis Agent over emerge_cli corpus." }
+        { "id": "sk-emerge", "name": "/emerge", "kind": "module", "files": ["skills/emerge/SKILL.md"], "purpose": "TRIAGE. Surfaces unnamed cross-note patterns over a window via a synthesis Agent over emerge_cli corpus." },
+        { "id": "sk-consolidate", "name": "/consolidate", "kind": "module", "files": ["skills/consolidate/SKILL.md"], "purpose": "TRIAGE. Batch agglomerative clustering of unassigned notes into named themes (Haiku); stats/split/merge sub-commands; --full recluster." }
       ]
     },
     {
@@ -192,7 +195,7 @@
         { "id": "ops-commit-preflight", "name": "commit-preflight.sh", "kind": "ops", "files": ["scripts/commit-preflight.sh"], "purpose": "Creates a 5-minute token consumed by the require-preflight hook. Enforces (always-on) manifest version sync, then secret scan, then pytest with cov-fail-under 90. Flags: --docs-only, --skip-tests, --auto." },
         { "id": "ops-ci", "name": "CI workflow", "kind": "ops", "files": [".github/workflows/ci.yml"], "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), no-default-db AST guard, security-tests, and an advisory detect-release-merge check." },
         { "id": "ops-no-default-db", "name": "no-default-db.py", "kind": "ops", "files": ["scripts/ci-checks/no-default-db.py"], "purpose": "AST guard (GH #46): every ensure_index/rebuild_index/deep_analysis_pipeline call in tests/ must pass explicit db_path= so tests cannot pollute the live vault DB." },
-        { "id": "ops-pytest", "name": "pytest suite", "kind": "ops", "files": ["tests/"], "purpose": "69 test files, coverage source=hooks, fail_under=90. Hook simulation pattern pipes synthetic JSON into installed hooks; import-time state-dir constants isolated via autouse conftest monkeypatch." },
+        { "id": "ops-pytest", "name": "pytest suite", "kind": "ops", "files": ["tests/"], "purpose": "72 test files, coverage source=hooks, fail_under=90. Hook simulation pattern pipes synthetic JSON into installed hooks; import-time state-dir constants isolated via autouse conftest monkeypatch." },
         { "id": "ops-security-tests", "name": "test-security.sh", "kind": "ops", "files": ["scripts/test-security.sh"], "purpose": "Runs the security regression suite (path containment, secret scrub, temp-path safety) with OB_HOOKS_DIR=hooks." }
       ]
     }
@@ -325,6 +328,18 @@
       ]
     },
     {
+      "id": "theme-seeding",
+      "name": "/consolidate theme seeding",
+      "description": "Batch-cluster unassigned notes into named themes: partition by project, cluster per-project, name via Haiku, persist themes + theme_members.",
+      "steps": [
+        { "from": "sk-consolidate", "to": "consolidate-cli", "label": "shell out to consolidate_cli.py (run_consolidate / run_stats / run_split / run_merge)" },
+        { "from": "consolidate-cli", "to": "clustering", "label": "cluster_vectors (cosine>=threshold connected components, per-project)" },
+        { "from": "consolidate-cli", "to": "summarizer", "label": "generate_theme_names (batched Haiku via claude -p, deterministic fallback on failure)" },
+        { "from": "consolidate-cli", "to": "themes", "label": "create_theme (INSERT themes + theme_members, caller-owned txn)" },
+        { "from": "themes", "to": "db-index", "label": "persist theme row + member rows (similarity to centroid)" }
+      ]
+    },
+    {
       "id": "release-lockstep",
       "name": "Git Flow release (version lockstep)",
       "description": "A release branch from develop, then bump manifests in lockstep, then preflight, then CI, then merge into main with a back-merge to develop.",
@@ -383,7 +398,7 @@
     ]
   },
   "testing": {
-    "unitSuite": { "tool": "pytest", "fileCount": 69, "duration": "fast (stdlib, no network)", "environments": { "python": "3.12" }, "coverage": { "lines": 90, "source": "hooks", "omits": ["obsidian_utils.py (I/O monolith)", "emerge_cli.py", "deep_cli.py"] } },
+    "unitSuite": { "tool": "pytest", "fileCount": 72, "duration": "fast (stdlib, no network)", "environments": { "python": "3.12" }, "coverage": { "lines": 90, "source": "hooks", "omits": ["obsidian_utils.py (I/O monolith)", "emerge_cli.py", "deep_cli.py"] } },
     "manualMatrix": { "doc": "CLAUDE.md (Development Commands)", "devices": ["hook simulation: pipe synthetic SessionEnd/SessionStart/PreCompact JSON into installed hooks", "json.load validation of hooks.json and plugin.json"], "rationale": "No build/test framework for the prompt-based skills; hooks are validated by feeding synthetic lifecycle JSON and asserting vault writes + telemetry outcomes." }
   },
   "scripts": [
