@@ -9,8 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `/consolidate` skill: batch-clusters notes into named themes (3+ notes/theme) with Haiku naming, plus `stats`, `split <id>`, `merge <a> <b>` sub-commands and a `--full` recluster. Themes finally populate (previously `assign_to_theme` could only join existing themes, so they stayed empty). (#230)
+- `/recall` now shows a **Recurring Themes** section — the project's top themes ranked by activation, so resuming work surfaces the threads you keep returning to. (#231)
+- **Theme activation is now populated** (ACT-R recency-decayed from member dates) and refreshed automatically by `/consolidate`, `/merge`, and `/emerge`. (#231)
 
 ### Changed
+- **`/emerge` now operates on themes instead of raw notes**, so it scales to vaults with 10k+ notes — the synthesis sub-agent reads a compact theme corpus (~30k tokens) rather than the full raw-note corpus (~400k). With fewer than 2 themes in the window it nudges you to run `/consolidate` or widen the window. (#231)
 - **Internal:** split `hooks/vault_index.py` (was ~2,068 lines) into focused modules — `hooks/tfidf.py` (TF-IDF primitives; stdlib-only leaf) and `hooks/themes.py` (theme assignment + surprise detection). `vault_index.py` keeps core index/sync/search and re-exports the moved symbols for back-compat; no behavior change. Enabling refactor for Friston Phase 3 (epic #53). Closes #229.
 - **TF-IDF relevance scores are now order-independent on full vault re-index.** Previously, notes indexed early in a bulk rebuild carried inflated relevance scores until they happened to be re-touched; `/vault-reindex` now runs a second pass after a bulk insert so every note's score is computed against the final corpus.
 - **Faster theme assignment on large vaults.** Theme candidates that share no terms with the note are skipped before cosine is computed (cosine is provably zero in that case), cutting the per-note cost proportionally to the fraction of unrelated themes.
@@ -18,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `scripts/test-dev-skill.sh install` now also syncs `hooks/hooks.json` (and the `.claude-plugin/` manifests) into the plugin cache. Previously only `hooks/*.py` and skill dirs were copied, so a newly **registered** hook (e.g. a new `Stop` event) had its script copied but was never registered — it silently never fired after `/dev-test install`. Closes #227.
+
+### Removed
+- The raw-note `/emerge` corpus path (`collect_vault_corpus` / `upgrade_and_collect_corpus`), superseded by the theme-level pipeline above. (#231)
 
 ## [2.7.1] - 2026-06-12
 
