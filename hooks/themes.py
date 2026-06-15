@@ -87,6 +87,7 @@ def assign_to_theme(
                     (project,),
                 ).fetchall()
 
+            note_terms = set(note_vec)
             best: tuple[float, int, dict, int] | None = None
             for cand in candidates:
                 if not cand["centroid"]:
@@ -94,6 +95,10 @@ def assign_to_theme(
                 try:
                     centroid = json.loads(cand["centroid"])
                 except json.JSONDecodeError:
+                    continue
+                # Prefilter: cosine is 0 without a shared term, which is below
+                # the assignment threshold, so skip the expensive cosine call.
+                if not note_terms.intersection(centroid):
                     continue
                 sim = _cosine_similarity(note_vec, centroid)
                 if best is None or sim > best[0]:
