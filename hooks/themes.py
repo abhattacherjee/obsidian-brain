@@ -16,6 +16,76 @@ from tfidf import _cosine_similarity, _TOKEN_RE
 
 _THEME_SIMILARITY_THRESHOLD = 0.3
 
+_CENTROID_EPSILON = 1e-6
+
+
+def compute_centroid(vectors: list[dict[str, float]]) -> dict[str, float]:
+    """Element-wise mean of sparse vectors, pruning terms below epsilon."""
+    if not vectors:
+        return {}
+    n = len(vectors)
+    acc: dict[str, float] = {}
+    for vec in vectors:
+        for term, w in vec.items():
+            acc[term] = acc.get(term, 0.0) + w
+    return {t: s / n for t, s in acc.items() if abs(s / n) >= _CENTROID_EPSILON}
+
+
+def get_unassigned_notes(db_path: str, project: str | None = None) -> list[tuple[str, str | None, dict]]:
+    """Notes with a non-empty tfidf_vector and NO theme_members row. If ``project``
+    is given, restrict to that project. Returns [(path, project, vec), ...]."""
+    from vault_index import _connect
+    conn = _connect(db_path)
+    try:
+        sql = (
+            "SELECT n.path, n.project, n.tfidf_vector FROM notes n "
+            "LEFT JOIN theme_members m ON n.path = m.note_path "
+            "WHERE m.note_path IS NULL AND n.tfidf_vector IS NOT NULL AND n.tfidf_vector != ''"
+        )
+        params: tuple = ()
+        if project is not None:
+            sql += " AND n.project IS ?"
+            params = (project,)
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for path, proj, vec_json in rows:
+        try:
+            vec = json.loads(vec_json)
+        except (ValueError, TypeError):
+            continue
+        if vec:
+            out.append((path, proj, vec))
+    return out
+
+
+def create_theme(
+    conn: sqlite3.Connection,
+    name: str,
+    summary: str,
+    centroid: dict[str, float],
+    members: list[tuple[str, dict[str, float]]],
+    project: str | None,
+    now_iso: str,
+) -> int:
+    """INSERT a themes row + its theme_members rows (similarity = cosine to the
+    centroid). Caller owns the transaction (does not commit). Returns theme id."""
+    cur = conn.execute(
+        "INSERT INTO themes (name, summary, centroid, note_count, activation, "
+        "created_date, updated_date, project) VALUES (?, ?, ?, ?, 0.0, ?, ?, ?)",
+        (name, summary, json.dumps(centroid, separators=(",", ":")), len(members),
+         now_iso, now_iso, project),
+    )
+    theme_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO theme_members (theme_id, note_path, similarity, surprise, added_date) "
+        "VALUES (?, ?, ?, 0.0, ?) "
+        "ON CONFLICT(theme_id, note_path) DO UPDATE SET similarity = excluded.similarity",
+        [(theme_id, path, _cosine_similarity(vec, centroid), now_iso) for path, vec in members],
+    )
+    return theme_id
+
 
 def assign_to_theme(
     db_path: str,
