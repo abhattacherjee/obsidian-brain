@@ -29,7 +29,7 @@
         { "label": "SQLite + FTS5", "sub": "7-signal rank · themes", "color": "#10B981" },
         { "label": "Config + Telemetry", "sub": "~/.claude", "color": "#84CC16" }
       ] },
-      { "arrowLabel": "on demand (18 skills)", "nodes": [
+      { "arrowLabel": "on demand (19 skills)", "nodes": [
         { "label": "Capture / Recall", "sub": "compress · recall · vault-ask · standup", "color": "#8B5CF6" },
         { "label": "vault-doctor", "sub": "9 pluggable checks", "color": "#EC4899" },
         { "label": "check-items", "sub": "AI triage pipeline", "color": "#F59E0B" }
@@ -138,7 +138,7 @@
       "id": "skills",
       "name": "Skills (prompt-based procedures)",
       "color": "#8B5CF6",
-      "description": "18 SKILL.md prompt procedures (no code files) that Claude Code follows step-by-step, reaching the backing Python via a cache glob. Grouped by lifecycle: SETUP, CAPTURE, RECALL/QUERY, MAINTENANCE, TRIAGE. Some fan out to sub-agents; most run inline.",
+      "description": "19 SKILL.md prompt procedures (no code files) that Claude Code follows step-by-step, reaching the backing Python via a cache glob. Grouped by lifecycle: SETUP, CAPTURE, RECALL/QUERY, MAINTENANCE, TRIAGE. Some fan out to sub-agents; most run inline.",
       "components": [
         { "id": "sk-obsidian-setup", "name": "/obsidian-setup", "kind": "module", "files": ["skills/obsidian-setup/SKILL.md"], "purpose": "SETUP. First-run/upgrade config: vault path, folders, dashboards install, optional deps; writes the config JSON and rebuilds the index." },
         { "id": "sk-vault-config", "name": "/vault-config", "kind": "module", "files": ["skills/vault-config/SKILL.md"], "purpose": "SETUP. Interactive numbered-menu editor for config (toggles, thresholds, snapshot flags) with atomic config rewrite." },
@@ -275,7 +275,9 @@
         { "from": "summarizer", "to": "themes", "label": "assign_to_theme(note_text=...) — computes + writes surprise in-txn (1 connection)" },
         { "from": "themes", "to": "db-index", "label": "write theme_members row + surprise in same BEGIN IMMEDIATE" },
         { "from": "write-vault-note", "to": "db-vault", "label": "flip status: auto-logged to summarized" },
-        { "from": "sk-recall", "to": "search-vault", "label": "build context brief from ranked notes" }
+        { "from": "sk-recall", "to": "search-vault", "label": "build context brief from ranked notes" },
+        { "from": "sk-recall", "to": "recurring-themes-section", "label": "append Recurring Themes section (get_top_themes_for_project by activation)" },
+        { "from": "recurring-themes-section", "to": "db-index", "label": "read themes table via themes.get_top_themes_for_project" }
       ]
     },
     {
@@ -371,7 +373,9 @@
     { "name": "Result", "file": "scripts/vault_doctor_checks/__init__.py", "kind": "type", "fields": ["check", "note_path", "status", "backup_path", "error"], "values": ["applied", "skipped", "error", "unresolved"] },
     { "name": "Scope", "file": "hooks/check_items_args.py", "kind": "type", "fields": ["mode", "project", "window_days", "show_all", "dry_run", "no_cache"], "values": ["current", "vault", "project"] },
     { "name": "ReaperOutcome", "file": "hooks/obsidian_session_reaper.py", "kind": "type", "fields": ["reaped", "skipped_existing", "skipped_below", "canary_blocked", "timeout", "wall_ms"] },
-    { "name": "NoteType (frontmatter discriminator)", "file": "templates/", "kind": "enum", "values": ["claude-session", "claude-snapshot", "claude-insight", "claude-decision", "claude-error-fix", "claude-check-items-report", "claude-stats", "claude-retro", "claude-emerge", "imported(claude-session)"] }
+    { "name": "NoteType (frontmatter discriminator)", "file": "templates/", "kind": "enum", "values": ["claude-session", "claude-snapshot", "claude-insight", "claude-decision", "claude-error-fix", "claude-check-items-report", "claude-stats", "claude-retro", "claude-emerge", "imported(claude-session)"] },
+    { "name": "Theme", "file": "hooks/vault_index.py", "kind": "type", "fields": ["id", "name", "summary", "centroid", "note_count", "activation", "created_date", "updated_date", "project"] },
+    { "name": "ThemeMember", "file": "hooks/vault_index.py", "kind": "type", "fields": ["theme_id", "note_path", "similarity", "surprise", "added_date"] }
   ],
   "environment": [
     { "name": "CLAUDE_PLUGIN_ROOT", "default": "(set by Claude Code)", "purpose": "Base path the hook registration uses to invoke the plugin hook scripts." },

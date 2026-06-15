@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - The raw-note `/emerge` corpus path (`collect_vault_corpus` / `upgrade_and_collect_corpus`), superseded by the theme-level pipeline above. (#231)
 
+### Documentation
+- Architecture page (`docs/architecture/architecture.json` + `.html`) synced for the Friston Phase 3 theme engine: corrected skill count (18→19), added `Theme`/`ThemeMember` schema to the types reference, and wired the `/recall` → Recurring Themes flow step. (#53)
+
 ## [2.7.1] - 2026-06-12
 
 ### Added
