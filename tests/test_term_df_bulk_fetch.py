@@ -95,3 +95,56 @@ def test_tfidf_vector_parity_with_full_fetch(tmp_path):
     conn.close()
     expected = vault_index._compute_tfidf_vector(tokens, full_df, total, top_k=50)
     assert vec == expected
+
+
+def test_tfidf_vector_large_token_set_chunked(tmp_path):
+    """_upsert_note correctly chunks >900 unique tokens into multiple IN-fetches.
+
+    Exercises the i in range(0, len(unique_terms), 900) boundary in vault_index
+    _upsert_note (lines ~392-399). A note with ~1000 unique tokens requires at
+    least 2 chunks; the resulting tfidf_vector must match a full-fetch oracle.
+    """
+    db = str(tmp_path / "v.db")
+    conn = vault_index._connect(db)
+    vault_index._init_schema(conn)
+    conn.close()
+
+    # Build a body with 1000 unique tokens.
+    token_list = [f"token{i}" for i in range(1000)]
+    body = " ".join(token_list)
+
+    # Seed term_df for all 1000 tokens so the scoped fetch actually returns data.
+    conn = vault_index._connect(db)
+    conn.executemany(
+        "INSERT OR IGNORE INTO term_df (term, df) VALUES (?, 1)",
+        [(t,) for t in token_list],
+    )
+    conn.commit()
+
+    conn.execute("BEGIN IMMEDIATE")
+    vault_index._upsert_note(
+        conn,
+        "/x/large.md",
+        {"type": "session", "title": "large", "tags": "",
+         "body": body, "date": "2026-06-15", "project": "p"},
+        mtime=1.0,
+        size=len(body),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT tfidf_vector FROM notes WHERE path = ?", ("/x/large.md",)
+    ).fetchone()
+    assert row is not None and row[0] is not None, "large note not indexed"
+    stored_vec = json.loads(row[0])
+
+    # Oracle: full term_df fetch -> compute expected vector.
+    tokens = vault_index._tokenize_for_tfidf("large " + body)
+    full_df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+    total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    conn.close()
+    expected = vault_index._compute_tfidf_vector(tokens, full_df, total, top_k=50)
+
+    assert stored_vec == expected, (
+        f"Large-token-set vector mismatch: stored {len(stored_vec)} terms, "
+        f"expected {len(expected)} terms; chunked IN-fetch may be incomplete"
+    )

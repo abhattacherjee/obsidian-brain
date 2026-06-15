@@ -4615,19 +4615,26 @@ def upgrade_note_with_summary(
                             (importance, note_path),
                         )
                         _conn.commit()
-                        # Capture body for surprise computation in Conn B.
-                        _note_body_for_surprise = _parsed.get("body", "") or ""
+                        # Read full raw file (frontmatter + body) to match the
+                        # legacy detect_surprise input exactly — behavior-neutral
+                        # refactor; Friston-data continuity requires byte-exact
+                        # parity with the old open(note_path, "r",
+                        # encoding="utf-8").read().
+                        with open(note_path, "r", encoding="utf-8") as _fh:
+                            _note_body_for_surprise = _fh.read()
                     except Exception as _exc:
                         try:
                             _conn.rollback()
                         except Exception:
                             pass
                         print(f"[obsidian-brain] index+importance write-back failed for "
-                              f"{os.path.basename(note_path)}: {_exc}", file=sys.stderr)
+                              f"{os.path.basename(note_path)}: "
+                              f"{type(_exc).__name__}: {_exc}", file=sys.stderr)
                     finally:
                         _conn.close()
                 else:
-                    print(f"[obsidian-brain] index+importance skipped (parse failed) for "
+                    _skip_reason = "parse failed" if _parsed is None else "note file gone"
+                    print(f"[obsidian-brain] index+importance skipped ({_skip_reason}) for "
                           f"{os.path.basename(note_path)}", file=sys.stderr)
     except Exception as exc:
         print(f"[obsidian-brain] index+importance write-back failed for "

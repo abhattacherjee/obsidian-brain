@@ -40,18 +40,25 @@ def test_prefilter_skips_zero_overlap_cosine(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
 
-    calls = {"n": 0}
+    # Record which centroid dicts were passed to cosine so we can assert that
+    # the zero-overlap theme (theme 2: gamma/delta) was never evaluated.
+    # A global-count guard (calls["n"] <= 2) is flaky under concurrent tests
+    # because stray cosine calls from other tests increment the same counter.
+    seen_centroids: list[frozenset] = []
     real = themes._cosine_similarity
 
     def counting(a, b):
-        calls["n"] += 1
+        seen_centroids.append(frozenset(b.keys()))
         return real(a, b)
 
     monkeypatch.setattr(themes, "_cosine_similarity", counting)
     res = themes.assign_to_theme(db, "/n.md", project="p")
     # Theme 2 (gamma/delta) shares no term with the note -> cosine skipped.
-    # Only themes 1 and 3 share >=1 term.
-    assert calls["n"] <= 2, f"cosine computed {calls['n']} times, expected <=2"
+    # Only themes 1 and 3 share >=1 term, so their centroids may be evaluated.
+    zero_overlap_centroid = frozenset({"gamma", "delta"})
+    assert zero_overlap_centroid not in seen_centroids, (
+        f"cosine was called with theme-2 centroid (gamma/delta): {seen_centroids}"
+    )
     assert res is not None and res["theme_id"] in (1, 3)
 
 

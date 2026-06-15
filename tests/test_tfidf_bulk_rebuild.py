@@ -176,3 +176,73 @@ def test_sync_triggers_recompute_on_bulk_insert(tmp_path):
             f"{name}: stored vector doesn't match final-corpus recompute: "
             f"{actual} != {expected}"
         )
+
+
+def test_sync_incremental_skip_no_recompute(tmp_path):
+    """Incremental _sync (1 new note added to a 10-note corpus) skips recompute.
+
+    With _BULK_RECOMPUTE_MIN_FRACTION = 0.5, inserting 1 note into a 10-note
+    corpus gives inserted=1 and total_after=11. The guard (1 > 11 * 0.5 = 5.5)
+    is False, so _recompute_all_tfidf_vectors is NOT called.
+
+    Also verifies that an existing note's tfidf_vector is bit-for-bit unchanged
+    between the two _sync calls.
+    """
+    from pathlib import Path
+
+    vault = tmp_path / "vault"
+    sess = vault / "claude-sessions"
+    sess.mkdir(parents=True)
+
+    # Seed 10 notes so the corpus is already large enough that 1 new note
+    # does not cross the 50% bulk-recompute threshold.
+    _EXTRA_BODIES = {f"note{i:02d}.md": f"term{i} common extra" for i in range(10)}
+    for name, body in _EXTRA_BODIES.items():
+        (sess / name).write_text(
+            f"---\ntype: session\nproject: p\ndate: 2026-06-15\n"
+            f"title: {name}\n---\n\n{body}\n"
+        )
+
+    db = str(tmp_path / "v.db")
+    conn = vault_index._connect(db)
+    vault_index._init_schema(conn)
+    stats1 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+
+    assert stats1["inserted"] == 10, f"expected 10 inserted: {stats1}"
+
+    # Capture vector for the first note before adding a new one.
+    first_note_path = str(sess / "note00.md")
+    conn = vault_index._connect(db)
+    row = conn.execute(
+        "SELECT tfidf_vector FROM notes WHERE path = ?", (first_note_path,)
+    ).fetchone()
+    conn.close()
+    assert row is not None, "note00.md not indexed after first sync"
+    vec_before = row[0]
+
+    # Add one new note and re-sync.
+    (sess / "new_note.md").write_text(
+        "---\ntype: session\nproject: p\ndate: 2026-06-15\n"
+        "title: new_note\n---\n\nnewnote unique term\n"
+    )
+
+    conn = vault_index._connect(db)
+    stats2 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+
+    assert stats2["inserted"] == 1, f"expected 1 inserted: {stats2}"
+    assert stats2["recomputed"] == 0, (
+        f"Expected recomputed=0 (1 of 11 notes < 50% threshold), got: {stats2}"
+    )
+
+    # Existing note vector must be unchanged (no recompute pass ran).
+    conn = vault_index._connect(db)
+    row2 = conn.execute(
+        "SELECT tfidf_vector FROM notes WHERE path = ?", (first_note_path,)
+    ).fetchone()
+    conn.close()
+    assert row2 is not None
+    assert row2[0] == vec_before, (
+        "note00.md tfidf_vector changed between syncs despite recomputed=0"
+    )
