@@ -364,6 +364,33 @@ def test_run_emerge_themes_ok(emerge_db, capsys):
     assert max_act > 0.0
 
 
+# --- _strip_leading_frontmatter -------------------------------------------
+
+def test_strip_leading_frontmatter_removes_block():
+    text = "---\ntitle: x\n---\n\n## Body\n- item\n"
+    out = emerge_cli._strip_leading_frontmatter(text)
+    assert out.startswith("## Body")
+    assert "title: x" not in out
+    assert "---" not in out
+
+
+def test_strip_leading_frontmatter_no_frontmatter_unchanged():
+    text = "## Body\n- item\n"
+    assert emerge_cli._strip_leading_frontmatter(text) == text
+
+
+def test_strip_leading_frontmatter_no_closing_delimiter_unchanged():
+    # A leading '---' with no closing '---' must NOT be corrupted.
+    text = "---\ntitle: x\n## Body still here\n"
+    assert emerge_cli._strip_leading_frontmatter(text) == text
+
+
+def test_strip_leading_frontmatter_delimiter_only_later_unchanged():
+    # '---' appears only mid-body (a horizontal rule), not at the top.
+    text = "## Body\nsome text\n---\nmore text\n"
+    assert emerge_cli._strip_leading_frontmatter(text) == text
+
+
 # --- run_build_note -------------------------------------------------------
 
 def test_run_build_note(emerge_db, tmp_vault, capsys):
@@ -379,7 +406,10 @@ def test_run_build_note(emerge_db, tmp_vault, capsys):
     with open(emerge_cli._themes_json_path(), "w") as f:
         json.dump(corpus, f)
     with open(emerge_cli._analysis_path(), "w") as f:
-        f.write("## Growing Themes\n- T1 is hot\n")
+        # Sub-agent mistakenly prepended its own YAML frontmatter. The final
+        # note must contain exactly ONE frontmatter block (the run_build_note
+        # claude-emerge block); the injected `title: T` must not appear.
+        f.write("---\ntitle: T\n---\n\n## Growing Themes\n- T1 is hot\n")
 
     emerge_cli.run_build_note()
 
@@ -394,6 +424,11 @@ def test_run_build_note(emerge_db, tmp_vault, capsys):
     assert "type: claude-emerge" in text
     assert "theme_count: 2" in text
     assert "## Growing Themes" in text
+    # Exactly ONE frontmatter block: the stray sub-agent block was stripped.
+    # Fail-first: without _strip_leading_frontmatter the body embeds a second
+    # `\n---\n`-delimited block, so this count would be 2 and `title: T` present.
+    assert text.count("\n---\n") == 1
+    assert "title: T" not in text
     # Temp files cleaned up on success.
     assert not os.path.exists(emerge_cli._themes_json_path())
     assert not os.path.exists(emerge_cli._analysis_path())

@@ -162,6 +162,34 @@ def run_emerge_themes(days: int = 30) -> None:
     print("STATUS=OK:" + str(len(theme_records)) + ":" + str(len(unassigned_records)))
 
 
+def _strip_leading_frontmatter(text: str) -> str:
+    """Remove a leading YAML frontmatter block from analysis body text.
+
+    The /emerge analysis sub-agent is instructed to emit only ``##`` body
+    sections, but a stray YAML frontmatter block prepended by the sub-agent
+    would otherwise be embedded verbatim into the note body, yielding a
+    malformed double-frontmatter note. If ``text`` (after left-stripping
+    whitespace) opens with a line that is exactly ``---``, drop everything
+    through the next line that is exactly ``---`` (plus any immediately
+    following blank lines). When there is no well-formed closing ``---``, the
+    text is returned unchanged so we never corrupt legitimate content.
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith("---"):
+        return text
+    lines = stripped.split("\n")
+    if lines[0].strip() != "---":
+        return text
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            rest = lines[i + 1:]
+            while rest and rest[0].strip() == "":
+                rest.pop(0)
+            return "\n".join(rest)
+    # No closing delimiter: leave content untouched.
+    return text
+
+
 def run_build_note() -> None:
     """Build the emerge vault note from emerge-themes.json + emerge-analysis.md.
 
@@ -184,6 +212,10 @@ def run_build_note() -> None:
         print(f"ERROR could not read emerge artifacts ({exc}); re-run /emerge to regenerate",
               file=sys.stderr)
         sys.exit(1)
+
+    # Belt-and-suspenders: the sub-agent is told not to emit frontmatter, but
+    # strip a stray leading block so it never embeds as double-frontmatter.
+    analysis = _strip_leading_frontmatter(analysis)
 
     today = datetime.now(timezone.utc).date().isoformat()
     projects = corpus.get("projects", [])
