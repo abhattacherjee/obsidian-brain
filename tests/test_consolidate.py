@@ -127,8 +127,8 @@ def test_merge_combines_members_and_drops_second(db):
     for tid, name in [(1,"A"),(2,"B")]:
         conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
                      "VALUES (?,?,?,?,?,?,?,?)",(tid,name,"s",json.dumps({"x":1.0}),1,"d","d","proj"))
-    conn.execute("INSERT INTO theme_members VALUES (1,'a.md',0.9,0.0,'d')")
-    conn.execute("INSERT INTO theme_members VALUES (2,'b.md',0.9,0.0,'d')")
+    conn.execute("INSERT INTO theme_members VALUES (1,'a.md',0.9,0.0,'2026-01-01')")
+    conn.execute("INSERT INTO theme_members VALUES (2,'b.md',0.9,0.0,'2026-01-01')")
     # member vectors must exist for centroid recompute — use DISTINCT terms so
     # the merged centroid is detectable (x:0.5, y:0.5), not a collapse to one term.
     conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
@@ -209,6 +209,39 @@ def test_merge_self_is_rejected(db):
     conn.close()
     assert theme_count == 1, "theme must still exist after self-merge"
     assert member_count == 2, "theme must still have 2 members after self-merge"
+
+
+def test_consolidate_refreshes_activation(db):
+    """After seeding a 3-note theme, its activation must be > 0.0 (the refresh
+    pass ran). Without recompute_activation in run_consolidate it stays 0.0."""
+    _seed_notes(db, [("a.md","proj",{"x":1.0}),("b.md","proj",{"x":1.0}),("c.md","proj",{"x":1.0})])
+    with patch("consolidate_cli.generate_theme_names", _fake_names):
+        consolidate_cli.run_consolidate(full=False)
+    conn = sqlite3.connect(db)
+    act = conn.execute("SELECT activation FROM themes").fetchone()[0]
+    conn.close()
+    assert act > 0.0
+
+
+def test_merge_refreshes_activation(db):
+    """After a merge, activation on the surviving theme must be recomputed > 0.0."""
+    conn = sqlite3.connect(db)
+    for tid, name in [(1,"A"),(2,"B")]:
+        conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,activation,created_date,updated_date,project) "
+                     "VALUES (?,?,?,?,?,?,?,?,?)",(tid,name,"s",json.dumps({"x":1.0}),1,0.0,"d","d","proj"))
+    today = consolidate_cli._now_iso()[:10]
+    conn.execute("INSERT INTO theme_members VALUES (1,'a.md',0.9,0.0,?)", (today,))
+    conn.execute("INSERT INTO theme_members VALUES (2,'b.md',0.9,0.0,?)", (today,))
+    conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                 "VALUES ('a.md','session','proj','t','b',1.0,?)", (json.dumps({"x":1.0}),))
+    conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                 "VALUES ('b.md','session','proj','t','b',1.0,?)", (json.dumps({"y":1.0}),))
+    conn.commit(); conn.close()
+    consolidate_cli.run_merge(1, 2)
+    conn = sqlite3.connect(db)
+    act = conn.execute("SELECT activation FROM themes WHERE id=1").fetchone()[0]
+    conn.close()
+    assert act > 0.0
 
 
 def test_split_noop_when_cohesive(db, capsys):
