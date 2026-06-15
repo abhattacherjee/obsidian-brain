@@ -9,11 +9,6 @@ import sys
 import os
 from datetime import date
 
-# Ensure hooks/ is on the path for direct imports.
-_hooks_dir = os.path.join(os.path.dirname(__file__), "..", "hooks")
-if _hooks_dir not in sys.path:
-    sys.path.insert(0, _hooks_dir)
-
 import obsidian_utils
 import vault_index
 import themes
@@ -332,8 +327,9 @@ def test_connection_a_rollback_does_not_block_upgrade(tmp_path, monkeypatch):
         f"got: {result!r}"
     )
 
-    # (3) No theme assignment — _note_body_for_surprise stays None when
-    # _upsert_note raises, so assign_to_theme is never called.
+    # (3) No theme assignment — _index_ok stays False when Connection-A
+    # rolls back, so both the surprise-body read and assign_to_theme are
+    # skipped entirely.
     conn = vault_index._connect(db)
     try:
         count = conn.execute("SELECT COUNT(*) FROM theme_members").fetchone()[0]
@@ -341,4 +337,97 @@ def test_connection_a_rollback_does_not_block_upgrade(tmp_path, monkeypatch):
         conn.close()
     assert count == 0, (
         f"theme_members must be empty when Connection-A rolled back; found {count} row(s)"
+    )
+
+
+def test_surprise_body_read_failure_still_assigns_theme(tmp_path, monkeypatch):
+    """When the surprise-body read fails (OSError), theme assignment still runs.
+
+    Regression test for C-001: the old code placed the open() call INSIDE
+    Connection A's try block.  An OSError there would:
+      (a) jump to the except, triggering a spurious rollback of an already-
+          committed transaction,
+      (b) log "index+importance write-back failed" (misleading), and
+      (c) leave _note_body_for_surprise = None, causing Connection B to be
+          skipped — theme assignment never occurred.
+
+    After the fix, the file read is outside Connection A.  A read failure:
+      - logs "surprise-body read failed" (accurate)
+      - does NOT skip theme assignment (_index_ok gates Connection B)
+      - results in assign_to_theme(note_text=None), which writes the default
+        surprise of 0.0 and still inserts the theme_members row.
+
+    Fail-first evidence: with the OLD coupled code, Connection B was gated on
+    ``_note_body_for_surprise is not None``.  Injecting an OSError on the open()
+    call would therefore leave theme_members empty (count == 0).  After the fix,
+    Connection B gates on ``_index_ok`` (True after a successful commit), so
+    theme_members has exactly 1 row even when note_text is None.
+    """
+    vault, note, db = _build_upgrade_setup(tmp_path)
+    monkeypatch.setattr(vault_index, "_default_db_path", lambda *a, **k: db)
+
+    # Intercept builtins.open: raise OSError only for the surprise-body read.
+    # The opens of note_path WITHOUT an 'errors' kwarg inside
+    # upgrade_note_with_summary are:
+    #   1. line ~4384: open(note_path, 'r', encoding='utf-8') — initial raw read
+    #   2. line ~4548: open(note_path, 'r', encoding='utf-8') — post-write verify
+    #   3. line ~4656: open(note_path, 'r', encoding='utf-8') — surprise-body read
+    # _parse_note uses errors='replace' so it does NOT count here.
+    # Raise on the 3rd open without 'errors', which is the surprise-body read.
+    import builtins
+    real_open = builtins.open
+    note_str = str(note)
+    _no_errors_open_count = {"n": 0}
+
+    def _selective_open(file, *args, **kwargs):
+        if str(file) == note_str and "errors" not in kwargs and len(args) < 3:
+            _no_errors_open_count["n"] += 1
+            if _no_errors_open_count["n"] >= 3:
+                raise OSError("injected: note file vanished in commit→read race")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _selective_open)
+
+    summary = (
+        "## Summary\nDid python work on changes.\n\n"
+        "## Key Decisions\nNone noted.\n\n"
+        "## Changes Made\nPython changes landed.\n\n"
+        "## Errors Encountered\nNone.\n\n"
+        "## Open Questions / Next Steps\nNone.\n\nIMPORTANCE: 6\n"
+    )
+
+    # (1) Must not raise.
+    result = obsidian_utils.upgrade_note_with_summary(
+        str(note), summary, str(vault), "claude-sessions", "p",
+    )
+
+    # (2) Must return success — the summary write and index commit both
+    # succeeded before the read was attempted.
+    assert result.startswith("Upgraded "), (
+        f"upgrade must succeed even when surprise-body read raises OSError; "
+        f"got: {result!r}"
+    )
+
+    # (3) Theme assignment MUST have occurred — Connection B gates on
+    # _index_ok (True), not on body-read success.
+    conn = vault_index._connect(db)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM theme_members").fetchone()[0]
+        surprise_row = conn.execute(
+            "SELECT surprise FROM theme_members WHERE note_path = ?",
+            (note_str,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert count == 1, (
+        f"theme_members must have 1 row even when surprise-body read fails "
+        f"(fix C-001: Connection B gates on _index_ok, not body-read success); "
+        f"found {count} row(s)"
+    )
+
+    # (4) Surprise is the default 0.0 — assign_to_theme received note_text=None.
+    assert surprise_row is not None, "no theme_members row found"
+    assert surprise_row[0] == 0.0, (
+        f"surprise must be default 0.0 when note_text=None; got {surprise_row[0]!r}"
     )

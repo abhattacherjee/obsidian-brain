@@ -270,7 +270,7 @@
         { "from": "upsert-note", "to": "db-index", "label": "DELETE-then-INSERT with token-scoped term_df fetch" },
         { "from": "summarizer", "to": "themes", "label": "assign_to_theme(note_text=...) — computes + writes surprise in-txn (1 connection)" },
         { "from": "themes", "to": "db-index", "label": "write theme_members row + surprise in same BEGIN IMMEDIATE" },
-        { "from": "summarizer", "to": "db-vault", "label": "flip status: auto-logged to summarized" },
+        { "from": "write-vault-note", "to": "db-vault", "label": "flip status: auto-logged to summarized" },
         { "from": "sk-recall", "to": "search-vault", "label": "build context brief from ranked notes" }
       ]
     },

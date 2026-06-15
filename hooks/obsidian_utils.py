@@ -4596,7 +4596,14 @@ def upgrade_note_with_summary(
     # call (which opened its own connection). Parsing is done in-process via
     # _parse_note so no extra I/O round-trip is needed; os.stat is cheap.
     # Best-effort — a failure here MUST NEVER mask the successful upgrade.
-    _note_body_for_surprise: str | None = None
+    #
+    # _index_ok tracks whether Connection A committed successfully.  The
+    # surprise-body read is intentionally OUTSIDE this try so that a read
+    # error (file removed in the commit→read race, decode error) does NOT:
+    #   (a) trigger a spurious rollback of an already-committed transaction, or
+    #   (b) log a misleading "index+importance write-back failed" message, or
+    #   (c) skip theme assignment entirely (the old coupled-read bug).
+    _index_ok: bool = False
     try:
         if _vault_index is not None:
             _db = _vault_index._default_db_path()
@@ -4615,13 +4622,7 @@ def upgrade_note_with_summary(
                             (importance, note_path),
                         )
                         _conn.commit()
-                        # Read full raw file (frontmatter + body) to match the
-                        # legacy detect_surprise input exactly — behavior-neutral
-                        # refactor; Friston-data continuity requires byte-exact
-                        # parity with the old open(note_path, "r",
-                        # encoding="utf-8").read().
-                        with open(note_path, "r", encoding="utf-8") as _fh:
-                            _note_body_for_surprise = _fh.read()
+                        _index_ok = True
                     except Exception as _exc:
                         try:
                             _conn.rollback()
@@ -4640,15 +4641,37 @@ def upgrade_note_with_summary(
         print(f"[obsidian-brain] index+importance write-back failed for "
               f"{os.path.basename(note_path)}: {exc}", file=sys.stderr)
 
+    # Read the full raw file (frontmatter + body) for surprise scoring.
+    # Done AFTER Connection A, in its own try, so a read error:
+    #   - never triggers a spurious rollback of the committed transaction
+    #   - never logs a misleading "index+importance write-back failed" message
+    #   - never skips theme assignment (Connection B gates on _index_ok, not
+    #     on body-read success — assign_to_theme handles note_text=None by
+    #     writing the default surprise of 0.0 and still assigning the theme)
+    # Friston-data continuity: byte-exact parity with legacy
+    # open(note_path, "r", encoding="utf-8").read() input to detect_surprise.
+    _note_body_for_surprise: str | None = None
+    if _index_ok:
+        try:
+            with open(note_path, "r", encoding="utf-8") as _fh:
+                _note_body_for_surprise = _fh.read()
+        except OSError as _rexc:
+            print(f"[obsidian-brain] surprise-body read failed for "
+                  f"{os.path.basename(note_path)}: "
+                  f"{type(_rexc).__name__}: {_rexc}", file=sys.stderr)
+            _note_body_for_surprise = None
+
     # Connection B: theme assignment + surprise in one transaction.
     # assign_to_theme opens a single BEGIN IMMEDIATE internally and now also
     # computes + writes surprise when note_text is supplied — eliminating the
     # separate fourth connection from the old pipeline.
+    # Gates on _index_ok (not _note_body_for_surprise) so a body-read failure
+    # still allows theme assignment (with default surprise=0.0).
     # Best-effort — a failure here MUST NEVER mask the successful upgrade.
     try:
         if _vault_index is not None:
             _db = _vault_index._default_db_path()
-            if os.path.isfile(_db) and _note_body_for_surprise is not None:
+            if os.path.isfile(_db) and _index_ok:
                 try:
                     _assignment = _vault_index.assign_to_theme(
                         _db, note_path, project=project,
