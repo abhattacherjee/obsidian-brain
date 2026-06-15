@@ -4,6 +4,7 @@ Covers recompute_activation (exact-value, fail-first), get_themes_in_window,
 get_theme_member_previews, and get_unassigned_notes_in_window.
 """
 import os
+import sqlite3
 import sys
 from datetime import date, timedelta
 
@@ -66,6 +67,63 @@ def test_recompute_activation_exact(db):
     assert acts[1] == 3.0          # 3 members today: 1+1+1
     assert acts[2] == 0.5          # one member at exactly one half-life
     assert acts[3] == 0.25         # one member at two half-lives
+
+
+class _StubConn:
+    """Minimal connection stub feeding canned rows to recompute_activation.
+
+    theme_members rows include a 'garbage' (ValueError) and a None (TypeError)
+    added_date — the latter cannot be stored in the NOT NULL added_date column,
+    so it is injected here to exercise the TypeError arm of the guard. UPDATEs
+    are captured so we can assert the resulting per-theme activation.
+    """
+    def __init__(self, member_rows, theme_ids):
+        self._member_rows = member_rows
+        self._theme_ids = theme_ids
+        self.activations = {}
+
+    def execute(self, sql, params=()):
+        s = sql.strip().upper()
+        if s.startswith("SELECT THEME_ID, ADDED_DATE FROM THEME_MEMBERS"):
+            return _StubCursor(self._member_rows)
+        if s.startswith("SELECT ID FROM THEMES"):
+            return _StubCursor([(tid,) for tid in self._theme_ids])
+        if s.startswith("UPDATE THEMES SET ACTIVATION"):
+            act, tid = params
+            self.activations[tid] = act
+            return None
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+
+class _StubCursor:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def fetchall(self):
+        return self._rows
+
+
+def test_recompute_activation_skips_bad_added_date():
+    # A member with a garbage added_date (ValueError) AND one with a None
+    # added_date (TypeError) must be SKIPPED — not crash the recompute and not
+    # mis-date the contribution. Fail-first: before the (ValueError, TypeError)
+    # guard, the 'garbage' parse raised ValueError uncaught (only the bare->time
+    # retry was caught) and the None parse raised TypeError uncaught.
+    member_rows = [
+        (1, "2026-06-15"),  # theme 1: one good member today
+        (1, "garbage"),     # theme 1: ValueError on parse -> skip
+        (1, None),          # theme 1: TypeError on parse -> skip
+        (2, (NOW_D - timedelta(days=30)).isoformat()),  # theme 2: one half-life
+    ]
+    conn = _StubConn(member_rows, theme_ids=[1, 2])
+
+    n = themes.recompute_activation(conn, NOW)  # must NOT raise
+
+    assert n == 2
+    # Only the single good member contributes to theme 1 (garbage + None skipped,
+    # NOT mis-dated to age 0). Theme 2's clean member computes correctly.
+    assert conn.activations[1] == 1.0
+    assert conn.activations[2] == 0.5  # one member at exactly one half-life
 
 
 def test_recompute_activation_uses_named_constant(db):
@@ -324,3 +382,33 @@ def test_run_build_note(emerge_db, tmp_vault, capsys):
     # Temp files cleaned up on success.
     assert not os.path.exists(emerge_cli._themes_json_path())
     assert not os.path.exists(emerge_cli._analysis_path())
+
+
+def test_run_emerge_themes_recompute_failure_exits_clean(emerge_db, capsys, monkeypatch):
+    # A sqlite3.Error inside recompute_activation must roll back and surface the
+    # clean ERROR/exit-1 contract, not a traceback.
+    conn = vault_index._connect(emerge_db)
+    _mk(conn, 1, "alpha", [("a.md", _recent(2))], updated_date=_recent(2))
+    _mk(conn, 2, "beta", [("b.md", _recent(2))], updated_date=_recent(2))
+    conn.commit()
+    conn.close()
+
+    def _boom(*a, **k):
+        raise sqlite3.Error("boom")
+
+    monkeypatch.setattr(emerge_cli.themes, "recompute_activation", _boom)
+    with pytest.raises(SystemExit) as exc:
+        emerge_cli.run_emerge_themes(30)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "ERROR" in err
+
+
+def test_run_build_note_missing_artifact_exits_clean(emerge_db, tmp_vault, capsys):
+    # Fresh HOME, no emerge-themes.json present.
+    assert not os.path.exists(emerge_cli._themes_json_path())
+    with pytest.raises(SystemExit) as exc:
+        emerge_cli.run_build_note()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "ERROR: could not read emerge artifacts" in err

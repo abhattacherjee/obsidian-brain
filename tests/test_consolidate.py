@@ -244,6 +244,37 @@ def test_merge_refreshes_activation(db):
     assert act > 0.0
 
 
+def test_merge_not_found_prints_marker_no_crash(db, capsys):
+    """run_merge on absent theme IDs prints the not-found marker, does not crash,
+    and never touches activation (no themes exist)."""
+    consolidate_cli.run_merge(99, 100)
+    out = capsys.readouterr().out
+    assert "ERROR theme(s) not found a=99 b=100" in out
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM themes").fetchone()[0] == 0
+    conn.close()
+
+
+def test_consolidate_rolls_back_on_recompute_failure(db, monkeypatch):
+    """A sqlite3.Error inside the seed transaction (raised by recompute_activation)
+    must roll back the whole transaction: SystemExit(1) AND zero themes committed."""
+    _seed_notes(db, [("a.md","proj",{"x":1.0}),("b.md","proj",{"x":1.0}),("c.md","proj",{"x":1.0})])
+
+    def _boom(*a, **k):
+        raise sqlite3.Error("boom")
+
+    monkeypatch.setattr(consolidate_cli.themes, "recompute_activation", _boom)
+    with patch("consolidate_cli.generate_theme_names", _fake_names):
+        with pytest.raises(SystemExit) as exc:
+            consolidate_cli.run_consolidate(full=False)
+    assert exc.value.code == 1
+    conn = sqlite3.connect(db)
+    # create_theme INSERTs happened before recompute_activation in the same
+    # transaction; the rollback must undo them — zero themes committed.
+    assert conn.execute("SELECT COUNT(*) FROM themes").fetchone()[0] == 0
+    conn.close()
+
+
 def test_split_noop_when_cohesive(db, capsys):
     conn = sqlite3.connect(db)
     conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "

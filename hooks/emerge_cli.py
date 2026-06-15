@@ -21,7 +21,11 @@ from vault_index import _connect, _default_db_path
 
 
 def _emerge_dir() -> str:
-    """Working directory for emerge temp artifacts (created 0o700 elsewhere)."""
+    """Path to the working directory for emerge temp artifacts.
+
+    Callers that create artifacts here pass ``mode=0o700`` to ``os.makedirs``
+    so the directory is created with owner-only permissions.
+    """
     return os.path.expanduser("~/.claude/obsidian-brain")
 
 
@@ -104,7 +108,7 @@ def run_emerge_themes(days: int = 30) -> None:
 
         unassigned = themes.get_unassigned_notes_in_window(db, window_start, limit=30)
         conn.close()
-    except (sqlite3.Error, RuntimeError) as exc:
+    except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -132,13 +136,26 @@ def run_emerge_themes(days: int = 30) -> None:
         "unassigned_candidates": unassigned_records,
     }
 
+    # The DB connection is closed above (all data is gathered), so the atomic
+    # JSON write below holds no connection. Clean up the temp file if any
+    # filesystem step fails and exit with the clean ERROR contract.
     out = _themes_json_path()
-    os.makedirs(_emerge_dir(), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=_emerge_dir(), suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(corpus, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, out)
+    tmp = None
+    try:
+        os.makedirs(_emerge_dir(), mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=_emerge_dir(), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(corpus, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, out)
+    except OSError as exc:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        print(f"ERROR {exc}", file=sys.stderr)
+        sys.exit(1)
 
     print("VAULT=" + vault)
     print("INS=" + ins)
@@ -158,10 +175,15 @@ def run_build_note() -> None:
     corpus_path = _themes_json_path()
     analysis_path = _analysis_path()
 
-    with open(corpus_path, encoding="utf-8") as f:
-        corpus = json.load(f)
-    with open(analysis_path, encoding="utf-8") as f:
-        analysis = f.read()
+    try:
+        with open(corpus_path, encoding="utf-8") as f:
+            corpus = json.load(f)
+        with open(analysis_path, encoding="utf-8") as f:
+            analysis = f.read()
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: could not read emerge artifacts ({exc}); re-run /emerge to regenerate",
+              file=sys.stderr)
+        sys.exit(1)
 
     today = datetime.now(timezone.utc).date().isoformat()
     projects = corpus.get("projects", [])

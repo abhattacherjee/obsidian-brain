@@ -471,10 +471,18 @@ def recompute_activation(conn: sqlite3.Connection, now_iso: str,
     for r in conn.execute("SELECT theme_id, added_date FROM theme_members").fetchall():
         tid = r["theme_id"] if hasattr(r, "keys") else r[0]
         added = r["added_date"] if hasattr(r, "keys") else r[1]
+        # A single member with a NULL or non-date added_date must be SKIPPED,
+        # not crash the whole recompute. The bare/with-time parses are nested
+        # so a None or garbage value raises (ValueError, TypeError) here.
         try:
-            ad = datetime.fromisoformat(added).date()
-        except ValueError:
-            ad = datetime.fromisoformat(added + "T00:00:00").date()
+            try:
+                ad = datetime.fromisoformat(added).date()
+            except ValueError:
+                ad = datetime.fromisoformat(added + "T00:00:00").date()
+        except (ValueError, TypeError):
+            print(f"[themes] skipping member with bad added_date={added!r} theme_id={tid}",
+                  file=sys.stderr)
+            continue
         age = max(0, (now_d - ad).days)
         acc[tid] = acc.get(tid, 0.0) + 0.5 ** (age / half_life_days)
     n = 0
@@ -489,7 +497,7 @@ def recompute_activation(conn: sqlite3.Connection, now_iso: str,
 
 def get_themes_in_window(db_path: str, window_start: str,
                          project: str | None = None) -> list[dict]:
-    """Themes whose updated_date is within [window_start, now], ranked by
+    """Themes whose updated_date >= window_start, ranked by
     activation then size. project=None returns every theme (cross-project);
     a project name returns that project's themes plus cross-project (NULL) ones.
     """
