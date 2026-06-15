@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "2.7.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-06-14",
+  "lastUpdated": "2026-06-15",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -15,7 +15,7 @@
     "realtime": { "protocol": "none", "endpoint": "direct filesystem writes — no MCP server, no REST API, no daemon" },
     "ai": { "provider": "Claude CLI (claude -p)", "model": "haiku default; escalates haiku to sonnet to opus on empty output (#165)", "notes": "summarization deferred from hooks to /recall" },
     "vectorSearch": { "engine": "SQLite FTS5 (BM25) + 7-signal rerank; TF-IDF cosine themes with ACT-R activation and Free-Energy surprise" },
-    "tests": { "unit": { "runner": "pytest", "count": 65, "environments": ["python3.12"], "coverage": { "lines": 90 } } },
+    "tests": { "unit": { "runner": "pytest", "count": 69, "environments": ["python3.12"], "coverage": { "lines": 90 } } },
     "packageManager": "none (stdlib only)"
   },
   "diagram": {
@@ -83,14 +83,14 @@
       "color": "#10B981",
       "description": "A local SQLite database (WAL mode, FTS5) that enables fast full-text and ranked recall across the vault. Lazy mtime-incremental sync, a 7-signal reranker, ACT-R activation from an access log, and TF-IDF cosine themes with a Free-Energy surprise signal. Hooks never touch this — it is skill-side only.",
       "components": [
-        { "id": "ensure-index", "name": "ensure_index() / _sync()", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Create-or-update the DB: schema init statement-by-statement (FTS5 IF NOT EXISTS), column migrations, mtime-incremental sync inside BEGIN IMMEDIATE, and corruption recovery that deletes+recreates db/-wal/-shm.", "overrideEnv": "OBSIDIAN_BRAIN_DB" },
+        { "id": "ensure-index", "name": "ensure_index() / _sync()", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Create-or-update the DB: schema init statement-by-statement (FTS5 IF NOT EXISTS), column migrations, mtime-incremental sync inside BEGIN IMMEDIATE, and corruption recovery that deletes+recreates db/-wal/-shm. After a bulk insert where >50% of the final corpus was added in one batch, _recompute_all_tfidf_vectors() runs a second pass to make TF-IDF scores independent of insertion order (early notes otherwise persist insertion-time IDF until the next mtime-triggered upsert).", "overrideEnv": "OBSIDIAN_BRAIN_DB" },
         { "id": "search-vault", "name": "search_vault()", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Sanitizes the query to AND-mode FTS5 (hyphens to spaces), runs bm25 with title 10x and tags 5x weighting, OR-fallback when AND is empty, reranks, batch-logs access, strips body before returning." },
         { "id": "rerank", "name": "rerank_results() — 7-signal scorer", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Weighted sum: proximity 0.25, bm25 0.20, activation 0.20, type 0.10, recency 0.10, importance 0.10, density 0.05. Type score is context-adaptive (debugging/standup/emerge/search/general)." },
         { "id": "access-log", "name": "log_access() / batch_activations()", "kind": "datastore-client", "files": ["hooks/vault_index.py"], "purpose": "Records access events (cascading snapshot accesses to the parent session) and computes ACT-R base-level activation, reserving 0.0 for notes with no history." },
         { "id": "tfidf", "name": "tfidf.py — TF-IDF primitives (leaf)", "kind": "module", "files": ["hooks/tfidf.py"], "purpose": "Stdlib-only leaf (no vault_index or themes imports). Exports _tokenize_for_tfidf, _compute_tfidf_vector, _cosine_similarity, _update_term_df, _STOPWORDS, _TOKEN_RE. Smoothed IDF, sparse top-50 vectors, cosine similarity. Imported by themes.py and re-exported from vault_index.py for back-compat; kept acyclic by design. term_df maintained via ON CONFLICT DO UPDATE, never blind REPLACE." },
-        { "id": "themes", "name": "themes.py — assign_to_theme() / detect_surprise()", "kind": "module", "files": ["hooks/themes.py"], "purpose": "Theme assignment + Free-Energy surprise detection, extracted from vault_index.py (#229). Depends on tfidf (one-directional); lazy-imports vault_index._connect at call-time to break the import cycle. TF-IDF cosine clustering into running-average centroids (threshold 0.3); surprise = negation-proximity over top shared terms." },
+        { "id": "themes", "name": "themes.py — assign_to_theme() / detect_surprise()", "kind": "module", "files": ["hooks/themes.py"], "purpose": "Theme assignment + Free-Energy surprise detection, extracted from vault_index.py (#229). Depends on tfidf (one-directional); lazy-imports vault_index._connect at call-time to break the import cycle. TF-IDF cosine clustering into running-average centroids (threshold 0.3); surprise = negation-proximity over top shared terms. assign_to_theme() now (a) prefilters theme candidates by term-overlap before computing cosine (zero-overlap pairs are guaranteed cosine=0, below the 0.3 threshold, so skipped), and (b) accepts optional note_text to compute surprise via detect_surprise and write theme_members.surprise within the same BEGIN IMMEDIATE transaction — no extra DB connection required." },
         { "id": "rebuild-index", "name": "rebuild_index() — Friston-preserving", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Default non-destructive rebuild preserves access_log, themes and theme_members (activation/centroid/surprise), with an absolute-path safety guard that skips orphan-prune on path-format drift. full=True is the legacy total wipe for corrupt schema." },
-        { "id": "upsert-note", "name": "_upsert_note() — DELETE-then-INSERT", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Deliberately avoids INSERT OR REPLACE: explicit DELETE+INSERT preserving the prior importance value, and issuing the contentless-FTS5 delete op with old column values so the FTS index never accumulates orphans." },
+        { "id": "upsert-note", "name": "_upsert_note() — DELETE-then-INSERT", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Deliberately avoids INSERT OR REPLACE: explicit DELETE+INSERT preserving the prior importance value, and issuing the contentless-FTS5 delete op with old column values so the FTS index never accumulates orphans. Token-scoped term_df fetch: only fetches df rows for terms in the current note (chunked IN clause at 900 placeholders), not a full-table scan, so cost is O(note tokens) not O(vocabulary)." },
         { "id": "vault-stats-compute", "name": "compute_stats()", "kind": "function", "files": ["hooks/vault_stats.py"], "purpose": "Read-only aggregation for /vault-stats: signal coverage (per-note activation + importance), access-by-context, top-accessed, importance distribution, and snapshot integrity metrics (orphans, broken backlinks, summarized fraction)." }
       ]
     },
@@ -192,7 +192,7 @@
         { "id": "ops-commit-preflight", "name": "commit-preflight.sh", "kind": "ops", "files": ["scripts/commit-preflight.sh"], "purpose": "Creates a 5-minute token consumed by the require-preflight hook. Enforces (always-on) manifest version sync, then secret scan, then pytest with cov-fail-under 90. Flags: --docs-only, --skip-tests, --auto." },
         { "id": "ops-ci", "name": "CI workflow", "kind": "ops", "files": [".github/workflows/ci.yml"], "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), no-default-db AST guard, security-tests, and an advisory detect-release-merge check." },
         { "id": "ops-no-default-db", "name": "no-default-db.py", "kind": "ops", "files": ["scripts/ci-checks/no-default-db.py"], "purpose": "AST guard (GH #46): every ensure_index/rebuild_index/deep_analysis_pipeline call in tests/ must pass explicit db_path= so tests cannot pollute the live vault DB." },
-        { "id": "ops-pytest", "name": "pytest suite", "kind": "ops", "files": ["tests/"], "purpose": "64 test files, coverage source=hooks, fail_under=90. Hook simulation pattern pipes synthetic JSON into installed hooks; import-time state-dir constants isolated via autouse conftest monkeypatch." },
+        { "id": "ops-pytest", "name": "pytest suite", "kind": "ops", "files": ["tests/"], "purpose": "69 test files, coverage source=hooks, fail_under=90. Hook simulation pattern pipes synthetic JSON into installed hooks; import-time state-dir constants isolated via autouse conftest monkeypatch." },
         { "id": "ops-security-tests", "name": "test-security.sh", "kind": "ops", "files": ["scripts/test-security.sh"], "purpose": "Runs the security regression suite (path containment, secret scrub, temp-path safety) with OB_HOOKS_DIR=hooks." }
       ]
     }
@@ -263,9 +263,13 @@
     {
       "id": "recall-deferred-summarize",
       "name": "/recall deferred summarization",
-      "description": "On demand, upgrade raw notes to AI summaries — the deferred half of the write-first pattern.",
+      "description": "On demand, upgrade raw notes to AI summaries — the deferred half of the write-first pattern. upgrade_note_with_summary now uses 2 DB connections (down from 4): one for upsert+importance, one inside assign_to_theme which also computes and writes surprise in-transaction.",
       "steps": [
         { "from": "sk-recall", "to": "summarizer", "label": "generate_summary (Claude CLI haiku, escalate)" },
+        { "from": "summarizer", "to": "upsert-note", "label": "upsert note + write importance (1 txn, 1 connection)" },
+        { "from": "upsert-note", "to": "db-index", "label": "DELETE-then-INSERT with token-scoped term_df fetch" },
+        { "from": "summarizer", "to": "themes", "label": "assign_to_theme(note_text=...) — computes + writes surprise in-txn (1 connection)" },
+        { "from": "themes", "to": "db-index", "label": "write theme_members row + surprise in same BEGIN IMMEDIATE" },
         { "from": "summarizer", "to": "db-vault", "label": "flip status: auto-logged to summarized" },
         { "from": "sk-recall", "to": "search-vault", "label": "build context brief from ranked notes" }
       ]
@@ -379,7 +383,7 @@
     ]
   },
   "testing": {
-    "unitSuite": { "tool": "pytest", "fileCount": 65, "duration": "fast (stdlib, no network)", "environments": { "python": "3.12" }, "coverage": { "lines": 90, "source": "hooks", "omits": ["obsidian_utils.py (I/O monolith)", "emerge_cli.py", "deep_cli.py"] } },
+    "unitSuite": { "tool": "pytest", "fileCount": 69, "duration": "fast (stdlib, no network)", "environments": { "python": "3.12" }, "coverage": { "lines": 90, "source": "hooks", "omits": ["obsidian_utils.py (I/O monolith)", "emerge_cli.py", "deep_cli.py"] } },
     "manualMatrix": { "doc": "CLAUDE.md (Development Commands)", "devices": ["hook simulation: pipe synthetic SessionEnd/SessionStart/PreCompact JSON into installed hooks", "json.load validation of hooks.json and plugin.json"], "rationale": "No build/test framework for the prompt-based skills; hooks are validated by feeding synthetic lifecycle JSON and asserting vault writes + telemetry outcomes." }
   },
   "scripts": [

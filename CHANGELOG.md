@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **TF-IDF relevance scores are now order-independent on full vault re-index.** Previously, notes indexed early in a bulk rebuild carried inflated relevance scores until they happened to be re-touched; `/vault-reindex` now runs a second pass after a bulk insert so every note's score is computed against the final corpus.
+- **Faster theme assignment on large vaults.** Theme candidates that share no terms with the note are skipped before cosine is computed (cosine is provably zero in that case), cutting the per-note cost proportionally to the fraction of unrelated themes.
+- **Session-note summarization now opens 2 DB connections instead of 4.** The surprise signal and theme assignment are computed in a single transaction, eliminating two extra round-trips on every `/recall` upgrade — this is most noticeable on vaults with many sessions.
+
 ### Changed
 - **Internal:** split `hooks/vault_index.py` (was ~2,068 lines) into focused modules — `hooks/tfidf.py` (TF-IDF primitives; stdlib-only leaf) and `hooks/themes.py` (theme assignment + surprise detection). `vault_index.py` keeps core index/sync/search and re-exports the moved symbols for back-compat; no behavior change. Enabling refactor for Friston Phase 3 (epic #53). Closes #229.
 
