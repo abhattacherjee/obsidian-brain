@@ -2496,6 +2496,74 @@ def generate_snapshot_summary(
     return None, last_reason or "unknown_failure"
 
 
+def generate_theme_names(
+    clusters: list[dict],
+    model: str = "haiku",
+    timeout: int = 120,
+) -> tuple[list[dict] | None, str | None]:
+    """Name + summarize N clusters in ONE ``claude -p --model <model>`` spawn.
+
+    ``clusters`` items: ``{"top_terms": [...], "sample_titles": [...]}``.
+    Returns ``([{"name","summary"}, ...], None)`` with exactly ``len(clusters)``
+    entries on success, or ``(None, reason)`` on failure
+    (``"haiku_timeout" | "haiku_subprocess_error" | "empty_output" |
+    "parse_error" | "count_mismatch" | "unknown_failure"``). Never raises.
+    """
+    if not clusters:
+        return [], None
+
+    lines = [
+        "You are naming clusters of related notes for a knowledge base.",
+        "For EACH cluster below, return a short Title Case name (<= 6 words) and a "
+        "one-sentence summary. Respond with ONLY a JSON array of "
+        '{"name": str, "summary": str}, one object per cluster, in order.',
+        "",
+    ]
+    for i, c in enumerate(clusters):
+        terms = ", ".join(c.get("top_terms", [])[:10])
+        titles = "; ".join(c.get("sample_titles", [])[:5])
+        lines.append(f"Cluster {i + 1}: top terms = [{terms}]; sample titles = [{titles}]")
+    prompt = "\n".join(lines)
+
+    attempts = (timeout, timeout * 2)
+    last_reason = "unknown_failure"
+    for idx, attempt_timeout in enumerate(attempts):
+        try:
+            result = subprocess.run(
+                ["claude", "-p", "--model", model],
+                input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
+            )
+        except FileNotFoundError:
+            return None, "haiku_subprocess_error"
+        except subprocess.TimeoutExpired:
+            last_reason = "haiku_timeout"
+            if idx == 0:
+                continue
+            return None, last_reason
+        if result.returncode != 0:
+            last_reason = "haiku_subprocess_error"
+            break
+        raw = result.stdout.strip()
+        if not raw:
+            last_reason = "empty_output"
+            break
+        # Strip ```json fences if present.
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None, "parse_error"
+        if not isinstance(parsed, list) or len(parsed) != len(clusters):
+            return None, "count_mismatch"
+        out = [{"name": str(p.get("name", "")).strip(),
+                "summary": str(p.get("summary", "")).strip()} for p in parsed]
+        if any(not o["name"] for o in out):
+            return None, "parse_error"
+        return out, None
+    return None, last_reason
+
+
 def generate_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
