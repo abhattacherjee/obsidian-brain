@@ -2,7 +2,7 @@
 name: recall
 description: "Pure read-only context resume — summarizes unsummarized notes and surfaces last-session context. Use `/check-items` to triage open items. Use when: (1) /recall command, (2) /recall <project-name>, (3) resuming work on a project and wanting prior context."
 metadata:
-  version: 1.6.0
+  version: 1.7.0
 ---
 
 # Recall — Load Project Context from Obsidian Vault
@@ -249,6 +249,25 @@ Snapshots appear in the brief as nested indented rows beneath their parent sessi
 If unsummarized notes were upgraded in Step 2, also mention:
 
 > _Upgraded N session note(s) with AI summaries._
+
+### Step 3b — Recurring Themes (read-only)
+
+Surface the project's top recurring themes (ranked by stored activation, kept fresh by `/consolidate` and `/emerge`). This is a fast, read-only DB read — `$PROJECT` is the value already derived in Step 1.
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 -c '
+import sys, os
+import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from obsidian_utils import recurring_themes_section
+from vault_index import _default_db_path
+print(recurring_themes_section(_default_db_path(), sys.argv[1] if len(sys.argv) > 1 else None))
+' "$PROJECT"
+```
+
+If the output is non-empty, append it verbatim to the brief (between the context brief and the open-items footer). If it is empty, print nothing — there are no themes yet.
+
+**Graceful degradation:** the helper swallows its own exceptions (`ImportError`, empty/missing DB, no themes) and returns `""`, so a missing index or an un-consolidated vault simply prints nothing and `/recall` continues normally. Do not treat an empty result as an error.
 
 ### Step 4 — Show read-only context brief footer
 

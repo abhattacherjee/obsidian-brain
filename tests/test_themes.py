@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 
+import themes
 import vault_index
 
 
@@ -737,14 +738,19 @@ class TestUpgradeWiresThemes:
             f"upgrade must succeed even when DB is missing, got: {status}"
         )
 
-    def test_upgrade_skips_theme_assignment_when_index_note_returns_false(
+    def test_upgrade_skips_theme_assignment_when_parse_fails(
         self, tmp_vault, mock_config
     ):
-        """If index_note returns False (no exception), assign_to_theme must NOT run.
+        """If _parse_note returns None (unparsable note), assign_to_theme must NOT run.
 
-        Regression: previously the pipeline used try/except/else, so a non-
-        raising False return from index_note would still fall through to
-        assign_to_theme on a stale or missing tfidf_vector.
+        Regression guard: the consolidated pipeline (Task 4, #42) gates
+        assign_to_theme on _note_body_for_surprise being set, which requires
+        _parse_note to succeed. A parse failure must not silently fall through
+        to assign_to_theme with a stale or missing tfidf_vector.
+
+        Previously this tested index_note returning False; the refactored
+        pipeline uses _parse_note + _upsert_note directly, so the gate is
+        now _parse_note returning None.
         """
         import obsidian_utils
         import vault_index
@@ -773,14 +779,14 @@ class TestUpgradeWiresThemes:
             str(tmp_vault), ["claude-sessions"], db_path=db_path,
         )
 
-        calls: dict[str, int] = {"index_note": 0, "assign_to_theme": 0}
-        original_index = vault_index.index_note
+        calls: dict[str, int] = {"parse_note": 0, "assign_to_theme": 0}
+        original_parse = vault_index._parse_note
         original_assign = vault_index.assign_to_theme
         original_default = vault_index._default_db_path
 
-        def fake_index_note(_db, _path):
-            calls["index_note"] += 1
-            return False  # signal failure without raising
+        def fake_parse_note(path):
+            calls["parse_note"] += 1
+            return None  # signal failure without raising
 
         def fake_assign_to_theme(*args, **kwargs):
             calls["assign_to_theme"] += 1
@@ -788,7 +794,7 @@ class TestUpgradeWiresThemes:
 
         try:
             vault_index._default_db_path = lambda: db_path
-            vault_index.index_note = fake_index_note
+            vault_index._parse_note = fake_parse_note
             vault_index.assign_to_theme = fake_assign_to_theme
 
             summary = (
@@ -806,14 +812,121 @@ class TestUpgradeWiresThemes:
             )
         finally:
             vault_index._default_db_path = original_default
-            vault_index.index_note = original_index
+            vault_index._parse_note = original_parse
             vault_index.assign_to_theme = original_assign
 
         assert not status.startswith("Failed:"), (
-            f"upgrade must succeed even when reindex fails, got: {status}"
+            f"upgrade must succeed even when parse fails, got: {status}"
         )
-        assert calls["index_note"] == 1, "index_note should have been called exactly once"
+        assert calls["parse_note"] == 1, "_parse_note should have been called exactly once"
         assert calls["assign_to_theme"] == 0, (
-            "assign_to_theme ran despite index_note returning False — "
+            "assign_to_theme ran despite _parse_note returning None — "
             "reindex-failure gating regressed"
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2: theme-creation helpers (compute_centroid, create_theme,
+#          get_unassigned_notes)
+# ---------------------------------------------------------------------------
+
+
+def _insert_note(conn, path, project, vec):
+    conn.execute(
+        "INSERT INTO notes (path, type, project, title, body, mtime, tfidf_vector) "
+        "VALUES (?, 'session', ?, 't', 'b', 1.0, ?)",
+        (path, project, json.dumps(vec)),
+    )
+
+
+def test_compute_centroid_is_elementwise_mean():
+    c = themes.compute_centroid([{"a": 1.0, "b": 0.0}, {"a": 0.0, "b": 1.0}])
+    assert c["a"] == pytest.approx(0.5)
+    assert c["b"] == pytest.approx(0.5)
+
+
+def test_compute_centroid_prunes_near_zero_and_handles_empty():
+    assert themes.compute_centroid([]) == {}
+    c = themes.compute_centroid([{"a": 1e-9}, {"a": 1e-9}])
+    assert "a" not in c  # pruned below epsilon
+
+
+def test_get_unassigned_notes_excludes_themed_and_vectorless(tmp_vault):
+    db = str(tmp_vault / "t.db")
+    vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+    conn = sqlite3.connect(db)
+    _insert_note(conn, "p/a.md", "proj", {"x": 1.0})
+    _insert_note(conn, "p/b.md", "proj", {"x": 1.0})
+    conn.execute("INSERT INTO notes (path, type, project, title, body, mtime, tfidf_vector) "
+                 "VALUES ('p/c.md','session','proj','t','b',1.0,NULL)")  # no vector
+    conn.execute("INSERT INTO theme_members (theme_id, note_path, similarity, surprise, added_date) "
+                 "VALUES (1, 'p/a.md', 0.9, 0.0, '2026-06-15')")  # a already themed
+    conn.commit()
+    conn.close()
+    rows = themes.get_unassigned_notes(db)
+    paths = {r[0] for r in rows}
+    assert paths == {"p/b.md"}  # a themed, c vectorless
+
+
+def test_create_theme_inserts_row_and_members(tmp_vault):
+    db = str(tmp_vault / "t.db")
+    vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+    conn = sqlite3.connect(db)
+    members = [("p/a.md", {"x": 1.0, "y": 0.5}), ("p/b.md", {"x": 0.8, "y": 0.6})]
+    centroid = themes.compute_centroid([v for _, v in members])
+    tid = themes.create_theme(conn, "X / Y", "Notes about x and y.", centroid, members, "proj", "2026-06-15")
+    conn.commit()
+    row = conn.execute("SELECT name, summary, note_count, project FROM themes WHERE id=?", (tid,)).fetchone()
+    assert row == ("X / Y", "Notes about x and y.", 2, "proj")
+    mem = conn.execute("SELECT note_path, similarity FROM theme_members WHERE theme_id=? ORDER BY note_path", (tid,)).fetchall()
+    assert [m[0] for m in mem] == ["p/a.md", "p/b.md"]
+    assert all(0.0 <= m[1] <= 1.0 for m in mem)  # similarity to centroid persisted
+    conn.close()
+
+
+def _seed_theme(conn, tid, project, activation, note_count=1):
+    conn.execute(
+        "INSERT INTO themes (id,name,summary,centroid,note_count,activation,created_date,updated_date,project) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (tid, f"t{tid}", "s", "{}", note_count, activation, "2026-01-01", "2026-06-14", project),
+    )
+
+
+class TestGetTopThemesForProject:
+    def test_project_plus_null_union(self, tmp_vault):
+        db = str(tmp_vault / "t.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+        conn = sqlite3.connect(db)
+        _seed_theme(conn, 1, "alpha", 2.0)
+        _seed_theme(conn, 2, "beta", 5.0)
+        _seed_theme(conn, 3, None, 1.0)
+        conn.commit()
+        conn.close()
+        rows = themes.get_top_themes_for_project(db, "alpha")
+        assert {r["id"] for r in rows} == {1, 3}  # alpha + cross-project NULL, not beta
+        assert isinstance(rows[0], dict)
+        assert set(rows[0]) == {"id", "name", "summary", "note_count", "activation"}
+
+    def test_orders_by_activation_desc(self, tmp_vault):
+        db = str(tmp_vault / "t.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+        conn = sqlite3.connect(db)
+        _seed_theme(conn, 1, "p", 1.0)
+        _seed_theme(conn, 2, "p", 5.0)
+        _seed_theme(conn, 3, "p", 3.0)
+        conn.commit()
+        conn.close()
+        rows = themes.get_top_themes_for_project(db, "p")
+        assert [r["id"] for r in rows] == [2, 3, 1]
+
+    def test_respects_limit(self, tmp_vault):
+        db = str(tmp_vault / "t.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+        conn = sqlite3.connect(db)
+        for i in range(1, 6):
+            _seed_theme(conn, i, "p", float(i))
+        conn.commit()
+        conn.close()
+        rows = themes.get_top_themes_for_project(db, "p", top_n=2)
+        assert len(rows) == 2
+        assert [r["id"] for r in rows] == [5, 4]

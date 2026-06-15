@@ -32,25 +32,6 @@ except ImportError as exc:
     print(f"[obsidian-brain] vault_index not available, access tracking disabled: {exc}",
           file=sys.stderr)
 
-# --- Section-parsing regexes (used by collect_vault_corpus, build_context_brief) ---
-# Each captures the body between a ## heading and the next ## heading (or EOF).
-
-_RE_SUMMARY = re.compile(
-    r"^## Summary\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
-)
-_RE_DECISIONS = re.compile(
-    r"^## Key Decisions\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
-)
-_RE_ERRORS = re.compile(
-    r"^## Errors Encountered\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
-)
-_RE_OPEN_ITEMS = re.compile(
-    r"^## Open Questions / Next Steps\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
-)
-_RE_RAW_CONVERSATION = re.compile(
-    r"^## Conversation \(raw\)\n(.+?)(?=\n^## |\Z)", re.MULTILINE | re.DOTALL
-)
-
 # Session IDs are CC UUIDs (or test fixtures). Restrict to safe filename chars
 # so the marker path never escapes ~/.claude/obsidian-brain/sessions/.
 _SID_FILENAME_SAFE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
@@ -1225,6 +1206,9 @@ _DEFAULTS: dict = {
     "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline. Consumed by /recall SKILL.md Step 2 (summarization is deferred to /recall), #84
     "summary_batch_size": 3,  # notes per claude -p spawn in upgrade_batch (#166); 1 = legacy per-note fan-out
     "summary_recovery": True,  # #167: post-process loose summaries (heading normalization, synth missing sections, default importance) before escalating/falling back. Set false to disable.
+    "consolidate_cluster_threshold": 0.5,  # cosine sim for single-linkage edge in /consolidate
+    "consolidate_min_cluster_size": 3,  # smallest cluster that becomes a theme
+    "consolidate_unassigned_threshold": 50,  # /consolidate stats nudge when unassigned exceeds this
     "aged_summarize_threshold_days": 90,  # #168: notes whose file mtime is older than this AND have no inbound vault links AND no pin tag are deferred (skipped) by /recall
     "summary_pin_tags": ["claude/keep", "claude/permanent"],  # #168: notes carrying any of these frontmatter tags are never deferred
     "auto_log_enabled": True,
@@ -2496,6 +2480,74 @@ def generate_snapshot_summary(
     return None, last_reason or "unknown_failure"
 
 
+def generate_theme_names(
+    clusters: list[dict],
+    model: str = "haiku",
+    timeout: int = 120,
+) -> tuple[list[dict] | None, str | None]:
+    """Name + summarize N clusters in ONE ``claude -p --model <model>`` spawn.
+
+    ``clusters`` items: ``{"top_terms": [...], "sample_titles": [...]}``.
+    Returns ``([{"name","summary"}, ...], None)`` with exactly ``len(clusters)``
+    entries on success, or ``(None, reason)`` on failure
+    (``"haiku_timeout" | "haiku_subprocess_error" | "empty_output" |
+    "parse_error" | "count_mismatch" | "unknown_failure"``). Never raises.
+    """
+    if not clusters:
+        return [], None
+
+    lines = [
+        "You are naming clusters of related notes for a knowledge base.",
+        "For EACH cluster below, return a short Title Case name (<= 6 words) and a "
+        "one-sentence summary. Respond with ONLY a JSON array of "
+        '{"name": str, "summary": str}, one object per cluster, in order.',
+        "",
+    ]
+    for i, c in enumerate(clusters):
+        terms = ", ".join(c.get("top_terms", [])[:10])
+        titles = "; ".join(c.get("sample_titles", [])[:5])
+        lines.append(f"Cluster {i + 1}: top terms = [{terms}]; sample titles = [{titles}]")
+    prompt = "\n".join(lines)
+
+    attempts = (timeout, timeout * 2)
+    last_reason = "unknown_failure"
+    for idx, attempt_timeout in enumerate(attempts):
+        try:
+            result = subprocess.run(
+                ["claude", "-p", "--model", model],
+                input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
+            )
+        except FileNotFoundError:
+            return None, "haiku_subprocess_error"
+        except subprocess.TimeoutExpired:
+            last_reason = "haiku_timeout"
+            if idx == 0:
+                continue
+            return None, last_reason
+        if result.returncode != 0:
+            last_reason = "haiku_subprocess_error"
+            break
+        raw = result.stdout.strip()
+        if not raw:
+            last_reason = "empty_output"
+            break
+        # Strip ```json fences if present.
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None, "parse_error"
+        if not isinstance(parsed, list) or len(parsed) != len(clusters):
+            return None, "count_mismatch"
+        out = [{"name": str(p.get("name", "")).strip(),
+                "summary": str(p.get("summary", "")).strip()} for p in parsed]
+        if any(not o["name"] for o in out):
+            return None, "parse_error"
+        return out, None
+    return None, last_reason
+
+
 def generate_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
@@ -3543,293 +3595,22 @@ def build_context_brief(
     return "\n".join(output_parts)
 
 
-# ---------------------------------------------------------------------------
-# Vault corpus collection (for /emerge pattern discovery)
-# ---------------------------------------------------------------------------
-
-
-def _parse_section_bullets(text: str | None) -> list[str]:
-    """Extract bullet items from a markdown section body.
-
-    Returns empty list for None, empty, or 'None.' content.
-    """
-    if not text:
-        return []
-    stripped = text.strip()
-    if stripped.lower() in ("none.", "none", "n/a", ""):
-        return []
-    items = []
-    for line in stripped.split("\n"):
-        line = line.strip()
-        if line.startswith("- "):
-            items.append(line[2:].strip())
-    return items
-
-
-def collect_vault_corpus(
-    vault_path: str,
-    sessions_folder: str,
-    insights_folder: str,
-    days: int = 7,
-    include_types: tuple[str, ...] | None = None,
-    exclude_types: tuple[str, ...] = ("claude-snapshot",),
-) -> str:
-    """Scan vault session and insight notes, date-filter, extract structured data.
-
-    Returns JSON string with keys: date_range, note_count, notes[].
-    Each note has: file, type, date, project, tags, summary, decisions,
-    errors, open_items.
-
-    Type filtering:
-        exclude_types: note types to drop (default: ``("claude-snapshot",)``).
-            Pass ``exclude_types=()`` to include all types.
-        include_types: when not None, only notes whose type is in this tuple
-            are kept (applied after exclude_types).
-
-    By default, ``claude-snapshot`` notes are excluded because their
-    "Key context that may be lost" bullets are transient mid-session content
-    that dilutes cross-session pattern synthesis in /emerge.  Pass
-    ``exclude_types=()`` to opt in.
-
-    Security: path containment via resolve() + is_relative_to().
-    Note: scrub_secrets() is NOT called — content is already scrubbed at write time.
-    """
-    vault_root = Path(vault_path).resolve()
-    cutoff = datetime.date.today() - datetime.timedelta(days=days)
-    end_date = datetime.date.today()
-
-    # Cap limits
-    _MAX_SUMMARY_CHARS = 500
-    _MAX_LIST_ITEMS = 10
-
-    notes_out: list[dict] = []
-
-    # Scan both folders
-    folders = [
-        (sessions_folder, "claude-session"),
-        (insights_folder, "claude-insight"),
-    ]
-
-    for folder_name, default_type in folders:
-        folder = vault_root / folder_name
-        if not folder.is_dir():
-            continue
-
-        for md_file in folder.iterdir():
-            if md_file.suffix != ".md":
-                continue
-
-            # Path containment: reject symlinks pointing outside vault
-            resolved = md_file.resolve()
-            if not resolved.is_relative_to(vault_root):
-                continue
-
-            meta = read_note_metadata(str(md_file))
-            if not meta:
-                continue
-
-            # Date filtering — skip notes without parseable date
-            date_str = meta.get("date", "")
-            if not date_str:
-                continue
-            try:
-                note_date = datetime.date.fromisoformat(date_str)
-            except (ValueError, TypeError):
-                continue
-            if note_date < cutoff:
-                continue
-
-            # Read full note content for section parsing
-            try:
-                content = md_file.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-
-            # Parse summary — with unsummarized fallback
-            summary = ""
-            m = _RE_SUMMARY.search(content)
-            if m:
-                raw_summary = m.group(1).strip()
-                if "AI summary unavailable" in raw_summary:
-                    # Fall back to raw conversation section
-                    m_raw = _RE_RAW_CONVERSATION.search(content)
-                    if m_raw:
-                        summary = m_raw.group(1).strip()[:_MAX_SUMMARY_CHARS]
-                else:
-                    summary = raw_summary[:_MAX_SUMMARY_CHARS]
-
-            # Parse structured sections
-            m_dec = _RE_DECISIONS.search(content)
-            decisions = _parse_section_bullets(m_dec.group(1) if m_dec else None)[
-                :_MAX_LIST_ITEMS
-            ]
-
-            m_err = _RE_ERRORS.search(content)
-            errors = _parse_section_bullets(m_err.group(1) if m_err else None)[
-                :_MAX_LIST_ITEMS
-            ]
-
-            m_open = _RE_OPEN_ITEMS.search(content)
-            open_items = _parse_section_bullets(m_open.group(1) if m_open else None)[
-                :_MAX_LIST_ITEMS
-            ]
-
-            tags = meta.get("tags", [])
-            if isinstance(tags, str):
-                tags = [tags]
-            tags = tags[:_MAX_LIST_ITEMS]
-
-            note_type = meta.get("type", default_type)
-
-            if exclude_types and note_type in exclude_types:
-                continue
-            if include_types is not None and note_type not in include_types:
-                continue
-
-            notes_out.append(
-                {
-                    "file": md_file.name,
-                    "type": note_type,
-                    "date": date_str,
-                    "project": meta.get("project", ""),
-                    "tags": tags,
-                    "summary": summary,
-                    "decisions": decisions,
-                    "errors": errors,
-                    "open_items": open_items,
-                }
-            )
-
-    result = {
-        "date_range": f"{cutoff.isoformat()} to {end_date.isoformat()}",
-        "note_count": len(notes_out),
-        "notes": notes_out,
-    }
-    return json.dumps(result, indent=2)
-
-
-def upgrade_and_collect_corpus(
-    vault_path: str,
-    sessions_folder: str,
-    insights_folder: str,
-    days: int,
-    output_path: str,
-    include_types: tuple[str, ...] | None = None,
-    exclude_types: tuple[str, ...] = ("claude-snapshot",),
-) -> str:
-    """Upgrade unsummarized notes then collect corpus in a single pass.
-
-    1. Scan sessions folder for notes with ``status: auto-logged`` within
-       the date window, group by frontmatter ``project``, and dispatch each
-       group through ``upgrade_batch()`` (which writes one telemetry record
-       per call to the summarizer metrics sink).
-    2. Call ``collect_vault_corpus()`` to build the full corpus (including
-       freshly upgraded notes).  ``include_types`` / ``exclude_types`` are
-       forwarded verbatim — see ``collect_vault_corpus`` docstring for details.
-    3. Atomically write corpus JSON to *output_path*.
-    4. Return status line: ``OK:<total>:<upgraded>:<failed>`` or
-       ``EMPTY:0:0:0``.
-    """
-    vault_root = Path(vault_path).resolve()
-    cutoff = datetime.date.today() - datetime.timedelta(days=days)
-
-    upgraded = 0
-    failed = 0
-
-    # --- Phase 1: upgrade unsummarized notes (group-by-project + batch) ---
-    from collections import defaultdict
-    candidates_by_project: dict[str, list[tuple[str, str]]] = defaultdict(list)
-
-    sessions_dir = vault_root / sessions_folder
-    if sessions_dir.is_dir():
-        # Pass A: collect candidates, grouped by frontmatter project
-        for md_file in sessions_dir.iterdir():
-            if md_file.suffix != ".md":
-                continue
-            resolved = md_file.resolve()
-            if not resolved.is_relative_to(vault_root):
-                continue
-            meta = read_note_metadata(str(md_file))
-            if not meta:
-                continue
-            date_str = meta.get("date", "")
-            if not date_str:
-                continue
-            try:
-                note_date = datetime.date.fromisoformat(date_str)
-            except (ValueError, TypeError):
-                continue
-            if note_date < cutoff:
-                continue
-            if meta.get("status") != "auto-logged":
-                continue
-            candidates_by_project[meta.get("project", "")].append(
-                (str(md_file), meta.get("session_id", ""))
-            )
-
-        # Pass B: one upgrade_batch call per project group.
-        # max_workers=1: dedup_note_open_items runs after each note write and
-        # scans sibling notes; parallel workers in the same project could each
-        # see the other's freshly written open item as a duplicate and both
-        # remove their copy. Serial dispatch preserves the pre-#182 semantics.
-        for project_name, group in candidates_by_project.items():
-            paths = [p for p, _ in group]
-            results = upgrade_batch(
-                paths, vault_path, sessions_folder, project_name,
-                max_workers=1,
-            )
-            for (path, session_id), result in zip(group, results):
-                if result["status"].startswith("Upgraded "):
-                    upgraded += 1
-                    if session_id:
-                        cache_invalidate(session_id)
-                else:
-                    print(
-                        f"[obsidian-brain] upgrade failed for {path}: {result['status']}",
-                        file=sys.stderr,
-                    )
-                    failed += 1
-
-    # --- Phase 2: collect corpus (now includes freshly upgraded notes) ---
-    corpus_json = collect_vault_corpus(
-        vault_path, sessions_folder, insights_folder, days,
-        include_types=include_types,
-        exclude_types=exclude_types,
-    )
-    corpus = json.loads(corpus_json)
-
-    total = corpus.get("note_count", 0)
-    if total == 0:
-        return "EMPTY:0:0:0"
-
-    # Add stats to corpus
-    corpus["stats"] = {
-        "total_notes": total,
-        "upgraded": upgraded,
-        "upgrade_failures": failed,
-        "window_days": days,
-    }
-
-    # --- Phase 3: atomic write to output_path ---
-    out = Path(output_path)
-    os.makedirs(str(out.parent), exist_ok=True)
-
-    fd, tmp = tempfile.mkstemp(
-        dir=str(out.parent), suffix=".tmp", prefix=".corpus-"
-    )
+def recurring_themes_section(db_path: str, project: str | None, top_n: int = 3) -> str:
+    """Return a '## Recurring Themes' markdown block for /recall, or '' if none."""
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(corpus, f, indent=2)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, str(out))
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-    return f"OK:{total}:{upgraded}:{failed}"
+        import themes
+        rows = themes.get_top_themes_for_project(db_path, project, top_n=top_n)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    lines = ["## Recurring Themes"]
+    for t in rows:
+        summary = (t.get("summary") or "").strip()
+        first = summary.split(". ")[0].rstrip(".") if summary else ""
+        suffix = f" — {first}" if first else ""
+        lines.append(f"- **{t['name']}**{suffix} ({t['note_count']} notes)")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -4591,91 +4372,96 @@ def upgrade_note_with_summary(
     if summary_signature not in summary_block_lines:
         return f"Failed: post-write verification — summary body missing from {os.path.basename(note_path)}"
 
-    # Write importance to DB only after file write + verification succeeded,
-    # so the DB stays in sync with the on-disk note state.
+    # Connection A: upsert + importance in one BEGIN IMMEDIATE transaction.
+    # Replaces the separate importance-UPDATE connection and the index_note
+    # call (which opened its own connection). Parsing is done in-process via
+    # _parse_note so no extra I/O round-trip is needed; os.stat is cheap.
+    # Best-effort — a failure here MUST NEVER mask the successful upgrade.
+    #
+    # _index_ok tracks whether Connection A committed successfully.  The
+    # surprise-body read is intentionally OUTSIDE this try so that a read
+    # error (file removed in the commit→read race, decode error) does NOT:
+    #   (a) trigger a spurious rollback of an already-committed transaction, or
+    #   (b) log a misleading "index+importance write-back failed" message, or
+    #   (c) skip theme assignment entirely (the old coupled-read bug).
+    _index_ok: bool = False
     try:
         if _vault_index is not None:
             _db = _vault_index._default_db_path()
             if os.path.isfile(_db):
-                _conn = _vault_index._connect(_db)
-                try:
-                    _conn.execute(
-                        "UPDATE notes SET importance = ? WHERE path = ?",
-                        (importance, note_path),
-                    )
-                    _conn.commit()
-                finally:
-                    _conn.close()
+                _parsed = _vault_index._parse_note(note_path)
+                if _parsed is not None and os.path.isfile(note_path):
+                    _st = os.stat(note_path)
+                    _conn = _vault_index._connect(_db)
+                    try:
+                        _conn.execute("BEGIN IMMEDIATE")
+                        _vault_index._upsert_note(
+                            _conn, note_path, _parsed, _st.st_mtime, _st.st_size
+                        )
+                        _conn.execute(
+                            "UPDATE notes SET importance = ? WHERE path = ?",
+                            (importance, note_path),
+                        )
+                        _conn.commit()
+                        _index_ok = True
+                    except Exception as _exc:
+                        try:
+                            _conn.rollback()
+                        except Exception:
+                            pass
+                        print(f"[obsidian-brain] index+importance write-back failed for "
+                              f"{os.path.basename(note_path)}: "
+                              f"{type(_exc).__name__}: {_exc}", file=sys.stderr)
+                    finally:
+                        _conn.close()
+                else:
+                    _skip_reason = "parse failed" if _parsed is None else "note file gone"
+                    print(f"[obsidian-brain] index+importance skipped ({_skip_reason}) for "
+                          f"{os.path.basename(note_path)}", file=sys.stderr)
     except Exception as exc:
-        print(f"[obsidian-brain] importance write-back failed for "
+        print(f"[obsidian-brain] index+importance write-back failed for "
               f"{os.path.basename(note_path)}: {exc}", file=sys.stderr)
 
-    # Phase 2: Incremental theme assignment.
-    # Best-effort — runs only when vault_index is importable and the DB file
-    # exists. A failure in this block MUST NEVER mask the successful upgrade.
+    # Read the full raw file (frontmatter + body) for surprise scoring.
+    # Done AFTER Connection A, in its own try, so a read error:
+    #   - never triggers a spurious rollback of the committed transaction
+    #   - never logs a misleading "index+importance write-back failed" message
+    #   - never skips theme assignment (Connection B gates on _index_ok, not
+    #     on body-read success — assign_to_theme handles note_text=None by
+    #     writing the default surprise of 0.0 and still assigning the theme)
+    # Friston-data continuity: byte-exact parity with legacy
+    # open(note_path, "r", encoding="utf-8").read() input to detect_surprise.
+    _note_body_for_surprise: str | None = None
+    if _index_ok:
+        try:
+            with open(note_path, "r", encoding="utf-8") as _fh:
+                _note_body_for_surprise = _fh.read()
+        except OSError as _rexc:
+            print(f"[obsidian-brain] surprise-body read failed for "
+                  f"{os.path.basename(note_path)}: "
+                  f"{type(_rexc).__name__}: {_rexc}", file=sys.stderr)
+            _note_body_for_surprise = None
+
+    # Connection B: theme assignment + surprise in one transaction.
+    # assign_to_theme opens a single BEGIN IMMEDIATE internally and now also
+    # computes + writes surprise when note_text is supplied — eliminating the
+    # separate fourth connection from the old pipeline.
+    # Gates on _index_ok (not _note_body_for_surprise) so a body-read failure
+    # still allows theme assignment (with default surprise=0.0).
+    # Best-effort — a failure here MUST NEVER mask the successful upgrade.
     try:
         if _vault_index is not None:
             _db = _vault_index._default_db_path()
-            if os.path.isfile(_db):
-                # Re-index the just-written note so its tfidf_vector reflects
-                # the final summarized body, then run incremental theme assignment.
-                _reindex_ok = False
+            if os.path.isfile(_db) and _index_ok:
                 try:
-                    # index_note() signals failure by returning False, not by
-                    # raising — swallowing the exception branch alone would
-                    # still let assign_to_theme run on a stale/missing vector.
-                    _reindex_ok = bool(_vault_index.index_note(_db, note_path))
+                    _assignment = _vault_index.assign_to_theme(
+                        _db, note_path, project=project,
+                        note_text=_note_body_for_surprise,
+                    )
                 except Exception as _exc:
-                    print(f"[obsidian-brain] theme re-index failed for "
-                          f"{os.path.basename(note_path)}: {_exc}", file=sys.stderr)
-                if _reindex_ok:
-                    try:
-                        _assignment = _vault_index.assign_to_theme(
-                            _db, note_path, project=project,
-                        )
-                    except Exception as _exc:
-                        print(f"[obsidian-brain] assign_to_theme failed for "
-                              f"{os.path.basename(note_path)}: {_exc}",
-                              file=sys.stderr)
-                        _assignment = None
-
-                    if _assignment is not None:
-                        try:
-                            with open(note_path, "r", encoding="utf-8") as _f:
-                                _body = _f.read()
-                            _conn = _vault_index._connect(_db)
-                            try:
-                                _row = _conn.execute(
-                                    "SELECT tfidf_vector FROM notes WHERE path = ?",
-                                    (note_path,),
-                                ).fetchone()
-                                _note_vec = (
-                                    json.loads(_row["tfidf_vector"])
-                                    if _row and _row["tfidf_vector"] else {}
-                                )
-                                _row2 = _conn.execute(
-                                    "SELECT centroid FROM themes WHERE id = ?",
-                                    (_assignment["theme_id"],),
-                                ).fetchone()
-                                _centroid = (
-                                    json.loads(_row2["centroid"])
-                                    if _row2 and _row2["centroid"] else {}
-                                )
-                                _surprise = _vault_index.detect_surprise(
-                                    _body, _note_vec, _centroid,
-                                )
-                                _conn.execute(
-                                    "UPDATE theme_members SET surprise = ? "
-                                    "WHERE theme_id = ? AND note_path = ?",
-                                    (_surprise, _assignment["theme_id"], note_path),
-                                )
-                                _conn.commit()
-                            finally:
-                                _conn.close()
-                        except Exception as _exc:
-                            print(f"[obsidian-brain] surprise scoring failed "
-                                  f"for {os.path.basename(note_path)}: {_exc}",
-                                  file=sys.stderr)
+                    print(f"[obsidian-brain] assign_to_theme failed for "
+                          f"{os.path.basename(note_path)}: {_exc}",
+                          file=sys.stderr)
     except Exception as _exc:
         print(f"[obsidian-brain] theme pipeline unexpected error "
               f"for {os.path.basename(note_path)}: {_exc}", file=sys.stderr)
