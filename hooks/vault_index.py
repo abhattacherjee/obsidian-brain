@@ -247,6 +247,10 @@ def _ensure_theme_indexes(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_themes_project "
         "ON themes (project)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_themes_updated "
+        "ON themes (updated_date)"
+    )
     conn.commit()
 
 
