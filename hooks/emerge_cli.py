@@ -1,172 +1,186 @@
-"""CLI helpers for /emerge — thin wrappers around obsidian_utils functions.
+"""CLI helpers for /emerge — theme-level pattern discovery.
 
-Each function is designed to be called from a minimal ``python3 -c`` stub
-in the emerge SKILL.md, keeping inline code to 2-3 lines.
+``run_emerge_themes`` refreshes ``themes.activation`` and dumps a theme-structured
+corpus (``emerge-themes.json``) for one analysis sub-agent. ``run_build_note``
+turns that corpus + the sub-agent's analysis into a vault note. Both print
+KEY=VALUE / marker lines for the emerge SKILL.md to parse.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import sys
-import time
+import tempfile
+from datetime import datetime, timezone, timedelta
 
-from obsidian_utils import (
-    collect_vault_corpus,
-    load_config,
-    upgrade_and_collect_corpus,
-    write_vault_note,
-)
+import themes
+from obsidian_utils import load_config, write_vault_note
+from vault_index import _connect, _default_db_path
 
 
-def run_corpus(days: int = 30, include_snapshots: bool = False) -> None:
-    """Upgrade unsummarized notes and collect vault corpus for /emerge.
+def _emerge_dir() -> str:
+    """Working directory for emerge temp artifacts (created 0o700 elsewhere)."""
+    return os.path.expanduser("~/.claude/obsidian-brain")
 
-    Prints KEY=VALUE lines for SKILL.md to parse.  Exits non-zero on error.
 
-    Args:
-        days: lookback window in days.
-        include_snapshots: when True, snapshot notes are included in the
-            corpus (pass ``--include-snapshots`` from the skill).  Default is
-            False — snapshots are excluded because their transient "key context"
-            bullets dilute cross-session pattern synthesis.
+def _themes_json_path() -> str:
+    return os.path.join(_emerge_dir(), "emerge-themes.json")
+
+
+def _analysis_path() -> str:
+    return os.path.join(_emerge_dir(), "emerge-analysis.md")
+
+
+def run_emerge_themes(days: int = 30) -> None:
+    """Refresh activation and write a theme-structured corpus for /emerge.
+
+    Prints ``VAULT=``, ``INS=`` and a ``STATUS=`` line for SKILL.md to parse.
+    On fewer than 2 themes in the window, emits ``STATUS=SPARSE:<n>`` and writes
+    no JSON (the skill nudges the user to /consolidate or widen the window).
+    Otherwise writes ``emerge-themes.json`` atomically and prints
+    ``STATUS=OK:<theme_count>:<unassigned_count>``.
     """
-    c = load_config()
-    if not c.get("vault_path"):
+    config = load_config()
+    if not config.get("vault_path"):
         print("ERROR: vault_path not configured", file=sys.stderr)
         sys.exit(1)
+    vault = config["vault_path"]
+    ins = config.get("insights_folder", "claude-insights")
 
-    out = os.path.expanduser("~/.claude/obsidian-brain/emerge-corpus.json")
-    exclude_types: tuple[str, ...] = () if include_snapshots else ("claude-snapshot",)
+    db = _default_db_path()
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    window_start = (now - timedelta(days=days)).date().isoformat()
+    today = now.date().isoformat()
+    date_range = f"{window_start} to {today}"
 
-    # Cache check: reuse if < 15 min old, same window, and same include_snapshots setting
-    if os.path.isfile(out) and (time.time() - os.path.getmtime(out)) < 900:
+    try:
+        # --- Refresh activation (the slice's write path) ---
+        conn = _connect(db)
         try:
-            with open(out) as f:
-                cached = json.load(f)
-            s = cached.get("stats", {})
-            if (
-                s.get("window_days") == days
-                and s.get("include_snapshots") == include_snapshots
-            ):
-                print("VAULT=" + c["vault_path"])
-                print("INS=" + c.get("insights_folder", "claude-insights"))
-                print("STATUS=CACHED:" + str(s["total_notes"]) + ":0:0")
-                return
-        except (OSError, json.JSONDecodeError, KeyError) as exc:
-            print(f"[obsidian-brain] cache read failed, collecting fresh: {exc}", file=sys.stderr)
+            conn.execute("BEGIN IMMEDIATE")
+            themes.recompute_activation(conn, now_iso)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
-    status = upgrade_and_collect_corpus(
-        c["vault_path"],
-        c.get("sessions_folder", "claude-sessions"),
-        c.get("insights_folder", "claude-insights"),
-        days,
-        out,
-        exclude_types=exclude_types,
+        themes_in_window = themes.get_themes_in_window(db, window_start, project=None)
+
+        # --- Sparse guard: nothing meaningful to synthesize ---
+        if len(themes_in_window) < 2:
+            conn.close()
+            print("VAULT=" + vault)
+            print("INS=" + ins)
+            print("STATUS=SPARSE:" + str(len(themes_in_window)))
+            return
+
+        theme_records = []
+        for t in themes_in_window:
+            previews = themes.get_theme_member_previews(conn, t["id"], top_n=3)
+            theme_records.append(
+                {
+                    "id": t["id"],
+                    "name": t["name"],
+                    "summary": t["summary"],
+                    "note_count": t["note_count"],
+                    "activation": t["activation"],
+                    "project": t["project"],
+                    "updated_date": t["updated_date"],
+                    "members": [
+                        {
+                            "title": m["title"],
+                            "excerpt": m["excerpt"],
+                            "similarity": m["similarity"],
+                            "surprise": m["surprise"],
+                            "project": m["project"],
+                        }
+                        for m in previews
+                    ],
+                }
+            )
+
+        unassigned = themes.get_unassigned_notes_in_window(db, window_start, limit=30)
+        conn.close()
+    except (sqlite3.Error, RuntimeError) as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    unassigned_records = [
+        {
+            "title": n["title"],
+            "excerpt": n["excerpt"],
+            "project": n["project"],
+            "date": n["date"],
+        }
+        for n in unassigned
+    ]
+
+    projects = sorted(
+        {t["project"] for t in theme_records if t["project"]}
+        | {n["project"] for n in unassigned_records if n["project"]}
     )
 
-    # Patch include_snapshots into stats so cache key round-trips correctly.
-    # We do this after upgrade_and_collect_corpus writes the file because
-    # that function doesn't know about include_snapshots at the stats level —
-    # the cleanest minimal change is a post-write patch here.
-    if os.path.isfile(out):
-        try:
-            with open(out) as f:
-                corpus = json.load(f)
-            corpus.setdefault("stats", {})["include_snapshots"] = include_snapshots
-            import tempfile
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out), suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(corpus, f, indent=2)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, out)
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"[obsidian-brain] stats patch failed: {exc}", file=sys.stderr)
+    corpus = {
+        "generated_at": now_iso,
+        "window_days": days,
+        "date_range": date_range,
+        "projects": projects,
+        "themes": theme_records,
+        "unassigned_candidates": unassigned_records,
+    }
 
-    print("VAULT=" + c["vault_path"])
-    print("INS=" + c.get("insights_folder", "claude-insights"))
-    print("STATUS=" + status)
-
-
-def run_recollect(days: int = 30, include_snapshots: bool = False) -> None:
-    """Re-collect corpus after fallback upgrades (no upgrade pass).
-
-    Prints REFRESHED:<count> for SKILL.md to parse.
-
-    Args:
-        days: lookback window in days.
-        include_snapshots: when True, snapshot notes are included in the
-            corpus.  Must match the value used in the preceding run_corpus()
-            call so the corpus stays consistent.
-    """
-    import tempfile
-
-    c = load_config()
-    exclude_types: tuple[str, ...] = () if include_snapshots else ("claude-snapshot",)
-    corpus_json = collect_vault_corpus(
-        c["vault_path"],
-        c.get("sessions_folder", "claude-sessions"),
-        c.get("insights_folder", "claude-insights"),
-        days,
-        exclude_types=exclude_types,
-    )
-    out = os.path.expanduser("~/.claude/obsidian-brain/emerge-corpus.json")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out), suffix=".tmp")
-    with os.fdopen(fd, "w") as f:
-        f.write(corpus_json)
+    out = _themes_json_path()
+    os.makedirs(_emerge_dir(), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=_emerge_dir(), suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(corpus, f, indent=2)
     os.chmod(tmp, 0o600)
     os.replace(tmp, out)
-    print("REFRESHED:" + str(json.loads(corpus_json).get("note_count", 0)))
+
+    print("VAULT=" + vault)
+    print("INS=" + ins)
+    print("STATUS=OK:" + str(len(theme_records)) + ":" + str(len(unassigned_records)))
 
 
 def run_build_note() -> None:
-    """Build emerge vault note from corpus + analysis.
+    """Build the emerge vault note from emerge-themes.json + emerge-analysis.md.
 
-    Prints SAVED:<path> then ---REPORT--- then the analysis body.
-    Cleans up temp files on success.
+    Prints SAVED:<path> then ---REPORT--- then the analysis body. Cleans up both
+    temp files on success.
     """
-    import datetime
-    import hashlib
+    config = load_config()
+    vault = config["vault_path"]
+    ins = config.get("insights_folder", "claude-insights")
 
-    c = load_config()
-    vault = c["vault_path"]
-    ins = c.get("insights_folder", "claude-insights")
+    corpus_path = _themes_json_path()
+    analysis_path = _analysis_path()
 
-    corpus_path = os.path.expanduser("~/.claude/obsidian-brain/emerge-corpus.json")
-    analysis_path = os.path.expanduser("~/.claude/obsidian-brain/emerge-analysis.md")
-
-    with open(corpus_path) as f:
+    with open(corpus_path, encoding="utf-8") as f:
         corpus = json.load(f)
-    with open(analysis_path) as f:
+    with open(analysis_path, encoding="utf-8") as f:
         analysis = f.read()
 
-    today = datetime.date.today().isoformat()
-    projects = sorted(
-        set(
-            n.get("project", "")
-            for n in corpus.get("notes", [])
-            if n.get("project")
-        )
-    )
-    src = [
-        "[[" + os.path.splitext(n["file"])[0] + "]]"
-        for n in corpus.get("notes", [])
-    ]
+    today = datetime.now(timezone.utc).date().isoformat()
+    projects = corpus.get("projects", [])
+    date_range = corpus.get("date_range", "")
+    theme_count = len(corpus.get("themes", []))
     tags = ["claude/emerge"] + ["claude/project/" + p for p in projects]
 
     fm = (
         "---\ntype: claude-emerge\ndate: " + today
-        + '\ndate_range: "' + corpus.get("date_range", "")
-        + '"\nprojects:\n' + "\n".join("  - " + p for p in projects)
-        + "\nsource_notes:\n" + "\n".join('  - "' + s + '"' for s in src)
-        + "\nnote_count: " + str(corpus.get("note_count", 0))
+        + '\ndate_range: "' + date_range + '"'
+        + "\nprojects:\n" + "\n".join("  - " + p for p in projects)
+        + "\ntheme_count: " + str(theme_count)
         + "\ntags:\n" + "\n".join("  - " + t for t in tags)
         + "\n---"
     )
-    title = "# Emerge: Pattern Discovery (" + corpus.get("date_range", "") + ")"
+    title = "# Emerge: Pattern Discovery (" + date_range + ")"
     header = (
         "**Projects:** " + ", ".join(projects)
-        + "\n**Notes analyzed:** " + str(corpus.get("note_count", 0))
+        + "\n**Themes analyzed:** " + str(theme_count)
     )
     body = fm + "\n\n" + title + "\n\n" + header + "\n\n" + analysis
 
@@ -182,7 +196,6 @@ def run_build_note() -> None:
         print(f"ERROR: write failed: {result}", file=sys.stderr)
         sys.exit(1)
 
-    # Cleanup temp files
     for p in [corpus_path, analysis_path]:
         try:
             os.remove(p)
