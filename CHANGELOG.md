@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-06-15
+
 ### Added
 - `/consolidate` skill: batch-clusters notes into named themes (3+ notes/theme) with Haiku naming, plus `stats`, `split <id>`, `merge <a> <b>` sub-commands and a `--full` recluster. Themes finally populate (previously `assign_to_theme` could only join existing themes, so they stayed empty). (#230)
 - `/recall` now shows a **Recurring Themes** section — the project's top themes ranked by activation, so resuming work surfaces the threads you keep returning to. (#231)
