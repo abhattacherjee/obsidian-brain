@@ -1225,9 +1225,9 @@ _DEFAULTS: dict = {
     "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline. Consumed by /recall SKILL.md Step 2 (summarization is deferred to /recall), #84
     "summary_batch_size": 3,  # notes per claude -p spawn in upgrade_batch (#166); 1 = legacy per-note fan-out
     "summary_recovery": True,  # #167: post-process loose summaries (heading normalization, synth missing sections, default importance) before escalating/falling back. Set false to disable.
-    "consolidate_cluster_threshold": 0.5,   # cosine sim for single-linkage edge in /consolidate
-    "consolidate_min_cluster_size": 3,      # smallest cluster that becomes a theme
-    "consolidate_unassigned_threshold": 50, # /consolidate stats nudge when unassigned exceeds this
+    "consolidate_cluster_threshold": 0.5,  # cosine sim for single-linkage edge in /consolidate
+    "consolidate_min_cluster_size": 3,  # smallest cluster that becomes a theme
+    "consolidate_unassigned_threshold": 50,  # /consolidate stats nudge when unassigned exceeds this
     "aged_summarize_threshold_days": 90,  # #168: notes whose file mtime is older than this AND have no inbound vault links AND no pin tag are deferred (skipped) by /recall
     "summary_pin_tags": ["claude/keep", "claude/permanent"],  # #168: notes carrying any of these frontmatter tags are never deferred
     "auto_log_enabled": True,

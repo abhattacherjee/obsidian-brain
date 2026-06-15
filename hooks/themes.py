@@ -399,7 +399,8 @@ def theme_stats(db_path: str) -> dict:
             "largest": [{"id": r[0], "name": r[1], "note_count": r[2]} for r in largest]}
 
 
-def _theme_member_vectors(conn, theme_id):
+def _theme_member_vectors(conn: sqlite3.Connection, theme_id: int) -> list[tuple[str, dict[str, float]]]:
+    """Return [(note_path, tfidf_vec), ...] for a theme's members, skipping notes with unparseable/empty vectors."""
     rows = conn.execute(
         "SELECT m.note_path, n.tfidf_vector FROM theme_members m "
         "JOIN notes n ON n.path = m.note_path WHERE m.theme_id = ?", (theme_id,)
@@ -421,7 +422,9 @@ def _theme_member_vectors(conn, theme_id):
 
 def merge_themes(db_path: str, a: int, b: int, now_iso: str) -> bool:
     """Move b's members into a, recompute a's centroid + note_count, delete b.
-    Returns True on success, False if either theme is missing."""
+    Returns True on success, False if either theme is missing or a==b."""
+    if a == b:
+        return False
     from vault_index import _connect
     conn = _connect(db_path)
     try:

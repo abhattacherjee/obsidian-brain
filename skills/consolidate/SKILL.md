@@ -19,8 +19,8 @@ seeder over unassigned notes; `--full` wipes and reclusters everything.
 
 - no args / `--full`  → Step 2 (consolidate)
 - `stats`             → Step 3
-- `split <id>`        → Step 4
-- `merge <a> <b>`     → Step 5
+- `split <id>`        → Step 4; bind `THEME_ID=<id>` from the user's numeric argument
+- `merge <a> <b>`     → Step 5; bind `A=<a>` and `B=<b>` from the two numeric arguments
 
 ### Step 2 — Consolidate (seed or full)
 

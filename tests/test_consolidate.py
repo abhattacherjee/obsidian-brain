@@ -190,6 +190,27 @@ def test_split_falls_back_on_haiku_failure(db):
     assert all(row[0] for row in sub_themes)  # all names are non-empty fallbacks
 
 
+def test_merge_self_is_rejected(db):
+    """merge(a, a) must be a no-op: theme and its members must survive intact."""
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
+                 "VALUES (1,'Solo','s','{\"x\":1.0}',2,'d','d','proj')")
+    conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                 "VALUES ('m1.md','session','proj','t','b',1.0,'{\"x\":1.0}')")
+    conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                 "VALUES ('m2.md','session','proj','t','b',1.0,'{\"y\":1.0}')")
+    conn.execute("INSERT INTO theme_members VALUES (1,'m1.md',0.9,0.0,'d')")
+    conn.execute("INSERT INTO theme_members VALUES (1,'m2.md',0.9,0.0,'d')")
+    conn.commit(); conn.close()
+    consolidate_cli.run_merge(1, 1)
+    conn = sqlite3.connect(db)
+    theme_count = conn.execute("SELECT COUNT(*) FROM themes WHERE id=1").fetchone()[0]
+    member_count = conn.execute("SELECT COUNT(*) FROM theme_members WHERE theme_id=1").fetchone()[0]
+    conn.close()
+    assert theme_count == 1, "theme must still exist after self-merge"
+    assert member_count == 2, "theme must still have 2 members after self-merge"
+
+
 def test_split_noop_when_cohesive(db, capsys):
     conn = sqlite3.connect(db)
     conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "

@@ -13,7 +13,7 @@ from __future__ import annotations
 from tfidf import _cosine_similarity
 
 
-def _components_stdlib(items, threshold):
+def _components_stdlib(items: list[tuple[str, dict[str, float]]], threshold: float) -> dict[int, list[int]]:
     """O(n^2) pairwise cosine + union-find. Returns dict root_index -> [indices]."""
     n = len(items)
     parent = list(range(n))
@@ -41,9 +41,10 @@ def _components_stdlib(items, threshold):
     return groups
 
 
-def _components_fast(items, threshold):
+def _components_fast(items: list[tuple[str, dict[str, float]]], threshold: float) -> dict[int, list[int]]:
     """numpy/scipy fast path: CSR cosine matrix -> thresholded sparse graph ->
-    connected_components. Returns dict label -> [indices]."""
+    connected_components. Stays sparse throughout — never materialises the N×N
+    dense matrix. Returns dict label -> [indices]."""
     import numpy as np
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
@@ -64,17 +65,18 @@ def _components_fast(items, threshold):
     norms[norms == 0] = 1.0
     inv = 1.0 / norms
     Xn = X.multiply(inv[:, None]).tocsr()
-    sim = (Xn @ Xn.T).toarray()
-    adj = (sim >= threshold)
-    np.fill_diagonal(adj, False)
-    _, labels = connected_components(csr_matrix(adj), directed=False)
+    sim = (Xn @ Xn.T)              # sparse CSR; implicit zeros stay implicit
+    adj = (sim >= threshold)       # threshold>0 keeps implicit zeros out -> stays sparse
+    adj.setdiag(False)
+    adj.eliminate_zeros()
+    _, labels = connected_components(adj, directed=False)
     groups: dict[int, list[int]] = {}
     for i, lab in enumerate(labels):
         groups.setdefault(int(lab), []).append(i)
     return groups
 
 
-def cluster_vectors(items, threshold=0.5, min_cluster_size=3, _force_stdlib=None):
+def cluster_vectors(items: list[tuple[str, dict[str, float]]], threshold: float = 0.5, min_cluster_size: int = 3, _force_stdlib: bool | None = None) -> list[list[str]]:
     """Cluster ``items`` (list of ``(note_path, sparse_vec)``) into single-linkage
     groups. Returns a list of clusters (each a list of note_paths), keeping only
     clusters with >= ``min_cluster_size`` members. Deterministic order: largest
