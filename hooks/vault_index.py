@@ -141,6 +141,12 @@ _REAL_PROD_DB = os.path.realpath(
     os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
 )
 
+# When a single _sync batch inserts more than this fraction of the final
+# corpus, early notes carry insertion-time IDF; recompute all vectors with
+# the final N/df. Bulk rebuild / first ingestion always trips this; steady-
+# state incremental syncs (a few notes into a large corpus) skip it.
+_BULK_RECOMPUTE_MIN_FRACTION = 0.5
+
 
 def _in_test_ctx() -> bool:
     """True when running under pytest. PYTEST_CURRENT_TEST is set automatically
@@ -444,6 +450,30 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
     )
 
 
+def _recompute_all_tfidf_vectors(conn: sqlite3.Connection) -> None:
+    """Recompute every note's tfidf_vector with the final corpus N and df.
+
+    Used as a second pass after a bulk insert so that vectors are independent
+    of insertion order (early notes otherwise persist insertion-time IDF).
+    Fetches term_df once (amortised over all notes) rather than per note.
+    """
+    total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    term_df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+    rows = conn.execute(
+        "SELECT path, title, tags, body FROM notes"
+    ).fetchall()
+    for path, title, tags, body in rows:
+        tokens = _tokenize_for_tfidf(
+            " ".join([title or "", tags or "", body or ""])
+        )
+        vec = _compute_tfidf_vector(tokens, term_df, total_docs, top_k=50)
+        vec_json = json.dumps(vec, separators=(",", ":")) if vec else None
+        conn.execute(
+            "UPDATE notes SET tfidf_vector = ? WHERE path = ?",
+            (vec_json, path),
+        )
+
+
 def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
     """Remove a note + FTS row + term_df contribution + theme memberships.
 
@@ -550,7 +580,7 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
     the connection (which would poison subsequent callers).
     """
     vault = Path(vault_path)
-    stats = {"inserted": 0, "skipped": 0, "deleted": 0, "by_type": {}}
+    stats = {"inserted": 0, "skipped": 0, "deleted": 0, "recomputed": 0, "by_type": {}}
 
     # Collect all .md files in target folders (keyed by absolute path)
     disk_files: dict[str, Path] = {}  # abs_path_str -> Path object
@@ -606,6 +636,14 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
             note_type = parsed.get("type", "unknown")
             stats["by_type"][note_type] = stats["by_type"].get(note_type, 0) + 1
             stats["inserted"] += 1
+
+        total_after = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        if (
+            total_after > 0
+            and stats["inserted"] > total_after * _BULK_RECOMPUTE_MIN_FRACTION
+        ):
+            _recompute_all_tfidf_vectors(conn)
+            stats["recomputed"] = total_after
 
         conn.commit()
     except Exception:
