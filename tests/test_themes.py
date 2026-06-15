@@ -882,3 +882,51 @@ def test_create_theme_inserts_row_and_members(tmp_vault):
     assert [m[0] for m in mem] == ["p/a.md", "p/b.md"]
     assert all(0.0 <= m[1] <= 1.0 for m in mem)  # similarity to centroid persisted
     conn.close()
+
+
+def _seed_theme(conn, tid, project, activation, note_count=1):
+    conn.execute(
+        "INSERT INTO themes (id,name,summary,centroid,note_count,activation,created_date,updated_date,project) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (tid, f"t{tid}", "s", "{}", note_count, activation, "2026-01-01", "2026-06-14", project),
+    )
+
+
+class TestGetTopThemesForProject:
+    def test_project_plus_null_union(self, tmp_vault):
+        db = str(tmp_vault / "t.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+        conn = sqlite3.connect(db)
+        _seed_theme(conn, 1, "alpha", 2.0)
+        _seed_theme(conn, 2, "beta", 5.0)
+        _seed_theme(conn, 3, None, 1.0)
+        conn.commit()
+        conn.close()
+        rows = themes.get_top_themes_for_project(db, "alpha")
+        assert {r["id"] for r in rows} == {1, 3}  # alpha + cross-project NULL, not beta
+        assert isinstance(rows[0], dict)
+        assert set(rows[0]) == {"id", "name", "summary", "note_count", "activation"}
+
+    def test_orders_by_activation_desc(self, tmp_vault):
+        db = str(tmp_vault / "t.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+        conn = sqlite3.connect(db)
+        _seed_theme(conn, 1, "p", 1.0)
+        _seed_theme(conn, 2, "p", 5.0)
+        _seed_theme(conn, 3, "p", 3.0)
+        conn.commit()
+        conn.close()
+        rows = themes.get_top_themes_for_project(db, "p")
+        assert [r["id"] for r in rows] == [2, 3, 1]
+
+    def test_respects_limit(self, tmp_vault):
+        db = str(tmp_vault / "t.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+        conn = sqlite3.connect(db)
+        for i in range(1, 6):
+            _seed_theme(conn, i, "p", float(i))
+        conn.commit()
+        conn.close()
+        rows = themes.get_top_themes_for_project(db, "p", top_n=2)
+        assert len(rows) == 2
+        assert [r["id"] for r in rows] == [5, 4]
