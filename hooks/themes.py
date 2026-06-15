@@ -340,3 +340,64 @@ def detect_surprise(
 
     score = hits / len(shared_terms)
     return max(0.0, min(1.0, score))
+
+
+def theme_stats(db_path: str) -> dict:
+    """Read-only counts for /consolidate stats."""
+    from vault_index import _connect
+    conn = _connect(db_path)
+    try:
+        themes_n = conn.execute("SELECT COUNT(*) FROM themes").fetchone()[0]
+        members_n = conn.execute("SELECT COUNT(*) FROM theme_members").fetchone()[0]
+        unassigned_n = conn.execute(
+            "SELECT COUNT(*) FROM notes n LEFT JOIN theme_members m ON n.path = m.note_path "
+            "WHERE m.note_path IS NULL AND n.tfidf_vector IS NOT NULL AND n.tfidf_vector != ''"
+        ).fetchone()[0]
+        largest = conn.execute(
+            "SELECT id, name, note_count FROM themes ORDER BY note_count DESC, id LIMIT 5"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {"themes": themes_n, "members": members_n, "unassigned": unassigned_n,
+            "largest": [{"id": r[0], "name": r[1], "note_count": r[2]} for r in largest]}
+
+
+def _theme_member_vectors(conn, theme_id):
+    rows = conn.execute(
+        "SELECT m.note_path, n.tfidf_vector FROM theme_members m "
+        "JOIN notes n ON n.path = m.note_path WHERE m.theme_id = ?", (theme_id,)
+    ).fetchall()
+    out = []
+    for path, vec_json in rows:
+        try:
+            vec = json.loads(vec_json) if vec_json else {}
+        except (ValueError, TypeError):
+            vec = {}
+        if vec:
+            out.append((path, vec))
+    return out
+
+
+def merge_themes(db_path: str, a: int, b: int, now_iso: str) -> bool:
+    """Move b's members into a, recompute a's centroid + note_count, delete b.
+    Returns True on success, False if either theme is missing."""
+    from vault_index import _connect
+    conn = _connect(db_path)
+    try:
+        rows = {r[0] for r in conn.execute("SELECT id FROM themes WHERE id IN (?, ?)", (a, b))}
+        if a not in rows or b not in rows:
+            return False
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE OR IGNORE theme_members SET theme_id = ? WHERE theme_id = ?", (a, b))
+        conn.execute("DELETE FROM theme_members WHERE theme_id = ?", (b,))
+        conn.execute("DELETE FROM themes WHERE id = ?", (b,))
+        vecs = _theme_member_vectors(conn, a)
+        centroid = compute_centroid([v for _, v in vecs])
+        conn.execute(
+            "UPDATE themes SET centroid = ?, note_count = ?, updated_date = ? WHERE id = ?",
+            (json.dumps(centroid, separators=(",", ":")), len(vecs), now_iso, a))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
