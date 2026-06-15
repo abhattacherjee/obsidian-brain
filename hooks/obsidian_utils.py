@@ -3614,6 +3614,24 @@ def build_context_brief(
     return "\n".join(output_parts)
 
 
+def recurring_themes_section(db_path, project, top_n=3):
+    """Return a '## Recurring Themes' markdown block for /recall, or '' if none."""
+    try:
+        import themes
+        rows = themes.get_top_themes_for_project(db_path, project, top_n=top_n)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    lines = ["## Recurring Themes"]
+    for t in rows:
+        summary = (t.get("summary") or "").strip()
+        first = summary.split(". ")[0].rstrip(".") if summary else ""
+        suffix = f" — {first}" if first else ""
+        lines.append(f"- **{t['name']}**{suffix} ({t['note_count']} notes)")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Vault corpus collection (for /emerge pattern discovery)
 # ---------------------------------------------------------------------------
