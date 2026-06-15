@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Internal:** split `hooks/vault_index.py` (was ~2,068 lines) into focused modules — `hooks/tfidf.py` (TF-IDF primitives; stdlib-only leaf) and `hooks/themes.py` (theme assignment + surprise detection). `vault_index.py` keeps core index/sync/search and re-exports the moved symbols for back-compat; no behavior change. Enabling refactor for Friston Phase 3 (epic #53). Closes #229.
+
 ### Fixed
 - `scripts/test-dev-skill.sh install` now also syncs `hooks/hooks.json` (and the `.claude-plugin/` manifests) into the plugin cache. Previously only `hooks/*.py` and skill dirs were copied, so a newly **registered** hook (e.g. a new `Stop` event) had its script copied but was never registered — it silently never fired after `/dev-test install`. Closes #227.
 
