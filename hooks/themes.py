@@ -16,6 +16,113 @@ from tfidf import _cosine_similarity, _TOKEN_RE
 
 _THEME_SIMILARITY_THRESHOLD = 0.3
 
+_CENTROID_EPSILON = 1e-6
+
+
+def compute_centroid(vectors: list[dict[str, float]]) -> dict[str, float]:
+    """Element-wise mean of sparse vectors, pruning terms below epsilon."""
+    if not vectors:
+        return {}
+    n = len(vectors)
+    acc: dict[str, float] = {}
+    for vec in vectors:
+        for term, w in vec.items():
+            acc[term] = acc.get(term, 0.0) + w
+    return {t: s / n for t, s in acc.items() if abs(s / n) >= _CENTROID_EPSILON}
+
+
+def get_unassigned_notes(db_path: str, project: str | None = None) -> list[tuple[str, str | None, dict]]:
+    """Notes with a non-empty tfidf_vector and NO theme_members row. If ``project``
+    is given, restrict to that project. Returns [(path, project, vec), ...]."""
+    from vault_index import _connect
+    conn = _connect(db_path)
+    try:
+        sql = (
+            "SELECT n.path, n.project, n.tfidf_vector FROM notes n "
+            "LEFT JOIN theme_members m ON n.path = m.note_path "
+            "WHERE m.note_path IS NULL AND n.tfidf_vector IS NOT NULL AND n.tfidf_vector != ''"
+        )
+        params: tuple = ()
+        if project is not None:
+            sql += " AND n.project IS ?"
+            params = (project,)
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    out = []
+    skipped = 0
+    for path, proj, vec_json in rows:
+        try:
+            vec = json.loads(vec_json)
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+        if vec:
+            out.append((path, proj, vec))
+    if skipped > 0:
+        print(f"[consolidate] skipped {skipped} notes with unparseable tfidf_vector", file=sys.stderr)
+    return out
+
+
+def get_all_vectorized_notes(db_path: str, project: str | None = None) -> list[tuple[str, str | None, dict]]:
+    """Notes with a non-empty tfidf_vector, regardless of theme membership. If
+    ``project`` is given, restrict to that project. Returns [(path, project, vec), ...].
+    Used by ``--full`` consolidation to read all notes after deferring the wipe."""
+    from vault_index import _connect
+    conn = _connect(db_path)
+    try:
+        sql = (
+            "SELECT path, project, tfidf_vector FROM notes "
+            "WHERE tfidf_vector IS NOT NULL AND tfidf_vector != ''"
+        )
+        params: tuple = ()
+        if project is not None:
+            sql += " AND project IS ?"
+            params = (project,)
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    out = []
+    skipped = 0
+    for path, proj, vec_json in rows:
+        try:
+            vec = json.loads(vec_json)
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+        if vec:
+            out.append((path, proj, vec))
+    if skipped > 0:
+        print(f"[consolidate] skipped {skipped} notes with unparseable tfidf_vector", file=sys.stderr)
+    return out
+
+
+def create_theme(
+    conn: sqlite3.Connection,
+    name: str,
+    summary: str,
+    centroid: dict[str, float],
+    members: list[tuple[str, dict[str, float]]],
+    project: str | None,
+    now_iso: str,
+) -> int:
+    """INSERT a themes row + its theme_members rows (similarity = cosine to the
+    centroid). Caller owns the transaction (does not commit). Returns theme id."""
+    cur = conn.execute(
+        "INSERT INTO themes (name, summary, centroid, note_count, activation, "
+        "created_date, updated_date, project) VALUES (?, ?, ?, ?, 0.0, ?, ?, ?)",
+        (name, summary, json.dumps(centroid, separators=(",", ":")), len(members),
+         now_iso, now_iso, project),
+    )
+    theme_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO theme_members (theme_id, note_path, similarity, surprise, added_date) "
+        "VALUES (?, ?, ?, 0.0, ?) "
+        "ON CONFLICT(theme_id, note_path) DO UPDATE SET similarity = excluded.similarity",
+        [(theme_id, path, _cosine_similarity(vec, centroid), now_iso) for path, vec in members],
+    )
+    return theme_id
+
 
 def assign_to_theme(
     db_path: str,
@@ -270,3 +377,74 @@ def detect_surprise(
 
     score = hits / len(shared_terms)
     return max(0.0, min(1.0, score))
+
+
+def theme_stats(db_path: str) -> dict:
+    """Read-only counts for /consolidate stats."""
+    from vault_index import _connect
+    conn = _connect(db_path)
+    try:
+        themes_n = conn.execute("SELECT COUNT(*) FROM themes").fetchone()[0]
+        members_n = conn.execute("SELECT COUNT(*) FROM theme_members").fetchone()[0]
+        unassigned_n = conn.execute(
+            "SELECT COUNT(*) FROM notes n LEFT JOIN theme_members m ON n.path = m.note_path "
+            "WHERE m.note_path IS NULL AND n.tfidf_vector IS NOT NULL AND n.tfidf_vector != ''"
+        ).fetchone()[0]
+        largest = conn.execute(
+            "SELECT id, name, note_count FROM themes ORDER BY note_count DESC, id LIMIT 5"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {"themes": themes_n, "members": members_n, "unassigned": unassigned_n,
+            "largest": [{"id": r[0], "name": r[1], "note_count": r[2]} for r in largest]}
+
+
+def _theme_member_vectors(conn: sqlite3.Connection, theme_id: int) -> list[tuple[str, dict[str, float]]]:
+    """Return [(note_path, tfidf_vec), ...] for a theme's members, skipping notes with unparseable/empty vectors."""
+    rows = conn.execute(
+        "SELECT m.note_path, n.tfidf_vector FROM theme_members m "
+        "JOIN notes n ON n.path = m.note_path WHERE m.theme_id = ?", (theme_id,)
+    ).fetchall()
+    out = []
+    skipped = 0
+    for path, vec_json in rows:
+        try:
+            vec = json.loads(vec_json) if vec_json else {}
+        except (ValueError, TypeError):
+            skipped += 1
+            vec = {}
+        if vec:
+            out.append((path, vec))
+    if skipped > 0:
+        print(f"[consolidate] skipped {skipped} notes with unparseable tfidf_vector", file=sys.stderr)
+    return out
+
+
+def merge_themes(db_path: str, a: int, b: int, now_iso: str) -> bool:
+    """Move b's members into a, recompute a's centroid + note_count, delete b.
+    Returns True on success, False if either theme is missing or a==b."""
+    if a == b:
+        return False
+    from vault_index import _connect
+    conn = _connect(db_path)
+    try:
+        rows = {r[0] for r in conn.execute("SELECT id FROM themes WHERE id IN (?, ?)", (a, b))}
+        if a not in rows or b not in rows:
+            return False
+        conn.execute("BEGIN IMMEDIATE")
+        # OR IGNORE deduplicates overlapping members (a note in both themes);
+        # the conflicting b-row is silently dropped, then b's remaining rows
+        # are deleted to leave only a's membership intact.
+        conn.execute(
+            "UPDATE OR IGNORE theme_members SET theme_id = ? WHERE theme_id = ?", (a, b))
+        conn.execute("DELETE FROM theme_members WHERE theme_id = ?", (b,))
+        conn.execute("DELETE FROM themes WHERE id = ?", (b,))
+        vecs = _theme_member_vectors(conn, a)
+        centroid = compute_centroid([v for _, v in vecs])
+        conn.execute(
+            "UPDATE themes SET centroid = ?, note_count = ?, updated_date = ? WHERE id = ?",
+            (json.dumps(centroid, separators=(",", ":")), len(vecs), now_iso, a))
+        conn.commit()
+        return True
+    finally:
+        conn.close()

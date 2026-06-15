@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `/consolidate` skill: batch-clusters notes into named themes (3+ notes/theme) with Haiku naming, plus `stats`, `split <id>`, `merge <a> <b>` sub-commands and a `--full` recluster. Themes finally populate (previously `assign_to_theme` could only join existing themes, so they stayed empty). (#230)
+
 ### Changed
 - **Internal:** split `hooks/vault_index.py` (was ~2,068 lines) into focused modules — `hooks/tfidf.py` (TF-IDF primitives; stdlib-only leaf) and `hooks/themes.py` (theme assignment + surprise detection). `vault_index.py` keeps core index/sync/search and re-exports the moved symbols for back-compat; no behavior change. Enabling refactor for Friston Phase 3 (epic #53). Closes #229.
 - **TF-IDF relevance scores are now order-independent on full vault re-index.** Previously, notes indexed early in a bulk rebuild carried inflated relevance scores until they happened to be re-touched; `/vault-reindex` now runs a second pass after a bulk insert so every note's score is computed against the final corpus.

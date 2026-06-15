@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 
+import themes
 import vault_index
 
 
@@ -822,3 +823,62 @@ class TestUpgradeWiresThemes:
             "assign_to_theme ran despite _parse_note returning None — "
             "reindex-failure gating regressed"
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2: theme-creation helpers (compute_centroid, create_theme,
+#          get_unassigned_notes)
+# ---------------------------------------------------------------------------
+
+
+def _insert_note(conn, path, project, vec):
+    conn.execute(
+        "INSERT INTO notes (path, type, project, title, body, mtime, tfidf_vector) "
+        "VALUES (?, 'session', ?, 't', 'b', 1.0, ?)",
+        (path, project, json.dumps(vec)),
+    )
+
+
+def test_compute_centroid_is_elementwise_mean():
+    c = themes.compute_centroid([{"a": 1.0, "b": 0.0}, {"a": 0.0, "b": 1.0}])
+    assert c["a"] == pytest.approx(0.5)
+    assert c["b"] == pytest.approx(0.5)
+
+
+def test_compute_centroid_prunes_near_zero_and_handles_empty():
+    assert themes.compute_centroid([]) == {}
+    c = themes.compute_centroid([{"a": 1e-9}, {"a": 1e-9}])
+    assert "a" not in c  # pruned below epsilon
+
+
+def test_get_unassigned_notes_excludes_themed_and_vectorless(tmp_vault):
+    db = str(tmp_vault / "t.db")
+    vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+    conn = sqlite3.connect(db)
+    _insert_note(conn, "p/a.md", "proj", {"x": 1.0})
+    _insert_note(conn, "p/b.md", "proj", {"x": 1.0})
+    conn.execute("INSERT INTO notes (path, type, project, title, body, mtime, tfidf_vector) "
+                 "VALUES ('p/c.md','session','proj','t','b',1.0,NULL)")  # no vector
+    conn.execute("INSERT INTO theme_members (theme_id, note_path, similarity, surprise, added_date) "
+                 "VALUES (1, 'p/a.md', 0.9, 0.0, '2026-06-15')")  # a already themed
+    conn.commit()
+    conn.close()
+    rows = themes.get_unassigned_notes(db)
+    paths = {r[0] for r in rows}
+    assert paths == {"p/b.md"}  # a themed, c vectorless
+
+
+def test_create_theme_inserts_row_and_members(tmp_vault):
+    db = str(tmp_vault / "t.db")
+    vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db)
+    conn = sqlite3.connect(db)
+    members = [("p/a.md", {"x": 1.0, "y": 0.5}), ("p/b.md", {"x": 0.8, "y": 0.6})]
+    centroid = themes.compute_centroid([v for _, v in members])
+    tid = themes.create_theme(conn, "X / Y", "Notes about x and y.", centroid, members, "proj", "2026-06-15")
+    conn.commit()
+    row = conn.execute("SELECT name, summary, note_count, project FROM themes WHERE id=?", (tid,)).fetchone()
+    assert row == ("X / Y", "Notes about x and y.", 2, "proj")
+    mem = conn.execute("SELECT note_path, similarity FROM theme_members WHERE theme_id=? ORDER BY note_path", (tid,)).fetchall()
+    assert [m[0] for m in mem] == ["p/a.md", "p/b.md"]
+    assert all(0.0 <= m[1] <= 1.0 for m in mem)  # similarity to centroid persisted
+    conn.close()
