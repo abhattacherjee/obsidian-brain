@@ -18,6 +18,10 @@ _THEME_SIMILARITY_THRESHOLD = 0.3
 
 _CENTROID_EPSILON = 1e-6
 
+# Half-life (days) for the ACT-R base-level activation decay (Slice D, #231).
+# Referenced by name in tests so activation assertions carry no magic literal.
+HALF_LIFE_DAYS = 30
+
 
 def compute_centroid(vectors: list[dict[str, float]]) -> dict[str, float]:
     """Element-wise mean of sparse vectors, pruning terms below epsilon."""
@@ -448,3 +452,156 @@ def merge_themes(db_path: str, a: int, b: int, now_iso: str) -> bool:
         return True
     finally:
         conn.close()
+
+
+# --- Slice D (#231): theme-query data layer + activation recompute --------
+
+
+def recompute_activation(conn: sqlite3.Connection, now_iso: str,
+                         half_life_days: int = HALF_LIFE_DAYS) -> int:
+    """Recompute themes.activation for all themes from member added_date recency.
+
+    activation = sum over members of 0.5 ** (age_days / half_life_days),
+    age_days = max(0, (now - added_date).days). Caller owns the transaction
+    (callers wrap this in BEGIN IMMEDIATE). Returns the number of themes updated.
+    """
+    from datetime import datetime
+    now_d = datetime.fromisoformat(now_iso).date()
+    acc: dict[int, float] = {}
+    for r in conn.execute("SELECT theme_id, added_date FROM theme_members").fetchall():
+        tid = r["theme_id"] if hasattr(r, "keys") else r[0]
+        added = r["added_date"] if hasattr(r, "keys") else r[1]
+        # A single member with a NULL or non-date added_date must be SKIPPED,
+        # not crash the whole recompute. The bare/with-time parses are nested
+        # so a None or garbage value raises (ValueError, TypeError) here.
+        try:
+            try:
+                ad = datetime.fromisoformat(added).date()
+            except ValueError:
+                ad = datetime.fromisoformat(added + "T00:00:00").date()
+        except (ValueError, TypeError):
+            print(f"[themes] skipping member with bad added_date={added!r} theme_id={tid}",
+                  file=sys.stderr)
+            continue
+        age = max(0, (now_d - ad).days)
+        acc[tid] = acc.get(tid, 0.0) + 0.5 ** (age / half_life_days)
+    n = 0
+    theme_ids = [r["id"] if hasattr(r, "keys") else r[0]
+                 for r in conn.execute("SELECT id FROM themes").fetchall()]
+    for tid in theme_ids:
+        conn.execute("UPDATE themes SET activation = ? WHERE id = ?",
+                     (acc.get(tid, 0.0), tid))
+        n += 1
+    return n
+
+
+def get_themes_in_window(db_path: str, window_start: str,
+                         project: str | None = None) -> list[dict]:
+    """Themes whose updated_date >= window_start, ranked by
+    activation then size. project=None returns every theme (cross-project);
+    a project name returns that project's themes plus cross-project (NULL) ones.
+    """
+    from vault_index import _connect
+    sql = (
+        "SELECT id, name, summary, note_count, activation, project, "
+        "created_date, updated_date FROM themes WHERE updated_date >= ?"
+    )
+    params: list = [window_start]
+    if project is not None:
+        sql += " AND (project = ? OR project IS NULL)"
+        params.append(project)
+    sql += " ORDER BY activation DESC, note_count DESC"
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_theme_member_previews(conn: sqlite3.Connection, theme_id: int,
+                              top_n: int = 3, body_chars: int = 600) -> list[dict]:
+    """Top-n members of a theme by similarity DESC, joined to notes.
+
+    Returns [{note_path, title, excerpt, similarity, surprise, project, date}].
+    excerpt = notes.body truncated to body_chars; falls back to title when body
+    is empty. Takes a live, caller-owned connection.
+    """
+    rows = conn.execute(
+        "SELECT tm.note_path, tm.similarity, tm.surprise, "
+        "n.title, n.body, n.project, n.date "
+        "FROM theme_members tm JOIN notes n ON n.path = tm.note_path "
+        "WHERE tm.theme_id = ? ORDER BY tm.similarity DESC LIMIT ?",
+        (theme_id, top_n),
+    ).fetchall()
+    out = []
+    for r in rows:
+        body = r["body"] or ""
+        title = r["title"] or ""
+        excerpt = body[:body_chars] if body else title
+        out.append({
+            "note_path": r["note_path"],
+            "title": title,
+            "excerpt": excerpt,
+            "similarity": r["similarity"],
+            "surprise": r["surprise"],
+            "project": r["project"],
+            "date": r["date"],
+        })
+    return out
+
+
+def get_top_themes_for_project(db_path: str, project: str | None,
+                               top_n: int = 3) -> list[dict]:
+    """Top themes for a project (plus cross-project NULL themes), ranked by
+    activation then size. Returns [{id, name, summary, note_count, activation}].
+    Used by /recall's Recurring Themes section.
+    """
+    from vault_index import _connect
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, name, summary, note_count, activation FROM themes "
+            "WHERE project = ? OR project IS NULL "
+            "ORDER BY activation DESC, note_count DESC LIMIT ?",
+            (project, top_n),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_unassigned_notes_in_window(db_path: str, window_start: str,
+                                   limit: int = 30) -> list[dict]:
+    """Vectorized notes with no theme_members row and date >= window_start,
+    newest first, capped at ``limit``. These are /emerge's new candidates.
+    Excludes transient ``claude-snapshot`` notes (parity with the retired
+    ``collect_vault_corpus`` default). Returns [{note_path, title, excerpt,
+    project, date}].
+    """
+    from vault_index import _connect
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT n.path, n.title, n.body, n.project, n.date FROM notes n "
+            "WHERE n.tfidf_vector IS NOT NULL AND n.tfidf_vector != '' "
+            "AND n.type != 'claude-snapshot' "
+            "AND n.date >= ? "
+            "AND NOT EXISTS (SELECT 1 FROM theme_members tm WHERE tm.note_path = n.path) "
+            "ORDER BY n.date DESC LIMIT ?",
+            (window_start, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        body = r["body"] or ""
+        title = r["title"] or ""
+        out.append({
+            "note_path": r["path"],
+            "title": title,
+            "excerpt": body[:600] if body else title,
+            "project": r["project"],
+            "date": r["date"],
+        })
+    return out

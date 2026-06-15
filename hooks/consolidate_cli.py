@@ -95,17 +95,20 @@ def run_consolidate(full: bool = False) -> None:
                 conn.execute("DELETE FROM themes")
             for proj, name, summary, cen, members in plan:
                 themes.create_theme(conn, name, summary, cen, members, proj, now)
+            themes.recompute_activation(conn, now)
             conn.commit()
         finally:
             conn.close()
 
         created = len(plan)
         conn = _connect(db)
-        total = conn.execute("SELECT COUNT(*) FROM themes").fetchone()[0]
-        conn.close()
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM themes").fetchone()[0]
+        finally:
+            conn.close()
         print(f"CREATED={created} THEMES_TOTAL={total}")
 
-    except (sqlite3.Error, RuntimeError) as exc:
+    except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -123,7 +126,7 @@ def run_stats() -> None:
         nudge = int(config.get("consolidate_unassigned_threshold", 50))
         if st["unassigned"] > nudge:
             print(f"NUDGE unassigned={st['unassigned']} exceeds {nudge}; run /consolidate")
-    except (sqlite3.Error, RuntimeError) as exc:
+    except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -132,8 +135,19 @@ def run_merge(a: int, b: int) -> None:
     db = _default_db_path()
     try:
         ok = themes.merge_themes(db, a, b, _now_iso())
+        if ok:
+            # merge_themes owns its own connection; refresh activation in a
+            # fresh short write transaction so the surviving theme reflects
+            # its merged membership recency.
+            conn = _connect(db)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                themes.recompute_activation(conn, _now_iso())
+                conn.commit()
+            finally:
+                conn.close()
         print(f"MERGED a={a} b={b}" if ok else f"ERROR theme(s) not found a={a} b={b}")
-    except (sqlite3.Error, RuntimeError) as exc:
+    except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -184,6 +198,6 @@ def run_split(theme_id: int) -> None:
             conn.close()
         print(f"SPLIT theme={theme_id} into={len(subclusters)}")
 
-    except (sqlite3.Error, RuntimeError) as exc:
+    except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         sys.exit(1)
