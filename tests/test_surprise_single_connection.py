@@ -4,6 +4,7 @@ Asserts that upgrade_note_with_summary opens at most 2 sqlite connections
 when running the full index + theme-assign + surprise pipeline.
 """
 import json
+import sqlite3
 import sys
 import os
 from datetime import date
@@ -179,9 +180,37 @@ def test_upgrade_surprise_value_reassignment(tmp_path, monkeypatch):
     """On reassignment, surprise is recomputed against the UNCHANGED centroid.
 
     Call assign_to_theme directly a second time with explicit note_text; assert
-    the stored surprise matches oracle using the original (pre-first-call)
-    centroid (effective_centroid = centroid branch in themes.py).
-    Fails if surprise is a hardcoded constant or the wrong centroid is used.
+    the stored surprise matches oracle using the pre-call centroid (effective_centroid
+    = centroid branch in themes.py).
+
+    Centroid-branch vacuity note (deep-review finding, 2026-06-15):
+    -------------------------------------------------------------------
+    The two branches in assign_to_theme (effective_centroid = centroid vs
+    effective_centroid = new_centroid) are BEHAVIORALLY INDISTINGUISHABLE by
+    detect_surprise for realistic fixtures.  Proof:
+
+    After the first assignment (new_member path), set(note_vec) ⊆ set(centroid)
+    because the running-average update absorbs all note_vec terms into the
+    centroid keyset.  On the second call (reassignment path):
+
+      - Correct:  effective_centroid = centroid  (unchanged)
+      - Bug:      effective_centroid = new_centroid = (centroid*N + note_vec)/(N+1)
+
+    Both have identical keysets → detect_surprise sees the same shared term SET
+    (shared = set(note_vec) & set(centroid) = set(note_vec) in both cases).
+    With ≤10 shared terms the top_shared list is identical; with more terms the
+    TF-IDF frequency ordering (changes/none/python dominate) is stable across the
+    trivial value-averaging.  Empirically: both branches yield surprise=0.0 (or
+    the same nonzero value) for every realistic small-note fixture.
+
+    The existing oracle assertion (stored == detect_surprise(text, vec, pre_call_centroid))
+    therefore catches "surprise not computed at all" (hardcoded 0.0) and
+    "wrong note_text input" (Fix 1 parity), but NOT a branch mispick
+    (centroid vs new_centroid).  This is the correct test for those two bugs.
+
+    To verify: the oracle_new_centroid assertion added below documents that the
+    two centroid variants produce the same detect_surprise output for this fixture,
+    confirming the branch-distinction finding.
     """
     vault, note, db = _build_upgrade_setup(tmp_path)
     monkeypatch.setattr(vault_index, "_default_db_path", lambda *a, **k: db)
@@ -200,11 +229,12 @@ def test_upgrade_surprise_value_reassignment(tmp_path, monkeypatch):
     assert result.startswith("Upgraded "), f"first upgrade failed: {result}"
 
     # Snapshot the centroid BEFORE the second assign_to_theme call.
-    # On reassignment, effective_centroid = centroid (unchanged) so the oracle
-    # must use this pre-call snapshot, not any new_centroid.
+    # On reassignment, effective_centroid = centroid (unchanged).
     conn = vault_index._connect(db)
     centroid_row = conn.execute("SELECT centroid FROM themes").fetchone()
     pre_call_centroid = json.loads(centroid_row[0])
+    count_row = conn.execute("SELECT note_count FROM themes").fetchone()
+    pre_call_count = count_row[0]
     note_vec_row = conn.execute(
         "SELECT tfidf_vector FROM notes WHERE path = ?", (str(note),)
     ).fetchone()
@@ -230,10 +260,85 @@ def test_upgrade_surprise_value_reassignment(tmp_path, monkeypatch):
     stored_surprise = row[0]
     conn.close()
 
-    # Oracle: detect_surprise with the pre-call centroid (unchanged on reassign).
-    oracle = themes.detect_surprise(full_text, note_vec, pre_call_centroid)
+    # Oracle A: detect_surprise with the pre-call centroid (unchanged on reassign).
+    # This is what the correct branch computes.
+    oracle_old = themes.detect_surprise(full_text, note_vec, pre_call_centroid)
 
-    assert stored_surprise == oracle, (
-        f"stored surprise {stored_surprise!r} != oracle {oracle!r}; "
+    assert stored_surprise == oracle_old, (
+        f"stored surprise {stored_surprise!r} != oracle {oracle_old!r}; "
         f"reassignment must use the unchanged centroid (effective_centroid = centroid)"
+    )
+
+    # Oracle B: detect_surprise with the re-averaged new_centroid (what the bug would use).
+    # Documented invariant: for this fixture, oracle_old == oracle_new because
+    # set(note_vec) ⊆ set(pre_call_centroid) — see docstring for explanation.
+    # This assertion documents the finding rather than asserting differentiation.
+    oracle_new = themes.detect_surprise(
+        full_text,
+        note_vec,
+        {
+            t: (pre_call_centroid.get(t, 0.0) * pre_call_count + note_vec.get(t, 0.0))
+            / (pre_call_count + 1)
+            for t in set(pre_call_centroid) | set(note_vec)
+        },
+    )
+    # The branch distinction is NOT observable via detect_surprise for this fixture
+    # (see docstring).  Assert equality to document the invariant — if this ever
+    # starts failing it means a fixture change has made the branches distinguishable,
+    # which would be the desired outcome for a future stricter test.
+    assert oracle_old == oracle_new, (
+        f"Branch-distinction invariant violated: oracle_old={oracle_old!r} != "
+        f"oracle_new={oracle_new!r}. The centroid-branch IS now distinguishable "
+        f"for this fixture — update the test to assert stored==oracle_old != oracle_new."
+    )
+
+
+def test_connection_a_rollback_does_not_block_upgrade(tmp_path, monkeypatch):
+    """Connection-A (index + importance) exception rolls back cleanly.
+
+    Best-effort contract: if _upsert_note raises inside the BEGIN IMMEDIATE
+    block, upgrade_note_with_summary must still return "Upgraded ..." (the
+    summary write already succeeded), must NOT propagate the exception, and
+    must NOT write a theme_members row (because _note_body_for_surprise is
+    never set when Connection-A fails, so Connection-B is skipped entirely).
+    """
+    vault, note, db = _build_upgrade_setup(tmp_path)
+    monkeypatch.setattr(vault_index, "_default_db_path", lambda *a, **k: db)
+
+    # Patch _upsert_note on the vault_index module object.  obsidian_utils
+    # imports vault_index as _vault_index at module level, so patching the
+    # module attribute is honored by the _vault_index._upsert_note call site.
+    def _boom(*args, **kwargs):
+        raise sqlite3.OperationalError("boom: injected by test")
+
+    monkeypatch.setattr(vault_index, "_upsert_note", _boom)
+
+    summary = (
+        "## Summary\nDid python work on changes.\n\n"
+        "## Key Decisions\nNone noted.\n\n"
+        "## Changes Made\nPython changes landed.\n\n"
+        "## Errors Encountered\nNone.\n\n"
+        "## Open Questions / Next Steps\nNone.\n\nIMPORTANCE: 6\n"
+    )
+
+    # (1) Must not raise.
+    result = obsidian_utils.upgrade_note_with_summary(
+        str(note), summary, str(vault), "claude-sessions", "p",
+    )
+
+    # (2) Must still return success (summary write happened before Connection-A).
+    assert result.startswith("Upgraded "), (
+        f"upgrade_note_with_summary must succeed even when Connection-A rolls back; "
+        f"got: {result!r}"
+    )
+
+    # (3) No theme assignment — _note_body_for_surprise stays None when
+    # _upsert_note raises, so assign_to_theme is never called.
+    conn = vault_index._connect(db)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM theme_members").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 0, (
+        f"theme_members must be empty when Connection-A rolled back; found {count} row(s)"
     )
