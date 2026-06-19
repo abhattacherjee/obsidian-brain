@@ -126,8 +126,10 @@ def run_stats() -> None:
         nudge = int(config.get("consolidate_unassigned_threshold", 50))
         if st["unassigned"] > nudge:
             print(f"NUDGE unassigned={st['unassigned']} exceeds {nudge}; run /consolidate")
-        # Oversized themes are by definition among the largest, so top-5 coverage
-        # is complete for any realistic cap; no additional DB query needed.
+        # Oversized themes are by definition among the largest, so the top-5 `largest`
+        # list covers them unless more than five themes simultaneously exceed the cap,
+        # in which case the rest surface on the next `stats` run after splitting. No
+        # extra DB query needed.
         max_size = int(config.get("consolidate_max_theme_size", 120))
         for t in st["largest"]:
             if t["note_count"] > max_size:

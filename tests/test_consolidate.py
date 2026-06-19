@@ -344,6 +344,38 @@ def test_stats_silent_at_cap_boundary(tmp_vault, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# T2b: run_stats WARN loop iterates ALL oversized themes, not just the first
+# ---------------------------------------------------------------------------
+
+def test_stats_flags_multiple_oversized_themes(tmp_vault, monkeypatch, capsys):
+    """WARN is printed for every oversized theme, not just the first one found."""
+    import vault_index as _vi
+    p = str(tmp_vault / "c.db")
+    _vi.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", p)
+    monkeypatch.setattr(
+        consolidate_cli, "load_config",
+        lambda: {"vault_path": str(tmp_vault), "consolidate_max_theme_size": 5},
+    )
+    conn = sqlite3.connect(p)
+    conn.execute(
+        "INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
+        "VALUES (1,'BigA','s','{}',6,'d','d','proj')"
+    )
+    conn.execute(
+        "INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
+        "VALUES (2,'BigB','s','{}',7,'d','d','proj')"
+    )
+    conn.commit(); conn.close()
+    consolidate_cli.run_stats()
+    out = capsys.readouterr().out
+    assert "WARN theme id=1 has 6 members" in out
+    assert "WARN theme id=2 has 7 members" in out
+    assert "/consolidate split 1" in out
+    assert "/consolidate split 2" in out
+
+
+# ---------------------------------------------------------------------------
 # T3: run_merge(a, a) emits the DISTINCT self-merge message, not not-found
 # ---------------------------------------------------------------------------
 
