@@ -535,7 +535,9 @@ run_batch_edit()
 '
 ```
 
-`run_build_checkoffs` reports `resolved N, skipped M` on stderr; **skipped items (drifted hint, no matching checkbox line, file-not-found) are NOT checked off** — surface them to the user rather than forcing an edit.
+`run_build_checkoffs` reports `resolved N, skipped M` on stderr; **skipped items (drifted hint, no matching checkbox line, ambiguous text match, file-not-found) are NOT checked off** — surface them to the user rather than forcing an edit. Note: when two distinct still-active checkboxes both text-match a representative and no valid hint disambiguates, the item is REFUSED with reason `ambiguous text match (N candidates)` — never guessed.
+
+**Also surface Stage 2 drops.** `run_batch_edit` prints `Applied N/M edits`; whenever `N < M` it follows with a `Skipped K checkoff(s) with no matching line:` block listing each dropped `old_text`. A Stage-1-resolved triple can still be dropped here if the line changed between stages — **report any `Applied N/M` where N<M and the listed skipped checkoffs to the user** so a silently-dropped checkoff is never missed.
 
 For confirmed link additions (NOT checkoffs), pass `[filepath, old_text, new_text]` triples directly into `run_batch_edit` via `$EDITS_JSON` — non-checkbox edits keep the substring-replace path:
 

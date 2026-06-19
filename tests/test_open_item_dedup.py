@@ -1189,3 +1189,59 @@ def test_anchor_quoted_prose_vs_checkbox():
     checkbox = "- [ ] Wire run_build_checkoffs into standup Step 18 pipeline"
     prose = "**Assistant:** I'll wire run_build_checkoffs into standup Step 18 pipeline next."
     assert anchor_text_matches(checkbox, prose) is True
+
+
+def test_anchor_lcs_boundary_24_drops_25_matches():
+    """A 24-char shared run does NOT match; a 25-char shared run DOES.
+
+    Each side is padded with DIFFERENT filler chars so the filler cannot inflate
+    the longest common substring beyond the deliberately-shared run.
+    """
+    shared_24 = "abcdefghijklmnopqrstuvwx"  # 24 chars
+    assert len(shared_24) == 24
+    a24 = "zzzzz" + shared_24 + "qqqqq"
+    b24 = "wwwww" + shared_24 + "rrrrr"
+    assert anchor_text_matches(a24, b24) is False
+
+    shared_25 = shared_24 + "y"  # 25 chars
+    assert len(shared_25) == 25
+    a25 = "zzzzz" + shared_25 + "qqqqq"
+    b25 = "wwwww" + shared_25 + "rrrrr"
+    assert anchor_text_matches(a25, b25) is True
+
+
+def test_anchor_short_item_substring_near_miss():
+    """Short items below the char threshold require full normalized equality.
+
+    "Fix bug" (7 chars) is a substring of "Fix bug now" but, being below the
+    25-char threshold, must NOT match on substring — only on full equality.
+    """
+    assert anchor_text_matches("- [ ] Fix bug", "Fix bug now") is False
+
+
+def test_anchor_long_input_is_capped_fast():
+    """A >2000-char input short-circuits the O(n*m) LCS DP via exact equality.
+
+    A `- [ ] ` checkbox line with a 40k-char no-space blob used to take ~37s
+    (one O(n*m) DP call). The _ANCHOR_MAX_CHARS cap must make this return fast,
+    and beyond the cap matching falls back to exact equality (#201 round-3).
+    """
+    import time
+
+    blob = "x" * 40_000
+    line = "- [ ] " + blob
+    ref = "y" * 40_000
+
+    # Timing guard: must return in well under 1s vs the ~37s the DP took before.
+    t = time.monotonic()
+    result = anchor_text_matches(line, ref)
+    elapsed = time.monotonic() - t
+    assert elapsed < 1.0, f"anchor_text_matches took {elapsed:.2f}s (cap not applied)"
+    assert result is False  # different blobs -> equality path -> no match
+
+    # Two IDENTICAL >2000-char normalized strings take the equality path -> True.
+    big = "z" * 5_000
+    assert anchor_text_matches(big, big) is True
+
+    # Two DIFFERENT >2000-char strings take the equality path -> False.
+    assert anchor_text_matches("a" * 5_000, "b" * 5_000) is False

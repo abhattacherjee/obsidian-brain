@@ -200,6 +200,38 @@ def test_guard_b_containment_violation_skipped(tmp_vault, monkeypatch, capsys):
     assert result["skipped"][0]["reason"] == "containment"
 
 
+def test_guard_b_ambiguous_text_match_refuses(tmp_vault, monkeypatch, capsys):
+    """Two distinct unchecked checkboxes both share a >=25-char run with the
+    representative; with no valid hint the resolver must REFUSE, not guess.
+
+    The two items share the long prefix "Add retry logic to the upload client
+    for transient 5xx errors" / "...for auth refresh" — both share a >25-char
+    run with the representative text. The hint (999) is past EOF, so text
+    resolution applies. With the OLD first-match code this would have emitted a
+    triple for the FIRST candidate (silently checking off the wrong still-active
+    item); the data-integrity fix skips with an "ambiguous" reason instead.
+    """
+    note = tmp_vault / "claude-sessions" / "2026-04-10-proj-ambig.md"
+    item_a = "Add retry logic to the upload client for transient 5xx errors"
+    item_b = "Add retry logic to the upload client for auth refresh"
+    note.write_text(
+        "---\ntype: claude-session\nproject: proj\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        f"- [ ] {item_a}\n"
+        f"- [ ] {item_b}\n",
+        encoding="utf-8",
+    )
+    # Representative text shares a >=25-char run with BOTH; hint past EOF.
+    items = [{"file": note.name, "line": 999, "text": item_a}]
+    out = _run_build_checkoffs(monkeypatch, tmp_vault, items, capsys)
+    result = json.loads(out)
+
+    # Neither wrong item targeted: no edits at all.
+    assert result["edits"] == []
+    assert len(result["skipped"]) == 1
+    assert "ambiguous" in result["skipped"][0]["reason"]
+
+
 # ---------------------------------------------------------------------------
 # Guard A — run_batch_edit (line-anchoring)
 # ---------------------------------------------------------------------------

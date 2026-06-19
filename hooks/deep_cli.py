@@ -159,6 +159,7 @@ def run_batch_edit() -> None:
     edits = json.load(sys.stdin)
     success = 0
     acted_texts: set[str] = set()
+    skipped_checkoffs: list[str] = []
     for filepath, old_text, new_text in edits:
         try:
             real_path = os.path.realpath(filepath)
@@ -189,6 +190,7 @@ def run_batch_edit() -> None:
                         f"[obsidian-brain] checkoff skipped (no matching checkbox line): {filepath}",
                         file=sys.stderr,
                     )
+                    skipped_checkoffs.append(old_text)
             else:
                 # NON-checkbox edit (e.g. link additions): legacy substring replace.
                 if old_text in content:
@@ -219,6 +221,10 @@ def run_batch_edit() -> None:
     if acted_texts:
         _save_acted_items(acted_texts)
     print(f"Applied {success}/{len(edits)} edits")
+    if skipped_checkoffs:
+        print(f"Skipped {len(skipped_checkoffs)} checkoff(s) with no matching line:")
+        for old_text in skipped_checkoffs:
+            print(f"  - {old_text}")
 
 
 def run_build_checkoffs() -> None:
@@ -248,8 +254,8 @@ def run_build_checkoffs() -> None:
 
     c = load_config()
     vault_root = os.path.realpath(c["vault_path"])
-    sessions_folder = c["sessions_folder"]
-    insights_folder = c["insights_folder"]
+    sessions_folder = c.get("sessions_folder", "claude-sessions")
+    insights_folder = c.get("insights_folder", "claude-insights")
 
     raw = sys.stdin.read(1_000_000)
     items = json.loads(raw) if raw.strip() else []
@@ -308,26 +314,38 @@ def run_build_checkoffs() -> None:
         ]
 
         target_idx = None
-        # Prefer the hint line iff it's a candidate AND text-matches.
+        # Prefer the hint line iff it's a candidate AND text-matches: a valid
+        # hint legitimately disambiguates between multiple text matches.
         if isinstance(line_hint, int) and 1 <= line_hint <= len(lines):
             hint_idx = line_hint - 1
             if hint_idx in candidate_idxs and anchor_text_matches(
                 lines[hint_idx].rstrip("\n"), ref_text
             ):
                 target_idx = hint_idx
-        # Otherwise first text-matching candidate.
-        if target_idx is None:
-            for i in candidate_idxs:
-                if anchor_text_matches(lines[i].rstrip("\n"), ref_text):
-                    target_idx = i
-                    break
 
         if target_idx is None:
-            skipped.append({
-                "file": file_field, "line": line_hint,
-                "reason": "no matching checkbox line",
-            })
-            continue
+            # No usable hint — fall back to text resolution. For a data-integrity
+            # fix we must REFUSE when the text is ambiguous (>1 distinct unchecked
+            # checkbox matches) rather than silently guessing the first one and
+            # checking off the WRONG still-active item.
+            matches = [
+                i for i in candidate_idxs
+                if anchor_text_matches(lines[i].rstrip("\n"), ref_text)
+            ]
+            if len(matches) == 1:
+                target_idx = matches[0]
+            elif len(matches) > 1:
+                skipped.append({
+                    "file": file_field, "line": line_hint,
+                    "reason": f"ambiguous text match ({len(matches)} candidates)",
+                })
+                continue
+            else:  # len(matches) == 0
+                skipped.append({
+                    "file": file_field, "line": line_hint,
+                    "reason": "no matching checkbox line",
+                })
+                continue
 
         old_text = lines[target_idx].rstrip("\n")
         new_text = old_text.replace("[ ]", "[x]", 1)

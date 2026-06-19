@@ -55,6 +55,11 @@ def _longest_common_substring_len(a: str, b: str) -> int:
 
 
 _ANCHOR_MIN_CHARS = 25  # the proven workaround threshold (#201)
+# Above this length we skip the O(n*m) LCS DP entirely and fall back to exact
+# equality. A legitimate checkbox anchor never needs a >2000-char common
+# substring, and a single long no-space blob line could otherwise stall the
+# DP for ~37s per candidate (#201 round-3 review).
+_ANCHOR_MAX_CHARS = 2000
 
 
 def anchor_text_matches(line_text: str, reference_text: str, min_chars: int = _ANCHOR_MIN_CHARS) -> bool:
@@ -63,6 +68,11 @@ def anchor_text_matches(line_text: str, reference_text: str, min_chars: int = _A
     Used to confirm a checkbox line really is the open item we mean to check off,
     rather than a drifted line or quoted prose (#201)."""
     a, b = _normalize_item_text(line_text), _normalize_item_text(reference_text)
+    # Long-input short-circuit (checked BEFORE the O(n*m) LCS DP): a legitimate
+    # checkbox anchor never needs a >2000-char common substring. Fall back to
+    # exact equality so a giant no-space blob can't stall the DP for ~37s.
+    if max(len(a), len(b)) > _ANCHOR_MAX_CHARS:
+        return a == b and bool(a)
     # short items: require full normalized equality (can't hit the char threshold)
     if min(len(a), len(b)) < min_chars:
         return a == b and bool(a)
