@@ -24,6 +24,8 @@ _STOPWORDS = frozenset(
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
+_CENTROID_PRUNE_EPSILON = 1e-9  # terms whose folded magnitude is <= this are dropped to keep centroids sparse
+
 
 def _tokenize_for_tfidf(text: str) -> list[str]:
     """Tokenize text for TF-IDF: lowercase alphanumerics, drop stopwords + single chars.
@@ -156,7 +158,7 @@ def _reverse_fold_centroid(
     centroid of the remaining ``count - 1`` members after ``note_vec`` is
     removed: ``new = (centroid * count - note_vec) / (count - 1)`` per term,
     over the union of both term sets. Terms whose magnitude falls to
-    ``<= 1e-9`` are pruned to keep the centroid sparse.
+    ``<= _CENTROID_PRUNE_EPSILON`` are pruned to keep the centroid sparse.
 
     Pure and DB-unaware. The caller guarantees ``count >= 2`` (the
     ``count <= 1`` "drop the theme" case is DB bookkeeping, not math).
@@ -167,6 +169,6 @@ def _reverse_fold_centroid(
         c_val = centroid.get(term, 0.0)
         v_val = note_vec.get(term, 0.0)
         new_val = (c_val * count - v_val) / new_count
-        if abs(new_val) > 1e-9:
+        if abs(new_val) > _CENTROID_PRUNE_EPSILON:
             new_centroid[term] = new_val
     return new_centroid
