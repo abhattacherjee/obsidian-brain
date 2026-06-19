@@ -7,10 +7,32 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 
-from open_item_dedup import build_deep_presentation, deep_analysis_pipeline
+from open_item_dedup import (
+    anchor_text_matches,
+    build_deep_presentation,
+    deep_analysis_pipeline,
+)
+
+# Matches an UNCHECKED markdown checkbox line with non-empty item text.
+_UNCHECKED_CHECKBOX_RE = re.compile(r"^\s*-\s+\[ \]\s+\S")
+
+
+def _is_checkbox_flip(old_text: str, new_text: str) -> bool:
+    """True iff (old_text -> new_text) is a pure unchecked->checked checkbox flip.
+
+    old_text must be an unchecked checkbox line (``- [ ] <text>``) and new_text
+    must equal old_text with ONLY the first ``[ ]`` replaced by ``[x]`` — every
+    other character identical. Anything else (link additions, prose edits) is
+    NOT a checkbox flip and keeps the legacy substring-replace path.
+    """
+    if not _UNCHECKED_CHECKBOX_RE.match(old_text):
+        return False
+    flipped = old_text.replace("[ ]", "[x]", 1)
+    return flipped == new_text
 
 
 def run_pipeline(vault_path: str, sessions_folder: str, insights_folder: str) -> None:
@@ -137,6 +159,8 @@ def run_batch_edit() -> None:
     edits = json.load(sys.stdin)
     success = 0
     acted_texts: set[str] = set()
+    skipped_checkoffs: list[str] = []
+    skipped_other: list[str] = []
     for filepath, old_text, new_text in edits:
         try:
             real_path = os.path.realpath(filepath)
@@ -146,14 +170,46 @@ def run_batch_edit() -> None:
 
             with open(real_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-            if old_text in content:
-                content = content.replace(old_text, new_text, 1)
+
+            new_content = None
+            if _is_checkbox_flip(old_text, new_text):
+                # CHECKBOX FLIP: line-anchored replace. Find the FIRST line whose
+                # full content (sans trailing newline) exactly equals old_text AND
+                # is an unchecked checkbox, then replace ONLY that line. This kills
+                # mode 2 (quoted-prose / substring) corruption — a prose line that
+                # merely *contains* the item text is never touched.
+                lines = content.splitlines(keepends=True)
+                for idx, raw_line in enumerate(lines):
+                    stripped = raw_line.rstrip("\n")
+                    if stripped == old_text and _UNCHECKED_CHECKBOX_RE.match(stripped):
+                        ending = raw_line[len(stripped):]  # preserve "\n" / "" / "\r\n"
+                        lines[idx] = new_text + ending
+                        new_content = "".join(lines)
+                        break
+                if new_content is None:
+                    print(
+                        f"[obsidian-brain] checkoff skipped (no matching checkbox line): {filepath}",
+                        file=sys.stderr,
+                    )
+                    skipped_checkoffs.append(old_text)
+            else:
+                # NON-checkbox edit (e.g. link additions): legacy substring replace.
+                if old_text in content:
+                    new_content = content.replace(old_text, new_text, 1)
+                else:
+                    # Parity with the checkoff path: a non-checkbox edit whose
+                    # old_text isn't present is a real miss — surface it instead
+                    # of failing silently (only the Applied count would reflect it).
+                    snippet = old_text if len(old_text) <= 80 else old_text[:77] + "..."
+                    skipped_other.append(snippet)
+
+            if new_content is not None:
                 fd, tmp = tempfile.mkstemp(
                     dir=os.path.dirname(real_path), suffix=".tmp"
                 )
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        f.write(content)
+                        f.write(new_content)
                     os.chmod(tmp, 0o600)
                     os.replace(tmp, real_path)
                 except BaseException:
@@ -172,3 +228,138 @@ def run_batch_edit() -> None:
     if acted_texts:
         _save_acted_items(acted_texts)
     print(f"Applied {success}/{len(edits)} edits")
+    if skipped_checkoffs:
+        print(f"Skipped {len(skipped_checkoffs)} checkoff(s) with no matching line:")
+        for old_text in skipped_checkoffs:
+            print(f"  - {old_text}")
+    if skipped_other:
+        print(f"Skipped {len(skipped_other)} non-checkbox edit(s) with no match:")
+        for old_text in skipped_other:
+            print(f"  - {old_text}")
+
+
+def run_build_checkoffs() -> None:
+    """Re-resolve checkoff targets by TEXT before any write (#201 Guard B).
+
+    Reads a JSON array from stdin; each element:
+        {"file": "<basename or path>", "line": <int hint>, "text": "<canonical item text>"}
+
+    For each item we IGNORE the classifier's line number entirely and
+    text-anchor the target: among the file's unchecked ``- [ ] `` lines we act
+    ONLY when EXACTLY ONE text-matches; if two or more match we REFUSE
+    (ambiguous), and if none match we SKIP. The drift-prone ``line`` hint can
+    never disambiguate among text-similar siblings, so it can never check off a
+    different still-active item, and quoted-prose lines (no checkbox) are never
+    targeted.
+
+    Emits to stdout::
+
+        {"edits": [[fullpath, old_text, new_text], ...],
+         "skipped": [{"file":..., "line":..., "reason":...}, ...]}
+
+    where each ``old_text`` is the EXACT current line content (no trailing
+    newline) and ``new_text`` is that line with the first ``[ ]`` flipped to
+    ``[x]`` — i.e. exactly what Guard A (run_batch_edit) line-matches. This
+    function is PURE of writes: it only reads + emits, and is safe to unit-test.
+    """
+    from obsidian_utils import load_config
+
+    c = load_config()
+    vault_root = os.path.realpath(c["vault_path"])
+    sessions_folder = c.get("sessions_folder", "claude-sessions")
+    insights_folder = c.get("insights_folder", "claude-insights")
+
+    raw = sys.stdin.read(1_000_000)
+    items = json.loads(raw) if raw.strip() else []
+
+    edits: list[list[str]] = []
+    skipped: list[dict] = []
+
+    def _resolve_path(file_field: str) -> str | None:
+        """Resolve a basename-or-path to a contained full path, else None."""
+        if os.path.isabs(file_field) or os.sep in file_field:
+            candidates = [file_field]
+        else:
+            candidates = [
+                os.path.join(vault_root, sessions_folder, file_field),
+                os.path.join(vault_root, insights_folder, file_field),
+            ]
+        for cand in candidates:
+            real = os.path.realpath(cand)
+            # containment check
+            if not (real == vault_root or real.startswith(vault_root + os.sep)):
+                continue
+            if os.path.isfile(real):
+                return real
+        return None
+
+    for item in items or []:
+        file_field = item.get("file", "")
+        line_hint = item.get("line")
+        ref_text = item.get("text", "") or ""
+
+        real = _resolve_path(file_field)
+        if real is None:
+            # Distinguish containment violation from plain not-found for the report.
+            probe = os.path.realpath(
+                file_field if (os.path.isabs(file_field) or os.sep in file_field)
+                else os.path.join(vault_root, sessions_folder, file_field)
+            )
+            reason = ("containment" if not (
+                probe == vault_root or probe.startswith(vault_root + os.sep)
+            ) else "file not found")
+            skipped.append({"file": file_field, "line": line_hint, "reason": reason})
+            continue
+
+        try:
+            with open(real, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError as exc:
+            print(f"[obsidian-brain] checkoff: cannot read {file_field}: {exc}", file=sys.stderr)
+            skipped.append({"file": file_field, "line": line_hint, "reason": "file not found"})
+            continue
+
+        # Candidate lines = unchecked checkboxes.
+        candidate_idxs = [
+            i for i, ln in enumerate(lines)
+            if _UNCHECKED_CHECKBOX_RE.match(ln.rstrip("\n"))
+        ]
+
+        # Resolve PURELY by text, NEVER by the classifier's line hint. The hint
+        # `line` is drift-prone (the whole #201 premise) and anchor_text_matches
+        # is loose (LCS>=25), so a drifted hint that happens to land on a
+        # TEXT-SIMILAR SIBLING checkbox could otherwise disambiguate among
+        # mutually-matching siblings and silently check off the WRONG still-active
+        # item — re-introducing the exact bug on the hint path. So a hint may
+        # NEVER override the ambiguity refusal: we compute ALL text-matching
+        # candidates first and only act when exactly one matches. The `line`
+        # value is retained in the skipped report for diagnostics, but is not
+        # used to SELECT among multiple matches (it can't be trusted to).
+        matches = [
+            i for i in candidate_idxs
+            if anchor_text_matches(lines[i].rstrip("\n"), ref_text)
+        ]
+        if len(matches) == 1:
+            target_idx = matches[0]
+        elif len(matches) > 1:
+            skipped.append({
+                "file": file_field, "line": line_hint,
+                "reason": f"ambiguous text match ({len(matches)} candidates)",
+            })
+            continue
+        else:  # len(matches) == 0
+            skipped.append({
+                "file": file_field, "line": line_hint,
+                "reason": "no matching checkbox line",
+            })
+            continue
+
+        old_text = lines[target_idx].rstrip("\n")
+        new_text = old_text.replace("[ ]", "[x]", 1)
+        edits.append([real, old_text, new_text])
+
+    print(
+        f"[obsidian-brain] checkoffs: resolved {len(edits)}, skipped {len(skipped)}",
+        file=sys.stderr,
+    )
+    print(json.dumps({"edits": edits, "skipped": skipped}))

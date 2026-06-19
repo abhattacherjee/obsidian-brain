@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-06-19
+
+### Added
+- `/consolidate stats` now flags themes whose size exceeds a soft cap (`consolidate_max_theme_size`, default 120) and suggests `/consolidate split <id>`. Clustering output is unchanged. (#238)
+
+### Changed
+- **Internal:** extracted the reverse-fold centroid math (shared by theme reassignment and note deletion) into a single `_reverse_fold_centroid` helper in `tfidf.py` (#246) — no behavior change.
+
+### Fixed
+- **`/standup deep` no longer risks checking off still-active items (#201):** checkoffs are now text-anchored to real `- [ ]` checkbox lines. Previously a drifted classifier line number could flip the *wrong* still-open item, and substring matching could corrupt a quoted-prose line that merely mentioned the item text. Targets are re-resolved by text against the file's actual unchecked checkboxes; when two distinct still-active checkboxes both match, the item is refused rather than guessed (the classifier line number is a diagnostic hint only, never used to disambiguate); and each flip is applied to an exact full-line match only.
+- **tfidf recompute on bulk churn (#235):** the corpus IDF is now recomputed after any sync that churns more than half the corpus — counting deletions and insertions together, not insertions alone. Previously a large pruning (or a large delete-and-replace) left surviving notes with stale pre-deletion IDF, skewing similarity/clustering until the next big insert.
+- `/consolidate merge <a> <a>` (self-merge) now reports a distinct `cannot merge a theme with itself` error instead of the misleading `theme(s) not found` message. (#239)
+- **Theme membership integrity (#234):** a note is now guaranteed to belong to at most one theme — reassigning a note to a different best-matching theme vacates and reconciles (note_count + centroid) its prior theme instead of silently accumulating duplicate memberships.
+
 ## [3.0.0] - 2026-06-15
 
 ### Added

@@ -28,6 +28,56 @@ _RE_MARKDOWN = re.compile(r'`([^`]*)`|\*\*([^*]*)\*\*|_([^_]*)_|\[([^\]]*)\]\([^
 
 _CHECKBOX_PREFIX_RE = re.compile(r"^\s*-\s+\[[ xX]\]\s+")
 
+
+def _normalize_item_text(s: str) -> str:
+    """Lowercase, strip a leading markdown checkbox/bullet, collapse whitespace."""
+    s = _CHECKBOX_PREFIX_RE.sub("", s)          # drop "- [ ] " / "- [x] " prefix if present
+    s = re.sub(r"^\s*[-*]\s+", "", s)           # drop a plain bullet too
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _longest_common_substring_len(a: str, b: str) -> int:
+    """Length of the longest contiguous common substring of a and b."""
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        ai = a[i - 1]
+        for j in range(1, len(b) + 1):
+            if ai == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
+_ANCHOR_MIN_CHARS = 25  # the proven workaround threshold (#201)
+# Above this length we skip the O(n*m) LCS DP entirely and fall back to exact
+# equality. A legitimate checkbox anchor never needs a >2000-char common
+# substring, and a single long no-space blob line could otherwise stall the
+# DP for ~37s per candidate (#201 round-3 review).
+_ANCHOR_MAX_CHARS = 2000
+
+
+def anchor_text_matches(line_text: str, reference_text: str, min_chars: int = _ANCHOR_MIN_CHARS) -> bool:
+    """True if line_text and reference_text share a normalized common substring >= min_chars.
+
+    Used to confirm a checkbox line really is the open item we mean to check off,
+    rather than a drifted line or quoted prose (#201)."""
+    a, b = _normalize_item_text(line_text), _normalize_item_text(reference_text)
+    # Long-input short-circuit (checked BEFORE the O(n*m) LCS DP): a legitimate
+    # checkbox anchor never needs a >2000-char common substring. Fall back to
+    # exact equality so a giant no-space blob can't stall the DP for ~37s.
+    if max(len(a), len(b)) > _ANCHOR_MAX_CHARS:
+        return a == b and bool(a)
+    # short items: require full normalized equality (can't hit the char threshold)
+    if min(len(a), len(b)) < min_chars:
+        return a == b and bool(a)
+    return _longest_common_substring_len(a, b) >= min_chars
+
 _STOPWORDS = frozenset({
     'the', 'a', 'an', 'to', 'for', 'in', 'on', 'of', 'and', 'or',
     'but', 'is', 'are', 'was', 'were', 'be', 'not', 'this', 'that',

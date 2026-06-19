@@ -9,7 +9,10 @@ import pytest
 from open_item_dedup import (
     _strip_markdown,
     _extract_distinctive_tokens,
+    _normalize_item_text,
+    _longest_common_substring_len,
     _tokenize,
+    anchor_text_matches,
     collect_open_items,
     find_duplicates,
     cascade_checkoff,
@@ -1130,3 +1133,115 @@ def test_verify_before_edit_logs_out_of_range_to_stderr(tmp_path, capsys):
     assert "verify_before_edit" in captured.err
     assert "out of range" in captured.err
     assert "99" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Text-anchor helper (#201)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_strips_checkbox_and_bullet():
+    """_normalize_item_text drops checkbox/bullet prefixes, lowercases, collapses."""
+    assert _normalize_item_text("- [ ]  Fix   the Login Handler ") == "fix the login handler"
+    assert _normalize_item_text("- [x] Done thing") == "done thing"
+    assert _normalize_item_text("* a plain bullet") == "a plain bullet"
+    assert _normalize_item_text("No prefix here") == "no prefix here"
+
+
+def test_longest_common_substring_len():
+    """LCS length is the contiguous common run, not subsequence."""
+    assert _longest_common_substring_len("abcdef", "zzcdezz") == 3  # "cde"
+    assert _longest_common_substring_len("", "abc") == 0
+    assert _longest_common_substring_len("abc", "") == 0
+    assert _longest_common_substring_len("abc", "abc") == 3
+
+
+def test_anchor_matches_minor_drift():
+    """True: same item with minor drift shares a long common substring."""
+    a = "- [ ] Refactor the authentication handler in src/auth.py for PR #99"
+    b = "Refactor the authentication handler in src/auth.py (PR #99) — followup"
+    assert anchor_text_matches(a, b) is True
+
+
+def test_anchor_rejects_different_item():
+    """False: two genuinely different items do not share a 25-char run."""
+    a = "- [ ] Refactor the authentication handler in src/auth.py"
+    b = "- [ ] Add a dashboard widget for vault statistics counts"
+    assert anchor_text_matches(a, b) is False
+
+
+def test_anchor_short_item_equality_path():
+    """Short items below the char threshold require full normalized equality."""
+    # Both normalize to "fix bug" (7 chars < 25) — equal -> True
+    assert anchor_text_matches("- [ ] Fix bug", "Fix bug") is True
+    # Different short items -> False even with some shared chars
+    assert anchor_text_matches("- [ ] Fix bug", "- [ ] Add log") is False
+    # Empty normalized text never matches
+    assert anchor_text_matches("- [ ] ", "") is False
+
+
+def test_anchor_quoted_prose_vs_checkbox():
+    """A checkbox and a prose line quoting the same item still anchor-match.
+
+    (The Guard-B resolver uses the CHECKBOX regex to exclude prose lines as
+    candidates; anchor_text_matches itself only confirms text identity.)
+    """
+    checkbox = "- [ ] Wire run_build_checkoffs into standup Step 18 pipeline"
+    prose = "**Assistant:** I'll wire run_build_checkoffs into standup Step 18 pipeline next."
+    assert anchor_text_matches(checkbox, prose) is True
+
+
+def test_anchor_lcs_boundary_24_drops_25_matches():
+    """A 24-char shared run does NOT match; a 25-char shared run DOES.
+
+    Each side is padded with DIFFERENT filler chars so the filler cannot inflate
+    the longest common substring beyond the deliberately-shared run.
+    """
+    shared_24 = "abcdefghijklmnopqrstuvwx"  # 24 chars
+    assert len(shared_24) == 24
+    a24 = "zzzzz" + shared_24 + "qqqqq"
+    b24 = "wwwww" + shared_24 + "rrrrr"
+    assert anchor_text_matches(a24, b24) is False
+
+    shared_25 = shared_24 + "y"  # 25 chars
+    assert len(shared_25) == 25
+    a25 = "zzzzz" + shared_25 + "qqqqq"
+    b25 = "wwwww" + shared_25 + "rrrrr"
+    assert anchor_text_matches(a25, b25) is True
+
+
+def test_anchor_short_item_substring_near_miss():
+    """Short items below the char threshold require full normalized equality.
+
+    "Fix bug" (7 chars) is a substring of "Fix bug now" but, being below the
+    25-char threshold, must NOT match on substring — only on full equality.
+    """
+    assert anchor_text_matches("- [ ] Fix bug", "Fix bug now") is False
+
+
+def test_anchor_long_input_is_capped_fast():
+    """A >2000-char input short-circuits the O(n*m) LCS DP via exact equality.
+
+    A `- [ ] ` checkbox line with a 40k-char no-space blob used to take ~37s
+    (one O(n*m) DP call). The _ANCHOR_MAX_CHARS cap must make this return fast,
+    and beyond the cap matching falls back to exact equality (#201 round-3).
+    """
+    import time
+
+    blob = "x" * 40_000
+    line = "- [ ] " + blob
+    ref = "y" * 40_000
+
+    # Timing guard: must return in well under 1s vs the ~37s the DP took before.
+    t = time.monotonic()
+    result = anchor_text_matches(line, ref)
+    elapsed = time.monotonic() - t
+    assert elapsed < 1.0, f"anchor_text_matches took {elapsed:.2f}s (cap not applied)"
+    assert result is False  # different blobs -> equality path -> no match
+
+    # Two IDENTICAL >2000-char normalized strings take the equality path -> True.
+    big = "z" * 5_000
+    assert anchor_text_matches(big, big) is True
+
+    # Two DIFFERENT >2000-char strings take the equality path -> False.
+    assert anchor_text_matches("a" * 5_000, "b" * 5_000) is False

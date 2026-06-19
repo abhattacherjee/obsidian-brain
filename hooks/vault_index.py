@@ -30,6 +30,7 @@ from tfidf import (  # noqa: F401  (re-export shim — callers use vault_index.<
     _compute_tfidf_vector,
     _cosine_similarity,
     _update_term_df,
+    _reverse_fold_centroid,
 )
 from themes import (  # noqa: F401  (re-export shim)
     assign_to_theme,
@@ -141,10 +142,16 @@ _REAL_PROD_DB = os.path.realpath(
     os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
 )
 
-# When a single _sync batch inserts more than this fraction of the final
-# corpus, early notes carry insertion-time IDF; recompute all vectors with
-# the final N/df. Bulk rebuild / first ingestion always trips this; steady-
-# state incremental syncs (a few notes into a large corpus) skip it.
+# When a single _sync batch churns MORE than this fraction of the final corpus
+# (inserts + deletions), the stored IDF has drifted enough to be worth an O(N)
+# recompute: inserts leave early notes carrying insertion-time IDF, and
+# deletions decrement df / shrink N so survivors carry pre-deletion IDF
+# (#235 / G-002). Above the fraction we recompute all vectors with the final
+# N/df. AT or BELOW it we deliberately do NOT — surviving notes retain their
+# pre-churn IDF by design. This is bounded staleness traded against running an
+# O(N) recompute on every small steady-state sync; it self-corrects on the next
+# bulk churn and is fixable on demand via `/vault-reindex`. Bulk rebuild / first
+# ingestion / bulk pruning trips this; small incremental syncs skip it.
 _BULK_RECOMPUTE_MIN_FRACTION = 0.5
 
 
@@ -535,17 +542,7 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
         except json.JSONDecodeError:
             centroid = {}
         new_count = count - 1
-        new_centroid: dict[str, float] = {}
-        all_terms = set(centroid) | set(note_vec)
-        for term in all_terms:
-            c_val = centroid.get(term, 0.0)
-            v_val = note_vec.get(term, 0.0)
-            # Reverse the running-average fold:
-            # old_centroid = (centroid*count - note_vec) / (count - 1)
-            new_val = (c_val * count - v_val) / new_count
-            # Prune near-zero terms to keep the centroid sparse.
-            if abs(new_val) > 1e-9:
-                new_centroid[term] = new_val
+        new_centroid = _reverse_fold_centroid(centroid, note_vec, count)
         conn.execute(
             "UPDATE themes "
             "SET centroid = ?, note_count = ?, updated_date = ? "
@@ -642,9 +639,18 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
             stats["inserted"] += 1
 
         total_after = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        # Recompute only when a single sync churns STRICTLY MORE than this
+        # fraction of the final corpus — via inserts OR deletions. Both perturb
+        # N and df: deletions decrement df (see _delete_note -> _update_term_df)
+        # and shrink N, staling survivors' IDF (#235 / G-002). stats["inserted"]
+        # already counts re-indexed updates, which also move df. At or below the
+        # fraction we skip the recompute by design: survivors keep their
+        # pre-churn IDF (bounded staleness), correctable via `/vault-reindex`.
+        # The `>` (not `>=`) is load-bearing — exactly-half must NOT fire.
+        changed = stats["inserted"] + stats["deleted"]
         if (
             total_after > 0
-            and stats["inserted"] > total_after * _BULK_RECOMPUTE_MIN_FRACTION
+            and changed > total_after * _BULK_RECOMPUTE_MIN_FRACTION
         ):
             _recompute_all_tfidf_vectors(conn)
             stats["recomputed"] = total_after

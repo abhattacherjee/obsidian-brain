@@ -126,12 +126,24 @@ def run_stats() -> None:
         nudge = int(config.get("consolidate_unassigned_threshold", 50))
         if st["unassigned"] > nudge:
             print(f"NUDGE unassigned={st['unassigned']} exceeds {nudge}; run /consolidate")
+        # Oversized themes are by definition among the largest, so the top-5 `largest`
+        # list covers them unless more than five themes simultaneously exceed the cap,
+        # in which case the rest surface on the next `stats` run after splitting. No
+        # extra DB query needed.
+        max_size = int(config.get("consolidate_max_theme_size", 120))
+        for t in st["largest"]:
+            if t["note_count"] > max_size:
+                print(f"WARN theme id={t['id']} has {t['note_count']} members (>{max_size} soft cap)")
+                print(f"  -> consider: /consolidate split {t['id']}")
     except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         sys.exit(1)
 
 
 def run_merge(a: int, b: int) -> None:
+    if a == b:
+        print(f"ERROR cannot merge a theme with itself a={a}")
+        return
     db = _default_db_path()
     try:
         ok = themes.merge_themes(db, a, b, _now_iso())
