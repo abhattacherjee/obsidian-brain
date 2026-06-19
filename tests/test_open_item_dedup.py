@@ -9,7 +9,10 @@ import pytest
 from open_item_dedup import (
     _strip_markdown,
     _extract_distinctive_tokens,
+    _normalize_item_text,
+    _longest_common_substring_len,
     _tokenize,
+    anchor_text_matches,
     collect_open_items,
     find_duplicates,
     cascade_checkoff,
@@ -1130,3 +1133,59 @@ def test_verify_before_edit_logs_out_of_range_to_stderr(tmp_path, capsys):
     assert "verify_before_edit" in captured.err
     assert "out of range" in captured.err
     assert "99" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Text-anchor helper (#201)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_strips_checkbox_and_bullet():
+    """_normalize_item_text drops checkbox/bullet prefixes, lowercases, collapses."""
+    assert _normalize_item_text("- [ ]  Fix   the Login Handler ") == "fix the login handler"
+    assert _normalize_item_text("- [x] Done thing") == "done thing"
+    assert _normalize_item_text("* a plain bullet") == "a plain bullet"
+    assert _normalize_item_text("No prefix here") == "no prefix here"
+
+
+def test_longest_common_substring_len():
+    """LCS length is the contiguous common run, not subsequence."""
+    assert _longest_common_substring_len("abcdef", "zzcdezz") == 3  # "cde"
+    assert _longest_common_substring_len("", "abc") == 0
+    assert _longest_common_substring_len("abc", "") == 0
+    assert _longest_common_substring_len("abc", "abc") == 3
+
+
+def test_anchor_matches_minor_drift():
+    """True: same item with minor drift shares a long common substring."""
+    a = "- [ ] Refactor the authentication handler in src/auth.py for PR #99"
+    b = "Refactor the authentication handler in src/auth.py (PR #99) — followup"
+    assert anchor_text_matches(a, b) is True
+
+
+def test_anchor_rejects_different_item():
+    """False: two genuinely different items do not share a 25-char run."""
+    a = "- [ ] Refactor the authentication handler in src/auth.py"
+    b = "- [ ] Add a dashboard widget for vault statistics counts"
+    assert anchor_text_matches(a, b) is False
+
+
+def test_anchor_short_item_equality_path():
+    """Short items below the char threshold require full normalized equality."""
+    # Both normalize to "fix bug" (7 chars < 25) — equal -> True
+    assert anchor_text_matches("- [ ] Fix bug", "Fix bug") is True
+    # Different short items -> False even with some shared chars
+    assert anchor_text_matches("- [ ] Fix bug", "- [ ] Add log") is False
+    # Empty normalized text never matches
+    assert anchor_text_matches("- [ ] ", "") is False
+
+
+def test_anchor_quoted_prose_vs_checkbox():
+    """A checkbox and a prose line quoting the same item still anchor-match.
+
+    (The Guard-B resolver uses the CHECKBOX regex to exclude prose lines as
+    candidates; anchor_text_matches itself only confirms text identity.)
+    """
+    checkbox = "- [ ] Wire run_build_checkoffs into standup Step 18 pipeline"
+    prose = "**Assistant:** I'll wire run_build_checkoffs into standup Step 18 pipeline next."
+    assert anchor_text_matches(checkbox, prose) is True
