@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `/consolidate merge <a> <a>` (self-merge) now reports a distinct `cannot merge a theme with itself` error instead of the misleading `theme(s) not found` message. (#239)
+- **Theme membership integrity (#234):** a note is now guaranteed to belong to at most one theme — reassigning a note to a different best-matching theme vacates and reconciles (note_count + centroid) its prior theme instead of silently accumulating duplicate memberships.
 
 ## [3.0.0] - 2026-06-15
 
