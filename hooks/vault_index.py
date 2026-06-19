@@ -141,12 +141,16 @@ _REAL_PROD_DB = os.path.realpath(
     os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
 )
 
-# When a single _sync batch inserts or deletes more than this fraction of the
-# final corpus, the stored IDF goes stale: inserts leave early notes carrying
-# insertion-time IDF, and deletions decrement df / shrink N so survivors carry
-# pre-deletion IDF (#235 / G-002). Either way, recompute all vectors with the
-# final N/df. Bulk rebuild / first ingestion / bulk pruning always trips this;
-# steady-state incremental syncs (a few notes into a large corpus) skip it.
+# When a single _sync batch churns MORE than this fraction of the final corpus
+# (inserts + deletions), the stored IDF has drifted enough to be worth an O(N)
+# recompute: inserts leave early notes carrying insertion-time IDF, and
+# deletions decrement df / shrink N so survivors carry pre-deletion IDF
+# (#235 / G-002). Above the fraction we recompute all vectors with the final
+# N/df. AT or BELOW it we deliberately do NOT — surviving notes retain their
+# pre-churn IDF by design. This is bounded staleness traded against running an
+# O(N) recompute on every small steady-state sync; it self-corrects on the next
+# bulk churn and is fixable on demand via `/vault-reindex`. Bulk rebuild / first
+# ingestion / bulk pruning trips this; small incremental syncs skip it.
 _BULK_RECOMPUTE_MIN_FRACTION = 0.5
 
 
@@ -644,11 +648,14 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
             stats["inserted"] += 1
 
         total_after = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
-        # Recompute when a single sync churns more than this fraction of the
-        # final corpus — via inserts OR deletions. Both perturb N and df:
-        # deletions decrement df (see _delete_note -> _update_term_df) and
-        # shrink N, staling survivors' IDF (#235 / G-002). stats["inserted"]
-        # already counts re-indexed updates, which also move df.
+        # Recompute only when a single sync churns STRICTLY MORE than this
+        # fraction of the final corpus — via inserts OR deletions. Both perturb
+        # N and df: deletions decrement df (see _delete_note -> _update_term_df)
+        # and shrink N, staling survivors' IDF (#235 / G-002). stats["inserted"]
+        # already counts re-indexed updates, which also move df. At or below the
+        # fraction we skip the recompute by design: survivors keep their
+        # pre-churn IDF (bounded staleness), correctable via `/vault-reindex`.
+        # The `>` (not `>=`) is load-bearing — exactly-half must NOT fire.
         changed = stats["inserted"] + stats["deleted"]
         if (
             total_after > 0

@@ -395,7 +395,6 @@ def test_sync_recompute_on_combined_churn_boundary(tmp_path):
     stats2 = vault_index._sync(conn, str(vault), ["claude-sessions"])
     conn.close()
 
-    total = stats2.get("recomputed")  # noqa: F841  (referenced below)
     assert stats2["deleted"] == 3, f"expected 3 deleted: {stats2}"
     assert stats2["inserted"] == 3, f"expected 3 inserted: {stats2}"
     # 3 alone would NOT trip (3 < 10*0.5=5); combined 6 > 5 does.
@@ -404,5 +403,167 @@ def test_sync_recompute_on_combined_churn_boundary(tmp_path):
     )
     assert stats2["recomputed"] > 0, (
         f"Expected recomputed > 0 on combined churn (3 ins + 3 del of 10), "
+        f"got: {stats2}"
+    )
+
+
+def test_sync_no_recompute_at_exact_half_threshold(tmp_path):
+    """Landing EXACTLY on changed == total_after * 0.5 must NOT recompute.
+
+    Pins the strict `>` operator (not `>=`). Deletion-only construction:
+    index 9 notes, delete 3 -> total_after=6, deleted=3, inserted=0, so
+    changed == 3 == 6 * 0.5 exactly. With `>`, 3 > 3.0 is False -> skip.
+    If the guard were `>=`, this would fire and the assert below would fail.
+    """
+    vault = tmp_path / "vault"
+    sess = vault / "claude-sessions"
+    bodies = {f"note{i:02d}.md": f"term{i} common extra shared" for i in range(9)}
+    for name, body in bodies.items():
+        _write_note(sess, name, body)
+
+    db = str(tmp_path / "v.db")
+    conn = vault_index._connect(db)
+    vault_index._init_schema(conn)
+    stats1 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+    assert stats1["inserted"] == 9, f"expected 9 inserted: {stats1}"
+
+    # Delete exactly 3 -> total_after=6, changed=3, 3 == 6 * 0.5 exactly.
+    for i in range(3):
+        (sess / f"note{i:02d}.md").unlink()
+
+    conn = vault_index._connect(db)
+    stats2 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+
+    assert stats2["deleted"] == 3, f"expected 3 deleted: {stats2}"
+    assert stats2["inserted"] == 0, f"expected 0 inserted: {stats2}"
+    # Confirm we landed exactly on the boundary (guards against drift).
+    total_after = 6
+    changed = stats2["inserted"] + stats2["deleted"]
+    assert changed == total_after * vault_index._BULK_RECOMPUTE_MIN_FRACTION, (
+        f"precondition: changed ({changed}) must equal exactly half of "
+        f"total_after ({total_after})"
+    )
+    assert stats2["recomputed"] == 0, (
+        f"Strict `>` must NOT fire at exactly half (changed == total_after*0.5); "
+        f"got recomputed={stats2['recomputed']}. If this fails, the guard is "
+        f"`>=` not `>`."
+    )
+
+
+def test_sync_recompute_just_over_half_threshold(tmp_path):
+    """One unit past exact half DOES recompute (sibling to the boundary test).
+
+    Index 10 notes, delete 4 -> total_after=6, changed=4, 4 > 6 * 0.5 = 3.0
+    -> fires. This is the near-twin that proves the threshold is live just
+    above the exact-half point pinned by the sibling test.
+    """
+    vault = tmp_path / "vault"
+    sess = vault / "claude-sessions"
+    bodies = {f"note{i:02d}.md": f"term{i} common extra shared" for i in range(10)}
+    for name, body in bodies.items():
+        _write_note(sess, name, body)
+
+    db = str(tmp_path / "v.db")
+    conn = vault_index._connect(db)
+    vault_index._init_schema(conn)
+    stats1 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+    assert stats1["inserted"] == 10, f"expected 10 inserted: {stats1}"
+
+    # Delete 4 -> total_after=6, changed=4 = 6*0.5 + 1, just over the boundary.
+    for i in range(4):
+        (sess / f"note{i:02d}.md").unlink()
+
+    conn = vault_index._connect(db)
+    stats2 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+
+    assert stats2["deleted"] == 4, f"expected 4 deleted: {stats2}"
+    total_after = 6
+    changed = stats2["inserted"] + stats2["deleted"]
+    assert changed == total_after * vault_index._BULK_RECOMPUTE_MIN_FRACTION + 1, (
+        f"precondition: changed ({changed}) must be exactly one over half of "
+        f"total_after ({total_after})"
+    )
+    assert stats2["recomputed"] > 0, (
+        f"Expected recomputed > 0 just over the half threshold, got: {stats2}"
+    )
+
+
+def test_sync_delete_all_notes_no_recompute_no_error(tmp_path):
+    """Deleting EVERY indexed note (total_after == 0) is a clean no-op recompute.
+
+    The `total_after > 0` guard short-circuits the trigger, so no recompute
+    runs (recomputing over an empty corpus would be meaningless/division-prone).
+    Also confirms no orphan term_df rows survive a full wipe.
+    """
+    vault = tmp_path / "vault"
+    sess = vault / "claude-sessions"
+    n = 6
+    bodies = {f"note{i:02d}.md": f"term{i} common extra shared" for i in range(n)}
+    for name, body in bodies.items():
+        _write_note(sess, name, body)
+
+    db = str(tmp_path / "v.db")
+    conn = vault_index._connect(db)
+    vault_index._init_schema(conn)
+    stats1 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+    assert stats1["inserted"] == n, f"expected {n} inserted: {stats1}"
+
+    # Delete ALL note files from disk.
+    for name in bodies:
+        (sess / name).unlink()
+
+    conn = vault_index._connect(db)
+    stats2 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    # No exception means the empty-corpus path is safe.
+    note_count = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    df_count = conn.execute("SELECT COUNT(*) FROM term_df").fetchone()[0]
+    conn.close()
+
+    assert stats2["deleted"] == n, f"expected {n} deleted: {stats2}"
+    assert stats2["recomputed"] == 0, (
+        f"Expected recomputed=0 when total_after==0, got: {stats2}"
+    )
+    assert note_count == 0, f"expected 0 notes after full delete, got {note_count}"
+    assert df_count == 0, (
+        f"expected 0 term_df rows after full delete (orphan df), got {df_count}"
+    )
+
+
+def test_sync_small_mixed_churn_no_recompute(tmp_path):
+    """Steady-state mixed churn (delete 1 + add 1 in a ~10-note corpus) skips.
+
+    changed = inserted(1) + deleted(1) = 2, well under 50% of total_after=10.
+    Locks in that counting deletions toward the trigger did not introduce a
+    spurious recompute on the realistic mixed incremental path.
+    """
+    vault = tmp_path / "vault"
+    sess = vault / "claude-sessions"
+    for i in range(10):
+        _write_note(sess, f"seed{i:02d}.md", f"seedterm{i} common shared body")
+
+    db = str(tmp_path / "v.db")
+    conn = vault_index._connect(db)
+    vault_index._init_schema(conn)
+    stats1 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+    assert stats1["inserted"] == 10, f"expected 10 inserted: {stats1}"
+
+    # Delete 1, add 1. Final corpus stays at 10; changed = 2.
+    (sess / "seed00.md").unlink()
+    _write_note(sess, "fresh00.md", "freshterm common shared body")
+
+    conn = vault_index._connect(db)
+    stats2 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+
+    assert stats2["deleted"] == 1, f"expected 1 deleted: {stats2}"
+    assert stats2["inserted"] == 1, f"expected 1 inserted: {stats2}"
+    assert stats2["recomputed"] == 0, (
+        f"Expected recomputed=0 on small mixed churn (changed=2 of 10), "
         f"got: {stats2}"
     )
