@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-06-19
+
 ### Added
 - `/consolidate stats` now flags themes whose size exceeds a soft cap (`consolidate_max_theme_size`, default 120) and suggests `/consolidate split <id>`. Clustering output is unchanged. (#238)
 
