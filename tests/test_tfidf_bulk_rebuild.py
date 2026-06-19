@@ -246,3 +246,163 @@ def test_sync_incremental_skip_no_recompute(tmp_path):
     assert row2[0] == vec_before, (
         "note00.md tfidf_vector changed between syncs despite recomputed=0"
     )
+
+
+def _write_note(folder, name, body):
+    """Write a single session note file with varied-token body."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / name).write_text(
+        f"---\ntype: session\nproject: p\ndate: 2026-06-15\n"
+        f"title: {name}\n---\n\n{body}\n"
+    )
+
+
+def _assert_survivors_match_final_corpus(db):
+    """Oracle: every stored tfidf_vector equals a fresh recompute against the
+    FINAL corpus N and df. Proves survivors are not stale post-deletion."""
+    conn = vault_index._connect(db)
+    total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    full_df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+    rows = conn.execute(
+        "SELECT path, title, tags, body, tfidf_vector FROM notes"
+    ).fetchall()
+    conn.close()
+
+    for path, title, tags, body, vec_json in rows:
+        tokens = vault_index._tokenize_for_tfidf(
+            " ".join([title or "", tags or "", body or ""])
+        )
+        expected = vault_index._compute_tfidf_vector(tokens, full_df, total, top_k=50)
+        actual = json.loads(vec_json) if vec_json else {}
+        name = path.split("/")[-1]
+        assert actual == expected, (
+            f"{name}: stored vector doesn't match final-corpus recompute "
+            f"(survivor is STALE): {actual} != {expected}"
+        )
+    return total
+
+
+def test_sync_triggers_recompute_on_bulk_deletion(tmp_path):
+    """_sync recomputes when deletions exceed 50% of the final corpus (#235).
+
+    Deleting survivors' peers decrements df and shrinks N; without a recompute,
+    survivors retain pre-deletion (stale) IDF. We build an 8-note corpus with
+    varied tokens, index it, delete 5 files (>50%), re-sync, and assert both
+    that recompute fired AND that survivors match a final-corpus oracle.
+    """
+    vault = tmp_path / "vault"
+    sess = vault / "claude-sessions"
+    # 8 notes; varied tokens so df differs across terms and IDF actually shifts
+    # when half the corpus is removed.
+    bodies = {
+        "n0.md": "alpha alpha beta common shared",
+        "n1.md": "beta gamma common shared rare1",
+        "n2.md": "gamma delta common common shared",
+        "n3.md": "delta epsilon common shared rare2",
+        "n4.md": "epsilon zeta common shared",
+        "n5.md": "zeta eta common shared rare3",
+        "n6.md": "eta theta common common shared",
+        "n7.md": "theta alpha common shared rare4",
+    }
+    for name, body in bodies.items():
+        _write_note(sess, name, body)
+
+    db = str(tmp_path / "v.db")
+    conn = vault_index._connect(db)
+    vault_index._init_schema(conn)
+    # Baseline: index all 8 (may trip the insert recompute — fine, establishes
+    # a clean state where stored vectors match the full 8-note corpus).
+    stats1 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+    assert stats1["inserted"] == 8, f"expected 8 inserted: {stats1}"
+
+    # Delete 5 of 8 note files (>50% of the final corpus of 3).
+    for name in ("n0.md", "n1.md", "n2.md", "n3.md", "n4.md"):
+        (sess / name).unlink()
+
+    conn = vault_index._connect(db)
+    stats2 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+
+    assert stats2["deleted"] == 5, f"expected 5 deleted: {stats2}"
+    assert stats2["recomputed"] > 0, (
+        f"Expected recomputed > 0 on bulk deletion (5 of 8 removed), got: {stats2}"
+    )
+
+    # Meaningful, non-vacuous oracle: survivors must match the FINAL 3-note
+    # corpus N/df, proving they were not left with pre-deletion IDF.
+    total = _assert_survivors_match_final_corpus(db)
+    assert total == 3, f"expected 3 survivors, got {total}"
+
+
+def test_sync_no_recompute_on_small_deletion(tmp_path):
+    """Deleting 1 of 11 notes (<50%) does not trip the recompute."""
+    vault = tmp_path / "vault"
+    sess = vault / "claude-sessions"
+    bodies = {f"note{i:02d}.md": f"term{i} common extra shared" for i in range(11)}
+    for name, body in bodies.items():
+        _write_note(sess, name, body)
+
+    db = str(tmp_path / "v.db")
+    conn = vault_index._connect(db)
+    vault_index._init_schema(conn)
+    stats1 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+    assert stats1["inserted"] == 11, f"expected 11 inserted: {stats1}"
+
+    # Delete just 1 note (1/11 ~= 9% < 50%).
+    (sess / "note00.md").unlink()
+
+    conn = vault_index._connect(db)
+    stats2 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+
+    assert stats2["deleted"] == 1, f"expected 1 deleted: {stats2}"
+    assert stats2["inserted"] == 0, f"expected 0 inserted: {stats2}"
+    assert stats2["recomputed"] == 0, (
+        f"Expected recomputed=0 (1 of 11 deleted < 50% threshold), got: {stats2}"
+    )
+
+
+def test_sync_recompute_on_combined_churn_boundary(tmp_path):
+    """Neither inserts nor deletes alone exceed 50%, but their SUM does.
+
+    Final corpus = 10 notes. We delete 3 existing notes and add 3 new ones in
+    one sync: inserted=3, deleted=3, total_after=10. 3 alone is < 5 (50% of 10),
+    but 3+3=6 > 5 trips the combined-churn trigger. Locks in that the trigger
+    keys off inserted+deleted, not either in isolation.
+    """
+    vault = tmp_path / "vault"
+    sess = vault / "claude-sessions"
+    # Seed 10 notes.
+    for i in range(10):
+        _write_note(sess, f"seed{i:02d}.md", f"seedterm{i} common shared body")
+
+    db = str(tmp_path / "v.db")
+    conn = vault_index._connect(db)
+    vault_index._init_schema(conn)
+    stats1 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+    assert stats1["inserted"] == 10, f"expected 10 inserted: {stats1}"
+
+    # Delete 3 seed notes, add 3 brand-new notes. Final corpus stays at 10.
+    for i in range(3):
+        (sess / f"seed{i:02d}.md").unlink()
+    for i in range(3):
+        _write_note(sess, f"fresh{i:02d}.md", f"freshterm{i} common shared body")
+
+    conn = vault_index._connect(db)
+    stats2 = vault_index._sync(conn, str(vault), ["claude-sessions"])
+    conn.close()
+
+    total = stats2.get("recomputed")  # noqa: F841  (referenced below)
+    assert stats2["deleted"] == 3, f"expected 3 deleted: {stats2}"
+    assert stats2["inserted"] == 3, f"expected 3 inserted: {stats2}"
+    # 3 alone would NOT trip (3 < 10*0.5=5); combined 6 > 5 does.
+    assert not (3 > 10 * vault_index._BULK_RECOMPUTE_MIN_FRACTION), (
+        "precondition: inserts alone must be below threshold"
+    )
+    assert stats2["recomputed"] > 0, (
+        f"Expected recomputed > 0 on combined churn (3 ins + 3 del of 10), "
+        f"got: {stats2}"
+    )

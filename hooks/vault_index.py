@@ -141,10 +141,12 @@ _REAL_PROD_DB = os.path.realpath(
     os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
 )
 
-# When a single _sync batch inserts more than this fraction of the final
-# corpus, early notes carry insertion-time IDF; recompute all vectors with
-# the final N/df. Bulk rebuild / first ingestion always trips this; steady-
-# state incremental syncs (a few notes into a large corpus) skip it.
+# When a single _sync batch inserts or deletes more than this fraction of the
+# final corpus, the stored IDF goes stale: inserts leave early notes carrying
+# insertion-time IDF, and deletions decrement df / shrink N so survivors carry
+# pre-deletion IDF (#235 / G-002). Either way, recompute all vectors with the
+# final N/df. Bulk rebuild / first ingestion / bulk pruning always trips this;
+# steady-state incremental syncs (a few notes into a large corpus) skip it.
 _BULK_RECOMPUTE_MIN_FRACTION = 0.5
 
 
@@ -642,9 +644,15 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
             stats["inserted"] += 1
 
         total_after = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        # Recompute when a single sync churns more than this fraction of the
+        # final corpus — via inserts OR deletions. Both perturb N and df:
+        # deletions decrement df (see _delete_note -> _update_term_df) and
+        # shrink N, staling survivors' IDF (#235 / G-002). stats["inserted"]
+        # already counts re-indexed updates, which also move df.
+        changed = stats["inserted"] + stats["deleted"]
         if (
             total_after > 0
-            and stats["inserted"] > total_after * _BULK_RECOMPUTE_MIN_FRACTION
+            and changed > total_after * _BULK_RECOMPUTE_MIN_FRACTION
         ):
             _recompute_all_tfidf_vectors(conn)
             stats["recomputed"] = total_after
