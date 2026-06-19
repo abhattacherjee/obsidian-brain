@@ -12,7 +12,7 @@ import sqlite3
 import sys
 from datetime import date
 
-from tfidf import _cosine_similarity, _TOKEN_RE
+from tfidf import _cosine_similarity, _TOKEN_RE, _reverse_fold_centroid
 
 _THEME_SIMILARITY_THRESHOLD = 0.3
 
@@ -308,14 +308,7 @@ def assign_to_theme(
                 except json.JSONDecodeError:
                     old_centroid = {}
                 new_count = old_count - 1
-                new_centroid: dict[str, float] = {}
-                all_terms = set(old_centroid) | set(note_vec)
-                for term in all_terms:
-                    c_val = old_centroid.get(term, 0.0)
-                    v_val = note_vec.get(term, 0.0)
-                    new_val = (c_val * old_count - v_val) / new_count
-                    if abs(new_val) > 1e-9:
-                        new_centroid[term] = new_val
+                new_centroid = _reverse_fold_centroid(old_centroid, note_vec, old_count)
                 conn.execute(
                     "UPDATE themes "
                     "SET centroid = ?, note_count = ?, updated_date = ? "
