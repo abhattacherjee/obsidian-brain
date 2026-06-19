@@ -298,9 +298,8 @@ def test_split_noop_when_cohesive(db, capsys):
 
 def test_stats_flags_oversized_theme(tmp_vault, monkeypatch, capsys):
     """WARN + split suggestion printed when a theme has note_count > cap."""
-    import vault_index as _vi
     p = str(tmp_vault / "c.db")
-    _vi.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
+    vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", p)
     monkeypatch.setattr(
         consolidate_cli, "load_config",
@@ -324,9 +323,8 @@ def test_stats_flags_oversized_theme(tmp_vault, monkeypatch, capsys):
 
 def test_stats_silent_at_cap_boundary(tmp_vault, monkeypatch, capsys):
     """No WARN when note_count is exactly at the cap — boundary is strict >."""
-    import vault_index as _vi
     p = str(tmp_vault / "c.db")
-    _vi.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
+    vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", p)
     monkeypatch.setattr(
         consolidate_cli, "load_config",
@@ -349,9 +347,8 @@ def test_stats_silent_at_cap_boundary(tmp_vault, monkeypatch, capsys):
 
 def test_stats_flags_multiple_oversized_themes(tmp_vault, monkeypatch, capsys):
     """WARN is printed for every oversized theme, not just the first one found."""
-    import vault_index as _vi
     p = str(tmp_vault / "c.db")
-    _vi.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
+    vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", p)
     monkeypatch.setattr(
         consolidate_cli, "load_config",
