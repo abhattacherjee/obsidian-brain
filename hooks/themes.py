@@ -308,18 +308,19 @@ def assign_to_theme(
                 except json.JSONDecodeError:
                     old_centroid = {}
                 new_count = old_count - 1
-                refolded: dict[str, float] = {}
-                for term in set(old_centroid) | set(note_vec):
+                new_centroid: dict[str, float] = {}
+                all_terms = set(old_centroid) | set(note_vec)
+                for term in all_terms:
                     c_val = old_centroid.get(term, 0.0)
                     v_val = note_vec.get(term, 0.0)
-                    nv = (c_val * old_count - v_val) / new_count
-                    if abs(nv) > 1e-9:
-                        refolded[term] = nv
+                    new_val = (c_val * old_count - v_val) / new_count
+                    if abs(new_val) > 1e-9:
+                        new_centroid[term] = new_val
                 conn.execute(
                     "UPDATE themes "
                     "SET centroid = ?, note_count = ?, updated_date = ? "
                     "WHERE id = ?",
-                    (json.dumps(refolded, separators=(",", ":")),
+                    (json.dumps(new_centroid, separators=(",", ":")),
                      new_count, today, old_id),
                 )
                 conn.execute(
