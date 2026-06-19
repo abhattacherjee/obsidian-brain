@@ -352,6 +352,233 @@ class TestAssignToTheme:
             "centroid term set changed on reassignment"
         )
 
+    def test_reassignment_to_new_best_theme_removes_old_membership(self, tmp_vault):
+        """#234: when a note's best theme changes across calls, the prior
+        membership must be vacated so the note belongs to at most one theme.
+
+        Sole-member case: the vacated theme had only this note, so it must be
+        dropped entirely (mirroring _delete_note's count<=1 branch).
+        """
+        path = _indexed_note(tmp_vault, "single", "retrieval scoring",
+                             "retrieval scoring activation importance")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
+        ).fetchone()[0])
+        # Theme B is seeded FIRST (lower rowid) with a non-matching centroid so
+        # the first assign goes to ThemeA, then B's centroid is updated to the
+        # note's exact vector before the second assign. With B at the lower
+        # rowid, the strict `sim > best` tie-break makes B win the second call —
+        # avoiding the cosine-1.0 tie that arises once ThemeA's sole-member
+        # centroid collapses to exactly `vec`.
+        cur = conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ThemeB", "", json.dumps({"zzz_unrelated_term": 1.0}), 1,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_b = cur.lastrowid
+        # Theme A: uniform centroid over the note's terms — a moderate cosine
+        # match. count 0 so the first assign makes the note its sole member.
+        seed_a = {t: 0.5 for t in vec}
+        cur = conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ThemeA", "", json.dumps(seed_a), 0,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_a = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        # First assign: note joins ThemeA (ThemeB shares no term → not a candidate).
+        result1 = vault_index.assign_to_theme(db_path, path, project="proj")
+        assert result1 is not None
+        assert result1["theme_id"] == theme_a
+
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT theme_id FROM theme_members WHERE note_path = ?", (path,)
+        ).fetchall()
+        assert len(rows) == 1 and rows[0][0] == theme_a
+        # Promote ThemeB to the note's exact vector → cosine ~1.0, now the best
+        # match (and lower rowid, so it wins the tie against ThemeA's centroid).
+        conn.execute(
+            "UPDATE themes SET centroid = ? WHERE id = ?",
+            (json.dumps(vec), theme_b),
+        )
+        conn.commit()
+        conn.close()
+
+        # Second assign: best is now ThemeB; ThemeA membership must be vacated.
+        result2 = vault_index.assign_to_theme(db_path, path, project="proj")
+        assert result2 is not None
+        assert result2["theme_id"] == theme_b
+
+        conn = sqlite3.connect(db_path)
+        n_members = conn.execute(
+            "SELECT COUNT(*) FROM theme_members WHERE note_path = ?", (path,)
+        ).fetchone()[0]
+        surviving = conn.execute(
+            "SELECT theme_id FROM theme_members WHERE note_path = ?", (path,)
+        ).fetchall()
+        n_theme_a = conn.execute(
+            "SELECT COUNT(*) FROM themes WHERE id = ?", (theme_a,)
+        ).fetchone()[0]
+        conn.close()
+
+        assert n_members == 1, (
+            f"note belongs to {n_members} themes — single-membership violated (#234)"
+        )
+        assert surviving[0][0] == theme_b, "surviving membership should be ThemeB"
+        assert n_theme_a == 0, (
+            "ThemeA was sole-member and should have been dropped when vacated"
+        )
+
+    def test_reassignment_decrements_and_refolds_multimember_old_theme(self, tmp_vault):
+        """#234: vacating a multi-member old theme must decrement its
+        note_count and reverse-fold the note's vector out of its centroid —
+        exactly like _delete_note — instead of leaving it overcounted/drifted.
+        """
+        path = _indexed_note(tmp_vault, "multi", "retrieval scoring",
+                             "retrieval scoring activation importance")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
+        ).fetchone()[0])
+        # Theme A: a multi-member theme (count=3) whose centroid folds in the
+        # note's contribution. Build it so the note is one of three members.
+        seed_a = {t: 0.5 for t in vec}
+        cur = conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ThemeA", "", json.dumps(seed_a), 3,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_a = cur.lastrowid
+        # Pre-INSERT the target note as a member of ThemeA.
+        conn.execute(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, surprise, added_date) "
+            "VALUES (?, ?, 0.5, 0.0, ?)",
+            (theme_a, path, "2026-04-16"),
+        )
+        # Theme B: centroid == the note's exact vector → the best match.
+        cur = conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ThemeB", "", json.dumps(vec), 0,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_b = cur.lastrowid
+        centroid_a_before = dict(seed_a)
+        conn.commit()
+        conn.close()
+
+        # Reassign: best is ThemeB; ThemeA must be vacated but survive.
+        result = vault_index.assign_to_theme(db_path, path, project="proj")
+        assert result is not None
+        assert result["theme_id"] == theme_b
+
+        conn = sqlite3.connect(db_path)
+        members = conn.execute(
+            "SELECT theme_id FROM theme_members WHERE note_path = ?", (path,)
+        ).fetchall()
+        a_count, a_centroid_json = conn.execute(
+            "SELECT note_count, centroid FROM themes WHERE id = ?", (theme_a,)
+        ).fetchone()
+        conn.close()
+
+        assert len(members) == 1 and members[0][0] == theme_b, (
+            f"note should have exactly one membership (ThemeB), got {members}"
+        )
+        assert a_count == 2, (
+            f"ThemeA note_count should decrement 3→2, got {a_count} — stale overcount"
+        )
+        a_centroid_after = json.loads(a_centroid_json)
+        assert a_centroid_after != centroid_a_before, (
+            "ThemeA centroid should be reverse-folded (note's contribution removed), "
+            "not left stale"
+        )
+
+    def test_reassignment_vacates_orphan_and_malformed_old_themes(self, tmp_vault):
+        """#234 defensive paths: a stale membership row may point at a theme
+        whose row is gone (orphan) or whose centroid is unparseable. Both must
+        be vacated without raising, leaving the note in exactly the new theme.
+        """
+        path = _indexed_note(tmp_vault, "orphan", "retrieval scoring",
+                             "retrieval scoring activation importance")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
+        ).fetchone()[0])
+        # Orphan membership: a theme_members row pointing at a theme id that has
+        # no themes row (exercises the `if not old:` branch).
+        conn.execute(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, surprise, added_date) "
+            "VALUES (999, ?, 0.5, 0.0, ?)",
+            (path, "2026-04-16"),
+        )
+        # Malformed old theme: exists, multi-member, but centroid is not valid
+        # JSON (exercises the json.JSONDecodeError branch → old_centroid = {}).
+        cur = conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ThemeBad", "", "{not valid json", 3,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_bad = cur.lastrowid
+        conn.execute(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, surprise, added_date) "
+            "VALUES (?, ?, 0.5, 0.0, ?)",
+            (theme_bad, path, "2026-04-16"),
+        )
+        # Theme B: centroid == the note's exact vector → the best match.
+        cur = conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ThemeB", "", json.dumps(vec), 0,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_b = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        result = vault_index.assign_to_theme(db_path, path, project="proj")
+        assert result is not None
+        assert result["theme_id"] == theme_b
+
+        conn = sqlite3.connect(db_path)
+        members = conn.execute(
+            "SELECT theme_id FROM theme_members WHERE note_path = ?", (path,)
+        ).fetchall()
+        bad_count = conn.execute(
+            "SELECT note_count FROM themes WHERE id = ?", (theme_bad,)
+        ).fetchone()[0]
+        conn.close()
+
+        assert len(members) == 1 and members[0][0] == theme_b, (
+            f"orphan + malformed memberships should be vacated, got {members}"
+        )
+        # The malformed theme survives (count was 3) and decrements to 2.
+        assert bad_count == 2, (
+            f"malformed-centroid theme should decrement 3→2, got {bad_count}"
+        )
+
     def test_cross_project_theme_candidate(self, tmp_vault):
         """A theme with project=NULL should be a valid candidate for any project."""
         path = _indexed_note(tmp_vault, "cross", "retrieval scoring",

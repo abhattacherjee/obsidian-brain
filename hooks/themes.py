@@ -272,6 +272,62 @@ def assign_to_theme(
                 # Centroid unchanged on reassignment — same as old impl.
                 effective_centroid = centroid
 
+            # Enforce single-theme membership (#234): a note belongs to at
+            # most one theme. If a prior call assigned it to a different best
+            # theme, vacate that membership and reconcile the old theme's
+            # note_count + centroid exactly as _delete_note does — a bare
+            # DELETE would leave the old theme overcounted and its centroid
+            # drifted (rebuild_index recomputes count but not centroids).
+            stale = conn.execute(
+                "SELECT theme_id FROM theme_members "
+                "WHERE note_path = ? AND theme_id <> ?",
+                (note_path, theme_id),
+            ).fetchall()
+            for s in stale:
+                old_id = s["theme_id"]
+                old = conn.execute(
+                    "SELECT centroid, note_count FROM themes WHERE id = ?",
+                    (old_id,),
+                ).fetchone()
+                if not old:
+                    conn.execute(
+                        "DELETE FROM theme_members "
+                        "WHERE theme_id = ? AND note_path = ?",
+                        (old_id, note_path),
+                    )
+                    continue
+                old_count = old["note_count"] or 0
+                if old_count <= 1:
+                    conn.execute(
+                        "DELETE FROM theme_members WHERE theme_id = ?", (old_id,)
+                    )
+                    conn.execute("DELETE FROM themes WHERE id = ?", (old_id,))
+                    continue
+                try:
+                    old_centroid = json.loads(old["centroid"]) if old["centroid"] else {}
+                except json.JSONDecodeError:
+                    old_centroid = {}
+                new_count = old_count - 1
+                refolded: dict[str, float] = {}
+                for term in set(old_centroid) | set(note_vec):
+                    c_val = old_centroid.get(term, 0.0)
+                    v_val = note_vec.get(term, 0.0)
+                    nv = (c_val * old_count - v_val) / new_count
+                    if abs(nv) > 1e-9:
+                        refolded[term] = nv
+                conn.execute(
+                    "UPDATE themes "
+                    "SET centroid = ?, note_count = ?, updated_date = ? "
+                    "WHERE id = ?",
+                    (json.dumps(refolded, separators=(",", ":")),
+                     new_count, today, old_id),
+                )
+                conn.execute(
+                    "DELETE FROM theme_members "
+                    "WHERE theme_id = ? AND note_path = ?",
+                    (old_id, note_path),
+                )
+
             # Preserve surprise + added_date on reassignment — only
             # similarity is refreshed from the latest cosine computation.
             conn.execute(
