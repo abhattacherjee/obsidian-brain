@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/consolidate stats` now flags themes whose size exceeds a soft cap (`consolidate_max_theme_size`, default 120) and suggests `/consolidate split <id>`. Clustering output is unchanged. (#238)
 
 ### Fixed
+- **tfidf recompute on bulk churn (#235):** the corpus IDF is now recomputed after any sync that churns more than half the corpus — counting deletions and insertions together, not insertions alone. Previously a large pruning (or a large delete-and-replace) left surviving notes with stale pre-deletion IDF, skewing similarity/clustering until the next big insert.
 - `/consolidate merge <a> <a>` (self-merge) now reports a distinct `cannot merge a theme with itself` error instead of the misleading `theme(s) not found` message. (#239)
 - **Theme membership integrity (#234):** a note is now guaranteed to belong to at most one theme — reassigning a note to a different best-matching theme vacates and reconciles (note_count + centroid) its prior theme instead of silently accumulating duplicate memberships.
 
