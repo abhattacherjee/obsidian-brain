@@ -4,8 +4,14 @@ Parity oracle: inserting notes in forward vs reverse order must yield identical
 tfidf_vector values after _recompute_all_tfidf_vectors() corrects the insertion-
 time IDF. The underlying bug: early notes inserted in a _sync batch use a smaller
 total_docs (N) so their IDF values are inflated relative to later notes.
+
+This file also covers the bulk-DELETION / combined-churn recompute trigger
+(deletions and insertions counted together against the corpus), the exact-half
+`>` boundary (strict, not `>=`), and the empty-corpus (total_after == 0) edge.
 """
 import json
+from pathlib import Path
+
 import vault_index
 
 
@@ -51,7 +57,7 @@ def _build_with_order(tmp_path, order, db_name="v.db"):
     rows = conn.execute("SELECT path, tfidf_vector FROM notes").fetchall()
     conn.close()
     return db, {
-        p.split("/")[-1]: (json.loads(v) if v else {}) for p, v in rows
+        Path(p).name: (json.loads(v) if v else {}) for p, v in rows
     }
 
 
@@ -90,7 +96,7 @@ def test_tfidf_order_invariant_after_recompute(tmp_path):
         conn = vault_index._connect(db)
         rows = conn.execute("SELECT path, tfidf_vector FROM notes").fetchall()
         conn.close()
-        return {p.split("/")[-1]: (json.loads(v) if v else {}) for p, v in rows}
+        return {Path(p).name: (json.loads(v) if v else {}) for p, v in rows}
 
     forward = _vecs(db_f)
     reverse = _vecs(db_r)
@@ -110,7 +116,7 @@ def test_recompute_helper_matches_final_corpus(tmp_path):
     vault_index._recompute_all_tfidf_vectors(conn)
     conn.commit()
     rows = conn.execute("SELECT path, tfidf_vector FROM notes").fetchall()
-    vecs = {p.split("/")[-1]: (json.loads(v) if v else {}) for p, v in rows}
+    vecs = {Path(p).name: (json.loads(v) if v else {}) for p, v in rows}
 
     # Independently recompute a.md's vector with the final corpus stats.
     total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
@@ -135,7 +141,6 @@ def test_sync_triggers_recompute_on_bulk_insert(tmp_path):
     are consistent with final-corpus N/df.
     """
     import os
-    from pathlib import Path
 
     vault = tmp_path / "vault"
     sess = vault / "claude-sessions"
@@ -171,7 +176,7 @@ def test_sync_triggers_recompute_on_bulk_insert(tmp_path):
         )
         expected = vault_index._compute_tfidf_vector(tokens, full_df, total, top_k=50)
         actual = json.loads(vec_json) if vec_json else {}
-        name = path.split("/")[-1]
+        name = Path(path).name
         assert actual == expected, (
             f"{name}: stored vector doesn't match final-corpus recompute: "
             f"{actual} != {expected}"
@@ -188,8 +193,6 @@ def test_sync_incremental_skip_no_recompute(tmp_path):
     Also verifies that an existing note's tfidf_vector is bit-for-bit unchanged
     between the two _sync calls.
     """
-    from pathlib import Path
-
     vault = tmp_path / "vault"
     sess = vault / "claude-sessions"
     sess.mkdir(parents=True)
@@ -274,7 +277,7 @@ def _assert_survivors_match_final_corpus(db):
         )
         expected = vault_index._compute_tfidf_vector(tokens, full_df, total, top_k=50)
         actual = json.loads(vec_json) if vec_json else {}
-        name = path.split("/")[-1]
+        name = Path(path).name
         assert actual == expected, (
             f"{name}: stored vector doesn't match final-corpus recompute "
             f"(survivor is STALE): {actual} != {expected}"
