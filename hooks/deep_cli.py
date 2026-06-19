@@ -160,6 +160,7 @@ def run_batch_edit() -> None:
     success = 0
     acted_texts: set[str] = set()
     skipped_checkoffs: list[str] = []
+    skipped_other: list[str] = []
     for filepath, old_text, new_text in edits:
         try:
             real_path = os.path.realpath(filepath)
@@ -195,6 +196,12 @@ def run_batch_edit() -> None:
                 # NON-checkbox edit (e.g. link additions): legacy substring replace.
                 if old_text in content:
                     new_content = content.replace(old_text, new_text, 1)
+                else:
+                    # Parity with the checkoff path: a non-checkbox edit whose
+                    # old_text isn't present is a real miss — surface it instead
+                    # of failing silently (only the Applied count would reflect it).
+                    snippet = old_text if len(old_text) <= 80 else old_text[:77] + "..."
+                    skipped_other.append(snippet)
 
             if new_content is not None:
                 fd, tmp = tempfile.mkstemp(
@@ -225,6 +232,10 @@ def run_batch_edit() -> None:
         print(f"Skipped {len(skipped_checkoffs)} checkoff(s) with no matching line:")
         for old_text in skipped_checkoffs:
             print(f"  - {old_text}")
+    if skipped_other:
+        print(f"Skipped {len(skipped_other)} non-checkbox edit(s) with no match:")
+        for old_text in skipped_other:
+            print(f"  - {old_text}")
 
 
 def run_build_checkoffs() -> None:
@@ -233,10 +244,11 @@ def run_build_checkoffs() -> None:
     Reads a JSON array from stdin; each element:
         {"file": "<basename or path>", "line": <int hint>, "text": "<canonical item text>"}
 
-    For each item we IGNORE the classifier's line number as authoritative and
-    instead text-anchor the target: among the file's unchecked ``- [ ] `` lines
-    we pick the line at the hint IFF it text-matches, else the FIRST candidate
-    that text-matches. A drifted/absent hint can therefore never check off a
+    For each item we IGNORE the classifier's line number entirely and
+    text-anchor the target: among the file's unchecked ``- [ ] `` lines we act
+    ONLY when EXACTLY ONE text-matches; if two or more match we REFUSE
+    (ambiguous), and if none match we SKIP. The drift-prone ``line`` hint can
+    never disambiguate among text-similar siblings, so it can never check off a
     different still-active item, and quoted-prose lines (no checkbox) are never
     targeted.
 
@@ -313,39 +325,34 @@ def run_build_checkoffs() -> None:
             if _UNCHECKED_CHECKBOX_RE.match(ln.rstrip("\n"))
         ]
 
-        target_idx = None
-        # Prefer the hint line iff it's a candidate AND text-matches: a valid
-        # hint legitimately disambiguates between multiple text matches.
-        if isinstance(line_hint, int) and 1 <= line_hint <= len(lines):
-            hint_idx = line_hint - 1
-            if hint_idx in candidate_idxs and anchor_text_matches(
-                lines[hint_idx].rstrip("\n"), ref_text
-            ):
-                target_idx = hint_idx
-
-        if target_idx is None:
-            # No usable hint — fall back to text resolution. For a data-integrity
-            # fix we must REFUSE when the text is ambiguous (>1 distinct unchecked
-            # checkbox matches) rather than silently guessing the first one and
-            # checking off the WRONG still-active item.
-            matches = [
-                i for i in candidate_idxs
-                if anchor_text_matches(lines[i].rstrip("\n"), ref_text)
-            ]
-            if len(matches) == 1:
-                target_idx = matches[0]
-            elif len(matches) > 1:
-                skipped.append({
-                    "file": file_field, "line": line_hint,
-                    "reason": f"ambiguous text match ({len(matches)} candidates)",
-                })
-                continue
-            else:  # len(matches) == 0
-                skipped.append({
-                    "file": file_field, "line": line_hint,
-                    "reason": "no matching checkbox line",
-                })
-                continue
+        # Resolve PURELY by text, NEVER by the classifier's line hint. The hint
+        # `line` is drift-prone (the whole #201 premise) and anchor_text_matches
+        # is loose (LCS>=25), so a drifted hint that happens to land on a
+        # TEXT-SIMILAR SIBLING checkbox could otherwise disambiguate among
+        # mutually-matching siblings and silently check off the WRONG still-active
+        # item — re-introducing the exact bug on the hint path. So a hint may
+        # NEVER override the ambiguity refusal: we compute ALL text-matching
+        # candidates first and only act when exactly one matches. The `line`
+        # value is retained in the skipped report for diagnostics, but is not
+        # used to SELECT among multiple matches (it can't be trusted to).
+        matches = [
+            i for i in candidate_idxs
+            if anchor_text_matches(lines[i].rstrip("\n"), ref_text)
+        ]
+        if len(matches) == 1:
+            target_idx = matches[0]
+        elif len(matches) > 1:
+            skipped.append({
+                "file": file_field, "line": line_hint,
+                "reason": f"ambiguous text match ({len(matches)} candidates)",
+            })
+            continue
+        else:  # len(matches) == 0
+            skipped.append({
+                "file": file_field, "line": line_hint,
+                "reason": "no matching checkbox line",
+            })
+            continue
 
         old_text = lines[target_idx].rstrip("\n")
         new_text = old_text.replace("[ ]", "[x]", 1)

@@ -232,6 +232,40 @@ def test_guard_b_ambiguous_text_match_refuses(tmp_vault, monkeypatch, capsys):
     assert "ambiguous" in result["skipped"][0]["reason"]
 
 
+def test_guard_b_hint_on_text_similar_sibling_refuses(tmp_vault, monkeypatch, capsys):
+    """A drifted hint that lands on a TEXT-SIMILAR SIBLING must NOT override the
+    ambiguity refusal.
+
+    Two sibling unchecked checkboxes share a >=25-char run with the
+    representative text ("Refactor the authentication handler in src/auth.py" vs
+    "...src/auth_v2.py" — they mutually match). The representative text is the
+    auth.py one, but the classifier's drifted `line` hint points at the WRONG
+    sibling (auth_v2.py). Because anchor_text_matches is loose (LCS>=25), an
+    old hint-preferred branch would have accepted the hint line and checked off
+    the wrong still-active item. The fix computes ALL text matches first and
+    refuses on ambiguity regardless of the hint.
+    """
+    note = tmp_vault / "claude-sessions" / "2026-04-10-proj-sibling.md"
+    item_a = "Refactor the authentication handler in src/auth.py"
+    item_b = "Refactor the authentication handler in src/auth_v2.py"
+    note.write_text(
+        "---\ntype: claude-session\nproject: proj\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        f"- [ ] {item_a}\n"   # line 7 (representative / correct)
+        f"- [ ] {item_b}\n",  # line 8 (wrong sibling the hint points at)
+        encoding="utf-8",
+    )
+    # Representative text = the auth.py item; hint points at the WRONG sibling.
+    items = [{"file": note.name, "line": 8, "text": item_a}]
+    out = _run_build_checkoffs(monkeypatch, tmp_vault, items, capsys)
+    result = json.loads(out)
+
+    # The hint must not disambiguate among siblings -> no edits, ambiguous skip.
+    assert result["edits"] == []
+    assert len(result["skipped"]) == 1
+    assert "ambiguous" in result["skipped"][0]["reason"]
+
+
 # ---------------------------------------------------------------------------
 # Guard A — run_batch_edit (line-anchoring)
 # ---------------------------------------------------------------------------
