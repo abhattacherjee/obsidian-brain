@@ -183,6 +183,19 @@ class TestReverseFoldCentroid:
         assert result["p"] == pytest.approx(1.3)
         assert result["q"] == pytest.approx(0.2)
 
+    def test_prune_boundary_pins_strict_operator(self):
+        """Strict `> 1e-9` prune: a term folding to exactly 1e-9 is pruned; just above is kept."""
+        # count=2 → new_count=1, so for a note-only term new_val == (0*2 - v)/1 == -v.
+        # exactly 1e-9 → abs(1e-9) > 1e-9 is False → pruned (a `>=` operator would keep it).
+        at_threshold = vault_index._reverse_fold_centroid({}, {"t": -1e-9}, count=2)
+        assert "t" not in at_threshold, (
+            f"exactly 1e-9 must be pruned by strict >, got {at_threshold}"
+        )
+        # just above 1e-9 → kept, with the exact folded value 2e-9.
+        above = vault_index._reverse_fold_centroid({}, {"t": -2e-9}, count=2)
+        assert "t" in above
+        assert above["t"] == pytest.approx(2e-9)
+
 
 class TestUpsertStoresTfidf:
     def test_first_insert_writes_tfidf_vector(self, tmp_vault):
