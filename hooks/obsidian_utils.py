@@ -1209,6 +1209,7 @@ _DEFAULTS: dict = {
     "consolidate_cluster_threshold": 0.5,  # cosine sim for single-linkage edge in /consolidate
     "consolidate_min_cluster_size": 3,  # smallest cluster that becomes a theme
     "consolidate_unassigned_threshold": 50,  # /consolidate stats nudge when unassigned exceeds this
+    "consolidate_max_theme_size": 120,  # /consolidate stats flags themes larger than this + suggests split
     "aged_summarize_threshold_days": 90,  # #168: notes whose file mtime is older than this AND have no inbound vault links AND no pin tag are deferred (skipped) by /recall
     "summary_pin_tags": ["claude/keep", "claude/permanent"],  # #168: notes carrying any of these frontmatter tags are never deferred
     "auto_log_enabled": True,

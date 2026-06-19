@@ -290,3 +290,77 @@ def test_split_noop_when_cohesive(db, capsys):
     assert conn.execute("SELECT COUNT(*) FROM themes WHERE id=1").fetchone()[0] == 1  # unchanged
     conn.close()
     assert "NO_SPLIT" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# T1: run_stats WARN line fires when note_count STRICTLY exceeds cap
+# ---------------------------------------------------------------------------
+
+def test_stats_flags_oversized_theme(tmp_vault, monkeypatch, capsys):
+    """WARN + split suggestion printed when a theme has note_count > cap."""
+    import vault_index as _vi
+    p = str(tmp_vault / "c.db")
+    _vi.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", p)
+    monkeypatch.setattr(
+        consolidate_cli, "load_config",
+        lambda: {"vault_path": str(tmp_vault), "consolidate_max_theme_size": 5},
+    )
+    conn = sqlite3.connect(p)
+    conn.execute(
+        "INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
+        "VALUES (1,'BigTheme','s','{}',6,'d','d','proj')"
+    )
+    conn.commit(); conn.close()
+    consolidate_cli.run_stats()
+    out = capsys.readouterr().out
+    assert "WARN theme id=1 has 6 members" in out
+    assert "/consolidate split 1" in out
+
+
+# ---------------------------------------------------------------------------
+# T2: run_stats stays silent when note_count == cap (strict > boundary)
+# ---------------------------------------------------------------------------
+
+def test_stats_silent_at_cap_boundary(tmp_vault, monkeypatch, capsys):
+    """No WARN when note_count is exactly at the cap — boundary is strict >."""
+    import vault_index as _vi
+    p = str(tmp_vault / "c.db")
+    _vi.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", p)
+    monkeypatch.setattr(
+        consolidate_cli, "load_config",
+        lambda: {"vault_path": str(tmp_vault), "consolidate_max_theme_size": 5},
+    )
+    conn = sqlite3.connect(p)
+    conn.execute(
+        "INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
+        "VALUES (1,'ExactCap','s','{}',5,'d','d','proj')"
+    )
+    conn.commit(); conn.close()
+    consolidate_cli.run_stats()
+    out = capsys.readouterr().out
+    assert "WARN" not in out
+
+
+# ---------------------------------------------------------------------------
+# T3: run_merge(a, a) emits the DISTINCT self-merge message, not not-found
+# ---------------------------------------------------------------------------
+
+def test_merge_self_emits_distinct_message(db, capsys):
+    """run_merge(1, 1) must say 'cannot merge a theme with itself', NOT 'not found'."""
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
+        "VALUES (1,'Solo','s','{\"x\":1.0}',1,'d','d','proj')"
+    )
+    conn.execute(
+        "INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+        "VALUES ('m1.md','session','proj','t','b',1.0,'{\"x\":1.0}')"
+    )
+    conn.execute("INSERT INTO theme_members VALUES (1,'m1.md',0.9,0.0,'d')")
+    conn.commit(); conn.close()
+    consolidate_cli.run_merge(1, 1)
+    out = capsys.readouterr().out
+    assert "cannot merge a theme with itself" in out
+    assert "theme(s) not found" not in out
