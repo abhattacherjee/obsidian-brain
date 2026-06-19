@@ -30,6 +30,7 @@ from tfidf import (  # noqa: F401  (re-export shim — callers use vault_index.<
     _compute_tfidf_vector,
     _cosine_similarity,
     _update_term_df,
+    _reverse_fold_centroid,
 )
 from themes import (  # noqa: F401  (re-export shim)
     assign_to_theme,
@@ -541,17 +542,7 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
         except json.JSONDecodeError:
             centroid = {}
         new_count = count - 1
-        new_centroid: dict[str, float] = {}
-        all_terms = set(centroid) | set(note_vec)
-        for term in all_terms:
-            c_val = centroid.get(term, 0.0)
-            v_val = note_vec.get(term, 0.0)
-            # Reverse the running-average fold:
-            # old_centroid = (centroid*count - note_vec) / (count - 1)
-            new_val = (c_val * count - v_val) / new_count
-            # Prune near-zero terms to keep the centroid sparse.
-            if abs(new_val) > 1e-9:
-                new_centroid[term] = new_val
+        new_centroid = _reverse_fold_centroid(centroid, note_vec, count)
         conn.execute(
             "UPDATE themes "
             "SET centroid = ?, note_count = ?, updated_date = ? "

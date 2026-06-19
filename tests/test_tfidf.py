@@ -144,6 +144,46 @@ class TestUpdateTermDf:
         assert "solo" not in rows
 
 
+class TestReverseFoldCentroid:
+    def test_basic_removes_member_contribution(self):
+        """Removing one member from a 3-member centroid yields the 2-member mean."""
+        result = vault_index._reverse_fold_centroid(
+            {"a": 0.6, "b": 0.4}, {"a": 0.2}, count=3,
+        )
+        # new_count=2 → a=(0.6*3-0.2)/2=0.8, b=(0.4*3-0)/2=0.6
+        assert set(result.keys()) == {"a", "b"}
+        assert result["a"] == pytest.approx(0.8)
+        assert result["b"] == pytest.approx(0.6)
+
+    def test_term_only_in_note_vec(self):
+        """A term present in note_vec but absent from centroid folds to a negative."""
+        result = vault_index._reverse_fold_centroid(
+            {"a": 0.5}, {"b": 0.3}, count=2,
+        )
+        # new_count=1 → a=(0.5*2-0)/1=1.0, b=(0*2-0.3)/1=-0.3
+        assert set(result.keys()) == {"a", "b"}
+        assert result["a"] == pytest.approx(1.0)
+        assert result["b"] == pytest.approx(-0.3)
+
+    def test_prunes_terms_folding_to_zero(self):
+        """A term whose magnitude folds to <= 1e-9 is pruned (strict > 1e-9 keep)."""
+        result = vault_index._reverse_fold_centroid(
+            {"x": 0.5}, {"x": 1.0}, count=2,
+        )
+        # new_count=1 → x=(0.5*2-1.0)/1=0.0 → pruned
+        assert "x" not in result
+        assert result == {}
+
+    def test_count_two_boundary(self):
+        """count=2 (new_count=1) is the minimum valid fold and is exact."""
+        result = vault_index._reverse_fold_centroid(
+            {"p": 0.9, "q": 0.1}, {"p": 0.5}, count=2,
+        )
+        # new_count=1 → p=(0.9*2-0.5)/1=1.3, q=(0.1*2-0)/1=0.2
+        assert result["p"] == pytest.approx(1.3)
+        assert result["q"] == pytest.approx(0.2)
+
+
 class TestUpsertStoresTfidf:
     def test_first_insert_writes_tfidf_vector(self, tmp_vault):
         """After ensure_index indexes a real note, its row carries a non-empty vector."""
