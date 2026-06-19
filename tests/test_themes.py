@@ -454,14 +454,32 @@ class TestAssignToTheme:
         vec = json.loads(conn.execute(
             "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
         ).fetchone()[0])
-        # Theme A: a multi-member theme (count=3) whose centroid folds in the
-        # note's contribution. Build it so the note is one of three members.
-        seed_a = {t: 0.5 for t in vec}
+        # Theme A: a multi-member theme (count=C) whose centroid folds in the
+        # note's contribution. Seed a KNOWN centroid (distinct per-term values,
+        # not derived from vec) so the reverse-fold oracle below is meaningful
+        # rather than tautological. Construct one term that reverse-folds to a
+        # surviving value and one that reverse-folds to near-zero (must prune).
+        C = 3
+        terms = sorted(vec)
+        assert len(terms) >= 1, "note vector must have terms for the oracle"
+        seed_a = {}
+        for i, t in enumerate(terms):
+            # Spread distinct, non-uniform weights across the note's terms.
+            seed_a[t] = 0.3 + 0.11 * (i + 1)
+        # Add a centroid-only term whose reverse-fold value is non-zero (it has
+        # no counterpart in vec, so it cannot prune to zero): exercises the
+        # `set(old_centroid) | set(note_vec)` union on the centroid-only side.
+        seed_a["theme_only_term"] = 0.6
+        # Add a term engineered to reverse-fold to ~0 so the prune branch fires:
+        # choose c such that (c*C - v)/(C-1) ≈ 0  =>  c = v / C.
+        prune_term = terms[0]
+        v0 = vec[prune_term]
+        seed_a[prune_term] = v0 / C  # reverse-fold = (v0 - v0)/(C-1) = 0 → pruned
         cur = conn.execute(
             "INSERT INTO themes (name, summary, centroid, note_count, "
             "created_date, updated_date, project) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("ThemeA", "", json.dumps(seed_a), 3,
+            ("ThemeA", "", json.dumps(seed_a), C,
              "2026-04-16", "2026-04-16", "proj"),
         )
         theme_a = cur.lastrowid
@@ -480,7 +498,6 @@ class TestAssignToTheme:
              "2026-04-16", "2026-04-16", "proj"),
         )
         theme_b = cur.lastrowid
-        centroid_a_before = dict(seed_a)
         conn.commit()
         conn.close()
 
@@ -501,13 +518,140 @@ class TestAssignToTheme:
         assert len(members) == 1 and members[0][0] == theme_b, (
             f"note should have exactly one membership (ThemeB), got {members}"
         )
-        assert a_count == 2, (
-            f"ThemeA note_count should decrement 3→2, got {a_count} — stale overcount"
+        assert a_count == C - 1, (
+            f"ThemeA note_count should decrement {C}→{C - 1}, got {a_count} — stale overcount"
         )
+        # Exact reverse-fold oracle, mirroring the _delete_note precision test:
+        # for each term in the union of seed centroid + note vector, the new
+        # centroid value is (seed_a[term]*C - vec[term])/(C-1), pruned if |x|<1e-9.
         a_centroid_after = json.loads(a_centroid_json)
-        assert a_centroid_after != centroid_a_before, (
-            "ThemeA centroid should be reverse-folded (note's contribution removed), "
-            "not left stale"
+        for term in set(seed_a) | set(vec):
+            expected = (seed_a.get(term, 0.0) * C - vec.get(term, 0.0)) / (C - 1)
+            if abs(expected) > 1e-9:
+                assert a_centroid_after.get(term) == pytest.approx(expected, rel=1e-6), (
+                    f"term {term!r} reverse-fold: expected {expected}, "
+                    f"got {a_centroid_after.get(term)}"
+                )
+            else:
+                assert term not in a_centroid_after, (
+                    f"term {term!r} reverse-folded to ~0 ({expected}) and must be pruned, "
+                    f"but is present as {a_centroid_after.get(term)}"
+                )
+        # Sanity: the engineered prune term and a surviving term behaved as designed.
+        assert prune_term not in a_centroid_after, (
+            f"engineered prune term {prune_term!r} should be absent after reverse-fold"
+        )
+        assert "theme_only_term" in a_centroid_after, (
+            "centroid-only term (no vec counterpart) should survive the reverse-fold"
+        )
+
+    def test_reassignment_vacates_multiple_stale_themes(self, tmp_vault):
+        """#234 loop-as-a-loop: a note may simultaneously be a member of more
+        than one stale theme (e.g. via earlier invariant drift). A single
+        assign_to_theme call to a new best theme must vacate ALL of them — the
+        `for s in stale:` loop must iterate over every other membership, not
+        just the first.
+        """
+        path = _indexed_note(tmp_vault, "multistale", "retrieval scoring",
+                             "retrieval scoring activation importance")
+        db_path = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        vec = json.loads(conn.execute(
+            "SELECT tfidf_vector FROM notes WHERE path = ?", (path,)
+        ).fetchone()[0])
+        # ThemeB seeded FIRST (lowest rowid) with centroid == the note's exact
+        # vector → cosine ~1.0, the unambiguous best match. The low rowid makes
+        # it win even the `sim > best` strict tie-break (mirrors the sole-member
+        # test's technique) should any other theme also reach ~1.0.
+        cur = conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ThemeB", "", json.dumps(vec), 1,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_b = cur.lastrowid
+        # ThemeA: a STALE sole-member theme (note_count=1) → vacating drops it.
+        seed_a = {t: 0.5 for t in vec}
+        cur = conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ThemeA", "", json.dumps(seed_a), 1,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_a = cur.lastrowid
+        # ThemeC: a STALE multi-member theme (note_count=3) → vacating
+        # decrements it to 2 and removes the note's membership row.
+        seed_c = {t: 0.4 for t in vec}
+        cur = conn.execute(
+            "INSERT INTO themes (name, summary, centroid, note_count, "
+            "created_date, updated_date, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("ThemeC", "", json.dumps(seed_c), 3,
+             "2026-04-16", "2026-04-16", "proj"),
+        )
+        theme_c = cur.lastrowid
+        # Pre-INSERT the note as a member of BOTH stale themes (the drift the
+        # loop must clean up). It is NOT yet a member of ThemeB. ThemeC also
+        # gets two OTHER member rows so its 3 rows match its note_count=3.
+        conn.execute(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, surprise, added_date) "
+            "VALUES (?, ?, 0.5, 0.0, ?)",
+            (theme_a, path, "2026-04-16"),
+        )
+        conn.executemany(
+            "INSERT INTO theme_members (theme_id, note_path, similarity, surprise, added_date) "
+            "VALUES (?, ?, 0.4, 0.0, ?)",
+            [
+                (theme_c, path, "2026-04-16"),
+                (theme_c, "/other/c1.md", "2026-04-16"),
+                (theme_c, "/other/c2.md", "2026-04-16"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        # One assign_to_theme call: best is ThemeB; BOTH ThemeA and ThemeC
+        # memberships must be vacated in this single call.
+        result = vault_index.assign_to_theme(db_path, path, project="proj")
+        assert result is not None
+        assert result["theme_id"] == theme_b
+
+        conn = sqlite3.connect(db_path)
+        memberships = conn.execute(
+            "SELECT theme_id FROM theme_members WHERE note_path = ?", (path,)
+        ).fetchall()
+        n_theme_a = conn.execute(
+            "SELECT COUNT(*) FROM themes WHERE id = ?", (theme_a,)
+        ).fetchone()[0]
+        c_count = conn.execute(
+            "SELECT note_count FROM themes WHERE id = ?", (theme_c,)
+        ).fetchone()[0]
+        c_member_rows = conn.execute(
+            "SELECT COUNT(*) FROM theme_members WHERE theme_id = ?", (theme_c,)
+        ).fetchone()[0]
+        conn.close()
+
+        # Exactly one surviving membership, and it is ThemeB.
+        assert len(memberships) == 1 and memberships[0][0] == theme_b, (
+            f"note should belong to exactly ThemeB after reassign, got {memberships} "
+            "— a stale membership was not vacated (loop processed only the first)"
+        )
+        # ThemeA was sole-member → dropped entirely when vacated.
+        assert n_theme_a == 0, (
+            "ThemeA (sole-member) should have been dropped when vacated"
+        )
+        # ThemeC was multi-member → survives, decremented 3→2.
+        assert c_count == 2, (
+            f"ThemeC note_count should decrement 3→2, got {c_count} — stale overcount"
+        )
+        # ThemeC had 3 members incl. the note → the note's row removed leaves 2.
+        assert c_member_rows == 2, (
+            f"ThemeC should have 2 member rows after the note's row is removed, "
+            f"got {c_member_rows}"
         )
 
     def test_reassignment_vacates_orphan_and_malformed_old_themes(self, tmp_vault):
@@ -569,10 +713,21 @@ class TestAssignToTheme:
         bad_count = conn.execute(
             "SELECT note_count FROM themes WHERE id = ?", (theme_bad,)
         ).fetchone()[0]
+        # Isolate the orphan branch: the dangling theme_members row pointing at
+        # the non-existent theme 999 must be gone (the `if not old:` defensive
+        # DELETE fired), distinguishing "orphan row deleted" from "orphan row
+        # left behind but malformed theme handled".
+        orphan_rows = conn.execute(
+            "SELECT COUNT(*) FROM theme_members WHERE theme_id = 999"
+        ).fetchone()[0]
         conn.close()
 
         assert len(members) == 1 and members[0][0] == theme_b, (
             f"orphan + malformed memberships should be vacated, got {members}"
+        )
+        assert orphan_rows == 0, (
+            "orphan membership row (theme_id=999, no themes row) should be deleted "
+            f"by the `if not old:` branch, got {orphan_rows} rows"
         )
         # The malformed theme survives (count was 3) and decrements to 2.
         assert bad_count == 2, (
