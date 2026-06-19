@@ -514,7 +514,32 @@ Display the output to the user. Wait for user response — they may confirm acti
 
 **Step 18 — Execute confirmed actions.** Parse user response. If user typed `skip`, skip this step.
 
-**Important:** Do NOT use the Edit tool for batch vault edits — it requires Read first for each file, which is impractical for 20+ files. Instead, use a Python script that reads, modifies, and writes files directly:
+**Important:** Do NOT use the Edit tool for batch vault edits — it requires Read first for each file, which is impractical for 20+ files. Instead, use the two Python helpers below.
+
+**Checkoffs are text-anchored (#201).** Do NOT hand-build `old_text` from a classifier's `instances[].line` — a drifted line number can check off the WRONG still-active item, and a substring `old_text` can corrupt quoted prose. Instead, build a JSON array of confirmed checkoff items and let `run_build_checkoffs` re-resolve each target by TEXT against the file's real `- [ ] ` lines, emitting verified `[filepath, old_text, new_text]` triples. Then feed those `.edits` into `run_batch_edit` (which additionally line-anchors each flip).
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+# Stage 1 — resolve targets by text. $CHECKOFFS_JSON is a JSON array of
+# {"file": "<basename>", "line": <hint>, "text": "<group representative / canonical text>"}.
+RESOLVED=$(printf '%s' "$CHECKOFFS_JSON" | python3 -c '
+import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from deep_cli import run_build_checkoffs; run_build_checkoffs()
+')
+# Stage 2 — apply only the verified, text-anchored edits.
+printf '%s' "$RESOLVED" | python3 -c '
+import sys, json, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+from deep_cli import run_batch_edit
+sys.stdin = __import__("io").StringIO(json.dumps(json.load(sys.stdin)["edits"]))
+run_batch_edit()
+'
+```
+
+`run_build_checkoffs` reports `resolved N, skipped M` on stderr; **skipped items (drifted hint, no matching checkbox line, ambiguous text match, file-not-found) are NOT checked off** — surface them to the user rather than forcing an edit. Note: when two distinct still-active checkboxes both text-match a representative, the item is REFUSED with reason `ambiguous text match (N candidates)` — never guessed; the classifier `line` is a diagnostic hint only and is not used to disambiguate.
+
+**Also surface Stage 2 drops.** `run_batch_edit` prints `Applied N/M edits`; whenever `N < M` it follows with a `Skipped K checkoff(s) with no matching line:` block listing each dropped `old_text`. A Stage-1-resolved triple can still be dropped here if the line changed between stages — **report any `Applied N/M` where N<M and the listed skipped checkoffs to the user** so a silently-dropped checkoff is never missed.
+
+For confirmed link additions (NOT checkoffs), pass `[filepath, old_text, new_text]` triples directly into `run_batch_edit` via `$EDITS_JSON` — non-checkbox edits keep the substring-replace path:
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -524,9 +549,7 @@ from deep_cli import run_batch_edit; run_batch_edit()
 '
 ```
 
-Where `$EDITS_JSON` is a JSON array of `[filepath, old_text, new_text]` triples constructed from the confirmed actions. Use `errors="replace"` when reading to handle vault notes with encoding corruption (binary file matches).
-
-For confirmed link additions, use the same Python pattern to append wikilinks. Mark task #4 complete, task #5 in_progress.
+Mark task #4 complete, task #5 in_progress.
 
 **Step 19 — Cascade checkoffs + cleanup.** For each project with newly checked items, run `batch_cascade_checkoff()` (same as Step 14b) in parallel.
 

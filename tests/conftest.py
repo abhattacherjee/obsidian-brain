@@ -228,3 +228,21 @@ def _isolate_vault_index_db_globally(tmp_path_factory, monkeypatch):
     """
     db = tmp_path_factory.mktemp("vidx") / "test-vault.db"
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(db))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_acted_items_path_globally(tmp_path_factory, monkeypatch):
+    """Redirect deep_cli._ACTED_ITEMS_PATH to a per-test tmp file so tests that
+    call run_batch_edit never read/write/remove the REAL
+    ~/.claude/obsidian-brain/deep-acted-items.json. That real-state mutation
+    caused a non-reproducible flake in
+    test_deep_cli.py::test_guard_b_ambiguous_text_match_refuses (#201 round-3).
+
+    deep_cli is only present once hooks/ is on sys.path (added at module import
+    above); if it can't be imported in a given context, this is a no-op."""
+    try:
+        import deep_cli
+    except ImportError:
+        return  # module not present in some test contexts
+    acted = tmp_path_factory.mktemp("acted") / "deep-acted-items.json"
+    monkeypatch.setattr(deep_cli, "_ACTED_ITEMS_PATH", str(acted))
