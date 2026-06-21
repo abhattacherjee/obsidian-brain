@@ -417,7 +417,7 @@ def test_or_fallback_high_cosine_matches():
 # (same operands, same order) and thus produce the same bit pattern — the same way
 # test_cosine_at_floor_boundary uses 2.0 / (3.0 * 6.0) to mirror the internal ops.
 _QUERY_RESCUE = {"aa": 3.0, "bb": 4.0}
-_NOTE_RESCUE_EXACT = {"aa": 4.0, "cc": 4.0, "dd": 2.0}   # cosine == 0.4 (same float ops as _cosine_similarity → same bit pattern)
+_NOTE_RESCUE_EXACT = {"aa": 4.0, "cc": 4.0, "dd": 2.0}
 
 # Near-miss rank delta: top -10.97, #2 -10.73 → delta = 0.24 < MIN_RANK_DELTA (0.25).
 _NEAR_MISS_TOP_RANK = -10.97
@@ -441,7 +441,7 @@ def test_rank_delta_nearmiss_rescued_by_strong_cosine():
 def test_rank_delta_nearmiss_weak_cosine_rejects():
     """Near-miss rank_delta with weak cosine is NOT rescued.
 
-    Same rank delta as the rescue test but top cosine < MIN_COSINE_RESCUE (~0.30).
+    Same rank delta as the rescue test but top cosine < MIN_COSINE_RESCUE (0.40).
     Rescue requires STRONG cosine; a weak match must still be rejected.
 
     Vectors: q = _QUERY_RESCUE (aa:3, bb:4), n = {aa:4, cc:16, dd:2}
