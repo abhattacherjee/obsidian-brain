@@ -10,8 +10,6 @@ Covers:
 
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
 
 import vault_index

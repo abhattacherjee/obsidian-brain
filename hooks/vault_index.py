@@ -1659,6 +1659,9 @@ def compute_query_vector(
     correct when a new note is about to be inserted; a query is not a corpus
     document).
 
+    ``conn`` must be obtained via :func:`_connect` (not a raw
+    ``sqlite3.connect``), consistent with the repo's CI guard.
+
     Returns ``{}`` for an empty string or a query whose tokens are all
     stopwords — callers should treat ``{}`` as a signal to skip cosine gating.
     """
