@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-06-21
+
+> **Upgrade note:** This release improves the `/compress` topic-match cosine gate, which relies on per-note TF-IDF vectors. Notes indexed before the vector-storage migration (~26% of a typical vault) have no vector. Run `/vault-reindex` once after updating to backfill them (non-destructive — preserves Friston activation data); until you do, the cosine gate fail-opens on those notes via the AND-path.
+
+### Added
+- **`/compress` match prompt now surfaces adjudication evidence (#189):** on a high-confidence existing-note match, Step 3.5 shows the match rank with a calibration band (very strong / strong / moderate / borderline) and the next-best rank, the shared TF-IDF terms between the query and the matched note, and a snippet of the note's first paragraph — so the "update vs create new" choice distinguishes topical identity from tangential keyword overlap instead of being guessed from title/tags alone.
+
+### Fixed
+- **`/compress` now also searches `claude-session` notes (Step 3.5) and rescues a borderline rank-gap match when the top result's TF-IDF cosine is strong (`MIN_COSINE_RESCUE = 0.40`), so genuine same-topic notes (often sessions) are no longer missed as false negatives. (#254)**
+- **`/compress` no longer surfaces semantically-unrelated notes as high-confidence matches (#252, #108):** the match guard now applies a TF-IDF **cosine floor** on the top result — reusing the stored per-note `tfidf_vector` — in addition to the existing FTS rank-strength and rank-delta gates. Previously a single OR-fallback hit sharing only generic terms (#252), or a cross-topic peer whose rank gap happened to pass (#108), could be matched — risking an "update" that appends to the wrong note. The cosine gate can only *reject* a match, never loosen one, and degrades to the prior rank-only behavior when no query or note vector is available.
+  - **Live-calibration refinement:** OR-fallback hits that have no stored `tfidf_vector` are now **rejected** (fail-closed) rather than accepted. Previously the gate failed open for any missing-vector result regardless of how the hit was retrieved; live-vault calibration showed this allowed a NULL-vector OR-fallback hit — matched only on generic tokens — to pass as high-confidence. AND-path hits (all query terms present) without a vector remain fail-open, as full-term presence is sufficient for rank confidence.
+- **`/vault-reindex` (non-destructive) now backfills `tfidf_vector` for notes indexed before the vector-storage migration** (~26% had NULL vectors), so the `/compress` cosine gate applies to (nearly) all candidates instead of fail-opening on vectorless notes. (#255)
+
 ## [3.1.0] - 2026-06-19
 
 ### Added

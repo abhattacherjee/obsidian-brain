@@ -485,6 +485,52 @@ def _recompute_all_tfidf_vectors(conn: sqlite3.Connection) -> None:
         )
 
 
+def _backfill_missing_tfidf_vectors(conn: sqlite3.Connection) -> int:
+    """Compute and store tfidf_vector for every note that currently has NULL.
+
+    Targets only rows missing a vector (``tfidf_vector IS NULL``), leaving all
+    existing non-NULL vectors untouched.  This is a READ-ONLY operation on
+    ``term_df`` — it never increments or decrements document-frequency counts.
+
+    Tokenization source matches ``_upsert_note`` exactly:
+    ``" ".join([title, tags, body])`` — title first, then tags, then body.
+
+    ``total_docs`` is the current corpus count (``SELECT COUNT(*) FROM notes``)
+    without the ``+1`` adjustment that ``_upsert_note`` applies for a brand-new
+    row, because the rows being backfilled already exist in the table.
+
+    Returns the count of rows that received a non-NULL vector (rows whose
+    content tokenises to empty are correctly left NULL and are not counted).
+    """
+    # These corpus stats are read at the current transaction boundary (i.e. after
+    # Step-3 prune/theme-repair in rebuild_index). This is correct because Step 3
+    # does NOT delete notes rows. A future change that deletes notes earlier in
+    # the same transaction must keep this backfill as the last note-count-affecting
+    # step, or recompute total_docs/term_df after that deletion.
+    total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    term_df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
+
+    rows = conn.execute(
+        "SELECT path, title, tags, body FROM notes WHERE tfidf_vector IS NULL"
+    ).fetchall()
+
+    backfilled = 0
+    for path, title, tags, body in rows:
+        tokens = _tokenize_for_tfidf(
+            " ".join([title or "", tags or "", body or ""])
+        )
+        vec = _compute_tfidf_vector(tokens, term_df, total_docs, top_k=50)
+        vec_json = json.dumps(vec, separators=(",", ":")) if vec else None
+        conn.execute(
+            "UPDATE notes SET tfidf_vector = ? WHERE path = ?",
+            (vec_json, path),
+        )
+        if vec_json is not None:
+            backfilled += 1
+
+    return backfilled
+
+
 def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
     """Remove a note + FTS row + term_df contribution + theme memberships.
 
@@ -1012,6 +1058,7 @@ def rebuild_index(
             _ensure_access_log_indexes(conn)
             _ensure_theme_indexes(conn)
             stats = _sync(conn, vault_path, folders)
+            stats["backfilled"] = 0  # full wipe rebuilds all vectors from scratch
         finally:
             conn.close()
     else:
@@ -1135,6 +1182,11 @@ def rebuild_index(
                     ")"
                 )
                 conn.execute("DELETE FROM themes WHERE note_count = 0")
+                # Backfill any notes that still have tfidf_vector IS NULL
+                # (rows that existed before the column was added and were
+                # never touched by _upsert_note since the migration).
+                # READ-ONLY on term_df — does not change df counts.
+                backfilled_count = _backfill_missing_tfidf_vectors(conn)
                 conn.commit()
             except BaseException:
                 try:
@@ -1142,6 +1194,13 @@ def rebuild_index(
                 except sqlite3.Error:
                     pass
                 raise
+
+            if backfilled_count > 0:
+                print(
+                    f"[vault-index] Backfilled {backfilled_count} missing tfidf_vector(s)",
+                    file=sys.stderr,
+                )
+            stats["backfilled"] = backfilled_count
 
             # Report preserved/pruned counts from the actual after-state
             # rather than deleted rowcount. _sync and _delete_note also
@@ -1530,6 +1589,7 @@ def search_vault(
     note_type: str | None = None,
     limit: int = 15,
     caller: str | None = None,
+    include_vectors: bool = False,
 ) -> list[dict]:
     """Full-text search over the vault index.
 
@@ -1544,6 +1604,15 @@ def search_vault(
 
     The optional ``caller`` parameter (e.g. 'vault-search', 'standup')
     drives task-context detection for context-adaptive type scoring.
+
+    When ``include_vectors=True`` each result dict contains a decoded
+    ``tfidf_vector`` key (``dict[str, float]`` or ``None`` for notes with no
+    stored vector).  Default is ``False`` — callers that do not need the
+    vector pay no overhead and the key is absent (backward-compatible).
+
+    Every result dict carries an ``or_fallback`` boolean: ``True`` when the
+    row was retrieved via the OR-fallback branch (AND returned 0 results),
+    ``False`` on the normal AND path.
     """
     if not os.path.isfile(db_path):
         return []
@@ -1573,9 +1642,12 @@ def search_vault(
             filter_sql += "AND n.type = ? "
             filter_params.append(note_type)
 
+        # Optionally include the stored TF-IDF vector column.
+        vector_col = ", n.tfidf_vector" if include_vectors else ""
         sql = (
             "SELECT n.path, n.type, n.date, n.project, n.title, n.tags, n.status, "
-            "n.source_session, n.source_note, n.size, n.body, n.importance, "
+            "n.source_session, n.source_note, n.size, n.body, n.importance"
+            + vector_col + ", "
             "bm25(notes_fts, 10.0, 1.0, 5.0) AS rank "
             "FROM notes_fts f "
             "JOIN notes n ON n.rowid = f.rowid "
@@ -1587,6 +1659,13 @@ def search_vault(
 
         rows = conn.execute(sql, params).fetchall()
         candidates = [dict(row) for row in rows]
+        # AND path — mark all candidates as non-fallback.
+        # or_fallback is consumed by compress_guard.is_high_confidence_match:
+        # OR-fallback hits that lack a stored tfidf_vector are rejected (fail-closed)
+        # because only generic tokens matched and semantic closeness cannot be confirmed.
+        # AND-path hits (or_fallback=False) without a vector remain fail-open.
+        for c in candidates:
+            c["or_fallback"] = False
 
         # OR fallback when AND returns nothing
         if not candidates:
@@ -1597,6 +1676,11 @@ def search_vault(
                 or_params: list = [or_query] + filter_params + [candidate_limit]
                 rows = conn.execute(sql, or_params).fetchall()
                 candidates = [dict(row) for row in rows]
+                # OR path — mark all candidates as fallback rows.
+                # Consumed by compress_guard: OR-fallback hits without a stored vector
+                # are rejected (fail-closed) to prevent false-positive dedup matches.
+                for c in candidates:
+                    c["or_fallback"] = True
 
         task_context = detect_task_context(caller_skill=caller) if caller else None
         results = rerank_results(
@@ -1612,15 +1696,73 @@ def search_vault(
             "search",
             project=[r.get("project") for r in results],
         )
-        # Strip body — callers don't need it
+        # Strip body — callers don't need it.
+        # Decode tfidf_vector when requested (None-safe); leave key absent otherwise.
         for r in results:
             r.pop("body", None)
+            if include_vectors:
+                raw = r.get("tfidf_vector")
+                if raw:
+                    try:
+                        r["tfidf_vector"] = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        print(
+                            f"[vault-index] corrupt tfidf_vector for {r.get('path')!r}; treating as None",
+                            file=sys.stderr,
+                        )
+                        r["tfidf_vector"] = None
+                else:
+                    r["tfidf_vector"] = None
         return results
 
     except sqlite3.Error as exc:
         print(f"[vault-index] search_vault query failed: {exc}",
               file=sys.stderr)
         return []
+    finally:
+        conn.close()
+
+
+def compute_query_vector(
+    db_path: str,
+    query: str,
+) -> dict[str, float]:
+    """Compute a sparse TF-IDF vector for ``query`` against the live corpus.
+
+    Takes a db_path (like :func:`search_vault`) and manages its own connection
+    via :func:`_connect`, closing it in a ``finally`` block.
+
+    Uses the same tokenization and IDF weighting as ``_upsert_note`` but does
+    NOT pre-increment ``total_docs`` (that pre-increment exists because a new
+    note is about to be inserted); ``_compute_tfidf_vector`` still adds 1
+    internally, so effective N = COUNT(*)+1 for a query vs COUNT(*)+2 for a
+    fresh insert — a one-document offset, negligible at any realistic corpus
+    size.
+
+    Returns ``{}`` for an empty string or a query whose tokens are all
+    stopwords — callers should treat ``{}`` as a signal to skip cosine gating.
+
+    Propagates ``sqlite3.Error`` on DB query failure; callers are responsible
+    for catching.
+    """
+    tokens = _tokenize_for_tfidf(query)
+    if not tokens:
+        return {}
+
+    conn = _connect(db_path)
+    try:
+        total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        unique_terms = list(set(tokens))
+        term_df: dict[str, int] = {}
+        for i in range(0, len(unique_terms), 900):
+            chunk = unique_terms[i : i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT term, df FROM term_df WHERE term IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            term_df.update(dict(rows))
+        return _compute_tfidf_vector(tokens, term_df, total_docs, top_k=50)
     finally:
         conn.close()
 

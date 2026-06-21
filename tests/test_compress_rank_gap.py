@@ -7,8 +7,11 @@ results list.
 """
 
 from compress_guard import (
+    MIN_COSINE,
+    MIN_COSINE_RESCUE,
     MIN_RANK_DELTA,
     MIN_RANK_STRENGTH,
+    MIN_TERM_OVERLAP,
     is_high_confidence_match,
 )
 
@@ -116,3 +119,430 @@ def test_constants_are_exposed():
     assert MIN_RANK_DELTA > 0.0
     # Hard constraint from issue #45 — fix is not complete without this.
     assert MIN_RANK_DELTA < 4.75
+    # Pin the rescue threshold so accidental retuning is caught immediately.
+    assert MIN_COSINE_RESCUE == 0.40
+
+
+# ---------------------------------------------------------------------------
+# Cosine + high-IDF gate tests (#252 / #108)
+# ---------------------------------------------------------------------------
+
+# Helper vectors used across multiple cosine tests.
+# ON-TOPIC: query and note share "notebook" and "obsidian" (high-specificity
+# terms); cosine is clearly above MIN_COSINE.
+_QUERY_ON_TOPIC = {"notebook": 4.0, "obsidian": 4.0, "plugin": 2.0}
+_NOTE_ON_TOPIC = {"notebook": 4.0, "obsidian": 4.0, "vault": 2.0}
+
+# CROSS-TOPIC: query is about "obsidian notebook" but note is about "python
+# code debug" — no shared terms → cosine = 0.0 < MIN_COSINE.
+_NOTE_CROSS_TOPIC = {"python": 4.0, "code": 4.0, "debug": 2.0}
+
+# GENERIC: query and note share only "plugin" (low-weight generic term).
+# Actual cosine depends on weights; see test_single_or_fallback_generic_overlap_rejects.
+_NOTE_GENERIC_OVERLAP = {"plugin": 2.0, "other": 8.0}
+
+# Rank that passes the strength gate (single result branch, the #252 bug path).
+_SINGLE_RESULT_STRONG_RANK = -29.46
+
+
+def test_query_vec_none_is_backward_compatible():
+    """When query_vec=None the new parameters must have zero effect on behavior.
+
+    Deliberately mirrors the pre-existing rank-only test cases (empty list,
+    single strong, two-result large delta, two-result tight delta) as an
+    explicit backward-compat contract guard — not accidental duplication.
+    Exercises the new optional-parameter signature to confirm it does not
+    alter outcomes when cosine data is absent.
+    """
+    # empty → False (unchanged)
+    assert is_high_confidence_match([], query_vec=None) is False
+
+    # single result, strong rank → True (the #252 bug path, unchanged without cosine)
+    assert is_high_confidence_match(
+        [{"rank": _SINGLE_RESULT_STRONG_RANK}], query_vec=None
+    ) is True
+
+    # two results, large delta → True
+    results_strong = [{"rank": -29.46}, {"rank": -24.71}]
+    assert is_high_confidence_match(results_strong, query_vec=None) is True
+
+    # two results, delta below threshold → False
+    results_tight = [{"rank": -29.0}, {"rank": -28.9}]
+    assert is_high_confidence_match(results_tight, query_vec=None) is False
+
+    # explicit min_cosine with query_vec=None must still be a no-op
+    assert is_high_confidence_match(
+        [{"rank": _SINGLE_RESULT_STRONG_RANK}], query_vec=None, min_cosine=0.99
+    ) is True
+
+
+def test_cosine_below_floor_rejects_strong_rank():
+    """Top result passes rank gates but cosine(query, note) < MIN_COSINE → False.
+
+    Models the #108 cross-topic peer scenario: two notes have very similar FTS5
+    rank values (large delta) but the query is semantically unrelated to the
+    top result (different domain entirely).
+    """
+    results = [
+        {"rank": -29.46, "tfidf_vector": _NOTE_CROSS_TOPIC},
+        {"rank": -24.71},
+    ]
+    # Sanity: without cosine gate (query_vec=None) the rank gates would accept.
+    assert is_high_confidence_match(results, query_vec=None) is True
+
+    # With cosine gate: cross-topic → cosine = 0.0 < MIN_COSINE → reject.
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC) is False
+
+
+def test_single_or_fallback_generic_overlap_rejects():
+    """Single result, strong rank, but query/note share only a low-weight generic term.
+
+    Models #252: the single-result fast-path (no runner-up) previously returned
+    True unconditionally.  With the cosine gate a generic-only overlap must be
+    rejected when query_vec is supplied.
+    """
+    # Only "plugin" is shared; its weight in both vectors is 2.0.
+    # query = {"notebook": 4, "obsidian": 4, "plugin": 2}
+    # note  = {"plugin": 2, "other": 8}
+    # dot = 2*2 = 4
+    # |q| = sqrt(16+16+4) = sqrt(36) = 6
+    # |n| = sqrt(4+64) = sqrt(68) ≈ 8.246
+    # cosine ≈ 4/(6*8.246) ≈ 0.081 < MIN_COSINE (0.12)
+    results = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK, "tfidf_vector": _NOTE_GENERIC_OVERLAP},
+    ]
+    # Rank-only (the pre-fix behavior) would accept this.
+    assert is_high_confidence_match(results, query_vec=None) is True
+
+    # Cosine gate with the supplied query_vec rejects the generic-only overlap.
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC) is False
+
+
+def test_cosine_above_floor_matches():
+    """Strong rank + cosine clearly above MIN_COSINE → True.
+
+    On-topic query and note share high-weight specific terms; the cosine gate
+    should not spuriously reject a genuine match.
+
+    Non-vacuity probe: same inputs but min_cosine=0.99 must return False,
+    proving the cosine branch is reached and controlling the outcome.
+    """
+    results = [
+        {"rank": -29.46, "tfidf_vector": _NOTE_ON_TOPIC},
+        {"rank": -24.71},
+    ]
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC) is True
+    # Non-vacuity: only min_cosine changed; cosine is <<0.99 so gate fires.
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC, min_cosine=0.99) is False
+
+
+def test_cosine_at_floor_boundary():
+    """Boundary: cosine == min_cosine must be accepted (>= semantics).
+
+    Constructs sparse vectors with power-of-two weights where cosine can be
+    computed exactly in IEEE 754, then passes that exact value as min_cosine.
+
+    Vectors chosen:
+        q = {"a": 1.0, "b": 2.0, "c": 2.0}   |q| = sqrt(1+4+4) = 3
+        n = {"a": 2.0, "d": 4.0, "e": 4.0}   |n| = sqrt(4+16+16) = 6
+        dot = 1*2 = 2
+        cosine = 2 / (3*6) = 2/18 = 1/9
+
+    1/9 is not exactly representable in IEEE 754, but Python's float division
+    2.0 / (3.0 * 6.0) produces the same bit pattern as the cosine computation
+    inside _cosine_similarity — so the exact-equality test is reliable.
+    """
+    q_vec = {"a": 1.0, "b": 2.0, "c": 2.0}   # |q| = 3.0 (exact)
+    n_vec = {"a": 2.0, "d": 4.0, "e": 4.0}   # |n| = 6.0 (exact)
+    # cosine = dot / (|q| * |n|) = 2.0 / 18.0 = 1/9 (same float ops as _cosine_similarity)
+    exact_cosine = 2.0 / (3.0 * 6.0)
+
+    results = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK, "tfidf_vector": n_vec},
+    ]
+
+    # At boundary (min_cosine == cosine): >= passes, > would reject.
+    assert is_high_confidence_match(
+        results, query_vec=q_vec, min_cosine=exact_cosine
+    ) is True  # cosine == min_cosine → accepted (>= semantics)
+
+    # Strictly above boundary: also passes.
+    assert is_high_confidence_match(
+        results, query_vec=q_vec, min_cosine=exact_cosine - 1e-10
+    ) is True
+
+    # Strictly below boundary: rejects.
+    assert is_high_confidence_match(
+        results, query_vec=q_vec, min_cosine=exact_cosine + 1e-10
+    ) is False
+
+
+def test_issue_45_true_positive_still_matches():
+    """The #45 repro case (top -29.46 / runner-up -24.71) must stay True with cosine gate.
+
+    On-topic vectors confirm cosine >> MIN_COSINE so the gate does not regress
+    a real match.
+
+    Non-vacuity probe: same inputs but min_cosine=0.99 must return False,
+    proving the cosine branch is reached and controlling the outcome.
+    """
+    results = [
+        {"rank": -29.46, "tfidf_vector": _NOTE_ON_TOPIC},
+        {"rank": -24.71},
+    ]
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC) is True
+    # Non-vacuity: only min_cosine changed; cosine is <<0.99 so gate fires.
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC, min_cosine=0.99) is False
+
+
+def test_missing_tfidf_vector_defaults_safe():
+    """When tfidf_vector is missing/None, the cosine gate is skipped (fail-open).
+
+    The caller may have been indexed before cosine vectors were computed, or the
+    note may be too short to produce a non-empty TF-IDF vector.  In both cases
+    we fall back to the rank-only verdict rather than spuriously rejecting.
+    """
+    # tfidf_vector key absent entirely — must not KeyError, must fall back.
+    results_absent = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK},
+        {"rank": -24.71},
+    ]
+    assert is_high_confidence_match(results_absent, query_vec=_QUERY_ON_TOPIC) is True
+
+    # tfidf_vector key present but None.
+    results_none = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK, "tfidf_vector": None},
+        {"rank": -24.71},
+    ]
+    assert is_high_confidence_match(results_none, query_vec=_QUERY_ON_TOPIC) is True
+
+    # tfidf_vector present but empty dict — treated as missing (cosine would be 0).
+    # An empty vector means the note had no usable terms; skip gate.
+    results_empty = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK, "tfidf_vector": {}},
+        {"rank": -24.71},
+    ]
+    assert is_high_confidence_match(results_empty, query_vec=_QUERY_ON_TOPIC) is True
+
+
+# ---------------------------------------------------------------------------
+# OR-fallback × vector matrix tests (#252 / #108 live-calibration fix)
+# ---------------------------------------------------------------------------
+
+def test_or_fallback_missing_vector_rejects():
+    """OR-fallback hit with no tfidf_vector must be REJECTED (fail-closed).
+
+    Models the live #108 false-positive: the top result came from the OR-fallback
+    branch (only generic terms matched) and has no stored vector to confirm
+    semantic closeness. Without this fix the gate would fail-open and accept the
+    result, risking an "update" that appends to the wrong note.
+
+    Non-vacuity proof: if the new fail-closed branch were deleted (restoring the
+    old fail-open behavior), this test would return True — confirming the branch
+    is the sole decider.  Verified by temporarily commenting out the new
+    `if is_or_fallback: return False` path: the assertion flips to True.
+
+    Rank input passes both the strength gate (-29.46 <= -5.0) and the single-result
+    delta gate (no runner-up → rank_verdict=True), so the or_fallback/cosine
+    logic is the sole decider.
+    """
+    results = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK, "or_fallback": True},
+        # No tfidf_vector key — mirrors a NULL-vector OR-fallback hit.
+    ]
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC) is False
+
+
+def test_and_path_missing_vector_fail_open():
+    """AND-path hit (or_fallback absent/False) with no tfidf_vector stays fail-open.
+
+    All query terms matched in AND mode; no vector needed for confidence.
+    The fail-open behavior for the AND-path must be preserved unchanged.
+    Results without an or_fallback key are treated as AND-path (falsy default).
+    """
+    # or_fallback key absent entirely — treated as AND-path.
+    results_no_key = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK},
+    ]
+    assert is_high_confidence_match(results_no_key, query_vec=_QUERY_ON_TOPIC) is True
+
+    # or_fallback explicitly False — also AND-path.
+    results_false = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK, "or_fallback": False},
+    ]
+    assert is_high_confidence_match(results_false, query_vec=_QUERY_ON_TOPIC) is True
+
+    # tfidf_vector=None with or_fallback=False — still fail-open.
+    results_none_and = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK, "or_fallback": False, "tfidf_vector": None},
+    ]
+    assert is_high_confidence_match(results_none_and, query_vec=_QUERY_ON_TOPIC) is True
+
+
+def test_or_fallback_high_cosine_matches():
+    """OR-fallback hit WITH a vector that clears the cosine floor must be ACCEPTED.
+
+    A genuine OR-fallback match that is semantically close (cosine >= min_cosine)
+    is not a false positive — it should be kept.  This test confirms the new
+    fail-closed path only fires when the vector is missing, not when cosine passes.
+    """
+    results = [
+        {
+            "rank": _SINGLE_RESULT_STRONG_RANK,
+            "or_fallback": True,
+            "tfidf_vector": _NOTE_ON_TOPIC,
+        },
+        {"rank": -24.71},
+    ]
+    # On-topic vectors: cosine >> MIN_COSINE → accepted even though or_fallback=True.
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC) is True
+    # Non-vacuity: raising min_cosine to 0.99 must flip to False (cosine branch fires).
+    assert is_high_confidence_match(
+        results, query_vec=_QUERY_ON_TOPIC, min_cosine=0.99
+    ) is False
+
+
+# ---------------------------------------------------------------------------
+# Cosine-rescue tests (#254 — near-miss rank_delta rescued by strong cosine)
+# ---------------------------------------------------------------------------
+
+# Exact-cosine fixture for the rescue boundary tests.
+# Constructed so the float arithmetic yields cosine == 0.4 reliably:
+#   q = {"aa": 3.0, "bb": 4.0}  → |q| = sqrt(9+16) = 5.0  (exact integer norm)
+#   n = {"aa": 4.0, "cc": 4.0, "dd": 2.0}  → |n| = sqrt(16+16+4) = 6.0  (exact)
+#   dot = 3*4 = 12   (only "aa" is shared)
+#   cosine = 12 / (5.0 * 6.0) = 12/30 = 0.4
+# Note: 0.4 is not exactly representable in IEEE 754, but the test is reliable
+# because the fixture and _cosine_similarity perform the IDENTICAL float operations
+# (same operands, same order) and thus produce the same bit pattern — the same way
+# test_cosine_at_floor_boundary uses 2.0 / (3.0 * 6.0) to mirror the internal ops.
+_QUERY_RESCUE = {"aa": 3.0, "bb": 4.0}
+_NOTE_RESCUE_EXACT = {"aa": 4.0, "cc": 4.0, "dd": 2.0}
+
+# Near-miss rank delta: top -10.97, #2 -10.73 → delta = 0.24 < MIN_RANK_DELTA (0.25).
+_NEAR_MISS_TOP_RANK = -10.97
+_NEAR_MISS_RUNNER_UP_RANK = -10.73
+
+
+def test_rank_delta_nearmiss_rescued_by_strong_cosine():
+    """Near-miss rank_delta rescued when top cosine >= MIN_COSINE_RESCUE.
+
+    FAIL-FIRST: confirms this returns False before the rescue logic exists, then
+    True after. Rank delta = 0.24 < MIN_RANK_DELTA (0.25), top rank -10.97 passes
+    the strength gate. Top note cosine is exactly 0.4 >= MIN_COSINE_RESCUE (0.40).
+    """
+    results = [
+        {"rank": _NEAR_MISS_TOP_RANK, "tfidf_vector": _NOTE_RESCUE_EXACT},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    assert is_high_confidence_match(results, query_vec=_QUERY_RESCUE) is True
+
+
+def test_rank_delta_nearmiss_weak_cosine_rejects():
+    """Near-miss rank_delta with weak cosine is NOT rescued.
+
+    Same rank delta as the rescue test but top cosine < MIN_COSINE_RESCUE (0.40).
+    Rescue requires STRONG cosine; a weak match must still be rejected.
+
+    Vectors: q = _QUERY_RESCUE (aa:3, bb:4), n = {aa:4, cc:16, dd:2}
+    dot = 3*4 = 12, |q|=5, |n| = sqrt(16+256+4) = sqrt(276) ≈ 16.61
+    cosine ≈ 12 / (5 * 16.61) ≈ 0.145 — clearly below MIN_COSINE_RESCUE (0.40).
+    """
+    note_vec_weak = {"aa": 4.0, "cc": 16.0, "dd": 2.0}
+    results = [
+        {"rank": _NEAR_MISS_TOP_RANK, "tfidf_vector": note_vec_weak},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    assert is_high_confidence_match(results, query_vec=_QUERY_RESCUE) is False
+
+
+def test_rank_delta_nearmiss_no_query_vec_rejects():
+    """Near-miss rank_delta with query_vec=None returns False (legacy path preserved).
+
+    Rescue fires ONLY when query_vec is not None. This test locks the invariant
+    that the legacy rank-only path is byte-identical when no cosine data is available.
+    """
+    results = [
+        {"rank": _NEAR_MISS_TOP_RANK, "tfidf_vector": _NOTE_RESCUE_EXACT},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    assert is_high_confidence_match(results, query_vec=None) is False
+
+
+def test_rescue_boundary_exact_threshold():
+    """Cosine exactly == MIN_COSINE_RESCUE is rescued (>= semantics); just-below rejects.
+
+    Uses the exact-cosine fixture where _cosine_similarity returns 0.4 bit-for-bit.
+    Two assertions:
+      1. min_cosine_rescue == cosine (0.4) → rescued (True).
+      2. min_cosine_rescue slightly above cosine (0.4 + epsilon) → rejected (False).
+    This guards the >= boundary precisely without relying on random or wide-gap vectors.
+    """
+    results = [
+        {"rank": _NEAR_MISS_TOP_RANK, "tfidf_vector": _NOTE_RESCUE_EXACT},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    # At threshold: cosine == 0.4 == min_cosine_rescue → rescued.
+    assert is_high_confidence_match(
+        results, query_vec=_QUERY_RESCUE, min_cosine_rescue=0.4
+    ) is True
+    # Just above threshold: cosine 0.4 < 0.4 + 1e-15 → not rescued → rejected.
+    assert is_high_confidence_match(
+        results, query_vec=_QUERY_RESCUE, min_cosine_rescue=0.4 + 1e-15
+    ) is False
+
+
+def test_strong_cosine_does_not_override_absolute_strength():
+    """Absolute-strength gate failure is NOT overridden by a strong cosine.
+
+    Rescue only bypasses the rank_delta gate, never the strength gate.
+    Top rank -3.0 fails the strength gate (> MIN_RANK_STRENGTH -5.0), so the
+    function returns False even when cosine is well above MIN_COSINE_RESCUE.
+    """
+    results = [
+        {"rank": -3.0, "tfidf_vector": _NOTE_RESCUE_EXACT},
+        {"rank": -2.5},
+    ]
+    # Cosine is 0.4 >= MIN_COSINE_RESCUE, but strength gate fires first.
+    assert is_high_confidence_match(results, query_vec=_QUERY_RESCUE) is False
+
+
+def test_passing_rank_delta_unaffected_by_rescue():
+    """Healthy rank_delta (> MIN_RANK_DELTA) returns True regardless of rescue path.
+
+    Ensures the rescue insertion does not break the ordinary passing case.
+    Tested both with and without query_vec.
+    """
+    # delta = 5.0 >> MIN_RANK_DELTA (0.25)
+    results_pass = [
+        {"rank": -15.0, "tfidf_vector": _NOTE_RESCUE_EXACT},
+        {"rank": -10.0},
+    ]
+    assert is_high_confidence_match(results_pass, query_vec=_QUERY_RESCUE) is True
+    assert is_high_confidence_match(results_pass, query_vec=None) is True
+
+
+def test_rank_delta_nearmiss_no_tfidf_vector_rejects():
+    """Near-miss rank_delta with query_vec supplied but top result has no tfidf_vector does NOT rescue.
+
+    Rescue requires an actual stored vector on the top result to compute a cosine;
+    when tfidf_vector is absent or None, there is nothing to score, so the rescue
+    branch cannot fire and the near-miss rank_delta verdict stands as False.
+
+    Tests both the absent-key and explicit-None cases to lock the empty-vector
+    handling on the rescue side (mirroring test_rank_delta_nearmiss_weak_cosine_rejects
+    for the non-rescue near-miss path).
+    """
+    # tfidf_vector key entirely absent — rescue cannot compute cosine → no rescue.
+    results_absent = [
+        {"rank": _NEAR_MISS_TOP_RANK},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    assert is_high_confidence_match(results_absent, query_vec=_QUERY_RESCUE) is False
+
+    # tfidf_vector key present but None — falsy, treated same as absent → no rescue.
+    results_none = [
+        {"rank": _NEAR_MISS_TOP_RANK, "tfidf_vector": None},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    assert is_high_confidence_match(results_none, query_vec=_QUERY_RESCUE) is False
