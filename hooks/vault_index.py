@@ -1530,6 +1530,7 @@ def search_vault(
     note_type: str | None = None,
     limit: int = 15,
     caller: str | None = None,
+    include_vectors: bool = False,
 ) -> list[dict]:
     """Full-text search over the vault index.
 
@@ -1544,6 +1545,15 @@ def search_vault(
 
     The optional ``caller`` parameter (e.g. 'vault-search', 'standup')
     drives task-context detection for context-adaptive type scoring.
+
+    When ``include_vectors=True`` each result dict contains a decoded
+    ``tfidf_vector`` key (``dict[str, float]`` or ``None`` for notes with no
+    stored vector).  Default is ``False`` — callers that do not need the
+    vector pay no overhead and the key is absent (backward-compatible).
+
+    Every result dict carries an ``or_fallback`` boolean: ``True`` when the
+    row was retrieved via the OR-fallback branch (AND returned 0 results),
+    ``False`` on the normal AND path.
     """
     if not os.path.isfile(db_path):
         return []
@@ -1573,9 +1583,12 @@ def search_vault(
             filter_sql += "AND n.type = ? "
             filter_params.append(note_type)
 
+        # Optionally include the stored TF-IDF vector column.
+        vector_col = ", n.tfidf_vector" if include_vectors else ""
         sql = (
             "SELECT n.path, n.type, n.date, n.project, n.title, n.tags, n.status, "
-            "n.source_session, n.source_note, n.size, n.body, n.importance, "
+            "n.source_session, n.source_note, n.size, n.body, n.importance"
+            + vector_col + ", "
             "bm25(notes_fts, 10.0, 1.0, 5.0) AS rank "
             "FROM notes_fts f "
             "JOIN notes n ON n.rowid = f.rowid "
@@ -1587,6 +1600,9 @@ def search_vault(
 
         rows = conn.execute(sql, params).fetchall()
         candidates = [dict(row) for row in rows]
+        # AND path — mark all candidates as non-fallback
+        for c in candidates:
+            c["or_fallback"] = False
 
         # OR fallback when AND returns nothing
         if not candidates:
@@ -1597,6 +1613,9 @@ def search_vault(
                 or_params: list = [or_query] + filter_params + [candidate_limit]
                 rows = conn.execute(sql, or_params).fetchall()
                 candidates = [dict(row) for row in rows]
+                # OR path — mark all candidates as fallback rows
+                for c in candidates:
+                    c["or_fallback"] = True
 
         task_context = detect_task_context(caller_skill=caller) if caller else None
         results = rerank_results(
@@ -1612,9 +1631,13 @@ def search_vault(
             "search",
             project=[r.get("project") for r in results],
         )
-        # Strip body — callers don't need it
+        # Strip body — callers don't need it.
+        # Decode tfidf_vector when requested (None-safe); leave key absent otherwise.
         for r in results:
             r.pop("body", None)
+            if include_vectors:
+                raw = r.get("tfidf_vector")
+                r["tfidf_vector"] = json.loads(raw) if raw else None
         return results
 
     except sqlite3.Error as exc:
@@ -1623,6 +1646,38 @@ def search_vault(
         return []
     finally:
         conn.close()
+
+
+def compute_query_vector(
+    conn: sqlite3.Connection,
+    query: str,
+) -> dict[str, float]:
+    """Compute a sparse TF-IDF vector for ``query`` against the live corpus.
+
+    Uses the same tokenization and IDF weighting as ``_upsert_note`` but does
+    NOT apply the ``total_docs + 1`` adjustment (that adjustment is only
+    correct when a new note is about to be inserted; a query is not a corpus
+    document).
+
+    Returns ``{}`` for an empty string or a query whose tokens are all
+    stopwords — callers should treat ``{}`` as a signal to skip cosine gating.
+    """
+    tokens = _tokenize_for_tfidf(query)
+    if not tokens:
+        return {}
+
+    total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    unique_terms = list(set(tokens))
+    term_df: dict[str, int] = {}
+    for i in range(0, len(unique_terms), 900):
+        chunk = unique_terms[i : i + 900]
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT term, df FROM term_df WHERE term IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        term_df.update(dict(rows))
+    return _compute_tfidf_vector(tokens, term_df, total_docs, top_k=50)
 
 
 # ---------------------------------------------------------------------------
