@@ -138,14 +138,6 @@ _NOTE_CROSS_TOPIC = {"python": 4.0, "code": 4.0, "debug": 2.0}
 # Actual cosine depends on weights; see test_single_or_fallback_generic_overlap_rejects.
 _NOTE_GENERIC_OVERLAP = {"plugin": 2.0, "other": 8.0}
 
-# Rank values that pass BOTH rank gates (strength and delta) when two results
-# are present, so cosine becomes the sole decider.  Top = -29.46, runner-up =
-# -24.71 (the real #45 vault values; delta 4.75 >> MIN_RANK_DELTA = 0.25).
-_TWO_RESULTS_STRONG = [
-    {"rank": -29.46, "tfidf_vector": None},   # will be overridden per test
-    {"rank": -24.71},
-]
-
 # Rank that passes the strength gate (single result branch, the #252 bug path).
 _SINGLE_RESULT_STRONG_RANK = -29.46
 
@@ -153,9 +145,11 @@ _SINGLE_RESULT_STRONG_RANK = -29.46
 def test_query_vec_none_is_backward_compatible():
     """When query_vec=None the new parameters must have zero effect on behavior.
 
-    Exercises the same cases as the pre-existing tests via the new signature to
-    confirm exact backward compat — not a duplicate, but an explicit contract
-    guard for the new optional parameters.
+    Deliberately mirrors the pre-existing rank-only test cases (empty list,
+    single strong, two-result large delta, two-result tight delta) as an
+    explicit backward-compat contract guard — not accidental duplication.
+    Exercises the new optional-parameter signature to confirm it does not
+    alter outcomes when cosine data is absent.
     """
     # empty → False (unchanged)
     assert is_high_confidence_match([], query_vec=None) is False
