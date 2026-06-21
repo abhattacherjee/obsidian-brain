@@ -1600,8 +1600,11 @@ def search_vault(
 
         rows = conn.execute(sql, params).fetchall()
         candidates = [dict(row) for row in rows]
-        # AND path — mark all candidates as non-fallback
-        # or_fallback: additive signal; no consumer yet (future: OR-fallback-aware guard, #252 follow-up).
+        # AND path — mark all candidates as non-fallback.
+        # or_fallback is consumed by compress_guard.is_high_confidence_match:
+        # OR-fallback hits that lack a stored tfidf_vector are rejected (fail-closed)
+        # because only generic tokens matched and semantic closeness cannot be confirmed.
+        # AND-path hits (or_fallback=False) without a vector remain fail-open.
         for c in candidates:
             c["or_fallback"] = False
 
@@ -1614,8 +1617,9 @@ def search_vault(
                 or_params: list = [or_query] + filter_params + [candidate_limit]
                 rows = conn.execute(sql, or_params).fetchall()
                 candidates = [dict(row) for row in rows]
-                # OR path — mark all candidates as fallback rows
-                # or_fallback: additive signal; no consumer yet (future: OR-fallback-aware guard, #252 follow-up).
+                # OR path — mark all candidates as fallback rows.
+                # Consumed by compress_guard: OR-fallback hits without a stored vector
+                # are rejected (fail-closed) to prevent false-positive dedup matches.
                 for c in candidates:
                     c["or_fallback"] = True
 

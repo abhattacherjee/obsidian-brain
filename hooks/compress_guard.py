@@ -17,6 +17,17 @@ against a representative set of vault notes is a follow-up (#252 / #108).
 TF-IDF query-vs-note sparse cosine scores are inherently low (sparse overlap
 between a short query vector and a pruned top-50 note vector), so 0.12 is
 already conservative; lower values risk accepting cross-topic matches.
+
+OR-fallback awareness (live-calibration fix, #252/#108):
+  When the top result has or_fallback=True (retrieved via the FTS5 OR-path
+  because AND found nothing), it may share only generic tokens with the query.
+  Missing-vector policy is therefore split by path:
+    - AND-path (or_fallback absent or False): fail-OPEN — all query terms were
+      present, so high rank confidence is sufficient even without a stored vector.
+    - OR-fallback (or_fallback=True) + no vector: fail-CLOSED — cannot confirm
+      semantic closeness; this is exactly the #252/#108 false-positive class.
+  When a vector IS present, both paths use the same cosine >= min_cosine gate
+  (unchanged behavior).
 """
 
 from tfidf import _cosine_similarity
@@ -65,10 +76,15 @@ def is_high_confidence_match(
           (b) top.rank passes the absolute-strength gate,
           (c) either there is no runner-up or |top.rank| - |runner_up.rank|
               exceeds the delta gate, AND
-          (d) when query_vec is not None AND top result carries a non-empty
-              tfidf_vector: cosine(query_vec, tfidf_vector) >= min_cosine
-              (if tfidf_vector is absent or None, the cosine gate is skipped
-              and the rank verdict stands).
+          (d) when query_vec is not None:
+              - if top result carries a non-empty tfidf_vector:
+                  cosine(query_vec, tfidf_vector) >= min_cosine (both paths).
+              - if tfidf_vector is absent/None/empty:
+                  - AND-path (or_fallback absent or False): fail-OPEN, rank
+                    verdict stands (all query terms matched → high confidence).
+                  - OR-fallback (or_fallback=True): fail-CLOSED, return False
+                    (cannot confirm semantic closeness for a generic-token hit;
+                    this is the #252/#108 false-positive class).
     """
     if min_strength is None:
         min_strength = MIN_RANK_STRENGTH
@@ -95,9 +111,9 @@ def is_high_confidence_match(
     # Cosine gate — only evaluated when caller supplies a query vector.
     if query_vec is not None:
         note_vec = top.get("tfidf_vector")
-        # Skip cosine gate when the note vector is missing, None, or empty;
-        # fall back to the rank-only verdict (fail-open, not spurious reject).
+        is_or_fallback = bool(top.get("or_fallback"))
         if note_vec:
+            # Vector present: apply cosine gate for both AND and OR-fallback paths.
             if min_term_overlap > 0:
                 shared = sum(
                     1
@@ -108,6 +124,14 @@ def is_high_confidence_match(
                     return False
             cosine = _cosine_similarity(query_vec, note_vec)
             if cosine < min_cosine:
+                return False
+        else:
+            # No vector to confirm semantic closeness.
+            # OR-fallback hit: fail-CLOSED — generic-token match, cannot verify
+            # relatedness; this is the #252/#108 false-positive class.
+            # AND-path (or_fallback absent/False): fail-OPEN — all query terms
+            # were present, so rank confidence is sufficient.
+            if is_or_fallback:
                 return False
 
     return True

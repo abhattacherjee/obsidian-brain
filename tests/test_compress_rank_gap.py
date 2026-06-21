@@ -320,3 +320,80 @@ def test_missing_tfidf_vector_defaults_safe():
         {"rank": -24.71},
     ]
     assert is_high_confidence_match(results_empty, query_vec=_QUERY_ON_TOPIC) is True
+
+
+# ---------------------------------------------------------------------------
+# OR-fallback × vector matrix tests (#252 / #108 live-calibration fix)
+# ---------------------------------------------------------------------------
+
+def test_or_fallback_missing_vector_rejects():
+    """OR-fallback hit with no tfidf_vector must be REJECTED (fail-closed).
+
+    Models the live #108 false-positive: the top result came from the OR-fallback
+    branch (only generic terms matched) and has no stored vector to confirm
+    semantic closeness. Without this fix the gate would fail-open and accept the
+    result, risking an "update" that appends to the wrong note.
+
+    Non-vacuity proof: if the new fail-closed branch were deleted (restoring the
+    old fail-open behavior), this test would return True — confirming the branch
+    is the sole decider.  Verified by temporarily commenting out the new
+    `if is_or_fallback: return False` path: the assertion flips to True.
+
+    Rank input passes both the strength gate (-29.46 <= -5.0) and the single-result
+    delta gate (no runner-up → rank_verdict=True), so the or_fallback/cosine
+    logic is the sole decider.
+    """
+    results = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK, "or_fallback": True},
+        # No tfidf_vector key — mirrors a NULL-vector OR-fallback hit.
+    ]
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC) is False
+
+
+def test_and_path_missing_vector_fail_open():
+    """AND-path hit (or_fallback absent/False) with no tfidf_vector stays fail-open.
+
+    All query terms matched in AND mode; no vector needed for confidence.
+    The fail-open behavior for the AND-path must be preserved unchanged.
+    Results without an or_fallback key are treated as AND-path (falsy default).
+    """
+    # or_fallback key absent entirely — treated as AND-path.
+    results_no_key = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK},
+    ]
+    assert is_high_confidence_match(results_no_key, query_vec=_QUERY_ON_TOPIC) is True
+
+    # or_fallback explicitly False — also AND-path.
+    results_false = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK, "or_fallback": False},
+    ]
+    assert is_high_confidence_match(results_false, query_vec=_QUERY_ON_TOPIC) is True
+
+    # tfidf_vector=None with or_fallback=False — still fail-open.
+    results_none_and = [
+        {"rank": _SINGLE_RESULT_STRONG_RANK, "or_fallback": False, "tfidf_vector": None},
+    ]
+    assert is_high_confidence_match(results_none_and, query_vec=_QUERY_ON_TOPIC) is True
+
+
+def test_or_fallback_high_cosine_matches():
+    """OR-fallback hit WITH a vector that clears the cosine floor must be ACCEPTED.
+
+    A genuine OR-fallback match that is semantically close (cosine >= min_cosine)
+    is not a false positive — it should be kept.  This test confirms the new
+    fail-closed path only fires when the vector is missing, not when cosine passes.
+    """
+    results = [
+        {
+            "rank": _SINGLE_RESULT_STRONG_RANK,
+            "or_fallback": True,
+            "tfidf_vector": _NOTE_ON_TOPIC,
+        },
+        {"rank": -24.71},
+    ]
+    # On-topic vectors: cosine >> MIN_COSINE → accepted even though or_fallback=True.
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC) is True
+    # Non-vacuity: raising min_cosine to 0.99 must flip to False (cosine branch fires).
+    assert is_high_confidence_match(
+        results, query_vec=_QUERY_ON_TOPIC, min_cosine=0.99
+    ) is False
