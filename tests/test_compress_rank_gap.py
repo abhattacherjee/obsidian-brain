@@ -220,12 +220,17 @@ def test_cosine_above_floor_matches():
 
     On-topic query and note share high-weight specific terms; the cosine gate
     should not spuriously reject a genuine match.
+
+    Non-vacuity probe: same inputs but min_cosine=0.99 must return False,
+    proving the cosine branch is reached and controlling the outcome.
     """
     results = [
         {"rank": -29.46, "tfidf_vector": _NOTE_ON_TOPIC},
         {"rank": -24.71},
     ]
     assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC) is True
+    # Non-vacuity: only min_cosine changed; cosine is <<0.99 so gate fires.
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC, min_cosine=0.99) is False
 
 
 def test_cosine_at_floor_boundary():
@@ -274,12 +279,17 @@ def test_issue_45_true_positive_still_matches():
 
     On-topic vectors confirm cosine >> MIN_COSINE so the gate does not regress
     a real match.
+
+    Non-vacuity probe: same inputs but min_cosine=0.99 must return False,
+    proving the cosine branch is reached and controlling the outcome.
     """
     results = [
         {"rank": -29.46, "tfidf_vector": _NOTE_ON_TOPIC},
         {"rank": -24.71},
     ]
     assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC) is True
+    # Non-vacuity: only min_cosine changed; cosine is <<0.99 so gate fires.
+    assert is_high_confidence_match(results, query_vec=_QUERY_ON_TOPIC, min_cosine=0.99) is False
 
 
 def test_missing_tfidf_vector_defaults_safe():

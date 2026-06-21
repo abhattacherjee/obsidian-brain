@@ -1601,6 +1601,7 @@ def search_vault(
         rows = conn.execute(sql, params).fetchall()
         candidates = [dict(row) for row in rows]
         # AND path — mark all candidates as non-fallback
+        # or_fallback: additive signal; no consumer yet (future: OR-fallback-aware guard, #252 follow-up).
         for c in candidates:
             c["or_fallback"] = False
 
@@ -1614,6 +1615,7 @@ def search_vault(
                 rows = conn.execute(sql, or_params).fetchall()
                 candidates = [dict(row) for row in rows]
                 # OR path — mark all candidates as fallback rows
+                # or_fallback: additive signal; no consumer yet (future: OR-fallback-aware guard, #252 follow-up).
                 for c in candidates:
                     c["or_fallback"] = True
 
@@ -1637,7 +1639,17 @@ def search_vault(
             r.pop("body", None)
             if include_vectors:
                 raw = r.get("tfidf_vector")
-                r["tfidf_vector"] = json.loads(raw) if raw else None
+                if raw:
+                    try:
+                        r["tfidf_vector"] = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        print(
+                            f"[vault-index] corrupt tfidf_vector for {r.get('path')!r}; treating as None",
+                            file=sys.stderr,
+                        )
+                        r["tfidf_vector"] = None
+                else:
+                    r["tfidf_vector"] = None
         return results
 
     except sqlite3.Error as exc:
@@ -1655,15 +1667,20 @@ def compute_query_vector(
     """Compute a sparse TF-IDF vector for ``query`` against the live corpus.
 
     Uses the same tokenization and IDF weighting as ``_upsert_note`` but does
-    NOT apply the ``total_docs + 1`` adjustment (that adjustment is only
-    correct when a new note is about to be inserted; a query is not a corpus
-    document).
+    NOT pre-increment ``total_docs`` (that pre-increment exists because a new
+    note is about to be inserted); ``_compute_tfidf_vector`` still adds 1
+    internally, so effective N = COUNT(*)+1 for a query vs COUNT(*)+2 for a
+    fresh insert — a one-document offset, negligible at any realistic corpus
+    size.
 
     ``conn`` must be obtained via :func:`_connect` (not a raw
     ``sqlite3.connect``), consistent with the repo's CI guard.
 
     Returns ``{}`` for an empty string or a query whose tokens are all
     stopwords — callers should treat ``{}`` as a signal to skip cosine gating.
+
+    Propagates ``sqlite3.Error`` on DB query failure; callers are responsible
+    for catching.
     """
     tokens = _tokenize_for_tfidf(query)
     if not tokens:

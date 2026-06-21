@@ -78,16 +78,20 @@ try:
     from obsidian_utils import load_config
     # Pure predicate: top rank must pass absolute-strength gate AND |top|-|#2| delta gate.
     # MIN_RANK_DELTA tuned against scripts/compress_rank_gap_corpus.json (issue #45).
-    # Cosine gate: query_vec threads through when non-empty; {} (stopword/empty query
-    # or fresh index with no term_df) becomes None so guard runs rank-only (legacy path).
+    # Cosine gate: query_vec threads through when non-empty; {} (stopword/empty query only)
+    # becomes None so guard runs rank-only (legacy path). Note: a fresh (0-note) index still
+    # yields IDF=1.0 for every token, so a non-stopword query produces a NON-empty dict —
+    # but search_vault returns [] on an empty corpus, so the cosine gate is never reached.
     from compress_guard import is_high_confidence_match
     c = load_config()
     vp = c["vault_path"]
     folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
     db = ensure_index(vp, folders)
     conn = _connect(db)
-    query_vec = compute_query_vector(conn, sys.argv[1])
-    conn.close()
+    try:
+        query_vec = compute_query_vector(conn, sys.argv[1])
+    finally:
+        conn.close()
     results = search_vault(db, sys.argv[1], note_type="claude-insight", limit=3, include_vectors=True)
     results += search_vault(db, sys.argv[1], note_type="claude-decision", limit=3, include_vectors=True)
     # Sort combined results by rank (most negative = best match)

@@ -94,6 +94,9 @@ class TestIncludeVectors:
             assert v is None or isinstance(v, dict), (
                 f"tfidf_vector must be dict or None, got {type(v)}: {v!r}"
             )
+        assert any(r["tfidf_vector"] is not None for r in results), (
+            "at least one indexed note should carry a non-None tfidf_vector"
+        )
 
     def test_search_vault_default_omits_tfidf_vector(self, tmp_vault):
         """Default call (include_vectors=False) must NOT include tfidf_vector key."""
