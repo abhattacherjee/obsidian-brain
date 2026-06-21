@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **`/compress` no longer surfaces semantically-unrelated notes as high-confidence matches (#252, #108):** the match guard now applies a TF-IDF **cosine floor** on the top result — reusing the stored per-note `tfidf_vector` — in addition to the existing FTS rank-strength and rank-delta gates. Previously a single OR-fallback hit sharing only generic terms (#252), or a cross-topic peer whose rank gap happened to pass (#108), could be matched — risking an "update" that appends to the wrong note. The cosine gate can only *reject* a match, never loosen one, and degrades to the prior rank-only behavior when no query or note vector is available.
   - **Live-calibration refinement:** OR-fallback hits that have no stored `tfidf_vector` are now **rejected** (fail-closed) rather than accepted. Previously the gate failed open for any missing-vector result regardless of how the hit was retrieved; live-vault calibration showed this allowed a NULL-vector OR-fallback hit — matched only on generic tokens — to pass as high-confidence. AND-path hits (all query terms present) without a vector remain fail-open, as full-term presence is sufficient for rank confidence.
+- **`/vault-reindex` (non-destructive) now backfills `tfidf_vector` for notes indexed before the vector-storage migration** (~26% had NULL vectors), so the `/compress` cosine gate applies to (nearly) all candidates instead of fail-opening on vectorless notes. (#255)
 
 ## [3.1.0] - 2026-06-19
 
