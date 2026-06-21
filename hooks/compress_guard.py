@@ -46,6 +46,13 @@ MIN_COSINE = 0.12         # minimum cosine(query_vec, top_note_tfidf_vector) to 
 # rescue hardens the broader #45 class, which currently lacks a live repro.
 MIN_COSINE_RESCUE = 0.40
 
+# A rescued match must still clear the cosine gate, so the rescue threshold
+# must be >= the cosine floor; otherwise a rescue would fire then be silently
+# rejected. Fail loudly at import if a future tuning breaks this invariant.
+assert MIN_COSINE_RESCUE >= MIN_COSINE, (
+    "MIN_COSINE_RESCUE must be >= MIN_COSINE (a rescued match must pass the cosine gate)"
+)
+
 # Minimum shared terms (query weight > 0) between query and top note; set to 0
 # to disable the overlap check by default (cosine already captures generic-only
 # overlap via low IDF weight; this param is available for future tightening).
@@ -83,7 +90,10 @@ def is_high_confidence_match(
             match with cosine >= min_cosine_rescue is rescued (rank_verdict
             flipped True and evaluation continues into the cosine gate).
             Ignored when query_vec is None. Default None uses the module
-            constant MIN_COSINE_RESCUE.
+            constant MIN_COSINE_RESCUE. Callers overriding this parameter
+            must keep min_cosine_rescue >= min_cosine; the function does
+            not re-validate override params (the module-level assert only
+            guards the default constants).
 
     Returns:
         bool. True only if:

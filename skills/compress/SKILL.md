@@ -91,6 +91,7 @@ try:
     results = search_vault(db, sys.argv[1], note_type="claude-insight", limit=3, include_vectors=True)
     results += search_vault(db, sys.argv[1], note_type="claude-decision", limit=3, include_vectors=True)
     results += search_vault(db, sys.argv[1], note_type="claude-session", limit=3, include_vectors=True)
+    # No dedup needed: each note has a single type, so the three note_type searches are disjoint.
     # Sort combined results by rank (most negative = best match)
     results.sort(key=lambda r: r["rank"])
     if is_high_confidence_match(results, query_vec=query_vec or None):

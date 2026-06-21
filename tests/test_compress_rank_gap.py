@@ -119,6 +119,8 @@ def test_constants_are_exposed():
     assert MIN_RANK_DELTA > 0.0
     # Hard constraint from issue #45 — fix is not complete without this.
     assert MIN_RANK_DELTA < 4.75
+    # Pin the rescue threshold so accidental retuning is caught immediately.
+    assert MIN_COSINE_RESCUE == 0.40
 
 
 # ---------------------------------------------------------------------------
@@ -405,15 +407,17 @@ def test_or_fallback_high_cosine_matches():
 # ---------------------------------------------------------------------------
 
 # Exact-cosine fixture for the rescue boundary tests.
-# Constructed so the float arithmetic yields cosine == 0.4 exactly:
+# Constructed so the float arithmetic yields cosine == 0.4 reliably:
 #   q = {"aa": 3.0, "bb": 4.0}  → |q| = sqrt(9+16) = 5.0  (exact integer norm)
 #   n = {"aa": 4.0, "cc": 4.0, "dd": 2.0}  → |n| = sqrt(16+16+4) = 6.0  (exact)
 #   dot = 3*4 = 12   (only "aa" is shared)
-#   cosine = 12 / (5.0 * 6.0) = 12/30 = 0.4  (exact IEEE 754)
-# Power-of-two weights NOT required here — integer norms produce the exact product.
-# The identical float ops in _cosine_similarity reproduce 0.4 bit-for-bit.
+#   cosine = 12 / (5.0 * 6.0) = 12/30 = 0.4
+# Note: 0.4 is not exactly representable in IEEE 754, but the test is reliable
+# because the fixture and _cosine_similarity perform the IDENTICAL float operations
+# (same operands, same order) and thus produce the same bit pattern — the same way
+# test_cosine_at_floor_boundary uses 2.0 / (3.0 * 6.0) to mirror the internal ops.
 _QUERY_RESCUE = {"aa": 3.0, "bb": 4.0}
-_NOTE_RESCUE_EXACT = {"aa": 4.0, "cc": 4.0, "dd": 2.0}   # cosine == 0.4 exactly
+_NOTE_RESCUE_EXACT = {"aa": 4.0, "cc": 4.0, "dd": 2.0}   # cosine == 0.4 (same float ops as _cosine_similarity → same bit pattern)
 
 # Near-miss rank delta: top -10.97, #2 -10.73 → delta = 0.24 < MIN_RANK_DELTA (0.25).
 _NEAR_MISS_TOP_RANK = -10.97
@@ -516,3 +520,29 @@ def test_passing_rank_delta_unaffected_by_rescue():
     ]
     assert is_high_confidence_match(results_pass, query_vec=_QUERY_RESCUE) is True
     assert is_high_confidence_match(results_pass, query_vec=None) is True
+
+
+def test_rank_delta_nearmiss_no_tfidf_vector_rejects():
+    """Near-miss rank_delta with query_vec supplied but top result has no tfidf_vector does NOT rescue.
+
+    Rescue requires an actual stored vector on the top result to compute a cosine;
+    when tfidf_vector is absent or None, there is nothing to score, so the rescue
+    branch cannot fire and the near-miss rank_delta verdict stands as False.
+
+    Tests both the absent-key and explicit-None cases to lock the empty-vector
+    handling on the rescue side (mirroring test_rank_delta_nearmiss_weak_cosine_rejects
+    for the non-rescue near-miss path).
+    """
+    # tfidf_vector key entirely absent — rescue cannot compute cosine → no rescue.
+    results_absent = [
+        {"rank": _NEAR_MISS_TOP_RANK},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    assert is_high_confidence_match(results_absent, query_vec=_QUERY_RESCUE) is False
+
+    # tfidf_vector key present but None — falsy, treated same as absent → no rescue.
+    results_none = [
+        {"rank": _NEAR_MISS_TOP_RANK, "tfidf_vector": None},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    assert is_high_confidence_match(results_none, query_vec=_QUERY_RESCUE) is False
