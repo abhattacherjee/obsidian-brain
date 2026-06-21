@@ -38,6 +38,14 @@ MIN_RANK_DELTA = 0.25     # tuned against scripts/compress_rank_gap_corpus.json 
 # PROVISIONAL default — see module docstring for calibration note.
 MIN_COSINE = 0.12         # minimum cosine(query_vec, top_note_tfidf_vector) to accept a match
 
+# Strong-cosine threshold that rescues a borderline rank_delta near-miss (#254 / #45 class).
+# A top match this semantically close to the query is the right home even when the BM25
+# rank-gap (MIN_RANK_DELTA) is a near-miss.  Conservative default: above the cross-topic
+# false-positive cosine band (~0.12–0.20), at/below genuine same-topic (~0.42+).
+# Mechanism-proving: #254's own repro is closed by the note_type widening (Fix A); this
+# rescue hardens the broader #45 class, which currently lacks a live repro.
+MIN_COSINE_RESCUE = 0.40
+
 # Minimum shared terms (query weight > 0) between query and top note; set to 0
 # to disable the overlap check by default (cosine already captures generic-only
 # overlap via low IDF weight; this param is available for future tightening).
@@ -51,6 +59,7 @@ def is_high_confidence_match(
     query_vec=None,
     min_cosine=None,
     min_term_overlap=None,
+    min_cosine_rescue=None,
 ):
     """Return True if the top search result is a high-confidence match.
 
@@ -69,13 +78,21 @@ def is_high_confidence_match(
             the top result must share at least this many terms (with query
             weight > 0) with the query. Ignored when query_vec is None.
             Default 0 disables the check.
+        min_cosine_rescue: optional override for MIN_COSINE_RESCUE. When
+            query_vec is not None and the rank_delta gate fails, a top
+            match with cosine >= min_cosine_rescue is rescued (rank_verdict
+            flipped True and evaluation continues into the cosine gate).
+            Ignored when query_vec is None. Default None uses the module
+            constant MIN_COSINE_RESCUE.
 
     Returns:
         bool. True only if:
           (a) results is non-empty,
           (b) top.rank passes the absolute-strength gate,
           (c) either there is no runner-up or |top.rank| - |runner_up.rank|
-              exceeds the delta gate, AND
+              exceeds the delta gate, OR (c-rescue) the delta gate fails but
+              query_vec is not None, the top result has a non-empty
+              tfidf_vector, and cosine >= min_cosine_rescue, AND
           (d) when query_vec is not None:
               - if top result carries a non-empty tfidf_vector:
                   cosine(query_vec, tfidf_vector) >= min_cosine (both paths).
@@ -94,6 +111,8 @@ def is_high_confidence_match(
         min_cosine = MIN_COSINE
     if min_term_overlap is None:
         min_term_overlap = MIN_TERM_OVERLAP
+    if min_cosine_rescue is None:
+        min_cosine_rescue = MIN_COSINE_RESCUE
 
     if not results:
         return False
@@ -105,8 +124,20 @@ def is_high_confidence_match(
     else:
         rank_verdict = (abs(top["rank"]) - abs(results[1]["rank"])) > min_delta
 
+    # Cosine-rescue: when rank_delta is a near-miss, a strong top-match cosine
+    # rescues it.  The cosine value is computed once here and reused in the
+    # cosine gate below to avoid calling _cosine_similarity twice.
+    # Rescue fires only when query_vec is available (None → legacy path unchanged).
+    top_cosine = None  # computed once, shared with the cosine gate below
     if not rank_verdict:
-        return False
+        if query_vec is not None:
+            top_vec = top.get("tfidf_vector")
+            if top_vec:
+                top_cosine = _cosine_similarity(query_vec, top_vec)
+                if top_cosine >= min_cosine_rescue:
+                    rank_verdict = True  # rescued — continue into cosine gate
+        if not rank_verdict:
+            return False
 
     # Cosine gate — only evaluated when caller supplies a query vector.
     if query_vec is not None:
@@ -114,6 +145,11 @@ def is_high_confidence_match(
         is_or_fallback = bool(top.get("or_fallback"))
         if note_vec:
             # Vector present: apply cosine gate for both AND and OR-fallback paths.
+            # Reuse the cosine computed during rescue (if available) to avoid a
+            # second call to _cosine_similarity on the same pair of vectors.
+            if top_cosine is None:
+                top_cosine = _cosine_similarity(query_vec, note_vec)
+            cosine = top_cosine
             if min_term_overlap > 0:
                 shared = sum(
                     1
@@ -122,7 +158,6 @@ def is_high_confidence_match(
                 )
                 if shared < min_term_overlap:
                     return False
-            cosine = _cosine_similarity(query_vec, note_vec)
             if cosine < min_cosine:
                 return False
         else:

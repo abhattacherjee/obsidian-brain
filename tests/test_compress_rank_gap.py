@@ -8,6 +8,7 @@ results list.
 
 from compress_guard import (
     MIN_COSINE,
+    MIN_COSINE_RESCUE,
     MIN_RANK_DELTA,
     MIN_RANK_STRENGTH,
     MIN_TERM_OVERLAP,
@@ -397,3 +398,121 @@ def test_or_fallback_high_cosine_matches():
     assert is_high_confidence_match(
         results, query_vec=_QUERY_ON_TOPIC, min_cosine=0.99
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# Cosine-rescue tests (#254 — near-miss rank_delta rescued by strong cosine)
+# ---------------------------------------------------------------------------
+
+# Exact-cosine fixture for the rescue boundary tests.
+# Constructed so the float arithmetic yields cosine == 0.4 exactly:
+#   q = {"aa": 3.0, "bb": 4.0}  → |q| = sqrt(9+16) = 5.0  (exact integer norm)
+#   n = {"aa": 4.0, "cc": 4.0, "dd": 2.0}  → |n| = sqrt(16+16+4) = 6.0  (exact)
+#   dot = 3*4 = 12   (only "aa" is shared)
+#   cosine = 12 / (5.0 * 6.0) = 12/30 = 0.4  (exact IEEE 754)
+# Power-of-two weights NOT required here — integer norms produce the exact product.
+# The identical float ops in _cosine_similarity reproduce 0.4 bit-for-bit.
+_QUERY_RESCUE = {"aa": 3.0, "bb": 4.0}
+_NOTE_RESCUE_EXACT = {"aa": 4.0, "cc": 4.0, "dd": 2.0}   # cosine == 0.4 exactly
+
+# Near-miss rank delta: top -10.97, #2 -10.73 → delta = 0.24 < MIN_RANK_DELTA (0.25).
+_NEAR_MISS_TOP_RANK = -10.97
+_NEAR_MISS_RUNNER_UP_RANK = -10.73
+
+
+def test_rank_delta_nearmiss_rescued_by_strong_cosine():
+    """Near-miss rank_delta rescued when top cosine >= MIN_COSINE_RESCUE.
+
+    FAIL-FIRST: confirms this returns False before the rescue logic exists, then
+    True after. Rank delta = 0.24 < MIN_RANK_DELTA (0.25), top rank -10.97 passes
+    the strength gate. Top note cosine is exactly 0.4 >= MIN_COSINE_RESCUE (0.40).
+    """
+    results = [
+        {"rank": _NEAR_MISS_TOP_RANK, "tfidf_vector": _NOTE_RESCUE_EXACT},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    assert is_high_confidence_match(results, query_vec=_QUERY_RESCUE) is True
+
+
+def test_rank_delta_nearmiss_weak_cosine_rejects():
+    """Near-miss rank_delta with weak cosine is NOT rescued.
+
+    Same rank delta as the rescue test but top cosine < MIN_COSINE_RESCUE (~0.30).
+    Rescue requires STRONG cosine; a weak match must still be rejected.
+
+    Vectors: q = _QUERY_RESCUE (aa:3, bb:4), n = {aa:4, cc:16, dd:2}
+    dot = 3*4 = 12, |q|=5, |n| = sqrt(16+256+4) = sqrt(276) ≈ 16.61
+    cosine ≈ 12 / (5 * 16.61) ≈ 0.145 — clearly below MIN_COSINE_RESCUE (0.40).
+    """
+    note_vec_weak = {"aa": 4.0, "cc": 16.0, "dd": 2.0}
+    results = [
+        {"rank": _NEAR_MISS_TOP_RANK, "tfidf_vector": note_vec_weak},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    assert is_high_confidence_match(results, query_vec=_QUERY_RESCUE) is False
+
+
+def test_rank_delta_nearmiss_no_query_vec_rejects():
+    """Near-miss rank_delta with query_vec=None returns False (legacy path preserved).
+
+    Rescue fires ONLY when query_vec is not None. This test locks the invariant
+    that the legacy rank-only path is byte-identical when no cosine data is available.
+    """
+    results = [
+        {"rank": _NEAR_MISS_TOP_RANK, "tfidf_vector": _NOTE_RESCUE_EXACT},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    assert is_high_confidence_match(results, query_vec=None) is False
+
+
+def test_rescue_boundary_exact_threshold():
+    """Cosine exactly == MIN_COSINE_RESCUE is rescued (>= semantics); just-below rejects.
+
+    Uses the exact-cosine fixture where _cosine_similarity returns 0.4 bit-for-bit.
+    Two assertions:
+      1. min_cosine_rescue == cosine (0.4) → rescued (True).
+      2. min_cosine_rescue slightly above cosine (0.4 + epsilon) → rejected (False).
+    This guards the >= boundary precisely without relying on random or wide-gap vectors.
+    """
+    results = [
+        {"rank": _NEAR_MISS_TOP_RANK, "tfidf_vector": _NOTE_RESCUE_EXACT},
+        {"rank": _NEAR_MISS_RUNNER_UP_RANK},
+    ]
+    # At threshold: cosine == 0.4 == min_cosine_rescue → rescued.
+    assert is_high_confidence_match(
+        results, query_vec=_QUERY_RESCUE, min_cosine_rescue=0.4
+    ) is True
+    # Just above threshold: cosine 0.4 < 0.4 + 1e-15 → not rescued → rejected.
+    assert is_high_confidence_match(
+        results, query_vec=_QUERY_RESCUE, min_cosine_rescue=0.4 + 1e-15
+    ) is False
+
+
+def test_strong_cosine_does_not_override_absolute_strength():
+    """Absolute-strength gate failure is NOT overridden by a strong cosine.
+
+    Rescue only bypasses the rank_delta gate, never the strength gate.
+    Top rank -3.0 fails the strength gate (> MIN_RANK_STRENGTH -5.0), so the
+    function returns False even when cosine is well above MIN_COSINE_RESCUE.
+    """
+    results = [
+        {"rank": -3.0, "tfidf_vector": _NOTE_RESCUE_EXACT},
+        {"rank": -2.5},
+    ]
+    # Cosine is 0.4 >= MIN_COSINE_RESCUE, but strength gate fires first.
+    assert is_high_confidence_match(results, query_vec=_QUERY_RESCUE) is False
+
+
+def test_passing_rank_delta_unaffected_by_rescue():
+    """Healthy rank_delta (> MIN_RANK_DELTA) returns True regardless of rescue path.
+
+    Ensures the rescue insertion does not break the ordinary passing case.
+    Tested both with and without query_vec.
+    """
+    # delta = 5.0 >> MIN_RANK_DELTA (0.25)
+    results_pass = [
+        {"rank": -15.0, "tfidf_vector": _NOTE_RESCUE_EXACT},
+        {"rank": -10.0},
+    ]
+    assert is_high_confidence_match(results_pass, query_vec=_QUERY_RESCUE) is True
+    assert is_high_confidence_match(results_pass, query_vec=None) is True
