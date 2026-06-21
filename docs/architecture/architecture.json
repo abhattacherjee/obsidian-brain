@@ -1,21 +1,21 @@
 {
   "name": "obsidian-brain",
   "displayName": "Obsidian Brain",
-  "version": "3.0.1",
+  "version": "3.1.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-06-19",
+  "lastUpdated": "2026-06-21",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
     "language": { "name": "Python", "version": "3.12", "strict": true, "notes": "stdlib only — no pip dependencies; deterministic hooks safe to run at session boundaries" },
-    "framework": { "name": "Claude Code Plugin", "version": "3.0.1", "router": "lifecycle hooks + prompt-based skills" },
+    "framework": { "name": "Claude Code Plugin", "version": "3.1.1", "router": "lifecycle hooks + prompt-based skills" },
     "runtime": { "name": "Python", "minVersion": "3.12" },
     "ui": { "library": "Obsidian Dataview", "version": "community plugin (JS + inline queries)", "notes": "dashboards only — the plugin itself requires no Obsidian plugin to write notes" },
     "persistence": { "primary": "Markdown vault (filesystem)", "secondary": ["SQLite + FTS5 search index", "JSON config", "append-only telemetry logs"] },
     "realtime": { "protocol": "none", "endpoint": "direct filesystem writes — no MCP server, no REST API, no daemon" },
     "ai": { "provider": "Claude CLI (claude -p)", "model": "haiku default; escalates haiku to sonnet to opus on empty output (#165)", "notes": "summarization deferred from hooks to /recall" },
     "vectorSearch": { "engine": "SQLite FTS5 (BM25) + 7-signal rerank; TF-IDF cosine themes with ACT-R activation and Free-Energy surprise" },
-    "tests": { "unit": { "runner": "pytest", "count": 73, "environments": ["python3.12"], "coverage": { "lines": 90 } } },
+    "tests": { "unit": { "runner": "pytest", "count": 1679, "environments": ["python3.12"], "coverage": { "lines": 91 } } },
     "packageManager": "none (stdlib only)"
   },
   "diagram": {
@@ -85,7 +85,8 @@
       "description": "A local SQLite database (WAL mode, FTS5) that enables fast full-text and ranked recall across the vault. Lazy mtime-incremental sync, a 7-signal reranker, ACT-R activation from an access log, and TF-IDF cosine themes with a Free-Energy surprise signal. Hooks never touch this — it is skill-side only.",
       "components": [
         { "id": "ensure-index", "name": "ensure_index() / _sync()", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Create-or-update the DB: schema init statement-by-statement (FTS5 IF NOT EXISTS), column migrations, mtime-incremental sync inside BEGIN IMMEDIATE, and corruption recovery that deletes+recreates db/-wal/-shm. When a single sync churns >50% of the final corpus — via inserts OR deletions combined — _recompute_all_tfidf_vectors() runs a second pass so TF-IDF scores reflect the final N/df: inserts otherwise leave early notes with insertion-time IDF, and deletions otherwise leave survivors with pre-deletion IDF (#235) until the next mtime-triggered upsert.", "overrideEnv": "OBSIDIAN_BRAIN_DB" },
-        { "id": "search-vault", "name": "search_vault()", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Sanitizes the query to AND-mode FTS5 (hyphens to spaces), runs bm25 with title 10x and tags 5x weighting, OR-fallback when AND is empty, reranks, batch-logs access, strips body before returning." },
+        { "id": "search-vault", "name": "search_vault()", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Sanitizes the query to AND-mode FTS5 (hyphens to spaces), runs bm25 with title 10x and tags 5x weighting, OR-fallback when AND is empty, reranks, batch-logs access, strips body before returning. Two opt-in additions: include_vectors=True adds a decoded tfidf_vector key (dict[str,float] or None) to each result, used by /compress Step 3.5 for the cosine gate; every result dict also carries an or_fallback bool (True when retrieved via the OR-fallback branch)." },
+        { "id": "compute-query-vector", "name": "compute_query_vector()", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Computes a sparse TF-IDF vector for a search query against the live corpus (vault_index.py). Takes a db_path string (consistent with search_vault) and manages its own connection via _connect with try/finally close. Uses the same tokenization and IDF weighting as _upsert_note but without the caller-side total_docs pre-increment that _upsert_note applies for a new insert (effective N = COUNT(*)+1 for a query vs COUNT(*)+2 for a fresh insert — a one-document offset, negligible at any realistic corpus size). Returns {} for empty/stopword-only queries — callers treat {} as a signal to skip cosine gating. Used by /compress Step 3.5 to produce query_vec passed into is_high_confidence_match." },
         { "id": "rerank", "name": "rerank_results() — 7-signal scorer", "kind": "function", "files": ["hooks/vault_index.py"], "purpose": "Weighted sum: proximity 0.25, bm25 0.20, activation 0.20, type 0.10, recency 0.10, importance 0.10, density 0.05. Type score is context-adaptive (debugging/standup/emerge/search/general)." },
         { "id": "access-log", "name": "log_access() / batch_activations()", "kind": "datastore-client", "files": ["hooks/vault_index.py"], "purpose": "Records access events (cascading snapshot accesses to the parent session) and computes ACT-R base-level activation, reserving 0.0 for notes with no history." },
         { "id": "tfidf", "name": "tfidf.py — TF-IDF primitives (leaf)", "kind": "module", "files": ["hooks/tfidf.py"], "purpose": "Stdlib-only leaf (no vault_index or themes imports). Exports _tokenize_for_tfidf, _compute_tfidf_vector, _cosine_similarity, _update_term_df, _reverse_fold_centroid, _STOPWORDS, _TOKEN_RE. Smoothed IDF, sparse top-50 vectors, cosine similarity. _reverse_fold_centroid does the reverse-fold removal of a note's vector from a running-average centroid, shared by themes.assign_to_theme and vault_index._delete_note (#246). Imported by themes.py and re-exported from vault_index.py for back-compat; kept acyclic by design. term_df maintained via ON CONFLICT DO UPDATE, never blind REPLACE." },
@@ -107,7 +108,7 @@
         { "id": "check-items-cli", "name": "check_items_cli.py", "kind": "module", "files": ["hooks/check_items_cli.py"], "purpose": "Holds the semantic-merge and classifier prompts and the Claude CLI dispatch. Solves the timeout problem by chunking to <=25 groups/call (well under the 300s ceiling) so chunks stay on Haiku; strips json fences and validates the 6-field payload.", "overrideEnv": "CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE" },
         { "id": "check-items-report", "name": "check_items_report.py", "kind": "module", "files": ["hooks/check_items_report.py"], "purpose": "Writes the per-scope dashboard note (Done/Needs-Action/Stale/Active sections + classifier-mode frontmatter), always written even on --dry-run, path-contained and atomic." },
         { "id": "open-item-dedup", "name": "open_item_dedup.py", "kind": "module", "files": ["hooks/open_item_dedup.py"], "purpose": "Cross-note open-item dedup (exact to distinctive-token to fuzzy set-intersection), cascade-checkoff with verify-before-edit, the heuristic fallback classifier (distinctive token AND completion phrase within +/-120 chars), the deep_analysis_pipeline evidence engine, and anchor_text_matches/_normalize_item_text — the text-anchor helper (#201) that confirms a checkbox line is the open item meant for checkoff via a normalized longest-common-substring threshold." },
-        { "id": "compress-guard", "name": "compress_guard.py", "kind": "module", "files": ["hooks/compress_guard.py"], "purpose": "is_high_confidence_match() predicate for /compress dedup: absolute-strength gate (top rank <= -5.0) AND rank-delta gate (top minus runner-up > 0.25), tuned against compress_rank_gap_corpus.json." },
+        { "id": "compress-guard", "name": "compress_guard.py", "kind": "module", "files": ["hooks/compress_guard.py"], "purpose": "is_high_confidence_match() predicate for /compress dedup: absolute-strength gate (top rank <= MIN_RANK_STRENGTH -5.0) AND rank-delta gate (top minus runner-up > MIN_RANK_DELTA 0.25), PLUS an optional OR-fallback-aware TF-IDF cosine gate. When caller supplies query_vec: if the top result has a stored tfidf_vector, cosine(query_vec, note_vec) >= MIN_COSINE (default 0.12) is required for both AND and OR-fallback hits. If no vector is stored: OR-fallback hits (or_fallback=True) are rejected fail-CLOSED (cannot confirm semantic closeness for a generic-token match — the #252/#108 false-positive class); AND-path hits (or_fallback absent/False) remain fail-OPEN (all query terms matched, rank confidence sufficient). Cosine gate entirely skipped when query_vec is None (backward compat). Constants MIN_RANK_STRENGTH/MIN_RANK_DELTA/MIN_COSINE/MIN_TERM_OVERLAP are module-level and overridable per-call for tuning." },
         { "id": "deep-cli", "name": "deep_cli.py", "kind": "module", "files": ["hooks/deep_cli.py"], "purpose": "Thin CLI backing /standup deep: runs the deep pipeline, renders the presentation, and applies path-contained batch edits with a 24h acted-on store so items are not re-recommended. The /standup deep checkoff path is text-anchored (#201): run_build_checkoffs re-resolves each target by text against the file's real unchecked-checkbox lines (ignoring drifted classifier line hints), refuses ambiguous matches (>1 distinct unchecked checkbox text-matching the representative) instead of guessing — the classifier line is a diagnostic hint only, never used to select a target, and emits verified triples; run_batch_edit line-anchors every checkbox flip (exact full-line match), surfaces any flip with no matching line as a skipped-checkoff list, and keeps the substring path only for non-checkbox edits like link additions. (The /check-items sibling-cascade path is line-based, not text-anchored.)" },
         { "id": "emerge-cli", "name": "emerge_cli.py", "kind": "module", "files": ["hooks/emerge_cli.py"], "purpose": "Thin CLI backing /emerge (theme-level). run_emerge_themes(days) refreshes theme activation (BEGIN IMMEDIATE), pulls themes updated in the window with their top-3 member previews plus windowed unassigned candidates, and writes a compact emerge-themes.json corpus atomically; emits STATUS=SPARSE:<n> (and writes nothing) when fewer than 2 themes are in the window. run_build_note() assembles the claude-emerge note from the sub-agent's emerge-analysis.md. The raw-note corpus path (run_corpus/run_recollect) was retired." },
         { "id": "consolidate-cli", "name": "consolidate_cli.py", "kind": "module", "files": ["hooks/consolidate_cli.py"], "purpose": "Thin CLI backing /consolidate: gathers unassigned (or all, with --full) note vectors, clusters per-project, names via Haiku, persists themes + theme_members; stats/split/merge." },
@@ -322,10 +323,11 @@
     {
       "id": "compress-dedup",
       "name": "/compress insight dedup",
-      "description": "Before saving a curated insight, check the index for a high-confidence existing match to offer update-vs-create.",
+      "description": "Before saving a curated insight, check the index for a high-confidence existing match to offer update-vs-create. Step 3.5 adds a cosine gate: query vector computed from live corpus IDF, threaded through search_vault(include_vectors=True) and into is_high_confidence_match.",
       "steps": [
-        { "from": "sk-compress", "to": "search-vault", "label": "FTS5 search for the topic" },
-        { "from": "search-vault", "to": "compress-guard", "label": "strength gate (<=-5.0) AND rank-delta gate (>0.25)" },
+        { "from": "sk-compress", "to": "compute-query-vector", "label": "compute sparse TF-IDF query vector from live corpus (Step 3.5)" },
+        { "from": "sk-compress", "to": "search-vault", "label": "FTS5 search for the topic (include_vectors=True, note_type=claude-insight/claude-decision)" },
+        { "from": "search-vault", "to": "compress-guard", "label": "strength gate (<=-5.0) AND rank-delta gate (>0.25) AND cosine gate (query_vec, min_cosine=0.12)" },
         { "from": "compress-guard", "to": "write-vault-note", "label": "create new OR append Update section" },
         { "from": "write-vault-note", "to": "db-vault", "label": "atomic write" }
       ]
@@ -439,7 +441,7 @@
     ],
     "preflight": "./scripts/commit-preflight.sh — manifest-sync (always-on) + secret-scan + pytest cov>=90; required before every commit",
     "plugin": "abhattacherjee/git-flow",
-    "currentVersion": "3.0.1"
+    "currentVersion": "3.1.1"
   },
   "docs": [
     { "title": "Standalone Marketplace Distribution (plan)", "path": "docs/superpowers/plans/2026-06-01-standalone-marketplace-distribution.md", "scope": "Migration to a standalone marketplace served from this repo (no monorepo sync)." },
