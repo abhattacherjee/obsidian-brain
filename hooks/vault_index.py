@@ -502,6 +502,11 @@ def _backfill_missing_tfidf_vectors(conn: sqlite3.Connection) -> int:
     Returns the count of rows that received a non-NULL vector (rows whose
     content tokenises to empty are correctly left NULL and are not counted).
     """
+    # These corpus stats are read at the current transaction boundary (i.e. after
+    # Step-3 prune/theme-repair in rebuild_index). This is correct because Step 3
+    # does NOT delete notes rows. A future change that deletes notes earlier in
+    # the same transaction must keep this backfill as the last note-count-affecting
+    # step, or recompute total_docs/term_df after that deletion.
     total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
     term_df = dict(conn.execute("SELECT term, df FROM term_df").fetchall())
 
@@ -1053,6 +1058,7 @@ def rebuild_index(
             _ensure_access_log_indexes(conn)
             _ensure_theme_indexes(conn)
             stats = _sync(conn, vault_path, folders)
+            stats["backfilled"] = 0  # full wipe rebuilds all vectors from scratch
         finally:
             conn.close()
     else:
@@ -1189,6 +1195,11 @@ def rebuild_index(
                     pass
                 raise
 
+            if backfilled_count > 0:
+                print(
+                    f"[vault-index] backfilled {backfilled_count} missing tfidf_vector(s)",
+                    file=sys.stderr,
+                )
             stats["backfilled"] = backfilled_count
 
             # Report preserved/pruned counts from the actual after-state

@@ -395,3 +395,57 @@ class TestBackfillMissingTfidfVectors:
             )
         finally:
             conn.close()
+
+    def test_h_full_false_no_nulls_backfilled_is_zero(self, tmp_vault):
+        """(h) rebuild_index(full=False) on a fully-indexed corpus returns stats['backfilled'] == 0.
+
+        Guards against a future refactor that gates the key on count > 0
+        — the key must always be present, even when there is nothing to backfill.
+        """
+        db_path = _build_index(tmp_vault, _sample_notes())
+
+        # Confirm all vectors are non-NULL (fresh index)
+        conn = _connect(db_path)
+        try:
+            null_count = conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE tfidf_vector IS NULL"
+            ).fetchone()[0]
+            assert null_count == 0, "fresh index must have no NULL vectors"
+        finally:
+            conn.close()
+
+        stats = rebuild_index(str(tmp_vault), FOLDERS, db_path=db_path, full=False)
+
+        assert "backfilled" in stats, (
+            f"'backfilled' key must be present even when nothing was backfilled; got: {stats}"
+        )
+        assert stats["backfilled"] == 0, (
+            f"expected stats['backfilled'] == 0 on a fully-indexed corpus, got {stats['backfilled']}"
+        )
+
+    def test_i_full_true_backfilled_is_zero(self, tmp_vault):
+        """(i) rebuild_index(full=True) returns stats with 'backfilled' == 0.
+
+        A full wipe rebuilds all vectors from scratch via _sync, so no NULLs
+        can remain — verified directly against the DB. Fix-1 contract: the key
+        must always be present. backfilled==0 is causally meaningful here: the
+        DB check confirms there are no NULLs left to backfill.
+        """
+        db_path = _build_index(tmp_vault, _sample_notes())
+
+        stats = rebuild_index(str(tmp_vault), FOLDERS, db_path=db_path, full=True)
+
+        assert "backfilled" in stats, (
+            f"'backfilled' key must be present after full=True rebuild; got: {stats}"
+        )
+        assert stats["backfilled"] == 0, (
+            f"expected stats['backfilled'] == 0 after full rebuild, got {stats['backfilled']}"
+        )
+        conn = _connect(db_path)
+        try:
+            null_after = conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE tfidf_vector IS NULL"
+            ).fetchone()[0]
+            assert null_after == 0, "full rebuild must leave no NULL vectors"
+        finally:
+            conn.close()
