@@ -1661,10 +1661,13 @@ def search_vault(
 
 
 def compute_query_vector(
-    conn: sqlite3.Connection,
+    db_path: str,
     query: str,
 ) -> dict[str, float]:
     """Compute a sparse TF-IDF vector for ``query`` against the live corpus.
+
+    Takes a db_path (like :func:`search_vault`) and manages its own connection
+    via :func:`_connect`, closing it in a ``finally`` block.
 
     Uses the same tokenization and IDF weighting as ``_upsert_note`` but does
     NOT pre-increment ``total_docs`` (that pre-increment exists because a new
@@ -1672,9 +1675,6 @@ def compute_query_vector(
     internally, so effective N = COUNT(*)+1 for a query vs COUNT(*)+2 for a
     fresh insert — a one-document offset, negligible at any realistic corpus
     size.
-
-    ``conn`` must be obtained via :func:`_connect` (not a raw
-    ``sqlite3.connect``), consistent with the repo's CI guard.
 
     Returns ``{}`` for an empty string or a query whose tokens are all
     stopwords — callers should treat ``{}`` as a signal to skip cosine gating.
@@ -1686,18 +1686,22 @@ def compute_query_vector(
     if not tokens:
         return {}
 
-    total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
-    unique_terms = list(set(tokens))
-    term_df: dict[str, int] = {}
-    for i in range(0, len(unique_terms), 900):
-        chunk = unique_terms[i : i + 900]
-        placeholders = ",".join("?" * len(chunk))
-        rows = conn.execute(
-            f"SELECT term, df FROM term_df WHERE term IN ({placeholders})",
-            chunk,
-        ).fetchall()
-        term_df.update(dict(rows))
-    return _compute_tfidf_vector(tokens, term_df, total_docs, top_k=50)
+    conn = _connect(db_path)
+    try:
+        total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        unique_terms = list(set(tokens))
+        term_df: dict[str, int] = {}
+        for i in range(0, len(unique_terms), 900):
+            chunk = unique_terms[i : i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT term, df FROM term_df WHERE term IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            term_df.update(dict(rows))
+        return _compute_tfidf_vector(tokens, term_df, total_docs, top_k=50)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

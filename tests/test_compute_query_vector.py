@@ -209,7 +209,7 @@ class TestComputeQueryVector:
 
     def test_compute_query_vector_matches_note_vectorization(self, tmp_vault):
         """compute_query_vector returns the same dict as _compute_tfidf_vector called
-        with the live term_df + total_docs from the same connection.
+        with the live term_df + total_docs from the same db.
 
         Anchored to caller-side behavior: runs the same computation that
         _upsert_note would use (minus the +1 that accounts for a note-about-to-insert).
@@ -217,12 +217,12 @@ class TestComputeQueryVector:
         db_path = _build_db(tmp_vault, self._notes())
         text = "cosine similarity gate compress confidence matching"
 
-        # Get result from the helper under test
+        # Get result from the helper under test (manages its own connection)
+        result = vault_index.compute_query_vector(db_path, text)
+
+        # Independent recomputation via a separate connection
         conn = _connect(db_path)
         try:
-            result = vault_index.compute_query_vector(conn, text)
-
-            # Independent recomputation using the same connection
             tokens = _tokenize_for_tfidf(text)
             total_docs = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
             unique_terms = list(set(tokens))
@@ -248,11 +248,7 @@ class TestComputeQueryVector:
     def test_compute_query_vector_empty_query(self, tmp_vault):
         """Empty or stopword-only query returns {} (cosine skip signal)."""
         db_path = _build_db(tmp_vault, self._notes())
-        conn = _connect(db_path)
-        try:
-            # pure empty string
-            assert vault_index.compute_query_vector(conn, "") == {}
-            # stopwords only — _tokenize_for_tfidf returns []
-            assert vault_index.compute_query_vector(conn, "the a and or") == {}
-        finally:
-            conn.close()
+        # pure empty string
+        assert vault_index.compute_query_vector(db_path, "") == {}
+        # stopwords only — _tokenize_for_tfidf returns []
+        assert vault_index.compute_query_vector(db_path, "the a and or") == {}

@@ -74,7 +74,7 @@ python3 -c '
 import sys, os, json
 import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
 try:
-    from vault_index import ensure_index, search_vault, compute_query_vector, _connect
+    from vault_index import ensure_index, search_vault, compute_query_vector
     from obsidian_utils import load_config
     # Pure predicate: top rank must pass absolute-strength gate AND |top|-|#2| delta gate.
     # MIN_RANK_DELTA tuned against scripts/compress_rank_gap_corpus.json (issue #45).
@@ -87,11 +87,7 @@ try:
     vp = c["vault_path"]
     folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
     db = ensure_index(vp, folders)
-    conn = _connect(db)
-    try:
-        query_vec = compute_query_vector(conn, sys.argv[1])
-    finally:
-        conn.close()
+    query_vec = compute_query_vector(db, sys.argv[1])
     results = search_vault(db, sys.argv[1], note_type="claude-insight", limit=3, include_vectors=True)
     results += search_vault(db, sys.argv[1], note_type="claude-decision", limit=3, include_vectors=True)
     # Sort combined results by rank (most negative = best match)
