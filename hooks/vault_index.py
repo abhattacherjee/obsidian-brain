@@ -1197,7 +1197,7 @@ def rebuild_index(
 
             if backfilled_count > 0:
                 print(
-                    f"[vault-index] backfilled {backfilled_count} missing tfidf_vector(s)",
+                    f"[vault-index] Backfilled {backfilled_count} missing tfidf_vector(s)",
                     file=sys.stderr,
                 )
             stats["backfilled"] = backfilled_count

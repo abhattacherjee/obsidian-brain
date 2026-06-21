@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -94,7 +95,7 @@ def _sample_notes():
 class TestBackfillMissingTfidfVectors:
     """_backfill_missing_tfidf_vectors correctness tests."""
 
-    def test_a_core_null_vector_backfilled(self, tmp_vault):
+    def test_null_vector_gets_backfilled(self, tmp_vault):
         """(a) NULLed vector is repopulated; return count == 1."""
         db_path = _build_index(tmp_vault, _sample_notes())
         conn = _connect(db_path)
@@ -140,7 +141,7 @@ class TestBackfillMissingTfidfVectors:
         finally:
             conn.close()
 
-    def test_b_value_oracle_backfilled_equals_original(self, tmp_vault):
+    def test_backfilled_vector_equals_fresh_index_vector(self, tmp_vault):
         """(b) Backfilled vector is byte-identical to the original (freshly indexed) value."""
         db_path = _build_index(tmp_vault, _sample_notes())
         conn = _connect(db_path)
@@ -174,7 +175,7 @@ class TestBackfillMissingTfidfVectors:
         finally:
             conn.close()
 
-    def test_c_idempotency(self, tmp_vault):
+    def test_second_backfill_is_noop(self, tmp_vault):
         """(c) Second call returns 0 and changes no vectors."""
         db_path = _build_index(tmp_vault, _sample_notes())
         conn = _connect(db_path)
@@ -216,7 +217,7 @@ class TestBackfillMissingTfidfVectors:
         finally:
             conn.close()
 
-    def test_d_non_null_rows_untouched(self, tmp_vault):
+    def test_existing_vectors_untouched(self, tmp_vault):
         """(d) Rows that already have a tfidf_vector are not changed by backfill."""
         db_path = _build_index(tmp_vault, _sample_notes())
         conn = _connect(db_path)
@@ -250,7 +251,7 @@ class TestBackfillMissingTfidfVectors:
         finally:
             conn.close()
 
-    def test_e_empty_note_stays_null(self, tmp_vault):
+    def test_empty_note_stays_null(self, tmp_vault):
         """(e) A note whose content tokenizes to empty keeps tfidf_vector IS NULL.
 
         The tokenization source is title + tags + body joined with spaces.
@@ -268,7 +269,6 @@ class TestBackfillMissingTfidfVectors:
             # Insert a sentinel note directly with known-empty tokenization.
             # title="", tags="", body="a b c" — all single-char tokens (dropped by
             # _tokenize_for_tfidf which requires len(t) > 1).
-            import time as _time
             empty_path = str(tmp_vault / "claude-sessions" / "note-empty.md")
             conn.execute(
                 "INSERT INTO notes (path, type, date, project, title, tags, body, "
@@ -279,7 +279,7 @@ class TestBackfillMissingTfidfVectors:
                     "",    # title — empty
                     "",    # tags — empty
                     "a b c",  # body — single-char tokens only, all dropped
-                    "auto-logged", _time.time(), 10, 5,
+                    "auto-logged", time.time(), 10, 5,
                 ),
             )
             conn.commit()
@@ -322,7 +322,7 @@ class TestBackfillMissingTfidfVectors:
         finally:
             conn.close()
 
-    def test_f_term_df_invariant(self, tmp_vault):
+    def test_term_df_unchanged_by_backfill(self, tmp_vault):
         """(f) term_df table is completely unchanged by backfill."""
         db_path = _build_index(tmp_vault, _sample_notes())
         conn = _connect(db_path)
@@ -354,7 +354,7 @@ class TestBackfillMissingTfidfVectors:
         finally:
             conn.close()
 
-    def test_g_integration_rebuild_index_full_false(self, tmp_vault):
+    def test_rebuild_index_full_false_backfills(self, tmp_vault):
         """(g) rebuild_index(full=False) repopulates NULL vectors and reports 'backfilled' in stats."""
         notes = _sample_notes()
         db_path = _build_index(tmp_vault, notes)
@@ -396,7 +396,7 @@ class TestBackfillMissingTfidfVectors:
         finally:
             conn.close()
 
-    def test_h_full_false_no_nulls_backfilled_is_zero(self, tmp_vault):
+    def test_full_false_no_nulls_reports_zero(self, tmp_vault):
         """(h) rebuild_index(full=False) on a fully-indexed corpus returns stats['backfilled'] == 0.
 
         Guards against a future refactor that gates the key on count > 0
@@ -423,7 +423,7 @@ class TestBackfillMissingTfidfVectors:
             f"expected stats['backfilled'] == 0 on a fully-indexed corpus, got {stats['backfilled']}"
         )
 
-    def test_i_full_true_backfilled_is_zero(self, tmp_vault):
+    def test_full_true_reports_zero_and_no_nulls(self, tmp_vault):
         """(i) rebuild_index(full=True) returns stats with 'backfilled' == 0.
 
         A full wipe rebuilds all vectors from scratch via _sync, so no NULLs

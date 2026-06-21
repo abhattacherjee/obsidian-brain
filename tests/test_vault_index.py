@@ -823,7 +823,7 @@ class TestRebuildIndex:
         # Preserve mode must carry all three contract groups
         assert set(preserve_stats) >= {
             "inserted", "skipped", "by_type",
-            "preserved", "pruned_orphans",
+            "preserved", "pruned_orphans", "backfilled",
         }
         assert set(preserve_stats["preserved"]) == {
             "access_log", "themes", "theme_members"
@@ -836,7 +836,7 @@ class TestRebuildIndex:
             str(tmp_vault), ["claude-sessions"], db_path=db_path, full=True
         )
         # Full mode must carry only the base contract, not preservation keys
-        assert set(full_stats) >= {"inserted", "skipped", "by_type"}
+        assert set(full_stats) >= {"inserted", "skipped", "by_type", "backfilled"}
         assert "preserved" not in full_stats
         assert "pruned_orphans" not in full_stats
 
