@@ -82,7 +82,7 @@ try:
     # becomes None so guard runs rank-only (legacy path). Note: a fresh (0-note) index still
     # yields IDF=1.0 for every token, so a non-stopword query produces a NON-empty dict —
     # but search_vault returns [] on an empty corpus, so the cosine gate is never reached.
-    from compress_guard import is_high_confidence_match
+    from compress_guard import is_high_confidence_match, summarize_match_evidence, topic_snippet
     c = load_config()
     vp = c["vault_path"]
     folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
@@ -96,7 +96,14 @@ try:
     results.sort(key=lambda r: r["rank"])
     if is_high_confidence_match(results, query_vec=query_vec or None):
         top = results[0]
-        print(json.dumps({"match": True, "path": top["path"], "title": top["title"], "date": top["date"], "tags": top["tags"], "rank": top["rank"]}))
+        ev = summarize_match_evidence(results, query_vec=query_vec or None)
+        snippet = ""
+        try:
+            with open(top["path"], "r", encoding="utf-8") as fh:
+                snippet = topic_snippet(fh.read(1_000_000))
+        except (OSError, UnicodeDecodeError):
+            pass  # snippet is cosmetic — a read/decode failure must not discard the match
+        print(json.dumps({"match": True, "path": top["path"], "title": top["title"], "date": top["date"], "tags": top["tags"], "rank": top["rank"], "rank_note": ev["rank_note"], "runner_up_rank": ev["runner_up_rank"], "shared_terms": ev["shared_terms"], "snippet": snippet}))
     else:
         print(json.dumps({"match": False}))
 except ImportError as e:
@@ -114,10 +121,17 @@ If `match` is `true`, store the `path` field as `MATCH_PATH` and the `title` fie
 
 **If `match` is `false`:** No existing note found. Proceed silently to Step 4A (create new note).
 
-**If `match` is `true`:** Present the match to the user:
+**If `match` is `true`:** Present the match to the user. Render the block below, applying these rules:
+- OMIT the "next-best:" clause (the " · next-best: <runner_up_rank>" tail, including the leading " · " separator and its surrounding spaces) when `runner_up_rank` is null — the line becomes exactly `Match rank: <rank> (<rank_note>)`.
+- OMIT the "Shared terms" line entirely when `shared_terms` is empty.
+- OMIT the "Snippet" line entirely when `snippet` is empty.
 
 > Found an existing note on this topic:
-> **"<title>"** (<date>, <tags as comma-separated list>)
+> **"<title>"** (<date>)
+> Tags: <tags as comma-separated list, or "no tags">
+> Match rank: <rank> (<rank_note>) · next-best: <runner_up_rank>
+> Shared terms with your query: `<term1>`, `<term2>`, …
+> Snippet: "<snippet>"
 >
 > Would you like to **update** this note or **create new**?
 

@@ -30,6 +30,8 @@ OR-fallback awareness (live-calibration fix, #252/#108):
   (unchanged behavior).
 """
 
+from __future__ import annotations
+
 from tfidf import _cosine_similarity
 
 MIN_RANK_STRENGTH = -5.0  # top result's FTS5 rank must be <= this (stronger = more negative)
@@ -180,3 +182,147 @@ def is_high_confidence_match(
                 return False
 
     return True
+
+
+def summarize_match_evidence(results, query_vec=None, min_strength=None, max_terms=8):
+    """Summarize the evidence for why the top search result is a high-confidence match.
+
+    Pure function — no file I/O. Designed to be called after is_high_confidence_match()
+    confirms a match, but guarded defensively for the empty-results case.
+
+    Arguments:
+        results: same sorted-most-negative-first list passed to is_high_confidence_match.
+            Each element may carry a "tfidf_vector" key (dict[str, float] | None).
+        query_vec: sparse TF-IDF dict {term: float} for the search query, or None.
+            When None (or empty dict), shared_terms is always [].
+        min_strength: accepted for call-site symmetry with is_high_confidence_match;
+            not used anywhere in this function (band thresholds are fixed). Default None.
+        max_terms: maximum number of shared terms to return (default 8).
+
+    Returns a dict with:
+        "rank": float | None — results[0]["rank"], or None if results is empty.
+        "runner_up_rank": float | None — results[1]["rank"] if len>=2, else None.
+        "rank_note": str — calibration band based on abs(rank):
+            >= 25 → "very strong"
+            >= 15 → "strong"
+            >= 8  → "moderate"
+            else  → "borderline"
+            Boundaries are inclusive at the lower edge (|rank|==25 → "very strong",
+            ==15 → "strong", ==8 → "moderate"). Returns "" when rank is None.
+        "shared_terms": list[str] — terms present in BOTH query_vec (query weight > 0)
+            AND results[0]["tfidf_vector"] (any stored weight), sorted by descending query weight (ties
+            broken alphabetically for determinism), capped to max_terms. Empty list
+            when query_vec is None/empty or top result has no usable tfidf_vector
+            (None/missing/empty).
+    """
+    if not results:
+        return {
+            "rank": None,
+            "runner_up_rank": None,
+            "rank_note": "",
+            "shared_terms": [],
+        }
+
+    rank = results[0]["rank"]
+    runner_up_rank = results[1]["rank"] if len(results) >= 2 else None
+
+    abs_rank = abs(rank)
+    if abs_rank >= 25:
+        rank_note = "very strong"
+    elif abs_rank >= 15:
+        rank_note = "strong"
+    elif abs_rank >= 8:
+        rank_note = "moderate"
+    else:
+        rank_note = "borderline"
+
+    shared_terms = []
+    if query_vec:
+        note_vec = results[0].get("tfidf_vector")
+        if note_vec:
+            # Find terms in both vectors where query weight > 0
+            shared = [
+                (term, w)
+                for term, w in query_vec.items()
+                if w > 0 and term in note_vec
+            ]
+            # Sort by descending query weight; alphabetical tiebreak for determinism
+            shared.sort(key=lambda tv: (-tv[1], tv[0]))
+            shared_terms = [term for term, _ in shared[:max_terms]]
+
+    return {
+        "rank": rank,
+        "runner_up_rank": runner_up_rank,
+        "rank_note": rank_note,
+        "shared_terms": shared_terms,
+    }
+
+
+def topic_snippet(note_text, max_chars=200):
+    """Extract the first substantive paragraph from a vault note.
+
+    Pure function — caller passes already-read text. No file I/O.
+
+    Behavior:
+        1. Strip a leading YAML frontmatter block if present: when the first line is exactly "---", drop through the next line that is exactly "---" (CRLF and LF endings both handled). If there is no closing fence, nothing is stripped.
+        2. Skip leading blank lines and ATX headings (lines starting with "#").
+        3. Collect consecutive non-blank, non-heading lines as the first paragraph.
+        4. Join collected lines with single spaces, collapsing internal whitespace.
+        5. Truncate to max_chars; append "…" (single ellipsis char) if truncated.
+        6. Return "" if no substantive content found.
+
+    Arguments:
+        note_text: full raw text of a note file (YAML frontmatter + markdown body)
+            or just a body. May be empty.
+        max_chars: maximum number of characters to return before truncation (default 200).
+
+    Returns:
+        str — first substantive paragraph, possibly truncated with "…", or "".
+    """
+    if not note_text:
+        return ""
+
+    # Normalize line endings so CRLF notes are handled identically to LF.
+    lines = note_text.replace("\r\n", "\n").split("\n")
+
+    # Strip a leading YAML frontmatter block: when the first line is exactly
+    # "---", drop through the next line that is exactly "---". If there is no
+    # closing fence, nothing is stripped (the text is treated as a bare body).
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                lines = lines[i + 1:]
+                break
+
+    # Collect first substantive paragraph: skip blank/heading lines until content,
+    # then collect until the next blank line or heading.
+    paragraph_lines = []
+    in_paragraph = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            # Blank line: end paragraph if we've started one, otherwise skip
+            if in_paragraph:
+                break
+            continue
+        if stripped.startswith("#"):
+            # Heading line: end paragraph if started, otherwise skip
+            if in_paragraph:
+                break
+            continue
+        # Substantive line
+        in_paragraph = True
+        paragraph_lines.append(" ".join(stripped.split()))
+
+    if not paragraph_lines:
+        return ""
+
+    # Join with single spaces (internal whitespace already stripped per line)
+    result = " ".join(paragraph_lines)
+
+    # Truncate if needed
+    if len(result) > max_chars:
+        result = result[:max_chars] + "…"
+
+    return result

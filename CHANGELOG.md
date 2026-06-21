@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`/compress` match prompt now surfaces adjudication evidence (#189):** on a high-confidence existing-note match, Step 3.5 shows the match rank with a calibration band (very strong / strong / moderate / borderline) and the next-best rank, the shared TF-IDF terms between the query and the matched note, and a snippet of the note's first paragraph — so the "update vs create new" choice distinguishes topical identity from tangential keyword overlap instead of being guessed from title/tags alone.
+
 ### Fixed
 - **`/compress` now also searches `claude-session` notes (Step 3.5) and rescues a borderline rank-gap match when the top result's TF-IDF cosine is strong (`MIN_COSINE_RESCUE = 0.40`), so genuine same-topic notes (often sessions) are no longer missed as false negatives. (#254)**
 - **`/compress` no longer surfaces semantically-unrelated notes as high-confidence matches (#252, #108):** the match guard now applies a TF-IDF **cosine floor** on the top result — reusing the stored per-note `tfidf_vector` — in addition to the existing FTS rank-strength and rank-delta gates. Previously a single OR-fallback hit sharing only generic terms (#252), or a cross-topic peer whose rank gap happened to pass (#108), could be matched — risking an "update" that appends to the wrong note. The cosine gate can only *reject* a match, never loosen one, and degrades to the prior rank-only behavior when no query or note vector is available.
