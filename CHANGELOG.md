@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-06-21
+
+> **Upgrade note:** This release improves the `/compress` topic-match cosine gate, which relies on per-note TF-IDF vectors. Notes indexed before the vector-storage migration (~26% of a typical vault) have no vector. Run `/vault-reindex` once after updating to backfill them (non-destructive — preserves Friston activation data); until you do, the cosine gate fail-opens on those notes via the AND-path.
+
 ### Added
 - **`/compress` match prompt now surfaces adjudication evidence (#189):** on a high-confidence existing-note match, Step 3.5 shows the match rank with a calibration band (very strong / strong / moderate / borderline) and the next-best rank, the shared TF-IDF terms between the query and the matched note, and a snippet of the note's first paragraph — so the "update vs create new" choice distinguishes topical identity from tangential keyword overlap instead of being guessed from title/tags alone.
 
