@@ -122,7 +122,7 @@ Then proceed with whatever evidence was collected (possibly none).
 
 ### Step 3 — Analyze the session honestly
 
-Be **candid**, not defensive or self-congratulatory. This retro draws on two sources: the current session's pre-compact snapshots (the Step 3a bundle) and the live post-compact conversation. Work them in that order — mine the snapshots first (3.0 below), then review the live conversation.
+Be **candid**, not defensive or self-congratulatory. This retro draws on the current session's pre-compact evidence (the Step 3a bundle — snapshots plus insights/decisions/error-fixes) and the live post-compact conversation. Work the bundle first — mine the snapshots in 3.0 below — then review the live conversation.
 
 **When the bundle from Step 3a is non-empty, mine the snapshots BEFORE analyzing the live conversation.** The pre-compact snapshot arcs almost always hold more decision points and dead ends than the vivid post-compact buffer, and are the evidence most easily skimmed. The pre-pass below is **mandatory** — running it first is what gives snapshots equal-or-higher priority than the live buffer.
 
