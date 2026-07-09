@@ -144,7 +144,7 @@ Snapshot [<hhmmss>] <stem> — verdict: RELEVANT | EARLIER-ARC/UNRELATED
 **Verdict rules:**
 - **Default to `RELEVANT`.** Only mark a snapshot `EARLIER-ARC/UNRELATED` when it is *unmistakably* about a different, self-contained earlier task that is not part of the work this retrospective covers. This bias keeps the exclusion path from becoming a new way to drop content.
 - Judge relevance by topical continuity with what this retro is about (the live buffer's focus + the most recent arc). A long session can span several `/ship` arcs that each already got their own retro — earlier arcs' snapshots are `EARLIER-ARC/UNRELATED`.
-- If `bundle["snapshots"]` is empty, skip this pre-pass; emit `No current-session snapshots — active-conversation-only retro.` only if Step 3a did not already print its no-evidence fallback notice (do not print a duplicate).
+- If `bundle["snapshots"]` is empty, skip this pre-pass; emit `No current-session snapshots — skipping the snapshot pre-pass.` only if Step 3a did not already print its no-evidence fallback notice (do not print a duplicate).
 
 Then weight the analysis by the two halves' decision density: if the pre-compact half ran 6 hours and the post-compact half ran 90 minutes, "What Didn't Work" should reflect that. Treat every `RELEVANT` snapshot body and the insight/decision/error-fix bodies as **first-class evidence**, not background context — every `RELEVANT` snapshot's findings must surface in the sections below.
 

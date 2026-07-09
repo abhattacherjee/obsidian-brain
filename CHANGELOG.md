@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`/retro` now force-mines current-session pre-compact snapshots (#261):** Step 3 gains a mandatory, visible per-snapshot pre-pass that emits a digest and a `RELEVANT` / `EARLIER-ARC/UNRELATED` verdict for every snapshot in the evidence bundle (default-to-`RELEVANT`), so pre-compact decision points and dead ends are no longer skimmed in favour of the vivid post-compact buffer. `## Evidence Consulted` now lists only `RELEVANT` snapshots and requires an explicit no-findings acknowledgment, which also stops earlier-`/ship`-arc snapshots from contaminating a multi-arc session's retro.
+
 ## [3.2.0] - 2026-06-21
 
 > **Upgrade note:** This release improves the `/compress` topic-match cosine gate, which relies on per-note TF-IDF vectors. Notes indexed before the vector-storage migration (~26% of a typical vault) have no vector. Run `/vault-reindex` once after updating to backfill them (non-destructive — preserves Friston activation data); until you do, the cosine gate fail-opens on those notes via the AND-path.
