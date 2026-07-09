@@ -2,7 +2,7 @@
 name: retro
 description: "Generates honest session retrospectives analyzing what worked, what didn't, key learnings, and actionable process improvements. Use when: (1) /retro command at end of session, (2) user wants to reflect on session quality and outcomes."
 metadata:
-  version: 1.2.0
+  version: 1.3.0
 ---
 
 # Retro — Generate Honest Session Retrospective
@@ -122,7 +122,7 @@ Then proceed with whatever evidence was collected (possibly none).
 
 ### Step 3 — Analyze the session honestly
 
-Review the full current conversation. Be **candid**, not defensive or self-congratulatory.
+Be **candid**, not defensive or self-congratulatory. This retro draws on two sources: the current session's pre-compact snapshots (the Step 3a bundle) and the live post-compact conversation. Work them in that order — mine the snapshots first (3.0 below), then review the live conversation.
 
 **When the bundle from Step 3a is non-empty, mine the snapshots BEFORE analyzing the live conversation.** The pre-compact snapshot arcs almost always hold more decision points and dead ends than the vivid post-compact buffer, and are the evidence most easily skimmed. The pre-pass below is **mandatory** — running it first is what gives snapshots equal-or-higher priority than the live buffer.
 
@@ -143,8 +143,8 @@ Snapshot [<hhmmss>] <stem> — verdict: RELEVANT | EARLIER-ARC/UNRELATED
 
 **Verdict rules:**
 - **Default to `RELEVANT`.** Only mark a snapshot `EARLIER-ARC/UNRELATED` when it is *unmistakably* about a different, self-contained earlier task that is not part of the work this retrospective covers. This bias keeps the exclusion path from becoming a new way to drop content.
-- Judge relevance by topical continuity with what this retro is about (the live buffer's focus + the most recent arc). A long session can span several `/ship` arcs that each already got their own retro — earlier arcs' snapshots are `EARLIER-ARC`.
-- If `bundle["snapshots"]` is empty, emit one line — `No current-session snapshots — active-conversation-only retro.` — and skip this pre-pass.
+- Judge relevance by topical continuity with what this retro is about (the live buffer's focus + the most recent arc). A long session can span several `/ship` arcs that each already got their own retro — earlier arcs' snapshots are `EARLIER-ARC/UNRELATED`.
+- If `bundle["snapshots"]` is empty, skip this pre-pass; emit `No current-session snapshots — active-conversation-only retro.` only if Step 3a did not already print its no-evidence fallback notice (do not print a duplicate).
 
 Then weight the analysis by the two halves' decision density: if the pre-compact half ran 6 hours and the post-compact half ran 90 minutes, "What Didn't Work" should reflect that. Treat every `RELEVANT` snapshot body and the insight/decision/error-fix bodies as **first-class evidence**, not background context — every `RELEVANT` snapshot's findings must surface in the sections below.
 
@@ -193,7 +193,7 @@ Draft the note body using this exact structure:
 **Rules for `## Evidence Consulted`:**
 - List **only snapshots marked `RELEVANT`** in the Step 3.0 pre-pass. `EARLIER-ARC/UNRELATED` snapshots are excluded here — their exclusion rationale already lives in the 3.0 digest.
 - **Coverage:** every `RELEVANT` snapshot must be represented in the analysis. If a `RELEVANT` snapshot genuinely yielded no distinct dead-ends beyond the live buffer, say so explicitly in "What Didn't Work" (e.g. `- [[stem]]: no distinct dead-ends beyond the live buffer`) rather than silently omitting it.
-- Omit any list line whose count is 0 (no `Snapshots: 0 file(s)` noise).
+- Omit any list line whose count is 0 (no `... : 0 file(s)` zero-count noise).
 - Omit the entire `## Evidence Consulted` section if the empty-bundle fallback fired in Step 3a.
 - Wikilinks (`[[stem]]`) preserve Obsidian backlinks and round-trip through the FTS index.
 - Active-conversation message count is approximate — the count visible to the model when /retro fires; an order-of-magnitude figure is fine.
