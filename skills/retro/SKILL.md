@@ -143,7 +143,7 @@ Snapshot [<hhmmss>] <stem> — verdict: RELEVANT | EARLIER-ARC/UNRELATED
 
 **Verdict rules:**
 - **Default to `RELEVANT`.** Only mark a snapshot `EARLIER-ARC/UNRELATED` when it is *unmistakably* about a different, self-contained earlier task that is not part of the work this retrospective covers. This bias keeps the exclusion path from becoming a new way to drop content.
-- Judge relevance by topical continuity with what this retro is about (the live buffer's focus + the most recent arc). A long session can span several `/ship` arcs that each already got their own retro — earlier arcs' snapshots are `EARLIER-ARC/UNRELATED`. This topical-continuity check is a default-case guide only — it never overrides the default-to-`RELEVANT` bias above (e.g. if `/retro` is invoked to reflect on an earlier arc, that arc's snapshots are `RELEVANT`).
+- Judge relevance by topical continuity with what this retro is about. `/retro` takes no arc argument — it reflects on the current session as a whole — so infer the focus from the live buffer and the most recent arc, and treat `most recent arc` as a heuristic, not a hard boundary. Only a clearly-concluded earlier `/ship` arc that already got its own retro is `EARLIER-ARC/UNRELATED`; when in any doubt, mark `RELEVANT` (the default-to-`RELEVANT` bias above governs). Every excluded snapshot is still recorded in `## Evidence Consulted` (Step 4), so a wrong exclusion stays visible to the user in the Step 6 preview rather than being silently lost.
 - If `bundle["snapshots"]` is empty, skip this pre-pass; emit `No current-session snapshots — skipping the snapshot pre-pass.` only if Step 3a did not already print its no-evidence fallback notice (do not print a duplicate).
 
 Then weight the analysis by the two halves' decision density: if the pre-compact half ran 6 hours and the post-compact half ran 90 minutes, "What Didn't Work" should reflect that. Estimate this weighting only from `RELEVANT` snapshots — exclude the time span covered by any `EARLIER-ARC/UNRELATED` snapshot from both the duration estimate and the resulting weight. Treat every `RELEVANT` snapshot body and the insight/decision/error-fix bodies as **first-class evidence**, not background context — every `RELEVANT` snapshot's findings must surface in the sections below.
@@ -165,9 +165,11 @@ Draft the note body using this exact structure:
 ```markdown
 ## Evidence Consulted
 - Active conversation: <N> messages (post-compact buffer)
-- Snapshots (RELEVANT only): <K> file(s)
+- Snapshots — RELEVANT: <K> file(s)
   - [[<stem-1>]] (<hhmmss>, <trigger>)
   - [[<stem-2>]] (<hhmmss>, <trigger>)
+- Snapshots — excluded as earlier-arc: <M> file(s)
+  - [[<stem-x>]] (<hhmmss>) — <one-line exclusion reason from the 3.0 digest>
 - Insights: <K> file(s)
   - [[<stem-1>]] — <title>
 - Decisions: <K> file(s)
@@ -191,9 +193,9 @@ Draft the note body using this exact structure:
 ```
 
 **Rules for `## Evidence Consulted`:**
-- List **only snapshots marked `RELEVANT`** in the Step 3.0 pre-pass. `EARLIER-ARC/UNRELATED` snapshots are excluded here — their exclusion rationale already lives in the 3.0 digest.
+- Under `Snapshots — RELEVANT`, list the snapshots marked `RELEVANT` in the Step 3.0 pre-pass. Under `Snapshots — excluded as earlier-arc`, list every `EARLIER-ARC/UNRELATED` snapshot with its one-line reason. The 3.0 digest is console-only, so persisting excluded snapshots here is what keeps an exclusion auditable in the saved note (and catchable by the user in the Step 6 preview) — never rely on the digest alone.
 - **Coverage:** every `RELEVANT` snapshot must be represented in the analysis. If a `RELEVANT` snapshot genuinely yielded no distinct dead-ends beyond the live buffer, say so explicitly in "What Didn't Work" (e.g. `- [[stem]]: no distinct dead-ends beyond the live buffer`) rather than silently omitting it.
-- Omit any list line whose count is 0 (no `... : 0 file(s)` zero-count noise).
+- Omit any list line whose count is 0 (no `... : 0 file(s)` zero-count noise) — **except** the two `Snapshots —` lines: whenever `bundle["snapshots"]` was non-empty, render BOTH lines even at count 0, so an all-excluded session is never indistinguishable from a no-snapshot one.
 - Omit the entire `## Evidence Consulted` section if the empty-bundle fallback fired in Step 3a.
 - Wikilinks (`[[stem]]`) preserve Obsidian backlinks and round-trip through the FTS index.
 - Active-conversation message count is approximate — the count visible to the model when /retro fires; an order-of-magnitude figure is fine.
