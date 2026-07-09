@@ -124,7 +124,29 @@ Then proceed with whatever evidence was collected (possibly none).
 
 Review the full current conversation. Be **candid**, not defensive or self-congratulatory.
 
-**When the bundle from Step 3a is non-empty:** treat its snapshot bodies and insight/decision/error-fix bodies as **first-class evidence**, not background context. Pre-compact arcs in snapshot files almost always contain more decision points and dead ends than the post-compact half — surface specific corrections and abandoned approaches from there. The "What Didn't Work" section in particular should reflect the relative duration and decision density of both halves; if the pre-compact half ran 6 hours and the post-compact half ran 90 minutes, the analysis should weight accordingly.
+**When the bundle from Step 3a is non-empty, mine the snapshots BEFORE analyzing the live conversation.** The pre-compact snapshot arcs almost always hold more decision points and dead ends than the vivid post-compact buffer, and are the evidence most easily skimmed. The pre-pass below is **mandatory** — running it first is what gives snapshots equal-or-higher priority than the live buffer.
+
+#### 3.0 — Mine each snapshot FIRST (MANDATORY)
+
+For **each** entry in `bundle["snapshots"]`, emit a short **visible** digest so the pass leaves an auditable trace — do not silently "consider" snapshots; print the digest:
+
+```
+Snapshot [<hhmmss>] <stem> — verdict: RELEVANT | EARLIER-ARC/UNRELATED
+  (if RELEVANT)
+    - decision points: ...
+    - abandoned approaches / dead ends: ...
+    - user corrections / redirects: ...
+    - anything the post-compact buffer alone would not reveal: ...
+  (if EARLIER-ARC/UNRELATED)
+    - reason (e.g. "distinct earlier /ship arc for #NN, not part of this retro")
+```
+
+**Verdict rules:**
+- **Default to `RELEVANT`.** Only mark a snapshot `EARLIER-ARC/UNRELATED` when it is *unmistakably* about a different, self-contained earlier task that is not part of the work this retrospective covers. This bias keeps the exclusion path from becoming a new way to drop content.
+- Judge relevance by topical continuity with what this retro is about (the live buffer's focus + the most recent arc). A long session can span several `/ship` arcs that each already got their own retro — earlier arcs' snapshots are `EARLIER-ARC`.
+- If `bundle["snapshots"]` is empty, emit one line — `No current-session snapshots — active-conversation-only retro.` — and skip this pre-pass.
+
+Then weight the analysis by the two halves' decision density: if the pre-compact half ran 6 hours and the post-compact half ran 90 minutes, "What Didn't Work" should reflect that. Treat every `RELEVANT` snapshot body and the insight/decision/error-fix bodies as **first-class evidence**, not background context — every `RELEVANT` snapshot's findings must surface in the sections below.
 
 The **"What Didn't Work"** section is the MOST valuable part of this retrospective — invest the most analysis there.
 
@@ -143,7 +165,7 @@ Draft the note body using this exact structure:
 ```markdown
 ## Evidence Consulted
 - Active conversation: <N> messages (post-compact buffer)
-- Snapshots: <K> file(s)
+- Snapshots (RELEVANT only): <K> file(s)
   - [[<stem-1>]] (<hhmmss>, <trigger>)
   - [[<stem-2>]] (<hhmmss>, <trigger>)
 - Insights: <K> file(s)
@@ -169,6 +191,8 @@ Draft the note body using this exact structure:
 ```
 
 **Rules for `## Evidence Consulted`:**
+- List **only snapshots marked `RELEVANT`** in the Step 3.0 pre-pass. `EARLIER-ARC/UNRELATED` snapshots are excluded here — their exclusion rationale already lives in the 3.0 digest.
+- **Coverage:** every `RELEVANT` snapshot must be represented in the analysis. If a `RELEVANT` snapshot genuinely yielded no distinct dead-ends beyond the live buffer, say so explicitly in "What Didn't Work" (e.g. `- [[stem]]: no distinct dead-ends beyond the live buffer`) rather than silently omitting it.
 - Omit any list line whose count is 0 (no `Snapshots: 0 file(s)` noise).
 - Omit the entire `## Evidence Consulted` section if the empty-bundle fallback fired in Step 3a.
 - Wikilinks (`[[stem]]`) preserve Obsidian backlinks and round-trip through the FTS index.
