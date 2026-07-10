@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-07-09
+
 ### Fixed
 - **`/retro` now force-mines current-session pre-compact snapshots (#261):** Step 3 gains a mandatory, visible per-snapshot pre-pass that emits a digest and a `RELEVANT` / `EARLIER-ARC/UNRELATED` verdict for every snapshot in the evidence bundle (default-to-`RELEVANT`), so pre-compact decision points and dead ends are no longer skimmed in favor of the vivid post-compact buffer. `## Evidence Consulted` now lists `RELEVANT` snapshots (with an explicit no-findings acknowledgment for any that yielded nothing) and separately records `EARLIER-ARC/UNRELATED` snapshots with their exclusion reason — so earlier-`/ship`-arc snapshots stop contaminating a multi-arc retro without silently vanishing from the saved note.
 
