@@ -159,7 +159,12 @@ def test_no_groups_have_evidence_subagent_not_called(tmp_path, monkeypatch):
     out = json.loads(Path(output_path).read_text())
     assert len(out) == 2
     for record in out:
-        assert record["classification"] in ("ACTIVE", "STALE")
+        # ACTIVE/STALE/REVIEW are all valid synthetic (L2, no-sub-agent)
+        # outcomes (#264 Task 1 added REVIEW for distinctive-token items
+        # with no anchor and no evidence overlap); the assertion that
+        # matters here is prefiltered=True + LOW confidence, not which of
+        # the three labels a given fixture text lands on.
+        assert record["classification"] in ("ACTIVE", "STALE", "REVIEW")
         assert record["confidence"] == "LOW"
         assert record.get("prefiltered") is True
 
@@ -465,7 +470,10 @@ def test_all_synthetic_subprocess_never_invoked(tmp_path, monkeypatch):
     assert group_ids == ["g1", "g2", "g3"], "Input order must be preserved"
     for record in out:
         assert record.get("prefiltered") is True
-        assert record["classification"] in ("ACTIVE", "STALE")
+        # ACTIVE/STALE/REVIEW are all valid synthetic outcomes (#264 Task 1
+        # added REVIEW for distinctive-token items with no anchor/evidence);
+        # what matters here is that the sub-agent was skipped, not the label.
+        assert record["classification"] in ("ACTIVE", "STALE", "REVIEW")
         assert record["confidence"] == "LOW"
 
 
@@ -695,6 +703,50 @@ def test_file_path_branch_validates_schema_missing_fields(tmp_path, monkeypatch)
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 4, f"Expected rc=4 for file-path output missing required fields, got {rc}"
+
+
+# ---------------------------------------------------------------------------
+# REVIEW classification (#264 Task 1)
+# ---------------------------------------------------------------------------
+
+def test_validate_classifier_payload_accepts_review():
+    """_validate_classifier_payload must accept the new REVIEW classification
+    value — the surfacing bucket for unanchored, distinctive open items that
+    the classifier is not confident enough to call DONE or bury as ACTIVE."""
+    from check_items_cli import _validate_classifier_payload
+    payload = [{
+        "group_id": "g1", "classification": "REVIEW", "confidence": "LOW",
+        "canonical_text": "Return to feature/pull-to-refresh-v2 worktree",
+        "evidence_citation": "similarly-named branch feature/pull-to-refresh-v2 (deleted)",
+        "action_required": None,
+    }]
+    assert _validate_classifier_payload(payload) is True
+
+
+def test_validate_classifier_payload_rejects_unknown_classification():
+    """Regression: adding REVIEW must not loosen validation generally — an
+    unrecognised classification string is still rejected."""
+    from check_items_cli import _validate_classifier_payload
+    payload = [{
+        "group_id": "g1", "classification": "MAYBE", "confidence": "LOW",
+        "canonical_text": "x", "evidence_citation": None, "action_required": None,
+    }]
+    assert _validate_classifier_payload(payload) is False
+
+
+def test_validate_classifier_payload_done_shape_unaffected_by_review_addition():
+    """Regression: adding REVIEW to the valid-classification set must not
+    change validation of pre-existing classifications. A DONE payload with a
+    null evidence_citation still passes SHAPE validation unchanged — citation-
+    *content* enforcement (e.g. requiring DONE to always cite something
+    concrete) is a separate concern _validate_classifier_payload does not
+    implement today, and this task does not add it."""
+    from check_items_cli import _validate_classifier_payload
+    payload = [{
+        "group_id": "g1", "classification": "DONE", "confidence": "HIGH",
+        "canonical_text": "x", "evidence_citation": None, "action_required": None,
+    }]
+    assert _validate_classifier_payload(payload) is True
 
 
 # ---------------------------------------------------------------------------

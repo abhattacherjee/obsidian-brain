@@ -20,6 +20,8 @@ from open_item_dedup import (
     batch_cascade_checkoff,
     cascade_group_members,
     verify_before_edit,
+    assign_tier,
+    partition_for_review,
 )
 
 
@@ -1245,3 +1247,78 @@ def test_anchor_long_input_is_capped_fast():
 
     # Two DIFFERENT >2000-char strings take the equality path -> False.
     assert anchor_text_matches("a" * 5_000, "b" * 5_000) is False
+
+
+# ---------------------------------------------------------------------------
+# REVIEW classification routing (#264 Task 1)
+# ---------------------------------------------------------------------------
+
+def test_partition_for_review_puts_review_in_visible_bucket():
+    """A REVIEW-classified group must land in the visible `review` list, not
+    `dashboard_only` — it needs human eyes, unlike silent ACTIVE/STALE.
+
+    Real failure case (#264): 'Return to `feature/pull-to-refresh-v2`
+    worktree to complete Task 7 (documentation) and merge feature PR' — no
+    #N anchor, shipped via PR #48/tag v2.0.0, branch deleted — must surface
+    here instead of landing in the hidden ACTIVE bucket.
+    """
+    classifications = [
+        {"group_id": "g1", "classification": "REVIEW", "confidence": "LOW",
+         "canonical_text": "Return to `feature/pull-to-refresh-v2` worktree "
+                            "to complete Task 7 (documentation) and merge feature PR",
+         "evidence_citation": "similarly-named branch feature/pull-to-refresh-v2 (deleted)",
+         "action_required": None},
+    ]
+    out = partition_for_review(classifications, show_all=False)
+    review_ids = {item["group_id"] for item in out["review"]}
+    assert "g1" in review_ids
+    assert all(d["group_id"] != "g1" for d in out["dashboard_only"])
+
+
+def test_partition_for_review_preserves_review_evidence_citation():
+    """Unlike ACTIVE (which is scrubbed to null before dashboard write),
+    REVIEW must keep its evidence_citation — it's the weak signal a human
+    needs to judge the item."""
+    classifications = [
+        {"group_id": "g1", "classification": "REVIEW", "confidence": "LOW",
+         "canonical_text": "Return to feature/pull-to-refresh-v2 worktree",
+         "evidence_citation": "similarly-named branch feature/pull-to-refresh-v2 (deleted)",
+         "action_required": None},
+    ]
+    out = partition_for_review(classifications, show_all=False)
+    review_item = next(i for i in out["review"] if i["group_id"] == "g1")
+    assert review_item["evidence_citation"] == (
+        "similarly-named branch feature/pull-to-refresh-v2 (deleted)"
+    )
+
+
+def test_partition_for_review_review_present_regardless_of_show_all():
+    """REVIEW is always visible — show_all only affects STALE, not REVIEW."""
+    classifications = [
+        {"group_id": "g1", "classification": "REVIEW", "confidence": "LOW",
+         "canonical_text": "w", "evidence_citation": "weak signal",
+         "action_required": None},
+    ]
+    default = partition_for_review(classifications, show_all=False)
+    expanded = partition_for_review(classifications, show_all=True)
+    assert {i["group_id"] for i in default["review"]} == {"g1"}
+    assert {i["group_id"] for i in expanded["review"]} == {"g1"}
+
+
+def test_assign_tier_review_never_high_even_with_literal_ref_overlap():
+    """A REVIEW classification is inherently uncertain — assign_tier must
+    cap it at MED, never HIGH, even in the contrived case where the weak
+    evidence_citation happens to contain a literal ref that also appears in
+    item_text (the LLM classifier path can, in principle, cite a ref while
+    still being unsure and choosing REVIEW over DONE)."""
+    citation = "similarly-named tag v2.0.0 (unconfirmed)"
+    text = "Ship the v2.0.0 polish pass"
+    # Sanity: the same inputs WOULD be HIGH for a DONE/no-classification call.
+    assert assign_tier(citation, text) == "HIGH"
+    assert assign_tier(citation, text, "REVIEW") == "MED"
+
+
+def test_assign_tier_review_defaults_low_with_no_citation():
+    """REVIEW with no evidence_citation (the common synthetic-path case)
+    stays LOW, same as any other classification with no citation."""
+    assert assign_tier(None, "Return to feature/x worktree", "REVIEW") == "LOW"

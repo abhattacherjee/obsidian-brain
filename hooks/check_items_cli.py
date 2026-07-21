@@ -57,7 +57,7 @@ _REQUIRED_CLASSIFIER_FIELDS = {
     "group_id", "classification", "confidence",
     "canonical_text", "evidence_citation", "action_required",
 }
-_VALID_CLASSIFICATIONS = frozenset({"DONE", "NEEDS-ACTION", "STALE", "ACTIVE"})
+_VALID_CLASSIFICATIONS = frozenset({"DONE", "NEEDS-ACTION", "STALE", "ACTIVE", "REVIEW"})
 
 
 def _validate_classifier_payload(parsed) -> bool:
@@ -262,7 +262,7 @@ CLASSIFIER_PROMPT = """You are the classifier sub-agent for /check-items. Read t
 ## Your job
 
 For each group, decide whether the action it describes is DONE,
-NEEDS-ACTION, STALE, or ACTIVE. Cite the specific evidence you used.
+NEEDS-ACTION, STALE, ACTIVE, or REVIEW. Cite the specific evidence you used.
 
 ## Classification semantics
 
@@ -277,6 +277,12 @@ NEEDS-ACTION, STALE, or ACTIVE. Cite the specific evidence you used.
   LOW confidence by default.
 - ACTIVE — you did not find sufficient evidence to close. Set
   `evidence_citation` to null.
+- REVIEW — the item names a shipped-looking component, feature, or
+  branch, but you found no citable issue/PR/commit/title to confirm
+  completion. You are uncertain. Surface it for the user to judge; do
+  NOT guess DONE and do NOT bury it as ACTIVE. LOW confidence. Set
+  evidence_citation to the closest weak signal (e.g. a similarly-named
+  branch/tag/path) or null.
 
 ## Self-referential evidence rule (CRITICAL)
 
@@ -307,7 +313,7 @@ JSON to <output-json-path>.
 [
   {
     "group_id": "ob-NNNN",
-    "classification": "DONE | NEEDS-ACTION | STALE | ACTIVE",
+    "classification": "DONE | NEEDS-ACTION | STALE | ACTIVE | REVIEW",
     "confidence": "HIGH | MED | LOW",
     "canonical_text": "<short canonical phrasing of the action>",
     "evidence_citation": "<specific commit sha / PR# / issue# / release / note ref, OR null>",

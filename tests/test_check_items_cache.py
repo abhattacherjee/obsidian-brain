@@ -299,6 +299,14 @@ def test_ttl_active_longer_than_done():
     assert len(needs) == 0
 
 
+def test_ttl_for_review_matches_active():
+    """REVIEW is a nudge for human judgement, not a settled result like
+    DONE/STALE — it must re-evaluate on the same (longer) cadence as ACTIVE,
+    not be cached on the short DONE/NEEDS-ACTION/STALE cycle (#264 Task 1)."""
+    from check_items_cache import _ttl_for, TTL_ACTIVE
+    assert _ttl_for("REVIEW") == TTL_ACTIVE
+
+
 def test_cache_evicts_removed_items():
     """Test 20 - cached entries whose canonical_hash is not in current run are GC'd."""
     from check_items_cache import update_cache

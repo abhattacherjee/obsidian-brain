@@ -171,9 +171,18 @@ _STALE_THRESHOLD_SECS = _STALE_THRESHOLD_DAYS * 86_400
 def synthetic_classification(group: dict, now: float | None = None) -> dict:
     """Produce a synthetic classification record for a group with no evidence.
 
-    Decision matrix (per spec § L2 Decision matrix):
+    Decision matrix (per spec § L2 Decision matrix, extended by #264 Task 1):
     - Item age > 90 days since oldest (smallest) member mtime → STALE / LOW
-    - Item age <= 90 days                                     → ACTIVE / LOW
+      (always — a distinctive token never overrides an age-based STALE call).
+    - Item age <= 90 days AND canonical_text has >=1 DISTINCTIVE token
+      (reuse `_is_distinctive`)                                → REVIEW / LOW
+      (names a shipped-looking component/branch/feature but has no anchor
+      and no evidence overlap — surface for human judgement rather than
+      silently bury it ACTIVE; see #264, the `feature/pull-to-refresh-v2`
+      worktree item that landed in silent ACTIVE with no #N and a deleted
+      branch).
+    - Item age <= 90 days AND no distinctive token                → ACTIVE / LOW
+      (vague items like "clean up the code" stay ACTIVE as before).
 
     Age is derived from the oldest (smallest) mtime across the group's
     'instances' list. If mtime is 0 or missing, defaults to 0 (epoch),
@@ -203,9 +212,16 @@ def synthetic_classification(group: dict, now: float | None = None) -> dict:
     earliest_mtime = min(mtimes) if mtimes else 0.0
 
     age_secs = now - earliest_mtime
-    classification = "STALE" if age_secs > _STALE_THRESHOLD_SECS else "ACTIVE"
-
     canonical_text = group.get("representative") or group.get("canonical_text", "")
+
+    if age_secs > _STALE_THRESHOLD_SECS:
+        classification = "STALE"
+    else:
+        tokens = _content_tokens(canonical_text)
+        if any(_is_distinctive(t) for t in tokens):
+            classification = "REVIEW"
+        else:
+            classification = "ACTIVE"
 
     return {
         "group_id": group.get("group_id"),

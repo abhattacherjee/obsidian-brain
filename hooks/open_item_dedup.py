@@ -127,12 +127,19 @@ def _outer_subagent_timeout() -> int:
     return inner * 6
 
 
-def assign_tier(evidence_citation, item_text):
+def assign_tier(evidence_citation, item_text, classification=None):
     """Deterministically assign HIGH | MED | LOW from evidence citation shape.
 
     HIGH requires a literal ref (sha, #N, vX.Y) appearing in BOTH the citation
     and the item text. MED matches an inferred-ref shape in the citation only.
     LOW is the default.
+
+    `classification` is optional and defaults to None (backward compatible
+    with existing callers). When classification == "REVIEW", the result is
+    capped at MED — a REVIEW item is by definition uncertain (the classifier
+    could not confirm completion), so it must never read as HIGH confidence
+    even in the edge case where its weak evidence_citation happens to contain
+    a literal ref that also appears in item_text (#264 Task 1).
 
     Spec § Confidence tiers (lines 324-332).
     """
@@ -147,7 +154,7 @@ def assign_tier(evidence_citation, item_text):
             continue
         ref = cit_match.group(0)
         if ref in text:
-            return "HIGH"
+            return "MED" if classification == "REVIEW" else "HIGH"
 
     for pattern in CONFIDENCE_TIER_RULES["MED"]["inferred_ref_patterns"]:
         if re.search(pattern, citation):
@@ -1427,7 +1434,7 @@ def get_last_semantic_merge_mode():
 # Stage 4: classify_groups_with_agent orchestrator (Task 16)
 # ---------------------------------------------------------------------------
 
-_VALID_CLASSIFICATIONS = {"DONE", "NEEDS-ACTION", "STALE", "ACTIVE"}
+_VALID_CLASSIFICATIONS = {"DONE", "NEEDS-ACTION", "STALE", "ACTIVE", "REVIEW"}
 _REQUIRED_CLASSIFIER_FIELDS = {
     "group_id", "classification", "confidence",
     "canonical_text", "evidence_citation", "action_required",
@@ -1662,18 +1669,24 @@ def partition_for_review(classifications, show_all=False):
 
     Returns:
         {
-            "review": [...DONE + NEEDS-ACTION (+ STALE if show_all)...],
+            "review": [...DONE + NEEDS-ACTION + REVIEW (+ STALE if show_all)...],
             "dashboard_only": [...ACTIVE (always) + STALE (default-mode)...]
         }
 
     ACTIVE entries have evidence_citation forced to None before dashboard
     write, per spec § Classification semantics line 322.
+
+    REVIEW entries (#264 Task 1 — unanchored, distinctive open items the
+    classifier cannot confirm as DONE) are always routed to the visible
+    `review` bucket, never `dashboard_only`, and — unlike ACTIVE — keep their
+    evidence_citation intact: it carries the weak signal (e.g. a similarly-
+    named branch/tag/path) the human needs to judge the item.
     """
     review = []
     dashboard_only = []
     for item in classifications or []:
         kind = item.get("classification")
-        if kind in ("DONE", "NEEDS-ACTION"):
+        if kind in ("DONE", "NEEDS-ACTION", "REVIEW"):
             review.append(item)
         elif kind == "STALE":
             if show_all:
