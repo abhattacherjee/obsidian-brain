@@ -3176,6 +3176,13 @@ def find_unsummarized_notes(
     return json.dumps({"unsummarized": unsummarized, "auto_fixed": auto_fixed, "skipped_aged": skipped_aged})
 
 
+# BH-003: bound for the open-item evidence pool in build_context_brief().
+# Mirrors open_item_dedup.collect_open_items()'s own `max_sessions` default —
+# items are already capped to that recent window, so evidence built from the
+# same window cannot miss a session that could contradict one of them.
+_OPEN_ITEM_EVIDENCE_WINDOW = 10
+
+
 def build_context_brief(
     vault_path: str,
     sessions_folder: str,
@@ -3539,10 +3546,20 @@ def build_context_brief(
             # session already enumerated above (session_files is the full
             # project-filtered, snapshot-excluded scan — a superset of what
             # collect_open_items() reads).
+            # BH-003: session_files is the full project-filtered scan
+            # (unbounded). Reading every note's body to build the evidence
+            # pool doesn't scale. Cap the (expensive) body-read to the same
+            # recent-N window collect_open_items() uses below — items only
+            # ever come from that same recent window, and any session that
+            # could strictly-newer-contradict an item is necessarily within
+            # it too, so this cap cannot drop a needed newer session. The
+            # cheap date-lookup dict (no file read) still covers ALL
+            # project sessions so item_date resolution is unaffected.
             _session_evidence: list[tuple[str, str, str]] = []
             _session_date_by_path: dict[str, str] = {}
             for _fname, _fpath, _meta in session_files:
                 _session_date_by_path[os.path.abspath(_fpath)] = _meta.get('date', '')
+            for _fname, _fpath, _meta in session_files[:_OPEN_ITEM_EVIDENCE_WINDOW]:
                 _date = _meta.get('date', '')
                 if not _date:
                     continue
@@ -3588,7 +3605,16 @@ def build_context_brief(
                             ev_summary, [(fpath, line_num, item_text)]
                         )
                         for c in matched:
+                            # BH-001: confidence >= 3 alone only means a
+                            # distinctive token (e.g. a branch/file name) was
+                            # co-mentioned — it does NOT mean the newer
+                            # session reports the item DONE. A session that
+                            # merely mentions the same branch/file (even to
+                            # say it's still in progress) must not flag the
+                            # item. Require completion language too.
                             if c.get("confidence", 0) < 3:
+                                continue
+                            if not c.get("has_completion_phrase"):
                                 continue
                             if best is None or c["confidence"] > best["confidence"]:
                                 c["contradicted_by"] = ev_date

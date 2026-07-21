@@ -772,7 +772,7 @@ def test_classifier_prompt_includes_self_referential_rule():
     p = cli.CLASSIFIER_PROMPT
     assert "discovery" in p.lower() and "fix" in p.lower()
     assert "prefer ACTIVE" in p or "prefer ACTIVE." in p
-    for c in ("DONE", "NEEDS-ACTION", "STALE", "ACTIVE"):
+    for c in ("DONE", "NEEDS-ACTION", "STALE", "ACTIVE", "REVIEW"):
         assert c in p, f"prompt missing classification: {c}"
     assert "STRICT JSON" in p or "strict JSON" in p.lower()
     for field in ("group_id", "classification", "confidence",

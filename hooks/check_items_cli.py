@@ -298,6 +298,13 @@ Discovery evidence is NOT completion evidence. Examples:
 - Evidence: "PR #534 merged as abc1234 on 2026-04-24."
 - -> DONE. The fix-merge is cited directly.
 
+Precedence vs REVIEW: "prefer ACTIVE" above is the default for items that
+name nothing shipped-looking. If the item NAMES a shipped-looking
+component, feature, or branch (see REVIEW above) and the only evidence is
+self-referential/discovery-only — you cannot confirm completion — prefer
+REVIEW instead of ACTIVE. Do not bury it as ACTIVE just because the
+evidence is discovery-only.
+
 ## Anti-conflation rule
 
 Different PR numbers under the same parent feature ship different work.

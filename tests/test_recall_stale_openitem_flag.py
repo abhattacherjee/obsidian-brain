@@ -94,6 +94,38 @@ def test_open_item_not_flagged_when_completion_language_in_same_note(tmp_path):
     )
 
 
+def test_open_item_not_flagged_when_newer_session_lacks_completion_language(tmp_path):
+    """NEGATIVE (BH-001): a strictly-newer session that merely CO-MENTIONS the
+    branch/file an open item names — without reporting it done — must NOT
+    flag the item. A single distinctive-token match (the branch name) alone
+    reaches confidence >= 3 with no completion phrase required, which is the
+    false-positive this test guards against: mentioning work-in-progress on a
+    branch is not evidence the item is done."""
+    vault = tmp_path / "v"
+    sess = vault / "claude-sessions"
+    ins = vault / "claude-insights"
+    sess.mkdir(parents=True)
+    ins.mkdir()
+    _session(
+        sess / "2026-04-01-demo-ffff.md", "2026-04-01", "s6",
+        summary="Started work on the pull-to-refresh feature.",
+        open_items=["Return to feature/pull-to-refresh-v2 worktree and finish it"],
+    )
+    _session(
+        sess / "2026-04-15-demo-gggg.md", "2026-04-15", "s7",
+        summary="Spent the afternoon on feature/pull-to-refresh-v2; still investigating the reducer.",
+    )
+
+    out = build_context_brief(str(vault), "claude-sessions", "claude-insights", "demo")
+    payload, candidates = _candidates(out)
+
+    match = next((c for c in candidates if "pull-to-refresh-v2" in c["text"]), None)
+    assert match is None, (
+        f"newer session co-mentioning the branch WITHOUT completion language "
+        f"must NOT flag the item, got {match!r}"
+    )
+
+
 def test_open_item_not_flagged_by_older_session_summary(tmp_path):
     """NEGATIVE/BOUNDARY (b): completion language in an OLDER session (dated
     before the open item's own source session) must NOT flag the item —

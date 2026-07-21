@@ -90,13 +90,13 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     parts.append(f"## Done ({applied} applied of {len(by_kind['DONE'])} classified)")
     for c in by_kind["DONE"]:
         parts.append(f"- [x] {c.get('canonical_text', '')}")
-        parts.append(f"  - Evidence: {c.get('evidence_citation', 'n/a')}")
+        parts.append(f"  - Evidence: {c.get('evidence_citation') or 'n/a'}")
     parts.append("")
 
     parts.append(f"## Needs-Action ({len(by_kind['NEEDS-ACTION'])} surfaced, not applied)")
     for c in by_kind["NEEDS-ACTION"]:
         parts.append(f"- [ ] {c.get('canonical_text', '')}")
-        parts.append(f"  - Evidence: {c.get('evidence_citation', 'n/a')}")
+        parts.append(f"  - Evidence: {c.get('evidence_citation') or 'n/a'}")
         if c.get("action_required"):
             parts.append(f"  - Action: `{c['action_required']}`")
     parts.append("")
@@ -108,7 +108,7 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     parts.append(f"## Review ({len(by_kind['REVIEW'])} needs a human look, not applied)")
     for c in by_kind["REVIEW"]:
         parts.append(f"- [ ] {c.get('canonical_text', '')}")
-        parts.append(f"  - Weak signal: {c.get('evidence_citation', 'n/a')}")
+        parts.append(f"  - Weak signal: {c.get('evidence_citation') or 'n/a'}")
     parts.append("")
 
     parts.append(f"## Stale ({len(by_kind['STALE'])} — hidden without --show-all)")
