@@ -210,7 +210,7 @@ Contains Obsidian Dataview dashboard templates that auto-update as notes are add
 
 #### `claude-check-items/` — Open Item Reports
 
-Holds per-run reports produced by `/check-items`: a markdown note per scope (project or `all`) per day, listing the open-item groups, AI classifications (DONE / NEEDS-ACTION / STALE / ACTIVE), and the audit trail of any auto-applied checkoffs. These are notes you read, not Dataview queries — they live in their own folder so dashboards stay browseable.
+Holds per-run reports produced by `/check-items`: a markdown note per scope (project or `all`) per day, listing the open-item groups, AI classifications (DONE / NEEDS-ACTION / REVIEW / STALE / ACTIVE), and the audit trail of any auto-applied checkoffs. `REVIEW` items name a shipped-looking component, branch, or feature that couldn't be confirmed `DONE` — they surface in their own `## Review` section for a human look rather than landing silently in `Active`. These are notes you read, not Dataview queries — they live in their own folder so dashboards stay browseable.
 
 **Configuration:** Folder name is set by `check_items_folder` in `~/.claude/obsidian-brain-config.json` (default `claude-check-items`). To keep the legacy v2.5.0 location, set it to `"claude-dashboards"`. Existing files in `claude-dashboards/check-items-*.md` are not migrated automatically.
 

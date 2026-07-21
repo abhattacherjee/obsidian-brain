@@ -159,7 +159,12 @@ def test_no_groups_have_evidence_subagent_not_called(tmp_path, monkeypatch):
     out = json.loads(Path(output_path).read_text())
     assert len(out) == 2
     for record in out:
-        assert record["classification"] in ("ACTIVE", "STALE")
+        # ACTIVE/STALE/REVIEW are all valid synthetic (L2, no-sub-agent)
+        # outcomes (#264 Task 1 added REVIEW for distinctive-token items
+        # with no anchor and no evidence overlap); the assertion that
+        # matters here is prefiltered=True + LOW confidence, not which of
+        # the three labels a given fixture text lands on.
+        assert record["classification"] in ("ACTIVE", "STALE", "REVIEW")
         assert record["confidence"] == "LOW"
         assert record.get("prefiltered") is True
 
@@ -465,7 +470,10 @@ def test_all_synthetic_subprocess_never_invoked(tmp_path, monkeypatch):
     assert group_ids == ["g1", "g2", "g3"], "Input order must be preserved"
     for record in out:
         assert record.get("prefiltered") is True
-        assert record["classification"] in ("ACTIVE", "STALE")
+        # ACTIVE/STALE/REVIEW are all valid synthetic outcomes (#264 Task 1
+        # added REVIEW for distinctive-token items with no anchor/evidence);
+        # what matters here is that the sub-agent was skipped, not the label.
+        assert record["classification"] in ("ACTIVE", "STALE", "REVIEW")
         assert record["confidence"] == "LOW"
 
 
@@ -695,6 +703,50 @@ def test_file_path_branch_validates_schema_missing_fields(tmp_path, monkeypatch)
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 4, f"Expected rc=4 for file-path output missing required fields, got {rc}"
+
+
+# ---------------------------------------------------------------------------
+# REVIEW classification (#264 Task 1)
+# ---------------------------------------------------------------------------
+
+def test_validate_classifier_payload_accepts_review():
+    """_validate_classifier_payload must accept the new REVIEW classification
+    value — the surfacing bucket for unanchored, distinctive open items that
+    the classifier is not confident enough to call DONE or bury as ACTIVE."""
+    from check_items_cli import _validate_classifier_payload
+    payload = [{
+        "group_id": "g1", "classification": "REVIEW", "confidence": "LOW",
+        "canonical_text": "Return to feature/pull-to-refresh-v2 worktree",
+        "evidence_citation": "similarly-named branch feature/pull-to-refresh-v2 (deleted)",
+        "action_required": None,
+    }]
+    assert _validate_classifier_payload(payload) is True
+
+
+def test_validate_classifier_payload_rejects_unknown_classification():
+    """Regression: adding REVIEW must not loosen validation generally — an
+    unrecognised classification string is still rejected."""
+    from check_items_cli import _validate_classifier_payload
+    payload = [{
+        "group_id": "g1", "classification": "MAYBE", "confidence": "LOW",
+        "canonical_text": "x", "evidence_citation": None, "action_required": None,
+    }]
+    assert _validate_classifier_payload(payload) is False
+
+
+def test_validate_classifier_payload_done_shape_unaffected_by_review_addition():
+    """Regression: adding REVIEW to the valid-classification set must not
+    change validation of pre-existing classifications. A DONE payload with a
+    null evidence_citation still passes SHAPE validation unchanged — citation-
+    *content* enforcement (e.g. requiring DONE to always cite something
+    concrete) is a separate concern _validate_classifier_payload does not
+    implement today, and this task does not add it."""
+    from check_items_cli import _validate_classifier_payload
+    payload = [{
+        "group_id": "g1", "classification": "DONE", "confidence": "HIGH",
+        "canonical_text": "x", "evidence_citation": None, "action_required": None,
+    }]
+    assert _validate_classifier_payload(payload) is True
 
 
 # ---------------------------------------------------------------------------
@@ -948,6 +1000,136 @@ def test_bridge_project_evidence_omits_issue_body_from_closed_issues_text():
     # URL and timestamps are also excluded (noise)
     assert "https://example" not in closed_text
     assert "2026-05-11" not in closed_text
+
+
+# ---------------------------------------------------------------------------
+# #264 Task 2 follow-up: wire fold_tags_and_paths_into_completion_zone into
+# _bridge_project_evidence so no-anchor items whose only ground-truth signal
+# is a git tag or changed file path are promoted to the sub-agent classifier.
+# ---------------------------------------------------------------------------
+
+def test_bridge_project_evidence_folds_changed_paths_promotes_no_anchor_item():
+    """A no-#N-anchor open item whose distinctive token appears ONLY in
+    proj_evidence['changed_paths'] (not commits/merged_prs/closed_issues/
+    releases/changelog/fts) must still reach has_classifiable_evidence()==True
+    once _bridge_project_evidence folds changed_paths into the completion
+    zone via fold_tags_and_paths_into_completion_zone()."""
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _bridge_project_evidence
+    from check_items_prefilter import has_classifiable_evidence
+
+    group = {
+        "group_id": "g-pull-to-refresh",
+        "project": "obsidian-brain",
+        "representative": "Wire up PullToRefresh on the feed screen",
+        "instances": [{"file": "note.md", "line": 1,
+                        "text": "Wire up PullToRefresh on the feed screen",
+                        "mtime": 0.0}],
+    }
+    evidence = {
+        "obsidian-brain": {
+            "commits": [],
+            "merged_prs": [],
+            "closed_issues": [],
+            "releases": [],
+            "changelog_excerpt": "",
+            "fts_mentions": {},
+            "tags": [],
+            # Distinctive token appears ONLY here.
+            "changed_paths": ["src/components/PullToRefresh.tsx"],
+        }
+    }
+
+    bridged = _bridge_project_evidence(evidence, "obsidian-brain")
+
+    assert has_classifiable_evidence(group, bridged) is True, (
+        "changed_paths evidence should promote a no-anchor item to the "
+        "sub-agent classifier once folded into the completion zone"
+    )
+
+
+def test_bridge_project_evidence_folds_tags_promotes_no_anchor_item():
+    """Same as above, but the distinctive token appears only in
+    proj_evidence['tags'] (a recent git tag), not changed_paths."""
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _bridge_project_evidence
+    from check_items_prefilter import has_classifiable_evidence
+
+    group = {
+        "group_id": "g-pull-to-refresh-tag",
+        "project": "obsidian-brain",
+        "representative": "Ship the PullToRefresh gesture",
+        "instances": [{"file": "note.md", "line": 1,
+                        "text": "Ship the PullToRefresh gesture",
+                        "mtime": 0.0}],
+    }
+    evidence = {
+        "obsidian-brain": {
+            "commits": [],
+            "merged_prs": [],
+            "closed_issues": [],
+            "releases": [],
+            "changelog_excerpt": "",
+            "fts_mentions": {},
+            "tags": ["v3.3.0-PullToRefresh"],
+            "changed_paths": [],
+        }
+    }
+
+    bridged = _bridge_project_evidence(evidence, "obsidian-brain")
+
+    assert has_classifiable_evidence(group, bridged) is True, (
+        "tags evidence should promote a no-anchor item to the sub-agent "
+        "classifier once folded into the completion zone"
+    )
+
+
+def test_bridge_project_evidence_no_match_stays_unclassifiable_with_tags_and_paths():
+    """Regression/negative: an item with no distinctive-token match anywhere
+    (including tags/changed_paths) must still return False — the fold must
+    not manufacture false-positive matches."""
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _bridge_project_evidence
+    from check_items_prefilter import has_classifiable_evidence
+
+    group = {
+        "group_id": "g-unrelated",
+        "project": "obsidian-brain",
+        "representative": "Investigate the flaky nightly job",
+        "instances": [{"file": "note.md", "line": 1,
+                        "text": "Investigate the flaky nightly job",
+                        "mtime": 0.0}],
+    }
+    evidence = {
+        "obsidian-brain": {
+            "commits": [],
+            "merged_prs": [],
+            "closed_issues": [],
+            "releases": [],
+            "changelog_excerpt": "",
+            "fts_mentions": {},
+            "tags": ["v3.3.0"],
+            "changed_paths": ["src/components/PullToRefresh.tsx"],
+        }
+    }
+
+    bridged = _bridge_project_evidence(evidence, "obsidian-brain")
+
+    assert has_classifiable_evidence(group, bridged) is False, (
+        "unrelated tags/changed_paths must not falsely promote an item"
+    )
 
 
 def test_strip_unreleased_removes_unreleased_section():

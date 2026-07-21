@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-07-21
+
+### Fixed
+- **Unanchored next-step checkboxes that name shipped work are no longer silently left open (#264):** `/check-items` now surfaces them in a new **Review** tier — a distinctive, unanchored item (a named component, branch, or feature) that neither the deterministic prefilter nor the AI classifier can confirm `DONE` is shown in a visible `## Review` dashboard section instead of quietly falling into `Active`. `/check-items` also gathers git tags and changed paths as additional completion evidence, so an item can now auto-close as `Done` purely on tag/path grounding even with no anchor or PR reference. Separately, `/recall` now flags an open item when a **strictly newer** session's own summary reports it done, with a one-line nudge to run `/check-items` to confirm.
+
 ## [3.2.1] - 2026-07-09
 
 ### Fixed
