@@ -747,6 +747,13 @@ def _resolve_project_paths() -> dict[str, str]:
     return result
 
 
+# Bounds for #264 Task 2's widened git ground truth (tags, changed_paths).
+# Kept small and deterministic — these feed a claude -p prompt payload and an
+# L2 evidence-text blob, so an unbounded git dump would blow both budgets.
+_MAX_EVIDENCE_TAGS = 20
+_MAX_EVIDENCE_CHANGED_PATHS = 200
+
+
 def deep_analysis_pipeline(
     basenames: list[str],
     projects_json: str,
@@ -935,6 +942,64 @@ def deep_analysis_pipeline(
         except (OSError, subprocess.TimeoutExpired) as exc:
             print(f"[obsidian-brain] git log error for {project}: {exc}", file=sys.stderr)
 
+        # git tag --list (#264 Task 2: widen git ground truth). A genuinely-
+        # shipped item may be grounded in a release tag rather than a PR/issue
+        # title (e.g. the reporter's `feature/pull-to-refresh-v2` case, shipped
+        # via tag v2.0.0 with no #N anchor in the checkbox text). Sorted by
+        # creation recency and capped/deduped to keep the evidence blob small.
+        try:
+            proc = subprocess.run(
+                ["git", "tag", "--list", "--sort=-creatordate"],
+                cwd=repo_path, capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode == 0:
+                _seen_tags: set[str] = set()
+                _tags: list[str] = []
+                for _line in proc.stdout.strip().split("\n"):
+                    _line = _line.strip()
+                    if not _line or _line in _seen_tags:
+                        continue
+                    _seen_tags.add(_line)
+                    _tags.append(_line)
+                    if len(_tags) >= _MAX_EVIDENCE_TAGS:
+                        break
+                proj_evidence["tags"] = _tags
+            else:
+                print(f"[obsidian-brain] git tag failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                proj_evidence["tags"] = []
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"[obsidian-brain] git tag error for {project}: {exc}", file=sys.stderr)
+            proj_evidence["tags"] = []
+
+        # git log --name-only (#264 Task 2: changed file paths on the default
+        # branch's recent history). Completion may live in changed paths rather
+        # than a PR title (e.g. source/test/doc files landing under a shipped
+        # component's directory). Deduped and hard-capped so the evidence blob
+        # stays bounded regardless of commit size.
+        try:
+            proc = subprocess.run(
+                ["git", "log", "--name-only", "--pretty=format:", "-40"],
+                cwd=repo_path, capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode == 0:
+                _seen_paths: set[str] = set()
+                _paths: list[str] = []
+                for _line in proc.stdout.strip().split("\n"):
+                    _line = _line.strip()
+                    if not _line or _line in _seen_paths:
+                        continue
+                    _seen_paths.add(_line)
+                    _paths.append(_line)
+                    if len(_paths) >= _MAX_EVIDENCE_CHANGED_PATHS:
+                        break
+                proj_evidence["changed_paths"] = _paths
+            else:
+                print(f"[obsidian-brain] git log --name-only failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                proj_evidence["changed_paths"] = []
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"[obsidian-brain] git log --name-only error for {project}: {exc}", file=sys.stderr)
+            proj_evidence["changed_paths"] = []
+
         # gh release list
         try:
             proc = subprocess.run(
@@ -1059,6 +1124,54 @@ def deep_analysis_pipeline(
         return _result
     _evidence_cache_put(_ck, (_result, _output_json_str), _now)
     return _result
+
+
+def fold_tags_and_paths_into_completion_zone(zone_text: dict, proj_evidence: dict) -> dict:
+    """Fold #264 Task 2's `tags` and `changed_paths` evidence sources into the
+    COMPLETION-ZONE evidence text consumed by
+    check_items_prefilter.has_classifiable_evidence().
+
+    `zone_text` is the flat, `_text`-suffixed dict produced by an evidence
+    bridge (e.g. check_items_cli.py's `_bridge_project_evidence()`) for the
+    pre-existing evidence sources (commits, merged_prs, closed_issues,
+    releases, changelog_excerpt, fts_mentions). `proj_evidence` is the raw
+    per-project evidence dict this pipeline builds (see
+    `deep_analysis_pipeline`), now additionally carrying `tags` (recent git
+    tags) and `changed_paths` (files touched on the default branch's recent
+    history).
+
+    Both new sources represent completed / merged-to-default-branch work —
+    the same class of signal as `releases_text` / `changelog_excerpt` — so
+    they are appended into those two buckets rather than left under keys
+    `has_classifiable_evidence()` does not read (it only inspects
+    merged_prs_text, closed_issues_text, releases_text, and
+    changelog_excerpt for its completion-zone rule). Tags are release-like
+    -> `releases_text`; changed paths are prose-adjacent free text ->
+    `changelog_excerpt`.
+
+    Returns a NEW dict; never mutates `zone_text` in place (callers may reuse
+    or cache it).
+
+    NOTE — scope: production wiring additionally requires the LIVE bridge
+    (currently `check_items_cli.py`'s `_bridge_project_evidence()`) to call
+    this helper (or fold tags/changed_paths equivalently) before invoking
+    `has_classifiable_evidence()`. That file is out of scope for #264 Task 2
+    (scoped to `hooks/open_item_dedup.py`'s `deep_analysis_pipeline` only) —
+    flagged as a required follow-up rather than edited here.
+    """
+    out = dict(zone_text)
+
+    tags = proj_evidence.get("tags") or []
+    if tags:
+        tags_blob = " ".join(str(t) for t in tags)
+        out["releases_text"] = (str(out.get("releases_text") or "") + " " + tags_blob).strip()
+
+    changed_paths = proj_evidence.get("changed_paths") or []
+    if changed_paths:
+        paths_blob = " ".join(str(p) for p in changed_paths)
+        out["changelog_excerpt"] = (str(out.get("changelog_excerpt") or "") + "\n" + paths_blob).strip()
+
+    return out
 
 
 def build_deep_presentation(

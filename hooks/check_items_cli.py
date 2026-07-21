@@ -402,7 +402,7 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
                 return " ".join(str(k) for k in val)
             return str(val)
 
-        return {
+        zone_text = {
             "commits_text": _to_text(proj.get("commits")),
             "merged_prs_text": _to_text(proj.get("merged_prs")),
             "closed_issues_text": _to_text(proj.get("closed_issues")),
@@ -410,6 +410,17 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
             "changelog_excerpt": _strip_unreleased_section(proj.get("changelog_excerpt") or ""),
             "fts_mentions_text": _to_text(proj.get("fts_mentions")),
         }
+
+        # #264 Task 2 follow-up: fold the bounded/deduped `tags` and
+        # `changed_paths` git ground truth (collected by
+        # open_item_dedup.deep_analysis_pipeline) into the completion-zone
+        # text so has_classifiable_evidence() can see it. Without this, a
+        # no-anchor item whose only evidence is a git tag or a changed file
+        # path never reaches the sub-agent classifier. Degrades cleanly when
+        # `proj` carries no tags/changed_paths keys (helper treats missing as
+        # empty).
+        from open_item_dedup import fold_tags_and_paths_into_completion_zone
+        return fold_tags_and_paths_into_completion_zone(zone_text, proj)
 
     # Shape B: already _text-suffixed at top level (test fixtures / simplified payloads)
     _TEXT_KEYS = {"commits_text", "merged_prs_text", "closed_issues_text",

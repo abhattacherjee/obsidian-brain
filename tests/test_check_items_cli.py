@@ -1002,6 +1002,136 @@ def test_bridge_project_evidence_omits_issue_body_from_closed_issues_text():
     assert "2026-05-11" not in closed_text
 
 
+# ---------------------------------------------------------------------------
+# #264 Task 2 follow-up: wire fold_tags_and_paths_into_completion_zone into
+# _bridge_project_evidence so no-anchor items whose only ground-truth signal
+# is a git tag or changed file path are promoted to the sub-agent classifier.
+# ---------------------------------------------------------------------------
+
+def test_bridge_project_evidence_folds_changed_paths_promotes_no_anchor_item():
+    """A no-#N-anchor open item whose distinctive token appears ONLY in
+    proj_evidence['changed_paths'] (not commits/merged_prs/closed_issues/
+    releases/changelog/fts) must still reach has_classifiable_evidence()==True
+    once _bridge_project_evidence folds changed_paths into the completion
+    zone via fold_tags_and_paths_into_completion_zone()."""
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _bridge_project_evidence
+    from check_items_prefilter import has_classifiable_evidence
+
+    group = {
+        "group_id": "g-pull-to-refresh",
+        "project": "obsidian-brain",
+        "representative": "Wire up PullToRefresh on the feed screen",
+        "instances": [{"file": "note.md", "line": 1,
+                        "text": "Wire up PullToRefresh on the feed screen",
+                        "mtime": 0.0}],
+    }
+    evidence = {
+        "obsidian-brain": {
+            "commits": [],
+            "merged_prs": [],
+            "closed_issues": [],
+            "releases": [],
+            "changelog_excerpt": "",
+            "fts_mentions": {},
+            "tags": [],
+            # Distinctive token appears ONLY here.
+            "changed_paths": ["src/components/PullToRefresh.tsx"],
+        }
+    }
+
+    bridged = _bridge_project_evidence(evidence, "obsidian-brain")
+
+    assert has_classifiable_evidence(group, bridged) is True, (
+        "changed_paths evidence should promote a no-anchor item to the "
+        "sub-agent classifier once folded into the completion zone"
+    )
+
+
+def test_bridge_project_evidence_folds_tags_promotes_no_anchor_item():
+    """Same as above, but the distinctive token appears only in
+    proj_evidence['tags'] (a recent git tag), not changed_paths."""
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _bridge_project_evidence
+    from check_items_prefilter import has_classifiable_evidence
+
+    group = {
+        "group_id": "g-pull-to-refresh-tag",
+        "project": "obsidian-brain",
+        "representative": "Ship the PullToRefresh gesture",
+        "instances": [{"file": "note.md", "line": 1,
+                        "text": "Ship the PullToRefresh gesture",
+                        "mtime": 0.0}],
+    }
+    evidence = {
+        "obsidian-brain": {
+            "commits": [],
+            "merged_prs": [],
+            "closed_issues": [],
+            "releases": [],
+            "changelog_excerpt": "",
+            "fts_mentions": {},
+            "tags": ["v3.3.0-PullToRefresh"],
+            "changed_paths": [],
+        }
+    }
+
+    bridged = _bridge_project_evidence(evidence, "obsidian-brain")
+
+    assert has_classifiable_evidence(group, bridged) is True, (
+        "tags evidence should promote a no-anchor item to the sub-agent "
+        "classifier once folded into the completion zone"
+    )
+
+
+def test_bridge_project_evidence_no_match_stays_unclassifiable_with_tags_and_paths():
+    """Regression/negative: an item with no distinctive-token match anywhere
+    (including tags/changed_paths) must still return False — the fold must
+    not manufacture false-positive matches."""
+    import sys
+    import os
+    HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
+    if HOOKS not in sys.path:
+        sys.path.insert(0, HOOKS)
+    from check_items_cli import _bridge_project_evidence
+    from check_items_prefilter import has_classifiable_evidence
+
+    group = {
+        "group_id": "g-unrelated",
+        "project": "obsidian-brain",
+        "representative": "Investigate the flaky nightly job",
+        "instances": [{"file": "note.md", "line": 1,
+                        "text": "Investigate the flaky nightly job",
+                        "mtime": 0.0}],
+    }
+    evidence = {
+        "obsidian-brain": {
+            "commits": [],
+            "merged_prs": [],
+            "closed_issues": [],
+            "releases": [],
+            "changelog_excerpt": "",
+            "fts_mentions": {},
+            "tags": ["v3.3.0"],
+            "changed_paths": ["src/components/PullToRefresh.tsx"],
+        }
+    }
+
+    bridged = _bridge_project_evidence(evidence, "obsidian-brain")
+
+    assert has_classifiable_evidence(group, bridged) is False, (
+        "unrelated tags/changed_paths must not falsely promote an item"
+    )
+
+
 def test_strip_unreleased_removes_unreleased_section():
     import sys
     import os
