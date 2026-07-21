@@ -254,6 +254,15 @@ def test_synthetic_distinctive_token_young_item_is_review():
     Real failure: '- [ ] Return to `feature/pull-to-refresh-v2` worktree to
     complete Task 7 (documentation) and merge feature PR' — no #N, shipped
     via PR #48/tag v2.0.0, branch deleted — landed in silent ACTIVE.
+
+    Note: the branch name itself is NOT what makes this text distinctive —
+    `_content_tokens` splits `feature/pull-to-refresh-v2` on non-word
+    characters into `feature`, `pull`, `refresh` (each too short/generic),
+    with `v2` dropped as len<=2. The REVIEW verdict here is actually
+    triggered by the plain >=8-char generic words `worktree` and
+    `documentation` clearing `_DISTINCTIVE_MIN_LEN` — see
+    test_synthetic_camelcase_component_young_item_is_review below for a
+    fixture where a genuine CamelCase component name is the trigger.
     """
     from check_items_prefilter import synthetic_classification
     mtime_30d_ago = _time.time() - (30 * 86400)
@@ -268,6 +277,29 @@ def test_synthetic_distinctive_token_young_item_is_review():
     assert result["prefiltered"] is True
     assert result["evidence_citation"] is None
     assert result["group_id"] == "test-synth-01"
+
+
+def test_synthetic_camelcase_component_young_item_is_review():
+    """Pins #264's core intent directly: an item naming a genuine
+    CamelCase component (not merely incidental long generic words, as in
+    test_synthetic_distinctive_token_young_item_is_review above) with no
+    anchor and no evidence overlap must be surfaced for REVIEW rather than
+    silently buried ACTIVE.
+
+    Every other word in the text is short/generic (`Ship`, `the`, `chip`) —
+    `PullToRefresh` is the SOLE distinctive token, and it qualifies via
+    `_is_distinctive`'s interior-mixed-case rule (it also happens to clear
+    the >=8-char length rule, which is expected: real component names are
+    usually both — the point is it names a *component*, unlike the generic
+    English words `worktree`/`documentation` in the fixture above)."""
+    from check_items_prefilter import synthetic_classification
+    mtime_30d_ago = _time.time() - (30 * 86400)
+    group = _make_group_with_mtime("Ship the PullToRefresh chip", mtime_30d_ago)
+    result = synthetic_classification(group)
+    assert result["classification"] == "REVIEW"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+    assert result["evidence_citation"] is None
 
 
 def test_synthetic_no_distinctive_token_young_item_still_active():
@@ -293,6 +325,42 @@ def test_synthetic_distinctive_token_old_item_still_stale():
         mtime_100d_ago,
     )
     result = synthetic_classification(group)
+    assert result["classification"] == "STALE"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+
+
+def test_synthetic_classification_exact_90_day_boundary_is_review():
+    """Pin the exact STALE boundary at `age_secs > _STALE_THRESHOLD_SECS`
+    (strictly greater-than). At age == threshold exactly, `age_secs >
+    _STALE_THRESHOLD_SECS` is False, so the item falls into the <=90d branch.
+    Item text carries a distinctive token so that branch resolves to REVIEW
+    (not ACTIVE), giving this test a distinct, non-default classification to
+    assert on — a `>=` regression would misclassify this exact-boundary case
+    as STALE."""
+    from check_items_prefilter import synthetic_classification, _STALE_THRESHOLD_SECS
+    mtime = 1_000_000.0
+    group = _make_group_with_mtime(
+        "Investigate the outstanding synchronization backlog", mtime,
+    )
+    result = synthetic_classification(group, now=mtime + _STALE_THRESHOLD_SECS)
+    assert result["classification"] == "REVIEW"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+
+
+def test_synthetic_classification_one_second_over_90_day_boundary_is_stale():
+    """Companion to the exact-boundary test above: one second past the
+    threshold, `age_secs > _STALE_THRESHOLD_SECS` is True → STALE, even
+    though the text carries the same distinctive token that would otherwise
+    route to REVIEW — age-based STALE always wins (see decision matrix in
+    synthetic_classification's docstring)."""
+    from check_items_prefilter import synthetic_classification, _STALE_THRESHOLD_SECS
+    mtime = 1_000_000.0
+    group = _make_group_with_mtime(
+        "Investigate the outstanding synchronization backlog", mtime,
+    )
+    result = synthetic_classification(group, now=mtime + _STALE_THRESHOLD_SECS + 1)
     assert result["classification"] == "STALE"
     assert result["confidence"] == "LOW"
     assert result["prefiltered"] is True

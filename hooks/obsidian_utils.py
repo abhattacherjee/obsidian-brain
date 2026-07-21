@@ -3575,7 +3575,14 @@ def build_context_brief(
                         continue
                     best: dict | None = None
                     for ev_date, ev_title, ev_summary in _session_evidence:
-                        if ev_date <= item_date:
+                        # Compare day-prefixes only (mirrors _safe_sort_key's
+                        # `p.name[:10]` convention above) so a future note whose
+                        # `date:` frontmatter carries a full datetime (not just
+                        # YYYY-MM-DD) still compares correctly against a
+                        # date-only value. Both sides are guaranteed non-empty
+                        # strings here (see the `if not item_date` / `if not
+                        # _date` guards above).
+                        if ev_date[:10] <= item_date[:10]:
                             continue  # same-date or older session — never contradicts
                         matched = match_items_against_evidence(
                             ev_summary, [(fpath, line_num, item_text)]

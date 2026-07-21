@@ -1152,12 +1152,8 @@ def fold_tags_and_paths_into_completion_zone(zone_text: dict, proj_evidence: dic
     Returns a NEW dict; never mutates `zone_text` in place (callers may reuse
     or cache it).
 
-    NOTE — scope: production wiring additionally requires the LIVE bridge
-    (currently `check_items_cli.py`'s `_bridge_project_evidence()`) to call
-    this helper (or fold tags/changed_paths equivalently) before invoking
-    `has_classifiable_evidence()`. That file is out of scope for #264 Task 2
-    (scoped to `hooks/open_item_dedup.py`'s `deep_analysis_pipeline` only) —
-    flagged as a required follow-up rather than edited here.
+    Wired in production via check_items_cli._bridge_project_evidence()
+    (Shape A path), which calls this helper before has_classifiable_evidence().
     """
     out = dict(zone_text)
 
