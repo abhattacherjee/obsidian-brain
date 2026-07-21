@@ -236,7 +236,7 @@ If the command fails (non-zero exit code), print the error and stop — do not f
 
 1. Extract `<<<OB_CONTEXT_BRIEF>>>` — everything between this delimiter and `<<<OB_LOAD_MANIFEST>>>`. This is the brief to display.
 2. Extract `<<<OB_LOAD_MANIFEST>>>` — parse `full_session_title`, `full_session_date`, `full_session_path`, `summary_session_title`, `summary_session_date`, `insight_count`, `snapshot_count` (optional), and all `snapshot:` lines (there may be zero or more, each followed by optional 2-space-indented `key_context` bullets).
-3. Extract `<<<OB_OPEN_ITEM_CANDIDATES>>>` — either `NO_CANDIDATES`, `NO_ITEMS`, or a JSON array. Count the number of `- [ ]` items across all scanned session notes. Store as `open_items_total`.
+3. Extract `<<<OB_OPEN_ITEM_CANDIDATES>>>` — either `NO_CANDIDATES`, `NO_ITEMS`, or a JSON array. Count the number of `- [ ]` items across all scanned session notes. Store as `open_items_total`. When the payload is a JSON array, each element may carry two optional fields — `contradicted_by` (a `YYYY-MM-DD` date) and `contradicted_by_title` (that session's title) — meaning a STRICTLY NEWER session's own summary reports that item done. Collect every element that has a non-empty `contradicted_by` into a list of flagged items (`text`, `contradicted_by`) for Step 4. Elements without `contradicted_by` are not flagged — ignore them (do not surface, do not count as done).
 
 **Present the brief immediately** (same turn — saves one parent round):
 
@@ -271,13 +271,21 @@ If the output is non-empty, append it verbatim to the brief (between the context
 
 ### Step 4 — Show read-only context brief footer
 
-Append to the brief written in Step 3:
+For each flagged item collected in Step 3 (those carrying a non-empty `contradicted_by`), render one line, in the order returned:
+
+> ⚠ "<item's text field, verbatim>" looks done per session <contradicted_by> — run `/check-items` to confirm
+
+If `contradicted_by_title` is present and non-empty, you may append it in parentheses after the date for extra context. Do not paraphrase the item text.
+
+Then append to the brief:
 
 > _N open items in this project — run `/check-items` to triage._
 
-Where N is the count of `- [ ]` items found while scanning sessions in Step 3. Use the `open_items_total` value already computed by the Python block in Step 3 (if not present, count by re-scanning the same notes). This step is read-only: do NOT prompt the user about individual items, do NOT compute candidate matches, and do NOT cite any session note.
+Where N is the count of `- [ ]` items found while scanning sessions in Step 3 (the `open_items_total` value already computed by the Python block in Step 3; if not present, count by re-scanning the same notes) MINUS the number of flagged items already rendered above, so a flagged item is never double-counted in the plain footer.
 
-If `N == 0`, omit the footer entirely.
+This step remains strictly read-only: never check anything off, and never prompt the user to action an individual item beyond the single flagged-line nudge above. Do NOT independently compute candidate matches or cite session evidence of your own — the flagged lines are rendered only from the `contradicted_by` field Python already computed in Step 3.
+
+If `N == 0` and there are no flagged items either, omit the footer/warning block entirely. If there are flagged items but `N == 0`, still render the flagged lines (omit only the plain `_N open items...` line).
 
 Mark task #3 (the renamed final task) as `completed` and end.
 

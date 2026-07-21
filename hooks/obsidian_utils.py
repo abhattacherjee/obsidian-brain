@@ -3520,6 +3520,13 @@ def build_context_brief(
     brief = "\n".join(brief_parts)
 
     # --- 5. Open-item detection ---
+    # Fix B (#264 task 3): an open item is only "contradicted" by a session
+    # STRICTLY NEWER (by session date) than the item's own source session —
+    # never by its own note, and never by an older one. Previously this only
+    # matched every item against the single most-recent session's own
+    # sections, so a stale item never got flagged even after a later session
+    # reported it done (and, worse, could false-positive off its own note's
+    # sections when that note happened to be the most recent one).
     candidates_output = "NO_CANDIDATES"
     if most_recent_path:
         try:
@@ -3528,27 +3535,62 @@ def build_context_brief(
                 sys.path.insert(0, _hooks_dir)
             from open_item_dedup import collect_open_items
 
-            evidence_parts: list[str] = []
-            try:
-                content = Path(most_recent_path).read_text(encoding='utf-8', errors='replace')
-                for section in ["Summary", "Key Decisions", "Changes Made", "Errors Encountered"]:
-                    m = re.search(rf"## {section}\n(.*?)(?=\n## |\Z)", content, re.DOTALL)
-                    if m:
-                        evidence_parts.append(m.group(1))
-            except OSError:
-                pass
+            # Evidence pool: (date, title, "## Summary" text) for every
+            # session already enumerated above (session_files is the full
+            # project-filtered, snapshot-excluded scan — a superset of what
+            # collect_open_items() reads).
+            _session_evidence: list[tuple[str, str, str]] = []
+            _session_date_by_path: dict[str, str] = {}
+            for _fname, _fpath, _meta in session_files:
+                _session_date_by_path[os.path.abspath(_fpath)] = _meta.get('date', '')
+                _date = _meta.get('date', '')
+                if not _date:
+                    continue
+                try:
+                    _content = Path(_fpath).read_text(encoding='utf-8', errors='replace')
+                except OSError:
+                    continue
+                _m = _summary_re.search(_content)
+                if not _m:
+                    continue
+                _summary_text = _m.group(1).strip()
+                if not _summary_text:
+                    continue
+                _title = f"Session: {_meta.get('project', project)}"
+                _first_line = _summary_text.split('\n')[0].strip()
+                if _first_line:
+                    _title = _first_line
+                _session_evidence.append((_date, _title, _summary_text))
 
-            evidence = "\n".join(evidence_parts)
-            if evidence:
-                items = collect_open_items(vault_path, sessions_folder, project)
-                if not items:
-                    candidates_output = "NO_ITEMS"
-                elif items:
-                    candidates = match_items_against_evidence(evidence, items)
-                    if candidates:
-                        filtered = [c for c in candidates if c.get("confidence", 0) >= 3]
-                        if filtered:
-                            candidates_output = json.dumps(filtered)
+            items = collect_open_items(vault_path, sessions_folder, project)
+            if not items:
+                candidates_output = "NO_ITEMS"
+            else:
+                flagged: list[dict] = []
+                for fpath, line_num, item_text in items:
+                    item_date = _session_date_by_path.get(os.path.abspath(fpath), '')
+                    if not item_date:
+                        # Can't establish "strictly newer" without a known
+                        # source date — never flag.
+                        continue
+                    best: dict | None = None
+                    for ev_date, ev_title, ev_summary in _session_evidence:
+                        if ev_date <= item_date:
+                            continue  # same-date or older session — never contradicts
+                        matched = match_items_against_evidence(
+                            ev_summary, [(fpath, line_num, item_text)]
+                        )
+                        for c in matched:
+                            if c.get("confidence", 0) < 3:
+                                continue
+                            if best is None or c["confidence"] > best["confidence"]:
+                                c["contradicted_by"] = ev_date
+                                c["contradicted_by_title"] = ev_title
+                                best = c
+                    if best is not None:
+                        flagged.append(best)
+                if flagged:
+                    candidates_output = json.dumps(flagged)
         except Exception as exc:
             print(f"[obsidian-brain] open-item detection failed (non-fatal): {exc}", file=sys.stderr)
 
