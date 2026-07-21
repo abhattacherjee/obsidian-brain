@@ -97,10 +97,15 @@ def save_cache(data: dict[str, Any]) -> None:
 
 
 def _ttl_for(classification: str) -> int:
+    # REVIEW is a nudge for human judgement (#264 Task 1) — it must
+    # re-evaluate on the same cadence as ACTIVE, not the short DONE/
+    # NEEDS-ACTION/STALE cycle, so it maps explicitly to TTL_ACTIVE
+    # (matches the default fallback, spelled out here for clarity).
     return {
         "DONE": TTL_DONE,
         "NEEDS-ACTION": TTL_NEEDS_ACTION,
         "STALE": TTL_STALE,
+        "REVIEW": TTL_ACTIVE,
     }.get(classification, TTL_ACTIVE)
 
 

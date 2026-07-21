@@ -32,11 +32,11 @@ def _safe_filename_component(s: str) -> str:
 def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
                  classifications, applied, cascaded,
                  semantic_merge_mode, classifier_mode):
-    counts = {"done": 0, "needs_action": 0, "stale": 0, "active": 0}
+    counts = {"done": 0, "needs_action": 0, "stale": 0, "active": 0, "review": 0}
     for c in classifications:
         kind = c.get("classification", "")
         key = {"DONE": "done", "NEEDS-ACTION": "needs_action",
-               "STALE": "stale", "ACTIVE": "active"}.get(kind)
+               "STALE": "stale", "ACTIVE": "active", "REVIEW": "review"}.get(kind)
         if key:
             counts[key] += 1
     # scope_name and date_str are sanitized defensively so this helper is safe
@@ -59,6 +59,7 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
         f"  needs_action: {counts['needs_action']}\n"
         f"  stale: {counts['stale']}\n"
         f"  active: {counts['active']}\n"
+        f"  review: {counts['review']}\n"
         f"applied: {applied}\n"
         f"cascaded: {cascaded}\n"
         "tags:\n"
@@ -70,7 +71,7 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
 
 def _body(scope_name, date_str, window_days, raw_count, group_count,
           classifications, applied, cascaded, merges):
-    by_kind = {"DONE": [], "NEEDS-ACTION": [], "STALE": [], "ACTIVE": []}
+    by_kind = {"DONE": [], "NEEDS-ACTION": [], "STALE": [], "ACTIVE": [], "REVIEW": []}
     for c in classifications:
         by_kind.setdefault(c.get("classification", "ACTIVE"), []).append(c)
 
@@ -80,7 +81,8 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
         f"Window {window_days}d. {raw_count} raw items collapsed to "
         f"{group_count} groups after dedup. "
         f"{len(by_kind['DONE'])} DONE, {len(by_kind['NEEDS-ACTION'])} NEEDS-ACTION, "
-        f"{len(by_kind['STALE'])} STALE, {len(by_kind['ACTIVE'])} ACTIVE. "
+        f"{len(by_kind['STALE'])} STALE, {len(by_kind['ACTIVE'])} ACTIVE, "
+        f"{len(by_kind['REVIEW'])} REVIEW. "
         f"{applied} applied, {cascaded} cascaded."
     )
     parts.append("")
@@ -88,15 +90,25 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     parts.append(f"## Done ({applied} applied of {len(by_kind['DONE'])} classified)")
     for c in by_kind["DONE"]:
         parts.append(f"- [x] {c.get('canonical_text', '')}")
-        parts.append(f"  - Evidence: {c.get('evidence_citation', 'n/a')}")
+        parts.append(f"  - Evidence: {c.get('evidence_citation') or 'n/a'}")
     parts.append("")
 
     parts.append(f"## Needs-Action ({len(by_kind['NEEDS-ACTION'])} surfaced, not applied)")
     for c in by_kind["NEEDS-ACTION"]:
         parts.append(f"- [ ] {c.get('canonical_text', '')}")
-        parts.append(f"  - Evidence: {c.get('evidence_citation', 'n/a')}")
+        parts.append(f"  - Evidence: {c.get('evidence_citation') or 'n/a'}")
         if c.get("action_required"):
             parts.append(f"  - Action: `{c['action_required']}`")
+    parts.append("")
+
+    # REVIEW: names a shipped-looking component/branch/feature but has no
+    # citable anchor — surfaced for human judgement, never auto-checked
+    # (#264 Task 1). Always rendered here regardless of --show-all; unlike
+    # ACTIVE its evidence_citation is never scrubbed upstream.
+    parts.append(f"## Review ({len(by_kind['REVIEW'])} needs a human look, not applied)")
+    for c in by_kind["REVIEW"]:
+        parts.append(f"- [ ] {c.get('canonical_text', '')}")
+        parts.append(f"  - Weak signal: {c.get('evidence_citation') or 'n/a'}")
     parts.append("")
 
     parts.append(f"## Stale ({len(by_kind['STALE'])} — hidden without --show-all)")

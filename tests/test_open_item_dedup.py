@@ -20,6 +20,8 @@ from open_item_dedup import (
     batch_cascade_checkoff,
     cascade_group_members,
     verify_before_edit,
+    assign_tier,
+    partition_for_review,
 )
 
 
@@ -1245,3 +1247,385 @@ def test_anchor_long_input_is_capped_fast():
 
     # Two DIFFERENT >2000-char strings take the equality path -> False.
     assert anchor_text_matches("a" * 5_000, "b" * 5_000) is False
+
+
+# ---------------------------------------------------------------------------
+# REVIEW classification routing (#264 Task 1)
+# ---------------------------------------------------------------------------
+
+def test_partition_for_review_puts_review_in_visible_bucket():
+    """A REVIEW-classified group must land in the visible `review` list, not
+    `dashboard_only` — it needs human eyes, unlike silent ACTIVE/STALE.
+
+    Real failure case (#264): 'Return to `feature/pull-to-refresh-v2`
+    worktree to complete Task 7 (documentation) and merge feature PR' — no
+    #N anchor, shipped via PR #48/tag v2.0.0, branch deleted — must surface
+    here instead of landing in the hidden ACTIVE bucket.
+    """
+    classifications = [
+        {"group_id": "g1", "classification": "REVIEW", "confidence": "LOW",
+         "canonical_text": "Return to `feature/pull-to-refresh-v2` worktree "
+                            "to complete Task 7 (documentation) and merge feature PR",
+         "evidence_citation": "similarly-named branch feature/pull-to-refresh-v2 (deleted)",
+         "action_required": None},
+    ]
+    out = partition_for_review(classifications, show_all=False)
+    review_ids = {item["group_id"] for item in out["review"]}
+    assert "g1" in review_ids
+    assert all(d["group_id"] != "g1" for d in out["dashboard_only"])
+
+
+def test_partition_for_review_preserves_review_evidence_citation():
+    """Unlike ACTIVE (which is scrubbed to null before dashboard write),
+    REVIEW must keep its evidence_citation — it's the weak signal a human
+    needs to judge the item."""
+    classifications = [
+        {"group_id": "g1", "classification": "REVIEW", "confidence": "LOW",
+         "canonical_text": "Return to feature/pull-to-refresh-v2 worktree",
+         "evidence_citation": "similarly-named branch feature/pull-to-refresh-v2 (deleted)",
+         "action_required": None},
+    ]
+    out = partition_for_review(classifications, show_all=False)
+    review_item = next(i for i in out["review"] if i["group_id"] == "g1")
+    assert review_item["evidence_citation"] == (
+        "similarly-named branch feature/pull-to-refresh-v2 (deleted)"
+    )
+
+
+def test_partition_for_review_review_present_regardless_of_show_all():
+    """REVIEW is always visible — show_all only affects STALE, not REVIEW."""
+    classifications = [
+        {"group_id": "g1", "classification": "REVIEW", "confidence": "LOW",
+         "canonical_text": "w", "evidence_citation": "weak signal",
+         "action_required": None},
+    ]
+    default = partition_for_review(classifications, show_all=False)
+    expanded = partition_for_review(classifications, show_all=True)
+    assert {i["group_id"] for i in default["review"]} == {"g1"}
+    assert {i["group_id"] for i in expanded["review"]} == {"g1"}
+
+
+def test_assign_tier_review_never_high_even_with_literal_ref_overlap():
+    """A REVIEW classification is inherently uncertain — assign_tier must
+    cap it at MED, never HIGH, even in the contrived case where the weak
+    evidence_citation happens to contain a literal ref that also appears in
+    item_text (the LLM classifier path can, in principle, cite a ref while
+    still being unsure and choosing REVIEW over DONE)."""
+    citation = "similarly-named tag v2.0.0 (unconfirmed)"
+    text = "Ship the v2.0.0 polish pass"
+    # Sanity: the same inputs WOULD be HIGH for a DONE/no-classification call.
+    assert assign_tier(citation, text) == "HIGH"
+    assert assign_tier(citation, text, "REVIEW") == "MED"
+
+
+def test_assign_tier_review_defaults_low_with_no_citation():
+    """REVIEW with no evidence_citation (the common synthetic-path case)
+    stays LOW, same as any other classification with no citation."""
+    assert assign_tier(None, "Return to feature/x worktree", "REVIEW") == "LOW"
+
+
+# ---------------------------------------------------------------------------
+# Widen git ground truth: tags + changed_paths evidence (#264 Task 2)
+# ---------------------------------------------------------------------------
+#
+# deep_analysis_pipeline() gathers per-project evidence via subprocess.run
+# (git log, gh release/pr/issue list). #264's real failure case (the
+# `feature/pull-to-refresh-v2` item, shipped via PR #48 + tag v2.0.0 but
+# phrased with no #N anchor) showed the bug reporter had to verify by hand
+# with `git tag` and `git ls-tree` — ground truth that never reached the
+# classifier because deep_analysis_pipeline() never collected it. These
+# tests widen that collection with two new bounded, deduped evidence
+# sources (`tags`, `changed_paths`) and prove they can ground
+# has_classifiable_evidence() to True for a no-anchor item.
+
+import json as _json
+
+import open_item_dedup as oid
+from unittest.mock import patch, MagicMock
+
+from check_items_prefilter import has_classifiable_evidence
+
+
+def _fake_completed_oid(stdout="", returncode=0):
+    cp = MagicMock()
+    cp.stdout = stdout
+    cp.returncode = returncode
+    cp.stderr = ""
+    return cp
+
+
+def _make_fake_vault_index_oid(tmp_path):
+    vi = MagicMock()
+    vi.ensure_index.return_value = str(tmp_path / "vault.db")
+    vi.extract_keywords.return_value = []
+    vi.search_vault.return_value = []
+    return vi
+
+
+def _run_pipeline_with_fake_git(tmp_path, fake_run, db_name="test-vault.db"):
+    """Drive deep_analysis_pipeline() with subprocess.run + _resolve_project_paths
+    + vault_index mocked, mirroring tests/test_check_items_smart.py's pattern.
+    Returns (result_str, proj_evidence dict for 'myproject')."""
+    repo_dir = tmp_path / "fake-repo"
+    repo_dir.mkdir(exist_ok=True)
+    output_path = str(tmp_path / "pipeline-out.json")
+    vault_path = str(tmp_path)
+    sessions_folder = "sessions"
+    insights_folder = "insights"
+    os.makedirs(str(tmp_path / sessions_folder), exist_ok=True)
+    os.makedirs(str(tmp_path / insights_folder), exist_ok=True)
+
+    fake_vi = _make_fake_vault_index_oid(tmp_path)
+
+    with patch("subprocess.run", side_effect=fake_run), \
+         patch.dict("sys.modules", {"vault_index": fake_vi}), \
+         patch.object(oid, "_resolve_project_paths", return_value={"myproject": str(repo_dir)}):
+
+        result = oid.deep_analysis_pipeline(
+            basenames=[],
+            projects_json=_json.dumps(["myproject"]),
+            output_path=output_path,
+            vault_path=vault_path,
+            sessions_folder=sessions_folder,
+            insights_folder=insights_folder,
+            db_path=str(tmp_path / db_name),
+        )
+
+    with open(output_path, encoding="utf-8") as f:
+        data = _json.load(f)
+    proj_evidence = data.get("evidence", {}).get("myproject", {})
+    return result, proj_evidence
+
+
+def test_deep_analysis_pipeline_collects_tags_and_changed_paths(tmp_path):
+    """proj_evidence must carry a bounded `tags` list (git tag --list) and a
+    bounded, deduped `changed_paths` list (git log --name-only) alongside the
+    existing commits/merged_prs/closed_issues/releases evidence."""
+
+    def fake_run(cmd, *args, **kwargs):
+        if not isinstance(cmd, list):
+            cmd = cmd.split()
+        if cmd[:2] == ["git", "tag"]:
+            return _fake_completed_oid("v2.0.0\nv1.9.0\n")
+        if cmd[:2] == ["git", "log"] and "--name-only" in cmd:
+            return _fake_completed_oid(
+                "src/pull_to_refresh.py\ndocs/pull-to-refresh.md\n"
+            )
+        if cmd[:2] == ["git", "log"]:
+            return _fake_completed_oid("abc1234 feat: test\n")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return _fake_completed_oid(_json.dumps([]))
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return _fake_completed_oid(_json.dumps([]))
+        if cmd[:2] == ["gh", "release"]:
+            return _fake_completed_oid("")
+        return _fake_completed_oid("")
+
+    result, proj_evidence = _run_pipeline_with_fake_git(tmp_path, fake_run)
+
+    assert result.startswith("OK:"), f"pipeline returned error: {result}"
+    assert "tags" in proj_evidence, f"tags missing from evidence: {list(proj_evidence.keys())}"
+    assert "changed_paths" in proj_evidence, (
+        f"changed_paths missing from evidence: {list(proj_evidence.keys())}"
+    )
+    assert proj_evidence["tags"] == ["v2.0.0", "v1.9.0"]
+    assert proj_evidence["changed_paths"] == [
+        "src/pull_to_refresh.py", "docs/pull-to-refresh.md",
+    ]
+
+
+def test_deep_analysis_pipeline_tags_and_paths_are_capped_and_deduped(tmp_path):
+    """Boundedness: a repo with many tags/changed paths (with duplicates) must
+    collect a CAPPED, DEDUPED set — never an unbounded git-output dump."""
+
+    many_tags = "\n".join(f"v0.{i}.0" for i in range(50))  # 50 unique tags
+    # 250 changed-path lines with heavy duplication (only 220 unique)
+    many_paths = "\n".join(f"src/file_{i % 220}.py" for i in range(250))
+
+    def fake_run(cmd, *args, **kwargs):
+        if not isinstance(cmd, list):
+            cmd = cmd.split()
+        if cmd[:2] == ["git", "tag"]:
+            return _fake_completed_oid(many_tags + "\n")
+        if cmd[:2] == ["git", "log"] and "--name-only" in cmd:
+            return _fake_completed_oid(many_paths + "\n")
+        if cmd[:2] == ["git", "log"]:
+            return _fake_completed_oid("abc1234 feat: test\n")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return _fake_completed_oid(_json.dumps([]))
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return _fake_completed_oid(_json.dumps([]))
+        if cmd[:2] == ["gh", "release"]:
+            return _fake_completed_oid("")
+        return _fake_completed_oid("")
+
+    result, proj_evidence = _run_pipeline_with_fake_git(
+        tmp_path, fake_run, db_name="test-vault-cap.db",
+    )
+
+    assert result.startswith("OK:")
+    tags = proj_evidence.get("tags", [])
+    paths = proj_evidence.get("changed_paths", [])
+
+    # Non-vacuous: the fixture supplies 50 tags / 220 unique paths, so an
+    # unimplemented (missing-key) baseline must fail these first two asserts.
+    assert tags, "tags must be collected (non-empty) from the fixture's 50 tags"
+    assert paths, "changed_paths must be collected (non-empty) from the fixture's paths"
+
+    assert len(tags) <= 20, f"tags must be capped to <=20, got {len(tags)}"
+    assert len(tags) == len(set(tags)), "tags must be deduped"
+
+    assert len(paths) <= 200, f"changed_paths must be capped to <=200, got {len(paths)}"
+    assert len(paths) == len(set(paths)), "changed_paths must be deduped"
+
+
+def test_deep_analysis_pipeline_tags_and_paths_degrade_on_git_absence(tmp_path):
+    """git missing (FileNotFoundError/OSError) for tag/log --name-only must
+    degrade tags/changed_paths to [] — never raise, never crash the pipeline."""
+
+    def fake_run(cmd, *args, **kwargs):
+        if not isinstance(cmd, list):
+            cmd = cmd.split()
+        if cmd[:2] == ["git", "tag"]:
+            raise FileNotFoundError("git: command not found")
+        if cmd[:2] == ["git", "log"] and "--name-only" in cmd:
+            raise FileNotFoundError("git: command not found")
+        if cmd[:2] == ["git", "log"]:
+            return _fake_completed_oid("abc1234 feat: test\n")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return _fake_completed_oid(_json.dumps([]))
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return _fake_completed_oid(_json.dumps([]))
+        if cmd[:2] == ["gh", "release"]:
+            return _fake_completed_oid("")
+        return _fake_completed_oid("")
+
+    result, proj_evidence = _run_pipeline_with_fake_git(
+        tmp_path, fake_run, db_name="test-vault-absence.db",
+    )
+
+    assert result.startswith("OK:"), f"pipeline must not crash on git absence: {result}"
+    # Strict: must be the explicit empty list (same degrade-to-[] contract as
+    # merged_prs/closed_issues), not merely "key absent" -- a missing key is
+    # indistinguishable from "never implemented" and would let this pass
+    # vacuously on unmodified code.
+    assert proj_evidence.get("tags") == [], (
+        f"tags must degrade to [] on git absence, got: {proj_evidence.get('tags')!r}"
+    )
+    assert proj_evidence.get("changed_paths") == [], (
+        f"changed_paths must degrade to [] on git absence, got: "
+        f"{proj_evidence.get('changed_paths')!r}"
+    )
+
+
+def test_deep_analysis_pipeline_tags_and_paths_degrade_on_nonzero_rc_and_timeout(tmp_path):
+    """git tag returns non-zero rc; git log --name-only times out. Both must
+    degrade to [] (or absent) without raising, matching the existing
+    commits/merged_prs/closed_issues guard pattern exactly."""
+    import subprocess as sp
+
+    def fake_run(cmd, *args, **kwargs):
+        if not isinstance(cmd, list):
+            cmd = cmd.split()
+        if cmd[:2] == ["git", "tag"]:
+            return _fake_completed_oid("", returncode=1)
+        if cmd[:2] == ["git", "log"] and "--name-only" in cmd:
+            raise sp.TimeoutExpired(cmd, 10)
+        if cmd[:2] == ["git", "log"]:
+            return _fake_completed_oid("abc1234 feat: test\n")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return _fake_completed_oid(_json.dumps([]))
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return _fake_completed_oid(_json.dumps([]))
+        if cmd[:2] == ["gh", "release"]:
+            return _fake_completed_oid("")
+        return _fake_completed_oid("")
+
+    result, proj_evidence = _run_pipeline_with_fake_git(
+        tmp_path, fake_run, db_name="test-vault-rc-timeout.db",
+    )
+
+    assert result.startswith("OK:")
+    assert proj_evidence.get("tags") == [], (
+        f"tags must degrade to [] on non-zero rc, got: {proj_evidence.get('tags')!r}"
+    )
+    assert proj_evidence.get("changed_paths") == [], (
+        f"changed_paths must degrade to [] on timeout, got: "
+        f"{proj_evidence.get('changed_paths')!r}"
+    )
+
+
+def test_tags_and_changed_paths_ground_no_anchor_item_to_done_eligible():
+    """The actual #264 acceptance: a no-anchor open item naming a component
+    (e.g. `pull-to-refresh`) with NO #N/PR ref and NO merged_prs/closed_issues/
+    releases/changelog overlap must still reach `has_classifiable_evidence() ==
+    True` when the only ground truth is a git TAG and/or a changed PATH
+    containing that token — grounding it for the sub-agent to potentially
+    auto-close as DONE, instead of falling through to the synthetic
+    REVIEW/ACTIVE fallback.
+    """
+    from open_item_dedup import fold_tags_and_paths_into_completion_zone
+
+    # Distinctive token here is the CamelCase component name `PullToRefresh`
+    # (interior-mixed-case per check_items_prefilter._is_distinctive) — the
+    # hyphenated branch name `pull-to-refresh-v2` itself tokenizes into
+    # generic sub-8-char words (pull/refresh) that are NOT individually
+    # distinctive, matching the real #264 case where the branch name alone
+    # couldn't anchor the item; the component name is what grounds it.
+    group = {
+        "representative": (
+            "Return to `feature/pull-to-refresh-v2` worktree to finish "
+            "PullToRefresh docs and merge feature PR"
+        ),
+    }
+
+    # No anchor, no completion-zone overlap at all yet (the pre-#264-Task-2
+    # baseline): has_classifiable_evidence must be False here.
+    base_zone = {
+        "commits_text": "",
+        "merged_prs_text": "",
+        "closed_issues_text": "",
+        "releases_text": "",
+        "changelog_excerpt": "",
+        "fts_mentions_text": "",
+    }
+    assert has_classifiable_evidence(group, base_zone) is False
+
+    # Case 1: only a git TAG contains the distinctive token.
+    proj_evidence_tag_only = {
+        "tags": ["v2.0.0-PullToRefresh"],
+        "changed_paths": [],
+    }
+    zone = fold_tags_and_paths_into_completion_zone(base_zone, proj_evidence_tag_only)
+    assert has_classifiable_evidence(group, zone) is True
+
+    # Case 2: only a changed file PATH contains the distinctive token.
+    proj_evidence_path_only = {
+        "tags": [],
+        "changed_paths": ["src/features/PullToRefresh/index.tsx"],
+    }
+    zone = fold_tags_and_paths_into_completion_zone(base_zone, proj_evidence_path_only)
+    assert has_classifiable_evidence(group, zone) is True
+
+
+def test_fold_tags_and_paths_does_not_mutate_input_zone_text():
+    """fold_tags_and_paths_into_completion_zone must return a NEW dict, never
+    mutate the caller's zone_text in place (it may be reused/cached elsewhere)."""
+    from open_item_dedup import fold_tags_and_paths_into_completion_zone
+
+    zone = {"releases_text": "", "changelog_excerpt": ""}
+    zone_before = dict(zone)
+    fold_tags_and_paths_into_completion_zone(
+        zone, {"tags": ["v9.9.9"], "changed_paths": ["a/b.py"]},
+    )
+    assert zone == zone_before
+
+
+def test_fold_tags_and_paths_noop_when_no_tags_or_paths():
+    """No tags/changed_paths collected (e.g. git absent) -> zone_text passes
+    through unchanged; no spurious tokens injected."""
+    from open_item_dedup import fold_tags_and_paths_into_completion_zone
+
+    zone = {"releases_text": "v1.0.0", "changelog_excerpt": "notes"}
+    out = fold_tags_and_paths_into_completion_zone(zone, {})
+    assert out == zone

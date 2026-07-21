@@ -135,10 +135,13 @@ def _make_group_with_mtime(canonical_text: str, mtime: float) -> dict:
 
 
 def test_synthetic_young_item_is_active():
-    """Item first seen 30 days ago (<=90d) → ACTIVE/LOW."""
+    """Item first seen 30 days ago (<=90d), with NO distinctive token in its
+    text, → ACTIVE/LOW. (Text deliberately avoids distinctive tokens — see
+    #264 Task 1: a distinctive-token item in this same age window now yields
+    REVIEW instead, exercised separately below.)"""
     from check_items_prefilter import synthetic_classification
     mtime_30d_ago = _time.time() - (30 * 86400)
-    group = _make_group_with_mtime("Investigate dispatcher discovery", mtime_30d_ago)
+    group = _make_group_with_mtime("Look at this thing again", mtime_30d_ago)
     result = synthetic_classification(group)
     assert result["classification"] == "ACTIVE"
     assert result["confidence"] == "LOW"
@@ -213,10 +216,13 @@ def test_synthetic_record_has_canonical_text():
 
 
 def test_synthetic_classification_now_injection_active():
-    """Fixed clock — ACTIVE branch. Exercises the `now=` injection path."""
+    """Fixed clock — ACTIVE branch. Exercises the `now=` injection path.
+
+    Text deliberately has no distinctive token (see #264 Task 1) so this
+    isolates the age-boundary behavior from the new REVIEW branch."""
     from check_items_prefilter import synthetic_classification
     mtime = 1_000_000.0
-    group = _make_group_with_mtime("Investigate dispatcher discovery", mtime)
+    group = _make_group_with_mtime("Look at this thing again", mtime)
     # 30 days after mtime → ACTIVE
     result = synthetic_classification(group, now=mtime + 30 * 86_400)
     assert result["classification"] == "ACTIVE"
@@ -231,6 +237,130 @@ def test_synthetic_classification_now_injection_stale():
     group = _make_group_with_mtime("Fix ancient configuration bug", mtime)
     # 100 days after mtime → STALE
     result = synthetic_classification(group, now=mtime + 100 * 86_400)
+    assert result["classification"] == "STALE"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+
+
+# ---------------------------------------------------------------------------
+# REVIEW routing (#264 Task 1 — "surfacing half" of the unanchored-checkbox fix)
+# ---------------------------------------------------------------------------
+
+def test_synthetic_distinctive_token_young_item_is_review():
+    """Adversarial fixture from the real failure case (#264): an item naming
+    a shipped-looking branch with no #N/PR anchor and no evidence overlap
+    must be surfaced for REVIEW, not silently buried ACTIVE.
+
+    Real failure: '- [ ] Return to `feature/pull-to-refresh-v2` worktree to
+    complete Task 7 (documentation) and merge feature PR' — no #N, shipped
+    via PR #48/tag v2.0.0, branch deleted — landed in silent ACTIVE.
+
+    Note: the branch name itself is NOT what makes this text distinctive —
+    `_content_tokens` splits `feature/pull-to-refresh-v2` on non-word
+    characters into `feature`, `pull`, `refresh` (each too short/generic),
+    with `v2` dropped as len<=2. The REVIEW verdict here is actually
+    triggered by the plain >=8-char generic words `worktree` and
+    `documentation` clearing `_DISTINCTIVE_MIN_LEN` — see
+    test_synthetic_camelcase_component_young_item_is_review below for a
+    fixture where a genuine CamelCase component name is the trigger.
+    """
+    from check_items_prefilter import synthetic_classification
+    mtime_30d_ago = _time.time() - (30 * 86400)
+    group = _make_group_with_mtime(
+        "Return to `feature/pull-to-refresh-v2` worktree to complete Task 7 "
+        "(documentation) and merge feature PR",
+        mtime_30d_ago,
+    )
+    result = synthetic_classification(group)
+    assert result["classification"] == "REVIEW"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+    assert result["evidence_citation"] is None
+    assert result["group_id"] == "test-synth-01"
+
+
+def test_synthetic_camelcase_component_young_item_is_review():
+    """Pins #264's core intent directly: an item naming a genuine
+    CamelCase component (not merely incidental long generic words, as in
+    test_synthetic_distinctive_token_young_item_is_review above) with no
+    anchor and no evidence overlap must be surfaced for REVIEW rather than
+    silently buried ACTIVE.
+
+    Every other word in the text is short/generic (`Ship`, `the`, `chip`) —
+    `PullToRefresh` is the SOLE distinctive token, and it qualifies via
+    `_is_distinctive`'s interior-mixed-case rule (it also happens to clear
+    the >=8-char length rule, which is expected: real component names are
+    usually both — the point is it names a *component*, unlike the generic
+    English words `worktree`/`documentation` in the fixture above)."""
+    from check_items_prefilter import synthetic_classification
+    mtime_30d_ago = _time.time() - (30 * 86400)
+    group = _make_group_with_mtime("Ship the PullToRefresh chip", mtime_30d_ago)
+    result = synthetic_classification(group)
+    assert result["classification"] == "REVIEW"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+    assert result["evidence_citation"] is None
+
+
+def test_synthetic_no_distinctive_token_young_item_still_active():
+    """Regression: a vague item with NO distinctive token still yields
+    ACTIVE (<=90d) — REVIEW only fires when a distinctive token is present."""
+    from check_items_prefilter import synthetic_classification
+    mtime_30d_ago = _time.time() - (30 * 86400)
+    group = _make_group_with_mtime("clean up the code", mtime_30d_ago)
+    result = synthetic_classification(group)
+    assert result["classification"] == "ACTIVE"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+
+
+def test_synthetic_distinctive_token_old_item_still_stale():
+    """Regression: an item older than the STALE threshold (>90d) stays STALE
+    even when it contains a distinctive token — REVIEW never overrides an
+    already-STALE age classification."""
+    from check_items_prefilter import synthetic_classification
+    mtime_100d_ago = _time.time() - (100 * 86400)
+    group = _make_group_with_mtime(
+        "Return to `feature/pull-to-refresh-v2` worktree to finish docs",
+        mtime_100d_ago,
+    )
+    result = synthetic_classification(group)
+    assert result["classification"] == "STALE"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+
+
+def test_synthetic_classification_exact_90_day_boundary_is_review():
+    """Pin the exact STALE boundary at `age_secs > _STALE_THRESHOLD_SECS`
+    (strictly greater-than). At age == threshold exactly, `age_secs >
+    _STALE_THRESHOLD_SECS` is False, so the item falls into the <=90d branch.
+    Item text carries a distinctive token so that branch resolves to REVIEW
+    (not ACTIVE), giving this test a distinct, non-default classification to
+    assert on — a `>=` regression would misclassify this exact-boundary case
+    as STALE."""
+    from check_items_prefilter import synthetic_classification, _STALE_THRESHOLD_SECS
+    mtime = 1_000_000.0
+    group = _make_group_with_mtime(
+        "Investigate the outstanding synchronization backlog", mtime,
+    )
+    result = synthetic_classification(group, now=mtime + _STALE_THRESHOLD_SECS)
+    assert result["classification"] == "REVIEW"
+    assert result["confidence"] == "LOW"
+    assert result["prefiltered"] is True
+
+
+def test_synthetic_classification_one_second_over_90_day_boundary_is_stale():
+    """Companion to the exact-boundary test above: one second past the
+    threshold, `age_secs > _STALE_THRESHOLD_SECS` is True → STALE, even
+    though the text carries the same distinctive token that would otherwise
+    route to REVIEW — age-based STALE always wins (see decision matrix in
+    synthetic_classification's docstring)."""
+    from check_items_prefilter import synthetic_classification, _STALE_THRESHOLD_SECS
+    mtime = 1_000_000.0
+    group = _make_group_with_mtime(
+        "Investigate the outstanding synchronization backlog", mtime,
+    )
+    result = synthetic_classification(group, now=mtime + _STALE_THRESHOLD_SECS + 1)
     assert result["classification"] == "STALE"
     assert result["confidence"] == "LOW"
     assert result["prefiltered"] is True
@@ -345,9 +475,12 @@ def test_mtime_threading_new_file_classifies_active(tmp_path):
     (epoch) and every item was STALE regardless of file age. This test
     proves the ACTIVE branch is reachable once _safe_mtime(fpath) is
     wired in at group_members construction.
+
+    Text deliberately has no distinctive token (#264 Task 1) so this test
+    keeps isolating mtime-threading from the new REVIEW branch.
     """
     from check_items_prefilter import synthetic_classification
-    group = _build_group_from_real_files(tmp_path, "Investigate new feature discovery", old=False)
+    group = _build_group_from_real_files(tmp_path, "Look at this thing again", old=False)
     result = synthetic_classification(group)
     assert result["classification"] == "ACTIVE", (
         f"Expected ACTIVE for 20-day-old file mtime; got {result['classification']!r}. "
@@ -364,10 +497,14 @@ def test_mtime_threading_old_and_new_files_differ(tmp_path):
     Regression guard: ensures both branches are independently exercised.
     If either file's mtime were missing (→ 0 → epoch → STALE), the new
     file would incorrectly be STALE and this assertion would fail.
+
+    new_group's text deliberately has no distinctive token (#264 Task 1) so
+    the ACTIVE assertion below isolates mtime-threading from the new
+    REVIEW branch.
     """
     from check_items_prefilter import synthetic_classification
     old_group = _build_group_from_real_files(tmp_path, "Fix ancient configuration bug", old=True)
-    new_group = _build_group_from_real_files(tmp_path, "Ship new dashboard feature", old=False)
+    new_group = _build_group_from_real_files(tmp_path, "Look over this again soon", old=False)
     old_result = synthetic_classification(old_group)
     new_result = synthetic_classification(new_group)
     assert old_result["classification"] == "STALE"

@@ -6,7 +6,7 @@ get_theme_member_previews, and get_unassigned_notes_in_window.
 import os
 import sqlite3
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import json
 
@@ -17,8 +17,12 @@ import emerge_cli  # noqa: E402
 import themes  # noqa: E402
 import vault_index  # noqa: E402
 
-NOW = "2026-06-15T00:00:00+00:00"
-NOW_D = date(2026, 6, 15)
+# Anchored to the real UTC "today" (not a frozen calendar date) so fixture
+# theme/member dates stay correctly inside/outside the 30-day window that
+# emerge_cli.run_emerge_themes computes from the REAL datetime.now(timezone.utc)
+# — a hardcoded NOW_D rots as real time advances past it (#264).
+NOW_D = datetime.now(timezone.utc).date()
+NOW = datetime.combine(NOW_D, datetime.min.time(), tzinfo=timezone.utc).isoformat()
 
 
 @pytest.fixture
@@ -53,7 +57,8 @@ def _mk_note(conn, path, project, title, body, ndate, vec='{"x":1.0}', ntype="se
 
 def test_recompute_activation_exact(db):
     conn = vault_index._connect(db)
-    _mk(conn, 1, "p", [("a.md", "2026-06-15"), ("b.md", "2026-06-15"), ("c.md", "2026-06-15")])
+    d0 = NOW_D.isoformat()
+    _mk(conn, 1, "p", [("a.md", d0), ("b.md", d0), ("c.md", d0)])
     d30 = (NOW_D - timedelta(days=30)).isoformat()
     d60 = (NOW_D - timedelta(days=60)).isoformat()
     _mk(conn, 2, "p", [("x.md", d30)])
@@ -110,7 +115,7 @@ def test_recompute_activation_skips_bad_added_date():
     # guard, the 'garbage' parse raised ValueError uncaught (only the bare->time
     # retry was caught) and the None parse raised TypeError uncaught.
     member_rows = [
-        (1, "2026-06-15"),  # theme 1: one good member today
+        (1, NOW_D.isoformat()),  # theme 1: one good member today
         (1, "garbage"),     # theme 1: ValueError on parse -> skip
         (1, None),          # theme 1: TypeError on parse -> skip
         (2, (NOW_D - timedelta(days=30)).isoformat()),  # theme 2: one half-life

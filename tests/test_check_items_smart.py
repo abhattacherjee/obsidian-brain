@@ -772,7 +772,7 @@ def test_classifier_prompt_includes_self_referential_rule():
     p = cli.CLASSIFIER_PROMPT
     assert "discovery" in p.lower() and "fix" in p.lower()
     assert "prefer ACTIVE" in p or "prefer ACTIVE." in p
-    for c in ("DONE", "NEEDS-ACTION", "STALE", "ACTIVE"):
+    for c in ("DONE", "NEEDS-ACTION", "STALE", "ACTIVE", "REVIEW"):
         assert c in p, f"prompt missing classification: {c}"
     assert "STRICT JSON" in p or "strict JSON" in p.lower()
     for field in ("group_id", "classification", "confidence",
@@ -1434,6 +1434,35 @@ def test_dashboard_body_includes_merged_groups_audit(tmp_path):
     assert "gh issue close 534" in body
     assert "Old TODO" in body
     assert "Still open" in body
+
+
+def test_dashboard_body_includes_review_section(tmp_path):
+    """REVIEW items must be visible in the persisted dashboard report — this
+    is the actual "surfaced VISIBLY" contract from #264. Without this, a
+    REVIEW classification would look correct in the live Step-7 print but
+    silently vanish from the file that gets left behind for the user."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "REVIEW",
+         "canonical_text": "Return to feature/pull-to-refresh-v2 worktree "
+                            "to complete Task 7 and merge feature PR",
+         "evidence_citation": "similarly-named branch feature/pull-to-refresh-v2 (deleted)",
+         "action_required": None},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="obsidian-brain", date_str="2026-05-11",
+        window_days=14, raw_count=1, group_count=1,
+        classifications=classifications,
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    content = open(path).read()
+    assert "pull-to-refresh-v2" in content
+    assert "review: 1" in content
+    # REVIEW must never be auto-checked — it always renders as an open box.
+    assert "- [ ] Return to feature/pull-to-refresh-v2" in content
 
 
 def test_dashboard_idempotent_overwrite(tmp_path):

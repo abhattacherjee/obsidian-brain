@@ -57,7 +57,7 @@ _REQUIRED_CLASSIFIER_FIELDS = {
     "group_id", "classification", "confidence",
     "canonical_text", "evidence_citation", "action_required",
 }
-_VALID_CLASSIFICATIONS = frozenset({"DONE", "NEEDS-ACTION", "STALE", "ACTIVE"})
+_VALID_CLASSIFICATIONS = frozenset({"DONE", "NEEDS-ACTION", "STALE", "ACTIVE", "REVIEW"})
 
 
 def _validate_classifier_payload(parsed) -> bool:
@@ -262,7 +262,7 @@ CLASSIFIER_PROMPT = """You are the classifier sub-agent for /check-items. Read t
 ## Your job
 
 For each group, decide whether the action it describes is DONE,
-NEEDS-ACTION, STALE, or ACTIVE. Cite the specific evidence you used.
+NEEDS-ACTION, STALE, ACTIVE, or REVIEW. Cite the specific evidence you used.
 
 ## Classification semantics
 
@@ -277,6 +277,12 @@ NEEDS-ACTION, STALE, or ACTIVE. Cite the specific evidence you used.
   LOW confidence by default.
 - ACTIVE — you did not find sufficient evidence to close. Set
   `evidence_citation` to null.
+- REVIEW — the item names a shipped-looking component, feature, or
+  branch, but you found no citable issue/PR/commit/title to confirm
+  completion. You are uncertain. Surface it for the user to judge; do
+  NOT guess DONE and do NOT bury it as ACTIVE. LOW confidence. Set
+  evidence_citation to the closest weak signal (e.g. a similarly-named
+  branch/tag/path) or null.
 
 ## Self-referential evidence rule (CRITICAL)
 
@@ -291,6 +297,13 @@ Discovery evidence is NOT completion evidence. Examples:
 - Item: "Close GitHub issue #534"
 - Evidence: "PR #534 merged as abc1234 on 2026-04-24."
 - -> DONE. The fix-merge is cited directly.
+
+Precedence vs REVIEW: "prefer ACTIVE" above is the default for items that
+name nothing shipped-looking. If the item NAMES a shipped-looking
+component, feature, or branch (see REVIEW above) and the only evidence is
+self-referential/discovery-only — you cannot confirm completion — prefer
+REVIEW instead of ACTIVE. Do not bury it as ACTIVE just because the
+evidence is discovery-only.
 
 ## Anti-conflation rule
 
@@ -307,7 +320,7 @@ JSON to <output-json-path>.
 [
   {
     "group_id": "ob-NNNN",
-    "classification": "DONE | NEEDS-ACTION | STALE | ACTIVE",
+    "classification": "DONE | NEEDS-ACTION | STALE | ACTIVE | REVIEW",
     "confidence": "HIGH | MED | LOW",
     "canonical_text": "<short canonical phrasing of the action>",
     "evidence_citation": "<specific commit sha / PR# / issue# / release / note ref, OR null>",
@@ -396,7 +409,7 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
                 return " ".join(str(k) for k in val)
             return str(val)
 
-        return {
+        zone_text = {
             "commits_text": _to_text(proj.get("commits")),
             "merged_prs_text": _to_text(proj.get("merged_prs")),
             "closed_issues_text": _to_text(proj.get("closed_issues")),
@@ -404,6 +417,17 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
             "changelog_excerpt": _strip_unreleased_section(proj.get("changelog_excerpt") or ""),
             "fts_mentions_text": _to_text(proj.get("fts_mentions")),
         }
+
+        # #264 Task 2 follow-up: fold the bounded/deduped `tags` and
+        # `changed_paths` git ground truth (collected by
+        # open_item_dedup.deep_analysis_pipeline) into the completion-zone
+        # text so has_classifiable_evidence() can see it. Without this, a
+        # no-anchor item whose only evidence is a git tag or a changed file
+        # path never reaches the sub-agent classifier. Degrades cleanly when
+        # `proj` carries no tags/changed_paths keys (helper treats missing as
+        # empty).
+        from open_item_dedup import fold_tags_and_paths_into_completion_zone
+        return fold_tags_and_paths_into_completion_zone(zone_text, proj)
 
     # Shape B: already _text-suffixed at top level (test fixtures / simplified payloads)
     _TEXT_KEYS = {"commits_text", "merged_prs_text", "closed_issues_text",

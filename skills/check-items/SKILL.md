@@ -477,11 +477,14 @@ classifications_path = os.environ["CLASSIFICATIONS_PATH"]
 scope = json.load(open(scope_path))
 data = json.load(open(classifications_path))
 for item in data["classifications"]:
-    item["tier"] = assign_tier(item.get("evidence_citation"), item.get("canonical_text"))
+    item["tier"] = assign_tier(item.get("evidence_citation"), item.get("canonical_text"),
+                                item.get("classification"))
 
 buckets = partition_for_review(data["classifications"], show_all=scope["show_all"])
 # Format: HIGH first, MED next, LOW (only if show_all). DONE preselected [x],
-# NEEDS-ACTION [ ] with action_required command surfaced.
+# NEEDS-ACTION [ ] with action_required command surfaced. REVIEW always [ ]
+# (never auto-checked — assign_tier caps REVIEW at MED, so it never sorts
+# into the HIGH+DONE preselected group either).
 print("\n=== Review ===", file=sys.stderr)
 for item in sorted(buckets["review"],
                    key=lambda x: ("HIGH MED LOW".split().index(x.get("tier", "LOW")),
@@ -739,7 +742,7 @@ PYEOF
 ✓ /check-items obsidian-brain (14d)
   Raw: 225  Groups: 40  Merged: 24
   Mode: semantic+classifier  Cached: 8 reused, 16 fresh
-  Result: 3 DONE (auto-checked), 2 NEEDS-ACTION (commands below), 19 ACTIVE (silent)
+  Result: 3 DONE (auto-checked), 2 NEEDS-ACTION (commands below), 4 REVIEW (needs a look), 19 ACTIVE (silent)
   Report: ~/Obsidian/claude-check-items/check-items-obsidian-brain-2026-05-11.md
   Cascaded: 2 sibling notes
 ```
