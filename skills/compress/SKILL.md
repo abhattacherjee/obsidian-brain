@@ -9,7 +9,7 @@ metadata:
 
 Analyze the current conversation, extract valuable insights, and save them as structured notes in the Obsidian vault. Supports both interactive multi-insight selection and targeted single-topic extraction.
 
-**Tools needed:** Bash, Write, Read, Edit
+**Tools needed:** Bash, Read
 
 ## Procedure
 

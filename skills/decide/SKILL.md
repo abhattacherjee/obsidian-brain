@@ -9,7 +9,7 @@ metadata:
 
 Capture architectural and technical decisions with full context as ADR-lite (Architecture Decision Record) notes in the Obsidian vault. Each decision records the context, options considered, rationale, and trade-offs accepted.
 
-**Tools needed:** Bash, Write, Read
+**Tools needed:** Bash, Read
 
 ## Procedure
 

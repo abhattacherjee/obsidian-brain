@@ -9,7 +9,7 @@ metadata:
 
 Analyze the current conversation for error -> investigation -> fix patterns, structure them as reusable troubleshooting notes, and save to the Obsidian vault.
 
-**Tools needed:** Bash, Write, Read
+**Tools needed:** Bash, Read
 
 ## Procedure
 

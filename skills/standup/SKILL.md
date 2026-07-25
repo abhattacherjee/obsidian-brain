@@ -9,7 +9,7 @@ metadata:
 
 Searches the Obsidian vault for session notes and insights within a date range, upgrades any unsummarized notes with AI summaries, groups findings by project, and generates a structured standup note.
 
-**Tools needed:** Bash, Grep, Read, Write
+**Tools needed:** Bash, Grep, Read
 
 ## Procedure
 
@@ -216,14 +216,47 @@ For each file in `UNSUMMARIZED`, if `upgrade_batch()` is unavailable or the prin
    - `## Errors Encountered` — Bulleted list with error messages, root causes, and fixes. If none, write "None."
    - `## Open Questions / Next Steps` — Checkbox list of specific, actionable items. If none, write "None."
 5. **Preserve the Session Metadata section** at the bottom if it exists.
-6. **Write the upgraded note** using the Write tool to the same file path. Structure:
+6. **Write the upgraded note** by running the note-writer CLI, piping the full rewritten file in on stdin — structured as:
    - Original frontmatter (unchanged)
    - `# <title from original note>`
    - The five summary sections
    - Session Metadata section (if it existed)
-7. Run `chmod 644 <filepath>` after writing.
 
-**Important:** Do NOT modify frontmatter. Do NOT change the filename. Do NOT add or remove tags.
+   This overwrites the note in place at its EXISTING path: pass `$SESSIONS_FOLDER` as the folder and the note's own basename (from `$NOTE_PATH`) as `<filename>` — never a new name. `write_vault_note()` (which the CLI delegates to) replaces an existing file atomically via the same temp-file + rename it uses to create one, so overwriting in place is a supported, safe case. **The heredoc delimiter `OB_NOTE_EOF` must stay quoted (`<<'OB_NOTE_EOF'`) — do not drop the quotes in a future edit.** An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the transcript content, silently corrupting the note:
+
+   ```bash
+   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+   HOOKS=$(python3 -c "import glob,os; print(max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), default='hooks'))")
+   python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$SESSIONS_FOLDER" "<existing basename>" <<'OB_NOTE_EOF'
+   ---
+   <original frontmatter, unchanged>
+   ---
+
+   # <title from original note>
+
+   ## Summary
+   ...
+
+   ## Key Decisions
+   ...
+
+   ## Changes Made
+   ...
+
+   ## Errors Encountered
+   ...
+
+   ## Open Questions / Next Steps
+   ...
+
+   ## Session Metadata
+   ...
+   OB_NOTE_EOF
+   ```
+
+   On success this prints `OK: <absolute path>` and the file is now at mode `0o600` (no separate `chmod` needed — the old `chmod 644` step is gone; this note is user data written by the plugin, same as every other CLI-written note). On failure it prints `ERROR: <reason>` to stderr and exits non-zero; treat this the same as an `upgrade_batch()` failure for this file — it stays at `status: auto-logged`, so a later `/standup` run will retry it.
+
+**Important:** Do NOT modify frontmatter. Do NOT change the filename. Do NOT add or remove tags. The content piped into the CLI above must satisfy all three — frontmatter copied verbatim, filename the note's existing basename, tags untouched.
 
 Move all upgraded files from `UNSUMMARIZED` into the working set alongside `SUMMARIZED`. Track the count of upgraded notes as `UPGRADED_COUNT`.
 

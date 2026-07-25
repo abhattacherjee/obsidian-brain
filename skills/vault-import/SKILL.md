@@ -9,7 +9,7 @@ metadata:
 
 Discover historical Claude Code sessions, summarize them via parallel sub-agents, and write structured session notes to the Obsidian vault. Skips sessions already present in the vault.
 
-**Tools needed:** Bash, Write, Read, Skill (for /context-shield sub-agents)
+**Tools needed:** Bash, Read, Skill (for /context-shield sub-agents)
 
 **Prerequisites:**
 - `/conversation-search` skill must be installed

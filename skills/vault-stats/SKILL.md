@@ -9,7 +9,7 @@ metadata:
 
 Shows vault-wide health metrics and current project usage analytics, then saves the report as a vault note for trend tracking.
 
-**Tools needed:** Bash, Write
+**Tools needed:** Bash
 
 ## Procedure
 

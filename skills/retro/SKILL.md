@@ -9,7 +9,7 @@ metadata:
 
 Analyze the current conversation candidly and save a structured retrospective to the Obsidian vault. The goal is honest reflection — not self-congratulation — so future sessions can improve.
 
-**Tools needed:** Bash, Write, Read
+**Tools needed:** Bash, Read
 
 ## Procedure
 
@@ -327,7 +327,7 @@ print(mark_retro_classification_pending(sys.argv[1], sys.argv[2]))
 
 ### Step 7.5 — Classify and file process improvements (DO THIS BEFORE Step 8)
 
-The retro is **not done** when the file is written. The literal next action after the `chmod 644` is to act on what the retro surfaced — **do not print the "saved" confirmation until this step is complete.** Step 7 armed a Stop-hook gate that blocks the turn from ending until you clear it here, so this is enforced, not merely advised.
+The retro is **not done** when the file is written. The literal next action after arming the classification gate is to act on what the retro surfaced — **do not print the "saved" confirmation until this step is complete.** Step 7 armed a Stop-hook gate that blocks the turn from ending until you clear it here, so this is enforced, not merely advised.
 
 1. **Extract** every item from the just-written **Process Improvements** and **Key Learnings** sections.
 2. **Classify** each item into exactly one bucket:
