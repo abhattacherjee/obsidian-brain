@@ -868,7 +868,12 @@ def test_append_update_appends_at_eof_when_no_marker_present(tmp_path):
     assert result.returncode == 0, result.stderr
     written = note.read_text(encoding="utf-8")
     assert written.rstrip("\n").endswith("New findings from today's session.")
-    assert "Body content here.\n" in written  # original content preserved
+    # The blank-line separator before an EOF-appended section is a real guard
+    # (`elif last_line.strip() != "": prefix += [eol]`) and had no assertion
+    # anywhere -- the rstrip() check above is blind to it, so the branch could
+    # be deleted with the whole suite green.
+    assert "Body content here.\n\n## Update (2026-07-25)" in written
+    assert "Body content here.\n## Update" not in written
 
 
 # ---------------------------------------------------------------------------
@@ -1865,9 +1870,18 @@ def test_run_append_update_in_process_eof_no_trailing_newline(tmp_path, capsys):
 def test_append_update_stdin_update_text_without_trailing_newline_gets_one(tmp_path):
     """`update_text` itself (the stdin payload) may not end with a newline
     -- the CLI must still terminate it properly rather than running the
-    trailing marker/EOF straight onto the update section's last line."""
+    trailing marker straight onto the update section's last line.
+
+    The fixture MUST have a trailing marker. With an EOF append, the `eol`
+    element in `prefix + [block_text, eol] + ...` supplies the newline on its
+    own, so an "ends with \\n" assertion is satisfied whether or not the
+    `block_text += eol` guard exists (verified: deleting the guard left the
+    old version of this test green). Only a following marker line makes the
+    difference observable -- separation, not mere termination."""
     vault = tmp_path / "vault"
-    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    note = _make_note(
+        vault, "claude-insights", "insight.md", BASIC_NOTE + "\n## Tool Usage\n- x\n"
+    )
     no_trailing_nl_update = "## Update (2026-07-25)\n\nNo trailing newline here."
     assert not no_trailing_nl_update.endswith("\n")
 
@@ -1875,22 +1889,31 @@ def test_append_update_stdin_update_text_without_trailing_newline_gets_one(tmp_p
 
     assert result.returncode == 0, result.stderr
     written = note.read_text(encoding="utf-8")
-    assert "No trailing newline here.\n" in written
+    assert "No trailing newline here.\n\n## Tool Usage" in written
+    assert "No trailing newline here.\n## Tool Usage" not in written
 
 
 def test_run_append_update_in_process_update_text_without_trailing_newline(tmp_path):
     """In-process counterpart of the subprocess test above -- a subprocess
     call is invisible to coverage.py, so this exercises the
-    `if not block_text.endswith(eol): block_text += eol` branch directly."""
+    `if not block_text.endswith(eol): block_text += eol` branch directly.
+
+    Same fixture requirement as its subprocess twin: a trailing marker must
+    follow the insertion point, otherwise the assertion is satisfied by the
+    separator element rather than by the guard (the docstring here previously
+    claimed to exercise the branch while asserting something that could not
+    distinguish it)."""
     vault = tmp_path / "vault"
-    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    note = _make_note(
+        vault, "claude-insights", "insight.md", BASIC_NOTE + "\n## Tool Usage\n- x\n"
+    )
     no_trailing_nl_update = "## Update (2026-07-25)\n\nNo trailing newline here."
 
     rc = note_writer.run_append_update(str(vault), str(note), no_trailing_nl_update)
 
     assert rc == 0
     written = note.read_text(encoding="utf-8")
-    assert "No trailing newline here.\n" in written
+    assert "No trailing newline here.\n\n## Tool Usage" in written
 
 
 # ===========================================================================
@@ -2516,3 +2539,187 @@ def test_read_stdin_capped_reports_oversize_in_process(monkeypatch):
     text2, oversized2 = note_writer._read_stdin_capped()
     assert oversized2 is False
     assert len(text2) == note_writer.STDIN_CAP_CHARS
+
+
+# ===========================================================================
+# Containment check (hooks/obsidian_utils.py write_vault_note) — the outermost
+# reachable layer.
+#
+# The pre-existing traversal tests (`../../escaped.md`, `../outside`) name this
+# guard in their docstrings but are satisfied by _validate_filename /
+# _validate_folder firing first, so deleting the containment check entirely
+# left the whole suite green. A SYMLINK component inside the vault is the one
+# vector that passes every argument validator — bare dot-free folder, bare
+# *.md filename — and can ONLY be stopped by resolve() + is_relative_to().
+# ===========================================================================
+
+def test_write_symlinked_folder_cannot_escape_vault(tmp_path):
+    """`folder` is a bare, dot-free, relative name and `filename` a bare *.md,
+    so both validators pass. Only write_vault_note()'s resolve() +
+    is_relative_to() containment check can reject this.
+
+    Proven fail-first: with the containment check at
+    hooks/obsidian_utils.py deleted, this returned rc=0 and genuinely created
+    the file OUTSIDE the vault root (see dr-fix2-report.md)."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (vault / "linkdir").symlink_to(outside, target_is_directory=True)
+
+    result = _run_write(vault, "linkdir", "evil.md", MINIMAL_FM + "pwned\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert "traversal" in result.stderr.lower()
+    assert not (outside / "evil.md").exists()
+    assert not (vault / "linkdir" / "evil.md").exists()
+
+
+def test_write_symlinked_folder_escape_blocked_in_process(tmp_path, capsys):
+    """In-process mirror so coverage.py sees run_write's error branch for this
+    vector (the subprocess run above is not instrumented)."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (vault / "linkdir").symlink_to(outside, target_is_directory=True)
+
+    rc = note_writer.run_write(str(vault), "linkdir", "evil.md", MINIMAL_FM + "x\n")
+
+    assert rc == 1
+    assert "ERROR" in capsys.readouterr().err
+    assert list(outside.iterdir()) == []
+
+
+def test_append_update_symlinked_note_cannot_escape_vault(tmp_path):
+    """append-update mirror: a symlink INSIDE the vault pointing at a file
+    outside it. The path is bare and dot-free, so only _resolve_note_path's
+    resolve() + is_relative_to() containment check rejects it. The outside
+    file must come back byte-identical."""
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "secret.md"
+    target.write_text(BASIC_NOTE, encoding="utf-8")
+    before = target.read_bytes()
+
+    link = vault / "claude-insights" / "link.md"
+    link.symlink_to(target)
+
+    result = _run_append_update(vault, link, UPDATE_SECTION, last_updated="2026-07-25")
+
+    assert result.returncode == 1
+    assert "traversal" in result.stderr.lower()
+    assert target.read_bytes() == before
+
+
+def test_append_update_symlinked_folder_cannot_escape_vault(tmp_path):
+    """Same escape via a symlinked DIRECTORY component rather than the note
+    file itself."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "note.md"
+    target.write_text(BASIC_NOTE, encoding="utf-8")
+    before = target.read_bytes()
+    (vault / "linkdir").symlink_to(outside, target_is_directory=True)
+
+    result = _run_append_update(vault, vault / "linkdir" / "note.md", UPDATE_SECTION)
+
+    assert result.returncode == 1
+    assert "traversal" in result.stderr.lower()
+    assert target.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter/body injection through flag values (named cases from the
+# test-integrity review).
+# ---------------------------------------------------------------------------
+
+def test_append_update_rejects_last_updated_forging_frontmatter_key(tmp_path):
+    """`--last-updated $'2026-07-25\\ntype: pwned'` previously injected an
+    arbitrary frontmatter key at rc=0 — overwriting `type`, which this module's
+    own docstrings list as never-touched."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(
+        vault, note, UPDATE_SECTION, last_updated="2026-07-25\ntype: pwned"
+    )
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "type: pwned" not in written
+    assert "type: claude-insight" in written
+    assert note.read_bytes() == before
+
+
+def test_append_update_rejects_tag_forging_closing_frontmatter_fence(tmp_path):
+    """`--add-tags $'ok\\n---\\nEVIL BODY'` previously forged a closing `---`
+    fence inside the tags block and injected body content, restructuring the
+    note at rc=0."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(
+        vault, note, UPDATE_SECTION, add_tags="ok\n---\nEVIL BODY"
+    )
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "EVIL BODY" not in written
+    # frontmatter still has exactly its original two fences
+    assert written.count("\n---\n") == 1
+    assert note.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Tag-block indentation detection (was untested; zero-indent produced mixed
+# indentation because `indent = m.group("indent") or indent` treats a
+# legitimately empty indent as "not found" and falls back to the 2-space
+# default).
+# ---------------------------------------------------------------------------
+
+def test_apply_add_tags_detects_four_space_indent():
+    fm = ["tags:\n", "    - a\n", "    - b\n"]
+    out = note_writer._apply_add_tags(fm, ["c"])
+    assert out == ["tags:\n", "    - a\n", "    - b\n", "    - c\n"]
+
+
+def test_apply_add_tags_detects_zero_indent_no_mixing():
+    """Zero indent is valid YAML (and what yaml.dump emits). The new tag must
+    match it rather than getting the hardcoded 2-space default, which produced
+    `tags:\\n- a\\n- b\\n  - c` — a block with mixed indentation."""
+    fm = ["tags:\n", "- a\n", "- b\n"]
+    out = note_writer._apply_add_tags(fm, ["c"])
+    assert out == ["tags:\n", "- a\n", "- b\n", "- c\n"]
+
+
+def test_apply_add_tags_empty_block_uses_two_space_default():
+    """No existing items to learn from — the documented 2-space default."""
+    fm = ["tags:\n"]
+    out = note_writer._apply_add_tags(fm, ["c"])
+    assert out == ["tags:\n", "  - c\n"]
+
+
+def test_append_update_four_space_tag_block_end_to_end(tmp_path):
+    vault = tmp_path / "vault"
+    note_content = BASIC_NOTE.replace(
+        "tags:\n  - claude/insight\n  - claude/topic/foo\n",
+        "tags:\n    - claude/insight\n    - claude/topic/foo\n",
+    )
+    note = _make_note(vault, "claude-insights", "insight.md", note_content)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/new")
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "    - claude/topic/new\n" in written
+    assert "  - claude/topic/new\n" not in written.replace("    - claude/topic/new\n", "")

@@ -656,9 +656,11 @@ def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n") -
     """Return frontmatter lines with ``add_tags`` merged into the ``tags:``
     block -- either style below, whichever the note actually uses.
 
-    Block style (``tags:`` on its own line, followed by indented ``- item``
-    lines): new tags are appended at the end of the block, in the block's
-    own existing indentation.
+    Block style (``tags:`` on its own line, followed by ``- item`` lines):
+    new tags are appended at the end of the block, in the block's own
+    existing indentation -- including a ZERO indent (``- a``), which is valid
+    YAML and what ``yaml.dump`` emits. Two spaces is used only when the block
+    has no existing item to copy the indentation from.
 
     Flow style (``tags: [a, b]`` or ``tags: []`` on one line): new tags are
     appended inside the brackets using ``", "`` as the separator -- the
@@ -692,7 +694,15 @@ def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n") -
             m = _TAG_ITEM_RE.match(fm_lines[idx].rstrip("\r\n"))
             if not m:
                 break
-            indent = m.group("indent") or indent
+            # Assign, don't `or` — a ZERO-indent block (`- a`, valid YAML and
+            # what yaml.dump emits) yields an empty-string indent, which `or`
+            # treats as "not found" and replaces with the 2-space default,
+            # appending `  - c` into a zero-indent block and leaving it with
+            # mixed indentation. The regex's `indent` group always
+            # participates, so an empty match here means "no indent", not
+            # "no match". The 2-space default below still applies when the
+            # block has no existing items to learn from.
+            indent = m.group("indent")
             existing.append(m.group("tag"))
             end_idx = idx + 1
 
