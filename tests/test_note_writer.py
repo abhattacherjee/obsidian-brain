@@ -1,22 +1,44 @@
 """Tests for note_writer.py — deterministic `write` command (#269).
 
-These are subprocess-level (black-box) tests: they invoke
-``python3 hooks/note_writer.py write <vault_path> <folder> <filename>``
-exactly as skills will, piping note content on stdin, so the tests exercise
-real stdin reads, real filesystem writes, and real exit codes rather than
-calling internal functions directly.
+Two layers, deliberately redundant where they overlap:
+
+- Subprocess-level (black-box) tests invoke
+  ``python3 hooks/note_writer.py write <vault_path> <folder> <filename>``
+  exactly as skills will, piping note content on stdin. These are the only
+  tests that prove argv parsing, real stdin piping, process exit codes, and
+  stdout/stderr formatting work end-to-end through the actual CLI entry
+  point skills call — do not replace them with in-process calls.
+- In-process tests import ``note_writer`` directly and call
+  ``run_write()``/``main()`` in-process (with ``monkeypatch``), so
+  coverage.py can instrument the module and branches unreachable except by
+  forcing ``write_vault_note`` to fail (e.g. the ``ERROR:`` path) are
+  exercised directly rather than only indirectly via a real filesystem
+  failure.
 """
 from __future__ import annotations
 
+import io
 import os
 import stat
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 NOTE_WRITER = Path(__file__).resolve().parent.parent / "hooks" / "note_writer.py"
 
 STDIN_CAP_BYTES = 1_000_000
+
+# Mirrors test_check_items_cli.py's convention of also inserting hooks/ onto
+# sys.path directly in the test module (in addition to conftest.py's global
+# insert), so `import note_writer` works the same way regardless of how the
+# test module is collected.
+HOOKS_DIR = os.path.join(os.path.dirname(__file__), "..", "hooks")
+if HOOKS_DIR not in sys.path:
+    sys.path.insert(0, HOOKS_DIR)
+
+import note_writer  # noqa: E402
 
 
 def _run_write(vault_path, folder, filename, content: str) -> subprocess.CompletedProcess:
@@ -209,3 +231,103 @@ def test_unknown_command_exits_2(tmp_path):
 
     assert result.returncode == 2
     assert "unknown command" in result.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# In-process tests — same claims as above, verified via direct calls so
+# coverage.py can instrument note_writer.py and so the write_vault_note
+# error branch can be forced without depending on a real filesystem failure.
+# ---------------------------------------------------------------------------
+
+def test_run_write_in_process_success(tmp_path, capsys):
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    content = "# Session\nBody.\n"
+
+    rc = note_writer.run_write(str(vault), "claude-sessions", "note.md", content)
+
+    dest = vault / "claude-sessions" / "note.md"
+    assert rc == 0
+    assert dest.read_text(encoding="utf-8") == content
+    captured = capsys.readouterr()
+    assert captured.out.strip() == f"OK: {dest.resolve()}"
+    # write_vault_note() itself logs a "wrote <dest>" diagnostic to stderr on
+    # success (obsidian_utils.py) — that's expected; just confirm no error.
+    assert "ERROR" not in captured.err
+
+
+def test_run_write_forced_error_path_prints_error_and_returns_1(
+    tmp_path, monkeypatch, capsys
+):
+    """Forces obsidian_utils.write_vault_note's error branch directly —
+    exercised only indirectly (via a real path-traversal block) by the
+    subprocess tests above. This proves run_write()'s ERROR:/exit-1 path is
+    reachable independent of *why* write_vault_note failed."""
+    monkeypatch.setattr(
+        note_writer, "write_vault_note", lambda *a, **k: "forced failure for test"
+    )
+
+    rc = note_writer.run_write(str(tmp_path / "vault"), "folder", "file.md", "content\n")
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "ERROR: forced failure for test"
+    assert captured.out == ""
+    # write_vault_note was faked out entirely, so nothing should exist.
+    assert not (tmp_path / "vault").exists()
+
+
+def test_main_write_dispatch_success_in_process(tmp_path, monkeypatch, capsys):
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    content = "in-process main() content\n"
+
+    monkeypatch.setattr(
+        sys, "argv", ["note_writer.py", "write", str(vault), "claude-sessions", "main.md"]
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(content))
+
+    with pytest.raises(SystemExit) as exc_info:
+        note_writer.main()
+
+    assert exc_info.value.code == 0
+    dest = vault / "claude-sessions" / "main.md"
+    assert dest.read_text(encoding="utf-8") == content
+    captured = capsys.readouterr()
+    assert captured.out.strip() == f"OK: {dest.resolve()}"
+
+
+def test_main_unknown_command_exits_2_in_process(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["note_writer.py", "bogus-command"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    with pytest.raises(SystemExit) as exc_info:
+        note_writer.main()
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "unknown command" in captured.err.lower()
+
+
+def test_main_wrong_arity_exits_2_in_process(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["note_writer.py", "write", "only-one-arg"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    with pytest.raises(SystemExit) as exc_info:
+        note_writer.main()
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "usage" in captured.err.lower()
+
+
+def test_main_no_argv_exits_2_in_process(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["note_writer.py"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    with pytest.raises(SystemExit) as exc_info:
+        note_writer.main()
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "usage" in captured.err.lower()
