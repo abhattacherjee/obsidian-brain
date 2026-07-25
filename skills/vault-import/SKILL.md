@@ -218,17 +218,23 @@ Generate the filename using the same convention as other session notes:
 
 Final filename: `YYYY-MM-DD-<slug>-<hash>.md`
 
-Write each note:
+Write each note by running the note-writer CLI once **per session**, piping that session's full note (frontmatter + body) in on stdin. It creates `$SESSIONS_FOLDER` if needed (idempotent across repeated calls in this loop — only the first call actually creates it) and writes each file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **The heredoc delimiter `OB_NOTE_EOF` must stay quoted (`<<'OB_NOTE_EOF'`) — do not drop the quotes in a future edit.** An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in imported session content, silently corrupting it:
 
 ```bash
-mkdir -p "$VAULT_PATH/$SESSIONS_FOLDER"
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "import glob,os; print(max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), default='hooks'))")
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$SESSIONS_FOLDER" "<filename>" <<'OB_NOTE_EOF'
+---
+type: claude-session
+...
+---
+
+# <Session Title>
+...
+OB_NOTE_EOF
 ```
 
-Use the **Write** tool to write the file, then:
-
-```bash
-chmod 644 "$VAULT_PATH/$SESSIONS_FOLDER/<filename>"
-```
+On success this prints `OK: <absolute path>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero for THAT session only — record it under `<FAILED_COUNT>`/`<Failed sessions>` in Step 8 and continue importing the remaining sessions; one failed write must not abort the whole import loop.
 
 ### Step 8 — Report results
 

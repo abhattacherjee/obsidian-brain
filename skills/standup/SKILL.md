@@ -388,23 +388,23 @@ Example: `2026-04-05-standup-daily-a3f2.md`
 
 ### Step 12 — Write the note
 
-Run:
+Run the note-writer CLI, piping the full note (frontmatter + body) in on stdin. It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **The heredoc delimiter `OB_NOTE_EOF` must stay quoted (`<<'OB_NOTE_EOF'`) — do not drop the quotes in a future edit.** An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the note body, silently corrupting it:
 
 ```bash
-mkdir -p "$VAULT_PATH/$INSIGHTS_FOLDER"
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "import glob,os; print(max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), default='hooks'))")
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-<slug>-<hash>.md" <<'OB_NOTE_EOF'
+---
+type: claude-standup
+...
+---
+
+# Standup: ...
+...
+OB_NOTE_EOF
 ```
 
-Then use the **Write** tool to write the full note (frontmatter + body) to:
-
-```
-$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-<slug>-<hash>.md
-```
-
-Then set permissions:
-
-```bash
-chmod 644 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-<slug>-<hash>.md"
-```
+On success this prints `OK: <absolute path>` — that is the file at `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here.
 
 ### Step 13 — Present to user
 

@@ -191,27 +191,36 @@ Wait for the user's response. Apply edits and re-show if requested. Repeat until
 
 If **cancel**, stop here.
 
-#### 4A-update.4 — Append the update section
+#### 4A-update.4 — Append the update section and update frontmatter
 
-Use the Edit tool to append the update section to the note body.
+Run the note-writer CLI's `append-update` command, piping the drafted `## Update (YYYY-MM-DD)` section (from 4A-update.2) in on stdin. **This single call replaces all three of the old Edit-tool steps** — it finds the correct insertion point (scanning from the bottom for `_(Summary source: ...)_`, `## Tool Usage`, `## Conversation (raw)`, `## Session Metadata`, `## Files Touched` and inserting immediately before the first one found, or at end-of-file if none are found), bumps `last_updated`, and merges new tags — all in one atomic write. Do NOT use the Edit tool for any of this.
 
-**Insertion point:** Scan the note from the bottom for these trailing metadata patterns: `_(Summary source: ...)_`, `## Tool Usage`, `## Conversation (raw)`, `## Session Metadata`, `## Files Touched`. If any are found, insert the update section on a new line immediately BEFORE the first trailing section. If none are found, append at the very end of the file.
+Generate 1-3 new topic tags from the update content (same logic as Step 5) and pass them via `--add-tags`. `--last-updated` is opt-in — it must be passed explicitly with today's date, or the note's `last_updated` field will NOT be bumped (that used to happen automatically; it no longer does without this flag).
 
-Use the Edit tool with the first line of the trailing section (or the last line of the file) as `old_string`, and prepend the update section + a blank line before it.
+**The heredoc delimiter `OB_UPDATE_EOF` must stay quoted (`<<'OB_UPDATE_EOF'`) — do not drop the quotes in a future edit.** Update sections routinely contain `$` variables, backtick commands, and fenced code blocks from the session; an unquoted delimiter lets the shell expand/corrupt them before they ever reach the file.
 
-**Verify:** After the Edit, use the Read tool to confirm the `## Update (YYYY-MM-DD)` heading is present in the note. If it is not, tell the user: "Failed to append update section — file may have unexpected structure. Please edit manually at `$MATCH_PATH`." Do NOT proceed to 4A-update.5 if the append failed.
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "import glob,os; print(max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), default='hooks'))")
+TODAY=$(date +%Y-%m-%d)
+python3 "$HOOKS/note_writer.py" append-update "$VAULT_PATH" "$MATCH_PATH" \
+  --last-updated "$TODAY" \
+  --add-tags "claude/topic/<new-tag-1>,claude/topic/<new-tag-2>" <<'OB_UPDATE_EOF'
+## Update (YYYY-MM-DD)
 
-#### 4A-update.5 — Update frontmatter
+<New content about this topic from today's session>
+OB_UPDATE_EOF
+```
 
-Use the Edit tool to update the frontmatter of the existing note:
+On success this prints `OK: <resolved path>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero — the file is left byte-identical (no partial write happens). Surface the error to the user: "Failed to append update section — `<error message>`. Please edit manually at `$MATCH_PATH`." and stop here.
 
-1. **`last_updated` field:** If `last_updated:` already exists in the frontmatter, replace its value with today's date. If it does not exist, add `last_updated: YYYY-MM-DD` after the `date:` line.
+The write is atomic and a non-zero exit means nothing was written, so there is nothing to gain from re-reading the file afterward to confirm — do NOT add a verification Read step here.
 
-2. **New topic tags:** Generate 1-3 topic tags from the update content (same logic as Step 5). For each new tag, check if it already exists in the `tags:` list. Only append tags that are NOT already present. Add new tags at the end of the tags list, before the closing `---`.
+**Do NOT change:** `date`, `source_session`, `source_session_note`, or `type` fields. These record the original creation context — the CLI never touches them.
 
-**Do NOT change:** `date`, `source_session`, `source_session_note`, or `type` fields. These record the original creation context.
+**Note on repeated runs:** running `/compress` update again later (even later the same day) appends another `## Update (YYYY-MM-DD)` section rather than merging into an existing one for that date. This is expected and lossless — do not describe or imply that same-date updates merge.
 
-#### 4A-update.6 — Re-sync vault index
+#### 4A-update.5 — Re-sync vault index
 
 Run:
 
@@ -233,7 +242,7 @@ except Exception as e:
 '
 ~~~
 
-#### 4A-update.7 — Confirm
+#### 4A-update.6 — Confirm
 
 Print:
 
@@ -380,23 +389,23 @@ Example: `2026-04-04-rate-limiting-with-redis-a3f2.md`
 
 ### Step 8 — Write the note
 
-Run:
+Run the note-writer CLI, piping the full note (frontmatter + body) in on stdin. It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **The heredoc delimiter `OB_NOTE_EOF` must stay quoted (`<<'OB_NOTE_EOF'`) — do not drop the quotes in a future edit.** An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the note body, silently corrupting it:
 
 ```bash
-mkdir -p "$VAULT_PATH/$INSIGHTS_FOLDER"
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "import glob,os; print(max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), default='hooks'))")
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-<slug>-<hash>.md" <<'OB_NOTE_EOF'
+---
+type: claude-insight
+...
+---
+
+# <Title>
+...
+OB_NOTE_EOF
 ```
 
-Then use the **Write** tool to write the full note (frontmatter + body) to:
-
-```
-$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-<slug>-<hash>.md
-```
-
-Then set permissions:
-
-```bash
-chmod 644 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-<slug>-<hash>.md"
-```
+On success this prints `OK: <absolute path>` — that is the file at `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here.
 
 ### Step 9 — Confirm
 

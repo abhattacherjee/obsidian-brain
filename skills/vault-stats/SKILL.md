@@ -194,13 +194,23 @@ tags:
 ---
 ```
 
-Use the **Write** tool to save to `$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-vault-stats-<hash>.md`.
-
-Then set permissions:
+Run the note-writer CLI, piping the full note (frontmatter + body) in on stdin. It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed (this skill already used `0o600`, so nothing changes there — only the write mechanism does). **The heredoc delimiter `OB_NOTE_EOF` must stay quoted (`<<'OB_NOTE_EOF'`) — do not drop the quotes in a future edit.** An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the note body, silently corrupting it:
 
 ```bash
-chmod 600 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-vault-stats-<hash>.md"
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "import glob,os; print(max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), default='hooks'))")
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-vault-stats-<hash>.md" <<'OB_NOTE_EOF'
+---
+type: claude-stats
+...
+---
+
+## Vault Health
+...
+OB_NOTE_EOF
 ```
+
+On success this prints `OK: <absolute path>` — that is the file at `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here.
 
 ### Step 5 — Confirm
 
