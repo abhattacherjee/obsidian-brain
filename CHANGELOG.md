@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Codex compatibility design proposal (#270):** `docs/codex-compatibility-design.md` documents how `obsidian-brain` could run as both a Claude Code plugin and a Codex plugin without forking the vault format or duplicating the Python core — Codex packaging metadata, a `runtime_provider.py` adapter for provider-specific config/state/DB paths, transcript and tool-name normalization, and an incremental `skills-codex/` port ordered read-workflows-first. Status: **proposed**; documentation only, no behavior change. The implementation phases it describes will be filed as separate issues.
+
 ## [3.3.0] - 2026-07-21
 
 ### Fixed
