@@ -28,7 +28,21 @@ import pytest
 
 NOTE_WRITER = Path(__file__).resolve().parent.parent / "hooks" / "note_writer.py"
 
-STDIN_CAP_BYTES = 1_000_000
+STDIN_CAP_CHARS = 1_000_000
+
+# Every `write` call site pipes a COMPLETE note (frontmatter + body), and the
+# CLI now enforces that (note_writer._validate_note_content), so any test
+# asserting a successful write must pipe a real note rather than a bare line.
+# Rejection tests deliberately keep their own throwaway content: argument
+# validation runs before content validation, so each of them still exercises
+# the guard it names.
+MINIMAL_FM = (
+    "---\n"
+    "type: claude-insight\n"
+    "date: 2026-07-25\n"
+    "---\n"
+    "\n"
+)
 
 # Mirrors test_check_items_cli.py's convention of also inserting hooks/ onto
 # sys.path directly in the test module (in addition to conftest.py's global
@@ -69,7 +83,7 @@ def test_write_creates_file_with_verbatim_content(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()
     (vault / "claude-sessions").mkdir()
-    content = "# Session\n\nSome body text.\n"
+    content = MINIMAL_FM + "# Session\n\nSome body text.\n"
 
     result = _run_write(vault, "claude-sessions", "note.md", content)
 
@@ -113,7 +127,7 @@ def test_write_preserves_dollar_backtick_and_fenced_block_verbatim(tmp_path):
     write path."""
     vault = tmp_path / "vault"
     (vault / "claude-sessions").mkdir(parents=True)
-    content = (
+    content = MINIMAL_FM + (
         "Ran `echo $HOME` and got a path back.\n"
         "\n"
         "```python\n"
@@ -132,7 +146,7 @@ def test_write_creates_missing_target_folder(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()
     # Note: claude-decisions does NOT exist yet under vault.
-    content = "# Decision\nBody.\n"
+    content = MINIMAL_FM + "# Decision\nBody.\n"
 
     result = _run_write(vault, "claude-decisions", "decision.md", content)
 
@@ -146,7 +160,7 @@ def test_write_file_mode_is_0o600(tmp_path):
     vault = tmp_path / "vault"
     (vault / "claude-sessions").mkdir(parents=True)
 
-    result = _run_write(vault, "claude-sessions", "mode-check.md", "content\n")
+    result = _run_write(vault, "claude-sessions", "mode-check.md", MINIMAL_FM + "content\n")
 
     dest = vault / "claude-sessions" / "mode-check.md"
     assert result.returncode == 0, result.stderr
@@ -194,18 +208,60 @@ def test_write_blocks_path_traversal_no_file_created_anywhere(tmp_path):
 # Stdin cap
 # ---------------------------------------------------------------------------
 
-def test_write_oversize_stdin_truncated_at_cap(tmp_path):
+def test_write_oversize_stdin_rejected_nothing_written(tmp_path):
+    """REPLACES test_write_oversize_stdin_truncated_at_cap, which asserted
+    rc==0 and a file truncated to exactly the cap. That behaviour is the
+    anti-goal of this CLI: the note lost its tail (e.g. ``## Session
+    Metadata``) with no signal at all, and at /standup's in-place
+    ``--overwrite`` site a truncated write replaces a complete note with a
+    mutilated one. Oversize input is now an ERROR with no write.
+
+    The cap VALUE is unchanged (and the character-vs-byte question is a
+    separate repo-wide follow-up) -- only truncation-vs-rejection changed."""
     vault = tmp_path / "vault"
     (vault / "claude-sessions").mkdir(parents=True)
-    oversize_content = "A" * (STDIN_CAP_BYTES + 500)
+    oversize_content = MINIMAL_FM + "A" * (STDIN_CAP_CHARS + 500)
 
     result = _run_write(vault, "claude-sessions", "oversize.md", oversize_content)
 
     dest = vault / "claude-sessions" / "oversize.md"
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert str(STDIN_CAP_CHARS) in result.stderr
+    assert "OK:" not in result.stdout
+    assert not dest.exists()
+
+
+def test_write_exactly_at_cap_still_succeeds(tmp_path):
+    """Boundary companion to the rejection test above: content of EXACTLY
+    STDIN_CAP_CHARS characters is at the cap, not over it, and must still be
+    written in full. A `> cap` check (correct) and a `>= cap` check (off by
+    one) differ only on this input."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    padding = "A" * (STDIN_CAP_CHARS - len(MINIMAL_FM))
+    content = MINIMAL_FM + padding
+    assert len(content) == STDIN_CAP_CHARS
+
+    result = _run_write(vault, "claude-sessions", "at-cap.md", content)
+
+    dest = vault / "claude-sessions" / "at-cap.md"
     assert result.returncode == 0, result.stderr
-    written = dest.read_text(encoding="utf-8")
-    assert len(written) == STDIN_CAP_BYTES
-    assert written == oversize_content[:STDIN_CAP_BYTES]
+    assert dest.read_text(encoding="utf-8") == content
+
+
+def test_append_update_oversize_stdin_rejected_note_unchanged(tmp_path):
+    """Same cap, same rejection, on the append-update path -- and the
+    existing note must be left byte-identical."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, "A" * (STDIN_CAP_CHARS + 500))
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert note.read_bytes() == before
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +298,7 @@ def test_unknown_command_exits_2(tmp_path):
 def test_run_write_in_process_success(tmp_path, capsys):
     vault = tmp_path / "vault"
     (vault / "claude-sessions").mkdir(parents=True)
-    content = "# Session\nBody.\n"
+    content = MINIMAL_FM + "# Session\nBody.\n"
 
     rc = note_writer.run_write(str(vault), "claude-sessions", "note.md", content)
 
@@ -269,7 +325,9 @@ def test_run_write_forced_error_path_prints_error_and_returns_1(
 
     vault = tmp_path / "vault"
     vault.mkdir()  # must exist to clear the new _validate_vault_path guard first
-    rc = note_writer.run_write(str(vault), "folder", "file.md", "content\n")
+    # Content must be a valid note too, so the forced write_vault_note error
+    # is what produces the ERROR line -- not the content guard upstream of it.
+    rc = note_writer.run_write(str(vault), "folder", "file.md", MINIMAL_FM + "content\n")
 
     assert rc == 1
     captured = capsys.readouterr()
@@ -283,7 +341,7 @@ def test_run_write_forced_error_path_prints_error_and_returns_1(
 def test_main_write_dispatch_success_in_process(tmp_path, monkeypatch, capsys):
     vault = tmp_path / "vault"
     (vault / "claude-sessions").mkdir(parents=True)
-    content = "in-process main() content\n"
+    content = MINIMAL_FM + "in-process main() content\n"
 
     monkeypatch.setattr(
         sys, "argv", ["note_writer.py", "write", str(vault), "claude-sessions", "main.md"]
@@ -590,7 +648,7 @@ def test_write_succeeds_with_valid_absolute_vault_path(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()
 
-    result = _run_write(vault, "claude-insights", "ok.md", "x\n")
+    result = _run_write(vault, "claude-insights", "ok.md", MINIMAL_FM + "x\n")
 
     assert result.returncode == 0, result.stderr
     assert (vault / "claude-insights" / "ok.md").exists()
@@ -600,7 +658,7 @@ def test_write_normal_folder_and_filename_still_succeeds(tmp_path):
     """Guards against the validation guard breaking the happy path."""
     vault = tmp_path / "vault"
     (vault / "claude-insights").mkdir(parents=True)
-    content = "# Retro\nBody.\n"
+    content = MINIMAL_FM + "# Retro\nBody.\n"
 
     result = _run_write(vault, "claude-insights", "2026-07-25-retro-a3f2.md", content)
 
@@ -896,19 +954,40 @@ def test_append_update_no_tags_block_does_not_crash(tmp_path):
     assert "## Update (2026-07-25)" in written  # body append still happened
 
 
-def test_append_update_empty_add_tags_is_noop(tmp_path):
+def test_append_update_empty_add_tags_value_is_rejected(tmp_path):
+    """REPLACES test_append_update_empty_add_tags_is_noop, which asserted
+    rc==0 for `--add-tags ""`. A flag PRESENT with an empty value is the
+    same shape as the `$VAULT_PATH=""` bug this branch already shipped a fix
+    for -- an unsubstituted variable, not a deliberate "no tags". Omitting
+    the flag entirely remains the supported no-op (see
+    test_append_update_omitted_add_tags_flag_is_noop), so nothing legitimate
+    loses a path here."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert note.read_bytes() == before
+
+
+def test_append_update_omitted_add_tags_flag_is_noop(tmp_path):
+    """The supported no-op: no --add-tags flag at all. The tags block must
+    come back byte-identical while the body update still lands."""
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
     before = note.read_text(encoding="utf-8")
 
-    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="")
+    result = _run_append_update(vault, note, UPDATE_SECTION)
 
     assert result.returncode == 0, result.stderr
     written = note.read_text(encoding="utf-8")
-    # tags block byte-identical to before (only the body section was added)
     before_tags = before.split("tags:\n", 1)[1].split("---", 1)[0]
     after_tags = written.split("tags:\n", 1)[1].split("---", 1)[0]
     assert before_tags == after_tags
+    assert "## Update (2026-07-25)" in written
 
 
 # ---------------------------------------------------------------------------
@@ -1914,3 +1993,526 @@ def test_split_lines_lf_crlf_in_process():
     # Lossless reconstruction via straight join, regardless of test case.
     for text in ("foo\rbar\n", "a\r\nb\nc", "", "no newline at all", "\r\n\r\n"):
         assert "".join(note_writer._split_lines_lf_crlf(text)) == text
+
+
+# ===========================================================================
+# Content-layer guards (deep-review round 1)
+#
+# The argument layer was already well validated; nothing validated the
+# CONTENT piped in on stdin or the values interpolated into YAML. Every test
+# below pins one of those guards. Each was proven fail-first by removing the
+# guard and re-running (see dr-fix1-report.md for the captured rc/stderr).
+# ===========================================================================
+
+# --- write: empty / malformed note content --------------------------------
+
+def test_write_rejects_empty_stdin_no_zero_byte_note(tmp_path):
+    """A 0-byte note reported as `OK:` is the worst outcome this CLI can
+    produce: /retro then arms its Stop-hook classification gate pointing at
+    an empty file, and the user is told the retro was saved."""
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+
+    result = _run_write(vault, "claude-insights", "empty.md", "")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert "OK:" not in result.stdout
+    assert not (vault / "claude-insights" / "empty.md").exists()
+
+
+def test_write_rejects_whitespace_only_stdin(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+
+    result = _run_write(vault, "claude-insights", "blank.md", "   \n\n\t\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert not (vault / "claude-insights" / "blank.md").exists()
+
+
+def test_write_rejects_content_without_opening_frontmatter_fence(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+
+    result = _run_write(
+        vault, "claude-insights", "nofm.md", "# Just a title\n\nBody.\n"
+    )
+
+    assert result.returncode == 1
+    assert "frontmatter" in result.stderr.lower()
+    assert not (vault / "claude-insights" / "nofm.md").exists()
+
+
+def test_write_rejects_indented_frontmatter_fence(tmp_path):
+    """The indented-heredoc corruption class, closed permanently: an
+    indented `   ---` is not a frontmatter fence, so a wrongly-indented
+    heredoc body now fails loudly instead of landing a note whose
+    frontmatter Obsidian cannot parse."""
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    indented = "   ---\n   type: claude-insight\n   ---\n\n   # Title\n"
+
+    result = _run_write(vault, "claude-insights", "indented.md", indented)
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert not (vault / "claude-insights" / "indented.md").exists()
+
+
+def test_write_rejects_content_without_closing_frontmatter_fence(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    unterminated = "---\ntype: claude-insight\ndate: 2026-07-25\n\n# Title\nBody.\n"
+
+    result = _run_write(vault, "claude-insights", "unterminated.md", unterminated)
+
+    assert result.returncode == 1
+    assert "closing" in result.stderr.lower()
+    assert not (vault / "claude-insights" / "unterminated.md").exists()
+
+
+def test_validate_note_content_in_process():
+    assert note_writer._validate_note_content("") is not None
+    assert note_writer._validate_note_content("  \n\t\n") is not None
+    assert note_writer._validate_note_content("# no fm\n") is not None
+    assert note_writer._validate_note_content("---\ntype: x\n") is not None
+    assert note_writer._validate_note_content("---\ntype: x\n---\nbody\n") is None
+    # CRLF-authored note: the fence check must not be defeated by \r\n.
+    assert note_writer._validate_note_content("---\r\ntype: x\r\n---\r\nbody\r\n") is None
+
+
+# --- write: overwrite guard -----------------------------------------------
+
+def test_write_refuses_to_clobber_existing_note(tmp_path):
+    """Claude Code's Write tool refused to overwrite a file it had not Read,
+    so a filename-hash collision used to be loud. Without this guard the
+    CLI conversion silently destroyed the existing insight and printed
+    `OK:`."""
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    dest = vault / "claude-insights" / "collide.md"
+    original = MINIMAL_FM + "ORIGINAL IMPORTANT CONTENT\n"
+    dest.write_text(original, encoding="utf-8")
+
+    result = _run_write(vault, "claude-insights", "collide.md", MINIMAL_FM + "new\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert "overwrite" in result.stderr.lower()
+    assert dest.read_text(encoding="utf-8") == original
+
+
+def test_write_overwrite_flag_replaces_existing_note(tmp_path):
+    """/standup Step 6.6 upgrades a session note in place and is the ONE
+    call site that passes --overwrite."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    dest = vault / "claude-sessions" / "session.md"
+    dest.write_text(MINIMAL_FM + "old\n", encoding="utf-8")
+    new_content = MINIMAL_FM + "upgraded with AI summary\n"
+
+    result = _run_argv(
+        "write", str(vault), "claude-sessions", "session.md", "--overwrite",
+        stdin=new_content,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"OK: {dest.resolve()}"
+    assert dest.read_text(encoding="utf-8") == new_content
+
+
+def test_write_unknown_flag_exits_2(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+
+    result = _run_argv(
+        "write", str(vault), "claude-sessions", "x.md", "--clobber",
+        stdin=MINIMAL_FM + "body\n",
+    )
+
+    assert result.returncode == 2
+    assert "unknown flag" in result.stderr.lower()
+
+
+# --- write: hidden-note filenames -----------------------------------------
+
+@pytest.mark.parametrize("filename", ["..md", ".secret.md", ".md"])
+def test_write_rejects_leading_dot_filenames(tmp_path, filename):
+    """`..md` and `.secret.md` passed the old length-based check and were
+    written -- a note invisible to Obsidian, reported as saved."""
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+
+    result = _run_write(vault, "claude-insights", filename, MINIMAL_FM + "body\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert not (vault / "claude-insights" / filename).exists()
+
+
+def test_validate_filename_rejects_hidden_names_in_process():
+    assert note_writer._validate_filename("..md") is not None
+    assert note_writer._validate_filename(".secret.md") is not None
+    assert note_writer._validate_filename(".md") is not None
+    assert note_writer._validate_filename("a.md") is None
+
+
+# --- append-update: empty content -----------------------------------------
+
+def test_append_update_rejects_empty_stdin_note_unchanged(tmp_path):
+    """Empty content used to return `OK:`, bump last_updated and append only
+    blank lines -- the note LOOKED freshly updated but gained nothing, and
+    /compress deliberately skips a verification re-read on the strength of
+    this exit code."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(
+        vault, note, "", last_updated="2026-07-25", add_tags="claude/topic/x"
+    )
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert "OK:" not in result.stdout
+    assert note.read_bytes() == before  # no last_updated bump, no tag, no body
+
+
+def test_append_update_rejects_whitespace_only_stdin_note_unchanged(tmp_path):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, "\n   \n\t\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert note.read_bytes() == before
+
+
+# --- append-update: tag validation ----------------------------------------
+
+def test_append_update_rejects_tag_with_newline_frontmatter_injection(tmp_path):
+    """The reported reproduction: a newline inside one CSV item injected an
+    arbitrary frontmatter key that overrode the note's own `type`."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(
+        vault, note, UPDATE_SECTION, add_tags="claude/topic/a\ntype: hijacked"
+    )
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "type: hijacked" not in written
+    assert note.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "bad_tag",
+    [
+        "foo: bar",            # turns the tags sequence into a sequence of maps
+        "claude/topic/a#x",    # starts a YAML comment
+        'claude/"quoted"',     # unbalances a flow-style tags: [...] line
+        "claude/'quoted'",
+        "claude/topic/a\r",    # bare CR
+        "claude/topic/a b",    # internal whitespace
+    ],
+)
+def test_append_update_rejects_malformed_tags(tmp_path, bad_tag):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags=bad_tag)
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert note.read_bytes() == before
+
+
+def test_append_update_rejects_malformed_tag_on_flow_style_note(tmp_path):
+    """Validation must run BEFORE either merge path -- flow-style notes are
+    just as injectable as block-style ones."""
+    vault = tmp_path / "vault"
+    flow_note = BASIC_NOTE.replace(
+        "tags:\n  - claude/insight\n  - claude/topic/foo\n",
+        "tags: [claude/insight, claude/topic/foo]\n",
+    )
+    assert "tags: [" in flow_note
+    note = _make_note(vault, "claude-insights", "insight.md", flow_note)
+    before = note.read_bytes()
+
+    result = _run_append_update(
+        vault, note, UPDATE_SECTION, add_tags="claude/topic/a\ntype: hijacked"
+    )
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert note.read_bytes() == before
+
+
+def test_append_update_accepts_conventional_csv_spacing(tmp_path):
+    """`a, b` (a space after the comma) is conventional CSV spacing, not a
+    malformed tag -- the guard must not reject the ordinary case."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+
+    result = _run_append_update(
+        vault, note, UPDATE_SECTION, add_tags="claude/topic/one, claude/topic/two"
+    )
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "  - claude/topic/one\n" in written
+    assert "  - claude/topic/two\n" in written
+
+
+def test_validate_tags_in_process():
+    assert note_writer._validate_tags(None) == ([], None)
+
+    tags, err = note_writer._validate_tags("a/b, c/d")
+    assert err is None and tags == ["a/b", "c/d"]
+
+    for bad in ("", "a,,b", "a,", "a\nb", "a: b", "a#b", "a'b", 'a"b', "a b"):
+        tags, err = note_writer._validate_tags(bad)
+        assert err is not None, bad
+        assert tags is None, bad
+
+
+# --- append-update: --last-updated validation -----------------------------
+
+def test_append_update_rejects_empty_last_updated_value(tmp_path):
+    """`--last-updated "$TODAY"` with TODAY unset yields a PRESENT flag with
+    an empty value -- previously indistinguishable from "flag omitted", so
+    the bump was skipped with no signal."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, last_updated="")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert note.read_bytes() == before
+
+
+@pytest.mark.parametrize("bad_date", ["yesterday", "2026-7-25", "2026-07-25\ntype: x"])
+def test_append_update_rejects_malformed_last_updated_value(tmp_path, bad_date):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, last_updated=bad_date)
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert note.read_bytes() == before
+
+
+def test_validate_last_updated_in_process():
+    assert note_writer._validate_last_updated(None) is None
+    assert note_writer._validate_last_updated("2026-07-25") is None
+    assert note_writer._validate_last_updated("") is not None
+    assert note_writer._validate_last_updated("   ") is not None
+    assert note_writer._validate_last_updated("2026-7-5") is not None
+    assert note_writer._validate_last_updated("2026-07-25 extra") is not None
+
+
+# --- append-update: closing-fence weld ------------------------------------
+
+def test_append_update_frontmatter_only_note_no_trailing_newline(tmp_path):
+    """With an empty body AND no trailing newline the separator branch never
+    ran, so the closing fence was welded onto the update heading
+    (`---## Update (...)`), leaving the frontmatter unterminated -- Obsidian
+    loses the note's type and tags -- at exit 0."""
+    vault = tmp_path / "vault"
+    content = "---\ntype: claude-insight\ndate: 2026-01-01\n---"  # no trailing \n
+    note = _make_note(vault, "claude-insights", "fm-only.md", content)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "---## Update" not in written
+    # Frontmatter still terminated by a fence on its own line.
+    assert written.startswith("---\ntype: claude-insight\ndate: 2026-01-01\n---\n")
+    assert "## Update (2026-07-25)" in written
+    # And it still parses as frontmatter for the CLI's own splitter.
+    lines = note_writer._split_lines_lf_crlf(written)
+    _open, fm, _close, _body = note_writer._split_frontmatter(lines)
+    assert fm is not None
+    assert "type: claude-insight\n" in fm
+
+
+def test_append_update_frontmatter_only_note_crlf_no_trailing_newline(tmp_path):
+    """Same case on a CRLF note -- the terminator this adds must be the
+    note's own line ending, not a hardcoded \\n."""
+    vault = tmp_path / "vault"
+    content = "---\r\ntype: claude-insight\r\ndate: 2026-01-01\r\n---"
+    note = _make_note(vault, "claude-insights", "fm-only-crlf.md", content)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8", newline="")
+    assert written.startswith(
+        "---\r\ntype: claude-insight\r\ndate: 2026-01-01\r\n---\r\n"
+    )
+    assert "\n---## Update" not in written
+
+
+# --- append-update: fenced-code-block-aware insertion scan ----------------
+
+def test_append_update_ignores_trailing_marker_inside_code_fence(tmp_path):
+    """A note quoting a session-note template contains `## Tool Usage`
+    inside a fence. Without fence tracking the update section was wedged
+    INSIDE that fence -- rendered as literal code, with the real body pushed
+    out past it, at exit 0."""
+    vault = tmp_path / "vault"
+    body = (
+        "\n# Insight\n\n"
+        "```markdown\n"
+        "## Tool Usage\n"
+        "- **Bash**: 12\n"
+        "```\n"
+        "\nReal body continues here.\n"
+    )
+    note = _make_note(vault, "claude-insights", "quoted.md", BASIC_NOTE + body)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    # The fenced block is untouched and intact...
+    assert "```markdown\n## Tool Usage\n- **Bash**: 12\n```\n" in written
+    # ...and the update landed after it (EOF), not inside it.
+    assert written.index("## Update (2026-07-25)") > written.index("```markdown")
+    assert written.index("## Update (2026-07-25)") > written.index("Real body continues here.")
+
+
+def test_append_update_uses_real_marker_after_a_code_fence(tmp_path):
+    """Fence tracking must not blind the scan to a genuine marker that
+    appears AFTER a closed fence."""
+    vault = tmp_path / "vault"
+    body = (
+        "\n# Insight\n\n"
+        "```markdown\n"
+        "## Tool Usage\n"
+        "```\n"
+        "\n## Session Metadata\n- id: abc\n"
+    )
+    note = _make_note(vault, "claude-insights", "both.md", BASIC_NOTE + body)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert written.index("## Update (2026-07-25)") < written.index("## Session Metadata")
+    assert written.index("## Update (2026-07-25)") > written.index("```markdown")
+
+
+def test_find_insertion_index_fence_variants_in_process():
+    def idx(text):
+        return note_writer._find_insertion_index(note_writer._split_lines_lf_crlf(text))
+
+    # Marker inside a tilde fence is ignored; EOF is used instead.
+    assert idx("~~~\n## Tool Usage\n~~~\n") == 3
+    # An info-string line (```python) opens but does NOT close a fence.
+    assert idx("```python\n## Tool Usage\n```\n## Files Touched\n") == 3
+    # A longer closing fence is valid; a shorter one is not.
+    assert idx("```\n## Tool Usage\n````\n## Files Touched\n") == 3
+    assert idx("````\n## Tool Usage\n```\n## Files Touched\nx\n") == 5
+    # Unclosed fence swallows the rest -- degrades to append-at-EOF.
+    assert idx("```\n## Tool Usage\nx\n") == 3
+    # No fence at all: first marker wins, top-down.
+    assert idx("intro\n## Tool Usage\n## Files Touched\n") == 1
+
+
+# ---------------------------------------------------------------------------
+# In-process counterparts for the new guards, following this module's
+# convention: the subprocess tests above prove the real CLI behaviour, these
+# let coverage.py instrument the same branches (a subprocess run is not
+# instrumented).
+# ---------------------------------------------------------------------------
+
+def test_validate_update_text_in_process():
+    assert note_writer._validate_update_text("") is not None
+    assert note_writer._validate_update_text("\n  \t\n") is not None
+    assert note_writer._validate_update_text("## Update\n") is None
+
+
+def test_run_write_in_process_refuses_existing_note(tmp_path, capsys):
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    dest = vault / "claude-insights" / "x.md"
+    dest.write_text(MINIMAL_FM + "original\n", encoding="utf-8")
+
+    rc = note_writer.run_write(
+        str(vault), "claude-insights", "x.md", MINIMAL_FM + "new\n"
+    )
+
+    assert rc == 1
+    assert "already exists" in capsys.readouterr().err
+    assert dest.read_text(encoding="utf-8") == MINIMAL_FM + "original\n"
+
+    rc2 = note_writer.run_write(
+        str(vault), "claude-insights", "x.md", MINIMAL_FM + "new\n", overwrite=True
+    )
+    assert rc2 == 0
+    assert dest.read_text(encoding="utf-8") == MINIMAL_FM + "new\n"
+
+
+def test_run_append_update_in_process_content_and_flag_errors(tmp_path, capsys):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "n.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    # empty update text
+    assert note_writer.run_append_update(str(vault), str(note), "") == 1
+    assert "empty" in capsys.readouterr().err
+
+    # malformed --last-updated
+    assert note_writer.run_append_update(
+        str(vault), str(note), UPDATE_SECTION, "not-a-date"
+    ) == 1
+    assert "last-updated" in capsys.readouterr().err
+
+    # malformed tag
+    assert note_writer.run_append_update(
+        str(vault), str(note), UPDATE_SECTION, None, "bad: tag"
+    ) == 1
+    assert "invalid tag" in capsys.readouterr().err
+
+    assert note.read_bytes() == before
+
+
+def test_run_append_update_in_process_frontmatter_only_no_trailing_newline(tmp_path):
+    """In-process counterpart of the closing-fence weld fix."""
+    vault = tmp_path / "vault"
+    note = _make_note(
+        vault, "claude-insights", "fm.md", "---\ntype: x\ndate: 2026-01-01\n---"
+    )
+
+    assert note_writer.run_append_update(str(vault), str(note), "## Update (x)\n") == 0
+    written = note.read_text(encoding="utf-8")
+    assert "---## Update" not in written
+    assert written.startswith("---\ntype: x\ndate: 2026-01-01\n---\n\n")
+
+
+def test_read_stdin_capped_reports_oversize_in_process(monkeypatch):
+    monkeypatch.setattr(
+        sys, "stdin", io.StringIO("A" * (note_writer.STDIN_CAP_CHARS + 10))
+    )
+    text, oversized = note_writer._read_stdin_capped()
+    assert oversized is True
+    assert len(text) == note_writer.STDIN_CAP_CHARS
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO("A" * note_writer.STDIN_CAP_CHARS))
+    text2, oversized2 = note_writer._read_stdin_capped()
+    assert oversized2 is False
+    assert len(text2) == note_writer.STDIN_CAP_CHARS

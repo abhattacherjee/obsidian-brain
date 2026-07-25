@@ -13,7 +13,18 @@ in environments that route writes through a context-blind helper sub-agent
   (``last_updated``, new tags) in the SAME atomic write. Never creates a
   file -- the target must already exist.
 
-Stdin is capped at 1_000_000 characters (project CLAUDE.md security pattern).
+Stdin is capped at 1_000_000 characters (project CLAUDE.md security pattern)
+and OVERSIZE input is rejected, never truncated: a silently truncated note
+that still reports ``OK:`` is the exact failure mode this CLI exists to
+remove (worst at /standup's in-place overwrite, where a truncated write
+destroys the original note).
+
+Both commands also validate the CONTENT they are handed, not just their
+arguments: empty/whitespace-only stdin, a note body with no frontmatter
+fence pair, and malformed ``--add-tags``/``--last-updated`` values are all
+rejected before any filesystem side effect. Without that, the CLI faithfully
+persists garbage and prints ``OK:`` — the skill then reports "saved!" over a
+0-byte or structurally broken note.
 """
 from __future__ import annotations
 
@@ -25,12 +36,27 @@ from pathlib import Path
 
 from obsidian_utils import write_vault_note
 
-STDIN_CAP_BYTES = 1_000_000
+# Counts CHARACTERS, not bytes -- sys.stdin.read(n) is a character read on a
+# text stream (the docstrings have always said "characters"; the constant was
+# named ...BYTES, which contradicted them). Note hooks/check_items_cli.py has
+# its own separate STDIN_CAP_BYTES; this rename is deliberately local.
+STDIN_CAP_CHARS = 1_000_000
 
 
-def _read_stdin_capped() -> str:
-    """Read stdin with the 1_000_000-character cap (project security pattern)."""
-    return sys.stdin.read(STDIN_CAP_BYTES)
+def _read_stdin_capped() -> tuple[str, bool]:
+    """Read stdin, returning ``(text, oversized)``.
+
+    Reads ``STDIN_CAP_CHARS + 1`` characters so overflow is *detectable*:
+    a plain ``read(cap)`` returns a silently truncated string that is
+    indistinguishable from an input that happened to be exactly at the cap,
+    which is how a 1.2 MB note previously landed truncated mid-body with an
+    ``OK:`` line. Callers must reject when ``oversized`` is True rather than
+    writing the truncated prefix.
+    """
+    text = sys.stdin.read(STDIN_CAP_CHARS + 1)
+    if len(text) > STDIN_CAP_CHARS:
+        return text[:STDIN_CAP_CHARS], True
+    return text, False
 
 
 def _validate_folder(folder: str):
@@ -121,11 +147,15 @@ def _validate_filename(filename: str):
     ``notes/x.md`` — so a filename segment can never place the write outside
     the single target folder write_vault_note() was given.
 
-    Also rejects a filename with nothing before the ``.md`` suffix (e.g.
-    ``".md"`` itself), which would otherwise create a hidden dotfile in the
-    target folder. Checked via length, not ``Path(...).stem`` — pathlib
-    treats a leading-dot name as an extension-less dotfile, so
-    ``Path(".md").stem == ".md"`` (not empty) and would silently miss this.
+    Also rejects any leading-dot filename, which would create a note
+    invisible to Obsidian (never indexed, never surfaced by /recall) while
+    the skill prints "saved!" with a path. Checked as ``startswith(".")``,
+    not via a length comparison against ``".md"`` and not via
+    ``Path(...).stem``: the length check caught only the literal ``".md"``
+    and let ``"..md"`` and ``".secret.md"`` through, and pathlib treats a
+    leading-dot name as an extension-less dotfile, so
+    ``Path(".md").stem == ".md"`` (not empty) and would silently miss all
+    three. ``startswith(".")`` subsumes every one of them.
     """
     if Path(filename).name != filename:
         return (
@@ -134,20 +164,102 @@ def _validate_filename(filename: str):
         )
     if not filename.endswith(".md"):
         return f"invalid filename (must end with .md): {filename!r}"
-    if len(filename) <= len(".md"):
-        return f"invalid filename (must have a non-empty name before .md): {filename!r}"
+    if filename.startswith("."):
+        return (
+            f"invalid filename (must not start with '.' — a hidden note is "
+            f"never indexed by Obsidian): {filename!r}"
+        )
     return None
 
 
-def run_write(vault_path: str, folder: str, filename: str, content: str) -> int:
+def _validate_note_content(content: str):
+    """Return an error message if ``content`` is not a plausible, complete
+    vault note, else None.
+
+    Three checks, all on the content the caller piped in on stdin — the
+    layer nothing else inspects:
+
+    1. Non-empty (after stripping whitespace). An empty heredoc body, or a
+       shell variable that expanded to nothing, previously produced a
+       0-byte note, exit 0 and an ``OK:`` line; /retro then armed its
+       Stop-hook classification gate pointing at that empty file.
+    2. Starts with a ``---`` frontmatter fence at column 0. Every caller
+       pipes a full note (frontmatter + body), so this is safe for all of
+       them — and it permanently closes the indented-heredoc corruption
+       class: an indented ``   ---`` is not a frontmatter fence, so a
+       wrongly-indented heredoc now fails loudly instead of landing a note
+       whose frontmatter no longer parses.
+    3. Has a closing ``---`` fence somewhere after the opening one.
+       Unterminated frontmatter means Obsidian loses the note's type and
+       tags entirely.
+    """
+    if not content.strip():
+        return "note content is empty or whitespace-only (nothing written)"
+
+    lines = _split_lines_lf_crlf(content)
+    first = lines[0].rstrip("\r\n")
+    if first != "---":
+        return (
+            "note content must begin with a '---' frontmatter fence at "
+            f"column 0 (first line was: {first[:60]!r})"
+        )
+    for line in lines[1:]:
+        if line.rstrip("\r\n") == "---":
+            return None
+    return "note content has no closing '---' frontmatter fence"
+
+
+def _validate_update_text(update_text: str):
+    """Return an error message if ``update_text`` is not a usable update
+    section, else None.
+
+    Empty/whitespace-only content previously returned ``OK:``, bumped
+    ``last_updated`` and appended only blank lines — the note looked freshly
+    updated but gained nothing, and /compress deliberately drops its
+    verification re-read on the strength of this command's exit code.
+
+    ``strip()`` being non-empty is exactly equivalent to "contains at least
+    one non-blank line": a line with any non-whitespace character survives
+    ``strip()``, and a text made only of blank lines does not. One check
+    covers both requirements.
+    """
+    if not update_text.strip():
+        return (
+            "update section content is empty or whitespace-only "
+            "(note left unchanged)"
+        )
+    return None
+
+
+def run_write(
+    vault_path: str,
+    folder: str,
+    filename: str,
+    content: str,
+    overwrite: bool = False,
+) -> int:
     """Write ``content`` to ``<vault_path>/<folder>/<filename>``.
 
     Validates ``vault_path``/``folder``/``filename`` (see
-    _validate_vault_path/_validate_folder/_validate_filename) before
-    touching the filesystem, then delegates the actual write entirely to
+    _validate_vault_path/_validate_folder/_validate_filename) and then
+    ``content`` (see _validate_note_content) before touching the
+    filesystem, then delegates the actual write entirely to
     write_vault_note() for the atomic write, the path-traversal containment
     check, and the 0o600 permission — this function does not reimplement
     any of that.
+
+    Argument validation runs BEFORE content validation deliberately: the
+    path guards are the security-critical ones, and keeping them first means
+    a traversal/dot-segment probe is still rejected *by its own guard*
+    regardless of what content happens to be piped in.
+
+    ``overwrite`` (CLI: ``--overwrite``) must be passed explicitly to
+    replace an existing note. Claude Code's Write tool — which every caller
+    used before #269 — refuses to overwrite a file it has not Read in the
+    session, so a filename-hash collision used to be loud; without this
+    flag the conversion would silently destroy an existing insight and
+    report success. Exactly one call site legitimately overwrites in place
+    (/standup's Step 6.6 note upgrade) and it passes the flag.
 
     Prints ``OK: <abs path>`` to stdout and returns 0 on success.
     Prints ``ERROR: <msg>`` to stderr and returns 1 on failure (validation
@@ -160,9 +272,19 @@ def run_write(vault_path: str, folder: str, filename: str, content: str) -> int:
         _validate_vault_path(vault_path)
         or _validate_folder(folder)
         or _validate_filename(filename)
+        or _validate_note_content(content)
     )
     if validation_err:
         print(f"ERROR: {validation_err}", file=sys.stderr)
+        return 1
+
+    dest_probe = Path(vault_path) / folder / filename
+    if not overwrite and dest_probe.exists():
+        print(
+            f"ERROR: note already exists (pass --overwrite to replace it "
+            f"deliberately): {dest_probe}",
+            file=sys.stderr,
+        )
         return 1
 
     err = write_vault_note(vault_path, folder, filename, content)
@@ -212,6 +334,127 @@ _TAGS_FLOW_RE = re.compile(r"^tags:\s*\[(?P<inner>.*)\]\s*$")
 # endings are recognized -- match/compare only ever inspects content, never
 # reconstructs a line from its stripped form, so this never discards an
 # original line ending.
+
+
+# Characters that must never appear in a tag value. `:` and `#` change how
+# YAML parses the line the tag is rendered into (`- foo: bar` turns the tags
+# sequence into a sequence of maps and breaks tag indexing/Dataview; `#`
+# starts a comment); the quote characters would unbalance a flow-style
+# `tags: [...]` line. Newline/CR are covered by the separate is-whitespace
+# check below, which is what blocks the frontmatter-key injection vector
+# (a tag of "claude/topic/a\ntype: hijacked" rendered an extra `type:` line
+# that overrode the note's own).
+_TAG_FORBIDDEN_CHARS = frozenset(":#\"'")
+
+_LAST_UPDATED_VALUE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# A fenced code block opener/closer: up to 3 leading spaces/tabs, then a run
+# of >= 3 backticks or tildes (CommonMark). Used to keep the insertion-point
+# scan out of fenced blocks.
+_FENCE_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+
+
+def _validate_tags(add_tags_csv):
+    """Return ``(tags, error)`` for a ``--add-tags`` CSV value.
+
+    ``add_tags_csv is None`` (flag omitted) yields ``([], None)`` — not
+    requested is not an error. A flag that IS present must name at least one
+    valid tag: these values are LLM-generated from session content and are
+    interpolated straight into YAML frontmatter, so by this repo's own
+    standard they are untrusted input and every one of them is validated
+    before either merge path (block-style or flow-style) runs.
+
+    Per item: surrounding spaces/tabs are stripped (conventional CSV
+    spacing, e.g. ``a, b``), then the tag must be non-empty and must contain
+    no whitespace at all (newline, CR, space, tab) and none of
+    ``_TAG_FORBIDDEN_CHARS``. Note the strip is ``" \\t"`` only — it
+    deliberately does NOT strip a newline, so ``"a\\ntype: hijacked"`` is
+    still seen (and rejected) as containing a newline rather than being
+    quietly trimmed into something valid.
+    """
+    if add_tags_csv is None:
+        return [], None
+
+    tags = []
+    for raw in add_tags_csv.split(","):
+        tag = raw.strip(" \t")
+        if not tag:
+            return None, (
+                f"invalid --add-tags value (empty tag item): {add_tags_csv!r} "
+                "— omit the flag entirely when there are no new tags"
+            )
+        for ch in tag:
+            if ch.isspace() or ch in _TAG_FORBIDDEN_CHARS:
+                return None, (
+                    f"invalid tag {tag!r}: contains {ch!r}, which would corrupt "
+                    "the note's YAML frontmatter (tags must not contain "
+                    "whitespace, ':', '#', or quote characters)"
+                )
+        tags.append(tag)
+    return tags, None
+
+
+def _validate_last_updated(last_updated):
+    """Return an error message if a PRESENT ``--last-updated`` value is
+    unusable, else None. ``None`` (flag omitted) is fine — that means "do
+    not bump", which is the documented opt-in behaviour.
+
+    An empty value is the ``$VAULT_PATH=""`` shape all over again: the call
+    site passes ``--last-updated "$TODAY"``, and an unset ``TODAY`` yields a
+    present flag with an empty value, which used to be indistinguishable
+    from "flag omitted" and skipped the bump with no signal at all. The
+    ``YYYY-MM-DD`` format check additionally keeps an arbitrary string
+    (newline included) out of the frontmatter line this value is rendered
+    into.
+    """
+    if last_updated is None:
+        return None
+    if not last_updated.strip():
+        return (
+            "--last-updated was given an empty value (omit the flag entirely "
+            "if no last_updated bump is wanted)"
+        )
+    if not _LAST_UPDATED_VALUE_RE.match(last_updated):
+        return f"invalid --last-updated value (must be YYYY-MM-DD): {last_updated!r}"
+    return None
+
+
+def _find_insertion_index(body_lines: list[str]) -> int:
+    """Return the index in ``body_lines`` where the update section belongs:
+    the first trailing marker at fence depth 0, or ``len(body_lines)`` if
+    there is none.
+
+    Fence tracking is load-bearing, not defensive: notes ABOUT this plugin
+    routinely quote a session-note template inside a fenced block, and such
+    a block contains lines like ``## Tool Usage``. Without fence state the
+    scan matched the quoted heading and wedged the whole update section
+    INSIDE someone else's code fence — rendering it as literal code and
+    pushing the real body out past the fence, at exit 0.
+
+    A fence opens on a line of >= 3 backticks/tildes and closes only on a
+    line using the SAME character, at least as long, with nothing but
+    whitespace after it (CommonMark) — so a ```` ```python ```` opener is
+    not mistaken for a closer. An unclosed fence swallows the rest of the
+    note, which degrades to "append at EOF": the safe direction.
+    """
+    open_fence = None  # (fence char, fence length)
+    for idx, line in enumerate(body_lines):
+        stripped = line.rstrip("\r\n")
+        m = _FENCE_RE.match(stripped)
+        if m:
+            marker = m.group("fence")
+            if open_fence is None:
+                open_fence = (marker[0], len(marker))
+            elif (
+                marker[0] == open_fence[0]
+                and len(marker) >= open_fence[1]
+                and not m.group("info").strip()
+            ):
+                open_fence = None
+            continue
+        if open_fence is None and _is_trailing_marker(line):
+            return idx
+    return len(body_lines)
 
 
 def _is_trailing_marker(line: str) -> bool:
@@ -547,6 +790,11 @@ def _parse_append_update_flags(argv: list[str]):
     optional -- an omitted flag is a no-op for that mutation, not an
     error). On a parse error the first two values are None and ``error`` is
     a usage-appropriate message.
+
+    ``None`` here means "flag absent" and is the ONLY benign case: a flag
+    present with an empty or malformed value is rejected downstream by
+    ``_validate_last_updated``/``_validate_tags``, which is why this
+    function must keep returning ``None`` (not ``""``) for an absent flag.
     """
     last_updated = None
     add_tags_csv = None
@@ -580,9 +828,17 @@ def run_append_update(
 
     Insertion point: scans the note body (after the frontmatter's closing
     fence) top-down for the first line matching a trailing metadata marker
-    (see ``_TRAILING_MARKERS``/``_SUMMARY_SOURCE_RE``) and inserts
-    ``update_text`` immediately before it, adding a blank line on either
-    side as needed. If no marker is found, appends at end of file.
+    (see ``_TRAILING_MARKERS``/``_SUMMARY_SOURCE_RE``) *outside any fenced
+    code block* (see ``_find_insertion_index``) and inserts ``update_text``
+    immediately before it, adding a blank line on either side as needed. If
+    no marker is found, appends at end of file.
+
+    Content validation (``update_text``, ``last_updated``, ``add_tags_csv``)
+    happens before the note is even read — see ``_validate_update_text`` /
+    ``_validate_last_updated`` / ``_validate_tags``. Empty content, an empty
+    or malformed date, or a tag that would corrupt the frontmatter are all
+    errors, not silent no-ops: /compress drops its verification re-read on
+    the strength of this command's exit code.
 
     Frontmatter mutations (both optional, applied via ``_apply_last_updated``
     / ``_apply_add_tags``): replace-or-insert ``last_updated``, and merge new
@@ -608,9 +864,18 @@ def run_append_update(
     its entire body silently rewritten to LF, which is exactly the kind of
     outside-the-inserted-section change this command promises never to make.
     """
-    vault_err = _validate_vault_path(vault_path)
+    vault_err = (
+        _validate_vault_path(vault_path)
+        or _validate_update_text(update_text)
+        or _validate_last_updated(last_updated)
+    )
     if vault_err:
         print(f"ERROR: {vault_err}", file=sys.stderr)
+        return 1
+
+    add_tags, tags_err = _validate_tags(add_tags_csv)
+    if tags_err:
+        print(f"ERROR: {tags_err}", file=sys.stderr)
         return 1
 
     resolved, err = _resolve_note_path(vault_path, note_path)
@@ -636,20 +901,18 @@ def run_append_update(
         )
         return 1
 
-    if last_updated:
+    # `is not None`, not truthiness: an empty value is a *present* flag with
+    # a broken value (already rejected by _validate_last_updated above), not
+    # an omitted one.
+    if last_updated is not None:
         fm_lines, fm_err = _apply_last_updated(fm_lines, last_updated, eol=eol)
         if fm_err:
             print(f"ERROR: {fm_err}", file=sys.stderr)
             return 1
 
-    add_tags = [t.strip() for t in (add_tags_csv or "").split(",") if t.strip()]
     fm_lines = _apply_add_tags(fm_lines, add_tags, eol=eol)
 
-    insertion_idx = len(body_lines)
-    for idx, line in enumerate(body_lines):
-        if _is_trailing_marker(line):
-            insertion_idx = idx
-            break
+    insertion_idx = _find_insertion_index(body_lines)
 
     prefix = body_lines[:insertion_idx]
     if prefix:
@@ -664,6 +927,15 @@ def run_append_update(
             prefix = prefix[:-1] + [last_line + eol, eol]
         elif last_line.strip() != "":
             prefix = prefix + [eol]
+    elif not close_fence.endswith(("\n", "\r")):
+        # Symmetric case: the note is frontmatter ONLY, with no trailing
+        # newline, so the closing `---` is the file's last line and carries
+        # no terminator. With an empty `prefix` the branch above never runs,
+        # and the reassembly below would weld the update heading straight
+        # onto the fence (`---## Update (...)`) -- leaving the frontmatter
+        # unterminated, so Obsidian loses the note's type and tags, at exit
+        # 0. Terminate the fence AND add the blank-line separator.
+        close_fence = close_fence + eol + eol
 
     block_text = _normalize_eol(update_text, eol)
     if not block_text.endswith(eol):
@@ -681,16 +953,31 @@ def run_append_update(
     return 0
 
 
+def _oversize_error() -> str:
+    """The single ``ERROR:`` line both commands print on oversize stdin.
+
+    Rejecting rather than truncating: a truncated note written under an
+    ``OK:`` line loses its tail (e.g. ``## Session Metadata``) with no
+    signal, and at /standup's in-place ``--overwrite`` site it would replace
+    a complete note with a truncated one.
+    """
+    return (
+        f"ERROR: stdin exceeds the {STDIN_CAP_CHARS}-character cap; "
+        "nothing written (split the content or shorten the note)"
+    )
+
+
 def main():
     """CLI entrypoint.
 
     Usage:
-      note_writer.py write <vault_path> <folder> <filename>
+      note_writer.py write <vault_path> <folder> <filename> [--overwrite]
       note_writer.py append-update <vault_path> <note_path> \
 [--last-updated YYYY-MM-DD] [--add-tags a,b,c]
     """
     usage = (
-        "usage: note_writer.py write <vault_path> <folder> <filename>\n"
+        "usage: note_writer.py write <vault_path> <folder> <filename> "
+        "[--overwrite]\n"
         "       note_writer.py append-update <vault_path> <note_path> "
         "[--last-updated YYYY-MM-DD] [--add-tags a,b,c]"
     )
@@ -700,12 +987,25 @@ def main():
 
     cmd = sys.argv[1]
     if cmd == "write":
-        if len(sys.argv) != 5:
+        positional = []
+        overwrite = False
+        for arg in sys.argv[2:]:
+            if arg == "--overwrite":
+                overwrite = True
+            elif arg.startswith("--"):
+                print(f"ERROR: unknown flag: {arg!r}", file=sys.stderr)
+                sys.exit(2)
+            else:
+                positional.append(arg)
+        if len(positional) != 3:
             print(usage, file=sys.stderr)
             sys.exit(2)
-        vault_path, folder, filename = sys.argv[2], sys.argv[3], sys.argv[4]
-        content = _read_stdin_capped()
-        sys.exit(run_write(vault_path, folder, filename, content))
+        vault_path, folder, filename = positional
+        content, oversized = _read_stdin_capped()
+        if oversized:
+            print(_oversize_error(), file=sys.stderr)
+            sys.exit(1)
+        sys.exit(run_write(vault_path, folder, filename, content, overwrite=overwrite))
 
     if cmd == "append-update":
         if len(sys.argv) < 4:
@@ -716,7 +1016,10 @@ def main():
         if flag_err:
             print(f"ERROR: {flag_err}", file=sys.stderr)
             sys.exit(2)
-        update_text = _read_stdin_capped()
+        update_text, oversized = _read_stdin_capped()
+        if oversized:
+            print(_oversize_error(), file=sys.stderr)
+            sys.exit(1)
         sys.exit(
             run_append_update(vault_path, note_path, update_text, last_updated, add_tags_csv)
         )

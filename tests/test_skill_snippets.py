@@ -9,8 +9,21 @@ import pytest
 _REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 
+# Single-quoted snippets, possibly spanning lines (the long-standing form).
+_SQ_SNIPPET_RE = re.compile(r"python3\s+-c\s+'(.*?)'", re.DOTALL)
+# Double-quoted snippets. Deliberately SINGLE-LINE and quote-free
+# (``[^"\n]*``): the note_writer.py call sites use a double-quoted one-liner
+# so their own inner strings can be single-quoted, and without this pattern
+# none of them were linted at all. Multi-line double-quoted snippets (e.g.
+# /check-items) embed their own ``"`` characters, so a naive DOTALL match
+# would slice them at the wrong quote and "lint" a fragment; requiring the
+# closing quote on the same line skips those instead of mis-parsing them.
+_DQ_SNIPPET_RE = re.compile(r'python3\s+-c\s+"([^"\n]*)"')
+
+
 def _extract_python_snippets():
-    """Extract python3 -c '...' blocks from all SKILL.md files."""
+    """Extract python3 -c '...' and single-line python3 -c "..." blocks from
+    all SKILL.md files."""
     snippets = []
     for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
         # Extract skill name from path: .../skills/<name>/SKILL.md
@@ -18,7 +31,9 @@ def _extract_python_snippets():
         skill_name = parts[-2]
         with open(skill_path, encoding="utf-8") as f:
             content = f.read()
-        for i, match in enumerate(re.finditer(r"python3\s+-c\s+'(.*?)'", content, re.DOTALL)):
+        matches = list(_SQ_SNIPPET_RE.finditer(content))
+        matches += list(_DQ_SNIPPET_RE.finditer(content))
+        for i, match in enumerate(matches):
             # Dedent to handle snippets indented inside bash blocks in SKILL.md
             code = textwrap.dedent(match.group(1))
             snippets.append((f"{skill_name}-{i}", code))
@@ -166,3 +181,89 @@ def test_snippets_import_glob_before_usage():
                     f"Snippet {name} uses glob.* before importing glob"
                 )
                 break
+
+
+# ---------------------------------------------------------------------------
+# Heredoc terminators for note_writer.py must be per-invocation, not fixed.
+#
+# A quoted delimiter blocks $/backtick expansion but NOT early termination:
+# a note body containing a line exactly equal to the terminator ends the
+# heredoc there, truncating the note and handing the rest of its text to the
+# shell as commands. Notes about this plugin routinely quote these blocks, so
+# the terminator carries a `<eof4>` placeholder the model substitutes with
+# fresh hex per run. These tests exist so a future edit cannot quietly revert
+# to a fixed delimiter.
+# ---------------------------------------------------------------------------
+
+_HEREDOC_OPEN_RE = re.compile(r"<<'(OB_[A-Za-z0-9_<>]*)'")
+
+
+def test_note_writer_heredoc_terminators_are_per_invocation():
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill_name = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as f:
+            content = f.read()
+        for delim in _HEREDOC_OPEN_RE.findall(content):
+            assert delim.endswith("_<eof4>"), (
+                f"Skill {skill_name} uses a FIXED heredoc terminator {delim!r}. "
+                "Note content containing that exact line ends the heredoc early "
+                "and executes the remainder as shell. Use OB_..._EOF_<eof4> and "
+                "substitute fresh hex per invocation."
+            )
+
+
+def test_note_writer_heredoc_openers_have_matching_terminator_lines():
+    """Every `<<'OB_..._<eof4>'` opener needs its terminator on its own line
+    at column 0 — an opener whose terminator was renamed (or indented) would
+    swallow the rest of the block."""
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill_name = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as f:
+            content = f.read()
+        for delim in _HEREDOC_OPEN_RE.findall(content):
+            terminators = re.findall(
+                rf"^{re.escape(delim)}$", content, re.MULTILINE
+            )
+            assert terminators, (
+                f"Skill {skill_name}: heredoc opener {delim!r} has no matching "
+                "terminator at column 0"
+            )
+
+
+def test_note_writer_call_sites_guard_missing_cli():
+    """Each note_writer.py block must resolve the plugin cache version-aware
+    (lexicographic max() picks 3.9.0 over 3.10.0) and prove the CLI is there,
+    so a stale cache fails in the documented `ERROR:` shape rather than as a
+    raw Python `can't open file` message."""
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill_name = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        for lineno, line in enumerate(lines):
+            if 'python3 "$HOOKS/note_writer.py"' not in line:
+                continue
+            window = "\n".join(lines[max(0, lineno - 6):lineno])
+            assert 'test -f "$HOOKS/note_writer.py"' in window, (
+                f"Skill {skill_name} line {lineno + 1} invokes note_writer.py "
+                "with no preceding `test -f` existence guard"
+            )
+            assert "key=lambda p:" in window, (
+                f"Skill {skill_name} line {lineno + 1} resolves $HOOKS with a "
+                "lexicographic max() — use the version-aware sort key"
+            )
+
+
+def test_only_standup_passes_overwrite():
+    """--overwrite is legitimate at exactly one call site (/standup's Step 6.6
+    in-place note upgrade). Anywhere else it would let a filename-hash
+    collision silently destroy an existing note."""
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill_name = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as f:
+            content = f.read()
+        for line in content.split("\n"):
+            if 'python3 "$HOOKS/note_writer.py"' in line and "--overwrite" in line:
+                assert skill_name == "standup", (
+                    f"Skill {skill_name} passes --overwrite to note_writer.py; "
+                    "only /standup's in-place upgrade may do that"
+                )
