@@ -200,15 +200,65 @@ def _detect_line_ending(text: str) -> str:
 
 
 def _normalize_eol(text: str, eol: str) -> str:
-    """Canonicalize every newline in ``text`` to ``eol``, so content coming
-    from elsewhere (the update-section text piped in on stdin, which is not
-    read from the note file and so carries no relationship to its line
-    ending) matches the destination note's convention instead of mixing
-    endings within one file."""
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    """Canonicalize every GENUINE line terminator in ``text`` to ``eol``,
+    so content coming from elsewhere (the update-section text piped in on
+    stdin, which is not read from the note file and so carries no
+    relationship to its line ending) matches the destination note's
+    convention instead of mixing endings within one file.
+
+    Exactly two ordered replacements, both targeting only real line
+    terminators: (1) collapse existing ``"\\r\\n"`` pairs to ``"\\n"``, then
+    (2) expand every ``"\\n"`` to ``eol``. A bare ``"\\r"`` NOT part of a
+    ``"\\r\\n"`` pair -- e.g. a pasted terminal progress-bar redraw inside a
+    fenced code block -- is touched by neither step and survives
+    byte-identical. (A prior version also did a blanket
+    ``.replace("\\r", "\\n")``, which silently turned any such bare ``\\r``
+    into a real line break -- exactly the kind of content corruption this
+    function exists to prevent, just inside the appended section instead of
+    the rest of the file. Fixed; do not reintroduce that replacement.)
+    """
+    normalized = text.replace("\r\n", "\n")
     if eol == "\r\n":
         normalized = normalized.replace("\n", "\r\n")
     return normalized
+
+
+def _split_lines_lf_crlf(text: str) -> list[str]:
+    """Split ``text`` into lines, each with its terminator attached,
+    recognizing ONLY ``"\\r\\n"`` and ``"\\n"`` as line terminators.
+
+    Deliberately NOT ``str.splitlines(keepends=True)``: that method also
+    treats a bare ``"\\r"`` (not part of a ``"\\r\\n"`` pair) -- plus
+    ``\\v``, ``\\f``, and several Unicode separators -- as a line break.
+    A note body can legitimately contain a bare ``\\r`` (e.g. a pasted
+    terminal progress-bar redraw inside a fenced code block); splitting on
+    it would be the same class of corruption ``_normalize_eol`` guards
+    against, just via a different function. Every line this parses is
+    later reassembled with a plain ``"".join(...)``, so this is lossless
+    for reconstruction regardless of where it draws boundaries -- but where
+    it draws them still matters for ``_is_trailing_marker``/frontmatter-key
+    matching and the "does the file already end in a newline" check, so it
+    must not draw a boundary at a bare ``\\r`` that isn't really one.
+    """
+    lines: list[str] = []
+    start = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            lines.append(text[start:i + 1])
+            start = i + 1
+            i += 1
+        elif ch == "\r" and i + 1 < n and text[i + 1] == "\n":
+            lines.append(text[start:i + 2])
+            start = i + 2
+            i += 2
+        else:
+            i += 1
+    if start < n:
+        lines.append(text[start:])
+    return lines
 
 
 def _unquote_tag(raw: str) -> str:
@@ -276,7 +326,7 @@ def _resolve_note_path(vault_path: str, note_path: str):
 
 
 def _split_frontmatter(lines: list[str]):
-    """Split ``lines`` (from ``str.splitlines(keepends=True)``) into the
+    """Split ``lines`` (from ``_split_lines_lf_crlf``) into the
     frontmatter fence pair and body.
 
     Returns ``(open_fence_line, frontmatter_lines, close_fence_line,
@@ -531,7 +581,7 @@ def run_append_update(
 
     eol = _detect_line_ending(original_text)
 
-    lines = original_text.splitlines(keepends=True)
+    lines = _split_lines_lf_crlf(original_text)
     open_fence, fm_lines, close_fence, body_lines = _split_frontmatter(lines)
     if fm_lines is None:
         print(

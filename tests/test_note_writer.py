@@ -1448,9 +1448,14 @@ def test_detect_line_ending_in_process():
 
 
 def test_normalize_eol_in_process():
-    assert note_writer._normalize_eol("a\nb\r\nc\r", "\r\n") == "a\r\nb\r\nc\r\n"
+    # Genuine \r\n and \n terminators are collapsed/expanded correctly.
+    assert note_writer._normalize_eol("a\nb\r\nc\n", "\r\n") == "a\r\nb\r\nc\r\n"
     assert note_writer._normalize_eol("a\r\nb\r\n", "\n") == "a\nb\n"
     assert note_writer._normalize_eol("a\nb\n", "\n") == "a\nb\n"
+    # A trailing bare \r (not part of a \r\n pair) is left untouched by
+    # both replacements -- see test_normalize_eol_does_not_touch_bare_cr_in_process
+    # for the dedicated bare-\r regression coverage.
+    assert note_writer._normalize_eol("a\nb\r\nc\r", "\r\n") == "a\r\nb\r\nc\r"
 
 
 def test_atomic_rewrite_writes_content_bytes_verbatim_no_translation(tmp_path):
@@ -1655,3 +1660,105 @@ def test_run_append_update_in_process_update_text_without_trailing_newline(tmp_p
     assert rc == 0
     written = note.read_text(encoding="utf-8")
     assert "No trailing newline here.\n" in written
+
+
+# ===========================================================================
+# Fix round 2 (post re-review): a bare `\r` (not part of `\r\n`) inside the
+# appended update-section text -- e.g. a pasted terminal progress-bar
+# redraw in a fenced code block -- must survive byte-intact, not get
+# silently converted into a real line break. Regression introduced by the
+# EOL work in fix round 1 (`_normalize_eol`'s blanket `.replace("\r", "\n")`)
+# and by using `str.splitlines()` on the note's own text (which treats a
+# bare `\r` as a line break too). Reproduced fail-first against the code at
+# HEAD (commit 5920fe7) before being fixed -- see the fix report.
+# ===========================================================================
+
+UPDATE_WITH_BARE_CR = (
+    "## Update (2026-07-25)\n"
+    "\n"
+    "```\n"
+    "Downloading... 10%\rDownloading... 50%\rDownloading... 100%\n"
+    "```\n"
+)
+
+
+def test_append_update_bare_cr_in_appended_content_survives_lf_note(tmp_path):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+
+    result = _run_append_update(vault, note, UPDATE_WITH_BARE_CR)
+
+    assert result.returncode == 0, result.stderr
+    after = note.read_bytes()
+    assert b"10%\rDownloading... 50%\rDownloading... 100%\n" in after
+
+
+def test_append_update_bare_cr_in_appended_content_survives_crlf_note(tmp_path):
+    vault = tmp_path / "vault"
+    note = _make_note_bytes(vault, "claude-insights", "insight.md", CRLF_NOTE.encode("utf-8"))
+
+    result = _run_append_update(vault, note, UPDATE_WITH_BARE_CR)
+
+    assert result.returncode == 0, result.stderr
+    after = note.read_bytes()
+    # The bare \r is untouched; the update text's own genuine "\n"
+    # terminators were normalized to the note's CRLF convention, but the
+    # literal "10%\rDownloading" substring (no real terminator there) must
+    # appear verbatim, not turned into "10%\r\nDownloading" or "10%\nDownloading".
+    assert b"10%\rDownloading... 50%\rDownloading... 100%\r\n" in after
+    assert b"10%\r\nDownloading" not in after
+    assert b"10%\nDownloading" not in after
+
+
+def test_append_update_crlf_terminated_update_text_matches_lf_note_ending(tmp_path):
+    """The update text's own GENUINE `\\r\\n` terminators (as opposed to a
+    bare `\\r`) must still be normalized to the destination note's actual
+    line ending -- this is existing, correct behavior from fix round 1 and
+    must not regress."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    crlf_terminated_update = "## Update (2026-07-25)\r\n\r\nSome content.\r\n"
+
+    result = _run_append_update(vault, note, crlf_terminated_update)
+
+    assert result.returncode == 0, result.stderr
+    after = note.read_bytes()
+    assert b"\r" not in after  # note is LF-only; no CRLF should leak in
+    assert b"## Update (2026-07-25)\n\nSome content.\n" in after
+
+
+def test_append_update_crlf_terminated_update_text_matches_crlf_note_ending(tmp_path):
+    vault = tmp_path / "vault"
+    note = _make_note_bytes(vault, "claude-insights", "insight.md", CRLF_NOTE.encode("utf-8"))
+    crlf_terminated_update = "## Update (2026-07-25)\r\n\r\nSome content.\r\n"
+
+    result = _run_append_update(vault, note, crlf_terminated_update)
+
+    assert result.returncode == 0, result.stderr
+    after = note.read_bytes()
+    assert b"## Update (2026-07-25)\r\n\r\nSome content.\r\n" in after
+
+
+def test_normalize_eol_does_not_touch_bare_cr_in_process():
+    # Bare \r survives both directions -- only real terminators are touched.
+    assert note_writer._normalize_eol("a\rb\n", "\n") == "a\rb\n"
+    assert note_writer._normalize_eol("a\rb\n", "\r\n") == "a\rb\r\n"
+    # Genuine \r\n terminators are still collapsed/expanded correctly.
+    assert note_writer._normalize_eol("a\r\nb\r\n", "\n") == "a\nb\n"
+    assert note_writer._normalize_eol("a\nb\n", "\r\n") == "a\r\nb\r\n"
+    # Mixed: a bare \r right next to a genuine \r\n later in the string.
+    assert note_writer._normalize_eol("a\rb\r\nc", "\n") == "a\rb\nc"
+
+
+def test_split_lines_lf_crlf_in_process():
+    # Bare \r is NOT a line boundary -- stays attached to whatever line it's in.
+    lines = note_writer._split_lines_lf_crlf("foo\rbar\n")
+    assert lines == ["foo\rbar\n"]
+
+    # \r\n and \n are both recognized as terminators, each on its own line.
+    lines2 = note_writer._split_lines_lf_crlf("a\r\nb\nc")
+    assert lines2 == ["a\r\n", "b\n", "c"]
+
+    # Lossless reconstruction via straight join, regardless of test case.
+    for text in ("foo\rbar\n", "a\r\nb\nc", "", "no newline at all", "\r\n\r\n"):
+        assert "".join(note_writer._split_lines_lf_crlf(text)) == text
