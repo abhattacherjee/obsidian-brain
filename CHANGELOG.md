@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Codex compatibility design proposal (#270):** `docs/codex-compatibility-design.md` documents how `obsidian-brain` could run as both a Claude Code plugin and a Codex plugin without forking the vault format or duplicating the Python core — Codex packaging metadata, a `runtime_provider.py` adapter for provider-specific config/state/DB paths, transcript and tool-name normalization, and an incremental `skills-codex/` port ordered read-workflows-first. Status: **proposed**; documentation only, no behavior change. The implementation phases it describes will be filed as separate issues.
 
+### Fixed
+- **Vault note persistence no longer depends on a Write tool call (#269):** `/retro`, `/compress`, `/decide`, `/error-log`, `/standup`, `/vault-stats` and `/vault-import` now save notes through a new deterministic CLI (`hooks/note_writer.py`) instead of a Write tool call. Previously, environments that route tool calls through a context-blind helper sub-agent could have that helper simply refuse to write an orchestrator-authored note; the CLI reads the note content from stdin and performs the same path-contained, atomic write directly, so a note save can no longer be silently skipped by a helper's own judgment.
+  - `/compress`'s update-existing path now applies the body append, the `last_updated` bump, and the tag merge in **one** atomic write instead of three separate edits, so a note can no longer be left half-updated if something goes wrong partway through.
+  - **Behavior change:** notes written through this new path now land with file mode `0600` instead of `0644`. This is intentional — it brings the skill-authored write path in line with the hook-authored path (session/snapshot notes) and `/vault-stats`, which were already `0600`. Existing notes on disk are not modified; only newly written notes get the tighter mode.
+
 ## [3.3.0] - 2026-07-21
 
 ### Fixed
