@@ -13,7 +13,7 @@ in environments that route writes through a context-blind helper sub-agent
   (``last_updated``, new tags) in the SAME atomic write. Never creates a
   file -- the target must already exist.
 
-Stdin is capped at 1_000_000 bytes (project CLAUDE.md security pattern).
+Stdin is capped at 1_000_000 characters (project CLAUDE.md security pattern).
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ STDIN_CAP_BYTES = 1_000_000
 
 
 def _read_stdin_capped() -> str:
-    """Read stdin with the 1_000_000-byte cap (project security pattern)."""
+    """Read stdin with the 1_000_000-character cap (project security pattern)."""
     return sys.stdin.read(STDIN_CAP_BYTES)
 
 
@@ -77,6 +77,41 @@ def _validate_folder(folder: str):
     return None
 
 
+def _validate_vault_path(vault_path: str):
+    """Return an error message if ``vault_path`` is not a non-empty,
+    absolute path to an existing directory, else None.
+
+    Neither ``write_vault_note()`` nor ``_resolve_note_path()`` validates
+    this argument -- both resolve it and then check *containment* of the
+    folder/note-path *within* it, which is a no-op guard when the vault
+    path itself is degenerate: ``Path("").resolve()`` and
+    ``Path(".").resolve()`` both resolve to the current working directory,
+    so a write is trivially "contained" in whatever directory the process
+    happens to be running in.
+
+    Every skill call site is preceded by `cd "$(git rev-parse
+    --show-toplevel ...)"`, so if a skill block runs with `$VAULT_PATH`
+    left unsubstituted (e.g. an unset variable in a fresh shell), an
+    unvalidated empty vault_path silently writes session content into the
+    user's git working tree -- exit 0, an `OK:` line, no filesystem error
+    at all. Verified empirically: prior to this guard,
+    ``write("", "claude-insights", "leak.md")`` created
+    ``<cwd>/claude-insights/leak.md`` and printed ``OK:``.
+
+    Checked, in order: non-empty, absolute (a relative path is exactly as
+    unmoored as an empty one -- it resolves relative to the CWD too), and
+    an existing directory. This runs before any other validation or
+    filesystem side effect in both ``write`` and ``append-update``.
+    """
+    if not vault_path:
+        return f"invalid vault path (must not be empty): {vault_path!r}"
+    if not Path(vault_path).is_absolute():
+        return f"invalid vault path (must be absolute, not relative): {vault_path!r}"
+    if not Path(vault_path).is_dir():
+        return f"invalid vault path (not an existing directory): {vault_path!r}"
+    return None
+
+
 def _validate_filename(filename: str):
     """Return an error message if ``filename`` is not a bare ``*.md`` name,
     else None.
@@ -107,11 +142,12 @@ def _validate_filename(filename: str):
 def run_write(vault_path: str, folder: str, filename: str, content: str) -> int:
     """Write ``content`` to ``<vault_path>/<folder>/<filename>``.
 
-    Validates ``folder``/``filename`` (see _validate_folder/_validate_filename)
-    before touching the filesystem, then delegates the actual write entirely
-    to write_vault_note() for the atomic write, the path-traversal
-    containment check, and the 0o600 permission — this function does not
-    reimplement any of that.
+    Validates ``vault_path``/``folder``/``filename`` (see
+    _validate_vault_path/_validate_folder/_validate_filename) before
+    touching the filesystem, then delegates the actual write entirely to
+    write_vault_note() for the atomic write, the path-traversal containment
+    check, and the 0o600 permission — this function does not reimplement
+    any of that.
 
     Prints ``OK: <abs path>`` to stdout and returns 0 on success.
     Prints ``ERROR: <msg>`` to stderr and returns 1 on failure (validation
@@ -120,7 +156,11 @@ def run_write(vault_path: str, folder: str, filename: str, content: str) -> int:
     write_vault_note() either lands the file atomically or returns an error
     before any rename.
     """
-    validation_err = _validate_folder(folder) or _validate_filename(filename)
+    validation_err = (
+        _validate_vault_path(vault_path)
+        or _validate_folder(folder)
+        or _validate_filename(filename)
+    )
     if validation_err:
         print(f"ERROR: {validation_err}", file=sys.stderr)
         return 1
@@ -549,12 +589,13 @@ def run_append_update(
     tags into the ``tags:`` block. ``date``, ``source_session``,
     ``source_session_note``, and ``type`` are never touched.
 
-    Validates path containment (``_resolve_note_path``) and parses/mutates
-    entirely in memory before calling ``_atomic_rewrite`` -- the single
-    write call. On ANY validation, frontmatter-parse, or write failure,
-    prints ``ERROR: <reason>`` to stderr, returns 1, and leaves the file on
-    disk byte-identical (no write attempt is made until every check upstream
-    of it has already succeeded).
+    Validates ``vault_path`` (see ``_validate_vault_path``) and path
+    containment (``_resolve_note_path``), then parses/mutates entirely in
+    memory before calling ``_atomic_rewrite`` -- the single write call. On
+    ANY validation, frontmatter-parse, or write failure, prints
+    ``ERROR: <reason>`` to stderr, returns 1, and leaves the file on disk
+    byte-identical (no write attempt is made until every check upstream of
+    it has already succeeded).
 
     Prints ``OK: <resolved path>`` to stdout and returns 0 on success.
 
@@ -567,6 +608,11 @@ def run_append_update(
     its entire body silently rewritten to LF, which is exactly the kind of
     outside-the-inserted-section change this command promises never to make.
     """
+    vault_err = _validate_vault_path(vault_path)
+    if vault_err:
+        print(f"ERROR: {vault_err}", file=sys.stderr)
+        return 1
+
     resolved, err = _resolve_note_path(vault_path, note_path)
     if err:
         print(f"ERROR: {err}", file=sys.stderr)

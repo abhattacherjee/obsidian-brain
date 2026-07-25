@@ -216,45 +216,52 @@ For each file in `UNSUMMARIZED`, if `upgrade_batch()` is unavailable or the prin
    - `## Errors Encountered` — Bulleted list with error messages, root causes, and fixes. If none, write "None."
    - `## Open Questions / Next Steps` — Checkbox list of specific, actionable items. If none, write "None."
 5. **Preserve the Session Metadata section** at the bottom if it exists.
-6. **Write the upgraded note** by running the note-writer CLI, piping the full rewritten file in on stdin — structured as:
-   - Original frontmatter (unchanged)
-   - `# <title from original note>`
-   - The five summary sections
-   - Session Metadata section (if it existed)
+6. **Write the upgraded note** using the note-writer CLI — see Step 6.6 below for the exact structure and command. Do NOT reproduce the heredoc inline inside this list item; the fenced block below must stay outdented to column 0.
 
-   This overwrites the note in place at its EXISTING path: pass `$SESSIONS_FOLDER` as the folder and the note's own basename (from `$NOTE_PATH`) as `<filename>` — never a new name. `write_vault_note()` (which the CLI delegates to) replaces an existing file atomically via the same temp-file + rename it uses to create one, so overwriting in place is a supported, safe case. **The heredoc delimiter `OB_NOTE_EOF` must stay quoted (`<<'OB_NOTE_EOF'`) — do not drop the quotes in a future edit.** An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the transcript content, silently corrupting the note:
+#### Step 6.6 — Write the upgraded note
 
-   ```bash
-   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-   HOOKS=$(python3 -c "import glob,os; print(max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), default='hooks'))")
-   python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$SESSIONS_FOLDER" "<existing basename>" <<'OB_NOTE_EOF'
-   ---
-   <original frontmatter, unchanged>
-   ---
+Run the note-writer CLI, piping the full rewritten file in on stdin — structured as:
 
-   # <title from original note>
+- Original frontmatter (unchanged)
+- `# <title from original note>`
+- The five summary sections
+- Session Metadata section (if it existed)
 
-   ## Summary
-   ...
+This overwrites the note in place at its EXISTING path: pass `$SESSIONS_FOLDER` as the folder and the note's own basename (from `$NOTE_PATH`) as `<filename>` — never a new name. `write_vault_note()` (which the CLI delegates to) replaces an existing file atomically via the same temp-file + rename it uses to create one, so overwriting in place is a supported, safe case. **The heredoc delimiter `OB_NOTE_EOF` must stay quoted (`<<'OB_NOTE_EOF'`) — do not drop the quotes in a future edit.** An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the transcript content, silently corrupting the note.
 
-   ## Key Decisions
-   ...
+**The fence, its content, and the `OB_NOTE_EOF` terminator below must all sit at column 0 — never indent this block, even though it is referenced from inside a numbered list item.** The heredoc is `<<'OB_NOTE_EOF'`, not `<<-'OB_NOTE_EOF'`, so POSIX requires the terminator at the start of its line; an indented terminator never closes the heredoc, which silently swallows every following command as note content.
 
-   ## Changes Made
-   ...
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "import glob,os; print(max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), default='hooks'))")
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$SESSIONS_FOLDER" "<existing basename>" <<'OB_NOTE_EOF'
+---
+<original frontmatter, unchanged>
+---
 
-   ## Errors Encountered
-   ...
+# <title from original note>
 
-   ## Open Questions / Next Steps
-   ...
+## Summary
+...
 
-   ## Session Metadata
-   ...
-   OB_NOTE_EOF
-   ```
+## Key Decisions
+...
 
-   On success this prints `OK: <absolute path>` and the file is now at mode `0o600` (no separate `chmod` needed — the old `chmod 644` step is gone; this note is user data written by the plugin, same as every other CLI-written note). On failure it prints `ERROR: <reason>` to stderr and exits non-zero; treat this the same as an `upgrade_batch()` failure for this file — it stays at `status: auto-logged`, so a later `/standup` run will retry it.
+## Changes Made
+...
+
+## Errors Encountered
+...
+
+## Open Questions / Next Steps
+...
+
+## Session Metadata
+...
+OB_NOTE_EOF
+```
+
+On success this prints `OK: <absolute path>` and the file is now at mode `0o600` (no separate `chmod` needed — the old `chmod 644` step is gone; this note is user data written by the plugin, same as every other CLI-written note). On failure it prints `ERROR: <reason>` to stderr and exits non-zero; treat this the same as an `upgrade_batch()` failure for this file. Either way — success or failure — this step never modifies frontmatter (see the Important note below), so the note stays at `status: auto-logged` regardless of outcome, and a later `/standup` run will re-attempt the upgrade for any note whose status is still `auto-logged`.
 
 **Important:** Do NOT modify frontmatter. Do NOT change the filename. Do NOT add or remove tags. The content piped into the CLI above must satisfy all three — frontmatter copied verbatim, filename the note's existing basename, tags untouched.
 

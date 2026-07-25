@@ -236,7 +236,7 @@ Search the source note's content for `[[target-filename]]` (filename without `.m
 After writing, set permissions:
 
 ```bash
-chmod 644 "<source-note-path>"
+chmod 600 "<source-note-path>"
 ```
 
 **5.4 — Read the target note** using the Read tool.
@@ -263,7 +263,7 @@ Search the target note's content for `[[source-filename]]`. If it already exists
 After writing, set permissions:
 
 ```bash
-chmod 644 "<target-note-path>"
+chmod 600 "<target-note-path>"
 ```
 
 ### Step 6 — Confirm

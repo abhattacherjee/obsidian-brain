@@ -267,14 +267,17 @@ def test_run_write_forced_error_path_prints_error_and_returns_1(
         note_writer, "write_vault_note", lambda *a, **k: "forced failure for test"
     )
 
-    rc = note_writer.run_write(str(tmp_path / "vault"), "folder", "file.md", "content\n")
+    vault = tmp_path / "vault"
+    vault.mkdir()  # must exist to clear the new _validate_vault_path guard first
+    rc = note_writer.run_write(str(vault), "folder", "file.md", "content\n")
 
     assert rc == 1
     captured = capsys.readouterr()
     assert captured.err.strip() == "ERROR: forced failure for test"
     assert captured.out == ""
-    # write_vault_note was faked out entirely, so nothing should exist.
-    assert not (tmp_path / "vault").exists()
+    # write_vault_note was faked out entirely, so it created nothing inside
+    # the (pre-existing, guard-satisfying) vault directory.
+    assert list(vault.iterdir()) == []
 
 
 def test_main_write_dispatch_success_in_process(tmp_path, monkeypatch, capsys):
@@ -522,6 +525,77 @@ def test_write_rejects_dot_md_filename_hidden_dotfile(tmp_path):
     assert not (vault / "claude-sessions" / ".md").exists()
 
 
+# ---------------------------------------------------------------------------
+# vault_path guard (security-critical — Path("").resolve() and a relative
+# path both resolve against the process CWD, not a fixed vault root, so an
+# unsubstituted `$VAULT_PATH` in a skill block would otherwise silently land
+# the note inside whatever directory the CLI happens to be invoked from
+# (every skill site `cd`s into the user's git repo root first). Proven
+# fail-first: prior to _validate_vault_path existing, the empty-string case
+# below returned rc=0 and genuinely created <cwd>/claude-insights/leak.md
+# (see fix report for the exact captured output).
+# ---------------------------------------------------------------------------
+
+def test_write_rejects_empty_vault_path_does_not_leak_into_cwd(tmp_path):
+    """Runs the real CLI with cwd=tmp_path — standing in for "the user's
+    repo root", which every skill call site cds into before invoking the
+    CLI — and asserts nothing lands there when vault_path is empty."""
+    result = subprocess.run(
+        [sys.executable, str(NOTE_WRITER), "write", "", "claude-insights", "leak.md"],
+        input="leak content\n",
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert "OK:" not in result.stdout
+    _assert_no_files_created(tmp_path)
+
+
+def test_write_rejects_relative_vault_path(tmp_path):
+    """A relative vault_path is exactly as unmoored as an empty one — it
+    also resolves against the CWD rather than a fixed vault root."""
+    (tmp_path / "some" / "dir").mkdir(parents=True)
+
+    result = subprocess.run(
+        [sys.executable, str(NOTE_WRITER), "write", "some/dir", "claude-insights", "leak.md"],
+        input="x\n",
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    _assert_no_files_created(tmp_path)
+
+
+def test_write_rejects_nonexistent_absolute_vault_path(tmp_path):
+    missing = tmp_path / "does-not-exist"
+
+    result = _run_write(missing, "claude-insights", "leak.md", "x\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert not missing.exists()
+
+
+def test_write_succeeds_with_valid_absolute_vault_path(tmp_path):
+    """The guard must not reject the ordinary case — a real, existing,
+    absolute vault directory."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = _run_write(vault, "claude-insights", "ok.md", "x\n")
+
+    assert result.returncode == 0, result.stderr
+    assert (vault / "claude-insights" / "ok.md").exists()
+
+
 def test_write_normal_folder_and_filename_still_succeeds(tmp_path):
     """Guards against the validation guard breaking the happy path."""
     vault = tmp_path / "vault"
@@ -537,6 +611,17 @@ def test_write_normal_folder_and_filename_still_succeeds(tmp_path):
 
 
 # In-process counterpart for coverage of the validation helpers directly.
+def test_validate_vault_path_in_process(tmp_path):
+    assert note_writer._validate_vault_path("") is not None
+    assert note_writer._validate_vault_path(".") is not None
+    assert note_writer._validate_vault_path("relative/dir") is not None
+    assert note_writer._validate_vault_path(str(tmp_path / "does-not-exist")) is not None
+
+    existing = tmp_path / "vault"
+    existing.mkdir()
+    assert note_writer._validate_vault_path(str(existing)) is None
+
+
 def test_validate_folder_and_filename_in_process():
     assert note_writer._validate_folder(".obsidian/plugins/evil") is not None
     assert note_writer._validate_folder("../outside") is not None
@@ -566,9 +651,9 @@ def test_run_write_in_process_rejects_invalid_folder_no_write_vault_note_call(
 
     monkeypatch.setattr(note_writer, "write_vault_note", _boom)
 
-    rc = note_writer.run_write(
-        str(tmp_path / "vault"), ".obsidian/plugins/evil", "main.js", "x\n"
-    )
+    vault = tmp_path / "vault"
+    vault.mkdir()  # must exist to clear the new _validate_vault_path guard first
+    rc = note_writer.run_write(str(vault), ".obsidian/plugins/evil", "main.js", "x\n")
 
     assert rc == 1
     captured = capsys.readouterr()
@@ -1011,6 +1096,73 @@ def test_append_update_rejects_directory_as_note_path(tmp_path):
     assert result.returncode == 1
     assert "ERROR" in result.stderr
     assert not_a_file.is_dir()  # untouched, not replaced with a file
+
+
+# ---------------------------------------------------------------------------
+# vault_path guard (same rationale as the `write`-side tests above: an
+# empty or relative vault_path resolves against the CWD, not a fixed vault
+# root, so _resolve_note_path()'s own containment check would otherwise
+# pass trivially for any note_path that happens to sit under the CWD).
+# ---------------------------------------------------------------------------
+
+def test_append_update_rejects_empty_vault_path_does_not_touch_cwd(tmp_path):
+    note = _make_note(tmp_path, "claude-insights", "note.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = subprocess.run(
+        [sys.executable, str(NOTE_WRITER), "append-update", "", str(note)],
+        input=UPDATE_SECTION,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert "OK:" not in result.stdout
+    assert note.read_bytes() == before
+
+
+def test_append_update_rejects_relative_vault_path(tmp_path):
+    note = _make_note(tmp_path, "claude-insights", "note.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = subprocess.run(
+        [sys.executable, str(NOTE_WRITER), "append-update", ".", str(note)],
+        input=UPDATE_SECTION,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert note.read_bytes() == before
+
+
+def test_append_update_rejects_nonexistent_absolute_vault_path(tmp_path):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "note.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(tmp_path / "does-not-exist", note, UPDATE_SECTION)
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert note.read_bytes() == before
+
+
+def test_append_update_succeeds_with_valid_absolute_vault_path(tmp_path):
+    """The guard must not reject the ordinary case."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "note.md", BASIC_NOTE)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
+    assert result.returncode == 0, result.stderr
+    assert "OK:" in result.stdout
 
 
 # ---------------------------------------------------------------------------
