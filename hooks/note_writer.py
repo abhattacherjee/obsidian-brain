@@ -41,13 +41,23 @@ def _validate_folder(folder: str):
     Deliberately NOT an allowlist of known vault folder names: folder names
     are user-configurable (~/.claude/obsidian-brain-config.json) and several
     skills write to different folders. The rules below (no absolute/home
-    path, no ``..`` segment, no dot-prefixed segment) block the actual
-    vector without that coupling.
+    path, no vault-root alias, no ``..`` segment, no dot-prefixed segment)
+    block the actual vector without that coupling.
+
+    Note: ``Path("").parts == Path(".").parts == ()`` — pathlib treats both
+    as "no path at all" rather than as a single dot-segment, so the
+    dot-prefix loop below never sees them. ``folder in ("", ".")`` is
+    checked explicitly for that reason: unchecked, ``Path(vault)/""`` and
+    ``Path(vault)/"."`` both collapse to the vault root itself (still fully
+    contained, so write_vault_note()'s own guard would not catch it either),
+    silently defeating the "write targets a named subfolder" contract.
     """
     if folder.startswith("/"):
         return f"invalid folder (must be relative to vault root, not absolute): {folder!r}"
     if folder.startswith("~"):
         return f"invalid folder (must not reference a home directory with '~'): {folder!r}"
+    if folder in ("", "."):
+        return f"invalid folder (must name a subfolder, not the vault root itself): {folder!r}"
     for part in Path(folder).parts:
         if part == "..":
             return f"invalid folder (contains a '..' traversal segment): {folder!r}"
@@ -67,6 +77,12 @@ def _validate_filename(filename: str):
     separator — including ``../`` traversal and a plain subdirectory like
     ``notes/x.md`` — so a filename segment can never place the write outside
     the single target folder write_vault_note() was given.
+
+    Also rejects a filename with nothing before the ``.md`` suffix (e.g.
+    ``".md"`` itself), which would otherwise create a hidden dotfile in the
+    target folder. Checked via length, not ``Path(...).stem`` — pathlib
+    treats a leading-dot name as an extension-less dotfile, so
+    ``Path(".md").stem == ".md"`` (not empty) and would silently miss this.
     """
     if Path(filename).name != filename:
         return (
@@ -75,6 +91,8 @@ def _validate_filename(filename: str):
         )
     if not filename.endswith(".md"):
         return f"invalid filename (must end with .md): {filename!r}"
+    if len(filename) <= len(".md"):
+        return f"invalid filename (must have a non-empty name before .md): {filename!r}"
     return None
 
 

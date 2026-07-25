@@ -350,11 +350,17 @@ def _assert_no_files_created(tmp_path) -> None:
 
 
 def test_write_rejects_dotted_folder_obsidian_plugin_vector(tmp_path):
-    """The load-bearing case: proven fail-first (see fix report) by running
-    this exact scenario against the pre-fix note_writer.py, which actually
-    wrote executable content to vault/.obsidian/plugins/evil/main.js —
-    write_vault_note()'s containment check does not fire here because the
-    write never leaves the vault root."""
+    """A valid, realistic end-to-end case for the .obsidian/plugins/evil
+    vector — proven fail-first against the pre-fix note_writer.py (see fix
+    report), which actually wrote executable content to
+    vault/.obsidian/plugins/evil/main.js.
+
+    NOTE: this specific filename ("main.js") does NOT isolate the
+    dot-segment rule in _validate_folder — _validate_filename's own
+    extension check independently rejects "main.js" regardless of the
+    folder's dot-segment. See
+    test_write_rejects_dotted_folder_isolated_by_dot_segment_rule below for
+    the test that can ONLY be rejected by the dot-segment rule."""
     vault = tmp_path / "vault"
     vault.mkdir()
 
@@ -362,6 +368,30 @@ def test_write_rejects_dotted_folder_obsidian_plugin_vector(tmp_path):
 
     assert result.returncode == 1
     assert "ERROR" in result.stderr
+    assert "OK:" not in result.stdout
+    _assert_no_files_created(tmp_path)
+
+
+def test_write_rejects_dotted_folder_isolated_by_dot_segment_rule(tmp_path):
+    """The load-bearing isolating case: filename "main.md" passes every
+    OTHER check (bare name, .md extension, non-empty stem) — only
+    _validate_folder's dot-segment rule can reject
+    ".obsidian/plugins/evil" here.
+
+    Proven fail-first empirically: with the `part.startswith(".")` branch
+    in _validate_folder temporarily removed, this exact scenario (folder=
+    ".obsidian/plugins/evil", filename="main.md") returned rc=0 and
+    genuinely wrote the file to
+    vault/.obsidian/plugins/evil/main.md (see fix report for the full
+    command/output). Restoring the branch makes this test pass."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = _run_write(vault, ".obsidian/plugins/evil", "main.md", "malicious md\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert "dot" in result.stderr.lower() or "hidden" in result.stderr.lower()
     assert "OK:" not in result.stdout
     _assert_no_files_created(tmp_path)
 
@@ -439,6 +469,59 @@ def test_write_rejects_home_relative_folder(tmp_path):
     _assert_no_files_created(tmp_path)
 
 
+def test_write_rejects_empty_folder_writing_to_vault_root(tmp_path):
+    """Path("vault") / "" == Path("vault") — an empty folder silently
+    collapses to the vault root, defeating the "must target a named
+    subfolder" contract. Not a containment escape (write_vault_note()'s
+    own guard does not fire), so this needs its own explicit rejection.
+
+    Proven fail-first: with the `folder in ("", ".")` check removed from
+    _validate_folder, this exact scenario returned rc=0 and wrote
+    vault/root-escape.md directly at the vault root (see fix report)."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = _run_write(vault, "", "root-escape.md", "x\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert not (vault / "root-escape.md").exists()
+    _assert_no_files_created(tmp_path)
+
+
+def test_write_rejects_dot_folder_writing_to_vault_root(tmp_path):
+    """Path("vault") / "." == Path("vault") — same vault-root collapse as
+    folder="", via a different literal. Proven fail-first the same way as
+    the folder="" case above (see fix report)."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = _run_write(vault, ".", "root-escape.md", "x\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert not (vault / "root-escape.md").exists()
+    _assert_no_files_created(tmp_path)
+
+
+def test_write_rejects_dot_md_filename_hidden_dotfile(tmp_path):
+    """filename=".md" is a bare name ending in ".md", so it passes both the
+    separator check and the extension check — but it has nothing before
+    the suffix, so it would create a hidden dotfile in the target folder.
+
+    Proven fail-first: with the empty-stem check removed from
+    _validate_filename, this exact scenario returned rc=0 and wrote
+    vault/claude-sessions/.md (see fix report)."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+
+    result = _run_write(vault, "claude-sessions", ".md", "x\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert not (vault / "claude-sessions" / ".md").exists()
+
+
 def test_write_normal_folder_and_filename_still_succeeds(tmp_path):
     """Guards against the validation guard breaking the happy path."""
     vault = tmp_path / "vault"
@@ -459,11 +542,14 @@ def test_validate_folder_and_filename_in_process():
     assert note_writer._validate_folder("../outside") is not None
     assert note_writer._validate_folder("/etc") is not None
     assert note_writer._validate_folder("~/x") is not None
+    assert note_writer._validate_folder("") is not None
+    assert note_writer._validate_folder(".") is not None
     assert note_writer._validate_folder("claude-insights") is None
 
     assert note_writer._validate_filename("notes/x.md") is not None
     assert note_writer._validate_filename("../../escape.md") is not None
     assert note_writer._validate_filename("x.txt") is not None
+    assert note_writer._validate_filename(".md") is not None
     assert note_writer._validate_filename("2026-07-25-retro-a3f2.md") is None
 
 
