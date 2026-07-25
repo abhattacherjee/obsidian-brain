@@ -331,3 +331,160 @@ def test_main_no_argv_exits_2_in_process(monkeypatch, capsys):
     assert exc_info.value.code == 2
     captured = capsys.readouterr()
     assert "usage" in captured.err.lower()
+
+
+# ---------------------------------------------------------------------------
+# folder/filename validation — closes a within-vault write vector
+#
+# write_vault_note()'s containment check only blocks writes that escape the
+# VAULT ROOT. It does not constrain where *inside* the vault a write lands.
+# Obsidian executes JavaScript from .obsidian/plugins/<x>/main.js, so a
+# folder of ".obsidian/plugins/evil" + filename "main.js" passes containment
+# cleanly and lands executable code — folder/filename are assembled by an
+# LLM from session content, so they are not fully trusted inputs.
+# ---------------------------------------------------------------------------
+
+def _assert_no_files_created(tmp_path) -> None:
+    created_files = [p for p in tmp_path.rglob("*") if p.is_file()]
+    assert created_files == [], f"unexpected file(s) created: {created_files}"
+
+
+def test_write_rejects_dotted_folder_obsidian_plugin_vector(tmp_path):
+    """The load-bearing case: proven fail-first (see fix report) by running
+    this exact scenario against the pre-fix note_writer.py, which actually
+    wrote executable content to vault/.obsidian/plugins/evil/main.js —
+    write_vault_note()'s containment check does not fire here because the
+    write never leaves the vault root."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = _run_write(vault, ".obsidian/plugins/evil", "main.js", "malicious JS\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert "OK:" not in result.stdout
+    _assert_no_files_created(tmp_path)
+
+
+def test_write_rejects_filename_subdirectory_separator(tmp_path):
+    """Also load-bearing: proven fail-first by running this against the
+    pre-fix note_writer.py with the 'notes' subdirectory pre-created under
+    the target folder — the file landed at
+    vault/claude-sessions/notes/x.md (see fix report). In a fresh folder
+    the pre-fix code happened to error out for an unrelated reason (mkdir
+    only creates the folder, not filename subdirectories), so the guard
+    must not depend on that directory-state coincidence."""
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions" / "notes").mkdir(parents=True)
+
+    result = _run_write(vault, "claude-sessions", "notes/x.md", "subdir escape\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert not (vault / "claude-sessions" / "notes" / "x.md").exists()
+
+
+def test_write_rejects_filename_path_traversal(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+
+    result = _run_write(vault, "claude-sessions", "../../escape.md", "x\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    _assert_no_files_created(tmp_path)
+
+
+def test_write_rejects_non_md_filename_extension(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+
+    result = _run_write(vault, "claude-sessions", "x.txt", "x\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    assert not (vault / "claude-sessions" / "x.txt").exists()
+
+
+def test_write_rejects_folder_traversal(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = _run_write(vault, "../outside", "y.md", "x\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    _assert_no_files_created(tmp_path)
+
+
+def test_write_rejects_absolute_folder(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = _run_write(vault, "/etc", "y.md", "x\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    _assert_no_files_created(tmp_path)
+
+
+def test_write_rejects_home_relative_folder(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = _run_write(vault, "~/x", "y.md", "x\n")
+
+    assert result.returncode == 1
+    assert "ERROR" in result.stderr
+    _assert_no_files_created(tmp_path)
+
+
+def test_write_normal_folder_and_filename_still_succeeds(tmp_path):
+    """Guards against the validation guard breaking the happy path."""
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    content = "# Retro\nBody.\n"
+
+    result = _run_write(vault, "claude-insights", "2026-07-25-retro-a3f2.md", content)
+
+    dest = vault / "claude-insights" / "2026-07-25-retro-a3f2.md"
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"OK: {dest.resolve()}"
+    assert dest.read_text(encoding="utf-8") == content
+
+
+# In-process counterpart for coverage of the validation helpers directly.
+def test_validate_folder_and_filename_in_process():
+    assert note_writer._validate_folder(".obsidian/plugins/evil") is not None
+    assert note_writer._validate_folder("../outside") is not None
+    assert note_writer._validate_folder("/etc") is not None
+    assert note_writer._validate_folder("~/x") is not None
+    assert note_writer._validate_folder("claude-insights") is None
+
+    assert note_writer._validate_filename("notes/x.md") is not None
+    assert note_writer._validate_filename("../../escape.md") is not None
+    assert note_writer._validate_filename("x.txt") is not None
+    assert note_writer._validate_filename("2026-07-25-retro-a3f2.md") is None
+
+
+def test_run_write_in_process_rejects_invalid_folder_no_write_vault_note_call(
+    tmp_path, monkeypatch, capsys
+):
+    """In-process counterpart to the validation-rejection branch in
+    run_write() (lines guarded by `if validation_err:`) — proves
+    write_vault_note() is never reached when validation fails, by making it
+    raise if called."""
+
+    def _boom(*a, **k):
+        raise AssertionError("write_vault_note() must not be called when validation fails")
+
+    monkeypatch.setattr(note_writer, "write_vault_note", _boom)
+
+    rc = note_writer.run_write(
+        str(tmp_path / "vault"), ".obsidian/plugins/evil", "main.js", "x\n"
+    )
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.err.strip().startswith("ERROR: invalid folder")
+    assert captured.out == ""

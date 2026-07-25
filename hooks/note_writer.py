@@ -25,18 +25,80 @@ def _read_stdin_capped() -> str:
     return sys.stdin.read(STDIN_CAP_BYTES)
 
 
+def _validate_folder(folder: str):
+    """Return an error message if ``folder`` is not a benign, vault-relative
+    path, else None.
+
+    write_vault_note()'s own containment check only blocks writes that
+    escape the vault ROOT — it does not constrain *where inside* the vault
+    a write lands. Obsidian executes JavaScript from
+    ``.obsidian/plugins/<x>/main.js``, so a folder like
+    ``.obsidian/plugins/evil`` passes containment cleanly and lands
+    executable code. ``folder``/``filename`` are assembled by an LLM from
+    session content, so they're not fully trusted inputs — validate here,
+    before any filesystem side effect.
+
+    Deliberately NOT an allowlist of known vault folder names: folder names
+    are user-configurable (~/.claude/obsidian-brain-config.json) and several
+    skills write to different folders. The rules below (no absolute/home
+    path, no ``..`` segment, no dot-prefixed segment) block the actual
+    vector without that coupling.
+    """
+    if folder.startswith("/"):
+        return f"invalid folder (must be relative to vault root, not absolute): {folder!r}"
+    if folder.startswith("~"):
+        return f"invalid folder (must not reference a home directory with '~'): {folder!r}"
+    for part in Path(folder).parts:
+        if part == "..":
+            return f"invalid folder (contains a '..' traversal segment): {folder!r}"
+        if part.startswith("."):
+            return (
+                f"invalid folder (contains a hidden/dot path segment, e.g. "
+                f"'.obsidian'): {folder!r}"
+            )
+    return None
+
+
+def _validate_filename(filename: str):
+    """Return an error message if ``filename`` is not a bare ``*.md`` name,
+    else None.
+
+    Bare-name check (``Path(filename).name == filename``) rejects any path
+    separator — including ``../`` traversal and a plain subdirectory like
+    ``notes/x.md`` — so a filename segment can never place the write outside
+    the single target folder write_vault_note() was given.
+    """
+    if Path(filename).name != filename:
+        return (
+            f"invalid filename (must be a bare name, no path separators): "
+            f"{filename!r}"
+        )
+    if not filename.endswith(".md"):
+        return f"invalid filename (must end with .md): {filename!r}"
+    return None
+
+
 def run_write(vault_path: str, folder: str, filename: str, content: str) -> int:
     """Write ``content`` to ``<vault_path>/<folder>/<filename>``.
 
-    Delegates entirely to write_vault_note() for the atomic write, the
-    path-traversal containment check, and the 0o600 permission — this
-    function does not reimplement any of that.
+    Validates ``folder``/``filename`` (see _validate_folder/_validate_filename)
+    before touching the filesystem, then delegates the actual write entirely
+    to write_vault_note() for the atomic write, the path-traversal
+    containment check, and the 0o600 permission — this function does not
+    reimplement any of that.
 
     Prints ``OK: <abs path>`` to stdout and returns 0 on success.
-    Prints ``ERROR: <msg>`` to stderr and returns 1 on failure. Never
-    partially writes: write_vault_note() either lands the file atomically
-    or returns an error before any rename.
+    Prints ``ERROR: <msg>`` to stderr and returns 1 on failure (validation
+    rejection or write_vault_note() error). Never partially writes:
+    validation failures have no filesystem side effect at all, and
+    write_vault_note() either lands the file atomically or returns an error
+    before any rename.
     """
+    validation_err = _validate_folder(folder) or _validate_filename(filename)
+    if validation_err:
+        print(f"ERROR: {validation_err}", file=sys.stderr)
+        return 1
+
     err = write_vault_note(vault_path, folder, filename, content)
     if err:
         print(f"ERROR: {err}", file=sys.stderr)
