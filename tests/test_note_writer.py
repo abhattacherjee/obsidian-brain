@@ -1352,3 +1352,306 @@ def test_atomic_rewrite_forces_inner_and_outer_exception_branches(
     # the temp file was cleaned up, not left behind
     leftover = list(note.parent.glob(".ob-*.md.tmp"))
     assert leftover == []
+
+
+# ===========================================================================
+# Fix round 1 (post-review): CRLF preservation, flow-style tags, EOF
+# blank-line separator when the source file has no trailing newline at all.
+#
+# Each bug was reproduced fail-first against the pre-fix code (git show
+# HEAD:hooks/note_writer.py, loaded as an isolated scratch module) before
+# being fixed here -- see the fix report for the exact repro output. These
+# tests encode the same scenarios directly against the shipped module.
+# ===========================================================================
+
+CRLF_NOTE = (
+    "---\r\n"
+    "type: claude-insight\r\n"
+    "date: 2026-01-01\r\n"
+    "source_session: abc123\r\n"
+    "project: obsidian-brain\r\n"
+    "tags:\r\n"
+    "  - claude/insight\r\n"
+    "---\r\n"
+    "\r\n"
+    "# Some Insight\r\n"
+    "\r\n"
+    "Body content here.\r\n"
+    "More body.\r\n"
+)
+
+
+def _make_note_bytes(vault: Path, folder: str, filename: str, raw_bytes: bytes) -> Path:
+    d = vault / folder
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / filename
+    p.write_bytes(raw_bytes)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Important 1: CRLF notes must not be silently rewritten to LF.
+# ---------------------------------------------------------------------------
+
+def test_append_update_preserves_crlf_line_endings_everywhere(tmp_path):
+    """The inserted section must ITSELF use CRLF (not just leave the rest of
+    the file alone), and every byte outside the inserted region must be
+    unchanged -- compared as actual bytes, not lines."""
+    vault = tmp_path / "vault"
+    note = _make_note_bytes(vault, "claude-insights", "insight.md", CRLF_NOTE.encode("utf-8"))
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, last_updated="2026-07-25")
+
+    assert result.returncode == 0, result.stderr
+    after = note.read_bytes()
+
+    # No bare LF anywhere -- every line ending in the whole file is CRLF.
+    assert b"\r\n" in after
+    stripped_of_crlf = after.replace(b"\r\n", b"")
+    assert b"\n" not in stripped_of_crlf, "found a bare LF outside of CRLF pairs"
+
+    # The inserted section itself uses CRLF.
+    assert b"## Update (2026-07-25)\r\n\r\nNew findings from today's session.\r\n" in after
+
+    # Content outside the inserted region is byte-identical to `before`,
+    # not merely line-equal: every original line (as bytes, with its
+    # original \r\n) is present verbatim in `after`.
+    for original_line in before.splitlines(keepends=True):
+        assert original_line in after, f"original line altered/missing: {original_line!r}"
+
+    # last_updated was inserted using CRLF too, immediately after date:
+    assert b"date: 2026-01-01\r\nlast_updated: 2026-07-25\r\n" in after
+
+
+def test_append_update_lf_note_unaffected_no_stray_cr(tmp_path):
+    """Mirror case: an LF-only note must not gain any CRLF -- a future
+    change to the eol-detection default can't silently flip which ending is
+    used for a plain-LF note."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, last_updated="2026-07-25")
+
+    assert result.returncode == 0, result.stderr
+    after = note.read_bytes()
+    assert b"\r" not in after
+
+
+def test_detect_line_ending_in_process():
+    assert note_writer._detect_line_ending("a\r\nb\r\nc\r\n") == "\r\n"
+    assert note_writer._detect_line_ending("a\nb\nc\n") == "\n"
+    assert note_writer._detect_line_ending("no newlines at all") == "\n"
+    # Mixed, CRLF-majority -> CRLF; mixed, LF-majority -> LF.
+    assert note_writer._detect_line_ending("a\r\nb\r\nc\n") == "\r\n"
+    assert note_writer._detect_line_ending("a\r\nb\nc\n") == "\n"
+
+
+def test_normalize_eol_in_process():
+    assert note_writer._normalize_eol("a\nb\r\nc\r", "\r\n") == "a\r\nb\r\nc\r\n"
+    assert note_writer._normalize_eol("a\r\nb\r\n", "\n") == "a\nb\n"
+    assert note_writer._normalize_eol("a\nb\n", "\n") == "a\nb\n"
+
+
+def test_atomic_rewrite_writes_content_bytes_verbatim_no_translation(tmp_path):
+    """_atomic_rewrite's own newline="" write path: content containing
+    literal CRLF sequences must land on disk exactly as given, byte for
+    byte -- not translated in either direction."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    content = "line one\r\nline two\r\nline three\r\n"
+
+    err = note_writer._atomic_rewrite(note, content)
+
+    assert err is None
+    assert note.read_bytes() == content.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Important 2: flow-style `tags: [a, b]` must not silently no-op.
+# ---------------------------------------------------------------------------
+
+FLOW_TAGS_NOTE = BASIC_NOTE.replace(
+    "tags:\n  - claude/insight\n  - claude/topic/foo\n",
+    "tags: [claude/insight, claude/topic/foo]\n",
+)
+
+EMPTY_FLOW_TAGS_NOTE = BASIC_NOTE.replace(
+    "tags:\n  - claude/insight\n  - claude/topic/foo\n",
+    "tags: []\n",
+)
+
+
+def test_append_update_flow_style_tags_gains_new_tag(tmp_path):
+    vault = tmp_path / "vault"
+    assert "tags: [" in FLOW_TAGS_NOTE
+    note = _make_note(vault, "claude-insights", "insight.md", FLOW_TAGS_NOTE)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/new-one")
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "tags: [claude/insight, claude/topic/foo, claude/topic/new-one]" in written
+
+
+def test_append_update_flow_style_duplicate_tag_not_readded(tmp_path):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", FLOW_TAGS_NOTE)
+
+    result = _run_append_update(
+        vault, note, UPDATE_SECTION, add_tags="claude/insight,claude/topic/new-one"
+    )
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert written.count("claude/insight") == 1  # not re-added
+    assert "claude/topic/new-one" in written
+
+
+def test_append_update_flow_style_empty_list(tmp_path):
+    vault = tmp_path / "vault"
+    assert "tags: []" in EMPTY_FLOW_TAGS_NOTE
+    note = _make_note(vault, "claude-insights", "insight.md", EMPTY_FLOW_TAGS_NOTE)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/new-one")
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "tags: [claude/topic/new-one]" in written
+
+
+def test_append_update_flow_style_all_requested_tags_already_present_is_noop(tmp_path):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", FLOW_TAGS_NOTE)
+    before = note.read_text(encoding="utf-8")
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/insight")
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    before_tags_line = [l for l in before.splitlines() if l.startswith("tags:")][0]
+    after_tags_line = [l for l in written.splitlines() if l.startswith("tags:")][0]
+    assert before_tags_line == after_tags_line
+
+
+def test_append_update_block_style_tags_unaffected_by_flow_support(tmp_path):
+    """Regression guard: adding flow-style support must not change block-
+    style behavior at all."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/new-one")
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "  - claude/topic/new-one\n" in written
+    assert "tags: [" not in written  # still block style, not converted
+
+
+def test_apply_add_tags_flow_style_in_process():
+    fm = ["project: y\n", "tags: [a, b]\n"]
+    out = note_writer._apply_add_tags(fm, ["b", "c"])
+    assert out == ["project: y\n", "tags: [a, b, c]\n"]
+
+    fm_empty = ["tags: []\n"]
+    out_empty = note_writer._apply_add_tags(fm_empty, ["a", "b"])
+    assert out_empty == ["tags: [a, b]\n"]
+
+    # Every requested tag already present -- byte-identical no-op.
+    fm_dup = ["tags: [a, b]\n"]
+    assert note_writer._apply_add_tags(fm_dup, ["a"]) == fm_dup
+
+    # Quoted existing items -- new item rendered with the same quote char.
+    fm_quoted = ['tags: ["a", "b"]\n']
+    out_quoted = note_writer._apply_add_tags(fm_quoted, ["c"])
+    assert out_quoted == ['tags: ["a", "b", "c"]\n']
+
+
+def test_append_update_flow_style_quoted_tags_new_tag_matches_quote_style(tmp_path):
+    vault = tmp_path / "vault"
+    note_content = BASIC_NOTE.replace(
+        "tags:\n  - claude/insight\n  - claude/topic/foo\n",
+        'tags: ["claude/insight", "claude/topic/foo"]\n',
+    )
+    note = _make_note(vault, "claude-insights", "insight.md", note_content)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/new-one")
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert '"claude/topic/new-one"' in written
+
+
+def test_split_flow_items_and_unquote_tag_in_process():
+    assert note_writer._split_flow_items("") == []
+    assert note_writer._split_flow_items("  ") == []
+    assert note_writer._split_flow_items("a, b, c") == ["a", " b", " c"]
+
+    assert note_writer._unquote_tag('"a"') == "a"
+    assert note_writer._unquote_tag("'a'") == "a"
+    assert note_writer._unquote_tag(" a ") == "a"
+    assert note_writer._unquote_tag("a") == "a"
+
+
+# ---------------------------------------------------------------------------
+# Minor 3: EOF insertion when the source file has no trailing newline.
+# ---------------------------------------------------------------------------
+
+NO_TRAILING_NEWLINE_NOTE = BASIC_NOTE.rstrip("\n")
+
+
+def test_append_update_eof_no_trailing_newline_gets_blank_line_separator(tmp_path):
+    vault = tmp_path / "vault"
+    assert not NO_TRAILING_NEWLINE_NOTE.endswith("\n")
+    note = _make_note(vault, "claude-insights", "insight.md", NO_TRAILING_NEWLINE_NOTE)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    # A genuine blank line separates the last original body line from the
+    # inserted heading -- not run straight onto it.
+    assert "Body content here.\n\n## Update (2026-07-25)" in written
+    assert "Body content here.\n## Update" not in written
+
+
+def test_run_append_update_in_process_eof_no_trailing_newline(tmp_path, capsys):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", NO_TRAILING_NEWLINE_NOTE)
+
+    rc = note_writer.run_append_update(str(vault), str(note), UPDATE_SECTION)
+
+    assert rc == 0
+    written = note.read_text(encoding="utf-8")
+    assert "Body content here.\n\n## Update (2026-07-25)" in written
+
+
+def test_append_update_stdin_update_text_without_trailing_newline_gets_one(tmp_path):
+    """`update_text` itself (the stdin payload) may not end with a newline
+    -- the CLI must still terminate it properly rather than running the
+    trailing marker/EOF straight onto the update section's last line."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    no_trailing_nl_update = "## Update (2026-07-25)\n\nNo trailing newline here."
+    assert not no_trailing_nl_update.endswith("\n")
+
+    result = _run_append_update(vault, note, no_trailing_nl_update)
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "No trailing newline here.\n" in written
+
+
+def test_run_append_update_in_process_update_text_without_trailing_newline(tmp_path):
+    """In-process counterpart of the subprocess test above -- a subprocess
+    call is invisible to coverage.py, so this exercises the
+    `if not block_text.endswith(eol): block_text += eol` branch directly."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    no_trailing_nl_update = "## Update (2026-07-25)\n\nNo trailing newline here."
+
+    rc = note_writer.run_append_update(str(vault), str(note), no_trailing_nl_update)
+
+    assert rc == 0
+    written = note.read_text(encoding="utf-8")
+    assert "No trailing newline here.\n" in written

@@ -161,15 +161,76 @@ _DATE_LINE_RE = re.compile(r"^date:\s*.*$")
 _LAST_UPDATED_LINE_RE = re.compile(r"^last_updated:\s*.*$")
 _TAGS_KEY_RE = re.compile(r"^tags:\s*$")
 _TAG_ITEM_RE = re.compile(r"^(?P<indent>\s*)-\s*(?P<tag>\S.*?)\s*$")
+# YAML flow-style tags, e.g. `tags: [claude/insight, claude/topic/foo]` or
+# the empty `tags: []` -- an alternative to the block style above that
+# _TAGS_KEY_RE/_TAG_ITEM_RE don't recognize (bug: silently no-op'd on a
+# flow-style note, reported as a false success).
+_TAGS_FLOW_RE = re.compile(r"^tags:\s*\[(?P<inner>.*)\]\s*$")
+
+# All comparisons below use rstrip("\r\n") (a character-set strip, not a
+# substring strip) rather than rstrip("\n"), so a CRLF-authored note's line
+# endings are recognized -- match/compare only ever inspects content, never
+# reconstructs a line from its stripped form, so this never discards an
+# original line ending.
 
 
 def _is_trailing_marker(line: str) -> bool:
     """True if ``line`` is one of the exact trailing-section headings, or
     matches the "_(Summary source: ...)_" line (its suffix varies)."""
-    stripped = line.rstrip("\n")
+    stripped = line.rstrip("\r\n")
     if stripped in _TRAILING_MARKERS:
         return True
     return bool(_SUMMARY_SOURCE_RE.match(stripped))
+
+
+def _detect_line_ending(text: str) -> str:
+    """Return ``text``'s dominant line ending, ``"\\r\\n"`` or ``"\\n"``.
+
+    Any line this command *adds* (frontmatter mutations, the inserted update
+    section, separator blank lines) is emitted using this detected ending
+    rather than a hardcoded ``"\\n"``, so a CRLF-authored note doesn't get
+    silently rewritten to LF -- content outside the inserted section must be
+    byte-identical, and that includes not flipping the file's own line-ending
+    convention. Ties, or a file with no line endings at all (e.g. a single
+    line with no trailing newline), default to ``"\\n"``.
+    """
+    crlf_count = text.count("\r\n")
+    lf_only_count = len(re.findall(r"(?<!\r)\n", text))
+    return "\r\n" if crlf_count > lf_only_count else "\n"
+
+
+def _normalize_eol(text: str, eol: str) -> str:
+    """Canonicalize every newline in ``text`` to ``eol``, so content coming
+    from elsewhere (the update-section text piped in on stdin, which is not
+    read from the note file and so carries no relationship to its line
+    ending) matches the destination note's convention instead of mixing
+    endings within one file."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if eol == "\r\n":
+        normalized = normalized.replace("\n", "\r\n")
+    return normalized
+
+
+def _unquote_tag(raw: str) -> str:
+    """Strip surrounding whitespace and one layer of matching quotes from a
+    single flow-style list item, e.g. ``' "claude/insight" '`` ->
+    ``'claude/insight'``."""
+    item = raw.strip()
+    if len(item) >= 2 and item[0] == item[-1] and item[0] in ("'", '"'):
+        item = item[1:-1]
+    return item
+
+
+def _split_flow_items(inner: str) -> list[str]:
+    """Split a flow-style tag list's raw inner text (the substring between
+    ``[`` and ``]``) on top-level commas, returning each item's raw,
+    still-possibly-quoted substring verbatim (not yet stripped/unquoted).
+    Returns ``[]`` for an empty/whitespace-only inner (the ``tags: []``
+    case). Tag values aren't expected to contain a literal comma, so a plain
+    ``split(",")`` is sufficient -- no quoted-comma edge case to handle."""
+    if not inner.strip():
+        return []
+    return inner.split(",")
 
 
 def _resolve_note_path(vault_path: str, note_path: str):
@@ -223,15 +284,15 @@ def _split_frontmatter(lines: list[str]):
     does not open with a well-formed ``---`` ... ``---`` frontmatter block
     (missing opening fence, or no closing fence found anywhere in the file).
     """
-    if not lines or lines[0].rstrip("\n") != "---":
+    if not lines or lines[0].rstrip("\r\n") != "---":
         return None, None, None, None
     for i in range(1, len(lines)):
-        if lines[i].rstrip("\n") == "---":
+        if lines[i].rstrip("\r\n") == "---":
             return lines[0], lines[1:i], lines[i], lines[i + 1:]
     return None, None, None, None
 
 
-def _apply_last_updated(fm_lines: list[str], last_updated: str):
+def _apply_last_updated(fm_lines: list[str], last_updated: str, eol: str = "\n"):
     """Return ``(new_fm_lines, error)``.
 
     Replaces an existing top-level ``last_updated:`` line's value in place.
@@ -239,61 +300,114 @@ def _apply_last_updated(fm_lines: list[str], last_updated: str):
     after the top-level ``date:`` line. Never touches ``date``,
     ``source_session``, ``source_session_note``, or ``type`` -- every other
     line is copied through unchanged.
+
+    ``eol`` is the line ending used for the new/replaced line itself (see
+    ``_detect_line_ending``) -- defaults to ``"\\n"`` so direct unit-test
+    callers that don't care about CRLF can omit it.
     """
     out = list(fm_lines)
     for idx, line in enumerate(out):
-        if _LAST_UPDATED_LINE_RE.match(line.rstrip("\n")):
-            out[idx] = f"last_updated: {last_updated}\n"
+        if _LAST_UPDATED_LINE_RE.match(line.rstrip("\r\n")):
+            out[idx] = f"last_updated: {last_updated}{eol}"
             return out, None
 
     for idx, line in enumerate(out):
-        if _DATE_LINE_RE.match(line.rstrip("\n")):
-            out.insert(idx + 1, f"last_updated: {last_updated}\n")
+        if _DATE_LINE_RE.match(line.rstrip("\r\n")):
+            out.insert(idx + 1, f"last_updated: {last_updated}{eol}")
             return out, None
 
     return None, "frontmatter missing 'date:' field (required to insert last_updated)"
 
 
-def _apply_add_tags(fm_lines: list[str], add_tags: list[str]) -> list[str]:
+def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n") -> list[str]:
     """Return frontmatter lines with ``add_tags`` merged into the ``tags:``
-    block, appended at its end in original list-item indentation.
+    block -- either style below, whichever the note actually uses.
 
-    No-op (returns ``fm_lines`` unchanged) if ``add_tags`` is empty, or if no
-    ``tags:`` block is present at all -- a note with no tags block is
+    Block style (``tags:`` on its own line, followed by indented ``- item``
+    lines): new tags are appended at the end of the block, in the block's
+    own existing indentation.
+
+    Flow style (``tags: [a, b]`` or ``tags: []`` on one line): new tags are
+    appended inside the brackets using ``", "`` as the separator -- the
+    conventional flow-style spacing -- and, when every existing item is
+    quoted with the same quote character, that same quote character;
+    existing items are otherwise left completely untouched (not
+    re-serialized), so any of their original micro-spacing survives as-is.
+
+    No-op (returns ``fm_lines`` unchanged) if ``add_tags`` is empty, if no
+    ``tags:`` key is present in EITHER style, or if every tag in
+    ``add_tags`` is already present -- a note with no tags block is
     "nothing to merge into", not an error. Tags already present (in the
-    existing block, or repeated within ``add_tags`` itself) are skipped.
+    existing block/list, or repeated within ``add_tags`` itself) are
+    skipped. ``eol`` is the line ending used for any new/rewritten line
+    (see ``_detect_line_ending``).
     """
     if not add_tags:
         return fm_lines
 
+    # Block style.
     tags_idx = None
     for idx, line in enumerate(fm_lines):
-        if _TAGS_KEY_RE.match(line.rstrip("\n")):
+        if _TAGS_KEY_RE.match(line.rstrip("\r\n")):
             tags_idx = idx
             break
-    if tags_idx is None:
-        return fm_lines
+    if tags_idx is not None:
+        existing = []
+        indent = "  "
+        end_idx = tags_idx + 1
+        for idx in range(tags_idx + 1, len(fm_lines)):
+            m = _TAG_ITEM_RE.match(fm_lines[idx].rstrip("\r\n"))
+            if not m:
+                break
+            indent = m.group("indent") or indent
+            existing.append(m.group("tag"))
+            end_idx = idx + 1
 
-    existing = []
-    indent = "  "
-    end_idx = tags_idx + 1
-    for idx in range(tags_idx + 1, len(fm_lines)):
-        m = _TAG_ITEM_RE.match(fm_lines[idx].rstrip("\n"))
+        seen = set(existing)
+        new_lines = []
+        for tag in add_tags:
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            new_lines.append(f"{indent}- {tag}{eol}")
+
+        return fm_lines[:end_idx] + new_lines + fm_lines[end_idx:]
+
+    # Flow style.
+    for idx, line in enumerate(fm_lines):
+        m = _TAGS_FLOW_RE.match(line.rstrip("\r\n"))
         if not m:
-            break
-        indent = m.group("indent") or indent
-        existing.append(m.group("tag"))
-        end_idx = idx + 1
-
-    seen = set(existing)
-    new_lines = []
-    for tag in add_tags:
-        if not tag or tag in seen:
             continue
-        seen.add(tag)
-        new_lines.append(f"{indent}- {tag}\n")
 
-    return fm_lines[:end_idx] + new_lines + fm_lines[end_idx:]
+        raw_items = _split_flow_items(m.group("inner"))
+        existing = [_unquote_tag(r) for r in raw_items]
+        seen = set(existing)
+        new_tags = []
+        for tag in add_tags:
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            new_tags.append(tag)
+
+        if not new_tags:
+            return fm_lines  # every requested tag already present -- untouched
+
+        quote = ""
+        if raw_items:
+            first = raw_items[0].strip()
+            if len(first) >= 2 and first[0] == first[-1] and first[0] in ("'", '"'):
+                quote = first[0]
+
+        rendered_new = [f"{quote}{tag}{quote}" for tag in new_tags]
+        if raw_items:
+            new_inner = m.group("inner").rstrip() + ", " + ", ".join(rendered_new)
+        else:
+            new_inner = ", ".join(rendered_new)
+
+        new_line = f"tags: [{new_inner}]{eol}"
+        return fm_lines[:idx] + [new_line] + fm_lines[idx + 1:]
+
+    return fm_lines  # no tags: key in either style -- nothing to merge into
 
 
 def _atomic_rewrite(dest: Path, content: str):
@@ -310,12 +424,16 @@ def _atomic_rewrite(dest: Path, content: str):
     last.
 
     Returns None on success, a non-empty error string on failure.
+
+    Opens with ``newline=""`` -- ``content`` already carries whatever line
+    endings it was built with (see ``run_append_update``'s CRLF handling),
+    so no newline translation should happen on the way out either.
     """
     dest_dir = dest.parent
     try:
         fd, tmp_path = tempfile.mkstemp(dir=str(dest_dir), prefix=".ob-", suffix=".md.tmp")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
                 fh.write(content)
             os.chmod(tmp_path, 0o600)
             os.rename(tmp_path, str(dest))
@@ -389,6 +507,15 @@ def run_append_update(
     of it has already succeeded).
 
     Prints ``OK: <resolved path>`` to stdout and returns 0 on success.
+
+    Line endings: read/written with ``newline=""`` so no universal-newline
+    translation happens in either direction, and every line this function
+    *adds* -- frontmatter mutations, separators, the update section itself
+    -- is emitted using the note's own detected line ending (see
+    ``_detect_line_ending``/``_normalize_eol``) rather than a hardcoded
+    ``"\\n"``. Without this, a CRLF-authored note would come back out with
+    its entire body silently rewritten to LF, which is exactly the kind of
+    outside-the-inserted-section change this command promises never to make.
     """
     resolved, err = _resolve_note_path(vault_path, note_path)
     if err:
@@ -396,11 +523,13 @@ def run_append_update(
         return 1
 
     try:
-        with open(resolved, "r", encoding="utf-8") as fh:
+        with open(resolved, "r", encoding="utf-8", newline="") as fh:
             original_text = fh.read()
     except OSError as exc:
         print(f"ERROR: cannot read {note_path}: {exc}", file=sys.stderr)
         return 1
+
+    eol = _detect_line_ending(original_text)
 
     lines = original_text.splitlines(keepends=True)
     open_fence, fm_lines, close_fence, body_lines = _split_frontmatter(lines)
@@ -412,13 +541,13 @@ def run_append_update(
         return 1
 
     if last_updated:
-        fm_lines, fm_err = _apply_last_updated(fm_lines, last_updated)
+        fm_lines, fm_err = _apply_last_updated(fm_lines, last_updated, eol=eol)
         if fm_err:
             print(f"ERROR: {fm_err}", file=sys.stderr)
             return 1
 
     add_tags = [t.strip() for t in (add_tags_csv or "").split(",") if t.strip()]
-    fm_lines = _apply_add_tags(fm_lines, add_tags)
+    fm_lines = _apply_add_tags(fm_lines, add_tags, eol=eol)
 
     insertion_idx = len(body_lines)
     for idx, line in enumerate(body_lines):
@@ -427,11 +556,23 @@ def run_append_update(
             break
 
     prefix = body_lines[:insertion_idx]
-    if prefix and prefix[-1].strip() != "":
-        prefix = prefix + ["\n"]
+    if prefix:
+        last_line = prefix[-1]
+        if not last_line.endswith(("\n", "\r")):
+            # The file has no trailing newline at all (only possible when
+            # `prefix` runs all the way to EOF, i.e. no trailing marker was
+            # found) -- terminate that last line AND add the blank-line
+            # separator (two line breaks total). One eol alone would only
+            # terminate the line, leaving the inserted section running
+            # straight onto it with no separating blank line.
+            prefix = prefix[:-1] + [last_line + eol, eol]
+        elif last_line.strip() != "":
+            prefix = prefix + [eol]
 
-    block_text = update_text if update_text.endswith("\n") else update_text + "\n"
-    new_body_lines = prefix + [block_text, "\n"] + body_lines[insertion_idx:]
+    block_text = _normalize_eol(update_text, eol)
+    if not block_text.endswith(eol):
+        block_text += eol
+    new_body_lines = prefix + [block_text, eol] + body_lines[insertion_idx:]
 
     new_text = open_fence + "".join(fm_lines) + close_fence + "".join(new_body_lines)
 
