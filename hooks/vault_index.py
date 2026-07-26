@@ -38,6 +38,7 @@ from themes import (  # noqa: F401  (re-export shim)
     _NEGATION_TERMS,
     _THEME_SIMILARITY_THRESHOLD,
 )
+from frontmatter import split_frontmatter, split_lines_lf_crlf
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -266,34 +267,35 @@ def _ensure_theme_indexes(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _parse_note(file_path: str) -> dict | None:
+def _parse_note_detailed(file_path: str) -> tuple[dict | None, str | None]:
     """Parse frontmatter and body from a vault note.
 
-    Returns dict with keys: type, date, project, title, source_session,
-    source_note, tags (comma-separated), status, body.
-    Returns None for files that can't be parsed.
+    Returns ``(meta, None)`` on success — ``meta`` has keys: type, date,
+    project, title, source_session, source_note, tags (comma-separated),
+    status, body. Returns ``(None, reason)`` for files that can't be parsed,
+    where ``reason`` is a human-readable string: ``"unreadable file: ..."``
+    for an OSError, or the ``frontmatter.split_frontmatter`` error verbatim
+    (covers a missing opening fence, a missing/unbounded closing fence, and
+    an oversized frontmatter block).
     """
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             full_text = f.read()
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, f"unreadable file: {exc}"
 
-    lines = full_text.split("\n")
-    if not lines or lines[0].strip() != "---":
-        return None
+    lines = split_lines_lf_crlf(full_text)
+    _open_fence, fm_lines, _close_fence, body_lines, split_err = split_frontmatter(lines)
+    if split_err:
+        return None, split_err
 
-    # Parse frontmatter (first 40 lines)
+    # Parse frontmatter key/value pairs + a `tags:` list block.
     meta: dict = {}
     tags: list[str] = []
     in_tags = False
-    end_idx = None
 
-    for idx, line in enumerate(lines[1:40], start=1):
-        stripped = line.strip()
-        if stripped == "---":
-            end_idx = idx
-            break
+    for raw_line in fm_lines:
+        stripped = raw_line.strip()
         if stripped.startswith("- ") and in_tags:
             tags.append(stripped[2:].strip())
             continue
@@ -307,15 +309,13 @@ def _parse_note(file_path: str) -> dict | None:
                 continue
             meta[key] = val
 
-    if end_idx is None:
-        return None
-
     if tags:
         meta["tags"] = ",".join(tags)
 
-    # Body: everything after closing ---
-    body_lines = lines[end_idx + 1:]
-    body = "\n".join(body_lines).strip()
+    # Body: everything after the closing fence. Line terminators are
+    # preserved on each element of body_lines, so join with "" — "\n".join
+    # would double every blank line in the body.
+    body = "".join(body_lines).strip()
     meta["body"] = body
 
     # Extract title from first H1 heading in body
@@ -333,7 +333,17 @@ def _parse_note(file_path: str) -> dict | None:
     if source_note_raw:
         meta["source_note"] = source_note_raw.strip("[]").replace("[[", "").replace("]]", "")
 
-    return meta
+    return meta, None
+
+
+def _parse_note(file_path: str) -> dict | None:
+    """Parse frontmatter and body from a vault note.
+
+    Returns dict with keys: type, date, project, title, source_session,
+    source_note, tags (comma-separated), status, body.
+    Returns None for files that can't be parsed.
+    """
+    return _parse_note_detailed(file_path)[0]
 
 
 # ---------------------------------------------------------------------------
