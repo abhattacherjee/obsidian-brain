@@ -484,7 +484,10 @@ def main() -> int:
                     f"in check '{mod.NAME}'? [y/N] "
                 )
                 sys.stderr.flush()
-                answer = sys.stdin.readline().strip().lower()
+                # readline() with no size is unbounded: input containing no
+                # newline is consumed to EOF. 1024 is far beyond any real
+                # y/N answer, so behaviour is identical for every sane input.
+                answer = sys.stdin.readline(1024).strip().lower()
                 if answer not in ("y", "yes"):
                     print(f"  skipped {proj}", file=sys.stderr)
                     continue

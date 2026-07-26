@@ -1427,10 +1427,15 @@ def merge_groups_semantically(coarse_groups):
         for g in flat_groups
     ]}
     payload_str = json.dumps(payload)
-    _STDIN_CAP_BYTES = 1_000_000
-    if len(payload_str.encode("utf-8")) >= _STDIN_CAP_BYTES:
+    # NOT a stdin cap: this bounds an OUTBOUND payload written for a
+    # sub-agent, and it measures real bytes (.encode("utf-8") below), so
+    # "BYTES" is accurate here. Renamed off the STDIN_CAP_* family in #275
+    # so it is not mistaken for the character-based stdin cap that
+    # check_items_cli.py and note_writer.py share.
+    _PAYLOAD_CAP_BYTES = 1_000_000
+    if len(payload_str.encode("utf-8")) >= _PAYLOAD_CAP_BYTES:
         print(
-            f"[check-items] payload {len(payload_str)} bytes >= {_STDIN_CAP_BYTES} cap; "
+            f"[check-items] payload {len(payload_str)} bytes >= {_PAYLOAD_CAP_BYTES} cap; "
             f"skipping semantic-merge sub-agent, using token-only.",
             file=sys.stderr,
         )
@@ -1609,11 +1614,16 @@ def classify_groups_with_agent(merged_groups, evidence):
         "evidence": evidence or {},
     }
     payload_str = json.dumps(payload)
-    _STDIN_CAP_BYTES = 1_000_000
-    if len(payload_str.encode("utf-8")) >= _STDIN_CAP_BYTES:
+    # NOT a stdin cap: this bounds an OUTBOUND payload written for a
+    # sub-agent, and it measures real bytes (.encode("utf-8") below), so
+    # "BYTES" is accurate here. Renamed off the STDIN_CAP_* family in #275
+    # so it is not mistaken for the character-based stdin cap that
+    # check_items_cli.py and note_writer.py share.
+    _PAYLOAD_CAP_BYTES = 1_000_000
+    if len(payload_str.encode("utf-8")) >= _PAYLOAD_CAP_BYTES:
         print(
             f"[check-items] classifier payload {len(payload_str)} bytes >= "
-            f"{_STDIN_CAP_BYTES} cap; falling back to heuristic.",
+            f"{_PAYLOAD_CAP_BYTES} cap; falling back to heuristic.",
             file=sys.stderr,
         )
         _LAST_CLASSIFIER_MODE = "heuristic-fallback"

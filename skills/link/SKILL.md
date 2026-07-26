@@ -23,7 +23,7 @@ Run:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
@@ -236,7 +236,7 @@ Search the source note's content for `[[target-filename]]` (filename without `.m
 After writing, set permissions:
 
 ```bash
-chmod 644 "<source-note-path>"
+chmod 600 "<source-note-path>"
 ```
 
 **5.4 — Read the target note** using the Read tool.
@@ -263,7 +263,7 @@ Search the target note's content for `[[source-filename]]`. If it already exists
 After writing, set permissions:
 
 ```bash
-chmod 644 "<target-note-path>"
+chmod 600 "<target-note-path>"
 ```
 
 ### Step 6 — Confirm

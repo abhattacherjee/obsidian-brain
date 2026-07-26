@@ -9,7 +9,7 @@ metadata:
 
 Analyze the current conversation, extract valuable insights, and save them as structured notes in the Obsidian vault. Supports both interactive multi-insight selection and targeted single-topic extraction.
 
-**Tools needed:** Bash, Write, Read, Edit
+**Tools needed:** Bash, Read
 
 ## Procedure
 
@@ -23,7 +23,7 @@ Run:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
@@ -72,7 +72,7 @@ Run a single Python call to search the vault index for existing notes matching t
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os, json
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 try:
     from vault_index import ensure_index, search_vault, compute_query_vector
     from obsidian_utils import load_config
@@ -191,27 +191,41 @@ Wait for the user's response. Apply edits and re-show if requested. Repeat until
 
 If **cancel**, stop here.
 
-#### 4A-update.4 — Append the update section
+#### 4A-update.4 — Append the update section and update frontmatter
 
-Use the Edit tool to append the update section to the note body.
+Run the note-writer CLI's `append-update` command, piping the drafted `## Update (YYYY-MM-DD)` section (from 4A-update.2) in on stdin. **This single call replaces all three of the old Edit-tool steps** — it finds the correct insertion point (scanning **top-down** for `_(Summary source: ...)_`, `## Tool Usage`, `## Conversation (raw)`, `## Session Metadata`, `## Files Touched` — ignoring any inside a fenced code block, and **stopping at the first `## Update (` heading**, since everything past that is a previously appended update rather than the note's audit trail — and inserting immediately before the first marker it finds, or at end-of-file), bumps `last_updated`, and merges new tags — all in one atomic write. Do NOT use the Edit tool for any of this.
 
-**Insertion point:** Scan the note from the bottom for these trailing metadata patterns: `_(Summary source: ...)_`, `## Tool Usage`, `## Conversation (raw)`, `## Session Metadata`, `## Files Touched`. If any are found, insert the update section on a new line immediately BEFORE the first trailing section. If none are found, append at the very end of the file.
+Generate 1-3 new topic tags from the update content (same logic as Step 5) and pass them via `--add-tags`. `--last-updated` is opt-in — it must be passed explicitly with today's date, or the note's `last_updated` field will NOT be bumped (that used to happen automatically; it no longer does without this flag).
 
-Use the Edit tool with the first line of the trailing section (or the last line of the file) as `old_string`, and prepend the update section + a blank line before it.
+**Both flags are validated — a present flag with a broken value is an error, not a silent skip.** `--last-updated` must be a real `YYYY-MM-DD` value (an empty `"$TODAY"` from an unset variable is rejected). Each `--add-tags` item must match `[A-Za-z0-9][A-Za-z0-9/_.-]*`: start with a letter or digit, then letters, digits, `/`, `_`, `.` or `-` only — **no empty items** (so no trailing comma, and no `--add-tags ""`) and **no leftover `<placeholder>` text** (the `claude/topic/<new-tag-1>` below is a template; substitute a real tag or the `<`/`>` will be rejected). If there are no new tags, **omit the `--add-tags` line entirely** — that is the supported no-op. The drafted update section must also be non-empty; piping an empty heredoc body is rejected and the note is left untouched.
 
-**Verify:** After the Edit, use the Read tool to confirm the `## Update (YYYY-MM-DD)` heading is present in the note. If it is not, tell the user: "Failed to append update section — file may have unexpected structure. Please edit manually at `$MATCH_PATH`." Do NOT proceed to 4A-update.5 if the append failed.
+If the note's frontmatter has no recognizable `tags:` block, the command now **fails** rather than silently dropping the tags — surface the error and add them manually, or omit `--add-tags` and re-run.
 
-#### 4A-update.5 — Update frontmatter
+**Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_UPDATE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_UPDATE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below sorts cached plugin versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`), and the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. Update sections routinely contain `$` variables, backtick commands, and fenced code blocks from the session; an unquoted delimiter lets the shell expand/corrupt them before they ever reach the file.
 
-Use the Edit tool to update the frontmatter of the existing note:
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "import glob,os,re; c=glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')); print(max(c, key=lambda p: ([int(n) for n in re.findall('[0-9]+', p.split('/')[-2])], p), default='hooks'))")
+test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - the plugin cache is stale or incomplete. Run /plugin marketplace update (or /dev-test install for local dev), then retry." >&2; exit 1; }
+TODAY=$(date +%Y-%m-%d)
+python3 "$HOOKS/note_writer.py" append-update "$VAULT_PATH" "$MATCH_PATH" \
+  --last-updated "$TODAY" \
+  --add-tags "claude/topic/<new-tag-1>,claude/topic/<new-tag-2>" <<'OB_UPDATE_EOF_<eof4>'
+## Update (YYYY-MM-DD)
 
-1. **`last_updated` field:** If `last_updated:` already exists in the frontmatter, replace its value with today's date. If it does not exist, add `last_updated: YYYY-MM-DD` after the `date:` line.
+<New content about this topic from today's session>
+OB_UPDATE_EOF_<eof4>
+```
 
-2. **New topic tags:** Generate 1-3 topic tags from the update content (same logic as Step 5). For each new tag, check if it already exists in the `tags:` list. Only append tags that are NOT already present. Add new tags at the end of the tags list, before the closing `---`.
+On success this prints `OK: <resolved path>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero — the file is left byte-identical (no partial write happens). Surface the error to the user: "Failed to append update section — `<error message>`. Please edit manually at `$MATCH_PATH`." and stop here.
 
-**Do NOT change:** `date`, `source_session`, `source_session_note`, or `type` fields. These record the original creation context.
+The write is atomic and a non-zero exit means nothing was written, so a Read purely to confirm the bytes landed adds nothing — do NOT add one for that purpose. The CLI also refuses to write if the note changed on disk after it was read (`ERROR: note changed on disk...`), which is what a second session running `/compress` on the same note looks like; on that error, re-run the update so it applies on top of the other change rather than discarding it.
 
-#### 4A-update.6 — Re-sync vault index
+**Do NOT change:** `date`, `source_session`, `source_session_note`, or `type` fields. These record the original creation context — the CLI never touches them.
+
+**Note on repeated runs:** running `/compress` update again later (even later the same day) appends another `## Update (YYYY-MM-DD)` section rather than merging into an existing one for that date. This is expected and lossless — do not describe or imply that same-date updates merge.
+
+#### 4A-update.5 — Re-sync vault index
 
 Run:
 
@@ -219,7 +233,7 @@ Run:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from vault_index import ensure_index
 from obsidian_utils import load_config
 c = load_config()
@@ -233,7 +247,7 @@ except Exception as e:
 '
 ~~~
 
-#### 4A-update.7 — Confirm
+#### 4A-update.6 — Confirm
 
 Print:
 
@@ -340,7 +354,7 @@ Where:
   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   python3 -c '
   import sys, os
-  import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+  import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
   from obsidian_utils import load_config, get_session_context
   c = load_config()
   ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
@@ -380,23 +394,26 @@ Example: `2026-04-04-rate-limiting-with-redis-a3f2.md`
 
 ### Step 8 — Write the note
 
-Run:
+Run the note-writer CLI, piping the full note (frontmatter + body) in on stdin. It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_NOTE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_NOTE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below sorts cached plugin versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`), and the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the note body, silently corrupting it:
 
 ```bash
-mkdir -p "$VAULT_PATH/$INSIGHTS_FOLDER"
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "import glob,os,re; c=glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')); print(max(c, key=lambda p: ([int(n) for n in re.findall('[0-9]+', p.split('/')[-2])], p), default='hooks'))")
+test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - the plugin cache is stale or incomplete. Run /plugin marketplace update (or /dev-test install for local dev), then retry." >&2; exit 1; }
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-<slug>-<hash>.md" <<'OB_NOTE_EOF_<eof4>'
+---
+type: claude-insight
+...
+---
+
+# <Title>
+...
+OB_NOTE_EOF_<eof4>
 ```
 
-Then use the **Write** tool to write the full note (frontmatter + body) to:
+On success this prints `OK: <absolute path>` — that is the file at `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here.
 
-```
-$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-<slug>-<hash>.md
-```
-
-Then set permissions:
-
-```bash
-chmod 644 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-<slug>-<hash>.md"
-```
+If the error is `note already exists`, the 4-hex filename hash collided with a note written in the same second. Regenerate the hash (Step 7's command), rebuild the filename, and retry the write **once**. If it fails again for any reason, surface the error and stop — do not loop.
 
 ### Step 9 — Confirm
 

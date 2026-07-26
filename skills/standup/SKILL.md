@@ -9,7 +9,7 @@ metadata:
 
 Searches the Obsidian vault for session notes and insights within a date range, upgrades any unsummarized notes with AI summaries, groups findings by project, and generates a structured standup note.
 
-**Tools needed:** Bash, Grep, Read, Write
+**Tools needed:** Bash, Grep, Read
 
 ## Procedure
 
@@ -23,7 +23,7 @@ Run:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
@@ -171,7 +171,7 @@ output_mode: files_with_matches
 ```bash
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import flip_note_status
 flip_note_status(sys.argv[1], "auto-logged", "summarized")
 ' "$FILE_PATH"
@@ -191,7 +191,7 @@ If `UNSUMMARIZED` is empty, skip to Step 7.
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import upgrade_batch
 results = upgrade_batch([sys.argv[1]], sys.argv[2], sys.argv[3], sys.argv[4])
 print(results[0]["status"])
@@ -216,14 +216,57 @@ For each file in `UNSUMMARIZED`, if `upgrade_batch()` is unavailable or the prin
    - `## Errors Encountered` — Bulleted list with error messages, root causes, and fixes. If none, write "None."
    - `## Open Questions / Next Steps` — Checkbox list of specific, actionable items. If none, write "None."
 5. **Preserve the Session Metadata section** at the bottom if it exists.
-6. **Write the upgraded note** using the Write tool to the same file path. Structure:
-   - Original frontmatter (unchanged)
-   - `# <title from original note>`
-   - The five summary sections
-   - Session Metadata section (if it existed)
-7. Run `chmod 644 <filepath>` after writing.
+6. **Write the upgraded note** using the note-writer CLI — see Step 6.6 below for the exact structure and command. Do NOT reproduce the heredoc inline inside this list item; the fenced block below must stay outdented to column 0.
 
-**Important:** Do NOT modify frontmatter. Do NOT change the filename. Do NOT add or remove tags.
+#### Step 6.6 — Write the upgraded note
+
+Run the note-writer CLI, piping the full rewritten file in on stdin — structured as:
+
+- Original frontmatter (unchanged)
+- `# <title from original note>`
+- The five summary sections
+- Session Metadata section (if it existed)
+
+This overwrites the note in place at its EXISTING path: pass `$SESSIONS_FOLDER` as the folder and the note's own basename (from `$NOTE_PATH`) as `<filename>` — never a new name. `write_vault_note()` (which the CLI delegates to) replaces an existing file atomically via the same temp-file + rename it uses to create one, so overwriting in place is a supported, safe case. **Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_NOTE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_NOTE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below sorts cached plugin versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`), and the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the transcript content, silently corrupting the note.
+
+**The fence, its content, and the terminator below must all sit at column 0 — never indent this block, even though it is referenced from inside a numbered list item.** The heredoc is `<<'...'`, not `<<-'...'`, so POSIX requires the terminator at the start of its line; an indented terminator never closes the heredoc, which silently swallows every following command as note content.
+
+This is also the ONE call site that passes `--overwrite`: it upgrades an existing note in place, and the CLI refuses to replace an existing file without that flag (a filename collision anywhere else must fail loudly rather than destroy a note). Do not copy `--overwrite` to any other `note_writer.py write` block.
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "import glob,os,re; c=glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')); print(max(c, key=lambda p: ([int(n) for n in re.findall('[0-9]+', p.split('/')[-2])], p), default='hooks'))")
+test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - the plugin cache is stale or incomplete. Run /plugin marketplace update (or /dev-test install for local dev), then retry." >&2; exit 1; }
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$SESSIONS_FOLDER" "<existing basename>" --overwrite <<'OB_NOTE_EOF_<eof4>'
+---
+<original frontmatter, unchanged>
+---
+
+# <title from original note>
+
+## Summary
+...
+
+## Key Decisions
+...
+
+## Changes Made
+...
+
+## Errors Encountered
+...
+
+## Open Questions / Next Steps
+...
+
+## Session Metadata
+...
+OB_NOTE_EOF_<eof4>
+```
+
+On success this prints `OK: <absolute path>` and the file is now at mode `0o600` (no separate `chmod` needed — the old `chmod 644` step is gone; this note is user data written by the plugin, same as every other CLI-written note). On failure it prints `ERROR: <reason>` to stderr and exits non-zero; treat this the same as an `upgrade_batch()` failure for this file. Either way — success or failure — this step never modifies frontmatter (see the Important note below), so the note stays at `status: auto-logged` regardless of outcome, and a later `/standup` run will re-attempt the upgrade for any note whose status is still `auto-logged`.
+
+**Important:** Do NOT modify frontmatter. Do NOT change the filename. Do NOT add or remove tags. The content piped into the CLI above must satisfy all three — frontmatter copied verbatim, filename the note's existing basename, tags untouched.
 
 Move all upgraded files from `UNSUMMARIZED` into the working set alongside `SUMMARIZED`. Track the count of upgraded notes as `UPGRADED_COUNT`.
 
@@ -388,23 +431,26 @@ Example: `2026-04-05-standup-daily-a3f2.md`
 
 ### Step 12 — Write the note
 
-Run:
+Run the note-writer CLI, piping the full note (frontmatter + body) in on stdin. It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_NOTE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_NOTE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below sorts cached plugin versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`), and the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the note body, silently corrupting it:
 
 ```bash
-mkdir -p "$VAULT_PATH/$INSIGHTS_FOLDER"
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "import glob,os,re; c=glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')); print(max(c, key=lambda p: ([int(n) for n in re.findall('[0-9]+', p.split('/')[-2])], p), default='hooks'))")
+test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - the plugin cache is stale or incomplete. Run /plugin marketplace update (or /dev-test install for local dev), then retry." >&2; exit 1; }
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-<slug>-<hash>.md" <<'OB_NOTE_EOF_<eof4>'
+---
+type: claude-standup
+...
+---
+
+# Standup: ...
+...
+OB_NOTE_EOF_<eof4>
 ```
 
-Then use the **Write** tool to write the full note (frontmatter + body) to:
+On success this prints `OK: <absolute path>` — that is the file at `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here.
 
-```
-$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-<slug>-<hash>.md
-```
-
-Then set permissions:
-
-```bash
-chmod 644 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-<slug>-<hash>.md"
-```
+If the error is `note already exists`, the 4-hex filename hash collided with a note written in the same second. Regenerate the hash (Step 11's command), rebuild the filename, and retry the write **once**. If it fails again for any reason, surface the error and stop — do not loop.
 
 ### Step 13 — Present to user
 
@@ -434,7 +480,7 @@ When open items are checked off in the standup note (either during generation or
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '%s' "$CHECKED_ITEMS_JSON" | python3 -c '
 import sys, json, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from open_item_dedup import batch_cascade_checkoff
 items = json.load(sys.stdin)
 summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
@@ -484,7 +530,7 @@ Then set task #1 to `in_progress` via TaskUpdate. **Do NOT proceed to Step 15 un
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '{"basenames": %s, "projects": %s}' "$NOTE_BASENAMES_JSON" "$PROJECTS_JSON" | python3 -c '
-import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from deep_cli import run_pipeline; run_pipeline(sys.argv[1], sys.argv[2], sys.argv[3])
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
 ```
@@ -505,7 +551,7 @@ Mark task #2 complete, task #3 in_progress.
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '%s' "$NOTE_BASENAMES_JSON" | python3 -c '
-import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from deep_cli import run_present; run_present(sys.argv[1], sys.argv[2], sys.argv[3])
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
 ```
@@ -523,12 +569,12 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 # Stage 1 — resolve targets by text. $CHECKOFFS_JSON is a JSON array of
 # {"file": "<basename>", "line": <hint>, "text": "<group representative / canonical text>"}.
 RESOLVED=$(printf '%s' "$CHECKOFFS_JSON" | python3 -c '
-import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from deep_cli import run_build_checkoffs; run_build_checkoffs()
 ')
 # Stage 2 — apply only the verified, text-anchored edits.
 printf '%s' "$RESOLVED" | python3 -c '
-import sys, json, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, json, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from deep_cli import run_batch_edit
 sys.stdin = __import__("io").StringIO(json.dumps(json.load(sys.stdin)["edits"]))
 run_batch_edit()
@@ -544,7 +590,7 @@ For confirmed link additions (NOT checkoffs), pass `[filepath, old_text, new_tex
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '%s' "$EDITS_JSON" | python3 -c '
-import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from deep_cli import run_batch_edit; run_batch_edit()
 '
 ```

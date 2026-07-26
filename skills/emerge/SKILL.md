@@ -32,7 +32,7 @@ Parse the arg as DAYS: no arg = 30, `Nd`/`N days` = N, `this week` = days since 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from emerge_cli import run_emerge_themes; run_emerge_themes(int(sys.argv[1]) if len(sys.argv) > 1 else 30)
 ' "$DAYS"
 ```
@@ -58,7 +58,7 @@ If no `WRITTEN:` response, report failure and stop. Mark task #2 `completed`.
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
-import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from emerge_cli import run_build_note; run_build_note()
 ' 2>&1
 ```
