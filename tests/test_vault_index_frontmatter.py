@@ -300,7 +300,7 @@ def test_sync_splits_unchanged_vs_malformed_and_skipped_is_their_sum(tmp_path):
     assert first["skipped"] == first["unchanged"] + first["malformed"] == 1
     assert len(first["malformed_files"]) == 1
     assert first["malformed_files"][0]["file"] == "bad.md"
-    assert "no closing" in first["malformed_files"][0]["reason"]
+    assert first["malformed_files"][0]["reason"] == "no_closing_fence"
 
     # Second pass, nothing changed on disk: the two valid notes now hit the
     # mtime-unchanged fast path; the malformed note is reparsed (and fails)
@@ -322,6 +322,11 @@ def test_sync_splits_unchanged_vs_malformed_and_skipped_is_their_sum(tmp_path):
 
 
 def test_malformed_files_capped_at_20_but_malformed_reports_true_count(tmp_path):
+    # 25 is a literal, independent of _MALFORMED_FILES_CAP -- NOT a formula
+    # over the constant (e.g. CAP + 5). If it were, the cap value and the
+    # fixture size would move in lockstep and this test could never observe
+    # them disagree, turning it into a tautology. 25 just needs to stay
+    # genuinely larger than the cap.
     sessions = tmp_path / "claude-sessions"
     sessions.mkdir()
     for i in range(25):
@@ -335,8 +340,12 @@ def test_malformed_files_capped_at_20_but_malformed_reports_true_count(tmp_path)
     assert stats["malformed"] == 25, (
         "malformed must report the TRUE total, not the capped list length"
     )
-    assert len(stats["malformed_files"]) == 20, (
-        "malformed_files must be capped at 20 entries even with 25 failures"
+    # Import the module constant rather than hardcoding 20 here, so the cap
+    # and this assertion cannot silently drift apart if the constant is
+    # deliberately changed.
+    assert len(stats["malformed_files"]) == vault_index._MALFORMED_FILES_CAP, (
+        "malformed_files must be capped at _MALFORMED_FILES_CAP entries "
+        "even with 25 failures"
     )
     assert stats["malformed"] != len(stats["malformed_files"]), (
         "these two must be able to disagree -- a regression that counts the "
@@ -359,5 +368,120 @@ def test_rebuild_index_full_mode_carries_split_counters_through(tmp_path):
 
     assert stats["inserted"] == 1
     assert stats["malformed"] == 1
-    assert stats["malformed_files"] == [{"file": "bad.md", "reason": stats["malformed_files"][0]["reason"]}]
-    assert "no closing" in stats["malformed_files"][0]["reason"]
+    assert stats["malformed_files"] == [{"file": "bad.md", "reason": "no_closing_fence"}]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (security review): malformed_files must not leak raw note
+# content, the vault's absolute filesystem path, or unsanitized filenames.
+# Before this, `_sync` stored `_parse_note_detailed`'s raw reason verbatim --
+# which can embed up to 60 chars of the note's own text -- directly in the
+# returned dict, which flows into `/vault-reindex` output, the model's
+# context, and the session transcript.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_parse_failure_maps_every_known_reason():
+    assert vault_index._classify_parse_failure(
+        "unreadable file: No such file or directory"
+    ) == "unreadable"
+    assert vault_index._classify_parse_failure(
+        "malformed frontmatter (file does not open with a '---' fence)"
+    ) == "no_opening_fence"
+    assert vault_index._classify_parse_failure(
+        "malformed or missing frontmatter (no closing '---'; stopped at a "
+        "line that is not frontmatter: 'SECRET_TOKEN_ABC123 not shaped')"
+    ) == "no_closing_fence"
+    assert vault_index._classify_parse_failure(
+        "malformed or missing frontmatter (no closing '---')"
+    ) == "no_closing_fence"
+    assert vault_index._classify_parse_failure(
+        "frontmatter exceeds 1000 lines (limit reached before the "
+        "frontmatter block ended -- the note may be fine; this is a size "
+        "limit, not a missing fence)"
+    ) == "frontmatter_too_long"
+
+
+def test_classify_parse_failure_falls_back_to_unknown():
+    assert vault_index._classify_parse_failure("some future reason string") == "unknown"
+    assert vault_index._classify_parse_failure(None) == "unknown"
+
+
+def test_classify_parse_failure_matches_prefix_not_first_colon():
+    """The 'no closing fence' reason embeds an excerpt that can itself
+    contain a colon (e.g. 'key: value' pasted mid-body). A classifier that
+    sliced at the first ':' instead of matching the stable prefix would
+    misclassify this as something else (or fail to classify it at all)."""
+    reason = (
+        "malformed or missing frontmatter (no closing '---'; stopped at a "
+        "line that is not frontmatter: 'note: this line has a colon too')"
+    )
+    assert vault_index._classify_parse_failure(reason) == "no_closing_fence"
+
+
+def test_sanitize_report_filename_strips_control_characters():
+    assert vault_index._sanitize_report_filename(
+        "evil\nname\t.md"
+    ) == "evilname.md"
+
+
+def test_sanitize_report_filename_caps_length():
+    long_name = "a" * 500 + ".md"
+    sanitized = vault_index._sanitize_report_filename(long_name)
+    assert len(sanitized) == vault_index._MALFORMED_FILENAME_CAP
+    assert sanitized == "a" * vault_index._MALFORMED_FILENAME_CAP
+
+
+def test_malformed_files_report_does_not_leak_raw_note_content(tmp_path):
+    """A malformed note whose body breaks the frontmatter shape check on a
+    line containing secret-looking content must NOT have that content
+    reproduced anywhere in the returned malformed_files report -- only the
+    stable classifier may appear."""
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    secret = "SECRET_TOKEN_ABC123_do_not_leak"
+    (sessions / "leaky.md").write_text(
+        f"---\ntype: session\n{secret} this line is not frontmatter shaped\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    db_path = str(tmp_path / "index.db")
+    stats = vault_index.rebuild_index(
+        str(tmp_path), ["claude-sessions"], db_path=db_path,
+    )
+
+    assert stats["malformed"] == 1
+    assert stats["malformed_files"] == [{"file": "leaky.md", "reason": "no_closing_fence"}]
+    assert secret not in repr(stats["malformed_files"])
+
+
+def test_malformed_files_report_does_not_leak_control_chars_in_filename(tmp_path):
+    """A filename containing a newline must not corrupt the report -- the
+    stored 'file' value must be the control-character-stripped form."""
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    # Most filesystems permit '\n' in a filename (not '/' or NUL).
+    evil_name = "evil\nname.md"
+    (sessions / evil_name).write_text(_malformed_note(), encoding="utf-8")
+
+    db_path = str(tmp_path / "index.db")
+    stats = vault_index.rebuild_index(
+        str(tmp_path), ["claude-sessions"], db_path=db_path,
+    )
+
+    assert stats["malformed"] == 1
+    assert "\n" not in stats["malformed_files"][0]["file"]
+    assert stats["malformed_files"][0]["file"] == "evilname.md"
+
+
+def test_unreadable_file_reason_does_not_leak_absolute_path(tmp_path):
+    """_parse_note_detailed's OSError branch must not embed the caller-
+    supplied absolute path in its reason string (str(OSError) does; this
+    reason flows into _sync's aggregated report)."""
+    missing_path = tmp_path / "does-not-exist.md"
+    parsed, err = vault_index._parse_note_detailed(str(missing_path))
+    assert parsed is None
+    assert err is not None
+    assert "unreadable file" in err
+    assert str(missing_path) not in err
+    assert str(tmp_path) not in err

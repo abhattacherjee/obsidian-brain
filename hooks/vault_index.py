@@ -282,7 +282,14 @@ def _parse_note_detailed(file_path: str) -> tuple[dict | None, str | None]:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             full_text = f.read()
     except OSError as exc:
-        return None, f"unreadable file: {exc}"
+        # exc.strerror (e.g. "No such file or directory"), NOT str(exc) --
+        # str(OSError) includes the full path argument
+        # ("[Errno 2] No such file or directory: '/Users/.../secret.md'"),
+        # which would leak the absolute vault path into this reason string
+        # and, from there, into _sync's aggregated malformed_files report.
+        # The caller-supplied basename (recorded separately by _sync) is
+        # the only path information this should ever emit.
+        return None, f"unreadable file: {exc.strerror or type(exc).__name__}"
 
     lines = split_lines_lf_crlf(full_text)
     _open_fence, fm_lines, _close_fence, body_lines, split_err = split_frontmatter(lines)
@@ -627,6 +634,73 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
         _update_term_df(conn, old_terms=old_terms, new_terms=set())
 
 
+# Cap on how many malformed-file entries `_sync` accumulates into
+# `stats["malformed_files"]` per pass, so a pathological vault (thousands of
+# broken notes) can't balloon the returned dict. Module-level (not
+# function-local) so tests can import it instead of hardcoding the value --
+# a hardcoded test constant and this cap could otherwise silently drift
+# apart. `stats["malformed"]` always reports the TRUE, uncapped count.
+_MALFORMED_FILES_CAP = 20
+
+# Cap on the length of a filename recorded in `stats["malformed_files"]`.
+# 120 chars is generous headroom over any realistic vault filename.
+_MALFORMED_FILENAME_CAP = 120
+
+# Stable-prefix classifiers for `_classify_parse_failure` below. Matched via
+# `str.startswith`, never by slicing at the first ':' -- the embedded
+# excerpt in the "no closing fence" reason can itself contain colons.
+_UNREADABLE_PREFIX = "unreadable file:"
+_NO_OPENING_FENCE_PREFIX = "malformed frontmatter (file does not open"
+_NO_CLOSING_FENCE_PREFIX = "malformed or missing frontmatter (no closing"
+_TOO_LONG_PREFIX = "frontmatter exceeds"
+
+
+def _classify_parse_failure(reason: str | None) -> str:
+    """Map a `_parse_note_detailed` failure reason to a stable, content-free
+    classifier for `_sync`'s aggregated `malformed_files` report.
+
+    `_parse_note_detailed`'s raw reason can embed up to 60 characters of the
+    note's own text (`split_frontmatter`'s "no closing '---'; stopped at a
+    line that is not frontmatter: '<excerpt>'"). Vault notes are
+    user/LLM-authored content -- a secret or injection string sitting in a
+    malformed frontmatter region would otherwise be echoed verbatim into
+    `/vault-reindex` output, the model's context, and the session
+    transcript. This function is the ONLY thing that may see the raw
+    reason on the way into that aggregated report; `_parse_note_detailed`'s
+    own return value is untouched and stays available to direct callers
+    for debugging.
+
+    Falls back to "unknown" for any reason string that doesn't match a
+    known prefix (including ``None``) rather than raising -- a future
+    change to `split_frontmatter`'s wording must not crash the sync loop.
+    """
+    if reason is None:
+        return "unknown"
+    if reason.startswith(_UNREADABLE_PREFIX):
+        return "unreadable"
+    if reason.startswith(_NO_OPENING_FENCE_PREFIX):
+        return "no_opening_fence"
+    if reason.startswith(_NO_CLOSING_FENCE_PREFIX):
+        return "no_closing_fence"
+    if reason.startswith(_TOO_LONG_PREFIX):
+        return "frontmatter_too_long"
+    return "unknown"
+
+
+def _sanitize_report_filename(name: str) -> str:
+    """Strip control characters and cap length before a filename enters
+    `_sync`'s `malformed_files` report.
+
+    A filename is attacker-influenced content (filenames may legally
+    contain newlines and other control characters on most filesystems),
+    and this value flows into `/vault-reindex` output, the model's
+    context, and the session transcript -- an embedded newline or other
+    control character could corrupt the rendered report.
+    """
+    cleaned = "".join(ch for ch in name if ch.isprintable())
+    return cleaned[:_MALFORMED_FILENAME_CAP]
+
+
 def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict:
     """Incremental sync: add new/changed files, remove deleted ones.
 
@@ -657,7 +731,6 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
         "recomputed": 0,
         "by_type": {},
     }
-    _MALFORMED_FILES_CAP = 20
 
     # Collect all .md files in target folders (keyed by absolute path)
     disk_files: dict[str, Path] = {}  # abs_path_str -> Path object
@@ -710,8 +783,16 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
                 stats["malformed"] += 1
                 stats["skipped"] += 1
                 if len(stats["malformed_files"]) < _MALFORMED_FILES_CAP:
+                    # Never store the raw `reason` here -- it can embed up
+                    # to 60 chars of the note's own content (see
+                    # _classify_parse_failure's docstring). Only the
+                    # stable classifier and a sanitized/capped filename
+                    # enter this aggregated report.
                     stats["malformed_files"].append(
-                        {"file": abs_path.name, "reason": reason}
+                        {
+                            "file": _sanitize_report_filename(abs_path.name),
+                            "reason": _classify_parse_failure(reason),
+                        }
                     )
                 continue
 
