@@ -321,8 +321,20 @@ _SUMMARY_SOURCE_RE = re.compile(r"^_\(Summary source:.*\)_\s*$")
 
 _DATE_LINE_RE = re.compile(r"^date:\s*.*$")
 _LAST_UPDATED_LINE_RE = re.compile(r"^last_updated:\s*.*$")
-_TAGS_KEY_RE = re.compile(r"^tags:\s*$")
+# Tolerates a trailing YAML comment (`tags:   # topics`), which the old
+# `^tags:\s*$` rejected -- silently dropping every requested tag on an
+# otherwise ordinary note.
+_TAGS_KEY_RE = re.compile(r"^tags:\s*(#.*)?$")
 _TAG_ITEM_RE = re.compile(r"^(?P<indent>\s*)-\s*(?P<tag>\S.*?)\s*$")
+
+# Shape of a line that may legitimately appear INSIDE frontmatter, used to
+# bound _split_frontmatter's closing-fence search (see its docstring).
+_FM_MAX_LINES = 200
+_FM_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*\s*:")
+_FM_ITEM_RE = re.compile(r"^\s*-\s")
+# An indented continuation: multi-line YAML values, block scalars (`x: |`),
+# and nested mappings all produce these.
+_FM_CONT_RE = re.compile(r"^\s+\S")
 # YAML flow-style tags, e.g. `tags: [claude/insight, claude/topic/foo]` or
 # the empty `tags: []` -- an alternative to the block style above that
 # _TAGS_KEY_RE/_TAG_ITEM_RE don't recognize (bug: silently no-op'd on a
@@ -336,17 +348,24 @@ _TAGS_FLOW_RE = re.compile(r"^tags:\s*\[(?P<inner>.*)\]\s*$")
 # original line ending.
 
 
-# Characters that must never appear in a tag value. `:` and `#` change how
-# YAML parses the line the tag is rendered into (`- foo: bar` turns the tags
-# sequence into a sequence of maps and breaks tag indexing/Dataview; `#`
-# starts a comment); the quote characters would unbalance a flow-style
-# `tags: [...]` line. Newline/CR are covered by the separate is-whitespace
-# check below, which is what blocks the frontmatter-key injection vector
-# (a tag of "claude/topic/a\ntype: hijacked" rendered an extra `type:` line
-# that overrode the note's own).
-_TAG_FORBIDDEN_CHARS = frozenset(":#\"'")
+# What a tag value may contain -- an ALLOWLIST, deliberately not a denylist.
+# A previous version enumerated forbidden YAML metacharacters (`:`, `#`,
+# quotes) and leaked `]`: `--add-tags 'a]'` on a flow-style note produced
+# `tags: [claude/insight, a]]`, which makes yaml.safe_load fail on the WHOLE
+# frontmatter -- the note loses `type` and every tag, at rc 0. `[`, `{`, `}`,
+# `,`, `&`, `*`, `!`, `%`, `@` are all the same shape, and chasing them one
+# at a time is how that bug arrived. Tags are a constrained format
+# (`claude/topic/foo`), so enumerate what is legal instead: start
+# alphanumeric, then alphanumerics plus `/ _ . -`.
+#
+# \A/\Z, not ^/$: `$` also matches just before a trailing newline, so
+# `^...$` would accept `"claude/topic/a\n"`.
+_TAG_VALUE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9/_.\-]*\Z")
 
-_LAST_UPDATED_VALUE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Same two traps as above: `$` accepted `"2026-01-01\n"` (which injected a
+# blank line into the frontmatter), and Python's `\d` is Unicode-aware, so
+# `٢٠٢٦-٠١-٠١` matched and was written verbatim. re.ASCII + \A/\Z close both.
+_LAST_UPDATED_VALUE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z", re.ASCII)
 
 # A fenced code block opener/closer: up to 3 leading spaces/tabs, then a run
 # of >= 3 backticks or tildes (CommonMark). Used to keep the insertion-point
@@ -365,12 +384,11 @@ def _validate_tags(add_tags_csv):
     before either merge path (block-style or flow-style) runs.
 
     Per item: surrounding spaces/tabs are stripped (conventional CSV
-    spacing, e.g. ``a, b``), then the tag must be non-empty and must contain
-    no whitespace at all (newline, CR, space, tab) and none of
-    ``_TAG_FORBIDDEN_CHARS``. Note the strip is ``" \\t"`` only — it
-    deliberately does NOT strip a newline, so ``"a\\ntype: hijacked"`` is
-    still seen (and rejected) as containing a newline rather than being
-    quietly trimmed into something valid.
+    spacing, e.g. ``a, b``), then the tag must be non-empty and must match
+    ``_TAG_VALUE_RE`` — an allowlist, see its comment for why a denylist is
+    the wrong shape here. Note the strip is ``" \\t"`` only, so it
+    deliberately does NOT strip a newline: ``"a\\ntype: hijacked"`` is still
+    seen (and rejected) rather than quietly trimmed into something valid.
     """
     if add_tags_csv is None:
         return [], None
@@ -383,13 +401,12 @@ def _validate_tags(add_tags_csv):
                 f"invalid --add-tags value (empty tag item): {add_tags_csv!r} "
                 "— omit the flag entirely when there are no new tags"
             )
-        for ch in tag:
-            if ch.isspace() or ch in _TAG_FORBIDDEN_CHARS:
-                return None, (
-                    f"invalid tag {tag!r}: contains {ch!r}, which would corrupt "
-                    "the note's YAML frontmatter (tags must not contain "
-                    "whitespace, ':', '#', or quote characters)"
-                )
+        if not _TAG_VALUE_RE.match(tag):
+            return None, (
+                f"invalid tag {tag!r}: a tag must start with a letter or digit "
+                "and contain only letters, digits, '/', '_', '.' and '-' "
+                "(anything else can corrupt the note's YAML frontmatter)"
+            )
         tags.append(tag)
     return tags, None
 
@@ -614,14 +631,37 @@ def _split_frontmatter(lines: list[str]):
 
     Returns ``(open_fence_line, frontmatter_lines, close_fence_line,
     body_lines)`` on success, or ``(None, None, None, None)`` if the file
-    does not open with a well-formed ``---`` ... ``---`` frontmatter block
-    (missing opening fence, or no closing fence found anywhere in the file).
+    does not open with a well-formed ``---`` ... ``---`` frontmatter block.
+
+    The closing-fence search is BOUNDED and SHAPE-CHECKED, not "first ``---``
+    anywhere in the file". On a note whose closing fence is missing (e.g.
+    corrupted by an earlier bad write) but whose body contains a ``---``
+    horizontal rule, the unbounded version treated the title heading and body
+    prose as frontmatter: ``last_updated`` and new tags were inserted among
+    the prose and the update section was appended after the rule, at rc 0.
+
+    Every candidate frontmatter line must therefore be blank, ``key:``-shaped,
+    a ``- `` list item, or an indented continuation (multi-line YAML values).
+    A ``# Title`` heading or a prose paragraph is none of those, so the scan
+    stops and the whole command fails loudly instead of silently mutating the
+    body. ``_FM_MAX_LINES`` is a second, cruder bound for a pathological file
+    whose body happens to be all key-shaped lines.
     """
     if not lines or lines[0].rstrip("\r\n") != "---":
         return None, None, None, None
-    for i in range(1, len(lines)):
-        if lines[i].rstrip("\r\n") == "---":
+    for i in range(1, min(len(lines), _FM_MAX_LINES + 1)):
+        stripped = lines[i].rstrip("\r\n")
+        if stripped == "---":
             return lines[0], lines[1:i], lines[i], lines[i + 1:]
+        if not stripped.strip():
+            continue
+        if (
+            _FM_KEY_RE.match(stripped)
+            or _FM_ITEM_RE.match(stripped)
+            or _FM_CONT_RE.match(stripped)
+        ):
+            continue
+        return None, None, None, None
     return None, None, None, None
 
 
@@ -652,9 +692,9 @@ def _apply_last_updated(fm_lines: list[str], last_updated: str, eol: str = "\n")
     return None, "frontmatter missing 'date:' field (required to insert last_updated)"
 
 
-def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n") -> list[str]:
-    """Return frontmatter lines with ``add_tags`` merged into the ``tags:``
-    block -- either style below, whichever the note actually uses.
+def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n"):
+    """Return ``(new_fm_lines, error)`` with ``add_tags`` merged into the
+    ``tags:`` block -- either style below, whichever the note actually uses.
 
     Block style (``tags:`` on its own line, followed by ``- item`` lines):
     new tags are appended at the end of the block, in the block's own
@@ -669,16 +709,24 @@ def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n") -
     existing items are otherwise left completely untouched (not
     re-serialized), so any of their original micro-spacing survives as-is.
 
-    No-op (returns ``fm_lines`` unchanged) if ``add_tags`` is empty, if no
-    ``tags:`` key is present in EITHER style, or if every tag in
-    ``add_tags`` is already present -- a note with no tags block is
-    "nothing to merge into", not an error. Tags already present (in the
-    existing block/list, or repeated within ``add_tags`` itself) are
-    skipped. ``eol`` is the line ending used for any new/rewritten line
-    (see ``_detect_line_ending``).
+    No-op (returns ``fm_lines`` unchanged, no error) if ``add_tags`` is
+    empty, or if every tag in ``add_tags`` is already present. Tags already
+    present (in the existing block/list, or repeated within ``add_tags``
+    itself) are skipped. ``eol`` is the line ending used for any new/rewritten
+    line (see ``_detect_line_ending``).
+
+    ERROR (not a no-op) when ``add_tags`` is non-empty and NO ``tags:`` key
+    matched in either style. This used to return ``fm_lines`` unchanged and
+    the command still printed ``OK:`` -- the caller asked for a mutation, it
+    did not happen, and nothing said so. A silently dropped tag is the exact
+    failure class this CLI exists to remove. It is reachable on a real note:
+    ``tags:   # topics`` (a trailing YAML comment) did not match the old
+    ``^tags:\\s*$`` key regex, so a perfectly ordinary note silently lost
+    every requested tag. The regex now tolerates a trailing comment, and
+    anything it still cannot recognize fails loudly instead of quietly.
     """
     if not add_tags:
-        return fm_lines
+        return fm_lines, None
 
     # Block style.
     tags_idx = None
@@ -714,7 +762,7 @@ def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n") -
             seen.add(tag)
             new_lines.append(f"{indent}- {tag}{eol}")
 
-        return fm_lines[:end_idx] + new_lines + fm_lines[end_idx:]
+        return fm_lines[:end_idx] + new_lines + fm_lines[end_idx:], None
 
     # Flow style.
     for idx, line in enumerate(fm_lines):
@@ -733,7 +781,7 @@ def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n") -
             new_tags.append(tag)
 
         if not new_tags:
-            return fm_lines  # every requested tag already present -- untouched
+            return fm_lines, None  # every requested tag already present
 
         quote = ""
         if raw_items:
@@ -748,9 +796,14 @@ def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n") -
             new_inner = ", ".join(rendered_new)
 
         new_line = f"tags: [{new_inner}]{eol}"
-        return fm_lines[:idx] + [new_line] + fm_lines[idx + 1:]
+        return fm_lines[:idx] + [new_line] + fm_lines[idx + 1:], None
 
-    return fm_lines  # no tags: key in either style -- nothing to merge into
+    return None, (
+        "cannot merge tags: the note has no recognizable 'tags:' block "
+        f"(requested: {', '.join(add_tags)}). Add the tags manually, or fix "
+        "the note's frontmatter -- a block-style 'tags:' followed by '- item' "
+        "lines, or a flow-style 'tags: [a, b]'."
+    )
 
 
 def _atomic_rewrite(dest: Path, content: str):
@@ -920,7 +973,10 @@ def run_append_update(
             print(f"ERROR: {fm_err}", file=sys.stderr)
             return 1
 
-    fm_lines = _apply_add_tags(fm_lines, add_tags, eol=eol)
+    fm_lines, tags_merge_err = _apply_add_tags(fm_lines, add_tags, eol=eol)
+    if tags_merge_err:
+        print(f"ERROR: {tags_merge_err}", file=sys.stderr)
+        return 1
 
     insertion_idx = _find_insertion_index(body_lines)
 

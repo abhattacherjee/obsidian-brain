@@ -117,6 +117,11 @@ def _prepare(block: str, tmp_path, vault, note_name: str):
     script = _HOOKS_LINE_RE.sub(f'HOOKS="{_HOOKS_DIR}"', block)
     script = script.replace("<eof4>", _EOF4)
     script = _WRITE_FILENAME_RE.sub(rf'\1"{note_name}"', script)
+    # `--add-tags "claude/topic/<new-tag-1>,…"` is a template the model fills
+    # in. Left literal, the angle brackets are (correctly) rejected by the tag
+    # allowlist -- so substitute them here exactly as the model would, rather
+    # than weakening the allowlist to accommodate a placeholder.
+    script = re.sub(r"<new-tag-(\d+)>", r"tag\1", script)
 
     is_update = "append-update" in script
     body_head = (

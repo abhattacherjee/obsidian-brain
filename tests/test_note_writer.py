@@ -943,20 +943,61 @@ def test_append_update_new_tag_appended_duplicate_skipped(tmp_path):
     assert "claude/topic/new-one" in tags_block
 
 
-def test_append_update_no_tags_block_does_not_crash(tmp_path):
+def test_append_update_no_tags_block_is_an_error_not_a_silent_drop(tmp_path):
+    """REPLACES test_append_update_no_tags_block_does_not_crash, which pinned
+    rc==0 for "note has no tags: block" and documented it as "nothing to merge
+    into, not an error".
+
+    That is the silent-drop failure class this whole CLI exists to remove: the
+    caller asked for a tag merge, it did not happen, and the command printed
+    `OK:`. It must fail loudly and leave the note untouched — no body append
+    either, since the whole point is one atomic all-or-nothing write."""
     vault = tmp_path / "vault"
     note_content = BASIC_NOTE.replace(
         "tags:\n  - claude/insight\n  - claude/topic/foo\n", ""
     )
     assert "tags:" not in note_content
     note = _make_note(vault, "claude-insights", "insight.md", note_content)
+    before = note.read_bytes()
 
     result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/new-one")
 
+    assert result.returncode == 1
+    assert "tags" in result.stderr
+    assert "claude/topic/new-one" in result.stderr  # names what was dropped
+    assert note.read_bytes() == before
+
+
+def test_append_update_no_tags_block_without_add_tags_still_succeeds(tmp_path):
+    """The error above is scoped to a REQUESTED merge. A note with no tags
+    block and no --add-tags flag is an ordinary append and must still work."""
+    vault = tmp_path / "vault"
+    note_content = BASIC_NOTE.replace(
+        "tags:\n  - claude/insight\n  - claude/topic/foo\n", ""
+    )
+    note = _make_note(vault, "claude-insights", "insight.md", note_content)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
     assert result.returncode == 0, result.stderr
     written = note.read_text(encoding="utf-8")
-    assert "tags:" not in written  # nothing to merge into -- no block invented
-    assert "## Update (2026-07-25)" in written  # body append still happened
+    assert "tags:" not in written  # no block invented
+    assert "## Update (2026-07-25)" in written
+
+
+def test_append_update_tags_key_with_trailing_comment_merges(tmp_path):
+    """End-to-end for the `tags:   # topics` case: previously rc 0 with the
+    tag silently absent."""
+    vault = tmp_path / "vault"
+    note_content = BASIC_NOTE.replace("tags:\n", "tags:   # topics\n")
+    note = _make_note(vault, "claude-insights", "insight.md", note_content)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/z")
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "  - claude/topic/z\n" in written
+    assert "tags:   # topics\n" in written  # comment preserved verbatim
 
 
 def test_append_update_empty_add_tags_value_is_rejected(tmp_path):
@@ -1318,17 +1359,30 @@ def test_apply_last_updated_replace_vs_insert_in_process():
 
 def test_apply_add_tags_in_process():
     fm = ["tags:\n", "  - claude/insight\n", "project: y\n"]
-    out = note_writer._apply_add_tags(fm, ["claude/insight", "claude/topic/new"])
+    out, err = note_writer._apply_add_tags(fm, ["claude/insight", "claude/topic/new"])
+    assert err is None
     assert out == [
         "tags:\n", "  - claude/insight\n", "  - claude/topic/new\n", "project: y\n",
     ]
 
-    # No tags: block -- no-op, no crash
+    # No tags: block at all -- a requested merge that CANNOT happen is now an
+    # error, not a silent no-op returning the input unchanged.
     fm_no_tags = ["type: x\n", "project: y\n"]
-    assert note_writer._apply_add_tags(fm_no_tags, ["claude/topic/new"]) == fm_no_tags
+    out_err, err2 = note_writer._apply_add_tags(fm_no_tags, ["claude/topic/new"])
+    assert out_err is None
+    assert "tags:" in err2
 
-    # Empty add_tags -- no-op
-    assert note_writer._apply_add_tags(fm, []) == fm
+    # Empty add_tags -- genuine no-op (nothing was requested)
+    assert note_writer._apply_add_tags(fm, []) == (fm, None)
+
+
+def test_apply_add_tags_tolerates_trailing_yaml_comment_on_tags_key():
+    """`tags:   # topics` is an ordinary note. The old `^tags:\\s*$` key regex
+    did not match it, so every requested tag was silently dropped at rc 0."""
+    fm = ["tags:   # topics\n", "  - claude/insight\n"]
+    out, err = note_writer._apply_add_tags(fm, ["claude/topic/z"])
+    assert err is None
+    assert out == ["tags:   # topics\n", "  - claude/insight\n", "  - claude/topic/z\n"]
 
 
 def test_is_trailing_marker_in_process():
@@ -1791,20 +1845,20 @@ def test_append_update_block_style_tags_unaffected_by_flow_support(tmp_path):
 
 def test_apply_add_tags_flow_style_in_process():
     fm = ["project: y\n", "tags: [a, b]\n"]
-    out = note_writer._apply_add_tags(fm, ["b", "c"])
+    out, _err = note_writer._apply_add_tags(fm, ["b", "c"])
     assert out == ["project: y\n", "tags: [a, b, c]\n"]
 
     fm_empty = ["tags: []\n"]
-    out_empty = note_writer._apply_add_tags(fm_empty, ["a", "b"])
+    out_empty, _ = note_writer._apply_add_tags(fm_empty, ["a", "b"])
     assert out_empty == ["tags: [a, b]\n"]
 
     # Every requested tag already present -- byte-identical no-op.
     fm_dup = ["tags: [a, b]\n"]
-    assert note_writer._apply_add_tags(fm_dup, ["a"]) == fm_dup
+    assert note_writer._apply_add_tags(fm_dup, ["a"]) == (fm_dup, None)
 
     # Quoted existing items -- new item rendered with the same quote char.
     fm_quoted = ['tags: ["a", "b"]\n']
-    out_quoted = note_writer._apply_add_tags(fm_quoted, ["c"])
+    out_quoted, _ = note_writer._apply_add_tags(fm_quoted, ["c"])
     assert out_quoted == ['tags: ["a", "b", "c"]\n']
 
 
@@ -2689,7 +2743,8 @@ def test_append_update_rejects_tag_forging_closing_frontmatter_fence(tmp_path):
 
 def test_apply_add_tags_detects_four_space_indent():
     fm = ["tags:\n", "    - a\n", "    - b\n"]
-    out = note_writer._apply_add_tags(fm, ["c"])
+    out, err = note_writer._apply_add_tags(fm, ["c"])
+    assert err is None
     assert out == ["tags:\n", "    - a\n", "    - b\n", "    - c\n"]
 
 
@@ -2698,14 +2753,16 @@ def test_apply_add_tags_detects_zero_indent_no_mixing():
     match it rather than getting the hardcoded 2-space default, which produced
     `tags:\\n- a\\n- b\\n  - c` — a block with mixed indentation."""
     fm = ["tags:\n", "- a\n", "- b\n"]
-    out = note_writer._apply_add_tags(fm, ["c"])
+    out, err = note_writer._apply_add_tags(fm, ["c"])
+    assert err is None
     assert out == ["tags:\n", "- a\n", "- b\n", "- c\n"]
 
 
 def test_apply_add_tags_empty_block_uses_two_space_default():
     """No existing items to learn from — the documented 2-space default."""
     fm = ["tags:\n"]
-    out = note_writer._apply_add_tags(fm, ["c"])
+    out, err = note_writer._apply_add_tags(fm, ["c"])
+    assert err is None
     assert out == ["tags:\n", "  - c\n"]
 
 
@@ -2723,3 +2780,201 @@ def test_append_update_four_space_tag_block_end_to_end(tmp_path):
     written = note.read_text(encoding="utf-8")
     assert "    - claude/topic/new\n" in written
     assert "  - claude/topic/new\n" not in written.replace("    - claude/topic/new\n", "")
+
+
+# ===========================================================================
+# Round 2: tag ALLOWLIST, bounded frontmatter scan, strict date anchoring.
+# ===========================================================================
+
+@pytest.mark.parametrize(
+    "bad_tag",
+    [
+        "a]",           # closes a flow-style list early -> yaml.safe_load fails
+        "a[",
+        "a{",
+        "a}",
+        "a&anchor",
+        "a*alias",
+        "a!tag",
+        "a%directive",
+        "a@x",
+        "-leading-dash",  # a bare `-` start reads as a nested sequence item
+        "foo: bar",
+        "a#comment",
+        'a"q"',
+        "a'q'",
+        "a b",
+        "claude/topic/a\ntype: hijacked",
+    ],
+)
+def test_append_update_tag_allowlist_rejects_yaml_metacharacters(tmp_path, bad_tag):
+    """The previous denylist enumerated `:#"'` and leaked every other YAML
+    metacharacter. `--add-tags 'a]'` on a flow-style note produced
+    `tags: [claude/insight, a]]`, which makes yaml.safe_load fail on the WHOLE
+    frontmatter -- the note loses `type` and every tag -- at rc 0.
+
+    Both merge paths are covered: validation runs before either is chosen.
+    """
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags=bad_tag)
+
+    assert result.returncode == 1
+    assert "invalid tag" in result.stderr
+    assert note.read_bytes() == before
+
+
+def test_append_update_flow_style_bracket_tag_rejected_yaml_stays_parseable(tmp_path):
+    """The reported reproduction, end to end on a flow-style note: the tag
+    must be rejected AND the frontmatter must still round-trip through a YAML
+    parse afterwards."""
+    vault = tmp_path / "vault"
+    flow_note = BASIC_NOTE.replace(
+        "tags:\n  - claude/insight\n  - claude/topic/foo\n",
+        "tags: [claude/insight]\n",
+    )
+    note = _make_note(vault, "claude-insights", "insight.md", flow_note)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="a]")
+
+    assert result.returncode == 1
+    assert "invalid tag" in result.stderr
+    assert note.read_bytes() == before
+    written = note.read_text(encoding="utf-8")
+    assert "tags: [claude/insight]" in written
+    assert "a]]" not in written
+
+
+@pytest.mark.parametrize(
+    "good_tag",
+    [
+        "claude/topic/note-writer",
+        "claude/insight",
+        "claude/topic/python3.12",
+        "claude/topic/a_b",
+        "0-numeric-start",
+    ],
+)
+def test_append_update_tag_allowlist_accepts_legitimate_tags(tmp_path, good_tag):
+    """The allowlist must not reject the tags skills actually generate."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags=good_tag)
+
+    assert result.returncode == 0, result.stderr
+    assert f"  - {good_tag}\n" in note.read_text(encoding="utf-8")
+
+
+def test_validate_tags_allowlist_in_process():
+    for bad in ("a]", "a[", "a{", "a}", "a&x", "a*x", "a!x", "a%x", "a@x",
+                "-x", ".x", "/x", "_x", "a b", "a\nb", "a: b", "a#b"):
+        tags, err = note_writer._validate_tags(bad)
+        assert err is not None, bad
+        assert tags is None, bad
+    for good in ("claude/topic/note-writer", "a", "A1", "a.b", "a_b", "a-b", "a/b"):
+        tags, err = note_writer._validate_tags(good)
+        assert err is None, good
+        assert tags == [good]
+
+
+# --- frontmatter scan is bounded and shape-checked -------------------------
+
+def test_append_update_missing_fence_with_horizontal_rule_fails_loudly(tmp_path):
+    """A note whose closing fence is missing but whose BODY contains a `---`
+    horizontal rule: the unbounded scan treated the title and prose as
+    frontmatter, inserted `last_updated` among them and appended the update
+    after the rule, all at rc 0."""
+    vault = tmp_path / "vault"
+    content = (
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-01-01\n"
+        "\n"
+        "# Title\n"
+        "\n"
+        "Body prose that is not frontmatter.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "More body.\n"
+    )
+    note = _make_note(vault, "claude-insights", "insight.md", content)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, last_updated="2026-07-25")
+
+    assert result.returncode == 1
+    assert "frontmatter" in result.stderr.lower()
+    assert note.read_bytes() == before
+
+
+def test_split_frontmatter_shape_and_bound_in_process():
+    def split(text):
+        return note_writer._split_frontmatter(note_writer._split_lines_lf_crlf(text))
+
+    # A heading is not a frontmatter line -> no closing fence "found" later on.
+    assert split("---\ntype: x\n\n# Title\n\n---\nbody\n")[1] is None
+    # Prose is not either.
+    assert split("---\ntype: x\nprose line\n---\nbody\n")[1] is None
+    # Legitimate frontmatter shapes all pass: keys, list items, blanks,
+    # indented continuations (block scalars / nested maps).
+    ok = "---\ntype: x\ntags:\n  - a\n\nsummary: |\n  line one\n  line two\n---\nbody\n"
+    assert split(ok)[1] is not None
+    # Beyond the bound, even valid-looking keys stop the scan.
+    long_fm = "---\n" + ("k: v\n" * (note_writer._FM_MAX_LINES + 5)) + "---\nbody\n"
+    assert split(long_fm)[1] is None
+
+
+# --- --last-updated anchoring ----------------------------------------------
+
+@pytest.mark.parametrize(
+    "bad_date",
+    [
+        "2026-01-01\n",              # `$` matched before a trailing newline
+        "2026-01-01\ntype: pwned",
+        "٢٠٢٦-٠١-٠١",  # Unicode digits
+    ],
+)
+def test_append_update_last_updated_anchoring(tmp_path, bad_date):
+    """`^...$` accepted a trailing newline (injecting a blank frontmatter
+    line) and Python's `\\d` is Unicode-aware, so Arabic-Indic digits were
+    accepted and written verbatim. \\A/\\Z + re.ASCII close both."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, last_updated=bad_date)
+
+    assert result.returncode == 1
+    assert "last-updated" in result.stderr
+    assert note.read_bytes() == before
+
+
+def test_validate_last_updated_anchoring_in_process():
+    assert note_writer._validate_last_updated("2026-01-01") is None
+    assert note_writer._validate_last_updated("2026-01-01\n") is not None
+    assert note_writer._validate_last_updated("\n2026-01-01") is not None
+    assert note_writer._validate_last_updated("٢٠٢٦-٠١-٠١") is not None
+
+
+def test_run_append_update_in_process_unmergeable_tags_error(tmp_path, capsys):
+    """In-process counterpart for the tag-merge error branch (a subprocess run
+    is invisible to coverage.py)."""
+    vault = tmp_path / "vault"
+    note_content = BASIC_NOTE.replace(
+        "tags:\n  - claude/insight\n  - claude/topic/foo\n", ""
+    )
+    note = _make_note(vault, "claude-insights", "n.md", note_content)
+    before = note.read_bytes()
+
+    rc = note_writer.run_append_update(
+        str(vault), str(note), UPDATE_SECTION, None, "claude/topic/x"
+    )
+
+    assert rc == 1
+    assert "cannot merge tags" in capsys.readouterr().err
+    assert note.read_bytes() == before
