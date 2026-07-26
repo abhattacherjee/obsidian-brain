@@ -7,12 +7,27 @@ bug class had already recurred independently in other modules (most recently
 ``vault_index.py``'s 40-line bound silently dropping notes from the search
 index) BECAUSE the fix lived only in ``note_writer.py`` and had to be
 hand-copied rather than imported. This module exists so there is exactly one
-copy of the logic for every caller under ``hooks/`` to share. A fourth,
-independent copy still lives in
-``scripts/vault_doctor_checks/missing_frontmatter_fence.py`` (it needs
-``_FM_KEY_RE``/``_FM_ITEM_RE``/``_FM_CONT_RE`` individually, which this
-module does not yet export as public names) -- collapsing it is a follow-up,
-not done here.
+copy of the logic for every caller under ``hooks/`` to share. Other
+independent frontmatter-scanning copies still live elsewhere, each with its
+own bound and its own (often looser) closing-fence guard -- collapsing them
+is a follow-up, not done here:
+
+- ``scripts/vault_doctor_checks/missing_frontmatter_fence.py`` (needs
+  ``_FM_KEY_RE``/``_FM_ITEM_RE``/``_FM_CONT_RE`` individually, which this
+  module does not yet export as public names)
+- ``obsidian_utils.read_note_metadata`` (40-line bound, no shape check, no
+  guard if the closing fence never appears within the bound)
+- ``obsidian_utils._peek_frontmatter_field`` (30-line bound, no shape check;
+  returns None either way, so a missing closing fence is harmless here)
+- the ``/recall`` note-upgrade path in ``obsidian_utils.py`` (no bound, no
+  shape check, but does fail loudly if no closing fence is found)
+- ``compress_guard.topic_snippet`` (no bound, no shape check; leaves the
+  text unstripped if no closing fence is found)
+- ``emerge_cli._strip_leading_frontmatter`` (no bound, no shape check;
+  leaves the text unchanged if no closing fence is found)
+
+This list is a snapshot, not a promise -- verify against live source before
+relying on it for a consolidation decision.
 
 Stdlib ``re`` only — this module must import nothing else from this package.
 ``obsidian_utils.py`` imports ``vault_index.py``; ``note_writer.py`` imports

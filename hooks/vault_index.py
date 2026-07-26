@@ -279,7 +279,14 @@ def _parse_note_detailed(file_path: str) -> tuple[dict | None, str | None]:
     an oversized frontmatter block).
     """
     try:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        # newline="" (universal-newline translation OFF) is required here,
+        # not cosmetic: split_lines_lf_crlf below is documented to treat a
+        # bare "\r" as NOT a line terminator. Opening with the default
+        # newline=None translates every bare "\r" to "\n" before the
+        # splitter ever sees it, silently defeating that guarantee one line
+        # below. note_writer.py's _split_frontmatter gets this right; this
+        # call site didn't (#277 follow-up).
+        with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as f:
             full_text = f.read()
     except OSError as exc:
         # exc.strerror (e.g. "No such file or directory"), NOT str(exc) --
@@ -646,6 +653,17 @@ _MALFORMED_FILES_CAP = 20
 # 120 chars is generous headroom over any realistic vault filename.
 _MALFORMED_FILENAME_CAP = 120
 
+# Allowlist, not denylist, for `_sanitize_report_filename` below: vault
+# filenames are `YYYY-MM-DD-slug-hash.md` by construction (see
+# note_writer.py), so restricting to this set costs nothing for real names.
+# str.isprintable() previously let every printable character through --
+# backticks included -- and skills/vault-reindex/SKILL.md renders the
+# sanitized value into a markdown bullet inside backticks (`` `<file>` ``);
+# a filename containing its own backtick breaks out of that span and
+# reaches the model's context as un-delimited, potentially
+# instruction-shaped text.
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._\- ]")
+
 # Stable-prefix classifiers for `_classify_parse_failure` below. Matched via
 # `str.startswith`, never by slicing at the first ':' -- the embedded
 # excerpt in the "no closing fence" reason can itself contain colons.
@@ -688,17 +706,24 @@ def _classify_parse_failure(reason: str | None) -> str:
 
 
 def _sanitize_report_filename(name: str) -> str:
-    """Strip control characters and cap length before a filename enters
-    `_sync`'s `malformed_files` report.
+    """Replace every character outside `_SAFE_FILENAME_RE`'s allowlist, then
+    cap length, before a filename enters `_sync`'s `malformed_files` report.
 
     A filename is attacker-influenced content (filenames may legally
-    contain newlines and other control characters on most filesystems),
-    and this value flows into `/vault-reindex` output, the model's
-    context, and the session transcript -- an embedded newline or other
-    control character could corrupt the rendered report.
+    contain newlines, backticks, and other arbitrary characters on most
+    filesystems), and this value flows into `/vault-reindex` output, the
+    model's context, and the session transcript. This used to strip via
+    `str.isprintable()`, which only excludes Unicode Other/Separator
+    categories -- every printable character survived, including backticks
+    that break out of the backtick span the value is rendered into
+    (see `_SAFE_FILENAME_RE`'s comment). Substituting the replacement
+    character rather than deleting keeps the name recognisable enough to
+    act on, and -- unlike deletion -- can never turn a non-empty name into
+    an empty one; the `or "<unnamed>"` fallback below exists only for a
+    genuinely empty ``name``.
     """
-    cleaned = "".join(ch for ch in name if ch.isprintable())
-    return cleaned[:_MALFORMED_FILENAME_CAP]
+    cleaned = _SAFE_FILENAME_RE.sub("�", name)[:_MALFORMED_FILENAME_CAP]
+    return cleaned or "<unnamed>"
 
 
 def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict:
