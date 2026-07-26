@@ -1,18 +1,19 @@
 """Shared frontmatter-splitting logic (#277).
 
-Extracted from the note-persistence CLI (#269), which was the first call
-site to get this right: a bounded, shape-checked scan for the closing
-``---`` fence, rather than an unbounded "first bare ``---`` anywhere in the
-file" scan. That bug class had already recurred independently elsewhere in
-this plugin (most recently the search-index builder's 40-line bound
-silently dropping notes from the index) BECAUSE the fix lived only in the
-one module and had to be hand-copied rather than imported. This module
-exists so there is exactly one copy of the logic for every caller to share.
+Extracted from ``note_writer.py`` (#269), which was the first call site to
+get this right: a bounded, shape-checked scan for the closing ``---`` fence,
+rather than an unbounded "first bare ``---`` anywhere in the file" scan. That
+bug class had already recurred independently in other modules (most recently
+``vault_index.py``'s 40-line bound silently dropping notes from the search
+index) BECAUSE the fix lived only in ``note_writer.py`` and had to be
+hand-copied rather than imported. This module exists so there is exactly one
+copy of the logic for every caller to share.
 
-Stdlib ``re`` only — this module must import nothing else from this
-package. Two sibling modules in this package form an import chain into each
-other, and this module is meant to be imported by both of them, so any
-import back into the package from here would create a cycle.
+Stdlib ``re`` only — this module must import nothing else from this package.
+``obsidian_utils.py`` imports ``vault_index.py``; ``note_writer.py`` imports
+``obsidian_utils.py``; so ``vault_index.py`` importing ``note_writer.py``
+would close a cycle. This module breaks that: both of them can import IT
+without either importing the other.
 """
 from __future__ import annotations
 
