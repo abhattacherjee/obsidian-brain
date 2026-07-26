@@ -292,7 +292,7 @@
       "description": "FTS5 BM25 candidate retrieval reranked by 7 signals, with access logged for ACT-R activation.",
       "steps": [
         { "from": "sk-vault-search", "to": "ensure-index", "label": "lazy mtime-incremental sync" },
-        { "from": "ensure-index", "to": "frontmatter-splitter", "label": "_parse_note_detailed(): bounded split_frontmatter() classifies unreadable/no_opening_fence/no_closing_fence/frontmatter_too_long (#277) instead of the old unbounded 40-line scan that silently dropped notes" },
+        { "from": "ensure-index", "to": "frontmatter-splitter", "label": "_parse_note_detailed(): bounded split_frontmatter() classifies unreadable/no_opening_fence/no_closing_fence/frontmatter_too_long (#277) instead of the old fixed 40-line scan that could not see past its own bound and silently dropped notes" },
         { "from": "ensure-index", "to": "db-index", "label": "upsert changed notes (DELETE-then-INSERT)" },
         { "from": "sk-vault-search", "to": "search-vault", "label": "AND-mode FTS5 query" },
         { "from": "search-vault", "to": "rerank", "label": "proximity/bm25/activation/type/recency/importance/density" },
