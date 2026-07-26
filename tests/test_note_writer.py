@@ -2965,9 +2965,10 @@ def test_split_frontmatter_shape_and_bound_in_process():
     # fixture from the constant under test makes it tautological: raising the
     # constant also grows the fixture, so the assertion holds for any value
     # and the bound survives deletion. (Caught by the mutation sweep — the
-    # earlier derived version was a survivor.) 400 > the shipped bound of 200;
-    # if the bound is ever raised past 400 this fails and must be updated
-    # deliberately.
+    # earlier derived version was a survivor.) 1500 > the shipped bound of
+    # 1000; the guard assert below fails if the bound is ever raised past
+    # 1500, so raising it forces a deliberate update here rather than
+    # silently neutering this case.
     assert note_writer._FM_MAX_LINES < 1500, "raise this fixture above the bound"
     long_fm = "---\n" + ("k: v\n" * 1500) + "---\nbody\n"
     over = split(long_fm)
@@ -3129,10 +3130,10 @@ def test_find_insertion_index_tilde_cannot_close_a_backtick_fence():
 # ===========================================================================
 
 def test_append_update_long_projects_list_frontmatter_succeeds(tmp_path):
-    """The case that is broken today: a well-formed note whose frontmatter
-    carries a ~250-entry `projects:` list. Its closing fence sits far past the
-    old 200-line bound, so /compress's update path rejected it outright --
-    and told the user the note was malformed."""
+    """The case the 200-line bound broke: a well-formed note whose frontmatter
+    carries a ~250-entry `projects:` list. Its closing fence sits far past 200,
+    so /compress's update path rejected it outright -- and told the user the
+    note was malformed. 11 such notes existed in the live vault."""
     vault = tmp_path / "vault"
     projects = "".join(f"  - project-{i:03d}\n" for i in range(250))
     content = (
