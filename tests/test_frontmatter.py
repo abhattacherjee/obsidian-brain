@@ -48,7 +48,7 @@ def test_split_lines_reassembly_is_lossless():
 
 
 # ---------------------------------------------------------------------------
-# split_frontmatter -- the five distinct error strings
+# split_frontmatter -- the four distinct error strings
 # ---------------------------------------------------------------------------
 
 def test_split_frontmatter_empty_lines_rejected():

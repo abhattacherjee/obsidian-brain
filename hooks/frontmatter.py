@@ -7,7 +7,12 @@ bug class had already recurred independently in other modules (most recently
 ``vault_index.py``'s 40-line bound silently dropping notes from the search
 index) BECAUSE the fix lived only in ``note_writer.py`` and had to be
 hand-copied rather than imported. This module exists so there is exactly one
-copy of the logic for every caller to share.
+copy of the logic for every caller under ``hooks/`` to share. A fourth,
+independent copy still lives in
+``scripts/vault_doctor_checks/missing_frontmatter_fence.py`` (it needs
+``_FM_KEY_RE``/``_FM_ITEM_RE``/``_FM_CONT_RE`` individually, which this
+module does not yet export as public names) -- collapsing it is a follow-up,
+not done here.
 
 Stdlib ``re`` only — this module must import nothing else from this package.
 ``obsidian_utils.py`` imports ``vault_index.py``; ``note_writer.py`` imports

@@ -708,7 +708,8 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
     ``skipped`` is the sum of two semantically distinct outcomes, also
     reported separately: ``unchanged`` (mtime matched the index — nothing
     to do, the healthy common case) and ``malformed`` (frontmatter failed
-    to parse — the note was dropped from the index, real data loss). A
+    to parse — the note was dropped from the index, real data loss, or, if it
+    was already indexed, left at its last-good indexed content). A
     40-line frontmatter-scan bound once hid 28 unparseable notes behind a
     reassuring ``skipped: 2011`` for months because the two were conflated
     (#277); splitting them, plus surfacing which files failed via

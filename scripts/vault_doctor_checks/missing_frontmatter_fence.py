@@ -50,10 +50,12 @@ DESCRIPTION = (
 )
 DEFAULT_WINDOW_DAYS = 9999  # unbounded — the damage is historic; scan all notes
 
-# Frontmatter line shapes, kept byte-identical to hooks/note_writer.py's
-# _FM_KEY_RE / _FM_ITEM_RE / _FM_CONT_RE. note_writer is the consumer that
-# has to parse the repaired note, so a shape this check accepts but
-# note_writer rejects would produce a "repair" that still fails to load.
+# Frontmatter line shapes, kept byte-identical to hooks/frontmatter.py's
+# _FM_KEY_RE / _FM_ITEM_RE / _FM_CONT_RE (#277 moved these off note_writer.py
+# onto the shared module; note_writer.py re-exports them but no longer
+# defines them). note_writer is the consumer that has to parse the repaired
+# note, so a shape this check accepts but note_writer rejects would produce
+# a "repair" that still fails to load.
 _FM_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*\s*:")
 _FM_ITEM_RE = re.compile(r"^\s*-\s")
 _FM_CONT_RE = re.compile(r"^\s+\S")
@@ -79,9 +81,15 @@ def _split_lines_lf_crlf(text: str) -> list[str]:
     Deliberately not ``str.splitlines(keepends=True)``, which also breaks on a
     bare ``\\r``, ``\\v``, ``\\f`` and several Unicode separators — a note body
     can legitimately contain a bare ``\\r`` (a pasted terminal progress-bar
-    redraw inside a fenced code block). Mirrors the helper of the same name in
-    hooks/note_writer.py; duplicated rather than imported because hooks/ is not
-    importable from the scripts/ package.
+    redraw inside a fenced code block). Mirrors ``split_lines_lf_crlf`` in
+    hooks/frontmatter.py. Not yet collapsed into a shared import: hooks/ IS
+    importable from scripts/ (see project_name_normalization.py's ``sys.path``
+    bootstrap above _HOOKS_DIR) -- the real blocker is that this check also
+    needs ``_FM_KEY_RE`` / ``_FM_ITEM_RE`` / ``_FM_CONT_RE`` individually (it
+    scans upward from a missing opening fence, frontmatter.py's own
+    ``split_frontmatter`` scans downward from one), and frontmatter.py does
+    not export those as public names yet. Follow-up: export them and switch
+    this module to import both the regexes and this splitter.
     """
     lines: list[str] = []
     start = 0

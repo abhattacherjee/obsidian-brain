@@ -10,6 +10,7 @@ preserving every existing behaviour of ``_parse_note``.
 """
 from __future__ import annotations
 
+import frontmatter
 import vault_index
 
 
@@ -417,6 +418,80 @@ def test_classify_parse_failure_matches_prefix_not_first_colon():
         "line that is not frontmatter: 'note: this line has a colon too')"
     )
     assert vault_index._classify_parse_failure(reason) == "no_closing_fence"
+
+
+def test_classifier_prefixes_match_split_frontmatter_actual_output():
+    """`_classify_parse_failure` matches by hardcoded prefix (vault_index.py's
+    own `_UNREADABLE_PREFIX` / `_NO_OPENING_FENCE_PREFIX` /
+    `_NO_CLOSING_FENCE_PREFIX` / `_TOO_LONG_PREFIX`), not by calling into
+    `frontmatter.py`. Nothing pins the two together: the tests above assert
+    the classifier against hand-copied literal strings, which validates the
+    classifier against itself, not against what `split_frontmatter` actually
+    emits. A wording change in `frontmatter.py` would degrade every affected
+    reason to "unknown" and this file's other tests would stay green (proven
+    by mutation during final review: rewording `frontmatter.py`'s
+    no-opening-fence message left the full 2100-test suite passing while the
+    production report silently fell back to `reason: "unknown"`). This test
+    derives each expected reason from a REAL `split_frontmatter` call, never
+    from a literal copied by hand, so a future rewording breaks this test
+    directly instead of drifting unnoticed.
+    """
+    cases = [
+        ([], vault_index._NO_OPENING_FENCE_PREFIX),
+        (
+            frontmatter.split_lines_lf_crlf("---\nk: v\n"),
+            vault_index._NO_CLOSING_FENCE_PREFIX,
+        ),
+        (
+            ["---\n"] + ["k: v\n"] * (frontmatter.MAX_FRONTMATTER_LINES + 1),
+            vault_index._TOO_LONG_PREFIX,
+        ),
+    ]
+    for lines, prefix in cases:
+        err = frontmatter.split_frontmatter(lines)[4]
+        assert err.startswith(prefix), f"classifier prefix drifted: {err!r}"
+
+    # The fourth classifier, "unreadable", isn't a split_frontmatter output at
+    # all -- it comes from _parse_note_detailed's own OSError branch -- so
+    # pin it directly against that real call instead.
+    _parsed, err = vault_index._parse_note_detailed("/nonexistent/x.md")
+    assert err.startswith(vault_index._UNREADABLE_PREFIX)
+
+
+def test_rebuild_index_reports_no_opening_fence_end_to_end(tmp_path):
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    (sessions / "no-fence.md").write_text(
+        "type: session\nproject: obsidian-brain\n\nBody text, no opening fence.\n",
+        encoding="utf-8",
+    )
+
+    db_path = str(tmp_path / "index.db")
+    stats = vault_index.rebuild_index(
+        str(tmp_path), ["claude-sessions"], db_path=db_path,
+    )
+
+    assert stats["malformed"] == 1
+    assert stats["malformed_files"] == [
+        {"file": "no-fence.md", "reason": "no_opening_fence"}
+    ]
+
+
+def test_rebuild_index_reports_frontmatter_too_long_end_to_end(tmp_path):
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    too_long = "---\n" + "k: v\n" * (frontmatter.MAX_FRONTMATTER_LINES + 1)
+    (sessions / "too-long.md").write_text(too_long, encoding="utf-8")
+
+    db_path = str(tmp_path / "index.db")
+    stats = vault_index.rebuild_index(
+        str(tmp_path), ["claude-sessions"], db_path=db_path,
+    )
+
+    assert stats["malformed"] == 1
+    assert stats["malformed_files"] == [
+        {"file": "too-long.md", "reason": "frontmatter_too_long"}
+    ]
 
 
 def test_sanitize_report_filename_strips_control_characters():

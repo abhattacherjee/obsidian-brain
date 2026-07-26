@@ -94,8 +94,8 @@ Parse the JSON output from Step 3. Extract:
 - `inserted` — total notes indexed
 - `skipped` — sum of `unchanged` + `malformed` (kept for backward compatibility; do not report this alone — it conflates a healthy outcome with a real one)
 - `unchanged` — notes whose mtime matched the index; nothing to do, the healthy common case
-- `malformed` — notes whose frontmatter failed to parse (true total, not capped)
-- `malformed_files` — list of `{"file": <sanitized basename>, "reason": <classifier>}`, capped at 20 entries even when `malformed` is larger
+- `malformed` — notes whose frontmatter failed to parse (true total, not capped): dropped from the index if never indexed before, or, if already indexed, left at its last-good indexed content
+- `malformed_files` — list of `{"file": <sanitized basename>, "reason": <classifier>}`, capped (currently 20 entries) even when `malformed` is larger
 - `elapsed` — time in seconds
 - `by_type` — dict mapping note type to count
 - `mode` — `"preserve"` or `"full"`
@@ -122,9 +122,9 @@ Only include rows in the table for types that appear in `by_type` (omit zero-cou
 > - `<file>` — `<reason>`
 > - ...
 
-List every entry in `malformed_files`. If `malformed` exceeds the length of `malformed_files` (the report caps at 20 entries), append:
+List every entry in `malformed_files`. If `malformed` exceeds the length of `malformed_files` (the report is capped), append, using the actual number of entries you just listed rather than a hardcoded number:
 
-> Showing the first 20 of `<malformed>` malformed file(s); re-run after fixing these to surface the rest.
+> Showing the first `<len(malformed_files)>` of `<malformed>` malformed file(s); re-run after fixing these to surface the rest.
 
 **Additional section — non-destructive mode only:**
 
