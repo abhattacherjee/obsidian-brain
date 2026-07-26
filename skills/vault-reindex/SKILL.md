@@ -92,7 +92,10 @@ Stop here on failure.
 Parse the JSON output from Step 3. Extract:
 
 - `inserted` — total notes indexed
-- `skipped` — files without valid frontmatter
+- `skipped` — sum of `unchanged` + `malformed` (kept for backward compatibility; do not report this alone — it conflates a healthy outcome with a real one)
+- `unchanged` — notes whose mtime matched the index; nothing to do, the healthy common case
+- `malformed` — notes whose frontmatter failed to parse (true total, not capped)
+- `malformed_files` — list of `{"file": <sanitized basename>, "reason": <classifier>}`, capped at 20 entries even when `malformed` is larger
 - `elapsed` — time in seconds
 - `by_type` — dict mapping note type to count
 - `mode` — `"preserve"` or `"full"`
@@ -109,9 +112,19 @@ Present this report:
 > | claude-insight | `<count>` |
 > | ... | ... |
 >
-> Skipped: `<skipped>` file(s) without frontmatter.
+> Unchanged: `<unchanged>` file(s) already indexed (nothing to do). Malformed: `<malformed>` file(s) with frontmatter that failed to parse.
 
 Only include rows in the table for types that appear in `by_type` (omit zero-count types). Sort rows by count descending.
+
+**If `malformed` is greater than 0**, list the named files so the user can act:
+
+> **Malformed files:**
+> - `<file>` — `<reason>`
+> - ...
+
+List every entry in `malformed_files`. If `malformed` exceeds the length of `malformed_files` (the report caps at 20 entries), append:
+
+> Showing the first 20 of `<malformed>` malformed file(s); re-run after fixing these to surface the rest.
 
 **Additional section — non-destructive mode only:**
 
