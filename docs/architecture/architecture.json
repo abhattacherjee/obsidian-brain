@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.3.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-07-25",
+  "lastUpdated": "2026-07-26",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -15,7 +15,7 @@
     "realtime": { "protocol": "none", "endpoint": "direct filesystem writes — no MCP server, no REST API, no daemon" },
     "ai": { "provider": "Claude CLI (claude -p)", "model": "haiku default; escalates haiku to sonnet to opus on empty output (#165)", "notes": "summarization deferred from hooks to /recall" },
     "vectorSearch": { "engine": "SQLite FTS5 (BM25) + 7-signal rerank; TF-IDF cosine themes with ACT-R activation and Free-Energy surprise" },
-    "tests": { "unit": { "runner": "pytest", "count": 2031, "environments": ["python3.12"], "coverage": { "lines": 92 } } },
+    "tests": { "unit": { "runner": "pytest", "count": 2060, "environments": ["python3.12"], "coverage": { "lines": 92 } } },
     "packageManager": "none (stdlib only)"
   },
   "diagram": {
@@ -134,7 +134,8 @@
         { "id": "check-project-normalization", "name": "project-name-normalization", "kind": "module", "files": ["scripts/vault_doctor_checks/project_name_normalization.py"], "purpose": "Detects underscores in project frontmatter (personal_ws to personal-ws) and the matching project tag; frontmatter-only regex; conf 1.0." },
         { "id": "check-spurious-wikilinks", "name": "spurious-wikilinks", "kind": "module", "files": ["scripts/vault_doctor_checks/spurious_wikilinks.py"], "purpose": "Escapes unescaped double-brackets in conversation/tool-usage lines (bash test brackets parsed by Obsidian as phantom wikilinks); session folder only; conf 1.0." },
         { "id": "check-encoding-corruption", "name": "encoding-corruption", "kind": "module", "files": ["scripts/vault_doctor_checks/encoding_corruption.py"], "purpose": "Detects invalid UTF-8 bytes (grep Binary file matches); re-encodes with errors=replace; backs up raw original bytes before the atomic rewrite." },
-        { "id": "check-audit-historic", "name": "audit-historic-repairs (opt-in)", "kind": "module", "files": ["scripts/vault_doctor_checks/audit_historic_repairs.py"], "purpose": "One-shot audit of prior doctor backups: classifies each note A (restore mtime-drift corruption) / B (keep) / C (ambiguous) / D (both-wrong); only category A auto-applies, restoring the oldest backup backlink. Loud no-op if the backup root is missing.", "overrideEnv": "OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT" }
+        { "id": "check-audit-historic", "name": "audit-historic-repairs (opt-in)", "kind": "module", "files": ["scripts/vault_doctor_checks/audit_historic_repairs.py"], "purpose": "One-shot audit of prior doctor backups: classifies each note A (restore mtime-drift corruption) / B (keep) / C (ambiguous) / D (both-wrong); only category A auto-applies, restoring the oldest backup backlink. Loud no-op if the backup root is missing.", "overrideEnv": "OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT" },
+        { "id": "check-missing-frontmatter-fence", "name": "missing-frontmatter-fence", "kind": "module", "files": ["scripts/vault_doctor_checks/missing_frontmatter_fence.py"], "purpose": "Repairs notes whose frontmatter lost its opening `---` (the leading-fence-eaten failure mode #269 stops going forward), which makes type/date/project/tags invisible to Dataview and every frontmatter-filtering tool. Fires only when all four hold: first line isn't already `---`, first line is key:-shaped, a closing `---` exists within the line bound, and every line above that closing fence is frontmatter-shaped. Repair inserts `---` as a new first line only; atomic temp+rename with per-note backup and re-verification against the live file (#276)." }
       ]
     },
     {
