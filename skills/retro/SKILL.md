@@ -23,7 +23,7 @@ Run:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
@@ -68,7 +68,7 @@ _OB_BUNDLE="$HOME/.claude/obsidian-brain/retro-bundle-$$.json"
 _OB_ERR="$HOME/.claude/obsidian-brain/retro-bundle-$$.err"
 python3 -c '
 import sys, os, json, glob
-sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import load_config, get_session_context, gather_session_evidence
 c = load_config()
 ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
@@ -320,7 +320,7 @@ If the error is `note already exists`, the 4-hex filename hash collided with a n
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os, glob
-sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import mark_retro_classification_pending
 print(mark_retro_classification_pending(sys.argv[1], sys.argv[2]))
 ' "<current-session-id>" "$VAULT_PATH/$INSIGHTS_FOLDER/<filename>"
@@ -344,7 +344,7 @@ The retro is **not done** when the file is written. The literal next action afte
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
    python3 -c '
    import sys, os, glob
-   sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+   import re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
    from obsidian_utils import clear_retro_classification_pending
    print("cleared" if clear_retro_classification_pending(sys.argv[1]) else "no-gate")
    ' "<current-session-id>"

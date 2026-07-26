@@ -23,7 +23,7 @@ Run:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
@@ -171,7 +171,7 @@ output_mode: files_with_matches
 ```bash
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import flip_note_status
 flip_note_status(sys.argv[1], "auto-logged", "summarized")
 ' "$FILE_PATH"
@@ -191,7 +191,7 @@ If `UNSUMMARIZED` is empty, skip to Step 7.
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import upgrade_batch
 results = upgrade_batch([sys.argv[1]], sys.argv[2], sys.argv[3], sys.argv[4])
 print(results[0]["status"])
@@ -480,7 +480,7 @@ When open items are checked off in the standup note (either during generation or
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '%s' "$CHECKED_ITEMS_JSON" | python3 -c '
 import sys, json, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from open_item_dedup import batch_cascade_checkoff
 items = json.load(sys.stdin)
 summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
@@ -530,7 +530,7 @@ Then set task #1 to `in_progress` via TaskUpdate. **Do NOT proceed to Step 15 un
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '{"basenames": %s, "projects": %s}' "$NOTE_BASENAMES_JSON" "$PROJECTS_JSON" | python3 -c '
-import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from deep_cli import run_pipeline; run_pipeline(sys.argv[1], sys.argv[2], sys.argv[3])
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
 ```
@@ -551,7 +551,7 @@ Mark task #2 complete, task #3 in_progress.
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '%s' "$NOTE_BASENAMES_JSON" | python3 -c '
-import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from deep_cli import run_present; run_present(sys.argv[1], sys.argv[2], sys.argv[3])
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER"
 ```
@@ -569,12 +569,12 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 # Stage 1 — resolve targets by text. $CHECKOFFS_JSON is a JSON array of
 # {"file": "<basename>", "line": <hint>, "text": "<group representative / canonical text>"}.
 RESOLVED=$(printf '%s' "$CHECKOFFS_JSON" | python3 -c '
-import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from deep_cli import run_build_checkoffs; run_build_checkoffs()
 ')
 # Stage 2 — apply only the verified, text-anchored edits.
 printf '%s' "$RESOLVED" | python3 -c '
-import sys, json, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, json, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from deep_cli import run_batch_edit
 sys.stdin = __import__("io").StringIO(json.dumps(json.load(sys.stdin)["edits"]))
 run_batch_edit()
@@ -590,7 +590,7 @@ For confirmed link additions (NOT checkoffs), pass `[filepath, old_text, new_tex
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 printf '%s' "$EDITS_JSON" | python3 -c '
-import sys, os, glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import sys, os, glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from deep_cli import run_batch_edit; run_batch_edit()
 '
 ```

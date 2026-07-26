@@ -22,6 +22,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1092,25 +1093,33 @@ def test_append_update_missing_closing_fence_fails_loudly_file_unchanged(tmp_pat
     assert note.read_bytes() == before
 
 
-def test_append_update_missing_date_field_when_last_updated_requested_fails_loudly(tmp_path):
-    """--last-updated needs a `date:` line to insert after when
-    `last_updated:` is not already present. If frontmatter has no `date:`
-    line, this must fail loudly rather than silently skip the insertion or
-    half-write the file (proves the failure is caught before the single
-    write call, not after)."""
+def test_append_update_missing_date_field_appends_last_updated_at_end(tmp_path):
+    """REPLACES test_append_update_missing_date_field_..._fails_loudly, which
+    pinned rc 1 for "frontmatter has no `date:` anchor".
+
+    That severity ordering was inverted: the update section is the payload the
+    user reviewed and approved, `last_updated` is bookkeeping, and the whole
+    append was discarded because the OPTIONAL bump had nowhere to anchor. It
+    is reachable on real data — a live-vault note carries `created:` and
+    `source_session*` but no `date:`. `last_updated` is now appended at the
+    end of the frontmatter block instead, and the update still lands."""
     vault = tmp_path / "vault"
     content = (
         "---\ntype: claude-insight\nproject: obsidian-brain\n---\n\n"
         "# No date field\nBody.\n"
     )
     note = _make_note(vault, "claude-insights", "insight.md", content)
-    before = note.read_bytes()
 
     result = _run_append_update(vault, note, UPDATE_SECTION, last_updated="2026-07-25")
 
-    assert result.returncode == 1
-    assert "ERROR" in result.stderr
-    assert note.read_bytes() == before
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "last_updated: 2026-07-25\n" in written
+    # ...inside the frontmatter block, not in the body
+    assert written.index("last_updated:") < written.index("# No date field")
+    assert "## Update (2026-07-25)" in written  # the payload survived
+    assert "type: claude-insight\n" in written
+    assert "project: obsidian-brain\n" in written
 
 
 # ---------------------------------------------------------------------------
@@ -1368,10 +1377,12 @@ def test_apply_last_updated_replace_vs_insert_in_process():
     assert err2 is None
     assert out2 == ["type: x\n", "date: 2026-01-01\n", "last_updated: 2026-07-25\n", "project: y\n"]
 
+    # No `date:` anchor -> appended at the end of the frontmatter block, not
+    # an error (see test_append_update_missing_date_field_appends_last_updated_at_end).
     fm_no_date = ["type: x\n", "project: y\n"]
     out3, err3 = note_writer._apply_last_updated(fm_no_date, "2026-07-25")
-    assert out3 is None
-    assert "date" in err3
+    assert err3 is None
+    assert out3 == ["type: x\n", "project: y\n", "last_updated: 2026-07-25\n"]
 
 
 def test_apply_add_tags_in_process():
@@ -1602,7 +1613,8 @@ def test_run_append_update_in_process_malformed_frontmatter_variants(tmp_path, c
     assert "no closing '---'" in capsys.readouterr().err
 
 
-def test_run_append_update_in_process_missing_date_field_reports_fm_err(tmp_path, capsys):
+def test_run_append_update_in_process_missing_date_field_still_writes(tmp_path, capsys):
+    """In-process counterpart: no `date:` anchor is no longer fatal."""
     vault = tmp_path / "vault"
     note = _make_note(
         vault, "claude-insights", "insight.md",
@@ -1613,8 +1625,9 @@ def test_run_append_update_in_process_missing_date_field_reports_fm_err(tmp_path
         str(vault), str(note), UPDATE_SECTION, last_updated="2026-07-25"
     )
 
-    assert rc == 1
-    assert "date" in capsys.readouterr().err
+    assert rc == 0
+    assert "ERROR" not in capsys.readouterr().err
+    assert "last_updated: 2026-07-25\n" in note.read_text(encoding="utf-8")
 
 
 def test_run_append_update_in_process_inserts_before_marker_hitting_loop_break(
@@ -3248,3 +3261,403 @@ def test_append_update_zero_indent_tags_block_end_to_end(tmp_path):
     assert "\n- claude/insight\n- claude/topic/z\n" in written  # indent matched
     assert "  - claude/topic/z" not in written
     assert "last_updated: 2026-07-25\n" in written
+
+
+# ===========================================================================
+# Adversarial pass (Claude<->Gemini, both-confirm). Each test below uses the
+# finding's OWN reproduction input verbatim.
+# ===========================================================================
+
+C001_NOTE = (
+    "---\n"
+    "type: claude-insight\n"
+    "date: 2026-01-01\n"
+    "tags:\n"
+    "  - claude/insight\n"
+    "---\n"
+    "\n"
+    "# Title\n"
+    "\n"
+    "original body\n"
+)
+
+
+def test_append_update_second_update_does_not_splice_into_the_first(tmp_path):
+    """C-001. The first update's TEXT contains a column-0 `## Tool Usage`, so
+    that marker lands in the body. The second update must not treat it as the
+    start of the audit trail and insert before it -- that splices update 2
+    into the middle of update 1's sentence, at rc 0, compounding on every
+    later run."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", C001_NOTE)
+
+    first = (
+        "## Update (2026-07-01)\n"
+        "\n"
+        "We changed the layout of the\n"
+        "\n"
+        "## Tool Usage\n"
+        "\n"
+        "section this session.\n"
+    )
+    r1 = _run_append_update(vault, note, first)
+    assert r1.returncode == 0, r1.stderr
+
+    second = "## Update (2026-07-25)\n\nSECOND UPDATE - should be after the first\n"
+    r2 = _run_append_update(vault, note, second)
+    assert r2.returncode == 0, r2.stderr
+
+    written = note.read_text(encoding="utf-8")
+    # Update 1's sentence is still contiguous...
+    assert "We changed the layout of the\n\n## Tool Usage\n\nsection this session." in written
+    # ...and update 2 comes after all of it, not inside it.
+    assert written.index("SECOND UPDATE") > written.index("section this session.")
+    assert written.index("## Update (2026-07-01)") < written.index("## Update (2026-07-25)")
+
+
+def test_append_update_third_update_still_appends_in_order(tmp_path):
+    """C-001 compounding case: a third update must land after the second."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", C001_NOTE)
+    for n, marker in ((1, "## Session Metadata"), (2, "## Files Touched"), (3, "")):
+        text = f"## Update (2026-07-0{n})\n\nbody {n}\n"
+        if marker:
+            text += f"\n{marker}\n\nquoted in an update\n"
+        r = _run_append_update(vault, note, text)
+        assert r.returncode == 0, r.stderr
+
+    written = note.read_text(encoding="utf-8")
+    positions = [written.index(f"body {n}") for n in (1, 2, 3)]
+    assert positions == sorted(positions), written
+
+
+def test_append_update_first_update_still_lands_before_a_real_audit_trail(tmp_path):
+    """The documented placement must survive the C-001 fix for the FIRST
+    update -- the case with no prior `## Update (` heading in the body."""
+    vault = tmp_path / "vault"
+    note = _make_note(
+        vault, "claude-insights", "insight.md",
+        BASIC_NOTE + "\n## Tool Usage\n- **Read**: x.py\n\n## Session Metadata\n- id: abc\n",
+    )
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert written.index("## Update (2026-07-25)") < written.index("## Tool Usage")
+
+
+def test_find_insertion_index_stops_at_an_update_heading_in_process():
+    def idx(text):
+        return note_writer._find_insertion_index(note_writer._split_lines_lf_crlf(text))
+
+    # An update heading before the marker -> append at EOF (index 4).
+    assert idx("body\n## Update (2026-07-01)\ntext\n## Tool Usage\n") == 4
+    # No update heading -> the marker still wins.
+    assert idx("body\n## Tool Usage\n") == 1
+    # An update heading INSIDE a fence is quoted content, not a real one.
+    assert idx("```\n## Update (2026-07-01)\n```\n## Tool Usage\nx\n") == 3
+
+
+# --- C-003 / C-004: block-style tag dedupe ---------------------------------
+
+def test_append_update_quoted_existing_block_tags_are_not_duplicated(tmp_path):
+    """C-003. `- "claude/insight"` was compared WITH its quotes, so the
+    already-present check missed and the tag was re-added unquoted."""
+    vault = tmp_path / "vault"
+    note_content = BASIC_NOTE.replace(
+        "tags:\n  - claude/insight\n  - claude/topic/foo\n",
+        'tags:\n  - "claude/insight"\n  - \'claude/topic/foo\'\n',
+    )
+    note = _make_note(vault, "claude-insights", "insight.md", note_content)
+
+    result = _run_append_update(
+        vault, note, UPDATE_SECTION, add_tags="claude/insight,claude/topic/foo"
+    )
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert written.count("claude/insight") == 1
+    assert written.count("claude/topic/foo") == 1
+
+
+def test_append_update_comment_inside_block_tag_list_does_not_split_it(tmp_path):
+    """C-004. A YAML comment mid-list truncated the dedupe set and pointed the
+    insertion index above the comment, re-adding an item that was already
+    present below it and splitting the block."""
+    vault = tmp_path / "vault"
+    note_content = BASIC_NOTE.replace(
+        "tags:\n  - claude/insight\n  - claude/topic/foo\n",
+        "tags:\n  - claude/insight\n  # legacy\n  - claude/topic/bar\n",
+    )
+    note = _make_note(vault, "claude-insights", "insight.md", note_content)
+
+    result = _run_append_update(
+        vault, note, UPDATE_SECTION, add_tags="claude/topic/bar,claude/topic/new"
+    )
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert written.count("claude/topic/bar") == 1  # not re-added
+    assert "  - claude/topic/new\n" in written
+    assert "  # legacy\n" in written  # comment preserved
+    # the new item lands below the comment, keeping one contiguous block
+    assert written.index("# legacy") < written.index("claude/topic/new")
+
+
+# --- C-006: flow-style tags with a trailing comment ------------------------
+
+def test_append_update_flow_style_tags_with_trailing_comment_merge(tmp_path):
+    """C-006. `tags: [a, b] # topics` matched NEITHER style, so the whole
+    update aborted -- and the error recommended the flow-style shape it had
+    just refused."""
+    vault = tmp_path / "vault"
+    note_content = BASIC_NOTE.replace(
+        "tags:\n  - claude/insight\n  - claude/topic/foo\n",
+        "tags: [claude/insight, claude/topic/a] # topics\n",
+    )
+    note = _make_note(vault, "claude-insights", "insight.md", note_content)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/new")
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "tags: [claude/insight, claude/topic/a, claude/topic/new] # topics\n" in written
+    assert "## Update (2026-07-25)" in written
+
+
+def test_apply_add_tags_flow_greedy_inner_and_bracket_in_quoted_item():
+    """The `inner` group must stay GREEDY so it runs to the LAST `]`: a
+    non-greedy group would truncate a list whose quoted item contains `]`."""
+    fm = ['tags: ["a]b", c]\n']
+    out, err = note_writer._apply_add_tags(fm, ["d"])
+    assert err is None
+    # Existing items are never re-serialized, so `c` keeps its bare form while
+    # the new item copies the first item's quote style.
+    assert out == ['tags: ["a]b", c, "d"]\n']
+    # Empty flow list with a comment still works.
+    out2, err2 = note_writer._apply_add_tags(["tags: [] # none yet\n"], ["x"])
+    assert err2 is None
+    assert out2 == ["tags: [x] # none yet\n"]
+
+
+# --- C-005: write and append-update agree on frontmatter -------------------
+
+def test_write_rejects_note_that_append_update_could_never_touch(tmp_path):
+    """C-005. `write` accepted a note whose frontmatter has no closing fence
+    but whose BODY has a `---` rule; `append-update` then refused it forever.
+    The two must agree, so this content is now rejected at write time."""
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    content = (
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-01-01\n"
+        "tags:\n"
+        "  - claude/insight\n"
+        "\n"
+        "# Title\n"
+        "\n"
+        "Some prose here.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "more\n"
+    )
+
+    result = _run_write(vault, "claude-insights", "unreachable.md", content)
+
+    assert result.returncode == 1
+    assert "frontmatter" in result.stderr.lower()
+    assert not (vault / "claude-insights" / "unreachable.md").exists()
+
+
+def test_write_then_append_update_round_trips(tmp_path):
+    """The positive half of C-005: anything `write` accepts, `append-update`
+    must be able to update."""
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    content = BASIC_NOTE
+
+    w = _run_write(vault, "claude-insights", "round-trip.md", content)
+    assert w.returncode == 0, w.stderr
+
+    dest = vault / "claude-insights" / "round-trip.md"
+    a = _run_append_update(vault, dest, UPDATE_SECTION, last_updated="2026-07-25")
+    assert a.returncode == 0, a.stderr
+    assert "## Update (2026-07-25)" in dest.read_text(encoding="utf-8")
+
+
+# --- C-008: concurrent write detection -------------------------------------
+
+def test_atomic_rewrite_refuses_when_the_file_changed_since_it_was_read(tmp_path):
+    """C-008. Unlocked read-modify-write: two concurrent append-updates both
+    exited 0 and one writer's update section AND tag vanished."""
+    dest = tmp_path / "note.md"
+    dest.write_text("original\n", encoding="utf-8")
+    stale = (0, 0)  # a stat that cannot match the file on disk
+
+    err = note_writer._atomic_rewrite(dest, "rewritten\n", expect_stat=stale)
+
+    assert err
+    assert "changed on disk" in err
+    assert dest.read_text(encoding="utf-8") == "original\n"
+    assert list(tmp_path.glob(".ob-*.md.tmp")) == []  # temp cleaned up
+
+
+def test_append_update_detects_a_concurrent_writer_end_to_end(tmp_path, capsys):
+    """End-to-end: another process rewrites the note between our read and our
+    rename. Must fail loudly and leave the OTHER writer's content intact."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    other_content = BASIC_NOTE + "\n## Update (2026-07-24)\n\nfrom the other writer\n"
+
+    real_apply = note_writer._apply_add_tags
+
+    def _interleave(*args, **kwargs):
+        # Simulates the competing process landing its own atomic write after
+        # we read the file but before we rename over it.
+        note.write_text(other_content, encoding="utf-8")
+        return real_apply(*args, **kwargs)
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(note_writer, "_apply_add_tags", _interleave)
+        rc = note_writer.run_append_update(
+            str(vault), str(note), UPDATE_SECTION, "2026-07-25", "claude/topic/mine"
+        )
+    finally:
+        monkey.undo()
+
+    assert rc == 1
+    assert "changed on disk" in capsys.readouterr().err
+    # The other writer's content survived; ours was not written.
+    assert note.read_text(encoding="utf-8") == other_content
+
+
+# --- C-008: the note lock ---------------------------------------------------
+
+def test_append_update_refuses_while_another_process_holds_the_lock(tmp_path):
+    """The stat re-check alone was measured to be insufficient: two
+    simultaneous append-updates both read the original, both re-checked while
+    it was still original, and both renamed — 5/5 trials lost one writer's
+    update at rc 0. The O_EXCL lock closes that window."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    before = note.read_bytes()
+    lock = note.parent / f".{note.name}.ob-lock"
+    lock.write_text("99999\n", encoding="utf-8")  # a live holder
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/x")
+
+    assert result.returncode == 1
+    assert "lock held" in result.stderr
+    assert note.read_bytes() == before
+    assert lock.exists()  # someone else's lock must not be removed
+
+
+def test_append_update_takes_over_a_stale_lock(tmp_path):
+    """A crashed process must not wedge a note forever."""
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
+    lock = note.parent / f".{note.name}.ob-lock"
+    lock.write_text("1\n", encoding="utf-8")
+    stale = time.time() - (note_writer._STALE_LOCK_SECONDS + 5)
+    os.utime(lock, (stale, stale))
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
+    assert result.returncode == 0, result.stderr
+    assert "## Update (2026-07-25)" in note.read_text(encoding="utf-8")
+    assert not lock.exists()  # taken over, then released
+
+
+def test_append_update_releases_the_lock_on_success_and_on_failure(tmp_path):
+    """The release is in a `finally`, so a mid-flight failure must not leave
+    the note locked for the next 60 seconds."""
+    vault = tmp_path / "vault"
+    lock_of = lambda n: n.parent / f".{n.name}.ob-lock"
+
+    ok_note = _make_note(vault, "claude-insights", "ok.md", BASIC_NOTE)
+    assert _run_append_update(vault, ok_note, UPDATE_SECTION).returncode == 0
+    assert not lock_of(ok_note).exists()
+
+    # Fails inside the locked section (frontmatter is unparseable).
+    bad_note = _make_note(
+        vault, "claude-insights", "bad.md", "---\ntype: x\n\n# Title\nprose\n"
+    )
+    assert _run_append_update(vault, bad_note, UPDATE_SECTION).returncode == 1
+    assert not lock_of(bad_note).exists()
+
+
+def test_lock_file_is_hidden_so_obsidian_ignores_it(tmp_path):
+    """The lock lives in the vault, so it must be dot-prefixed — the same
+    reason _validate_filename rejects leading-dot notes."""
+    dest = tmp_path / "claude-insights" / "2026-07-25-note.md"
+    assert note_writer._lock_path(dest).name == ".2026-07-25-note.md.ob-lock"
+    assert note_writer._lock_path(dest).parent == dest.parent
+
+
+def test_acquire_lock_branches_in_process(tmp_path, monkeypatch):
+    """In-process coverage for _acquire_lock's error paths (the subprocess
+    tests above exercise the happy/contended paths but are not instrumented)."""
+    dest = tmp_path / "n.md"
+    dest.write_text("x\n", encoding="utf-8")
+
+    # Happy path: claim, then a second claim is refused, then release.
+    lock, err = note_writer._acquire_lock(dest)
+    assert err is None and lock.exists()
+    _, err2 = note_writer._acquire_lock(dest)
+    assert err2 and "lock held" in err2
+    note_writer._release_lock(lock)
+    assert not lock.exists()
+
+    # _release_lock swallows a missing file (already cleaned up elsewhere).
+    note_writer._release_lock(lock)
+    note_writer._release_lock(None)
+
+    # A lock that vanishes between the O_EXCL failure and the stat: the loop
+    # retries the claim rather than crashing.
+    real_open = os.open
+    state = {"n": 0}
+
+    def _flaky_open(path, flags, *a, **kw):
+        if str(path).endswith(".ob-lock") and state["n"] == 0:
+            state["n"] += 1
+            raise FileExistsError(17, "exists")
+        return real_open(path, flags, *a, **kw)
+
+    monkeypatch.setattr(os, "open", _flaky_open)
+    lock2, err3 = note_writer._acquire_lock(dest)
+    assert err3 is None, err3
+    monkeypatch.undo()
+    note_writer._release_lock(lock2)
+
+
+def test_acquire_lock_reports_unwritable_directory(tmp_path, monkeypatch):
+    """A non-FileExistsError OSError (e.g. a read-only vault folder) is
+    reported rather than raised."""
+    dest = tmp_path / "n.md"
+    dest.write_text("x\n", encoding="utf-8")
+
+    def _boom(path, flags, *a, **kw):
+        raise PermissionError(13, "read-only")
+
+    monkeypatch.setattr(os, "open", _boom)
+    lock, err = note_writer._acquire_lock(dest)
+
+    assert lock is None
+    assert "cannot create lock file" in err
+
+
+def test_run_append_update_in_process_reports_lock_contention(tmp_path, capsys):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "n.md", BASIC_NOTE)
+    before = note.read_bytes()
+    (note.parent / f".{note.name}.ob-lock").write_text("1\n", encoding="utf-8")
+
+    rc = note_writer.run_append_update(str(vault), str(note), UPDATE_SECTION)
+
+    assert rc == 1
+    assert "lock held" in capsys.readouterr().err
+    assert note.read_bytes() == before

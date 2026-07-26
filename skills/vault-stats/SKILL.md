@@ -23,7 +23,7 @@ Run a single call that loads config, derives the project name, and computes all 
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os, json
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import load_config
 from vault_index import ensure_index
 from vault_stats import compute_stats

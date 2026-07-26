@@ -310,3 +310,50 @@ def test_no_python_3_13_only_apis():
                 code = line.split("#", 1)[0]  # ignore comments naming the API
                 for pattern, why in forbidden.items():
                     assert not re.search(pattern, code), f"{rel}:{lineno} — {why}"
+
+
+# Skills whose note_writer.py call sites this PR converted. Their sys.path
+# bootstrap lines must use the SAME numeric version key as the HOOKS= line, or
+# a single skill run can load obsidian_utils from one cached plugin version and
+# note_writer.py from another (verified: with 3.9.0 and 3.10.0 both cached, the
+# lexicographic form picks 3.9.0 while the numeric one picks 3.10.0).
+_VERSION_AWARE_SKILLS = (
+    "compress", "decide", "error-log", "retro", "standup",
+    "vault-import", "vault-stats",
+)
+_LEXICOGRAPHIC_MAX = (
+    'max(glob.glob(os.path.expanduser('
+    '"~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks")'
+)
+
+
+def test_converted_skills_resolve_plugin_version_numerically():
+    """Scoped deliberately to the skills this PR touches. The remaining
+    ~26 lexicographic lines in the other skill files are a tracked follow-up:
+    they are uniformly wrong together, which is survivable, whereas MIXING
+    resolvers inside one run is the hazard this pins."""
+    for skill in _VERSION_AWARE_SKILLS:
+        path = os.path.join(_REPO_ROOT, "skills", skill, "SKILL.md")
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        assert _LEXICOGRAPHIC_MAX not in content, (
+            f"Skill {skill} still resolves the plugin cache lexicographically; "
+            "at 3.10.x with a 3.9.x cached it will load a different plugin "
+            "version than the note_writer.py call site in the same run."
+        )
+
+
+def test_every_version_key_snippet_imports_re():
+    """The numeric key uses re.findall, so `re` must be imported on that line
+    or a prior one — otherwise the bootstrap dies with NameError at runtime."""
+    for name, code in _SNIPPETS:
+        if "re.findall" not in code:
+            continue
+        lines = code.strip().split("\n")
+        imported = False
+        for line in lines:
+            if re.search(r"^\s*import\s[^;]*\bre\b", line):
+                imported = True
+            if "re.findall" in line:
+                assert imported, f"Snippet {name} uses re.findall before importing re"
+                break

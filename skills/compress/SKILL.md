@@ -23,7 +23,7 @@ Run:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
@@ -72,7 +72,7 @@ Run a single Python call to search the vault index for existing notes matching t
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os, json
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 try:
     from vault_index import ensure_index, search_vault, compute_query_vector
     from obsidian_utils import load_config
@@ -193,7 +193,7 @@ If **cancel**, stop here.
 
 #### 4A-update.4 — Append the update section and update frontmatter
 
-Run the note-writer CLI's `append-update` command, piping the drafted `## Update (YYYY-MM-DD)` section (from 4A-update.2) in on stdin. **This single call replaces all three of the old Edit-tool steps** — it finds the correct insertion point (scanning **top-down** for `_(Summary source: ...)_`, `## Tool Usage`, `## Conversation (raw)`, `## Session Metadata`, `## Files Touched` — ignoring any that appear inside a fenced code block — and inserting immediately before the first one found, or at end-of-file if none are found), bumps `last_updated`, and merges new tags — all in one atomic write. Do NOT use the Edit tool for any of this.
+Run the note-writer CLI's `append-update` command, piping the drafted `## Update (YYYY-MM-DD)` section (from 4A-update.2) in on stdin. **This single call replaces all three of the old Edit-tool steps** — it finds the correct insertion point (scanning **top-down** for `_(Summary source: ...)_`, `## Tool Usage`, `## Conversation (raw)`, `## Session Metadata`, `## Files Touched` — ignoring any inside a fenced code block, and **stopping at the first `## Update (` heading**, since everything past that is a previously appended update rather than the note's audit trail — and inserting immediately before the first marker it finds, or at end-of-file), bumps `last_updated`, and merges new tags — all in one atomic write. Do NOT use the Edit tool for any of this.
 
 Generate 1-3 new topic tags from the update content (same logic as Step 5) and pass them via `--add-tags`. `--last-updated` is opt-in — it must be passed explicitly with today's date, or the note's `last_updated` field will NOT be bumped (that used to happen automatically; it no longer does without this flag).
 
@@ -219,7 +219,7 @@ OB_UPDATE_EOF_<eof4>
 
 On success this prints `OK: <resolved path>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero — the file is left byte-identical (no partial write happens). Surface the error to the user: "Failed to append update section — `<error message>`. Please edit manually at `$MATCH_PATH`." and stop here.
 
-The write is atomic and a non-zero exit means nothing was written, so there is nothing to gain from re-reading the file afterward to confirm — do NOT add a verification Read step here.
+The write is atomic and a non-zero exit means nothing was written, so a Read purely to confirm the bytes landed adds nothing — do NOT add one for that purpose. The CLI also refuses to write if the note changed on disk after it was read (`ERROR: note changed on disk...`), which is what a second session running `/compress` on the same note looks like; on that error, re-run the update so it applies on top of the other change rather than discarding it.
 
 **Do NOT change:** `date`, `source_session`, `source_session_note`, or `type` fields. These record the original creation context — the CLI never touches them.
 
@@ -233,7 +233,7 @@ Run:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
 from vault_index import ensure_index
 from obsidian_utils import load_config
 c = load_config()
@@ -354,7 +354,7 @@ Where:
   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   python3 -c '
   import sys, os
-  import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+  import glob, re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
   from obsidian_utils import load_config, get_session_context
   c = load_config()
   ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))

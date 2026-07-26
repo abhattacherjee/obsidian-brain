@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from obsidian_utils import write_vault_note
@@ -189,9 +190,14 @@ def _validate_note_content(content: str):
        class: an indented ``   ---`` is not a frontmatter fence, so a
        wrongly-indented heredoc now fails loudly instead of landing a note
        whose frontmatter no longer parses.
-    3. Has a closing ``---`` fence somewhere after the opening one.
-       Unterminated frontmatter means Obsidian loses the note's type and
-       tags entirely.
+    3. Parses as a frontmatter block under the SAME rules ``append-update``
+       uses (``_split_frontmatter``). This check used to be an independent,
+       unbounded "is there a bare ``---`` anywhere below?" scan, which let
+       ``write`` accept notes ``append-update`` then refused forever: a note
+       whose frontmatter has no closing fence but whose BODY contains a
+       ``---`` horizontal rule passed here and was unreachable to the update
+       path for the rest of its life. Delegating means the two commands
+       cannot drift apart again -- anything this CLI writes, it can update.
     """
     if not content.strip():
         return "note content is empty or whitespace-only (nothing written)"
@@ -203,10 +209,10 @@ def _validate_note_content(content: str):
             "note content must begin with a '---' frontmatter fence at "
             f"column 0 (first line was: {first[:60]!r})"
         )
-    for line in lines[1:]:
-        if line.rstrip("\r\n") == "---":
-            return None
-    return "note content has no closing '---' frontmatter fence"
+    _open, fm_lines, _close, _body, split_err = _split_frontmatter(lines)
+    if split_err:
+        return f"note content has an unparseable frontmatter block: {split_err}"
+    return None
 
 
 def _validate_update_text(update_text: str):
@@ -339,7 +345,13 @@ _FM_CONT_RE = re.compile(r"^\s+\S")
 # the empty `tags: []` -- an alternative to the block style above that
 # _TAGS_KEY_RE/_TAG_ITEM_RE don't recognize (bug: silently no-op'd on a
 # flow-style note, reported as a false success).
-_TAGS_FLOW_RE = re.compile(r"^tags:\s*\[(?P<inner>.*)\]\s*$")
+# `tail` captures any trailing YAML comment so a rewrite preserves it.
+# Without this, `tags: [a, b] # topics` matched NEITHER style and the
+# whole update aborted -- a harsher outcome than the block-style
+# equivalent that _TAGS_KEY_RE was already widened for. `inner` stays
+# GREEDY: it must run to the LAST `]` on the line, so a `]` inside a
+# quoted existing item does not truncate the list.
+_TAGS_FLOW_RE = re.compile(r"^tags:\s*\[(?P<inner>.*)\](?P<tail>\s*(?:#.*)?)$")
 
 # All comparisons below use rstrip("\r\n") (a character-set strip, not a
 # substring strip) rather than rstrip("\n"), so a CRLF-authored note's line
@@ -371,6 +383,11 @@ _LAST_UPDATED_VALUE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z", re.ASCII)
 # of >= 3 backticks or tildes (CommonMark). Used to keep the insertion-point
 # scan out of fenced blocks.
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+
+# An update section this command appended earlier. Everything from here to
+# EOF is appended-update territory, never the original audit trail -- see
+# _find_insertion_index.
+_UPDATE_HEADING_RE = re.compile(r"^##\s+Update\s*\(")
 
 
 def _validate_tags(add_tags_csv):
@@ -439,7 +456,25 @@ def _validate_last_updated(last_updated):
 def _find_insertion_index(body_lines: list[str]) -> int:
     """Return the index in ``body_lines`` where the update section belongs:
     the first trailing marker at fence depth 0, or ``len(body_lines)`` if
-    there is none.
+    there is none or if an appended update section is reached first.
+
+    The scan STOPS at the first ``## Update (`` heading (returning EOF).
+    Without that stop, the first update whose text contains a column-0
+    ``## Tool Usage`` (or any other trailing marker) writes that marker into
+    the body, and every later update then treats it as the start of the audit
+    trail and inserts BEFORE it -- splicing the new update into the MIDDLE of
+    the earlier one, at rc 0, and compounding on every subsequent run.
+    Updates are appended in date order, so anything at or past the first
+    ``## Update (`` heading is by construction not the original audit trail.
+
+    Deliberate tradeoff, recorded so it is not "fixed" by accident: on a note
+    that already has an update AND a real audit trail, later updates now land
+    at EOF (after the audit trail) rather than before it. That is cosmetically
+    worse than the old placement but it is not destructive, whereas the old
+    behaviour shredded user content. A structural rule cannot separate a real
+    ``## Tool Usage`` audit heading from one quoted inside an update section
+    -- they are byte-identical -- so the ambiguity is resolved toward not
+    corrupting anything.
 
     Fence tracking is load-bearing, not defensive: notes ABOUT this plugin
     routinely quote a session-note template inside a fenced block, and such
@@ -457,6 +492,8 @@ def _find_insertion_index(body_lines: list[str]) -> int:
     open_fence = None  # (fence char, fence length)
     for idx, line in enumerate(body_lines):
         stripped = line.rstrip("\r\n")
+        if open_fence is None and _UPDATE_HEADING_RE.match(stripped):
+            return len(body_lines)
         m = _FENCE_RE.match(stripped)
         if m:
             marker = m.group("fence")
@@ -712,7 +749,15 @@ def _apply_last_updated(fm_lines: list[str], last_updated: str, eol: str = "\n")
             out.insert(idx + 1, f"last_updated: {last_updated}{eol}")
             return out, None
 
-    return None, "frontmatter missing 'date:' field (required to insert last_updated)"
+    # No `date:` anchor: append at the END of the frontmatter block rather
+    # than failing. Aborting here discarded the whole append -- the update
+    # section the user reviewed and approved -- because an OPTIONAL secondary
+    # bookkeeping bump had nowhere to anchor. That severity ordering was
+    # inverted; `last_updated` is still applied, just without a date anchor.
+    # Reachable on real data: one live-vault note carries `created:` and
+    # `source_session*` but no `date:`.
+    out.append(f"last_updated: {last_updated}{eol}")
+    return out, None
 
 
 def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n"):
@@ -762,7 +807,18 @@ def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n"):
         indent = "  "
         end_idx = tags_idx + 1
         for idx in range(tags_idx + 1, len(fm_lines)):
-            m = _TAG_ITEM_RE.match(fm_lines[idx].rstrip("\r\n"))
+            raw = fm_lines[idx].rstrip("\r\n")
+            # Blank and `#`-comment lines INSIDE the block are skipped, not
+            # treated as its end. Breaking on them truncated the dedupe set to
+            # the items above the comment AND pointed end_idx there, so new
+            # items were inserted above the comment and an item below it was
+            # re-added as a duplicate. This is the same tolerance _TAGS_KEY_RE
+            # already got for `tags:   # topics`; the item scan never got it.
+            # end_idx deliberately does NOT advance for these lines, so
+            # trailing blanks after the block are not absorbed into it.
+            if not raw.strip() or raw.lstrip().startswith("#"):
+                continue
+            m = _TAG_ITEM_RE.match(raw)
             if not m:
                 break
             # Assign, don't `or` — a ZERO-indent block (`- a`, valid YAML and
@@ -774,7 +830,11 @@ def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n"):
             # "no match". The 2-space default below still applies when the
             # block has no existing items to learn from.
             indent = m.group("indent")
-            existing.append(m.group("tag"))
+            # _unquote_tag here too, not just on the flow path: a quoted
+            # existing item (`- "claude/insight"`) was compared WITH its
+            # quotes, so the already-present check missed and the tag was
+            # re-added unquoted -- the same tag twice after YAML parsing.
+            existing.append(_unquote_tag(m.group("tag")))
             end_idx = idx + 1
 
         seen = set(existing)
@@ -818,18 +878,88 @@ def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n"):
         else:
             new_inner = ", ".join(rendered_new)
 
-        new_line = f"tags: [{new_inner}]{eol}"
+        new_line = f"tags: [{new_inner}]{m.group('tail')}{eol}"
         return fm_lines[:idx] + [new_line] + fm_lines[idx + 1:], None
 
     return None, (
         "cannot merge tags: the note has no recognizable 'tags:' block "
         f"(requested: {', '.join(add_tags)}). Add the tags manually, or fix "
         "the note's frontmatter -- a block-style 'tags:' followed by '- item' "
-        "lines, or a flow-style 'tags: [a, b]'."
+        "lines, or a flow-style 'tags: [a, b]'. A trailing '# comment' on "
+        "either form is supported."
     )
 
 
-def _atomic_rewrite(dest: Path, content: str):
+# A crashed process must not wedge a note forever, so a lock older than this
+# is treated as abandoned and taken over. 60s is far longer than any real
+# append-update (milliseconds) and short enough that a user retrying after a
+# crash is not left stuck.
+_STALE_LOCK_SECONDS = 60
+
+
+def _lock_path(dest: Path) -> Path:
+    """Sibling lock file for ``dest``, dot-prefixed so Obsidian never indexes
+    it and the vault's own dot-segment guards treat it as hidden."""
+    return dest.parent / f".{dest.name}.ob-lock"
+
+
+def _acquire_lock(dest: Path):
+    """Return ``(lock_path, error)``. O_CREAT|O_EXCL is the atomic claim.
+
+    The mtime/size re-check in _atomic_rewrite alone does NOT make concurrent
+    updates safe, and this was measured rather than assumed: with two
+    append-update processes launched simultaneously, both read the original,
+    both re-checked while it was still original, and both renamed -- 5 trials
+    out of 5 lost one writer's update with two rc 0 exits. The uncovered
+    window is only the microseconds between the check and the rename, but two
+    processes doing identical work march through it in lockstep, so the
+    "unlikely" interleaving is in fact the reliable one.
+
+    The stat re-check is kept as well: it catches a writer that does NOT take
+    this lock -- most realistically the user saving the note in Obsidian while
+    /compress drafts the update -- which no amount of locking between our own
+    processes can cover.
+    """
+    lock = _lock_path(dest)
+    for attempt in (0, 1):
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except OSError:
+                continue  # vanished between the two calls -- retry the claim
+            if attempt == 0 and age > _STALE_LOCK_SECONDS:
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+                continue
+            return None, (
+                f"another process is updating this note (lock held at {lock}); "
+                "nothing written -- re-run in a moment"
+            )
+        except OSError as exc:
+            return None, f"cannot create lock file {lock}: {exc}"
+        else:
+            try:
+                os.write(fd, f"{os.getpid()}\n".encode())
+            finally:
+                os.close(fd)
+            return lock, None
+    return None, f"could not acquire lock {lock}"
+
+
+def _release_lock(lock):
+    if lock is None:
+        return
+    try:
+        Path(lock).unlink()
+    except OSError:
+        pass
+
+
+def _atomic_rewrite(dest: Path, content: str, expect_stat=None):
     """Rewrite an EXISTING file at ``dest`` with ``content``, atomically.
 
     Mirrors obsidian_utils.write_vault_note()'s temp-file + chmod 0o600 +
@@ -841,6 +971,20 @@ def _atomic_rewrite(dest: Path, content: str):
     failure the temp file is unlinked and ``dest`` is left byte-identical --
     the rename is the only step that can touch ``dest``, and it happens
     last.
+
+    ``expect_stat`` is the ``(st_mtime_ns, st_size)`` observed when the
+    caller READ ``dest``. Re-checked immediately before the rename: this is
+    an unlocked read-modify-write, and ``os.rename`` makes each write atomic
+    without doing anything about interleaving -- two concurrent
+    ``append-update`` runs both exited 0 while one writer's update section
+    and tag vanished entirely. That silent loss is precisely what this CLI
+    exists to eliminate, and /compress's prose tells the model not to
+    re-read the note afterwards, so nothing else would catch it.
+
+    This narrows the window to the microseconds between the stat and the
+    rename rather than closing it -- a lockfile would be needed for that --
+    but it converts the common case (two sessions running /compress on the
+    same note) from silent loss into a loud, retryable error.
 
     Returns None on success, a non-empty error string on failure.
 
@@ -855,6 +999,14 @@ def _atomic_rewrite(dest: Path, content: str):
             with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
                 fh.write(content)
             os.chmod(tmp_path, 0o600)
+            if expect_stat is not None:
+                current = os.stat(str(dest))
+                if (current.st_mtime_ns, current.st_size) != expect_stat:
+                    raise RuntimeError(
+                        "note changed on disk after it was read (concurrent "
+                        "update?); nothing written -- re-run to pick up the "
+                        "other change"
+                    )
             os.rename(tmp_path, str(dest))
         except Exception:
             try:
@@ -969,9 +1121,37 @@ def run_append_update(
         print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
+    lock, lock_err = _acquire_lock(resolved)
+    if lock_err:
+        print(f"ERROR: {lock_err}", file=sys.stderr)
+        return 1
+    try:
+        return _append_update_locked(
+            resolved, note_path, update_text, last_updated, add_tags
+        )
+    finally:
+        _release_lock(lock)
+
+
+def _append_update_locked(
+    resolved: Path,
+    note_path: str,
+    update_text: str,
+    last_updated,
+    add_tags: list[str],
+) -> int:
+    """The read-modify-write half of run_append_update, run while holding the
+    note's lock. Split out purely so the lock has one obvious scope and one
+    release point (the caller's ``finally``)."""
     try:
         with open(resolved, "r", encoding="utf-8", newline="") as fh:
             original_text = fh.read()
+        # Snapshot taken AFTER the read, so it reflects exactly the bytes this
+        # run is about to mutate. _atomic_rewrite re-checks it before the
+        # rename and refuses to clobber a note another process changed in
+        # between (see its docstring).
+        read_st = os.stat(resolved)
+        read_stat = (read_st.st_mtime_ns, read_st.st_size)
     except OSError as exc:
         print(f"ERROR: cannot read {note_path}: {exc}", file=sys.stderr)
         return 1
@@ -1030,7 +1210,7 @@ def run_append_update(
 
     new_text = open_fence + "".join(fm_lines) + close_fence + "".join(new_body_lines)
 
-    write_err = _atomic_rewrite(resolved, new_text)
+    write_err = _atomic_rewrite(resolved, new_text, expect_stat=read_stat)
     if write_err:
         print(f"ERROR: {write_err}", file=sys.stderr)
         return 1
