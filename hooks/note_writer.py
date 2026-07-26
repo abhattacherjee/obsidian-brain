@@ -38,9 +38,11 @@ from pathlib import Path
 from obsidian_utils import write_vault_note
 
 # Counts CHARACTERS, not bytes -- sys.stdin.read(n) is a character read on a
-# text stream (the docstrings have always said "characters"; the constant was
-# named ...BYTES, which contradicted them). Note hooks/check_items_cli.py has
-# its own separate STDIN_CAP_BYTES; this rename is deliberately local.
+# text stream, so a multi-byte UTF-8 payload can occupy up to ~4x this in
+# bytes. Characters is the deliberate repo-wide policy (#275): the project
+# security pattern is literally sys.stdin.read(1_000_000), and 1M characters
+# is still a real bound. hooks/check_items_cli.py now uses the same name and
+# the same policy.
 STDIN_CAP_CHARS = 1_000_000
 
 

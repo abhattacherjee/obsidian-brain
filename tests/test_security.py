@@ -1,4 +1,5 @@
 """Security hardening tests for obsidian-brain."""
+import ast
 import json
 import os
 import stat
@@ -260,18 +261,122 @@ class TestShellInjectionFix:
 
 
 class TestStdinCap:
-    """M6: All hook entry points cap stdin.read()."""
+    """M6: EVERY entry point that reads stdin caps the read.
 
-    @pytest.mark.parametrize("hook_file", [
-        "hooks/obsidian_session_log.py",
-        "hooks/obsidian_session_hint.py",
-        "hooks/obsidian_context_snapshot.py",
-    ])
-    def test_stdin_capped(self, hook_file):
-        with open(hook_file) as f:
-            src = f.read()
-        assert "read(1_000_000)" in src or "read(1000000)" in src, \
-            f"stdin not capped in {hook_file}"
+    This used to be a hardcoded list of three hook files checking for the
+    literal ``read(1_000_000)``. That is the shape of check that goes quietly
+    out of date: when ``hooks/note_writer.py`` was added with its own stdin
+    read, nothing here failed — the new entry point was simply not in the
+    list, and it reads ``STDIN_CAP_CHARS + 1`` rather than the literal, so
+    even adding it to the list would not have matched (#275).
+
+    The version below DISCOVERS stdin reads by parsing the AST of every module
+    under hooks/ and scripts/, resolves each read's bound through named
+    constants and simple arithmetic, and fails on any read it cannot prove is
+    bounded. A new uncapped entry point fails immediately, wherever it lands.
+    """
+
+    CAP = 1_000_000
+    # `read(CAP + 1)` is the documented overflow-detection idiom (note_writer),
+    # so the bound may exceed CAP by exactly one.
+    MAX_ALLOWED = CAP + 1
+
+    @staticmethod
+    def _source_modules():
+        roots = [
+            *sorted(Path("hooks").glob("*.py")),
+            *sorted(Path("scripts").rglob("*.py")),
+        ]
+        return [p for p in roots if p.is_file()]
+
+    @staticmethod
+    def _is_stdin_read(node):
+        """True if ``node`` is a ``...stdin[.buffer].read(...)`` call."""
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            return False
+        if node.func.attr != "read":
+            return False
+        target = node.func.value
+        if isinstance(target, ast.Attribute) and target.attr == "buffer":
+            target = target.value
+        if isinstance(target, ast.Attribute):
+            return target.attr == "stdin"
+        return isinstance(target, ast.Name) and target.id == "stdin"
+
+    @staticmethod
+    def _int_constants(tree):
+        """Every ``NAME = <int>`` binding in the module, at any nesting depth.
+
+        Module-level and function-local both count: check_items_cli defines its
+        cap at module level, and other call sites bind one inside a function.
+        """
+        consts = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                if isinstance(node.value.value, int):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            consts[target.id] = node.value.value
+        return consts
+
+    @classmethod
+    def _resolve_bound(cls, arg, consts):
+        """Static value of a read()'s size argument, or None if unresolvable."""
+        if arg is None:
+            return None
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
+            return arg.value
+        if isinstance(arg, ast.Name):
+            return consts.get(arg.id)
+        if isinstance(arg, ast.BinOp) and isinstance(arg.op, (ast.Add, ast.Sub)):
+            left = cls._resolve_bound(arg.left, consts)
+            right = cls._resolve_bound(arg.right, consts)
+            if left is None or right is None:
+                return None
+            return left + right if isinstance(arg.op, ast.Add) else left - right
+        return None
+
+    @classmethod
+    def _all_stdin_reads(cls):
+        """[(path, lineno, resolved_bound_or_None)] for the whole codebase."""
+        found = []
+        for path in cls._source_modules():
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            consts = cls._int_constants(tree)
+            for node in ast.walk(tree):
+                if not cls._is_stdin_read(node):
+                    continue
+                arg = node.args[0] if node.args else None
+                found.append((str(path), node.lineno, cls._resolve_bound(arg, consts)))
+        return found
+
+    def test_every_stdin_read_is_capped(self):
+        offenders = [
+            f"{path}:{lineno} "
+            + ("(no size argument)" if bound is None else f"(bound={bound})")
+            for path, lineno, bound in self._all_stdin_reads()
+            if bound is None or bound > self.MAX_ALLOWED
+        ]
+        assert not offenders, (
+            "Uncapped or over-cap stdin read(s): " + ", ".join(offenders)
+            + f". Cap reads at {self.CAP} characters (project CLAUDE.md security "
+            "pattern); read(CAP + 1) is allowed for overflow detection."
+        )
+
+    def test_discovery_finds_the_known_entry_points(self):
+        """Guards the guard: if the AST walk ever stops finding reads, the
+        check above would pass vacuously. These are the entry points that read
+        stdin today — including the two the old hardcoded list missed."""
+        paths = {path for path, _, _ in self._all_stdin_reads()}
+        for expected in (
+            "hooks/obsidian_session_log.py",
+            "hooks/obsidian_session_hint.py",
+            "hooks/obsidian_context_snapshot.py",
+            "hooks/note_writer.py",
+            "hooks/check_items_cli.py",
+        ):
+            assert expected in paths, f"stdin read in {expected} no longer discovered"
+        assert len(self._all_stdin_reads()) >= 8
 
 
 class TestFilePermissions:
