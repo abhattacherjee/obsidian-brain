@@ -2446,7 +2446,13 @@ def test_append_update_frontmatter_only_note_crlf_no_trailing_newline(tmp_path):
     result = _run_append_update(vault, note, UPDATE_SECTION)
 
     assert result.returncode == 0, result.stderr
-    written = note.read_text(encoding="utf-8", newline="")
+    # Path.open(newline=...), NOT Path.read_text(newline=...): the latter only
+    # gained the `newline` keyword in Python 3.13, and CI pins 3.12. The local
+    # interpreter is 3.13, so this passed here and failed there. The semantics
+    # are identical -- read with no newline translation, which is the whole
+    # point of the CRLF assertions below.
+    with note.open(encoding="utf-8", newline="") as fh:
+        written = fh.read()
     assert written.startswith(
         "---\r\ntype: claude-insight\r\ndate: 2026-01-01\r\n---\r\n"
     )

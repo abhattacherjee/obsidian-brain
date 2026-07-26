@@ -267,3 +267,46 @@ def test_only_standup_passes_overwrite():
                     f"Skill {skill_name} passes --overwrite to note_writer.py; "
                     "only /standup's in-place upgrade may do that"
                 )
+
+
+def test_no_python_3_13_only_apis():
+    """No source or test file may use an API newer than CI's Python.
+
+    CI pins 3.12 (.github/workflows/ci.yml) while local interpreters here are
+    3.13, so a 3.13-only API passes locally and fails in CI. That already
+    happened once: `Path.read_text(newline="")` (added in 3.13) went green
+    locally and red in CI. Sibling of test_hooks_future_annotations, which
+    guards the same class at the other end (3.9, the macOS system Python the
+    hooks actually run under).
+
+    Keep this list short and literal — it is a tripwire for APIs we have
+    actually reached for, not an exhaustive compatibility checker.
+
+    This module excludes ITSELF from the scan: the pattern table below
+    necessarily contains every literal it searches for, so scanning this file
+    would always self-trip. The alternative (splitting each literal across
+    string concatenations so it never appears whole) makes both the patterns
+    and the failure messages unreadable, which is a worse trade for a
+    tripwire.
+    """
+    forbidden = {
+        r"read_text\([^)]*newline": "Path.read_text(newline=...) is 3.13+; use Path.open(newline=...)",
+        r"write_text\([^)]*newline": "Path.write_text(newline=...) is 3.13+; use Path.open(newline=...)",
+        r"\.full_match\(": "PurePath.full_match() is 3.13+",
+        r"re\.PatternError": "re.PatternError is 3.13+; use re.error",
+        r"\bcopy\.replace\(": "copy.replace() is 3.13+",
+    }
+    py_files = sorted(
+        glob.glob(os.path.join(_REPO_ROOT, "hooks", "*.py"))
+        + glob.glob(os.path.join(_REPO_ROOT, "tests", "*.py"))
+        + glob.glob(os.path.join(_REPO_ROOT, "scripts", "**", "*.py"), recursive=True)
+    )
+    for py_file in py_files:
+        rel = os.path.relpath(py_file, _REPO_ROOT)
+        if os.path.samefile(py_file, __file__):
+            continue  # see docstring: the pattern table would self-trip
+        with open(py_file, encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                code = line.split("#", 1)[0]  # ignore comments naming the API
+                for pattern, why in forbidden.items():
+                    assert not re.search(pattern, code), f"{rel}:{lineno} — {why}"
