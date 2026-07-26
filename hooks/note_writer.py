@@ -329,7 +329,7 @@ _TAG_ITEM_RE = re.compile(r"^(?P<indent>\s*)-\s*(?P<tag>\S.*?)\s*$")
 
 # Shape of a line that may legitimately appear INSIDE frontmatter, used to
 # bound _split_frontmatter's closing-fence search (see its docstring).
-_FM_MAX_LINES = 200
+_FM_MAX_LINES = 1000
 _FM_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*\s*:")
 _FM_ITEM_RE = re.compile(r"^\s*-\s")
 # An indented continuation: multi-line YAML values, block scalars (`x: |`),
@@ -630,8 +630,14 @@ def _split_frontmatter(lines: list[str]):
     frontmatter fence pair and body.
 
     Returns ``(open_fence_line, frontmatter_lines, close_fence_line,
-    body_lines)`` on success, or ``(None, None, None, None)`` if the file
-    does not open with a well-formed ``---`` ... ``---`` frontmatter block.
+    body_lines, error)``. On success ``error`` is None; on failure the first
+    four are None and ``error`` names WHICH failure occurred.
+
+    The distinct error strings matter: the SKILL.md call sites tell the model
+    to surface this message to the user, so a wrong diagnosis sends someone to
+    repair a file that is not broken. Reporting "no closing '---'" on a note
+    whose fence demonstrably exists (it was just past the line bound) is
+    exactly that failure.
 
     The closing-fence search is BOUNDED and SHAPE-CHECKED, not "first ``---``
     anywhere in the file". On a note whose closing fence is missing (e.g.
@@ -644,15 +650,23 @@ def _split_frontmatter(lines: list[str]):
     a ``- `` list item, or an indented continuation (multi-line YAML values).
     A ``# Title`` heading or a prose paragraph is none of those, so the scan
     stops and the whole command fails loudly instead of silently mutating the
-    body. ``_FM_MAX_LINES`` is a second, cruder bound for a pathological file
-    whose body happens to be all key-shaped lines.
+    body -- that shape check is the guard doing the real work here.
+
+    ``_FM_MAX_LINES`` is a second, cruder bound for a pathological file whose
+    body happens to be all key-shaped lines. It is NOT a "notes are small"
+    assumption: it was 200, which false-rejected 11 well-formed notes in the
+    live vault -- /emerge and /standup output with long ``projects:`` lists,
+    whose closing fences sit as deep as line 460. 1000 is ~2x headroom over
+    the deepest observed. Raise it, do not remove it.
     """
     if not lines or lines[0].rstrip("\r\n") != "---":
-        return None, None, None, None
+        return None, None, None, None, (
+            "malformed frontmatter (file does not open with a '---' fence)"
+        )
     for i in range(1, min(len(lines), _FM_MAX_LINES + 1)):
         stripped = lines[i].rstrip("\r\n")
         if stripped == "---":
-            return lines[0], lines[1:i], lines[i], lines[i + 1:]
+            return lines[0], lines[1:i], lines[i], lines[i + 1:], None
         if not stripped.strip():
             continue
         if (
@@ -661,8 +675,17 @@ def _split_frontmatter(lines: list[str]):
             or _FM_CONT_RE.match(stripped)
         ):
             continue
-        return None, None, None, None
-    return None, None, None, None
+        return None, None, None, None, (
+            "malformed or missing frontmatter (no closing '---'; stopped at a "
+            f"line that is not frontmatter: {stripped[:60]!r})"
+        )
+    if len(lines) > _FM_MAX_LINES:
+        return None, None, None, None, (
+            f"frontmatter exceeds {_FM_MAX_LINES} lines (limit reached before "
+            "the frontmatter block ended -- the note may be fine; this is a "
+            "size limit, not a missing fence)"
+        )
+    return None, None, None, None, "malformed or missing frontmatter (no closing '---')"
 
 
 def _apply_last_updated(fm_lines: list[str], last_updated: str, eol: str = "\n"):
@@ -956,12 +979,9 @@ def run_append_update(
     eol = _detect_line_ending(original_text)
 
     lines = _split_lines_lf_crlf(original_text)
-    open_fence, fm_lines, close_fence, body_lines = _split_frontmatter(lines)
-    if fm_lines is None:
-        print(
-            f"ERROR: malformed or missing frontmatter (no closing '---'): {note_path}",
-            file=sys.stderr,
-        )
+    open_fence, fm_lines, close_fence, body_lines, fm_split_err = _split_frontmatter(lines)
+    if fm_split_err:
+        print(f"ERROR: {fm_split_err}: {note_path}", file=sys.stderr)
         return 1
 
     # `is not None`, not truthiness: an empty value is a *present* flag with

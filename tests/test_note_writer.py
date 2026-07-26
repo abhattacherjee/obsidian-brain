@@ -1330,15 +1330,27 @@ def test_append_update_flag_missing_value_exits_2(tmp_path):
 # In-process tests -- pure helper functions (direct coverage)
 # ---------------------------------------------------------------------------
 
-def test_split_frontmatter_returns_none_quad_when_malformed():
-    assert note_writer._split_frontmatter([]) == (None, None, None, None)
-    assert note_writer._split_frontmatter(["# no frontmatter\n"]) == (None, None, None, None)
-    assert note_writer._split_frontmatter(["---\n", "type: x\n"]) == (None, None, None, None)
+def test_split_frontmatter_returns_none_quad_and_reason_when_malformed():
+    """The 5th element is a SPECIFIC reason: the SKILL.md sites surface it to
+    the user, so "no closing '---'" on a note whose fence exists (just past
+    the line bound) sends someone to repair a file that is not broken."""
+    empty = note_writer._split_frontmatter([])
+    assert empty[:4] == (None, None, None, None)
+    assert "does not open with" in empty[4]
+
+    no_fm = note_writer._split_frontmatter(["# no frontmatter\n"])
+    assert no_fm[:4] == (None, None, None, None)
+    assert "does not open with" in no_fm[4]
+
+    unterminated = note_writer._split_frontmatter(["---\n", "type: x\n"])
+    assert unterminated[:4] == (None, None, None, None)
+    assert "no closing '---'" in unterminated[4]
 
 
 def test_split_frontmatter_happy_path():
     lines = ["---\n", "type: x\n", "date: 2026-01-01\n", "---\n", "\n", "# Title\n"]
-    open_fence, fm, close_fence, body = note_writer._split_frontmatter(lines)
+    open_fence, fm, close_fence, body, err = note_writer._split_frontmatter(lines)
+    assert err is None
     assert open_fence == "---\n"
     assert fm == ["type: x\n", "date: 2026-01-01\n"]
     assert close_fence == "---\n"
@@ -1577,7 +1589,8 @@ def test_run_append_update_in_process_malformed_frontmatter_variants(tmp_path, c
     )
     rc1 = note_writer.run_append_update(str(vault), str(no_fm), UPDATE_SECTION)
     assert rc1 == 1
-    assert "malformed or missing frontmatter" in capsys.readouterr().err
+    # Variant-specific message: this file never opens a fence at all.
+    assert "does not open with a '---' fence" in capsys.readouterr().err
 
     no_close = _make_note(
         vault, "claude-insights", "no-close.md",
@@ -1585,7 +1598,8 @@ def test_run_append_update_in_process_malformed_frontmatter_variants(tmp_path, c
     )
     rc2 = note_writer.run_append_update(str(vault), str(no_close), UPDATE_SECTION)
     assert rc2 == 1
-    assert "malformed or missing frontmatter" in capsys.readouterr().err
+    # ...and this one opens a fence but never closes it.
+    assert "no closing '---'" in capsys.readouterr().err
 
 
 def test_run_append_update_in_process_missing_date_field_reports_fm_err(tmp_path, capsys):
@@ -2431,7 +2445,7 @@ def test_append_update_frontmatter_only_note_no_trailing_newline(tmp_path):
     assert "## Update (2026-07-25)" in written
     # And it still parses as frontmatter for the CLI's own splitter.
     lines = note_writer._split_lines_lf_crlf(written)
-    _open, fm, _close, _body = note_writer._split_frontmatter(lines)
+    _open, fm, _close, _body, _err = note_writer._split_frontmatter(lines)
     assert fm is not None
     assert "type: claude-insight\n" in fm
 
@@ -2821,6 +2835,11 @@ def test_append_update_four_space_tag_block_end_to_end(tmp_path):
         "a'q'",
         "a b",
         "claude/topic/a\ntype: hijacked",
+        # \A...\Z anchoring, not ^...$: `$` also matches just before a
+        # trailing newline, so `^...$` accepted this and wrote a stray blank
+        # line into the frontmatter. The date validator already had this
+        # case; the tag validator did not.
+        "claude/topic/a\n",
     ],
 )
 def test_append_update_tag_allowlist_rejects_yaml_metacharacters(tmp_path, bad_tag):
@@ -2949,14 +2968,25 @@ def test_split_frontmatter_shape_and_bound_in_process():
     # earlier derived version was a survivor.) 400 > the shipped bound of 200;
     # if the bound is ever raised past 400 this fails and must be updated
     # deliberately.
-    assert note_writer._FM_MAX_LINES < 400, "raise this fixture above the bound"
-    long_fm = "---\n" + ("k: v\n" * 400) + "---\nbody\n"
-    assert split(long_fm)[1] is None
+    assert note_writer._FM_MAX_LINES < 1500, "raise this fixture above the bound"
+    long_fm = "---\n" + ("k: v\n" * 1500) + "---\nbody\n"
+    over = split(long_fm)
+    assert over[1] is None
+    # The bound gets its OWN message -- it must never be reported as a missing
+    # closing fence, because the fence is right there, just past the limit.
+    assert "exceeds" in over[4]
+    assert "no closing" not in over[4]
 
     # ...and a frontmatter comfortably inside the bound still parses, so the
     # bound is not just "reject everything long".
     short_fm = "---\n" + ("k: v\n" * 30) + "---\nbody\n"
     assert split(short_fm)[1] is not None
+
+    # A ZERO-INDENT list item is frontmatter too (_FM_ITEM_RE). _FM_CONT_RE
+    # only matches INDENTED lines, so this is the one shape _FM_ITEM_RE is
+    # uniquely load-bearing for -- and it is exactly the shape _apply_add_tags
+    # was taught to handle, so it must not be the one without coverage.
+    assert split("---\ntags:\n- a\n---\n")[1] is not None
 
 
 # --- --last-updated anchoring ----------------------------------------------
@@ -3089,3 +3119,131 @@ def test_find_insertion_index_tilde_cannot_close_a_backtick_fence():
         "```\n~~~\n## Tool Usage\n```\n## Files Touched\nx\n"
     )
     assert note_writer._find_insertion_index(lines) == 4
+
+
+# ===========================================================================
+# Round 3: the 200-line frontmatter bound false-rejected 11 real vault notes
+# (/emerge and /standup output with long `projects:` lists; the deepest valid
+# closing fence observed sits at line 460). Raised to 1000, with the bound
+# reporting its OWN error rather than claiming a missing closing fence.
+# ===========================================================================
+
+def test_append_update_long_projects_list_frontmatter_succeeds(tmp_path):
+    """The case that is broken today: a well-formed note whose frontmatter
+    carries a ~250-entry `projects:` list. Its closing fence sits far past the
+    old 200-line bound, so /compress's update path rejected it outright --
+    and told the user the note was malformed."""
+    vault = tmp_path / "vault"
+    projects = "".join(f"  - project-{i:03d}\n" for i in range(250))
+    content = (
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-01-01\n"
+        "tags:\n"
+        "  - claude/insight\n"
+        "projects:\n"
+        f"{projects}"
+        "---\n"
+        "\n"
+        "# Emerged pattern\n"
+        "\n"
+        "Body content here.\n"
+    )
+    # The closing fence really is past the OLD bound and inside the new one.
+    fence_line = content.split("\n").index("---", 1) + 1
+    assert 200 < fence_line < 1000, fence_line
+
+    note = _make_note(vault, "claude-insights", "emerge.md", content)
+
+    result = _run_append_update(
+        vault, note, UPDATE_SECTION, last_updated="2026-07-25",
+        add_tags="claude/topic/new",
+    )
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "last_updated: 2026-07-25\n" in written
+    assert "  - claude/topic/new\n" in written
+    assert "## Update (2026-07-25)" in written
+    assert "  - project-249\n" in written  # the long list survived intact
+
+
+def test_append_update_frontmatter_over_bound_reports_size_not_missing_fence(tmp_path):
+    """Over the bound with no closing fence at all: must fail with the
+    BOUND-specific message. Reporting "no closing '---'" for a size limit is
+    the wrong diagnosis, and the SKILL.md sites surface this text verbatim.
+
+    The line count is a LITERAL (1500), not derived from _FM_MAX_LINES --
+    deriving it would grow the fixture with the constant and make the
+    assertion hold for any value."""
+    vault = tmp_path / "vault"
+    content = "---\n" + "".join(f"k{i}: v\n" for i in range(1500)) + "\nBody.\n"
+    note = _make_note(vault, "claude-insights", "huge.md", content)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
+    assert result.returncode == 1
+    assert "exceeds 1000 lines" in result.stderr
+    assert "no closing" not in result.stderr
+    assert note.read_bytes() == before
+
+
+def test_append_update_i4_case_still_caught_by_shape_check_not_the_bound(tmp_path):
+    """The original I4 regression must still fail AFTER the bound was raised
+    5x -- i.e. via the shape check, not the bound. The fixture is far under
+    1000 lines, so only the shape check can reject it, and the message must
+    be the missing-fence one rather than the size one."""
+    vault = tmp_path / "vault"
+    content = (
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-01-01\n"
+        "\n"
+        "# Title\n"
+        "\n"
+        "Body prose that is not frontmatter.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "More body.\n"
+    )
+    assert len(content.split("\n")) < 200
+    note = _make_note(vault, "claude-insights", "i4.md", content)
+    before = note.read_bytes()
+
+    result = _run_append_update(vault, note, UPDATE_SECTION, last_updated="2026-07-25")
+
+    assert result.returncode == 1
+    assert "no closing '---'" in result.stderr
+    assert "exceeds" not in result.stderr
+    assert note.read_bytes() == before
+
+
+def test_append_update_zero_indent_tags_block_end_to_end(tmp_path):
+    """_FM_ITEM_RE is uniquely load-bearing for a ZERO-indent list item
+    (_FM_CONT_RE only matches indented lines). That is the same note shape
+    _apply_add_tags was taught to handle this round, so the frontmatter
+    parser and the tag merger must agree on it."""
+    vault = tmp_path / "vault"
+    content = (
+        "---\n"
+        "type: claude-insight\n"
+        "date: 2026-01-01\n"
+        "tags:\n"
+        "- claude/insight\n"
+        "---\n"
+        "\n"
+        "Body.\n"
+    )
+    note = _make_note(vault, "claude-insights", "zero-indent.md", content)
+
+    result = _run_append_update(
+        vault, note, UPDATE_SECTION, last_updated="2026-07-25", add_tags="claude/topic/z"
+    )
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert "\n- claude/insight\n- claude/topic/z\n" in written  # indent matched
+    assert "  - claude/topic/z" not in written
+    assert "last_updated: 2026-07-25\n" in written

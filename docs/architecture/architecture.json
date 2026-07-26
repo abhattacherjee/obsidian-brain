@@ -15,7 +15,7 @@
     "realtime": { "protocol": "none", "endpoint": "direct filesystem writes — no MCP server, no REST API, no daemon" },
     "ai": { "provider": "Claude CLI (claude -p)", "model": "haiku default; escalates haiku to sonnet to opus on empty output (#165)", "notes": "summarization deferred from hooks to /recall" },
     "vectorSearch": { "engine": "SQLite FTS5 (BM25) + 7-signal rerank; TF-IDF cosine themes with ACT-R activation and Free-Energy surprise" },
-    "tests": { "unit": { "runner": "pytest", "count": 2005, "environments": ["python3.12"], "coverage": { "lines": 92 } } },
+    "tests": { "unit": { "runner": "pytest", "count": 2010, "environments": ["python3.12"], "coverage": { "lines": 92 } } },
     "packageManager": "none (stdlib only)"
   },
   "diagram": {
