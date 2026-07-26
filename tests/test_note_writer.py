@@ -1015,7 +1015,12 @@ def test_append_update_empty_add_tags_value_is_rejected(tmp_path):
     result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="")
 
     assert result.returncode == 1
-    assert "ERROR" in result.stderr
+    # Assert the SPECIFIC message, not just "ERROR": the allowlist would also
+    # reject an empty item (as `invalid tag \'\'`), so a generic assertion let
+    # the dedicated empty-item branch survive deletion in the mutation sweep.
+    # Its message is the actionable one -- it names the fix.
+    assert "empty tag item" in result.stderr
+    assert "omit the flag entirely" in result.stderr
     assert note.read_bytes() == before
 
 
@@ -2374,7 +2379,12 @@ def test_append_update_rejects_empty_last_updated_value(tmp_path):
     result = _run_append_update(vault, note, UPDATE_SECTION, last_updated="")
 
     assert result.returncode == 1
-    assert "ERROR" in result.stderr
+    # Specific message again: the YYYY-MM-DD format check would also reject
+    # "" (as `invalid --last-updated value`), so asserting only "ERROR" let
+    # the empty-value branch survive deletion. This message tells the caller
+    # that omitting the flag is the supported way to skip the bump.
+    assert "empty value" in result.stderr
+    assert "omit the flag entirely" in result.stderr
     assert note.read_bytes() == before
 
 
@@ -2925,8 +2935,22 @@ def test_split_frontmatter_shape_and_bound_in_process():
     ok = "---\ntype: x\ntags:\n  - a\n\nsummary: |\n  line one\n  line two\n---\nbody\n"
     assert split(ok)[1] is not None
     # Beyond the bound, even valid-looking keys stop the scan.
-    long_fm = "---\n" + ("k: v\n" * (note_writer._FM_MAX_LINES + 5)) + "---\nbody\n"
+    #
+    # The line count is a LITERAL, not `_FM_MAX_LINES + 5`. Deriving the
+    # fixture from the constant under test makes it tautological: raising the
+    # constant also grows the fixture, so the assertion holds for any value
+    # and the bound survives deletion. (Caught by the mutation sweep — the
+    # earlier derived version was a survivor.) 400 > the shipped bound of 200;
+    # if the bound is ever raised past 400 this fails and must be updated
+    # deliberately.
+    assert note_writer._FM_MAX_LINES < 400, "raise this fixture above the bound"
+    long_fm = "---\n" + ("k: v\n" * 400) + "---\nbody\n"
     assert split(long_fm)[1] is None
+
+    # ...and a frontmatter comfortably inside the bound still parses, so the
+    # bound is not just "reject everything long".
+    short_fm = "---\n" + ("k: v\n" * 30) + "---\nbody\n"
+    assert split(short_fm)[1] is not None
 
 
 # --- --last-updated anchoring ----------------------------------------------
@@ -2978,3 +3002,84 @@ def test_run_append_update_in_process_unmergeable_tags_error(tmp_path, capsys):
     assert rc == 1
     assert "cannot merge tags" in capsys.readouterr().err
     assert note.read_bytes() == before
+
+
+# ===========================================================================
+# Round 2 addendum: two guards the mutation sweep found SHADOWED -- reachable
+# only by an input the existing tests never sent.
+# ===========================================================================
+
+def test_write_rejects_horizontal_rule_note_with_no_frontmatter(tmp_path):
+    """Isolates _validate_note_content's OPENING-fence check.
+
+    Every other rejection fixture is also caught by the closing-fence check,
+    so deleting the opening-fence branch left the suite green. This content
+    has a `---` horizontal rule -- so a closing fence IS found -- but never
+    opens with one, which only the opening-fence check can reject. Without it
+    the file is written."""
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    content = "# Title\n\n---\n\nBody.\n"
+
+    result = _run_write(vault, "claude-insights", "rule.md", content)
+
+    assert result.returncode == 1
+    assert "begin with a '---' frontmatter fence" in result.stderr
+    assert not (vault / "claude-insights" / "rule.md").exists()
+
+
+def test_append_update_info_string_fence_is_not_a_closer(tmp_path):
+    """Isolates the fence-CLOSER info-string check in _find_insertion_index.
+
+    ```` ```python ```` opens a block; CommonMark forbids an info string on a
+    closing fence, and the docstring claims this is handled -- but nothing
+    tested it. Here the outer bare fence is closed by the LAST ``` only, so
+    `## Tool Usage` sits at fence depth 0 and the update must land before it.
+    Without the info-string check, ```` ```python ```` closes the outer fence,
+    the third ``` opens a new one, `## Tool Usage` is swallowed by it, and the
+    update is appended at EOF instead."""
+    vault = tmp_path / "vault"
+    body = (
+        "\nIntro.\n"
+        "\n"
+        "```\n"
+        "```python\n"
+        "print(1)\n"
+        "```\n"
+        "\n"
+        "## Tool Usage\n"
+        "- x\n"
+    )
+    note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE + body)
+
+    result = _run_append_update(vault, note, UPDATE_SECTION)
+
+    assert result.returncode == 0, result.stderr
+    written = note.read_text(encoding="utf-8")
+    assert written.index("## Update (2026-07-25)") < written.index("## Tool Usage")
+    assert "```\n```python\nprint(1)\n```\n" in written  # fenced block intact
+
+
+def test_find_insertion_index_info_string_closer_in_process():
+    def idx(text):
+        return note_writer._find_insertion_index(note_writer._split_lines_lf_crlf(text))
+
+    # ```python cannot close the fence opened by the bare ``` above it, so the
+    # marker after the real closer is at depth 0 -> index 4.
+    assert idx("```\n```python\nprint(1)\n```\n## Tool Usage\nx\n") == 4
+
+
+def test_find_insertion_index_tilde_cannot_close_a_backtick_fence():
+    """Isolates the closer's SAME-CHARACTER check, which survived deletion:
+    every other fence fixture opens and closes with the same character, so
+    treating any fence line as a closer passed them all.
+
+    Here a ``~~~`` sits inside a backtick fence. It must NOT close it, so
+    ``## Tool Usage`` on the next line is still inside the block and the
+    insertion point is the marker after the real closer (index 4). With the
+    character check removed, ``~~~`` closes the fence and the scan returns 2
+    -- wedging the update inside someone else's code block."""
+    lines = note_writer._split_lines_lf_crlf(
+        "```\n~~~\n## Tool Usage\n```\n## Files Touched\nx\n"
+    )
+    assert note_writer._find_insertion_index(lines) == 4

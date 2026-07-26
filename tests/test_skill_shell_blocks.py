@@ -92,11 +92,44 @@ def _collect_blocks():
 _BLOCKS = _collect_blocks()
 
 
+# A LOOSER match for the same thing `_collect_blocks` looks for: any
+# note_writer.py invocation at the start of a line, indented or not, with or
+# without the `python3` prefix. `_collect_blocks` requires the command at
+# column 0, so a new call site written any other way would be silently
+# uncovered — and a `>= 9` floor would still pass. Cross-checking the strict
+# collector against this loose count makes that failure loud instead.
+_LOOSE_INVOCATION_RE = re.compile(
+    r"""^[ \t]*(?:python3\s+)?["']?[^"'\s]*note_writer\.py["']?\s+"""
+    r"""(?:write|append-update)\b""",
+    re.MULTILINE,
+)
+
+
+def _loose_invocation_count():
+    total = 0
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        with open(skill_path, encoding="utf-8") as fh:
+            total += len(_LOOSE_INVOCATION_RE.findall(fh.read()))
+    return total
+
+
 def test_every_note_writer_heredoc_site_is_covered():
     """Nine known call sites today (compress x2, standup x2, decide,
-    error-log, retro, vault-import, vault-stats). A drop below that means a
-    block stopped matching the extractor — i.e. it silently lost coverage."""
-    assert len(_BLOCKS) >= 9, [b[0] for b in _BLOCKS]
+    error-log, retro, vault-import, vault-stats).
+
+    Asserts EQUALITY against the loose count, not a `>= 9` floor: this
+    harness is the only thing standing between the repo and a repeat of the
+    heredoc-delimiter bug, so a call site it fails to match must fail the
+    suite rather than quietly reduce coverage to nothing."""
+    strict = [b[0] for b in _BLOCKS]
+    loose = _loose_invocation_count()
+    assert len(strict) == loose, (
+        f"{loose} note_writer.py invocation(s) found by a loose scan of "
+        f"skills/*/SKILL.md but only {len(strict)} extracted as runnable "
+        f"blocks ({strict}). A call site is not being executed by this "
+        "harness — fix _collect_blocks or the call site's formatting."
+    )
+    assert len(strict) >= 9, strict
 
 
 def _prepare(block: str, tmp_path, vault, note_name: str):
@@ -115,6 +148,14 @@ def _prepare(block: str, tmp_path, vault, note_name: str):
     delim_base = re.sub(r"_<eof4>$", "", raw)
 
     script = _HOOKS_LINE_RE.sub(f'HOOKS="{_HOOKS_DIR}"', block)
+    # `.sub` is a silent no-op if the HOOKS= line ever changes shape. The
+    # block's own `test -f` would then still pass -- against the INSTALLED
+    # plugin cache -- and the whole harness would be testing shipped code
+    # instead of the repo under test, while staying green.
+    assert _HOOKS_DIR in script, (
+        "HOOKS= line did not match _HOOKS_LINE_RE; the block would run "
+        "against the installed plugin cache, not this repo"
+    )
     script = script.replace("<eof4>", _EOF4)
     script = _WRITE_FILENAME_RE.sub(rf'\1"{note_name}"', script)
     # `--add-tags "claude/topic/<new-tag-1>,…"` is a template the model fills
