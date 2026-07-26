@@ -66,6 +66,11 @@ _FM_CONT_RE = re.compile(r"^\s+\S")
 # with long ``projects:`` lists, closing fences as deep as line 460).
 _FM_MAX_LINES = 1000
 
+# Minimum number of frontmatter lines before a `---` is believed to be a lost
+# closing fence rather than a setext H2 underline. See rule (5) in
+# _find_fenceless_frontmatter.
+_MIN_FRONTMATTER_LINES = 3
+
 
 def _split_lines_lf_crlf(text: str) -> list[str]:
     """Split ``text`` into lines with terminators attached, recognizing ONLY
@@ -145,6 +150,25 @@ def _find_fenceless_frontmatter(text: str) -> int | None:
     for i in range(1, min(len(lines), _FM_MAX_LINES)):
         stripped = lines[i].rstrip("\r\n")
         if stripped == "---":
+            # (5) A closing fence this close to the top is far more likely to
+            # be a SETEXT H2 than a lost frontmatter block. `Text` followed by
+            # `---` is a first-class CommonMark heading:
+            #
+            #     Summary: Q3 results
+            #     ---
+            #
+            # which is `<h2>`, not frontmatter — and "repairing" it silently
+            # turns a valid heading into a frontmatter block, changing how the
+            # document renders. The same shape covers a lead-in line above a
+            # `- a` / `- b` markdown list, and two prose lines that merely look
+            # like `key: value` above a horizontal rule.
+            #
+            # _MIN_FRONTMATTER_LINES is a LITERAL floor, not derived from the
+            # notes it filters: every one of the 9 genuinely damaged notes in
+            # the live vault carries 9-18 frontmatter lines, so requiring 3
+            # eliminates the entire setext class at zero cost to detection.
+            if i < _MIN_FRONTMATTER_LINES:
+                return None
             return i
         if not _is_frontmatter_shaped(stripped):
             return None

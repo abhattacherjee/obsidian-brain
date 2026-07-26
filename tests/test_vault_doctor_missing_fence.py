@@ -507,3 +507,89 @@ def test_project_filter_matches_frontmatter_value(tmp_path):
 
 def test_missing_vault_folders_return_no_issues(tmp_path):
     assert mff.scan(str(tmp_path / "nope"), SESSIONS, INSIGHTS, 9999) == []
+
+
+# ---------------------------------------------------------------------------
+# Rule (5): a `---` too close to the top is a setext H2, not a lost fence.
+#
+# `Text` + `---` is a first-class CommonMark construct, so these are ordinary
+# markdown documents, not damaged notes. Repairing one would silently convert
+# a valid <h2> into a frontmatter block and change how the document renders --
+# and this check MUTATES user notes, so a cheap exclusion is worth having.
+# ---------------------------------------------------------------------------
+
+def test_setext_h2_heading_is_not_flagged(tmp_path):
+    """The exact shape from the review: a `key: value`-looking line underlined
+    with `---`. Before rule (5) this was flagged and would have been
+    'repaired' into frontmatter."""
+    note = tmp_path / "setext.md"
+    note.write_text(
+        "Summary: Q3 results\n"
+        "---\n"
+        "\n"
+        "Body paragraph here.\n",
+        encoding="utf-8",
+    )
+    assert mff._find_fenceless_frontmatter(note.read_text(encoding="utf-8")) is None
+
+
+def test_lead_in_line_above_a_markdown_list_is_not_flagged(tmp_path):
+    """Neighbour of the setext case: a lead-in line, a short list, then a
+    horizontal rule. Every line is 'frontmatter-shaped' by the shape rules,
+    so only the minimum-length floor separates it from a real note."""
+    note = tmp_path / "list.md"
+    note.write_text(
+        "Shopping: this week\n"
+        "- a\n"
+        "---\n"
+        "\n"
+        "Rest of the document.\n",
+        encoding="utf-8",
+    )
+    assert mff._find_fenceless_frontmatter(note.read_text(encoding="utf-8")) is None
+
+
+def test_two_prose_lines_that_look_like_keys_are_not_flagged(tmp_path):
+    note = tmp_path / "prose.md"
+    note.write_text(
+        "Note: this is prose\n"
+        "Warning: so is this\n"
+        "---\n"
+        "\n"
+        "Body.\n",
+        encoding="utf-8",
+    )
+    assert mff._find_fenceless_frontmatter(note.read_text(encoding="utf-8")) is None
+
+
+def test_real_damaged_note_at_the_floor_is_still_flagged(tmp_path):
+    """The floor must not cost detection. Exactly _MIN_FRONTMATTER_LINES of
+    frontmatter is still repaired -- this is the boundary case, and it is a
+    LITERAL fixture built to the documented floor rather than derived from
+    the constant, so raising the constant fails this test deliberately."""
+    assert mff._MIN_FRONTMATTER_LINES == 3, "update this fixture deliberately"
+    note = tmp_path / "damaged.md"
+    note.write_text(
+        "type: claude-insight\n"
+        "date: 2026-01-01\n"
+        "project: obsidian-brain\n"
+        "---\n"
+        "\n"
+        "# Title\n",
+        encoding="utf-8",
+    )
+    assert mff._find_fenceless_frontmatter(note.read_text(encoding="utf-8")) == 3
+
+
+def test_one_line_below_the_floor_is_not_flagged(tmp_path):
+    """The other side of the same boundary."""
+    note = tmp_path / "shallow.md"
+    note.write_text(
+        "type: claude-insight\n"
+        "date: 2026-01-01\n"
+        "---\n"
+        "\n"
+        "# Title\n",
+        encoding="utf-8",
+    )
+    assert mff._find_fenceless_frontmatter(note.read_text(encoding="utf-8")) is None

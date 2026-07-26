@@ -318,16 +318,33 @@ def test_no_python_3_13_only_apis():
 # resolves to the WRONG (older) tree — and it fails as an opaque Python
 # traceback or a stale-module import, not as any documented ERROR: message.
 #
-# Matched against RAW FILE TEXT, not the extracted `python3 -c` snippets: some
-# sites are multi-line inside a double-quoted block, which the snippet
-# extractor deliberately does not parse. Quote character and internal
-# whitespace both vary across sites, so the pattern tolerates both.
-_CACHE_RESOLUTION_RE = re.compile(
-    r"max\(\s*glob\.glob\(os\.path\.expanduser\(\s*(?P<q>['\"])"
-    r"~/\.claude/plugins/cache/\*/obsidian-brain/\*/hooks(?P=q)\s*\)\s*\)\s*,"
-    r"\s*(?P<rest>[^)]*?)\s*,?\s*\)",
-    re.DOTALL,
-)
+# Scanned as a WINDOW around each occurrence of the cache path, not as a single
+# regex over `max(glob.glob(...))`: nine sites bind the glob to a variable
+# first (`c=glob.glob(...); print(max(c, key=...))`), which an expression-shaped
+# regex misses entirely — it matched 58 of the 67 real sites. The window also
+# covers the multi-line form, which the `python3 -c` snippet extractor does not
+# parse at all.
+_CACHE_GLOB_PATH = "~/.claude/plugins/cache/*/obsidian-brain/*/hooks"
+# 4 lines either side: the widest real separation between the glob and its
+# max() is the multi-line inline form (2 lines). Deliberately a literal, not
+# derived from the files it scans.
+_CACHE_WINDOW = 4
+
+
+def _cache_resolution_sites():
+    """[(skill, lineno, window_text)] for every plugin-cache resolution."""
+    sites = []
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill_name = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        for i, line in enumerate(lines):
+            if _CACHE_GLOB_PATH not in line:
+                continue
+            window = "\n".join(lines[max(0, i - _CACHE_WINDOW):i + _CACHE_WINDOW + 1])
+            if "max(" in window:
+                sites.append((skill_name, i + 1, window))
+    return sites
 
 
 def test_no_skill_resolves_the_plugin_cache_lexicographically():
@@ -337,15 +354,11 @@ def test_no_skill_resolves_the_plugin_cache_lexicographically():
     This is the regression guard for #274: the sweep itself is a one-off, but
     the pattern is easy to copy-paste back in from any older skill or from
     documentation."""
-    offenders = []
-    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
-        skill_name = skill_path.replace("\\", "/").split("/")[-2]
-        with open(skill_path, encoding="utf-8") as f:
-            content = f.read()
-        for m in _CACHE_RESOLUTION_RE.finditer(content):
-            if "key=lambda" not in m.group("rest"):
-                lineno = content[:m.start()].count("\n") + 1
-                offenders.append(f"{skill_name}/SKILL.md:{lineno}")
+    offenders = [
+        f"{skill}/SKILL.md:{lineno}"
+        for skill, lineno, window in _cache_resolution_sites()
+        if "key=lambda" not in window
+    ]
     assert not offenders, (
         "Lexicographic plugin-cache resolution found at: "
         + ", ".join(offenders)
@@ -354,15 +367,16 @@ def test_no_skill_resolves_the_plugin_cache_lexicographically():
     )
 
 
-def test_plugin_cache_resolution_sites_are_all_numeric_and_nonzero():
-    """Sanity floor: if the scan ever finds ZERO resolution sites the guard
-    above would pass vacuously (e.g. the pattern was reformatted past the
-    regex). Today every skill that loads plugin code has at least one."""
-    total = 0
-    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
-        with open(skill_path, encoding="utf-8") as f:
-            total += len(_CACHE_RESOLUTION_RE.findall(f.read()))
-    assert total >= 50, f"only {total} plugin-cache resolution sites matched the scan"
+def test_cache_resolution_scan_sees_every_site():
+    """Guards the guard: if the scan stops matching, the check above passes
+    vacuously. 67 is the measured count of resolution sites today (58 inline +
+    9 two-step); a LITERAL, not derived from the scan it validates. A drop
+    means the scan went blind; a rise is fine and only needs this number
+    raised deliberately."""
+    assert len(_cache_resolution_sites()) >= 67, (
+        f"only {len(_cache_resolution_sites())} cache-resolution sites matched "
+        "the scan — the pattern may have been reformatted past it"
+    )
 
 
 def test_every_version_key_snippet_imports_re():

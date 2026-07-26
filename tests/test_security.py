@@ -289,35 +289,97 @@ class TestStdinCap:
         ]
         return [p for p in roots if p.is_file()]
 
+    # Attributes that CONSUME the stream. `read`/`read1`/`readline` take a
+    # size; `readlines`' argument is a hint, not a bound, so it is always
+    # unbounded. Non-consuming attributes (isatty, fileno, encoding) are
+    # deliberately absent — they must not be flagged.
+    SIZED_READS = ("read", "read1", "readline")
+    UNSIZED_READS = ("readlines",)
+
     @staticmethod
-    def _is_stdin_read(node):
-        """True if ``node`` is a ``...stdin[.buffer].read(...)`` call."""
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            return False
-        if node.func.attr != "read":
-            return False
-        target = node.func.value
-        if isinstance(target, ast.Attribute) and target.attr == "buffer":
-            target = target.value
-        if isinstance(target, ast.Attribute):
-            return target.attr == "stdin"
-        return isinstance(target, ast.Name) and target.id == "stdin"
+    def _is_stdin_expr(node, aliases):
+        """True if ``node`` evaluates to stdin — ``sys.stdin``, a bare
+        ``stdin`` imported from sys, ``sys.stdin.buffer``, or a local alias
+        bound to one of those."""
+        if isinstance(node, ast.Attribute) and node.attr == "buffer":
+            node = node.value
+        if isinstance(node, ast.Attribute):
+            return node.attr == "stdin"
+        return isinstance(node, ast.Name) and node.id in aliases
+
+    @classmethod
+    def _stdin_aliases(cls, tree):
+        """Names bound to stdin: ``stdin`` itself (``from sys import stdin``)
+        plus any ``f = sys.stdin``. Without this, ``f = sys.stdin; f.read()``
+        walks straight past the guard."""
+        aliases = {"stdin"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and cls._is_stdin_expr(node.value, aliases):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        aliases.add(target.id)
+        return aliases
+
+    @classmethod
+    def _consumption_sites(cls, tree, aliases):
+        """Yield ``(node, size_arg_or_None, kind)`` for every construct that
+        drains stdin.
+
+        Four shapes, all of which evaded the original `.read`-attribute-only
+        check and one of which was LIVE in the tree (``json.load(sys.stdin)``
+        at two deep_cli entry points, both reachable from skills):
+
+        1. ``stdin.read(...)`` / ``read1`` / ``readline``  — sized, resolve it
+        2. ``stdin.readlines()``                            — hint, not a bound
+        3. ``stdin`` passed as an ARGUMENT to any call      — e.g. json.load,
+           io.TextIOWrapper: the callee reads to EOF and no size is visible
+        4. iteration — ``for line in stdin`` / comprehensions
+        """
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and cls._is_stdin_expr(
+                    node.func.value, aliases
+                ):
+                    if node.func.attr in cls.SIZED_READS:
+                        yield node, (node.args[0] if node.args else None), node.func.attr
+                    elif node.func.attr in cls.UNSIZED_READS:
+                        yield node, None, node.func.attr
+                    continue
+                # stdin handed to something else to drain (json.load(sys.stdin))
+                for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                    if cls._is_stdin_expr(arg, aliases):
+                        yield node, None, "passed-to-call"
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                if cls._is_stdin_expr(node.iter, aliases):
+                    yield node, None, "iteration"
+            elif isinstance(node, ast.comprehension):
+                if cls._is_stdin_expr(node.iter, aliases):
+                    yield node, None, "iteration"
 
     @staticmethod
     def _int_constants(tree):
-        """Every ``NAME = <int>`` binding in the module, at any nesting depth.
+        """``{NAME: value}`` for every unambiguous ``NAME = <int>`` binding.
 
-        Module-level and function-local both count: check_items_cli defines its
-        cap at module level, and other call sites bind one inside a function.
+        A name bound more than once is deliberately EXCLUDED rather than
+        resolved last-write-wins: this walk flattens every scope in the module
+        into one namespace, so a function-local ``CAP = 500`` and a
+        module-level ``CAP = 10**9`` would otherwise collapse into whichever
+        the walk happened to reach last — and half of those guesses resolve a
+        read to a bound it does not actually have. Unresolvable is the safe
+        answer: it reports the site as an offender rather than passing it.
         """
-        consts = {}
+        seen = {}
+        ambiguous = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
                 if isinstance(node.value.value, int):
                     for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            consts[target.id] = node.value.value
-        return consts
+                        if not isinstance(target, ast.Name):
+                            continue
+                        if target.id in seen and seen[target.id] != node.value.value:
+                            ambiguous.add(target.id)
+                        seen[target.id] = node.value.value
+        return {k: v for k, v in seen.items() if k not in ambiguous}
 
     @classmethod
     def _resolve_bound(cls, arg, consts):
@@ -338,23 +400,23 @@ class TestStdinCap:
 
     @classmethod
     def _all_stdin_reads(cls):
-        """[(path, lineno, resolved_bound_or_None)] for the whole codebase."""
+        """``[(path, lineno, bound_or_None, kind)]`` for the whole codebase."""
         found = []
         for path in cls._source_modules():
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             consts = cls._int_constants(tree)
-            for node in ast.walk(tree):
-                if not cls._is_stdin_read(node):
-                    continue
-                arg = node.args[0] if node.args else None
-                found.append((str(path), node.lineno, cls._resolve_bound(arg, consts)))
+            aliases = cls._stdin_aliases(tree)
+            for node, size_arg, kind in cls._consumption_sites(tree, aliases):
+                bound = cls._resolve_bound(size_arg, consts) if size_arg else None
+                found.append((str(path), node.lineno, bound, kind))
         return found
 
     def test_every_stdin_read_is_capped(self):
         offenders = [
-            f"{path}:{lineno} "
-            + ("(no size argument)" if bound is None else f"(bound={bound})")
-            for path, lineno, bound in self._all_stdin_reads()
+            f"{path}:{lineno} ({kind}, "
+            + ("no resolvable bound" if bound is None else f"bound={bound}")
+            + ")"
+            for path, lineno, bound, kind in self._all_stdin_reads()
             if bound is None or bound > self.MAX_ALLOWED
         ]
         assert not offenders, (
@@ -367,7 +429,7 @@ class TestStdinCap:
         """Guards the guard: if the AST walk ever stops finding reads, the
         check above would pass vacuously. These are the entry points that read
         stdin today — including the two the old hardcoded list missed."""
-        paths = {path for path, _, _ in self._all_stdin_reads()}
+        paths = {path for path, _, _, _ in self._all_stdin_reads()}
         for expected in (
             "hooks/obsidian_session_log.py",
             "hooks/obsidian_session_hint.py",
