@@ -312,35 +312,57 @@ def test_no_python_3_13_only_apis():
                     assert not re.search(pattern, code), f"{rel}:{lineno} — {why}"
 
 
-# Skills whose note_writer.py call sites this PR converted. Their sys.path
-# bootstrap lines must use the SAME numeric version key as the HOOKS= line, or
-# a single skill run can load obsidian_utils from one cached plugin version and
-# note_writer.py from another (verified: with 3.9.0 and 3.10.0 both cached, the
-# lexicographic form picks 3.9.0 while the numeric one picks 3.10.0).
-_VERSION_AWARE_SKILLS = (
-    "compress", "decide", "error-log", "retro", "standup",
-    "vault-import", "vault-stats",
-)
-_LEXICOGRAPHIC_MAX = (
-    'max(glob.glob(os.path.expanduser('
-    '"~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks")'
+# Plugin-cache resolution must be numeric, not lexicographic: max() over
+# strings puts "3.9.0" above "3.10.0", so the moment the plugin reaches a
+# two-digit minor with an older cache still present, every one of these lines
+# resolves to the WRONG (older) tree — and it fails as an opaque Python
+# traceback or a stale-module import, not as any documented ERROR: message.
+#
+# Matched against RAW FILE TEXT, not the extracted `python3 -c` snippets: some
+# sites are multi-line inside a double-quoted block, which the snippet
+# extractor deliberately does not parse. Quote character and internal
+# whitespace both vary across sites, so the pattern tolerates both.
+_CACHE_RESOLUTION_RE = re.compile(
+    r"max\(\s*glob\.glob\(os\.path\.expanduser\(\s*(?P<q>['\"])"
+    r"~/\.claude/plugins/cache/\*/obsidian-brain/\*/hooks(?P=q)\s*\)\s*\)\s*,"
+    r"\s*(?P<rest>[^)]*?)\s*,?\s*\)",
+    re.DOTALL,
 )
 
 
-def test_converted_skills_resolve_plugin_version_numerically():
-    """Scoped deliberately to the skills this PR touches. The remaining
-    ~26 lexicographic lines in the other skill files are a tracked follow-up:
-    they are uniformly wrong together, which is survivable, whereas MIXING
-    resolvers inside one run is the hazard this pins."""
-    for skill in _VERSION_AWARE_SKILLS:
-        path = os.path.join(_REPO_ROOT, "skills", skill, "SKILL.md")
-        with open(path, encoding="utf-8") as f:
+def test_no_skill_resolves_the_plugin_cache_lexicographically():
+    """Scans EVERY skills/*/SKILL.md — no hardcoded list — so a new skill file
+    is covered the moment it is added.
+
+    This is the regression guard for #274: the sweep itself is a one-off, but
+    the pattern is easy to copy-paste back in from any older skill or from
+    documentation."""
+    offenders = []
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill_name = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as f:
             content = f.read()
-        assert _LEXICOGRAPHIC_MAX not in content, (
-            f"Skill {skill} still resolves the plugin cache lexicographically; "
-            "at 3.10.x with a 3.9.x cached it will load a different plugin "
-            "version than the note_writer.py call site in the same run."
-        )
+        for m in _CACHE_RESOLUTION_RE.finditer(content):
+            if "key=lambda" not in m.group("rest"):
+                lineno = content[:m.start()].count("\n") + 1
+                offenders.append(f"{skill_name}/SKILL.md:{lineno}")
+    assert not offenders, (
+        "Lexicographic plugin-cache resolution found at: "
+        + ", ".join(offenders)
+        + ". max() over strings picks 3.9.0 over 3.10.0 — use the numeric key: "
+        'key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p)'
+    )
+
+
+def test_plugin_cache_resolution_sites_are_all_numeric_and_nonzero():
+    """Sanity floor: if the scan ever finds ZERO resolution sites the guard
+    above would pass vacuously (e.g. the pattern was reformatted past the
+    regex). Today every skill that loads plugin code has at least one."""
+    total = 0
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        with open(skill_path, encoding="utf-8") as f:
+            total += len(_CACHE_RESOLUTION_RE.findall(f.read()))
+    assert total >= 50, f"only {total} plugin-cache resolution sites matched the scan"
 
 
 def test_every_version_key_snippet_imports_re():
