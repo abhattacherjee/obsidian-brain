@@ -245,3 +245,119 @@ def test_explicit_title_field_takes_precedence_over_body_h1(tmp_path):
     parsed = vault_index._parse_note(str(note_path))
 
     assert parsed["title"] == "Explicit Title"
+
+
+# ---------------------------------------------------------------------------
+# #277 Task 3 — _sync() splits "skipped" into unchanged vs. malformed
+#
+# Before this change, _sync() incremented the SAME "skipped" counter for two
+# opposite outcomes: an unchanged file (mtime match, nothing to do -- the
+# healthy common case) and an unparseable file (frontmatter split failed,
+# note silently dropped from the index -- real data loss). That conflation
+# is exactly why a 40-line frontmatter bound hid 28 missing notes behind a
+# reassuring `skipped: 2011` for months (see module docstring above). These
+# tests prove the two are now reported separately, `skipped` remains their
+# sum, and the offending files are named (capped, with the true count kept
+# separately from the capped list length).
+# ---------------------------------------------------------------------------
+
+
+def _valid_note(project: str = "obsidian-brain") -> str:
+    return (
+        "---\n"
+        "type: insight\n"
+        f"project: {project}\n"
+        "---\n"
+        "Body text.\n"
+    )
+
+
+def _malformed_note() -> str:
+    """Opens a frontmatter fence but never closes it -- _parse_note_detailed
+    returns (None, reason) with a 'no closing' reason."""
+    return "---\ntype: session\n"
+
+
+def test_sync_splits_unchanged_vs_malformed_and_skipped_is_their_sum(tmp_path):
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    (sessions / "valid-one.md").write_text(_valid_note("proj-one"), encoding="utf-8")
+    (sessions / "valid-two.md").write_text(_valid_note("proj-two"), encoding="utf-8")
+    (sessions / "bad.md").write_text(_malformed_note(), encoding="utf-8")
+
+    db_path = str(tmp_path / "index.db")
+
+    # First pass: fresh DB, everything falls through to full rebuild. The two
+    # valid notes get inserted; the malformed note is dropped (never makes it
+    # into `notes`, so its mtime is never recorded -- it will be reparsed,
+    # and fail again, on every subsequent sync).
+    first = vault_index.rebuild_index(
+        str(tmp_path), ["claude-sessions"], db_path=db_path,
+    )
+    assert first["inserted"] == 2
+    assert first["malformed"] == 1
+    assert first["unchanged"] == 0
+    assert first["skipped"] == first["unchanged"] + first["malformed"] == 1
+    assert len(first["malformed_files"]) == 1
+    assert first["malformed_files"][0]["file"] == "bad.md"
+    assert "no closing" in first["malformed_files"][0]["reason"]
+
+    # Second pass, nothing changed on disk: the two valid notes now hit the
+    # mtime-unchanged fast path; the malformed note is reparsed (and fails)
+    # again since it was never indexed.
+    second = vault_index.rebuild_index(
+        str(tmp_path), ["claude-sessions"], db_path=db_path, full=False,
+    )
+    assert second["inserted"] == 0
+    assert second["unchanged"] == 2
+    assert second["malformed"] == 1
+    assert second["skipped"] == second["unchanged"] + second["malformed"] == 3
+    assert len(second["malformed_files"]) == 1
+    assert second["malformed_files"][0]["file"] == "bad.md"
+
+    # Files actually examined in the insert/update loop == the 3 files on
+    # disk; inserted + unchanged + malformed must equal that, never more or
+    # less (no file silently uncounted, none double-counted).
+    assert second["inserted"] + second["unchanged"] + second["malformed"] == 3
+
+
+def test_malformed_files_capped_at_20_but_malformed_reports_true_count(tmp_path):
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    for i in range(25):
+        (sessions / f"bad-{i:02d}.md").write_text(_malformed_note(), encoding="utf-8")
+
+    db_path = str(tmp_path / "index.db")
+    stats = vault_index.rebuild_index(
+        str(tmp_path), ["claude-sessions"], db_path=db_path,
+    )
+
+    assert stats["malformed"] == 25, (
+        "malformed must report the TRUE total, not the capped list length"
+    )
+    assert len(stats["malformed_files"]) == 20, (
+        "malformed_files must be capped at 20 entries even with 25 failures"
+    )
+    assert stats["malformed"] != len(stats["malformed_files"]), (
+        "these two must be able to disagree -- a regression that counts the "
+        "capped list instead of the true total would make them equal here"
+    )
+
+
+def test_rebuild_index_full_mode_carries_split_counters_through(tmp_path):
+    """rebuild_index(full=True) must surface unchanged/malformed/malformed_files
+    on its returned stats too, not just the non-destructive path."""
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    (sessions / "valid.md").write_text(_valid_note(), encoding="utf-8")
+    (sessions / "bad.md").write_text(_malformed_note(), encoding="utf-8")
+
+    db_path = str(tmp_path / "index.db")
+    stats = vault_index.rebuild_index(
+        str(tmp_path), ["claude-sessions"], db_path=db_path, full=True,
+    )
+
+    assert stats["inserted"] == 1
+    assert stats["malformed"] == 1
+    assert stats["malformed_files"] == [{"file": "bad.md", "reason": stats["malformed_files"][0]["reason"]}]
+    assert "no closing" in stats["malformed_files"][0]["reason"]

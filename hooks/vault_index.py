@@ -631,13 +631,33 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
     """Incremental sync: add new/changed files, remove deleted ones.
 
     Returns {"inserted": N, "skipped": M, "deleted": D, "by_type": {...}}.
+    ``skipped`` is the sum of two semantically distinct outcomes, also
+    reported separately: ``unchanged`` (mtime matched the index — nothing
+    to do, the healthy common case) and ``malformed`` (frontmatter failed
+    to parse — the note was dropped from the index, real data loss). A
+    40-line frontmatter-scan bound once hid 28 unparseable notes behind a
+    reassuring ``skipped: 2011`` for months because the two were conflated
+    (#277); splitting them, plus surfacing which files failed via
+    ``malformed_files`` (capped at 20 entries — ``malformed`` always
+    reports the TRUE count, uncapped), makes that kind of silent data loss
+    visible again.
 
     Wraps the entire pass in BEGIN IMMEDIATE + commit/rollback so a mid-
     loop failure doesn't leave a half-applied transaction attached to
     the connection (which would poison subsequent callers).
     """
     vault = Path(vault_path)
-    stats = {"inserted": 0, "skipped": 0, "deleted": 0, "recomputed": 0, "by_type": {}}
+    stats = {
+        "inserted": 0,
+        "skipped": 0,
+        "unchanged": 0,
+        "malformed": 0,
+        "malformed_files": [],
+        "deleted": 0,
+        "recomputed": 0,
+        "by_type": {},
+    }
+    _MALFORMED_FILES_CAP = 20
 
     # Collect all .md files in target folders (keyed by absolute path)
     disk_files: dict[str, Path] = {}  # abs_path_str -> Path object
@@ -681,12 +701,18 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
 
             # Skip if mtime unchanged (0.001 tolerance)
             if abs_path_str in indexed and abs(file_mtime - indexed[abs_path_str]) < 0.001:
+                stats["unchanged"] += 1
                 stats["skipped"] += 1
                 continue
 
-            parsed = _parse_note(str(abs_path))
+            parsed, reason = _parse_note_detailed(str(abs_path))
             if parsed is None:
+                stats["malformed"] += 1
                 stats["skipped"] += 1
+                if len(stats["malformed_files"]) < _MALFORMED_FILES_CAP:
+                    stats["malformed_files"].append(
+                        {"file": abs_path.name, "reason": reason}
+                    )
                 continue
 
             _upsert_note(conn, abs_path_str, parsed, file_mtime, file_size)
@@ -1036,9 +1062,10 @@ def rebuild_index(
     field is lost. Required only when the schema is corrupt or incompatible,
     or when the derivable tables need a clean-slate rebuild.
 
-    Returns ``{"inserted": N, "skipped": M, "by_type": {...}}`` plus, in
-    non-destructive mode, ``"preserved": {...}`` and ``"pruned_orphans":
-    {...}`` reporting the Friston-table delta.
+    Returns ``{"inserted": N, "skipped": M, "unchanged": U, "malformed": F,
+    "malformed_files": [...], "by_type": {...}}`` (``skipped == unchanged +
+    malformed``; see ``_sync``) plus, in non-destructive mode, ``"preserved":
+    {...}`` and ``"pruned_orphans": {...}`` reporting the Friston-table delta.
     """
     if db_path is None:
         db_path = _default_db_path()
