@@ -45,15 +45,25 @@ Parse the user's invocation into flags:
 - `--reconstruct` → set RECONSTRUCT=1 (session-coverage only: mark gaps resolvable for apply)
 - `--min-confidence <FLOAT>` → set MIN_CONFIDENCE (0.0–1.0 inclusive; default 0.0 keeps all; applies to both dry-run report and --apply); note: unresolved/WARN rows (confidence=0.0) are hidden at any threshold > 0 — drop the flag to audit them
 
-Locate the Python dispatcher via the standard plugin cache glob, with a fallback for local dev sessions where the repo is checked out as `$PWD`:
+Locate the Python dispatcher by resolving the obsidian-brain install: prefer the local checkout registered in `known_marketplaces.json` (this also covers local dev sessions, deterministically rather than via `$PWD`), falling back to the newest allowlisted version directory in the plugin cache:
 
 ```bash
-DISPATCHER="$(ls -dt ~/.claude/plugins/cache/*/obsidian-brain/*/scripts/vault_doctor.py 2>/dev/null | head -1)"
-if [[ -z "$DISPATCHER" ]]; then
-    if [[ -f "$(pwd)/scripts/vault_doctor.py" ]]; then
-        DISPATCHER="$(pwd)/scripts/vault_doctor.py"
-    fi
-fi
+DISPATCHER="$(python3 -c "
+import glob, json, os, re
+def _ob_doctor():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _h = os.path.join((_m or {}).get('installLocation', ''), 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                _v = os.path.join(os.path.dirname(_h), 'scripts', 'vault_doctor.py')
+                if os.path.isfile(_v):
+                    return _v
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/scripts/vault_doctor.py')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-3])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-3].split('.')], _p), default='')
+print(_ob_doctor())
+")"
 if [[ -z "$DISPATCHER" || ! -f "$DISPATCHER" ]]; then
     echo "ERROR: could not find scripts/vault_doctor.py" >&2
     exit 1
