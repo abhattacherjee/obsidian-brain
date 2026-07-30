@@ -162,7 +162,29 @@ echo ""
 # ─── Test 5: SKILL.md has IMPORTANCE prompt ───────────
 echo "Test 5: IMPORTANCE in SKILL.md"
 
-SKILL_PATH=$(find ~/.claude/plugins/cache -path "*/obsidian-brain/*/skills/recall/SKILL.md" -not -path "*.bak*" 2>/dev/null | sort -V | tail -1)
+# Canonical obsidian-brain skill-file resolver (#278), adapted to return
+# skills/recall/SKILL.md: marketplace-registered install location first
+# (sentinel = hooks/obsidian_utils.py), allowlisted-and-version-sorted cache
+# fallback otherwise.
+SKILL_PATH=$(python3 -c "
+import glob, json, os, re
+def _ob_skill():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                _s = os.path.join(os.path.dirname(_h), 'skills', 'recall', 'SKILL.md')
+                if os.path.isfile(_s):
+                    return _s
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/skills/recall/SKILL.md')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-4])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-4].split('.')], _p), default='')
+print(_ob_skill())
+")
 if [ -z "$SKILL_PATH" ]; then
     fail "recall SKILL.md not found in plugin cache"
 else
@@ -179,7 +201,25 @@ echo ""
 # ─── Test 6: stderr logging (non-destructive) ────────
 echo "Test 6: stderr logging on bad DB"
 
-HOOKS_PATH=$(find ~/.claude/plugins/cache -path "*/obsidian-brain/*/hooks" -type d -not -path "*.bak*" 2>/dev/null | sort -V | tail -1)
+# Canonical obsidian-brain hooks resolver (#278): marketplace-registered
+# install location first, allowlisted-and-version-sorted cache fallback.
+HOOKS_PATH=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='')
+print(_ob_hooks())
+")
 if [ -z "$HOOKS_PATH" ]; then
     HOOKS_PATH="hooks"
 fi

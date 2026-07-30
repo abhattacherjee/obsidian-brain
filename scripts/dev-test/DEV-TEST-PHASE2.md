@@ -164,8 +164,21 @@ If perms are anything else, the atomic write is regressing.
 
 ```bash
 python3 -c "
-import sys, glob, os
-sys.path.insert(0, max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks'))))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+sys.path.insert(0, _ob_hooks())
 import obsidian_utils
 c1 = obsidian_utils.load_config()
 c1.setdefault('optional_deps_declined', []).append('TEST_POISON')
@@ -243,8 +256,21 @@ echo "Before: notes=$NOTES_BEFORE, fts=$FTS_BEFORE"
 for i in 1 2 3; do
     touch -A +002 "$NOTE"  # bump mtime by 2s
     python3 -c "
-import sys, glob, os
-sys.path.insert(0, max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks'))))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+sys.path.insert(0, _ob_hooks())
 import vault_index
 from obsidian_utils import load_config
 c = load_config()
@@ -291,8 +317,21 @@ Two concurrent `index_note` calls should serialize cleanly, not deadlock or corr
 
 ```bash
 python3 -c "
-import sys, glob, os, threading
-sys.path.insert(0, max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks'))))
+import glob, json, os, re, sys, threading
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+sys.path.insert(0, _ob_hooks())
 import vault_index
 from obsidian_utils import load_config
 c = load_config()
