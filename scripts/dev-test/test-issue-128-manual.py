@@ -41,6 +41,9 @@ def _resolve_hooks_dir() -> str:
     install location first, allowlisted-and-version-sorted cache fallback."""
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
             _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -55,10 +58,17 @@ def _resolve_hooks_dir() -> str:
 
 HOOK_DIR = _resolve_hooks_dir()
 if not HOOK_DIR:
-    sys.exit("❌ No obsidian-brain install found (checked registered install location and plugin cache). Run /dev-test install first.")
+    sys.exit(
+        "❌ No obsidian-brain install found (checked registered install "
+        "location and plugin cache). On a directory-source install the "
+        "registered checkout is what resolves, so checking out the right "
+        "branch there is enough; otherwise run /dev-test install first."
+    )
 sys.path.insert(0, HOOK_DIR)
 
-# Sanity: confirm the #128 implementation is present. SKILL is derived from
+# Sanity: confirm the #128 implementation is present in whatever HOOK_DIR
+# resolved to — which since #278 is the marketplace-registered checkout on a
+# directory-source install, and the plugin cache otherwise. SKILL is derived from
 # HOOK_DIR's own install root (not a second independent cache glob) so it
 # can never resolve to a different version than the hooks we just imported.
 SRC = Path(HOOK_DIR) / "vault_index.py"
@@ -68,8 +78,9 @@ required_in_src = ["pruned_foreign", "allow_fallthrough", "dry_run", "malformed"
 missing = [r for r in required_in_src if SRC.exists() and r not in SRC.read_text()]
 if missing:
     sys.exit(
-        f"❌ Plugin cache at {HOOK_DIR} is missing #128 implementations: {missing}\n"
-        f"   Check out the #128 feature branch and run /dev-test install in a sibling CC session."
+        f"❌ Resolved install at {HOOK_DIR} is missing #128 implementations: {missing}\n"
+        f"   Check out the #128 feature branch there — and if that path is the plugin\n"
+        f"   cache rather than a registered checkout, run /dev-test install in a sibling CC session."
     )
 
 import vault_index  # noqa: E402  (import after path mutation + sanity)

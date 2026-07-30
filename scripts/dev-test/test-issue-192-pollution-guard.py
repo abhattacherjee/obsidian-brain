@@ -32,8 +32,20 @@ def _resolve_hooks(dev_repo: str | None) -> str:
         return repo_hooks
     # Canonical obsidian-brain hooks resolver (#278): marketplace-registered
     # install location first, allowlisted-and-version-sorted cache fallback.
+    #
+    # Kept even though `repo_hooks` above returns first whenever this script
+    # runs from its own checkout — which is the normal case, so this block is
+    # unreachable there. It is here for the abnormal one: copied out of the
+    # repo (a scratch dir, a downloaded gist) with no --dev-repo, where the
+    # relative `../../hooks` misses. Before #278 that path fell straight to
+    # the cache and silently tested the stale released tree; now it resolves
+    # the registered checkout first, same as every other site. Deleting it
+    # would make this the one tool that still prefers the cache.
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
             _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue

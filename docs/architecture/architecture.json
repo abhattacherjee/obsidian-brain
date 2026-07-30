@@ -15,7 +15,7 @@
     "realtime": { "protocol": "none", "endpoint": "direct filesystem writes — no MCP server, no REST API, no daemon" },
     "ai": { "provider": "Claude CLI (claude -p)", "model": "haiku default; escalates haiku to sonnet to opus on empty output (#165)", "notes": "summarization deferred from hooks to /recall" },
     "vectorSearch": { "engine": "SQLite FTS5 (BM25) + 7-signal rerank; TF-IDF cosine themes with ACT-R activation and Free-Energy surprise" },
-    "tests": { "unit": { "runner": "pytest", "count": 2236, "environments": ["python3.12"], "coverage": { "lines": 92 } } },
+    "tests": { "unit": { "runner": "pytest", "count": 2300, "environments": ["python3.12"], "coverage": { "lines": 92 } } },
     "packageManager": "none (stdlib only)"
   },
   "diagram": {
@@ -410,6 +410,7 @@
     { "name": "OBSIDIAN_BRAIN_DB", "default": "the vault index DB under ~/.claude", "purpose": "Override the SQLite index path (#192); also used by tests to avoid polluting the live DB." },
     { "name": "OBSIDIAN_BRAIN_VAULT", "default": "(config file)", "purpose": "vault-doctor config override (with _SESSIONS_FOLDER / _INSIGHTS_FOLDER); takes precedence over the config file." },
     { "name": "OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT", "default": "the doctor backup dir under ~/.claude", "purpose": "Scan root for the audit-historic-repairs check (apply always writes under the dispatcher backup root)." },
+    { "name": "OB_SCAN_RESOLVED_INSTALL", "default": "unset", "purpose": "Set to 1 to make the stdin-cap security test also walk the install tree the #278 resolver lands on. Off by default: on a machine whose install resolves a released plugin-cache version, scanning it fails the suite on code that is not in the checkout." },
     { "name": "CHECK_ITEMS_PREFILTER", "default": "on", "purpose": "Set to off to disable the L2 deterministic prefilter and send all items to the LLM classifier." },
     { "name": "CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "default": "300", "purpose": "Inner per-call timeout for the classifier/semantic-merge sub-agents; chunking keeps each call well under it." },
     { "name": "CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE", "default": "25", "purpose": "Max groups per classifier sub-agent call — sized to stay on Haiku and under the timeout." }
@@ -441,7 +442,7 @@
       { "decision": "L2 deterministic prefilter with a distinctiveness gate before the LLM classifier.", "alternatives": ["Send every open item to the classifier"], "rationale": "Most open items have no plausible completion evidence and can be triaged for free; the distinctiveness gate (snake_case / len>=8 / interior mixed-case) stops generic short words like add/fix from accidentally matching unrelated shipped features." },
       { "decision": "Classifier chunking at <=25 groups per sub-agent call.", "alternatives": ["One sub-agent call for the whole payload", "Raise the timeout ceiling"], "rationale": "A single large payload risks exceeding the 300s timeout and forces the slower Sonnet tier; chunking keeps each call fast, on Haiku, and recoverable on partial failure." },
       { "decision": "Cross-plugin O_EXCL dedup lock that fails open.", "alternatives": ["Assume a single install", "A fail-closed lock"], "rationale": "The monorepo and standalone marketplace copies can both be installed; the lock prevents double-writes, but fails open (empty session_id or any FS error to proceed) so it can never silently swallow a legitimate hook." },
-      { "decision": "Every SKILL.md (and live scripts/) resolver copy is inlined, not a single shared generated file (#278).", "alternatives": ["A generated resolver at a fixed installed path, imported/sourced by every call site"], "rationale": "A shared generated artifact is fewer copies but adds an install-time artifact that can itself go missing, trading 68+ visible duplicate copies for one invisible single point of failure. Duplication is deliberately tolerated and guarded instead: a drift test enforces byte-identity of the resolver body across every skills/*/SKILL.md site." }
+      { "decision": "Every SKILL.md (and live scripts/) resolver copy is inlined, not a single shared generated file (#278).", "alternatives": ["A generated resolver at a fixed installed path, imported/sourced by every call site"], "rationale": "A shared generated artifact is fewer copies but adds an install-time artifact that can itself go missing, trading 68+ visible duplicate copies for one invisible single point of failure. Duplication is deliberately tolerated and guarded instead: a drift test enforces byte-identity of the resolver body across every skills/*/SKILL.md site, and a second guard requires every scripts/** file that reaches into the plugin cache to consult known_marketplaces.json first (byte identity is impossible there: different defaults, path indices and host languages). The resolver consults only marketplace entries whose own source.source is 'directory', so github-source installs keep resolving the cache exactly as before #278 — obsidian-brain's marketplace.json declares source './', which makes a github marketplace clone satisfy the hooks/obsidian_utils.py sentinel too." }
     ]
   },
   "testing": {

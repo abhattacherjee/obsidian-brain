@@ -125,6 +125,9 @@ import sys, os, glob, json, re
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
             _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -171,6 +174,9 @@ import glob, json, os, re
 def _ob_skill():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
             _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -186,7 +192,7 @@ def _ob_skill():
 print(_ob_skill())
 ")
 if [ -z "$SKILL_PATH" ]; then
-    fail "recall SKILL.md not found in plugin cache"
+    fail "recall SKILL.md not found in the resolved install (checked the marketplace-registered directory-source install location, then the plugin cache)"
 else
     IMP_COUNT=$(grep -c "IMPORTANCE" "$SKILL_PATH" 2>/dev/null || echo "0")
     if [ "$IMP_COUNT" -ge 2 ]; then
@@ -208,6 +214,9 @@ import glob, json, os, re
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
             _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue

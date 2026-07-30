@@ -53,6 +53,9 @@ import glob, json, os, re
 def _ob_doctor():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
             _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue

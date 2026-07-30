@@ -57,6 +57,9 @@ def _resolve_session_log_hook() -> Path | None:
     version. Returns None if neither resolves."""
     try:
         for _m in json.load(open(REAL_HOME / ".claude/plugins/known_marketplaces.json")).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
             _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -76,16 +79,23 @@ def _resolve_session_log_hook() -> Path | None:
 
 HOOK_PY = _resolve_session_log_hook()
 if HOOK_PY is None:
-    sys.exit("❌ No installed obsidian-brain hook found (checked registered install location and plugin cache). Run /dev-test install first.")
+    sys.exit(
+        "❌ No installed obsidian-brain hook found (checked registered install "
+        "location and plugin cache). On a directory-source install the "
+        "registered checkout is what resolves, so checking out the right "
+        "branch there is enough; otherwise run /dev-test install first."
+    )
 
-# Sanity: confirm the cache has #123 implementation.
+# Sanity: confirm the resolved install has the #123 implementation — the
+# registered checkout on a directory-source install, the cache otherwise.
 hook_src = HOOK_PY.read_text()
 needed = ["_Outcome", "_append_sessionend_log", "OK_RAW_NOTE_ONLY", "SKIPPED_BELOW_THRESHOLD"]
 missing = [n for n in needed if n not in hook_src]
 if missing:
     sys.exit(
         f"❌ Installed hook at {HOOK_PY} is missing #123 markers: {missing}\n"
-        f"   Re-run /dev-test install on the #123 feature branch."
+        f"   Check out the #123 feature branch there, or re-run /dev-test install if\n"
+        f"   that path is the plugin cache rather than a registered checkout."
     )
 
 # ─── Cleanup registration (must run before any mutation) ─────────────────

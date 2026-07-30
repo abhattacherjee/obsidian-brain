@@ -65,15 +65,34 @@ The order is the whole fix. **Cache-first-with-fallback is wrong** — it still 
 cached module whenever one exists, which is exactly the silent class above. Resolution order:
 
 1. Read `~/.claude/plugins/known_marketplaces.json` (fixed path — safe to hardcode).
-2. Iterate entries; for each, test the sentinel `<installLocation>/hooks/obsidian_utils.py`.
+2. Skip every entry whose own `source.source` is not `"directory"`. Shape-tolerant: a non-dict
+   entry, or a `source` that is a string/list/`null`/absent, must `continue`, never raise — the
+   whole loop shares one `try`, so a raise on entry 1 silently skips entries 2..N.
+3. For each surviving entry, test the sentinel `<installLocation>/hooks/obsidian_utils.py`.
    The marketplace **key is user-chosen** (`obsidian-brain-repo` here) and must not be hardcoded.
    Verified discriminating: of 9 marketplaces, only the obsidian-brain one is `True` — including
    two *other* directory-source marketplaces (`cc-token-router-repo`, `claude-code-skills`).
-3. Fall back to the cache glob, filtered by the canonical-version allowlist, sorted numerically.
-4. Fall back to `"hooks"` (the existing relative default) — unchanged.
+4. Fall back to the cache glob, filtered by the canonical-version allowlist, sorted numerically.
+5. Fall back to `"hooks"` (the existing relative default) — unchanged.
 
-For a normal **github** install there is no directory entry, so step 2 finds nothing and behaviour
-is identical to today. This is a no-op for every user except directory-source installs.
+**Why step 2 exists (corrected after the final review).** An earlier version of this section said
+a github install "has no directory entry, so step 3 finds nothing". That is false twice over:
+every github-source marketplace carries an absolute `installLocation` pointing at its clone under
+`~/.claude/plugins/marketplaces/<name>`, and obsidian-brain's `.claude-plugin/marketplace.json`
+declares `"source": "./"` — the marketplace repo **is** the plugin repo — so that clone has
+`hooks/obsidian_utils.py` at its root and satisfies the sentinel. Reproduced by running the
+shipped FORM A against a github-shaped fake `$HOME`: it returned the clone, not the cache.
+
+Left that way, github-source users (the entire external population) would load `SKILL.md` from the
+**cache** while `sys.path` pointed at the **marketplace clone**, and `/plugin marketplace update`
+— the documented update path — refreshes the clone without touching the cache. That window is
+silent SKILL.md/hooks version skew: #278's own failure class, inverted.
+
+With step 2, github installs resolve the cache exactly as they did before #278 — **zero behaviour
+change for external users** — and the fix stays scoped to the reported bug. Pinned in both
+directions by `test_a_directory_source_install_beats_the_cache` and
+`test_a_github_source_install_falls_through_to_the_cache`, whose fixture deliberately builds a
+clone that *does* satisfy the sentinel.
 
 ## Global Constraints
 
@@ -194,20 +213,38 @@ the allowlisted cache. Do **not** reuse form A/B verbatim — different subdirec
   cache-targeted, not a #278 defect.** `/dev-test install` writes the working tree *into* the
   plugin cache; a script whose entire job is confirming that write succeeded must read the cache
   it just wrote to — resolving via marketplace `installLocation` first would validate the wrong
-  thing (the checkout, not the install). The distinguishing test: the script's own header states
-  `# Run AFTER: /dev-test install`. Five files are in this class — do not "fix" them:
-  - `scripts/test-dev-skill.sh`
+  thing (the checkout, not the install). The distinguishing test is **whether the file's entire
+  job is validating what `/dev-test install` itself wrote into the plugin cache** — not the
+  presence of a `# Run AFTER: /dev-test install` header. An earlier draft of this section named
+  that header as the criterion, and it is wrong: `test-issue-123-manual.py` and
+  `test-issue-128-manual.py` both carry that exact header and both **were** converted, correctly,
+  because they assert on *implementation content* (does this tree contain the #123/#128 markers?),
+  which is a question about whichever tree the skills load, not about the install. Stating the
+  header as the test would send the next sweep to revert them.
+
+  Seven files are in the cache-only class — do not "fix" them. The list is pinned by
+  `CACHE_ONLY_SCRIPTS` in `tests/test_hooks_resolver_drift.py`, which also asserts every entry
+  still exists so a rename cannot leave a dead exemption behind:
+  - `scripts/test-dev-skill.sh` — writes the cache; must find it as Claude Code laid it out
   - `scripts/dev-test/test-issue-101-manual.sh`
   - `scripts/dev-test/test-issue-105-manual.sh`
   - `scripts/dev-test/test-snapshots-manual.sh`
   - `scripts/dev-test/test-vault-doctor-snapshots-manual.sh`
+  - `scripts/dev-test/DEV-TEST-ISSUE-105.md` — manual checklist that greps the installed tree
+  - `scripts/dev-test/DEV-TEST-ISSUE-125.md` — same
 - **Audit-method limitation.** The site inventory that produced this plan's "14 `scripts/` sites"
   and the later "68 + N" counts was anchored on the literal string shape
   `plugins/cache/*/obsidian-brain` (a `glob.glob(...)` call). That grep cannot see other shapes
   that resolve the same cache directory differently — e.g. `find "$CACHE_DIR" -maxdepth 2 -type d
   -name hooks`, used by the five files above — so a shape-anchored audit undercounts by
   construction. Any future audit of this class must state which literal shape(s) it searched for,
-  not just report a total.
+  not just report a total. Partly closed since:
+  `test_no_scripts_file_reaches_the_cache_without_the_registry` scans `scripts/**` with a
+  deliberately shape-agnostic key (any `plugins/cache` mention, which catches the `find` and
+  `ls -dt` shapes too) and requires a `known_marketplaces.json` lookup in the same file, with the
+  seven cache-only files allowlisted. Byte identity is impossible there — different defaults,
+  different path indices (`[-2]`/`[-3]`/`[-4]`), Python and shell hosts — so this weaker invariant
+  is what `scripts/` gets in place of the 68 copies' byte-for-byte guard.
 - A generated resolver at a fixed path. Fewer copies, but it adds an install-time artifact that can
   itself go missing — trading 68 visible copies for one invisible single point of failure.
 - Restoring `3.3.1.bak` into the glob path. A sibling session moved it to

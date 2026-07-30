@@ -27,6 +27,9 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
             _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -90,6 +93,9 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
             _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -153,6 +159,9 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
             _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -224,6 +233,9 @@ When sub-agents return, for each:
    def _ob_hooks():
        try:
            for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+               _s = _m.get("source") if isinstance(_m, dict) else None
+               if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                   continue
                _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
                if not (isinstance(_i, str) and os.path.isabs(_i)):
                    continue
@@ -280,6 +292,9 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
             _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -332,6 +347,9 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
             _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue

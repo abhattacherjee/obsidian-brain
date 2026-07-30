@@ -13,12 +13,26 @@ against a canonical form declared here. The site count is asserted by
 
 **Behaviour (executed).** The canonical forms are not just compared as text —
 every distinct block observed in the files is ``exec``'d against fixture trees
-under ``tmp_path`` with ``$HOME`` redirected, and asserted to (a) prefer the
-marketplace ``installLocation`` over any cache, (b) reject non-canonical
-sibling directories, and (c) never raise on a malformed
+under ``tmp_path`` with ``$HOME`` redirected, and asserted to (a) prefer a
+**directory-source** marketplace ``installLocation`` over any cache, (b) ignore
+a github-source entry even when its clone satisfies the sentinel, (c) reject
+non-canonical sibling directories, and (d) never raise on a malformed
 ``known_marketplaces.json``. Executing the *file-derived* text (rather than the
 constants below) is deliberate: a site edited to keep the resolver's variable
 names while gutting its logic still gets run, and still fails.
+
+(b) is not decoration. obsidian-brain's ``.claude-plugin/marketplace.json``
+declares ``"source": "./"``, so the marketplace repo IS the plugin repo and a
+github-source clone under ``~/.claude/plugins/marketplaces/<name>`` carries
+``hooks/obsidian_utils.py`` at its root. The sentinel alone cannot tell a clone
+from a checkout; the ``source.source == "directory"`` discriminator can, and it
+is what keeps github-source installs — every external user — resolving the
+cache exactly as they did before #278.
+
+Fixtures that mean to exercise the ``installLocation``/``isabs`` guards
+therefore carry a valid directory ``source``. Without it the discriminator
+stands in front and skips the entry first, and the inner guard becomes
+untestable while its test still passes.
 
 That last point is the carried finding from Task 2's review, which proved by
 mutation that ``assert "key=lambda _p:" in window`` is a naming proxy: a site
@@ -58,6 +72,9 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
             _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -77,6 +94,9 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
             _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -96,6 +116,9 @@ import glob, json, os, re
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
             _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -116,6 +139,9 @@ import glob, json, os, re
 def _ob_doctor():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
             _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
@@ -289,6 +315,18 @@ def test_no_cache_glob_lives_outside_an_extracted_resolver_block():
     So: every line mentioning the plugin cache must lie INSIDE the line span of
     an extracted canonical block. Sites are dedented but never re-wrapped, so
     ``text.count("\\n")`` is an exact span.
+
+    **Known limit.** This keys on the literal string
+    ``~/.claude/plugins/cache/*/obsidian-brain/``. A hand-rolled resolver
+    written as
+    ``os.path.join(os.path.expanduser("~/.claude/plugins/cache"), ...)``, or
+    the ``find "$CACHE_DIR" -maxdepth 2 -name hooks`` shape that this branch
+    documents as having evaded an earlier audit, contains no such literal and
+    slips straight past. The literal is a good key for the shape the 68 copies
+    actually use, not a general-purpose detector.
+    ``test_no_scripts_file_reaches_the_cache_without_the_registry`` covers
+    ``scripts/**`` with a deliberately shape-agnostic key (any ``plugins/cache``
+    mention) for exactly this reason.
     """
     spans = {}
     for site in _SITES:
@@ -310,6 +348,107 @@ def test_no_cache_glob_lives_outside_an_extracted_resolver_block():
         + " — a resolver was added that is not one of the 68 canonical copies. "
         "Use FORM A/B/C verbatim; a hand-rolled or pre-#278 one-liner is "
         "invisible to every other test in this module."
+    )
+
+
+# Files under scripts/ whose ENTIRE job is validating what `/dev-test install`
+# wrote into the plugin cache. Resolving the checkout in these would defeat
+# them, so they are exempt by design, not by oversight. Each is asserted to
+# exist below, so a rename cannot leave a dead exemption behind that silently
+# widens as the path is reused.
+CACHE_ONLY_SCRIPTS = {
+    # Writes the cache; must find it the way Claude Code laid it out.
+    "scripts/test-dev-skill.sh",
+    # Assert on what the install put in the cache.
+    "scripts/dev-test/test-issue-101-manual.sh",
+    "scripts/dev-test/test-issue-105-manual.sh",
+    "scripts/dev-test/test-snapshots-manual.sh",
+    "scripts/dev-test/test-vault-doctor-snapshots-manual.sh",
+    # Manual checklists whose verification steps grep the INSTALLED tree.
+    "scripts/dev-test/DEV-TEST-ISSUE-105.md",
+    "scripts/dev-test/DEV-TEST-ISSUE-125.md",
+}
+
+
+def _scripts_files():
+    for dirpath, dirnames, filenames in os.walk(os.path.join(_REPO_ROOT, "scripts")):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for name in sorted(filenames):
+            yield os.path.join(dirpath, name)
+
+
+def test_cache_only_script_allowlist_has_no_dead_entries():
+    """An allowlist that outlives its files stops being an exemption and starts
+    being a hole: the next file to land on that path inherits the pass."""
+    missing = sorted(
+        p for p in CACHE_ONLY_SCRIPTS if not os.path.isfile(os.path.join(_REPO_ROOT, p))
+    )
+    assert not missing, (
+        "CACHE_ONLY_SCRIPTS names files that no longer exist: "
+        + ", ".join(missing)
+        + " — delete the entry or fix the path."
+    )
+
+
+def test_no_scripts_file_reaches_the_cache_without_the_registry():
+    """The 68 SKILL.md copies are pinned byte-for-byte; the ~13 copies under
+    ``scripts/`` cannot be, so this is the weaker invariant that still bites.
+
+    Byte identity is impossible there — different defaults, different path
+    indices ([-2] vs [-3] vs [-4]), Python and shell hosts — but the property
+    that matters survives: a file that reaches into the plugin cache must
+    consult the marketplace registry too, and the resolver-shaped references
+    must consult it FIRST. Without this, the argument that made 68 hand-copies
+    acceptable ("the mitigation is a drift test") simply did not extend to
+    them.
+
+    Two keys, deliberately different:
+
+    * **Presence** is keyed on any ``plugins/cache`` mention — shape-agnostic,
+      so it catches the ``find``/``ls -dt`` shapes that the literal-glob check
+      above cannot see.
+    * **Ordering** is keyed on the literal resolver glob
+      ``plugins/cache/*/obsidian-brain/``. The wildcard marketplace segment is
+      what makes a reference a *resolver* rather than a concrete path typed
+      into a manual `ls`, and only resolvers have an ordering to get wrong.
+    """
+    glob_key = "plugins/cache/*/obsidian-brain/"
+    missing_registry = []
+    cache_first = []
+    for path in _scripts_files():
+        rel = os.path.relpath(path, _REPO_ROOT).replace("\\", "/")
+        if rel in CACHE_ONLY_SCRIPTS:
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "plugins/cache" not in text:
+            continue
+        registry_at = text.find("known_marketplaces.json")
+        if registry_at < 0:
+            missing_registry.append(rel)
+            continue
+        # Offsets are accumulated rather than looked up with `text.index`:
+        # several of these files carry the identical glob line three times, and
+        # `index` would report the first one's offset for all three.
+        offset = 0
+        for lineno, line in enumerate(text.split("\n"), 1):
+            if glob_key in line and offset < registry_at:
+                cache_first.append(f"{rel}:{lineno}")
+            offset += len(line) + 1
+    assert not missing_registry, (
+        "scripts/ file(s) resolve the plugin cache with no marketplace lookup "
+        "at all: " + ", ".join(sorted(missing_registry)) + " — port FORM A/B/C "
+        "into them, or add them to CACHE_ONLY_SCRIPTS with a reason if their "
+        "entire job is validating what `/dev-test install` wrote into the cache."
+    )
+    assert not cache_first, (
+        "scripts/ file(s) glob the plugin cache BEFORE consulting "
+        "known_marketplaces.json: " + ", ".join(sorted(cache_first)) + " — "
+        "cache-first keeps serving the stale released tree whenever one "
+        "exists, which is the whole of #278."
     )
 
 
@@ -521,13 +660,39 @@ def _seed_cache(home, version, func):
     return str(base / "hooks")
 
 
-def _seed_install_location(home, func, *, with_doctor=True, key="user-chosen-name"):
-    """Register a directory-source marketplace whose installLocation holds a
-    real checkout, and return the path the resolver should produce.
+#: What a directory-source (local checkout) marketplace entry carries. The
+#: resolver keys on this and ONLY this: a github-source entry's clone root is
+#: also a full plugin tree for obsidian-brain (its marketplace.json declares
+#: `"source": "./"`, so the marketplace repo IS the plugin repo), which means
+#: the sentinel alone cannot tell the two apart. See
+#: ``test_a_github_source_install_falls_through_to_the_cache``.
+DIRECTORY_SOURCE = {"source": "directory", "path": "/irrelevant"}
+GITHUB_SOURCE = {"source": "github", "repo": "abhattacherjee/obsidian-brain"}
+
+#: Sentinel meaning "write no ``source`` key at all" — distinct from ``None``,
+#: which writes an explicit JSON ``null``. Both must be skipped, and a test
+#: that cannot tell them apart cannot pin either.
+OMIT_SOURCE = object()
+
+
+def _seed_install_location(
+    home,
+    func,
+    *,
+    with_doctor=True,
+    key="user-chosen-name",
+    source=DIRECTORY_SOURCE,
+):
+    """Register a marketplace whose installLocation holds a real checkout, and
+    return the path the resolver should produce for a directory-source entry.
 
     The registry key is deliberately NOT the plugin name: it is user-chosen
     (``obsidian-brain-repo`` on the author's machine), and a resolver that
     keyed off it would break for everyone else.
+
+    ``source`` defaults to a directory entry because that is the install shape
+    #278 exists to fix; pass ``GITHUB_SOURCE`` to build the shape that must be
+    REJECTED even though its tree satisfies the sentinel.
     """
     checkout = home / "checkout"
     (checkout / "hooks").mkdir(parents=True)
@@ -538,14 +703,37 @@ def _seed_install_location(home, func, *, with_doctor=True, key="user-chosen-nam
         expected = str(checkout / "scripts" / "vault_doctor.py")
         if with_doctor:
             (checkout / "scripts" / "vault_doctor.py").write_text("", encoding="utf-8")
+    entry = {"installLocation": str(checkout)}
+    if source is not OMIT_SOURCE:
+        entry["source"] = source
     (home / MARKETPLACES).write_text(
-        json.dumps({key: {"installLocation": str(checkout)}}), encoding="utf-8"
+        json.dumps({key: entry}), encoding="utf-8"
     )
     return expected
 
 
 def _default_for(func):
     return "" if func == "_ob_doctor" else "hooks"
+
+
+# Source-shape hazards, kept separate from MALFORMED_REGISTRIES because each of
+# these needs a REAL checkout behind its installLocation: with a dangling path
+# the sentinel would reject the entry anyway and the assertion would hold for
+# the wrong reason. `source` is third-party-controlled like every other key, so
+# a string/list/absent/odd value must `continue`, never raise — a raise inside
+# the shared `try` aborts iteration over every remaining entry (the C2 defect
+# arriving through a different key).
+NON_DIRECTORY_SOURCES = {
+    "github": GITHUB_SOURCE,
+    "local": {"source": "local"},
+    "source-is-a-bare-string": "directory",
+    "source-is-a-list": [],
+    "source-is-null": None,
+    "source-key-absent": OMIT_SOURCE,
+    "inner-source-key-absent": {"repo": "abhattacherjee/obsidian-brain"},
+    "inner-source-is-a-dict": {"source": {}},
+    "inner-source-differs-in-case": {"source": "Directory"},
+}
 
 
 # The seven sibling names from the plan's D2 table. Six are NOT canonical
@@ -649,22 +837,87 @@ def test_install_location_beats_a_newer_cache(text, func, fake_home):
 
 @pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
 def test_cache_is_used_when_no_marketplace_registry_exists(text, func, fake_home):
-    """github-source installs have no directory entry, so the marketplace loop
-    finds nothing and must fall through rather than blow up."""
+    """No registry file at all — the shape on CI, and on a machine with no
+    marketplaces installed. The loop must fall through rather than blow up.
+
+    This models "nothing installed", NOT "installed from github": a github
+    install DOES have a registry entry, with an absolute installLocation
+    pointing at the marketplace clone. That case is
+    ``test_a_github_source_install_falls_through_to_the_cache``.
+    """
     expected = _seed_cache(fake_home, "3.3.1", func)
     assert not (fake_home / MARKETPLACES).exists()
     assert _resolver(text, func)() == expected
 
 
 @pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
+def test_a_directory_source_install_beats_the_cache(text, func, fake_home):
+    """Half 1 of the discriminator pin: a *directory* entry whose tree carries
+    the sentinel wins over a newer cache. This is #278's whole point, and it is
+    stated as its own test so the pair below reads as a matched set."""
+    _seed_cache(fake_home, "9.9.9", func)
+    expected = _seed_install_location(fake_home, func, source=DIRECTORY_SOURCE)
+    assert _resolver(text, func)() == expected
+
+
+@pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
+def test_a_github_source_install_falls_through_to_the_cache(text, func, fake_home):
+    """Half 2, and the one the discriminator exists for.
+
+    obsidian-brain's ``.claude-plugin/marketplace.json`` declares
+    ``"source": "./"`` — the marketplace repo IS the plugin repo — so a
+    github-source install's clone under
+    ``~/.claude/plugins/marketplaces/<name>`` carries ``hooks/obsidian_utils.py``
+    at its root and satisfies the sentinel just as a local checkout does. The
+    fixture below is built that way deliberately: WITHOUT the ``source.source``
+    discriminator the resolver returns the clone, and external users — the
+    entire github-installed population — would load SKILL.md from the cache
+    (the installed version) while ``sys.path`` pointed at the marketplace
+    clone's default branch. ``/plugin marketplace update`` refreshes the clone
+    without touching the cache, so that skew is the NORMAL update path, not an
+    exotic one.
+
+    Cache must win. github installs keep the behaviour they had before #278.
+    """
+    expected = _seed_cache(fake_home, "3.3.1", func)
+    clone = _seed_install_location(fake_home, func, source=GITHUB_SOURCE)
+    assert os.path.isfile(
+        os.path.join(fake_home / "checkout", "hooks", "obsidian_utils.py")
+    ), "fixture must satisfy the sentinel, or it proves nothing"
+    assert _resolver(text, func)() == expected != clone
+
+
+@pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
+@pytest.mark.parametrize("shape", sorted(NON_DIRECTORY_SOURCES))
+def test_a_non_directory_source_falls_through_to_the_cache(
+    text, func, shape, fake_home
+):
+    """Every non-directory / malformed ``source`` shape is skipped, and none of
+    them raises. Each fixture's installLocation holds a REAL tree carrying the
+    sentinel, so falling through proves the discriminator did the work rather
+    than the sentinel."""
+    expected = _seed_cache(fake_home, "3.3.1", func)
+    _seed_install_location(fake_home, func, source=NON_DIRECTORY_SOURCES[shape])
+    assert _resolver(text, func)() == expected
+
+
+@pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
 def test_install_location_without_the_sentinel_falls_through(text, func, fake_home):
     """An installLocation pointing at some OTHER plugin's checkout must not
-    hijack resolution: no hooks/obsidian_utils.py, no match."""
+    hijack resolution: no hooks/obsidian_utils.py, no match.
+
+    The entry carries a valid directory ``source`` so the sentinel check is
+    what rejects it — otherwise the discriminator would skip it first and this
+    test would pass without ever reaching the guard it names.
+    """
     expected = _seed_cache(fake_home, "3.3.1", func)
     stranger = fake_home / "some-other-plugin"
     stranger.mkdir()
     (fake_home / MARKETPLACES).write_text(
-        json.dumps({"other": {"installLocation": str(stranger)}}), encoding="utf-8"
+        json.dumps(
+            {"other": {"source": DIRECTORY_SOURCE, "installLocation": str(stranger)}}
+        ),
+        encoding="utf-8",
     )
     assert _resolver(text, func)() == expected
 
@@ -679,6 +932,8 @@ def test_doctor_install_location_without_vault_doctor_falls_through(fake_home):
     assert _resolver(text, "_ob_doctor")() == expected
 
 
+_DIR = '"source": {"source": "directory"}'
+
 MALFORMED_REGISTRIES = {
     "not-json": "}{ not json at all",
     "empty-file": "",
@@ -686,11 +941,15 @@ MALFORMED_REGISTRIES = {
     "null-entry": '{"mp": null}',
     "entry-is-int": '{"mp": 7}',
     "entry-is-list": '{"mp": []}',
-    "missing-key": '{"mp": {}}',
-    "install-location-null": '{"mp": {"installLocation": null}}',
-    "install-location-int": '{"mp": {"installLocation": 3}}',
+    # These three carry a VALID directory source on purpose, so the guard they
+    # exercise is the installLocation validation itself. Without the source
+    # key the new `source.source` discriminator would skip them first and the
+    # inner guard would be shadowed — a test that can no longer fail for the
+    # reason its name gives.
+    "missing-key": "{" + '"mp": {' + _DIR + "}}",
+    "install-location-null": "{" + '"mp": {' + _DIR + ', "installLocation": null}}',
+    "install-location-int": "{" + '"mp": {' + _DIR + ', "installLocation": 3}}',
 }
-
 
 @pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
 @pytest.mark.parametrize("shape", sorted(MALFORMED_REGISTRIES))
@@ -724,14 +983,19 @@ def test_empty_install_location_falls_through_to_the_cache(
     The ``isabs`` guard in the resolver is what makes this pass. The
     cwd-on-a-checkout construction below is the whole point of the test: with
     a neutral cwd the assertion holds for the wrong reason (nothing matches
-    either way), and the regression walks straight back in.
+    either way), and the regression walks straight back in. For the same
+    reason the entry carries a valid directory ``source``: without it the new
+    discriminator would skip the entry first and the ``isabs`` guard would
+    never be reached.
     """
     cwd_checkout = tmp_path / "cwd-checkout"
     (cwd_checkout / "hooks").mkdir(parents=True)
     (cwd_checkout / "hooks" / "obsidian_utils.py").write_text("", encoding="utf-8")
     (cwd_checkout / "scripts").mkdir()
     (cwd_checkout / "scripts" / "vault_doctor.py").write_text("", encoding="utf-8")
-    (fake_home / MARKETPLACES).write_text('{"mp": {}}', encoding="utf-8")
+    (fake_home / MARKETPLACES).write_text(
+        json.dumps({"mp": {"source": DIRECTORY_SOURCE}}), encoding="utf-8"
+    )
     expected = _seed_cache(fake_home, "3.3.1", func)
 
     monkeypatch.chdir(cwd_checkout)
@@ -744,7 +1008,11 @@ def test_relative_install_location_falls_through_to_the_cache(
 ):
     """Same hazard, stated the other way: a RELATIVE ``installLocation`` is not
     usable either, because what it names depends on where the skill was
-    invoked from."""
+    invoked from.
+
+    Directory-source entry, again so the ``isabs`` guard is the one under
+    test rather than the discriminator standing in front of it.
+    """
     cwd_checkout = tmp_path / "cwd-checkout"
     (cwd_checkout / "relative-install" / "hooks").mkdir(parents=True)
     (cwd_checkout / "relative-install" / "hooks" / "obsidian_utils.py").write_text(
@@ -755,7 +1023,15 @@ def test_relative_install_location_falls_through_to_the_cache(
         "", encoding="utf-8"
     )
     (fake_home / MARKETPLACES).write_text(
-        json.dumps({"mp": {"installLocation": "relative-install"}}), encoding="utf-8"
+        json.dumps(
+            {
+                "mp": {
+                    "source": DIRECTORY_SOURCE,
+                    "installLocation": "relative-install",
+                }
+            }
+        ),
+        encoding="utf-8",
     )
     expected = _seed_cache(fake_home, "3.3.1", func)
 
@@ -769,13 +1045,34 @@ def test_relative_install_location_falls_through_to_the_cache(
 # whole registry". A real registry has one entry per installed marketplace (9
 # on the author's machine), in an order obsidian-brain does not control — so a
 # third-party entry sorted first must not be able to shadow ours.
+#
+# Two classes, and both are needed. The `dir-*` rows carry a valid directory
+# `source`, so the guard that must skip them is the installLocation validation
+# — those are the rows that keep `isabs`/`continue` honest now that the
+# `source.source` discriminator stands in front of it. The remaining rows have
+# a non-dict entry or a non-directory `source`, so the discriminator itself is
+# what must skip them without aborting the loop.
 MULTI_ENTRY_REGISTRIES = {
-    "bad-then-good": {"aaa-third-party": {"installLocation": None}},
+    "dir-null-location-then-good": {
+        "aaa-third-party": {"source": DIRECTORY_SOURCE, "installLocation": None}
+    },
+    "dir-no-location-then-good": {"aaa-third-party": {"source": DIRECTORY_SOURCE}},
+    "dir-relative-location-then-good": {
+        "aaa-third-party": {"source": DIRECTORY_SOURCE, "installLocation": "some/where"}
+    },
     "int-then-good": {"aaa-third-party": 7},
     "null-then-good": {"aaa-third-party": None},
     "list-then-good": {"aaa-third-party": []},
     "no-key-then-good": {"aaa-third-party": {}},
-    "relative-then-good": {"aaa-third-party": {"installLocation": "some/where"}},
+    "github-then-good": {
+        "aaa-third-party": {"source": GITHUB_SOURCE, "installLocation": "/abs/where"}
+    },
+    "string-source-then-good": {
+        "aaa-third-party": {"source": "directory", "installLocation": "/abs/where"}
+    },
+    "list-source-then-good": {
+        "aaa-third-party": {"source": [], "installLocation": "/abs/where"}
+    },
 }
 
 
@@ -789,10 +1086,11 @@ def test_a_bad_entry_does_not_shadow_a_later_good_one(
 
     With the whole ``for`` loop inside one ``try``, the first entry that raises
     (``os.path.join(None, "hooks")`` → TypeError, ``(7).get`` →
-    AttributeError) aborts iteration over every remaining entry and drops
-    straight to the cache — cache-first resolution restored silently, by
-    someone else's plugin, with no obsidian-brain misconfiguration involved.
-    That is this PR's own thesis failing.
+    AttributeError, ``"github".get("source")`` → AttributeError) aborts
+    iteration over every remaining entry and drops straight to the cache —
+    cache-first resolution restored silently, by someone else's plugin, with no
+    obsidian-brain misconfiguration involved. That is this PR's own thesis
+    failing.
     """
     _seed_cache(fake_home, "9.9.9", func)  # would win if the loop aborted
     expected = _seed_install_location(fake_home, func)
@@ -828,7 +1126,14 @@ def _probe_tree(tmp_path):
     cache.mkdir(parents=True)
     (cache / "obsidian_utils.py").write_text("", encoding="utf-8")
     (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(
-        json.dumps({"user-chosen-name": {"installLocation": str(checkout)}}),
+        json.dumps(
+            {
+                "user-chosen-name": {
+                    "source": DIRECTORY_SOURCE,
+                    "installLocation": str(checkout),
+                }
+            }
+        ),
         encoding="utf-8",
     )
     return home, checkout, cache
