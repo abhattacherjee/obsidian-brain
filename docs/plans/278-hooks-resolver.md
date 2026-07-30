@@ -120,14 +120,23 @@ Every functional assertion in Task 4 must be **fail-first proven** by this probe
 
 ## Tasks
 
-### Task 1 — canonical resolver, python-quoting form (48 sites)
+### Task 1 — canonical resolver, python-quoting form (58 sites)
 
 Define the two canonical forms. Apply form A (internal double quotes) to the
 `sys.path.insert` variants: 28 × `import glob, re; …`, 19 × `import re; …`,
 10 × `import sys, os, glob, re; …`, 1 × `import sys, json, os, glob, re; …`.
+28 + 19 + 10 + 1 = **58** (an earlier draft of this plan said 48 — arithmetic error,
+corrected here; 58 + 9 bash + 1 vault-doctor = the 68 skills-level total).
 
-Preserve each site's existing leading imports (they differ) — replace only the resolution
-expression. Every site ends up byte-identical from the resolver token onward.
+Form A is self-sufficient (it imports everything it uses), so replace the entire existing
+resolver line **including** its leading `import ...;` prefix rather than preserving it.
+Every site then ends up byte-identical.
+
+**Quoting is determined by the site's OUTER shell quote, not by the task split.** Two
+`check-items` sites are `python3 -c "…"` (outer double), so they must use *single* quotes
+internally while still ending in `sys.path.insert`. That is a third legal combination and
+is consistent with the stated invariant: the body is identical modulo quote character, and
+the last line is chosen by context. Task 4 must accept all three combinations, not two.
 
 ### Task 2 — bash-quoting form (9 sites)
 
@@ -151,8 +160,11 @@ the allowlisted cache. Do **not** reuse form A/B verbatim — different subdirec
 
 - Assert every in-scope site uses the canonical form **byte-identically**, with the site count
   asserted by **equality** against an independently derived count (`== 68`, never `>= 68`) so a
-  deleted site fails the test instead of silently passing.
-- Assert form B is exactly form A with quotes swapped.
+  deleted site fails the test instead of silently passing. Blocks are indented at their site, so
+  normalize by the block's own leading indent before comparing — comparing raw text produces
+  spurious families.
+- Assert the resolver **body** is identical across all three legal combinations modulo the quote
+  character: (double, `sys.path.insert`) ×56, (single, `sys.path.insert`) ×2, (single, `print`) ×9.
 - Unit-test the allowlist against **all seven** sibling names in the D2 table above, using the
   exact resolver expression — including the three that currently pass by ASCII accident.
 - Functional test via the `_probe_278.py` trigger: old resolver cannot see it, new one can.
