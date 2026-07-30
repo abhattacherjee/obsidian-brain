@@ -265,6 +265,26 @@ def test_note_writer_call_sites_guard_missing_cli():
                 f"Skill {skill_name} line {lineno + 1} resolves $HOOKS with a "
                 "lexicographic max() — use the version-aware sort key"
             )
+            # The line above is a NAMING check, and naming is not behaviour: a
+            # site rewritten back to cache-only globbing with the lambda's name
+            # left intact satisfied it (proved by mutation during #278 task 2 —
+            # all 91 tests still passed). These two are the semantic half.
+            # tests/test_hooks_resolver_drift.py enforces the same property
+            # over all 68 sites; this keeps it enforced at the note_writer call
+            # sites specifically, where the window is already in hand.
+            assert "known_marketplaces.json" in window, (
+                f"Skill {skill_name} line {lineno + 1} resolves $HOOKS from the "
+                "plugin cache only — it must consult the marketplace "
+                "installLocation first, or a directory-source install keeps "
+                "importing the stale released tree (#278)"
+            )
+            assert window.index("known_marketplaces.json") < window.index(
+                "plugins/cache/"
+            ), (
+                f"Skill {skill_name} line {lineno + 1} consults the plugin cache "
+                "before installLocation; cache-first still serves the stale "
+                "module whenever one exists (#278)"
+            )
 
 
 def test_only_standup_passes_overwrite():

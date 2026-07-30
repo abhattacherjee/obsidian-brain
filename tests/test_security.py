@@ -1,7 +1,9 @@
 """Security hardening tests for obsidian-brain."""
 import ast
+import glob
 import json
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -274,6 +276,12 @@ class TestStdinCap:
     under hooks/ and scripts/, resolves each read's bound through named
     constants and simple arithmetic, and fails on any read it cannot prove is
     bounded. A new uncapped entry point fails immediately, wherever it lands.
+
+    It also walks the tree the SKILL.md blocks ACTUALLY resolve (#278). The
+    repo-only walk has a blind spot with teeth: skills do not import from the
+    checkout, they import from whatever ``_ob_hooks()`` returns, and the cached
+    ``deep_cli.py`` could sit there with #275's ``_read_stdin_capped`` reverted
+    while this guard stayed green against a repo that had the fix.
     """
 
     CAP = 1_000_000
@@ -282,11 +290,57 @@ class TestStdinCap:
     MAX_ALLOWED = CAP + 1
 
     @staticmethod
-    def _source_modules():
+    def _skill_resolved_install_root():
+        """The install root the canonical #278 resolver lands on, or None.
+
+        Mirrors the resolver copied into all 68 SKILL.md sites — marketplace
+        ``installLocation`` first, allowlist-filtered cache glob as fallback.
+        Byte-identity of those copies is enforced by
+        tests/test_hooks_resolver_drift.py; what matters here is only WHERE
+        they point.
+
+        Returns None when nothing resolves — which is the normal state on CI
+        (no registry, no cache), so this extension is a no-op there rather than
+        a failure.
+        """
+        try:
+            registry = os.path.expanduser("~/.claude/plugins/known_marketplaces.json")
+            with open(registry, encoding="utf-8") as f:
+                for entry in json.load(f).values():
+                    location = (entry or {}).get("installLocation", "")
+                    hooks = os.path.join(location, "hooks")
+                    if os.path.isfile(os.path.join(hooks, "obsidian_utils.py")):
+                        return Path(location)
+        except Exception:
+            pass
+        cached = [
+            d
+            for d in glob.glob(
+                os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")
+            )
+            if re.fullmatch("[0-9]+([.][0-9]+)*", d.split("/")[-2])
+        ]
+        best = max(
+            cached,
+            key=lambda p: ([int(n) for n in p.split("/")[-2].split(".")], p),
+            default=None,
+        )
+        return Path(best).parent if best else None
+
+    @classmethod
+    def _source_modules(cls):
         roots = [
             *sorted(Path("hooks").glob("*.py")),
             *sorted(Path("scripts").rglob("*.py")),
         ]
+        resolved = cls._skill_resolved_install_root()
+        if resolved is not None and resolved.is_dir():
+            # Skip when the resolver points back at this checkout (the normal
+            # case for a directory-source install) — the repo walk above
+            # already covers it, and scanning it twice only doubles offenders.
+            if resolved.resolve() != Path(".").resolve():
+                roots += sorted((resolved / "hooks").glob("*.py"))
+                roots += sorted((resolved / "scripts").rglob("*.py"))
         return [p for p in roots if p.is_file()]
 
     # Attributes that CONSUME the stream. `read`/`read1`/`readline` take a
@@ -439,6 +493,43 @@ class TestStdinCap:
         ):
             assert expected in paths, f"stdin read in {expected} no longer discovered"
         assert len(self._all_stdin_reads()) >= 8
+
+    def test_scan_reaches_the_tree_the_skills_actually_resolve(
+        self, tmp_path, monkeypatch
+    ):
+        """#278: the walk must follow the resolver, not just the checkout.
+
+        Hermetic — a fake install under tmp_path with $HOME redirected, so this
+        behaves identically on CI, where neither a registry nor a cache exists.
+        The uncapped ``sys.stdin.read()`` planted below stands in for the real
+        hazard: a released ``deep_cli.py`` sitting in the resolved tree with
+        #275's cap reverted, invisible to a repo-only scan.
+        """
+        install = tmp_path / "resolved-install"
+        (install / "hooks").mkdir(parents=True)
+        (install / "hooks" / "obsidian_utils.py").write_text("", encoding="utf-8")
+        (install / "hooks" / "stale_cli.py").write_text(
+            "import sys\npayload = sys.stdin.read()\n", encoding="utf-8"
+        )
+        home = tmp_path / "home"
+        (home / ".claude" / "plugins").mkdir(parents=True)
+        (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(
+            json.dumps({"user-chosen-name": {"installLocation": str(install)}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("USERPROFILE", raising=False)
+
+        assert self._skill_resolved_install_root() == install
+        offenders = [
+            path for path, _, _, _ in self._all_stdin_reads() if "stale_cli" in path
+        ]
+        assert offenders, (
+            "the stdin-cap scan did not follow the resolver into the install "
+            "tree — a stale released module can revert its cap unnoticed"
+        )
+        with pytest.raises(AssertionError, match="Uncapped or over-cap stdin read"):
+            self.test_every_stdin_read_is_capped()
 
 
 class TestFilePermissions:
