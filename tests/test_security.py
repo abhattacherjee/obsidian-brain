@@ -1,6 +1,9 @@
 """Security hardening tests for obsidian-brain."""
+import ast
+import glob
 import json
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -260,18 +263,445 @@ class TestShellInjectionFix:
 
 
 class TestStdinCap:
-    """M6: All hook entry points cap stdin.read()."""
+    """M6: EVERY entry point that reads stdin caps the read.
 
-    @pytest.mark.parametrize("hook_file", [
-        "hooks/obsidian_session_log.py",
-        "hooks/obsidian_session_hint.py",
-        "hooks/obsidian_context_snapshot.py",
-    ])
-    def test_stdin_capped(self, hook_file):
-        with open(hook_file) as f:
-            src = f.read()
-        assert "read(1_000_000)" in src or "read(1000000)" in src, \
-            f"stdin not capped in {hook_file}"
+    This used to be a hardcoded list of three hook files checking for the
+    literal ``read(1_000_000)``. That is the shape of check that goes quietly
+    out of date: when ``hooks/note_writer.py`` was added with its own stdin
+    read, nothing here failed — the new entry point was simply not in the
+    list, and it reads ``STDIN_CAP_CHARS + 1`` rather than the literal, so
+    even adding it to the list would not have matched (#275).
+
+    The version below DISCOVERS stdin reads by parsing the AST of every module
+    under hooks/ and scripts/, resolves each read's bound through named
+    constants and simple arithmetic, and fails on any read it cannot prove is
+    bounded. A new uncapped entry point fails immediately, wherever it lands.
+
+    It also walks the tree the SKILL.md blocks ACTUALLY resolve (#278). The
+    repo-only walk has a blind spot with teeth: skills do not import from the
+    checkout, they import from whatever ``_ob_hooks()`` returns, and the cached
+    ``deep_cli.py`` could sit there with #275's ``_read_stdin_capped`` reverted
+    while this guard stayed green against a repo that had the fix.
+    """
+
+    CAP = 1_000_000
+    # `read(CAP + 1)` is the documented overflow-detection idiom (note_writer),
+    # so the bound may exceed CAP by exactly one.
+    MAX_ALLOWED = CAP + 1
+
+    @staticmethod
+    def _skill_resolved_install_root():
+        """The install root the canonical #278 resolver lands on, or None.
+
+        Mirrors the resolver copied into all 68 SKILL.md sites — marketplace
+        ``installLocation`` first, allowlist-filtered cache glob as fallback.
+        Byte-identity of those copies is enforced by
+        tests/test_hooks_resolver_drift.py; what matters here is only WHERE
+        they point.
+
+        Returns None when nothing resolves — which is the normal state on CI
+        (no registry, no cache), so this extension is a no-op there rather than
+        a failure.
+        """
+        try:
+            registry = os.path.expanduser("~/.claude/plugins/known_marketplaces.json")
+            with open(registry, encoding="utf-8") as f:
+                for entry in json.load(f).values():
+                    # Directory-source entries only. obsidian-brain's
+                    # marketplace.json declares `"source": "./"`, so a
+                    # github-source marketplace CLONE also carries
+                    # hooks/obsidian_utils.py and would satisfy the sentinel
+                    # below — the discriminator is what keeps github installs
+                    # resolving the cache. Shape-tolerant on purpose: a string
+                    # or list `source` must `continue`, never raise, or one
+                    # third-party entry aborts iteration over the rest.
+                    source = entry.get("source") if isinstance(entry, dict) else None
+                    if not (
+                        isinstance(source, dict) and source.get("source") == "directory"
+                    ):
+                        continue
+                    # `continue`, not a bare read: one malformed third-party
+                    # entry ordered ahead of obsidian-brain's must not abort
+                    # iteration. `isabs` because a relative location would make
+                    # the sentinel cwd-dependent. Kept in lockstep with the
+                    # canonical forms in tests/test_hooks_resolver_drift.py.
+                    location = (
+                        entry.get("installLocation")
+                        if isinstance(entry, dict)
+                        else None
+                    )
+                    if not (isinstance(location, str) and os.path.isabs(location)):
+                        continue
+                    hooks = os.path.join(location, "hooks")
+                    if os.path.isfile(os.path.join(hooks, "obsidian_utils.py")):
+                        return Path(location)
+        except Exception:
+            pass
+        cached = [
+            d
+            for d in glob.glob(
+                os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")
+            )
+            if re.fullmatch("[0-9]+([.][0-9]+)*", d.split("/")[-2])
+        ]
+        best = max(
+            cached,
+            key=lambda p: ([int(n) for n in p.split("/")[-2].split(".")], p),
+            default=None,
+        )
+        return Path(best).parent if best else None
+
+    @classmethod
+    def _source_modules(cls):
+        roots = [
+            *sorted(Path("hooks").glob("*.py")),
+            *sorted(Path("scripts").rglob("*.py")),
+        ]
+        # OPT-IN, not automatic. Scanning the resolved tree means asserting on
+        # code that is not in this checkout: a contributor whose install
+        # resolves the released 3.3.0 or 3.2.2 cache gets a RED suite on a
+        # clean `develop`, naming three files they cannot fix from their tree
+        # (deep_cli.py x2, vault_doctor.py). CI never sees it — no registry, no
+        # cache — so the failure lands only on developer machines. Set
+        # OB_SCAN_RESOLVED_INSTALL=1 to audit the tree the skills really load.
+        resolved = cls._skill_resolved_install_root()
+        if (
+            os.environ.get("OB_SCAN_RESOLVED_INSTALL") == "1"
+            and resolved is not None
+            and resolved.is_dir()
+        ):
+            # Skip when the resolver points back at this checkout (the normal
+            # case for a directory-source install) — the repo walk above
+            # already covers it, and scanning it twice only doubles offenders.
+            if resolved.resolve() != Path(".").resolve():
+                roots += sorted((resolved / "hooks").glob("*.py"))
+                roots += sorted((resolved / "scripts").rglob("*.py"))
+        return [p for p in roots if p.is_file()]
+
+    # Attributes that CONSUME the stream. `read`/`read1`/`readline` take a
+    # size; `readlines`' argument is a hint, not a bound, so it is always
+    # unbounded. Non-consuming attributes (isatty, fileno, encoding) are
+    # deliberately absent — they must not be flagged.
+    SIZED_READS = ("read", "read1", "readline")
+    UNSIZED_READS = ("readlines",)
+
+    @staticmethod
+    def _is_stdin_expr(node, aliases):
+        """True if ``node`` evaluates to stdin — ``sys.stdin``, a bare
+        ``stdin`` imported from sys, ``sys.stdin.buffer``, or a local alias
+        bound to one of those."""
+        if isinstance(node, ast.Attribute) and node.attr == "buffer":
+            node = node.value
+        if isinstance(node, ast.Attribute):
+            return node.attr == "stdin"
+        return isinstance(node, ast.Name) and node.id in aliases
+
+    @classmethod
+    def _stdin_aliases(cls, tree):
+        """Names bound to stdin: ``stdin`` itself (``from sys import stdin``)
+        plus any ``f = sys.stdin``. Without this, ``f = sys.stdin; f.read()``
+        walks straight past the guard."""
+        aliases = {"stdin"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and cls._is_stdin_expr(node.value, aliases):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        aliases.add(target.id)
+        return aliases
+
+    @classmethod
+    def _consumption_sites(cls, tree, aliases):
+        """Yield ``(node, size_arg_or_None, kind)`` for every construct that
+        drains stdin.
+
+        Four shapes, all of which evaded the original `.read`-attribute-only
+        check and one of which was LIVE in the tree (``json.load(sys.stdin)``
+        at two deep_cli entry points, both reachable from skills):
+
+        1. ``stdin.read(...)`` / ``read1`` / ``readline``  — sized, resolve it
+        2. ``stdin.readlines()``                            — hint, not a bound
+        3. ``stdin`` passed as an ARGUMENT to any call      — e.g. json.load,
+           io.TextIOWrapper: the callee reads to EOF and no size is visible
+        4. iteration — ``for line in stdin`` / comprehensions
+        """
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and cls._is_stdin_expr(
+                    node.func.value, aliases
+                ):
+                    if node.func.attr in cls.SIZED_READS:
+                        yield node, (node.args[0] if node.args else None), node.func.attr
+                    elif node.func.attr in cls.UNSIZED_READS:
+                        yield node, None, node.func.attr
+                    continue
+                # stdin handed to something else to drain (json.load(sys.stdin))
+                for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                    if cls._is_stdin_expr(arg, aliases):
+                        yield node, None, "passed-to-call"
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                if cls._is_stdin_expr(node.iter, aliases):
+                    yield node, None, "iteration"
+            elif isinstance(node, ast.comprehension):
+                if cls._is_stdin_expr(node.iter, aliases):
+                    yield node, None, "iteration"
+
+    @staticmethod
+    def _int_constants(tree):
+        """``{NAME: value}`` for every unambiguous ``NAME = <int>`` binding.
+
+        A name bound more than once is deliberately EXCLUDED rather than
+        resolved last-write-wins: this walk flattens every scope in the module
+        into one namespace, so a function-local ``CAP = 500`` and a
+        module-level ``CAP = 10**9`` would otherwise collapse into whichever
+        the walk happened to reach last — and half of those guesses resolve a
+        read to a bound it does not actually have. Unresolvable is the safe
+        answer: it reports the site as an offender rather than passing it.
+        """
+        seen = {}
+        ambiguous = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                if isinstance(node.value.value, int):
+                    for target in node.targets:
+                        if not isinstance(target, ast.Name):
+                            continue
+                        if target.id in seen and seen[target.id] != node.value.value:
+                            ambiguous.add(target.id)
+                        seen[target.id] = node.value.value
+        return {k: v for k, v in seen.items() if k not in ambiguous}
+
+    @classmethod
+    def _resolve_bound(cls, arg, consts):
+        """Static value of a read()'s size argument, or None if unresolvable."""
+        if arg is None:
+            return None
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
+            return arg.value
+        if isinstance(arg, ast.Name):
+            return consts.get(arg.id)
+        if isinstance(arg, ast.BinOp) and isinstance(arg.op, (ast.Add, ast.Sub)):
+            left = cls._resolve_bound(arg.left, consts)
+            right = cls._resolve_bound(arg.right, consts)
+            if left is None or right is None:
+                return None
+            return left + right if isinstance(arg.op, ast.Add) else left - right
+        return None
+
+    @classmethod
+    def _all_stdin_reads(cls):
+        """``[(path, lineno, bound_or_None, kind)]`` for the whole codebase."""
+        found = []
+        for path in cls._source_modules():
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            consts = cls._int_constants(tree)
+            aliases = cls._stdin_aliases(tree)
+            for node, size_arg, kind in cls._consumption_sites(tree, aliases):
+                bound = cls._resolve_bound(size_arg, consts) if size_arg else None
+                found.append((str(path), node.lineno, bound, kind))
+        return found
+
+    def test_every_stdin_read_is_capped(self):
+        offenders = [
+            f"{path}:{lineno} ({kind}, "
+            + ("no resolvable bound" if bound is None else f"bound={bound}")
+            + ")"
+            for path, lineno, bound, kind in self._all_stdin_reads()
+            if bound is None or bound > self.MAX_ALLOWED
+        ]
+        assert not offenders, (
+            "Uncapped or over-cap stdin read(s): " + ", ".join(offenders)
+            + f". Cap reads at {self.CAP} characters (project CLAUDE.md security "
+            "pattern); read(CAP + 1) is allowed for overflow detection."
+        )
+
+    def test_discovery_finds_the_known_entry_points(self):
+        """Guards the guard: if the AST walk ever stops finding reads, the
+        check above would pass vacuously. These are the entry points that read
+        stdin today — including the two the old hardcoded list missed."""
+        paths = {path for path, _, _, _ in self._all_stdin_reads()}
+        for expected in (
+            "hooks/obsidian_session_log.py",
+            "hooks/obsidian_session_hint.py",
+            "hooks/obsidian_context_snapshot.py",
+            "hooks/note_writer.py",
+            "hooks/check_items_cli.py",
+        ):
+            assert expected in paths, f"stdin read in {expected} no longer discovered"
+        assert len(self._all_stdin_reads()) >= 8
+
+    def test_scan_reaches_the_tree_the_skills_actually_resolve(
+        self, tmp_path, monkeypatch
+    ):
+        """#278: the walk must follow the resolver, not just the checkout.
+
+        Hermetic — a fake install under tmp_path with $HOME redirected, so this
+        behaves identically on CI, where neither a registry nor a cache exists.
+        The uncapped ``sys.stdin.read()`` planted below stands in for the real
+        hazard: a released ``deep_cli.py`` sitting in the resolved tree with
+        #275's cap reverted, invisible to a repo-only scan.
+
+        ``OB_SCAN_RESOLVED_INSTALL`` is set here because the extension is
+        opt-in for everyone else (see ``_source_modules``). Setting it inside
+        a hermetic fixture keeps this test proving the walking logic works
+        without exporting a real machine's cache into the assertion.
+        """
+        install = tmp_path / "resolved-install"
+        (install / "hooks").mkdir(parents=True)
+        (install / "hooks" / "obsidian_utils.py").write_text("", encoding="utf-8")
+        (install / "hooks" / "stale_cli.py").write_text(
+            "import sys\npayload = sys.stdin.read()\n", encoding="utf-8"
+        )
+        home = tmp_path / "home"
+        (home / ".claude" / "plugins").mkdir(parents=True)
+        (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(
+            json.dumps(
+                {
+                    "user-chosen-name": {
+                        "source": {"source": "directory", "path": str(install)},
+                        "installLocation": str(install),
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        monkeypatch.setenv("OB_SCAN_RESOLVED_INSTALL", "1")
+
+        assert self._skill_resolved_install_root() == install
+        offenders = [
+            path for path, _, _, _ in self._all_stdin_reads() if "stale_cli" in path
+        ]
+        assert offenders, (
+            "the stdin-cap scan did not follow the resolver into the install "
+            "tree — a stale released module can revert its cap unnoticed"
+        )
+        with pytest.raises(AssertionError, match="Uncapped or over-cap stdin read"):
+            self.test_every_stdin_read_is_capped()
+
+    # --- parity with the canonical resolver -------------------------------
+    #
+    # _skill_resolved_install_root is a MIRROR of the resolver copied into the
+    # 68 SKILL.md sites, and a mirror that can drift is worth little: a
+    # mutation that reverted the entry validation below left the whole security
+    # module green. tests/test_hooks_resolver_drift.py pins the 68 copies to
+    # each other; these two pin this copy to the same semantics, behaviourally
+    # rather than by comparing text.
+
+    #: A directory-source marketplace entry's ``source`` block. The resolver
+    #: keys on this: obsidian-brain's marketplace.json says ``"source": "./"``,
+    #: so a github clone is also a full plugin tree and the sentinel alone
+    #: cannot tell the two apart.
+    DIRECTORY_SOURCE = {"source": "directory", "path": "/irrelevant"}
+
+    @staticmethod
+    def _registry(home, entries):
+        (home / ".claude" / "plugins").mkdir(parents=True, exist_ok=True)
+        (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(
+            json.dumps(entries), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _install(root):
+        (root / "hooks").mkdir(parents=True)
+        (root / "hooks" / "obsidian_utils.py").write_text("", encoding="utf-8")
+        return root
+
+    def test_mirror_skips_a_bad_entry_and_keeps_looking(self, tmp_path, monkeypatch):
+        """A malformed third-party entry ordered first must not abort the loop
+        (json.load preserves insertion order, so ``aaa-`` is iterated first).
+
+        The bad entry carries a valid directory ``source`` so it reaches the
+        installLocation guard: without it the discriminator would skip it
+        first and this would stop testing what its name says.
+        """
+        install = self._install(tmp_path / "checkout")
+        home = tmp_path / "home"
+        self._registry(
+            home,
+            {
+                "aaa-third-party": {
+                    "source": self.DIRECTORY_SOURCE,
+                    "installLocation": None,
+                },
+                "user-chosen-name": {
+                    "source": self.DIRECTORY_SOURCE,
+                    "installLocation": str(install),
+                },
+            },
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        assert self._skill_resolved_install_root() == install
+
+    def test_mirror_ignores_a_cwd_relative_install_location(
+        self, tmp_path, monkeypatch
+    ):
+        """A relative installLocation must be skipped, not resolved against
+        whatever directory pytest happens to be running in."""
+        cwd = tmp_path / "cwd"
+        self._install(cwd / "relative-install")
+        home = tmp_path / "home"
+        self._registry(
+            home,
+            {
+                "mp": {
+                    "source": self.DIRECTORY_SOURCE,
+                    "installLocation": "relative-install",
+                }
+            },
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        monkeypatch.chdir(cwd)
+        assert self._skill_resolved_install_root() is None
+
+    def test_mirror_ignores_a_github_source_marketplace_clone(
+        self, tmp_path, monkeypatch
+    ):
+        """Third parity property, and the one #278's final review added.
+
+        A github-source marketplace clone satisfies the sentinel too (the
+        marketplace repo IS the plugin repo), so without the ``source.source``
+        discriminator this mirror would drift from the 68 SKILL.md copies the
+        moment they gained it — and a mirror that can drift is worth little.
+        """
+        clone = self._install(tmp_path / "marketplace-clone")
+        home = tmp_path / "home"
+        self._registry(
+            home,
+            {
+                "mp": {
+                    "source": {"source": "github", "repo": "a/obsidian-brain"},
+                    "installLocation": str(clone),
+                }
+            },
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        assert self._skill_resolved_install_root() is None
+
+    def test_mirror_does_not_raise_on_a_non_dict_source(self, tmp_path, monkeypatch):
+        """A string/list ``source`` must ``continue``, not raise: the whole
+        loop shares one ``try``, so a raise on entry 1 skips entries 2..N."""
+        install = self._install(tmp_path / "checkout")
+        home = tmp_path / "home"
+        self._registry(
+            home,
+            {
+                "aaa-third-party": {
+                    "source": "directory",
+                    "installLocation": str(tmp_path / "nowhere"),
+                },
+                "user-chosen-name": {
+                    "source": self.DIRECTORY_SOURCE,
+                    "installLocation": str(install),
+                },
+            },
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        assert self._skill_resolved_install_root() == install
 
 
 class TestFilePermissions:

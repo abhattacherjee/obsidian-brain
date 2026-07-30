@@ -25,7 +25,24 @@ Check for existing config:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from obsidian_utils import load_config
 c = load_config()
 vp = c.get("vault_path", "")
@@ -525,7 +542,24 @@ Build (or rebuild) the SQLite FTS5 index for fast vault search and context-drive
 ```bash
 python3 -c '
 import sys, os, json, glob
-sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from vault_index import rebuild_index
 counts = rebuild_index(sys.argv[1], [sys.argv[2], sys.argv[3]])
 print(json.dumps(counts))
@@ -548,7 +582,24 @@ Phase 2 theme clustering can use `numpy` (vectorized TF-IDF) and `scipy` (agglom
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os, json
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from obsidian_utils import check_optional_deps, load_config
 cfg = load_config()
 status = check_optional_deps()
@@ -588,7 +639,24 @@ Parse each line as `KEY=VALUE`.
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os, json, tempfile
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from pathlib import Path
 
 cfg_path = Path.home() / ".claude" / "obsidian-brain-config.json"

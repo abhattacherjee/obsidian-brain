@@ -29,7 +29,24 @@ Run:
 ```bash
 python3 -c '
 import sys, os, glob
-sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
@@ -66,7 +83,24 @@ Run, passing the config values and `FULL_MODE` as command-line arguments:
 ```bash
 python3 -c '
 import sys, os, glob, time, json
-sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from vault_index import rebuild_index
 t0 = time.time()
 full = sys.argv[4].lower() == "true"
@@ -92,7 +126,10 @@ Stop here on failure.
 Parse the JSON output from Step 3. Extract:
 
 - `inserted` — total notes indexed
-- `skipped` — files without valid frontmatter
+- `skipped` — sum of `unchanged` + `malformed` (kept for backward compatibility; do not report this alone — it conflates a healthy outcome with a real one)
+- `unchanged` — notes whose mtime matched the index; nothing to do, the healthy common case
+- `malformed` — notes whose frontmatter failed to parse (true total, not capped): dropped from the index if never indexed before, or, if already indexed, left at its last-good indexed content
+- `malformed_files` — list of `{"file": <sanitized basename>, "reason": <classifier>}`, capped (currently 20 entries) even when `malformed` is larger
 - `elapsed` — time in seconds
 - `by_type` — dict mapping note type to count
 - `mode` — `"preserve"` or `"full"`
@@ -109,9 +146,19 @@ Present this report:
 > | claude-insight | `<count>` |
 > | ... | ... |
 >
-> Skipped: `<skipped>` file(s) without frontmatter.
+> Unchanged: `<unchanged>` file(s) already indexed (nothing to do). Malformed: `<malformed>` file(s) with frontmatter that failed to parse.
 
 Only include rows in the table for types that appear in `by_type` (omit zero-count types). Sort rows by count descending.
+
+**If `malformed` is greater than 0**, list the named files so the user can act:
+
+> **Malformed files:**
+> - `<file>` — `<reason>`
+> - ...
+
+List every entry in `malformed_files`. If `malformed` exceeds the length of `malformed_files` (the report is capped), append, using the actual number of entries you just listed rather than a hardcoded number:
+
+> Showing the first `<len(malformed_files)>` of `<malformed>` malformed file(s); re-run after fixing these to surface the rest.
 
 **Additional section — non-destructive mode only:**
 

@@ -121,8 +121,24 @@ else
             touch "$TEST_NOTE"
             # Run ensure_index via Python
             python3 -c "
-import sys, os, glob
-sys.path.insert(0, max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), default='hooks'))
+import sys, os, glob, json, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+sys.path.insert(0, _ob_hooks())
 from obsidian_utils import load_config
 from vault_index import ensure_index
 c = load_config()
@@ -149,9 +165,34 @@ echo ""
 # ─── Test 5: SKILL.md has IMPORTANCE prompt ───────────
 echo "Test 5: IMPORTANCE in SKILL.md"
 
-SKILL_PATH=$(find ~/.claude/plugins/cache -path "*/obsidian-brain/*/skills/recall/SKILL.md" -not -path "*.bak*" 2>/dev/null | sort -V | tail -1)
+# Canonical obsidian-brain skill-file resolver (#278), adapted to return
+# skills/recall/SKILL.md: marketplace-registered install location first
+# (sentinel = hooks/obsidian_utils.py), allowlisted-and-version-sorted cache
+# fallback otherwise.
+SKILL_PATH=$(python3 -c "
+import glob, json, os, re
+def _ob_skill():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                _s = os.path.join(os.path.dirname(_h), 'skills', 'recall', 'SKILL.md')
+                if os.path.isfile(_s):
+                    return _s
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/skills/recall/SKILL.md')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-4])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-4].split('.')], _p), default='')
+print(_ob_skill())
+")
 if [ -z "$SKILL_PATH" ]; then
-    fail "recall SKILL.md not found in plugin cache"
+    fail "recall SKILL.md not found in the resolved install (checked the marketplace-registered directory-source install location, then the plugin cache)"
 else
     IMP_COUNT=$(grep -c "IMPORTANCE" "$SKILL_PATH" 2>/dev/null || echo "0")
     if [ "$IMP_COUNT" -ge 2 ]; then
@@ -166,17 +207,38 @@ echo ""
 # ─── Test 6: stderr logging (non-destructive) ────────
 echo "Test 6: stderr logging on bad DB"
 
-HOOKS_PATH=$(find ~/.claude/plugins/cache -path "*/obsidian-brain/*/hooks" -type d -not -path "*.bak*" 2>/dev/null | sort -V | tail -1)
+# Canonical obsidian-brain hooks resolver (#278): marketplace-registered
+# install location first, allowlisted-and-version-sorted cache fallback.
+HOOKS_PATH=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='')
+print(_ob_hooks())
+")
 if [ -z "$HOOKS_PATH" ]; then
     HOOKS_PATH="hooks"
 fi
 
 STDERR_OUTPUT=$(python3 -c "
 import sys, os
-sys.path.insert(0, '$HOOKS_PATH')
+sys.path.insert(0, sys.argv[1])
 import vault_index
 vault_index.log_access('/tmp/nonexistent-dir-phase1-test/fake.db', '/test', 'test')
-" 2>&1 || true)
+" "$HOOKS_PATH" 2>&1 || true)
 
 if echo "$STDERR_OUTPUT" | grep -q "vault-index.*log_access failed"; then
     pass "log_access logs to stderr on bad DB"
@@ -186,11 +248,11 @@ fi
 
 STDERR_OUTPUT2=$(python3 -c "
 import sys, os
-sys.path.insert(0, '$HOOKS_PATH')
+sys.path.insert(0, sys.argv[1])
 import vault_index
 result = vault_index.batch_activations('/tmp/nonexistent-dir-phase1-test/fake.db', ['/test'])
 print(result, file=sys.stderr)
-" 2>&1 || true)
+" "$HOOKS_PATH" 2>&1 || true)
 
 if echo "$STDERR_OUTPUT2" | grep -q "0.0"; then
     pass "batch_activations returns 0.0 on bad DB"

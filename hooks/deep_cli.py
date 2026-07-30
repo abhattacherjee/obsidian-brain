@@ -20,6 +20,33 @@ from open_item_dedup import (
 # Matches an UNCHECKED markdown checkbox line with non-empty item text.
 _UNCHECKED_CHECKBOX_RE = re.compile(r"^\s*-\s+\[ \]\s+\S")
 
+# Counts CHARACTERS, not bytes -- same constant and same policy as
+# hooks/note_writer.py and hooks/check_items_cli.py (#275).
+STDIN_CAP_CHARS = 1_000_000
+
+
+def _read_stdin_capped() -> str:
+    """Read stdin with the project cap, rejecting oversize input.
+
+    Two entry points in this module previously read stdin with an UNBOUNDED
+    ``json.load(...)``, which consumes the stream to EOF; the other two used
+    the capped ``read()`` idiom. Both unbounded ones are reachable from skill
+    invocations, so all four now route through this one capped reader.
+
+    Rejects rather than truncates: a truncated JSON payload would fail to
+    parse anyway, but with a confusing decode error instead of a statement
+    about the cap.
+    """
+    text = sys.stdin.read(STDIN_CAP_CHARS + 1)
+    if len(text) > STDIN_CAP_CHARS:
+        print(
+            f"[obsidian-brain] stdin exceeds the {STDIN_CAP_CHARS}-character cap; "
+            "nothing processed",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return text
+
 
 def _is_checkbox_flip(old_text: str, new_text: str) -> bool:
     """True iff (old_text -> new_text) is a pure unchecked->checked checkbox flip.
@@ -41,7 +68,7 @@ def run_pipeline(vault_path: str, sessions_folder: str, insights_folder: str) ->
     Reads ``{"basenames": [...], "projects": [...]}`` from stdin.
     Prints status line: ``OK:<n>:<g>:<e>`` or ``CACHED:<n>:<g>:<e>``.
     """
-    data = json.load(sys.stdin)
+    data = json.loads(_read_stdin_capped())
     basenames = data["basenames"]
     projects_json = json.dumps(data["projects"])
 
@@ -99,7 +126,7 @@ def run_present(vault_path: str, sessions_folder: str, insights_folder: str) -> 
     Reads basenames JSON array from stdin.
     Prints formatted markdown output.
     """
-    basenames_json = sys.stdin.read(1_000_000)
+    basenames_json = _read_stdin_capped()
     output = build_deep_presentation(
         os.path.expanduser("~/.claude/obsidian-brain/deep-pipeline.json"),
         os.path.expanduser("~/.claude/obsidian-brain/deep-classifications.json"),
@@ -156,7 +183,7 @@ def run_batch_edit() -> None:
     c = load_config()
     vault_root = os.path.realpath(c["vault_path"])
 
-    edits = json.load(sys.stdin)
+    edits = json.loads(_read_stdin_capped())
     success = 0
     acted_texts: set[str] = set()
     skipped_checkoffs: list[str] = []
@@ -269,7 +296,7 @@ def run_build_checkoffs() -> None:
     sessions_folder = c.get("sessions_folder", "claude-sessions")
     insights_folder = c.get("insights_folder", "claude-insights")
 
-    raw = sys.stdin.read(1_000_000)
+    raw = _read_stdin_capped()
     items = json.loads(raw) if raw.strip() else []
 
     edits: list[list[str]] = []

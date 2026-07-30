@@ -38,6 +38,7 @@ from themes import (  # noqa: F401  (re-export shim)
     _NEGATION_TERMS,
     _THEME_SIMILARITY_THRESHOLD,
 )
+from frontmatter import split_frontmatter, split_lines_lf_crlf
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -266,34 +267,49 @@ def _ensure_theme_indexes(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _parse_note(file_path: str) -> dict | None:
+def _parse_note_detailed(file_path: str) -> tuple[dict | None, str | None]:
     """Parse frontmatter and body from a vault note.
 
-    Returns dict with keys: type, date, project, title, source_session,
-    source_note, tags (comma-separated), status, body.
-    Returns None for files that can't be parsed.
+    Returns ``(meta, None)`` on success — ``meta`` has keys: type, date,
+    project, title, source_session, source_note, tags (comma-separated),
+    status, body. Returns ``(None, reason)`` for files that can't be parsed,
+    where ``reason`` is a human-readable string: ``"unreadable file: ..."``
+    for an OSError, or the ``frontmatter.split_frontmatter`` error verbatim
+    (covers a missing opening fence, a missing/unbounded closing fence, and
+    an oversized frontmatter block).
     """
     try:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        # newline="" (universal-newline translation OFF) is required here,
+        # not cosmetic: split_lines_lf_crlf below is documented to treat a
+        # bare "\r" as NOT a line terminator. Opening with the default
+        # newline=None translates every bare "\r" to "\n" before the
+        # splitter ever sees it, silently defeating that guarantee one line
+        # below. note_writer.py's _split_frontmatter gets this right; this
+        # call site didn't (#277 follow-up).
+        with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as f:
             full_text = f.read()
-    except OSError:
-        return None
+    except OSError as exc:
+        # exc.strerror (e.g. "No such file or directory"), NOT str(exc) --
+        # str(OSError) includes the full path argument
+        # ("[Errno 2] No such file or directory: '/Users/.../secret.md'"),
+        # which would leak the absolute vault path into this reason string
+        # and, from there, into _sync's aggregated malformed_files report.
+        # The caller-supplied basename (recorded separately by _sync) is
+        # the only path information this should ever emit.
+        return None, f"unreadable file: {exc.strerror or type(exc).__name__}"
 
-    lines = full_text.split("\n")
-    if not lines or lines[0].strip() != "---":
-        return None
+    lines = split_lines_lf_crlf(full_text)
+    _open_fence, fm_lines, _close_fence, body_lines, split_err = split_frontmatter(lines)
+    if split_err:
+        return None, split_err
 
-    # Parse frontmatter (first 40 lines)
+    # Parse frontmatter key/value pairs + a `tags:` list block.
     meta: dict = {}
     tags: list[str] = []
     in_tags = False
-    end_idx = None
 
-    for idx, line in enumerate(lines[1:40], start=1):
-        stripped = line.strip()
-        if stripped == "---":
-            end_idx = idx
-            break
+    for raw_line in fm_lines:
+        stripped = raw_line.strip()
         if stripped.startswith("- ") and in_tags:
             tags.append(stripped[2:].strip())
             continue
@@ -307,15 +323,13 @@ def _parse_note(file_path: str) -> dict | None:
                 continue
             meta[key] = val
 
-    if end_idx is None:
-        return None
-
     if tags:
         meta["tags"] = ",".join(tags)
 
-    # Body: everything after closing ---
-    body_lines = lines[end_idx + 1:]
-    body = "\n".join(body_lines).strip()
+    # Body: everything after the closing fence. Line terminators are
+    # preserved on each element of body_lines, so join with "" — "\n".join
+    # would double every blank line in the body.
+    body = "".join(body_lines).strip()
     meta["body"] = body
 
     # Extract title from first H1 heading in body
@@ -333,7 +347,17 @@ def _parse_note(file_path: str) -> dict | None:
     if source_note_raw:
         meta["source_note"] = source_note_raw.strip("[]").replace("[[", "").replace("]]", "")
 
-    return meta
+    return meta, None
+
+
+def _parse_note(file_path: str) -> dict | None:
+    """Parse frontmatter and body from a vault note.
+
+    Returns dict with keys: type, date, project, title, source_session,
+    source_note, tags (comma-separated), status, body.
+    Returns None for files that can't be parsed.
+    """
+    return _parse_note_detailed(file_path)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -617,17 +641,122 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
         _update_term_df(conn, old_terms=old_terms, new_terms=set())
 
 
+# Cap on how many malformed-file entries `_sync` accumulates into
+# `stats["malformed_files"]` per pass, so a pathological vault (thousands of
+# broken notes) can't balloon the returned dict. Module-level (not
+# function-local) so tests can import it instead of hardcoding the value --
+# a hardcoded test constant and this cap could otherwise silently drift
+# apart. `stats["malformed"]` always reports the TRUE, uncapped count.
+_MALFORMED_FILES_CAP = 20
+
+# Cap on the length of a filename recorded in `stats["malformed_files"]`.
+# 120 chars is generous headroom over any realistic vault filename.
+_MALFORMED_FILENAME_CAP = 120
+
+# Allowlist, not denylist, for `_sanitize_report_filename` below: vault
+# filenames are `YYYY-MM-DD-slug-hash.md` by construction (see
+# note_writer.py), so restricting to this set costs nothing for real names.
+# str.isprintable() previously let every printable character through --
+# backticks included -- and skills/vault-reindex/SKILL.md renders the
+# sanitized value into a markdown bullet inside backticks (`` `<file>` ``);
+# a filename containing its own backtick breaks out of that span and
+# reaches the model's context as un-delimited, potentially
+# instruction-shaped text.
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._\- ]")
+
+# Stable-prefix classifiers for `_classify_parse_failure` below. Matched via
+# `str.startswith`, never by slicing at the first ':' -- the embedded
+# excerpt in the "no closing fence" reason can itself contain colons.
+_UNREADABLE_PREFIX = "unreadable file:"
+_NO_OPENING_FENCE_PREFIX = "malformed frontmatter (file does not open"
+_NO_CLOSING_FENCE_PREFIX = "malformed or missing frontmatter (no closing"
+_TOO_LONG_PREFIX = "frontmatter exceeds"
+
+
+def _classify_parse_failure(reason: str | None) -> str:
+    """Map a `_parse_note_detailed` failure reason to a stable, content-free
+    classifier for `_sync`'s aggregated `malformed_files` report.
+
+    `_parse_note_detailed`'s raw reason can embed up to 60 characters of the
+    note's own text (`split_frontmatter`'s "no closing '---'; stopped at a
+    line that is not frontmatter: '<excerpt>'"). Vault notes are
+    user/LLM-authored content -- a secret or injection string sitting in a
+    malformed frontmatter region would otherwise be echoed verbatim into
+    `/vault-reindex` output, the model's context, and the session
+    transcript. This function is the ONLY thing that may see the raw
+    reason on the way into that aggregated report; `_parse_note_detailed`'s
+    own return value is untouched and stays available to direct callers
+    for debugging.
+
+    Falls back to "unknown" for any reason string that doesn't match a
+    known prefix (including ``None``) rather than raising -- a future
+    change to `split_frontmatter`'s wording must not crash the sync loop.
+    """
+    if reason is None:
+        return "unknown"
+    if reason.startswith(_UNREADABLE_PREFIX):
+        return "unreadable"
+    if reason.startswith(_NO_OPENING_FENCE_PREFIX):
+        return "no_opening_fence"
+    if reason.startswith(_NO_CLOSING_FENCE_PREFIX):
+        return "no_closing_fence"
+    if reason.startswith(_TOO_LONG_PREFIX):
+        return "frontmatter_too_long"
+    return "unknown"
+
+
+def _sanitize_report_filename(name: str) -> str:
+    """Replace every character outside `_SAFE_FILENAME_RE`'s allowlist, then
+    cap length, before a filename enters `_sync`'s `malformed_files` report.
+
+    A filename is attacker-influenced content (filenames may legally
+    contain newlines, backticks, and other arbitrary characters on most
+    filesystems), and this value flows into `/vault-reindex` output, the
+    model's context, and the session transcript. This used to strip via
+    `str.isprintable()`, which only excludes Unicode Other/Separator
+    categories -- every printable character survived, including backticks
+    that break out of the backtick span the value is rendered into
+    (see `_SAFE_FILENAME_RE`'s comment). Substituting the replacement
+    character rather than deleting keeps the name recognisable enough to
+    act on, and -- unlike deletion -- can never turn a non-empty name into
+    an empty one; the `or "<unnamed>"` fallback below exists only for a
+    genuinely empty ``name``.
+    """
+    cleaned = _SAFE_FILENAME_RE.sub("�", name)[:_MALFORMED_FILENAME_CAP]
+    return cleaned or "<unnamed>"
+
+
 def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict:
     """Incremental sync: add new/changed files, remove deleted ones.
 
     Returns {"inserted": N, "skipped": M, "deleted": D, "by_type": {...}}.
+    ``skipped`` is the sum of two semantically distinct outcomes, also
+    reported separately: ``unchanged`` (mtime matched the index — nothing
+    to do, the healthy common case) and ``malformed`` (frontmatter failed
+    to parse — the note was dropped from the index, real data loss, or, if it
+    was already indexed, left at its last-good indexed content). A
+    40-line frontmatter-scan bound once hid 28 unparseable notes behind a
+    reassuring ``skipped: 2011`` for months because the two were conflated
+    (#277); splitting them, plus surfacing which files failed via
+    ``malformed_files`` (capped at 20 entries — ``malformed`` always
+    reports the TRUE count, uncapped), makes that kind of silent data loss
+    visible again.
 
     Wraps the entire pass in BEGIN IMMEDIATE + commit/rollback so a mid-
     loop failure doesn't leave a half-applied transaction attached to
     the connection (which would poison subsequent callers).
     """
     vault = Path(vault_path)
-    stats = {"inserted": 0, "skipped": 0, "deleted": 0, "recomputed": 0, "by_type": {}}
+    stats = {
+        "inserted": 0,
+        "skipped": 0,
+        "unchanged": 0,
+        "malformed": 0,
+        "malformed_files": [],
+        "deleted": 0,
+        "recomputed": 0,
+        "by_type": {},
+    }
 
     # Collect all .md files in target folders (keyed by absolute path)
     disk_files: dict[str, Path] = {}  # abs_path_str -> Path object
@@ -671,12 +800,26 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
 
             # Skip if mtime unchanged (0.001 tolerance)
             if abs_path_str in indexed and abs(file_mtime - indexed[abs_path_str]) < 0.001:
+                stats["unchanged"] += 1
                 stats["skipped"] += 1
                 continue
 
-            parsed = _parse_note(str(abs_path))
+            parsed, reason = _parse_note_detailed(str(abs_path))
             if parsed is None:
+                stats["malformed"] += 1
                 stats["skipped"] += 1
+                if len(stats["malformed_files"]) < _MALFORMED_FILES_CAP:
+                    # Never store the raw `reason` here -- it can embed up
+                    # to 60 chars of the note's own content (see
+                    # _classify_parse_failure's docstring). Only the
+                    # stable classifier and a sanitized/capped filename
+                    # enter this aggregated report.
+                    stats["malformed_files"].append(
+                        {
+                            "file": _sanitize_report_filename(abs_path.name),
+                            "reason": _classify_parse_failure(reason),
+                        }
+                    )
                 continue
 
             _upsert_note(conn, abs_path_str, parsed, file_mtime, file_size)
@@ -1026,9 +1169,10 @@ def rebuild_index(
     field is lost. Required only when the schema is corrupt or incompatible,
     or when the derivable tables need a clean-slate rebuild.
 
-    Returns ``{"inserted": N, "skipped": M, "by_type": {...}}`` plus, in
-    non-destructive mode, ``"preserved": {...}`` and ``"pruned_orphans":
-    {...}`` reporting the Friston-table delta.
+    Returns ``{"inserted": N, "skipped": M, "unchanged": U, "malformed": F,
+    "malformed_files": [...], "by_type": {...}}`` (``skipped == unchanged +
+    malformed``; see ``_sync``) plus, in non-destructive mode, ``"preserved":
+    {...}`` and ``"pruned_orphans": {...}`` reporting the Friston-table delta.
     """
     if db_path is None:
         db_path = _default_db_path()

@@ -9,7 +9,7 @@ metadata:
 
 Analyze the current conversation candidly and save a structured retrospective to the Obsidian vault. The goal is honest reflection — not self-congratulation — so future sessions can improve.
 
-**Tools needed:** Bash, Write, Read
+**Tools needed:** Bash, Read
 
 ## Procedure
 
@@ -23,7 +23,24 @@ Run:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
@@ -68,7 +85,24 @@ _OB_BUNDLE="$HOME/.claude/obsidian-brain/retro-bundle-$$.json"
 _OB_ERR="$HOME/.claude/obsidian-brain/retro-bundle-$$.err"
 python3 -c '
 import sys, os, json, glob
-sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from obsidian_utils import load_config, get_session_context, gather_session_evidence
 c = load_config()
 ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
@@ -293,23 +327,45 @@ Final filename: `YYYY-MM-DD-retro-<hash>.md`
 
 Example: `2026-04-05-retro-a3f2.md`
 
-Run:
+Run the note-writer CLI, piping the full note (frontmatter + body) in on stdin. It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_NOTE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_NOTE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the note body, silently corrupting it:
 
 ```bash
-mkdir -p "$VAULT_PATH/$INSIGHTS_FOLDER"
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-retro-<hash>.md" <<'OB_NOTE_EOF_<eof4>'
+---
+type: claude-retro
+...
+---
+
+# Session Retrospective: ...
+...
+OB_NOTE_EOF_<eof4>
 ```
 
-Then use the **Write** tool to write the full note (frontmatter + body) to:
+On success this prints `OK: <absolute path>` — that is the file at `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here (do not proceed to arming the classification gate below on a failed write).
 
-```
-$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-retro-<hash>.md
-```
-
-Then set permissions:
-
-```bash
-chmod 644 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-retro-<hash>.md"
-```
+If the error is `note already exists`, the 4-hex filename hash collided with a note written in the same second. Regenerate the hash (Step 7's command), rebuild the filename, and retry the write **once**. If it fails again for any reason, surface the error and stop — do not loop.
 
 **Arm the classification gate.** Immediately after writing the note, mark classification as pending. This arms the `obsidian_retro_gate.py` **Stop** hook, which blocks the turn from ending until Step 7.5 clears the gate — so classification can no longer be silently skipped:
 
@@ -317,7 +373,24 @@ chmod 644 "$VAULT_PATH/$INSIGHTS_FOLDER/YYYY-MM-DD-retro-<hash>.md"
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os, glob
-sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from obsidian_utils import mark_retro_classification_pending
 print(mark_retro_classification_pending(sys.argv[1], sys.argv[2]))
 ' "<current-session-id>" "$VAULT_PATH/$INSIGHTS_FOLDER/<filename>"
@@ -327,7 +400,7 @@ print(mark_retro_classification_pending(sys.argv[1], sys.argv[2]))
 
 ### Step 7.5 — Classify and file process improvements (DO THIS BEFORE Step 8)
 
-The retro is **not done** when the file is written. The literal next action after the `chmod 644` is to act on what the retro surfaced — **do not print the "saved" confirmation until this step is complete.** Step 7 armed a Stop-hook gate that blocks the turn from ending until you clear it here, so this is enforced, not merely advised.
+The retro is **not done** when the file is written. The literal next action after arming the classification gate is to act on what the retro surfaced — **do not print the "saved" confirmation until this step is complete.** Step 7 armed a Stop-hook gate that blocks the turn from ending until you clear it here, so this is enforced, not merely advised.
 
 1. **Extract** every item from the just-written **Process Improvements** and **Key Learnings** sections.
 2. **Classify** each item into exactly one bucket:
@@ -341,7 +414,24 @@ The retro is **not done** when the file is written. The literal next action afte
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
    python3 -c '
    import sys, os, glob
-   sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+   import glob, json, os, re, sys
+   def _ob_hooks():
+       try:
+           for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+               _s = _m.get("source") if isinstance(_m, dict) else None
+               if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                   continue
+               _i = _m.get("installLocation") if isinstance(_m, dict) else None
+               if not (isinstance(_i, str) and os.path.isabs(_i)):
+                   continue
+               _h = os.path.join(_i, "hooks")
+               if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                   return _h
+       except Exception:
+           pass
+       _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+       return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+   sys.path.insert(0, _ob_hooks())
    from obsidian_utils import clear_retro_classification_pending
    print("cleared" if clear_retro_classification_pending(sys.argv[1]) else "no-gate")
    ' "<current-session-id>"

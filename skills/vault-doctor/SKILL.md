@@ -21,6 +21,7 @@ Audit and repair the Obsidian vault. Ships with one check initially (`source-ses
 - `/vault-doctor --check project-name-canonicalization` — one-time backfill check that rewrites worktree-slug project names to the canonical main-repo basename in session notes and insights. Phase 1: for each session note with a `project_path:`, derives canonical via `git rev-parse --git-common-dir` (cached per path) and proposes rewriting `project:` + the observed `claude/project/*` tag lines (production tags are slugified/40-char-truncated — both forms matched; sibling tags never touched). Phase 2: for each insight with a `source_session:` UUID, looks up the Phase-1 canonical (not the stale frontmatter value) and proposes the same rewrite. WARN rows for: missing `project_path`, path no longer exists, git unavailable/timed out, git errors (dubious ownership etc. — never silently treated as non-repo), empty `project:` field, insight source_session not in index. Non-git project dirs left alone; snapshot notes skipped. `--project` matches the old name OR the derived canonical (filtered sessions still seed the Phase-2 index); `--days` is ignored (full-vault backfill). **Opt-in** — excluded from default all-checks sweep (`OPT_IN=True`); run via `--check project-name-canonicalization`. Conceptually run after `--check project-name-normalization` (underscore → hyphen) for clean input.
 - `/vault-doctor --check session-coverage` — detect SessionEnd-hook coverage gaps: JSONLs in `~/.claude/projects/` with no corresponding session note. **Opt-in** — excluded from the default all-checks sweep (heavy all-projects JSONL walk); must be named via `--check`. Sessions below the configured `min_messages`/`min_duration_minutes` thresholds are excluded (the hook would also skip them; only text-bearing user messages count). Add `--strict` to emit `FAIL:` (not `WARN:`) when any note references the orphaned session via `source_session` (changes the reason prefix only, not the exit code). Add `--reconstruct` to enable `--apply` to reconstruct the missing note by re-running the SessionEnd hook via `replay-sessionend.py` (never automatic; always requires `--apply`). `--days` bounds JSONL mtime age (default 30). Note: the per-gap project name is derived from the JSONL's `cwd` basename, so `--project` expects the cwd-basename slug — worktree sessions may display a non-canonical expected note path (detection itself is session_id/hash-based and unaffected).
 - `/vault-doctor --check audit-historic-repairs` — one-shot audit of historic source-sessions repairs: diffs doctor backups against current notes, classifies each repair (A restore / B keep / C ambiguous / D both-wrong) by date agreement, and restores category-A mtime-bug corruptions on `fix`. **Opt-in** — excluded from the default all-checks sweep; must be named via `--check`. `--days` bounds backup-run age (default 180).
+- `/vault-doctor --check missing-frontmatter-fence` — repair notes whose frontmatter lost its opening `---` fence (the leading-fence-eaten failure mode: the first byte is the first frontmatter key, so the note parses as having no frontmatter at all and is invisible to tag-based Dataview queries). Only flags a note when all four preconditions hold: first line is not `---`, first line is `key:`-shaped, a closing `---` exists within the frontmatter line bound, and every line above it is frontmatter-shaped. The fix inserts `---` as a new first line and changes nothing else (line endings and file mode preserved). `--days` is ignored (the damage is historic). Re-run `/vault-reindex` afterwards so the recovered frontmatter reaches the index.
 - `/vault-doctor --days 14` — override default window (default: 7 days)
 - `/vault-doctor --project obsidian-brain` — limit to one project
 - `/vault-doctor fix --check source-sessions --days 7` — combine flags
@@ -44,15 +45,31 @@ Parse the user's invocation into flags:
 - `--reconstruct` → set RECONSTRUCT=1 (session-coverage only: mark gaps resolvable for apply)
 - `--min-confidence <FLOAT>` → set MIN_CONFIDENCE (0.0–1.0 inclusive; default 0.0 keeps all; applies to both dry-run report and --apply); note: unresolved/WARN rows (confidence=0.0) are hidden at any threshold > 0 — drop the flag to audit them
 
-Locate the Python dispatcher via the standard plugin cache glob, with a fallback for local dev sessions where the repo is checked out as `$PWD`:
+Locate the Python dispatcher by resolving the obsidian-brain install: prefer the local checkout registered in `known_marketplaces.json` (this also covers local dev sessions, deterministically rather than via `$PWD`), falling back to the newest allowlisted version directory in the plugin cache:
 
 ```bash
-DISPATCHER="$(ls -dt ~/.claude/plugins/cache/*/obsidian-brain/*/scripts/vault_doctor.py 2>/dev/null | head -1)"
-if [[ -z "$DISPATCHER" ]]; then
-    if [[ -f "$(pwd)/scripts/vault_doctor.py" ]]; then
-        DISPATCHER="$(pwd)/scripts/vault_doctor.py"
-    fi
-fi
+DISPATCHER="$(python3 -c "
+import glob, json, os, re
+def _ob_doctor():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                _v = os.path.join(os.path.dirname(_h), 'scripts', 'vault_doctor.py')
+                if os.path.isfile(_v):
+                    return _v
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/scripts/vault_doctor.py')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-3])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-3].split('.')], _p), default='')
+print(_ob_doctor())
+")"
 if [[ -z "$DISPATCHER" || ! -f "$DISPATCHER" ]]; then
     echo "ERROR: could not find scripts/vault_doctor.py" >&2
     exit 1

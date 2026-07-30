@@ -23,7 +23,24 @@ Run:
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 -c '
 import sys, os
-import glob; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from obsidian_utils import load_config
 c = load_config()
 if not c.get("vault_path"):
@@ -236,7 +253,7 @@ Search the source note's content for `[[target-filename]]` (filename without `.m
 After writing, set permissions:
 
 ```bash
-chmod 644 "<source-note-path>"
+chmod 600 "<source-note-path>"
 ```
 
 **5.4 — Read the target note** using the Read tool.
@@ -263,7 +280,7 @@ Search the target note's content for `[[source-filename]]`. If it already exists
 After writing, set permissions:
 
 ```bash
-chmod 644 "<target-note-path>"
+chmod 600 "<target-note-path>"
 ```
 
 ### Step 6 — Confirm

@@ -6,7 +6,7 @@ Keeps SKILL.md free of inline agent prompts. Two entry points:
   - run_classifier:     Stage 4 classification sub-agent (Phase E).
 
 Per spec § New hooks/check_items_cli.py (lines 581-587).
-Stdin is capped at 1_000_000 bytes (project CLAUDE.md security pattern).
+Stdin is capped at 1_000_000 characters (project CLAUDE.md security pattern).
 """
 from __future__ import annotations
 
@@ -18,7 +18,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-STDIN_CAP_BYTES = 1_000_000
+# Counts CHARACTERS, not bytes: sys.stdin.read(n) is a character read on a
+# text stream, so a multi-byte UTF-8 payload can occupy up to ~4x this in
+# bytes. The cap is still a real bound; the NAME just has to say what it
+# actually counts (#275). Same constant and same policy as
+# hooks/note_writer.py.
+STDIN_CAP_CHARS = 1_000_000
 SUBAGENT_TIMEOUT_SEC = int(os.environ.get("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "300"))
 
 # Cap groups per classifier sub-agent dispatch. Above this count, run_classifier()
@@ -168,8 +173,8 @@ def _pick_model(group_count: int) -> str:
 
 
 def _read_stdin_capped() -> str:
-    """Read stdin with the 1_000_000-byte cap (project security pattern)."""
-    return sys.stdin.read(STDIN_CAP_BYTES)
+    """Read stdin with the 1_000_000-character cap (project security pattern)."""
+    return sys.stdin.read(STDIN_CAP_CHARS)
 
 
 def _safe_workdir() -> Path:
