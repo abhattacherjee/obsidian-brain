@@ -221,7 +221,20 @@ Run the note-writer CLI, piping the full note (frontmatter + body) in on stdin. 
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-HOOKS=$(python3 -c "import glob,os,re; c=glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')); print(max(c, key=lambda p: ([int(n) for n in re.findall('[0-9]+', p.split('/')[-2])], p), default='hooks'))")
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _h = os.path.join((_m or {}).get('installLocation', ''), 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
 test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - the plugin cache is stale or incomplete. Run /plugin marketplace update (or /dev-test install for local dev), then retry." >&2; exit 1; }
 python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-<slug>-<hash>-decision.md" <<'OB_NOTE_EOF_<eof4>'
 ---

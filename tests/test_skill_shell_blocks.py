@@ -46,7 +46,12 @@ _CMD_LINE = 'python3 "$HOOKS/note_writer.py"'
 # assertions (truncated note + executed side effect) rather than crashing in
 # the harness, which would prove nothing.
 _HEREDOC_OPEN_RE = re.compile(r"<<'(OB_[A-Za-z0-9_]+(?:_<eof4>)?)'")
-_HOOKS_LINE_RE = re.compile(r"^HOOKS=\$\(python3 .*\)$", re.MULTILINE)
+# FORM B (#278) spans multiple physical lines: `HOOKS=$(python3 -c "` opens,
+# the resolver body follows, and a column-0 `")` closes it. DOTALL lets `.`
+# cross those newlines; the non-greedy `.*?` stops at the first bare `")`
+# line, which is unambiguous because no line inside the resolver body ends
+# with that exact two-character sequence.
+_HOOKS_LINE_RE = re.compile(r'^HOOKS=\$\(python3 -c "\n.*?\n"\)$', re.MULTILINE | re.DOTALL)
 # The filename positional of a `write` call: 3rd quoted argument.
 _WRITE_FILENAME_RE = re.compile(r'(write "\$VAULT_PATH" "\$\w+" )"[^"]*"')
 _WRITE_FOLDER_RE = re.compile(r'write "\$VAULT_PATH" "\$(\w+)"')
