@@ -201,7 +201,7 @@
         { "id": "ops-commit-preflight", "name": "commit-preflight.sh", "kind": "ops", "files": ["scripts/commit-preflight.sh"], "purpose": "Creates a 5-minute token consumed by the require-preflight hook. Enforces (always-on) manifest version sync, then secret scan, then pytest with cov-fail-under 90. Flags: --docs-only, --skip-tests, --auto." },
         { "id": "ops-ci", "name": "CI workflow", "kind": "ops", "files": [".github/workflows/ci.yml"], "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), no-default-db AST guard, security-tests, and an advisory detect-release-merge check." },
         { "id": "ops-no-default-db", "name": "no-default-db.py", "kind": "ops", "files": ["scripts/ci-checks/no-default-db.py"], "purpose": "AST guard (GH #46): every ensure_index/rebuild_index/deep_analysis_pipeline call in tests/ must pass explicit db_path= so tests cannot pollute the live vault DB." },
-        { "id": "ops-pytest", "name": "pytest suite", "kind": "ops", "files": ["tests/"], "purpose": "85 test files, coverage source=hooks, fail_under=90. Hook simulation pattern pipes synthetic JSON into installed hooks; import-time state-dir constants isolated via autouse conftest monkeypatch." },
+        { "id": "ops-pytest", "name": "pytest suite", "kind": "ops", "files": ["tests/"], "purpose": "84 test_*.py files plus conftest.py, coverage source=hooks, fail_under=90. Hook simulation pattern pipes synthetic JSON into installed hooks; import-time state-dir constants isolated via autouse conftest monkeypatch." },
         { "id": "ops-security-tests", "name": "test-security.sh", "kind": "ops", "files": ["scripts/test-security.sh"], "purpose": "Runs the security regression suite (path containment, secret scrub, temp-path safety) with OB_HOOKS_DIR=hooks." }
       ]
     }
@@ -446,7 +446,7 @@
     ]
   },
   "testing": {
-    "unitSuite": { "tool": "pytest", "fileCount": 85, "duration": "fast (stdlib, no network)", "environments": { "python": "3.12" }, "coverage": { "lines": 90, "source": "hooks", "omits": ["obsidian_utils.py (I/O monolith)", "deep_cli.py"] } },
+    "unitSuite": { "tool": "pytest", "fileCount": 84, "duration": "fast (stdlib, no network)", "environments": { "python": "3.12" }, "coverage": { "lines": 90, "source": "hooks", "omits": ["obsidian_utils.py (I/O monolith)", "deep_cli.py"] } },
     "manualMatrix": { "doc": "CLAUDE.md (Development Commands)", "devices": ["hook simulation: pipe synthetic SessionEnd/SessionStart/PreCompact JSON into installed hooks", "json.load validation of hooks.json and plugin.json"], "rationale": "No build/test framework for the prompt-based skills; hooks are validated by feeding synthetic lifecycle JSON and asserting vault writes + telemetry outcomes." }
   },
   "scripts": [

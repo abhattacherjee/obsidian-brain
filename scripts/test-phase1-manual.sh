@@ -128,7 +128,7 @@ def _ob_hooks():
             _s = _m.get('source') if isinstance(_m, dict) else None
             if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
                 continue
-            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
             _h = os.path.join(_i, 'hooks')
@@ -177,7 +177,7 @@ def _ob_skill():
             _s = _m.get('source') if isinstance(_m, dict) else None
             if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
                 continue
-            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
             _h = os.path.join(_i, 'hooks')
@@ -217,7 +217,7 @@ def _ob_hooks():
             _s = _m.get('source') if isinstance(_m, dict) else None
             if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
                 continue
-            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
             _h = os.path.join(_i, 'hooks')
@@ -235,10 +235,10 @@ fi
 
 STDERR_OUTPUT=$(python3 -c "
 import sys, os
-sys.path.insert(0, '$HOOKS_PATH')
+sys.path.insert(0, sys.argv[1])
 import vault_index
 vault_index.log_access('/tmp/nonexistent-dir-phase1-test/fake.db', '/test', 'test')
-" 2>&1 || true)
+" "$HOOKS_PATH" 2>&1 || true)
 
 if echo "$STDERR_OUTPUT" | grep -q "vault-index.*log_access failed"; then
     pass "log_access logs to stderr on bad DB"
@@ -248,11 +248,11 @@ fi
 
 STDERR_OUTPUT2=$(python3 -c "
 import sys, os
-sys.path.insert(0, '$HOOKS_PATH')
+sys.path.insert(0, sys.argv[1])
 import vault_index
 result = vault_index.batch_activations('/tmp/nonexistent-dir-phase1-test/fake.db', ['/test'])
 print(result, file=sys.stderr)
-" 2>&1 || true)
+" "$HOOKS_PATH" 2>&1 || true)
 
 if echo "$STDERR_OUTPUT2" | grep -q "0.0"; then
     pass "batch_activations returns 0.0 on bad DB"

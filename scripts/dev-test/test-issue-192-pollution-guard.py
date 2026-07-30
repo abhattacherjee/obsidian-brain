@@ -46,7 +46,7 @@ def _resolve_hooks(dev_repo: str | None) -> str:
             _s = _m.get("source") if isinstance(_m, dict) else None
             if not (isinstance(_s, dict) and _s.get("source") == "directory"):
                 continue
-            _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
             _h = os.path.join(_i, "hooks")

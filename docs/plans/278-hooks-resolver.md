@@ -94,6 +94,32 @@ directions by `test_a_directory_source_install_beats_the_cache` and
 `test_a_github_source_install_falls_through_to_the_cache`, whose fixture deliberately builds a
 clone that *does* satisfy the sentinel.
 
+## Accepted ambiguity: two directory-source entries that both satisfy the sentinel
+
+**This is known and accepted behaviour, not a bug — do not "fix" it without a reported failure.**
+
+The loop returns the **first** entry whose `source.source == "directory"` and whose
+`<installLocation>/hooks/obsidian_utils.py` exists. If a machine has *two* such entries — e.g. a
+second marketplace registered against a second obsidian-brain checkout (a worktree, a clone kept
+for bisecting, a fork) — the winner is decided by `known_marketplaces.json`'s **JSON insertion
+order**, which Claude Code owns and obsidian-brain does not control. Resolution is also **silent**:
+nothing warns that a second candidate existed.
+
+Deliberately left alone. Every tiebreak worth having needs information the resolver does not have
+(which checkout the user *meant*), and the resolver is 13 lines copied into 81 sites — every line
+added there is added 81 times, and each one is a new way for the copies to drift. The cost of
+being wrong is bounded and self-announcing: `sys.path` points at a real obsidian-brain checkout,
+just not the intended one, and the symptom (a skill that does not see your edit) is the same one
+that already sends people to `/vault-doctor`.
+
+Verified discriminating on the author's machine as of #278: of 9 registered marketplaces, exactly
+one satisfies the sentinel — including two other directory-source entries (`cc-token-router-repo`,
+`claude-code-skills`) that do not. Single-candidate is the expected shape; the ambiguity needs a
+deliberately unusual setup to reach.
+
+If it ever does bite, the fix is a user-facing one (a `/vault-doctor` check that reports every
+sentinel-satisfying entry and names the winner), not more logic inside the 81 copies.
+
 ## Global Constraints
 
 - **Quoting contexts are opposite and both are load-bearing.** Sites inside `python3 -c '...'` may

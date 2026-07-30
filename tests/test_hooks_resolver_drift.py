@@ -75,7 +75,7 @@ def _ob_hooks():
             _s = _m.get("source") if isinstance(_m, dict) else None
             if not (isinstance(_s, dict) and _s.get("source") == "directory"):
                 continue
-            _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
             _h = os.path.join(_i, "hooks")
@@ -97,7 +97,7 @@ def _ob_hooks():
             _s = _m.get('source') if isinstance(_m, dict) else None
             if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
                 continue
-            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
             _h = os.path.join(_i, 'hooks')
@@ -119,7 +119,7 @@ def _ob_hooks():
             _s = _m.get('source') if isinstance(_m, dict) else None
             if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
                 continue
-            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
             _h = os.path.join(_i, 'hooks')
@@ -142,7 +142,7 @@ def _ob_doctor():
             _s = _m.get('source') if isinstance(_m, dict) else None
             if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
                 continue
-            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
             if not (isinstance(_i, str) and os.path.isabs(_i)):
                 continue
             _h = os.path.join(_i, 'hooks')
@@ -411,8 +411,19 @@ def test_no_scripts_file_reaches_the_cache_without_the_registry():
       ``plugins/cache/*/obsidian-brain/``. The wildcard marketplace segment is
       what makes a reference a *resolver* rather than a concrete path typed
       into a manual `ls`, and only resolvers have an ordering to get wrong.
+
+    Ordering is checked **per occurrence, not per file**. The earlier form
+    compared every cache glob against one file-wide "first registry mention"
+    offset, which meant a file that already carried one compliant resolver
+    laundered every later one: a second, cache-only resolver appended to
+    ``scripts/test-security.sh`` sat after that offset and passed. Here each
+    cache glob must CLAIM its own preceding, not-yet-claimed registry mention.
+    The canonical forms carry exactly one of each per block, so the pairing is
+    1:1 per resolver and a registry-less resolver anywhere in the file — first,
+    last, or wedged between two compliant ones — has nothing left to claim.
     """
     glob_key = "plugins/cache/*/obsidian-brain/"
+    registry_key = "known_marketplaces.json"
     missing_registry = []
     cache_first = []
     for path in _scripts_files():
@@ -426,18 +437,29 @@ def test_no_scripts_file_reaches_the_cache_without_the_registry():
             continue
         if "plugins/cache" not in text:
             continue
-        registry_at = text.find("known_marketplaces.json")
-        if registry_at < 0:
+        if registry_key not in text:
             missing_registry.append(rel)
             continue
-        # Offsets are accumulated rather than looked up with `text.index`:
-        # several of these files carry the identical glob line three times, and
-        # `index` would report the first one's offset for all three.
-        offset = 0
-        for lineno, line in enumerate(text.split("\n"), 1):
-            if glob_key in line and offset < registry_at:
-                cache_first.append(f"{rel}:{lineno}")
-            offset += len(line) + 1
+        # Every occurrence of both keys, merged into one offset-ordered walk.
+        # `str.find` in a loop rather than `text.index`: several of these files
+        # carry the identical glob line three times, and `index` would report
+        # the first one's offset for all three.
+        events = []
+        for kind, needle in ((0, registry_key), (1, glob_key)):
+            at = text.find(needle)
+            while at >= 0:
+                events.append((at, kind))
+                at = text.find(needle, at + 1)
+        # kind 0 sorts before kind 1 at an equal offset, which cannot happen
+        # for these two distinct needles but keeps the walk total-ordered.
+        unclaimed = 0
+        for offset, kind in sorted(events):
+            if kind == 0:
+                unclaimed += 1
+            elif unclaimed:
+                unclaimed -= 1
+            else:
+                cache_first.append(f"{rel}:{text.count(chr(10), 0, offset) + 1}")
     assert not missing_registry, (
         "scripts/ file(s) resolve the plugin cache with no marketplace lookup "
         "at all: " + ", ".join(sorted(missing_registry)) + " — port FORM A/B/C "
@@ -445,10 +467,65 @@ def test_no_scripts_file_reaches_the_cache_without_the_registry():
         "entire job is validating what `/dev-test install` wrote into the cache."
     )
     assert not cache_first, (
-        "scripts/ file(s) glob the plugin cache BEFORE consulting "
-        "known_marketplaces.json: " + ", ".join(sorted(cache_first)) + " — "
-        "cache-first keeps serving the stale released tree whenever one "
-        "exists, which is the whole of #278."
+        "scripts/ file(s) glob the plugin cache with no preceding, unclaimed "
+        "known_marketplaces.json lookup of its own: "
+        + ", ".join(sorted(cache_first))
+        + " — cache-first keeps serving the stale released tree whenever one "
+        "exists, which is the whole of #278. An earlier compliant resolver in "
+        "the same file does NOT cover a later cache-only one; each resolver "
+        "needs its own registry lookup."
+    )
+
+
+# The shapes S-002 fixed: a shell expansion sitting inside a quoted Python
+# string literal, in a file whose path now comes from the registry.
+_INTERPOLATION_SHAPES = (
+    "sys.path.insert(0, '$",
+    'sys.path.insert(0, "$',
+    "open('$",
+    'open("$',
+)
+
+
+def test_no_converted_script_interpolates_a_resolved_path_into_python():
+    """CLAUDE.md: "No path interpolation in ``python3 -c``: always pass paths
+    via ``sys.argv``, never as string literals in the source code."
+
+    Scoped to scripts/ files that consult ``known_marketplaces.json``, because
+    those are precisely the files whose path variable this PR re-sourced. Before
+    #278 the value came from a ``$HOME``-rooted ``find`` and could be argued to
+    be well-formed by construction; now it is an arbitrary ``installLocation``
+    string read out of a JSON file the plugin does not own. A path containing a
+    single quote turns the interpolated program into a ``SyntaxError`` — the
+    whole embedded block dies, and in ``scripts/test-security.sh`` that reads as
+    a security test FAILING rather than as a broken harness.
+
+    The cache-only scripts are exempt for the same reason they are exempt from
+    the registry guard: their path is a cache directory they laid out
+    themselves, un-widened by this PR.
+    """
+    offenders = []
+    for path in _scripts_files():
+        rel = os.path.relpath(path, _REPO_ROOT).replace("\\", "/")
+        if rel in CACHE_ONLY_SCRIPTS:
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "known_marketplaces.json" not in text:
+            continue
+        for lineno, line in enumerate(text.split("\n"), 1):
+            if any(shape in line for shape in _INTERPOLATION_SHAPES):
+                offenders.append(f"{rel}:{lineno}")
+    assert not offenders, (
+        "shell variable interpolated into embedded Python source: "
+        + ", ".join(offenders)
+        + " — pass the path as an argv entry instead (`sys.argv[1]` in the "
+        "block, `\" \"$VAR\"` on the block's closing line). The resolved path "
+        "is an installLocation read out of known_marketplaces.json, so a quote "
+        "in it is a SyntaxError, not a hypothetical."
     )
 
 
@@ -964,9 +1041,27 @@ def test_resolver_never_raises_on_a_malformed_registry(text, func, shape, fake_h
     assert _resolver(text, func)() == expected
 
 
+# Two entries that both fail to yield a usable ``installLocation``, kept
+# separate because they are stopped by DIFFERENT halves of the same guard —
+# collapsing them is how the empty-string case went untested for a whole
+# review cycle while a docstring credited ``isabs`` for the pass.
+UNUSABLE_INSTALL_LOCATIONS = {
+    # The empty string is the ONLY shape that reaches `os.path.isabs`:
+    # `isinstance("", str)` is True, so `isabs` alone stands between it and
+    # `os.path.join("", "hooks") == "hooks"`.
+    "empty-string": {"source": DIRECTORY_SOURCE, "installLocation": ""},
+    # The key omitted entirely is a different path through the same `if`:
+    # `.get` returns None and `isinstance(_i, str)` rejects it before `isabs`
+    # is ever evaluated. Deleting `isabs` does NOT make this row fail, which
+    # is exactly why it cannot stand in for the row above.
+    "key-absent": {"source": DIRECTORY_SOURCE},
+}
+
+
 @pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
-def test_empty_install_location_falls_through_to_the_cache(
-    text, func, fake_home, tmp_path, monkeypatch
+@pytest.mark.parametrize("shape", sorted(UNUSABLE_INSTALL_LOCATIONS))
+def test_empty_or_absent_install_location_falls_through_to_the_cache(
+    text, func, shape, fake_home, tmp_path, monkeypatch
 ):
     """An entry with no usable ``installLocation`` must be SKIPPED — resolution
     may never depend on the caller's working directory.
@@ -980,13 +1075,17 @@ def test_empty_install_location_falls_through_to_the_cache(
     bug, and this would have let the same coupling back in through the front
     door.
 
-    The ``isabs`` guard in the resolver is what makes this pass. The
-    cwd-on-a-checkout construction below is the whole point of the test: with
-    a neutral cwd the assertion holds for the wrong reason (nothing matches
-    either way), and the regression walks straight back in. For the same
-    reason the entry carries a valid directory ``source``: without it the new
-    discriminator would skip the entry first and the ``isabs`` guard would
-    never be reached.
+    The ``isabs`` guard in the resolver is what makes the ``empty-string`` row
+    pass, and deleting that guard makes that row — and only that row — fail.
+    ``key-absent`` is carried alongside it rather than instead of it: it is
+    stopped one clause earlier, by ``isinstance(_i, str)``.
+
+    The cwd-on-a-checkout construction below is the whole point of the test:
+    with a neutral cwd the assertion holds for the wrong reason (nothing
+    matches either way), and the regression walks straight back in. For the
+    same reason both entries carry a valid directory ``source``: without it
+    the ``source.source`` discriminator would skip the entry first and neither
+    inner guard would be reached.
     """
     cwd_checkout = tmp_path / "cwd-checkout"
     (cwd_checkout / "hooks").mkdir(parents=True)
@@ -994,12 +1093,23 @@ def test_empty_install_location_falls_through_to_the_cache(
     (cwd_checkout / "scripts").mkdir()
     (cwd_checkout / "scripts" / "vault_doctor.py").write_text("", encoding="utf-8")
     (fake_home / MARKETPLACES).write_text(
-        json.dumps({"mp": {"source": DIRECTORY_SOURCE}}), encoding="utf-8"
+        json.dumps({"mp": UNUSABLE_INSTALL_LOCATIONS[shape]}), encoding="utf-8"
     )
     expected = _seed_cache(fake_home, "3.3.1", func)
 
     monkeypatch.chdir(cwd_checkout)
     assert _resolver(text, func)() == expected
+
+
+def test_the_empty_install_location_fixture_is_actually_empty():
+    """Guard on the guard. The bug this test exists to prevent is not a wrong
+    assertion, it is a fixture that quietly stops constructing the condition
+    its test is named for — which is precisely what happened here: the
+    ``empty-string`` row used to omit the key, so ``isabs`` was never reached
+    and the docstring credited a guard the test could not fail without.
+    """
+    assert UNUSABLE_INSTALL_LOCATIONS["empty-string"]["installLocation"] == ""
+    assert "installLocation" not in UNUSABLE_INSTALL_LOCATIONS["key-absent"]
 
 
 @pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
