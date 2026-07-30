@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -28,10 +30,33 @@ def _resolve_hooks(dev_repo: str | None) -> str:
     repo_hooks = os.path.abspath(os.path.join(here, "..", "..", "hooks"))
     if os.path.isdir(repo_hooks):
         return repo_hooks
-    cache = sorted(glob.glob(os.path.expanduser(
-        "~/.claude/plugins/cache/*/obsidian-brain/*/hooks")))
+    # Canonical obsidian-brain hooks resolver (#278): marketplace-registered
+    # install location first, allowlisted-and-version-sorted cache fallback.
+    #
+    # Kept even though `repo_hooks` above returns first whenever this script
+    # runs from its own checkout — which is the normal case, so this block is
+    # unreachable there. It is here for the abnormal one: copied out of the
+    # repo (a scratch dir, a downloaded gist) with no --dev-repo, where the
+    # relative `../../hooks` misses. Before #278 that path fell straight to
+    # the cache and silently tested the stale released tree; now it resolves
+    # the registered checkout first, same as every other site. Deleting it
+    # would make this the one tool that still prefers the cache.
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    cache = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     if cache:
-        return cache[-1]
+        return max(cache, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p))
     raise SystemExit("could not resolve hooks/ dir; pass --dev-repo")
 
 

@@ -234,7 +234,13 @@ def test_note_writer_call_sites_guard_missing_cli():
     """Each note_writer.py block must resolve the plugin cache version-aware
     (lexicographic max() picks 3.9.0 over 3.10.0) and prove the CLI is there,
     so a stale cache fails in the documented `ERROR:` shape rather than as a
-    raw Python `can't open file` message."""
+    raw Python `can't open file` message.
+
+    The window is bounded by the nearest preceding `HOOKS=` line rather than a
+    fixed line count: FORM B (#278) resolves $HOOKS through a multi-line
+    `HOOKS=$(python3 -c "...")` block, so a fixed-size window sized for the
+    old one-line resolver would clip the `key=lambda` check right out of
+    view."""
     for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
         skill_name = skill_path.replace("\\", "/").split("/")[-2]
         with open(skill_path, encoding="utf-8") as f:
@@ -242,14 +248,42 @@ def test_note_writer_call_sites_guard_missing_cli():
         for lineno, line in enumerate(lines):
             if 'python3 "$HOOKS/note_writer.py"' not in line:
                 continue
-            window = "\n".join(lines[max(0, lineno - 6):lineno])
+            hooks_start = next(
+                (j for j in range(lineno - 1, -1, -1) if lines[j].startswith("HOOKS=")),
+                None,
+            )
+            assert hooks_start is not None, (
+                f"Skill {skill_name} line {lineno + 1} invokes note_writer.py "
+                "with no preceding HOOKS= resolver line"
+            )
+            window = "\n".join(lines[hooks_start:lineno])
             assert 'test -f "$HOOKS/note_writer.py"' in window, (
                 f"Skill {skill_name} line {lineno + 1} invokes note_writer.py "
                 "with no preceding `test -f` existence guard"
             )
-            assert "key=lambda p:" in window, (
+            assert "key=lambda _p:" in window, (
                 f"Skill {skill_name} line {lineno + 1} resolves $HOOKS with a "
                 "lexicographic max() — use the version-aware sort key"
+            )
+            # The line above is a NAMING check, and naming is not behaviour: a
+            # site rewritten back to cache-only globbing with the lambda's name
+            # left intact satisfied it (proved by mutation during #278 task 2 —
+            # all 91 tests still passed). These two are the semantic half.
+            # tests/test_hooks_resolver_drift.py enforces the same property
+            # over all 68 sites; this keeps it enforced at the note_writer call
+            # sites specifically, where the window is already in hand.
+            assert "known_marketplaces.json" in window, (
+                f"Skill {skill_name} line {lineno + 1} resolves $HOOKS from the "
+                "plugin cache only — it must consult the marketplace "
+                "installLocation first, or a directory-source install keeps "
+                "importing the stale released tree (#278)"
+            )
+            assert window.index("known_marketplaces.json") < window.index(
+                "plugins/cache/"
+            ), (
+                f"Skill {skill_name} line {lineno + 1} consults the plugin cache "
+                "before installLocation; cache-first still serves the stale "
+                "module whenever one exists (#278)"
             )
 
 

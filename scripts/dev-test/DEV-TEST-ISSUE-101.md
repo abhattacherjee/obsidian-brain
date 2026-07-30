@@ -62,8 +62,24 @@ bottom for any deviations.
       a direct Bash call — then check:
       ```bash
       python3 -c '
-      import sys, glob, os
-      sys.path.insert(0, glob.glob(os.path.expanduser("~/.claude/plugins/cache/claude-code-skills/obsidian-brain/2.4.1/hooks"))[0])
+      import glob, json, os, re, sys
+      def _ob_hooks():
+          try:
+              for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+                  _s = _m.get("source") if isinstance(_m, dict) else None
+                  if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                      continue
+                  _i = _m.get("installLocation") if isinstance(_m, dict) else None
+                  if not (isinstance(_i, str) and os.path.isabs(_i)):
+                      continue
+                  _h = os.path.join(_i, "hooks")
+                  if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                      return _h
+          except Exception:
+              pass
+          _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+          return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+      sys.path.insert(0, _ob_hooks())
       import obsidian_utils; obsidian_utils._first_seen_date("'"$SID"'")'
 
       ls -la ~/.claude/obsidian-brain/sessions/$SID.json
@@ -134,8 +150,24 @@ bottom for any deviations.
       *Verify the underlying check in a Bash cell:*
       ```bash
       python3 -c '
-      import sys, glob, os
-      sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks"))))
+      import glob, json, os, re, sys
+      def _ob_hooks():
+          try:
+              for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+                  _s = _m.get("source") if isinstance(_m, dict) else None
+                  if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                      continue
+                  _i = _m.get("installLocation") if isinstance(_m, dict) else None
+                  if not (isinstance(_i, str) and os.path.isabs(_i)):
+                      continue
+                  _h = os.path.join(_i, "hooks")
+                  if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                      return _h
+          except Exception:
+              pass
+          _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+          return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+      sys.path.insert(0, _ob_hooks())
       import obsidian_utils
       v = "/Users/abhishek/path/to/your/vault"  # edit
       print(obsidian_utils.is_resumed_session(v, "claude-sessions", "'$SID'", cwd=os.getcwd()))

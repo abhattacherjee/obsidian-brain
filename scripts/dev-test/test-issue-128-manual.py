@@ -23,6 +23,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -34,26 +35,52 @@ from pathlib import Path
 
 REAL_HOME = os.path.expanduser("~")  # capture before any HOME override
 
-candidates = sorted(
-    glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks"))
-)
-if not candidates:
-    sys.exit("❌ No obsidian-brain plugin cache found. Run /dev-test install first.")
-HOOK_DIR = candidates[-1]
+
+def _resolve_hooks_dir() -> str:
+    """Canonical obsidian-brain hooks resolver (#278): marketplace-registered
+    install location first, allowlisted-and-version-sorted cache fallback."""
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="")
+
+
+HOOK_DIR = _resolve_hooks_dir()
+if not HOOK_DIR:
+    sys.exit(
+        "❌ No obsidian-brain install found (checked registered install "
+        "location and plugin cache). On a directory-source install the "
+        "registered checkout is what resolves, so checking out the right "
+        "branch there is enough; otherwise run /dev-test install first."
+    )
 sys.path.insert(0, HOOK_DIR)
 
-# Sanity: confirm the #128 implementation is present in the cache.
+# Sanity: confirm the #128 implementation is present in whatever HOOK_DIR
+# resolved to — which since #278 is the marketplace-registered checkout on a
+# directory-source install, and the plugin cache otherwise. SKILL is derived from
+# HOOK_DIR's own install root (not a second independent cache glob) so it
+# can never resolve to a different version than the hooks we just imported.
 SRC = Path(HOOK_DIR) / "vault_index.py"
-SKILL = next(
-    iter(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/skills/vault-reindex/SKILL.md"))),
-    "",
-)
+_skill_path = Path(HOOK_DIR).parent / "skills" / "vault-reindex" / "SKILL.md"
+SKILL = str(_skill_path) if _skill_path.is_file() else ""
 required_in_src = ["pruned_foreign", "allow_fallthrough", "dry_run", "malformed", "unchanged"]
 missing = [r for r in required_in_src if SRC.exists() and r not in SRC.read_text()]
 if missing:
     sys.exit(
-        f"❌ Plugin cache at {HOOK_DIR} is missing #128 implementations: {missing}\n"
-        f"   Check out the #128 feature branch and run /dev-test install in a sibling CC session."
+        f"❌ Resolved install at {HOOK_DIR} is missing #128 implementations: {missing}\n"
+        f"   Check out the #128 feature branch there — and if that path is the plugin\n"
+        f"   cache rather than a registered checkout, run /dev-test install in a sibling CC session."
     )
 
 import vault_index  # noqa: E402  (import after path mutation + sanity)

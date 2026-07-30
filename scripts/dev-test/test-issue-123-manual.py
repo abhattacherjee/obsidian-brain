@@ -25,6 +25,7 @@ import atexit
 import glob
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -48,21 +49,53 @@ CONFIG_BAK = REAL_HOME / ".claude" / "obsidian-brain-config.json.issue-123-bak"
 # stale cached config and the mutation will appear to be ignored.
 SECURE_DIR = REAL_HOME / ".claude" / "obsidian-brain"
 
-candidates = sorted(
-    glob.glob(str(REAL_HOME / ".claude/plugins/cache/*/obsidian-brain/*/hooks/obsidian_session_log.py"))
-)
-if not candidates:
-    sys.exit("❌ No installed obsidian-brain hook found. Run /dev-test install first.")
-HOOK_PY = Path(candidates[-1])
+def _resolve_session_log_hook() -> Path | None:
+    """Canonical obsidian-brain hooks resolver (#278), adapted to return the
+    obsidian_session_log.py file: prefers the marketplace-registered install
+    location (sentinel = hooks/obsidian_utils.py, the file that identifies an
+    obsidian-brain install), falls back to the newest allowlisted cache
+    version. Returns None if neither resolves."""
+    try:
+        for _m in json.load(open(REAL_HOME / ".claude/plugins/known_marketplaces.json")).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = Path(_i) / "hooks"
+            if (_h / "obsidian_utils.py").is_file() and (_h / "obsidian_session_log.py").is_file():
+                return _h / "obsidian_session_log.py"
+    except Exception:
+        pass
+    _c = [
+        _d for _d in glob.glob(str(REAL_HOME / ".claude/plugins/cache/*/obsidian-brain/*/hooks/obsidian_session_log.py"))
+        if re.fullmatch(r"[0-9]+([.][0-9]+)*", _d.split("/")[-3])
+    ]
+    if not _c:
+        return None
+    return Path(max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-3].split(".")], _p)))
 
-# Sanity: confirm the cache has #123 implementation.
+
+HOOK_PY = _resolve_session_log_hook()
+if HOOK_PY is None:
+    sys.exit(
+        "❌ No installed obsidian-brain hook found (checked registered install "
+        "location and plugin cache). On a directory-source install the "
+        "registered checkout is what resolves, so checking out the right "
+        "branch there is enough; otherwise run /dev-test install first."
+    )
+
+# Sanity: confirm the resolved install has the #123 implementation — the
+# registered checkout on a directory-source install, the cache otherwise.
 hook_src = HOOK_PY.read_text()
 needed = ["_Outcome", "_append_sessionend_log", "OK_RAW_NOTE_ONLY", "SKIPPED_BELOW_THRESHOLD"]
 missing = [n for n in needed if n not in hook_src]
 if missing:
     sys.exit(
         f"❌ Installed hook at {HOOK_PY} is missing #123 markers: {missing}\n"
-        f"   Re-run /dev-test install on the #123 feature branch."
+        f"   Check out the #123 feature branch there, or re-run /dev-test install if\n"
+        f"   that path is the plugin cache rather than a registered checkout."
     )
 
 # ─── Cleanup registration (must run before any mutation) ─────────────────
