@@ -190,7 +190,24 @@ the allowlisted cache. Do **not** reuse form A/B verbatim — different subdirec
 
 ## Out of scope
 
-- `scripts/test-dev-skill.sh:19` — correctly cache-targeted (see Global Constraints).
+- **Scripts whose stated purpose is validating the `/dev-test install` result are correctly
+  cache-targeted, not a #278 defect.** `/dev-test install` writes the working tree *into* the
+  plugin cache; a script whose entire job is confirming that write succeeded must read the cache
+  it just wrote to — resolving via marketplace `installLocation` first would validate the wrong
+  thing (the checkout, not the install). The distinguishing test: the script's own header states
+  `# Run AFTER: /dev-test install`. Five files are in this class — do not "fix" them:
+  - `scripts/test-dev-skill.sh`
+  - `scripts/dev-test/test-issue-101-manual.sh`
+  - `scripts/dev-test/test-issue-105-manual.sh`
+  - `scripts/dev-test/test-snapshots-manual.sh`
+  - `scripts/dev-test/test-vault-doctor-snapshots-manual.sh`
+- **Audit-method limitation.** The site inventory that produced this plan's "14 `scripts/` sites"
+  and the later "68 + N" counts was anchored on the literal string shape
+  `plugins/cache/*/obsidian-brain` (a `glob.glob(...)` call). That grep cannot see other shapes
+  that resolve the same cache directory differently — e.g. `find "$CACHE_DIR" -maxdepth 2 -type d
+  -name hooks`, used by the five files above — so a shape-anchored audit undercounts by
+  construction. Any future audit of this class must state which literal shape(s) it searched for,
+  not just report a total.
 - A generated resolver at a fixed path. Fewer copies, but it adds an install-time artifact that can
   itself go missing — trading 68 visible copies for one invisible single point of failure.
 - Restoring `3.3.1.bak` into the glob path. A sibling session moved it to
