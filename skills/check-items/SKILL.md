@@ -29,7 +29,18 @@ Each step below is a bash block; the embedded Python reads its inputs from `$1`,
 ARGUMENTS="${ARGUMENTS:-}"
 scope_path=$(python3 -c "
 import sys, os, glob, json, tempfile
-import re; sys.path.insert(0, max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), key=lambda p: ([int(n) for n in re.findall('[0-9]+', p.split('/')[-2])], p), default='hooks'))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _h = os.path.join((_m or {}).get('installLocation', ''), 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+sys.path.insert(0, _ob_hooks())
 from check_items_args import parse_scope
 
 argv = sys.argv[1:]
@@ -65,7 +76,18 @@ Note: `window_days` in scope controls how many sessions' files to pass as `basen
 ```bash
 raw_path=$(python3 -c "
 import sys, os, glob, json, itertools
-import re; sys.path.insert(0, max(glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')), key=lambda p: ([int(n) for n in re.findall('[0-9]+', p.split('/')[-2])], p), default='hooks'))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _h = os.path.join((_m or {}).get('installLocation', ''), 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+sys.path.insert(0, _ob_hooks())
 from open_item_dedup import collect_open_items
 
 scope_path = sys.argv[1]
@@ -174,7 +196,18 @@ Convention: each step is a `bash` block. Steps 1-2 use `python3 -c "..."` with p
 ```bash
 part_path=$(SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" python3 << 'PYEOF'
 import sys, os, glob, json, subprocess
-import re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from open_item_dedup import find_duplicates, cross_project_dedup
 from check_items_cache import canonical_hash, load_cache, partition
 from obsidian_utils import get_workspace_roots
@@ -274,7 +307,18 @@ echo "part_path=$part_path"
 ```bash
 merged_path=$(SCOPE_PATH="$scope_path" PART_PATH="$part_path" python3 << 'PYEOF'
 import sys, os, glob, json
-import re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from open_item_dedup import merge_groups_semantically, get_last_semantic_merge_mode
 
 scope_path = os.environ["SCOPE_PATH"]
@@ -319,7 +363,18 @@ echo "merged_path=$merged_path"
 ```bash
 evidence_path=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" python3 << 'PYEOF'
 import sys, os, glob, json, datetime
-import re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from open_item_dedup import deep_analysis_pipeline
 
 scope_path = os.environ["SCOPE_PATH"]
@@ -396,7 +451,18 @@ echo "evidence_path=$evidence_path"
 ```bash
 classifications_path=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" EVIDENCE_PATH="$evidence_path" python3 << 'PYEOF'
 import sys, os, glob, json
-import re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from open_item_dedup import (
     classify_groups_with_agent, classify_groups_heuristic, get_last_classifier_mode
 )
@@ -448,7 +514,18 @@ echo "classifications_path=$classifications_path"
 ```bash
 buckets_path=$(SCOPE_PATH="$scope_path" CLASSIFICATIONS_PATH="$classifications_path" python3 << 'PYEOF'
 import sys, os, glob, json
-import re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from open_item_dedup import assign_tier, partition_for_review
 
 scope_path = os.environ["SCOPE_PATH"]
@@ -517,7 +594,18 @@ print(path)
 
 SCOPE_PATH="$scope_path" BUCKETS_PATH="$buckets_path" MERGED_PATH="$merged_path" SKIPS_FILE="$_skips_file" python3 << 'PYEOF'
 import sys, os, glob, json, re
-import re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from open_item_dedup import cascade_group_members
 
 scope_path = os.environ["SCOPE_PATH"]
@@ -615,7 +703,18 @@ rm -f "$_skips_file"
 ```bash
 SCOPE_PATH="$scope_path" CLASSIFICATIONS_PATH="$classifications_path" PARTITION_PATH="$part_path" python3 << 'PYEOF'
 import sys, os, glob, json, time, subprocess
-import re; sys.path.insert(0, max(glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")), key=lambda p: ([int(n) for n in re.findall("[0-9]+", p.split("/")[-2])], p), default="hooks"))
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
 from check_items_cache import load_cache, save_cache, update_cache, canonical_hash
 from obsidian_utils import get_workspace_roots
 
