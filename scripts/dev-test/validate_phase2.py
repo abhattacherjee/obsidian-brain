@@ -28,6 +28,7 @@ import glob
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -52,6 +53,24 @@ def _find_dev_hooks() -> Path | None:
     return None
 
 
+def _ob_hooks() -> str:
+    """Canonical obsidian-brain hooks resolver (#278): prefers the
+    marketplace-registered install location, falls back to the newest
+    allowlisted plugin-cache version. Returns "" if neither resolves."""
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="")
+
+
 vault_index = None  # type: ignore[assignment]
 obsidian_utils = None  # type: ignore[assignment]
 
@@ -64,18 +83,17 @@ if not _HELP_REQUESTED:
             sys.exit(1)
         sys.path.insert(0, str(dev_hooks))
     else:
-        CACHE_GLOB = os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")
-        cache_hits = sorted(glob.glob(CACHE_GLOB))
-        if not cache_hits:
+        resolved_hooks = _ob_hooks()
+        if not resolved_hooks:
             dev_hooks = _find_dev_hooks()
             if dev_hooks is not None:
-                print(f"NOTE: no plugin cache found; falling back to {dev_hooks}")
+                print(f"NOTE: no registered install location or plugin cache found; falling back to {dev_hooks}")
                 sys.path.insert(0, str(dev_hooks))
             else:
                 print("ERROR: cannot locate obsidian-brain hooks/ directory", file=sys.stderr)
                 sys.exit(1)
         else:
-            sys.path.insert(0, cache_hits[-1])
+            sys.path.insert(0, resolved_hooks)
 
     try:
         import vault_index  # noqa: F811

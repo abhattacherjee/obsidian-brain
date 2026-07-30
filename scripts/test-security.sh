@@ -8,10 +8,24 @@ set -euo pipefail
 if [ -n "${OB_HOOKS_DIR:-}" ]; then
     HOOKS_DIR="$OB_HOOKS_DIR"
 else
+    # Canonical obsidian-brain hooks resolver (#278): marketplace-registered
+    # install location first, allowlisted-and-version-sorted cache fallback.
     HOOKS_DIR=$(python3 -c '
-import glob, os
-dirs = glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks"))
-print(max(dirs) if dirs else "")
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="")
+print(_ob_hooks())
 ')
 fi
 

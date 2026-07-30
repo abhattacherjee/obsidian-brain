@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.3.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-07-26",
+  "lastUpdated": "2026-07-30",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -15,7 +15,7 @@
     "realtime": { "protocol": "none", "endpoint": "direct filesystem writes — no MCP server, no REST API, no daemon" },
     "ai": { "provider": "Claude CLI (claude -p)", "model": "haiku default; escalates haiku to sonnet to opus on empty output (#165)", "notes": "summarization deferred from hooks to /recall" },
     "vectorSearch": { "engine": "SQLite FTS5 (BM25) + 7-signal rerank; TF-IDF cosine themes with ACT-R activation and Free-Energy surprise" },
-    "tests": { "unit": { "runner": "pytest", "count": 2065, "environments": ["python3.12"], "coverage": { "lines": 92 } } },
+    "tests": { "unit": { "runner": "pytest", "count": 2236, "environments": ["python3.12"], "coverage": { "lines": 92 } } },
     "packageManager": "none (stdlib only)"
   },
   "diagram": {
@@ -143,7 +143,7 @@
       "id": "skills",
       "name": "Skills (prompt-based procedures)",
       "color": "#8B5CF6",
-      "description": "19 SKILL.md prompt procedures (no code files) that Claude Code follows step-by-step, reaching the backing Python via a cache glob. Grouped by lifecycle: SETUP, CAPTURE, RECALL/QUERY, MAINTENANCE, TRIAGE. Some fan out to sub-agents; most run inline.",
+      "description": "19 SKILL.md prompt procedures (no code files) that Claude Code follows step-by-step, reaching the backing Python via a canonical resolver duplicated at each call site (#278): the marketplace-registered install location is tried first (validated by the presence of hooks/obsidian_utils.py), falling back to the newest allowlisted plugin-cache version only when no install location resolves — cache-first-with-fallback was rejected because it keeps serving a stale cached module whenever one exists, which silently defeats a directory-source (local checkout) install. Grouped by lifecycle: SETUP, CAPTURE, RECALL/QUERY, MAINTENANCE, TRIAGE. Some fan out to sub-agents; most run inline.",
       "components": [
         { "id": "sk-obsidian-setup", "name": "/obsidian-setup", "kind": "module", "files": ["skills/obsidian-setup/SKILL.md"], "purpose": "SETUP. First-run/upgrade config: vault path, folders, dashboards install, optional deps; writes the config JSON and rebuilds the index." },
         { "id": "sk-vault-config", "name": "/vault-config", "kind": "module", "files": ["skills/vault-config/SKILL.md"], "purpose": "SETUP. Interactive numbered-menu editor for config (toggles, thresholds, snapshot flags) with atomic config rewrite." },
@@ -201,7 +201,7 @@
         { "id": "ops-commit-preflight", "name": "commit-preflight.sh", "kind": "ops", "files": ["scripts/commit-preflight.sh"], "purpose": "Creates a 5-minute token consumed by the require-preflight hook. Enforces (always-on) manifest version sync, then secret scan, then pytest with cov-fail-under 90. Flags: --docs-only, --skip-tests, --auto." },
         { "id": "ops-ci", "name": "CI workflow", "kind": "ops", "files": [".github/workflows/ci.yml"], "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), no-default-db AST guard, security-tests, and an advisory detect-release-merge check." },
         { "id": "ops-no-default-db", "name": "no-default-db.py", "kind": "ops", "files": ["scripts/ci-checks/no-default-db.py"], "purpose": "AST guard (GH #46): every ensure_index/rebuild_index/deep_analysis_pipeline call in tests/ must pass explicit db_path= so tests cannot pollute the live vault DB." },
-        { "id": "ops-pytest", "name": "pytest suite", "kind": "ops", "files": ["tests/"], "purpose": "81 test files, coverage source=hooks, fail_under=90. Hook simulation pattern pipes synthetic JSON into installed hooks; import-time state-dir constants isolated via autouse conftest monkeypatch." },
+        { "id": "ops-pytest", "name": "pytest suite", "kind": "ops", "files": ["tests/"], "purpose": "85 test files, coverage source=hooks, fail_under=90. Hook simulation pattern pipes synthetic JSON into installed hooks; import-time state-dir constants isolated via autouse conftest monkeypatch." },
         { "id": "ops-security-tests", "name": "test-security.sh", "kind": "ops", "files": ["scripts/test-security.sh"], "purpose": "Runs the security regression suite (path containment, secret scrub, temp-path safety) with OB_HOOKS_DIR=hooks." }
       ]
     }
@@ -440,11 +440,12 @@
       { "decision": "Escalate exit code to 2 when a check crashes, even at 0 issues.", "alternatives": ["Return 0 on a crashed-but-no-issues run"], "rationale": "Automation must not read an incomplete sweep as a clean bill of health; a crash means coverage was partial, so the run is flagged distinctly from a genuine all-clear." },
       { "decision": "L2 deterministic prefilter with a distinctiveness gate before the LLM classifier.", "alternatives": ["Send every open item to the classifier"], "rationale": "Most open items have no plausible completion evidence and can be triaged for free; the distinctiveness gate (snake_case / len>=8 / interior mixed-case) stops generic short words like add/fix from accidentally matching unrelated shipped features." },
       { "decision": "Classifier chunking at <=25 groups per sub-agent call.", "alternatives": ["One sub-agent call for the whole payload", "Raise the timeout ceiling"], "rationale": "A single large payload risks exceeding the 300s timeout and forces the slower Sonnet tier; chunking keeps each call fast, on Haiku, and recoverable on partial failure." },
-      { "decision": "Cross-plugin O_EXCL dedup lock that fails open.", "alternatives": ["Assume a single install", "A fail-closed lock"], "rationale": "The monorepo and standalone marketplace copies can both be installed; the lock prevents double-writes, but fails open (empty session_id or any FS error to proceed) so it can never silently swallow a legitimate hook." }
+      { "decision": "Cross-plugin O_EXCL dedup lock that fails open.", "alternatives": ["Assume a single install", "A fail-closed lock"], "rationale": "The monorepo and standalone marketplace copies can both be installed; the lock prevents double-writes, but fails open (empty session_id or any FS error to proceed) so it can never silently swallow a legitimate hook." },
+      { "decision": "Every SKILL.md (and live scripts/) resolver copy is inlined, not a single shared generated file (#278).", "alternatives": ["A generated resolver at a fixed installed path, imported/sourced by every call site"], "rationale": "A shared generated artifact is fewer copies but adds an install-time artifact that can itself go missing, trading 68+ visible duplicate copies for one invisible single point of failure. Duplication is deliberately tolerated and guarded instead: a drift test enforces byte-identity of the resolver body across every skills/*/SKILL.md site." }
     ]
   },
   "testing": {
-    "unitSuite": { "tool": "pytest", "fileCount": 81, "duration": "fast (stdlib, no network)", "environments": { "python": "3.12" }, "coverage": { "lines": 90, "source": "hooks", "omits": ["obsidian_utils.py (I/O monolith)", "deep_cli.py"] } },
+    "unitSuite": { "tool": "pytest", "fileCount": 85, "duration": "fast (stdlib, no network)", "environments": { "python": "3.12" }, "coverage": { "lines": 90, "source": "hooks", "omits": ["obsidian_utils.py (I/O monolith)", "deep_cli.py"] } },
     "manualMatrix": { "doc": "CLAUDE.md (Development Commands)", "devices": ["hook simulation: pipe synthetic SessionEnd/SessionStart/PreCompact JSON into installed hooks", "json.load validation of hooks.json and plugin.json"], "rationale": "No build/test framework for the prompt-based skills; hooks are validated by feeding synthetic lifecycle JSON and asserting vault writes + telemetry outcomes." }
   },
   "scripts": [
