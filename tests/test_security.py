@@ -307,7 +307,18 @@ class TestStdinCap:
             registry = os.path.expanduser("~/.claude/plugins/known_marketplaces.json")
             with open(registry, encoding="utf-8") as f:
                 for entry in json.load(f).values():
-                    location = (entry or {}).get("installLocation", "")
+                    # `continue`, not a bare read: one malformed third-party
+                    # entry ordered ahead of obsidian-brain's must not abort
+                    # iteration. `isabs` because a relative location would make
+                    # the sentinel cwd-dependent. Kept in lockstep with the
+                    # canonical forms in tests/test_hooks_resolver_drift.py.
+                    location = (
+                        entry.get("installLocation")
+                        if isinstance(entry, dict)
+                        else None
+                    )
+                    if not (isinstance(location, str) and os.path.isabs(location)):
+                        continue
                     hooks = os.path.join(location, "hooks")
                     if os.path.isfile(os.path.join(hooks, "obsidian_utils.py")):
                         return Path(location)
@@ -530,6 +541,58 @@ class TestStdinCap:
         )
         with pytest.raises(AssertionError, match="Uncapped or over-cap stdin read"):
             self.test_every_stdin_read_is_capped()
+
+    # --- parity with the canonical resolver -------------------------------
+    #
+    # _skill_resolved_install_root is a MIRROR of the resolver copied into the
+    # 68 SKILL.md sites, and a mirror that can drift is worth little: a
+    # mutation that reverted the entry validation below left the whole security
+    # module green. tests/test_hooks_resolver_drift.py pins the 68 copies to
+    # each other; these two pin this copy to the same semantics, behaviourally
+    # rather than by comparing text.
+
+    @staticmethod
+    def _registry(home, entries):
+        (home / ".claude" / "plugins").mkdir(parents=True, exist_ok=True)
+        (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(
+            json.dumps(entries), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _install(root):
+        (root / "hooks").mkdir(parents=True)
+        (root / "hooks" / "obsidian_utils.py").write_text("", encoding="utf-8")
+        return root
+
+    def test_mirror_skips_a_bad_entry_and_keeps_looking(self, tmp_path, monkeypatch):
+        """A malformed third-party entry ordered first must not abort the loop
+        (json.load preserves insertion order, so ``aaa-`` is iterated first)."""
+        install = self._install(tmp_path / "checkout")
+        home = tmp_path / "home"
+        self._registry(
+            home,
+            {
+                "aaa-third-party": {"installLocation": None},
+                "user-chosen-name": {"installLocation": str(install)},
+            },
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        assert self._skill_resolved_install_root() == install
+
+    def test_mirror_ignores_a_cwd_relative_install_location(
+        self, tmp_path, monkeypatch
+    ):
+        """A relative installLocation must be skipped, not resolved against
+        whatever directory pytest happens to be running in."""
+        cwd = tmp_path / "cwd"
+        self._install(cwd / "relative-install")
+        home = tmp_path / "home"
+        self._registry(home, {"mp": {"installLocation": "relative-install"}})
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        monkeypatch.chdir(cwd)
+        assert self._skill_resolved_install_root() is None
 
 
 class TestFilePermissions:

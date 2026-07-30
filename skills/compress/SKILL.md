@@ -27,7 +27,10 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
             if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
                 return _h
     except Exception:
@@ -87,7 +90,10 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
             if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
                 return _h
     except Exception:
@@ -232,7 +238,10 @@ import glob, json, os, re
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _h = os.path.join((_m or {}).get('installLocation', ''), 'hooks')
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
             if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
                 return _h
     except Exception:
@@ -272,7 +281,10 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
             if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
                 return _h
     except Exception:
@@ -404,7 +416,10 @@ Where:
   def _ob_hooks():
       try:
           for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-              _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+              _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
+              if not (isinstance(_i, str) and os.path.isabs(_i)):
+                  continue
+              _h = os.path.join(_i, "hooks")
               if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
                   return _h
       except Exception:
@@ -460,7 +475,10 @@ import glob, json, os, re
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _h = os.path.join((_m or {}).get('installLocation', ''), 'hooks')
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
             if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
                 return _h
     except Exception:

@@ -58,7 +58,10 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _h = os.path.join((_m or {}).get("installLocation", ""), "hooks")
+            _i = (_m or {}).get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
             if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
                 return _h
     except Exception:
@@ -74,7 +77,10 @@ import glob, json, os, re, sys
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _h = os.path.join((_m or {}).get('installLocation', ''), 'hooks')
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
             if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
                 return _h
     except Exception:
@@ -90,7 +96,10 @@ import glob, json, os, re
 def _ob_hooks():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _h = os.path.join((_m or {}).get('installLocation', ''), 'hooks')
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
             if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
                 return _h
     except Exception:
@@ -107,7 +116,10 @@ import glob, json, os, re
 def _ob_doctor():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _h = os.path.join((_m or {}).get('installLocation', ''), 'hooks')
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
             if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
                 _v = os.path.join(os.path.dirname(_h), 'scripts', 'vault_doctor.py')
                 if os.path.isfile(_v):
@@ -257,6 +269,50 @@ def test_resolver_site_count_is_exactly_68():
     )
 
 
+def test_expected_counts_are_self_consistent():
+    """The two literals are independent of the scan, but not of each other."""
+    assert EXPECTED_SITE_COUNT == sum(EXPECTED_FORM_COUNTS.values())
+
+
+def test_no_cache_glob_lives_outside_an_extracted_resolver_block():
+    """Cross-check the two scans against each other.
+
+    ``_resolver_sites()`` keys on ``def _ob_hooks():`` / ``def _ob_doctor():``.
+    A site that does not use that shape — a fresh copy of the PRE-#278
+    one-liner, pasted in from an older skill or from documentation — is
+    invisible to ``_SITES``, so ``== 68`` never moves and byte identity has
+    nothing to compare. It also still contains ``key=lambda p:``, so the older
+    lexicographic guard in test_skill_snippets.py is satisfied, and that
+    module's site scan is a ``>= 67`` floor that only ever goes up. A 69th copy
+    of the OLD resolver is the same rot arriving by the front door.
+
+    So: every line mentioning the plugin cache must lie INSIDE the line span of
+    an extracted canonical block. Sites are dedented but never re-wrapped, so
+    ``text.count("\\n")`` is an exact span.
+    """
+    spans = {}
+    for site in _SITES:
+        spans.setdefault(site.skill, []).append(
+            (site.lineno, site.lineno + site.text.count("\n"))
+        )
+    offenders = []
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill_name = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as f:
+            for lineno, line in enumerate(f.read().split("\n"), 1):
+                if "~/.claude/plugins/cache/*/obsidian-brain/" not in line:
+                    continue
+                if not any(a <= lineno <= b for a, b in spans.get(skill_name, [])):
+                    offenders.append(f"{skill_name}:{lineno}")
+    assert not offenders, (
+        "plugin-cache glob outside a canonical resolver block: "
+        + ", ".join(offenders)
+        + " — a resolver was added that is not one of the 68 canonical copies. "
+        "Use FORM A/B/C verbatim; a hand-rolled or pre-#278 one-liner is "
+        "invisible to every other test in this module."
+    )
+
+
 def test_every_resolver_site_is_byte_identical_to_a_canonical_form():
     """No 'close enough' copies. 68 hand-maintained duplicates only stay safe
     while they are literally the same bytes."""
@@ -310,19 +366,30 @@ def _body(text):
 
 
 def _observed(form):
-    """The file-derived text for a canonical family (skips the test if the
-    family has already failed the drift check, so this test reports the
-    invariant and not a duplicate of the drift failure)."""
-    texts = {s.text for s in _SITES}
-    if form not in texts:
-        pytest.skip("family absent from the files — see the drift tests")
+    """Assert the family is PRESENT in the files, then hand back its text.
+
+    Membership is checked against the scan, so returning the constant is
+    equivalent to returning the file text — but only because of that check,
+    which is why it is an assertion and not a convenience.
+
+    It FAILS rather than skips when the family is missing. A skip reads as
+    green in a summary line, and the tests that depend on this include the
+    fail-first probe proof — the most load-bearing test in the module. The
+    drift tests fail in the same run and say what actually drifted.
+    """
+    if form not in {s.text for s in _SITES}:
+        pytest.fail("family absent — see the drift tests")
     return form
 
 
 def test_form_bodies_are_identical_modulo_quote_character():
     """FORM B is FORM A with the quotes swapped and ``sys`` dropped — nothing
-    else. Checked against the text actually present in the SKILL.md files, so
-    a body that diverges in one family only fails here.
+    else.
+
+    The constants are compared, which is meaningful because ``_observed()``
+    first asserts each family is present in the files byte-identically: a body
+    that diverges in one family fails the drift test, and the family it belongs
+    to then fails here.
 
     ``sys`` is the one legitimate asymmetry: FORM A needs it for
     ``sys.path``, FORM B (which prints) does not.
@@ -639,27 +706,25 @@ def test_resolver_never_raises_on_a_malformed_registry(text, func, shape, fake_h
 
 
 @pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
-def test_empty_install_location_makes_the_sentinel_cwd_relative(
+def test_empty_install_location_falls_through_to_the_cache(
     text, func, fake_home, tmp_path, monkeypatch
 ):
-    """CHARACTERIZATION test for a live defect — it pins what the shipped
-    resolver does today, NOT what it ought to do.
+    """An entry with no usable ``installLocation`` must be SKIPPED — resolution
+    may never depend on the caller's working directory.
 
-    A registry entry with no ``installLocation`` (or an empty one) reduces the
-    sentinel to the RELATIVE path ``hooks/obsidian_utils.py``. If the caller's
-    working directory happens to be any obsidian-brain checkout, that file
-    exists, the loop returns a relative path, and the plugin cache is never
-    consulted — resolution silently depends on the cwd, which is the coupling
-    #278's FORM C set out to remove (it deleted a ``$(pwd)`` fallback for
-    exactly this reason).
+    ``os.path.join("", "hooks")`` is the relative string ``"hooks"``, so a
+    sentinel check built on it is evaluated against the cwd. Run from inside
+    any obsidian-brain checkout — which is where a developer runs these skills
+    — that file exists, so the loop would return a relative path and the cache
+    would never be consulted. FORM C is the sharp end: it deliberately deleted
+    a ``$(pwd)/scripts/vault_doctor.py`` fallback because cwd-coupling is a
+    bug, and this would have let the same coupling back in through the front
+    door.
 
-    Reproduced outside pytest: ``{"mp": {}}`` in the registry + cwd on a
-    checkout makes the FORM C dispatcher return ``scripts/vault_doctor.py``.
-
-    Not currently harmful on a well-formed registry (every real entry carries
-    an absolute ``installLocation``). Reported alongside this commit. If the
-    resolver is hardened to require a non-empty ``installLocation``, this test
-    must be INVERTED, not deleted — that inversion is the point of pinning it.
+    The ``isabs`` guard in the resolver is what makes this pass. The
+    cwd-on-a-checkout construction below is the whole point of the test: with
+    a neutral cwd the assertion holds for the wrong reason (nothing matches
+    either way), and the regression walks straight back in.
     """
     cwd_checkout = tmp_path / "cwd-checkout"
     (cwd_checkout / "hooks").mkdir(parents=True)
@@ -667,11 +732,77 @@ def test_empty_install_location_makes_the_sentinel_cwd_relative(
     (cwd_checkout / "scripts").mkdir()
     (cwd_checkout / "scripts" / "vault_doctor.py").write_text("", encoding="utf-8")
     (fake_home / MARKETPLACES).write_text('{"mp": {}}', encoding="utf-8")
-    _seed_cache(fake_home, "3.3.1", func)  # present, and deliberately skipped
+    expected = _seed_cache(fake_home, "3.3.1", func)
 
     monkeypatch.chdir(cwd_checkout)
-    relative ="scripts/vault_doctor.py" if func == "_ob_doctor" else "hooks"
-    assert _resolver(text, func)() == relative
+    assert _resolver(text, func)() == expected
+
+
+@pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
+def test_relative_install_location_falls_through_to_the_cache(
+    text, func, fake_home, tmp_path, monkeypatch
+):
+    """Same hazard, stated the other way: a RELATIVE ``installLocation`` is not
+    usable either, because what it names depends on where the skill was
+    invoked from."""
+    cwd_checkout = tmp_path / "cwd-checkout"
+    (cwd_checkout / "relative-install" / "hooks").mkdir(parents=True)
+    (cwd_checkout / "relative-install" / "hooks" / "obsidian_utils.py").write_text(
+        "", encoding="utf-8"
+    )
+    (cwd_checkout / "relative-install" / "scripts").mkdir()
+    (cwd_checkout / "relative-install" / "scripts" / "vault_doctor.py").write_text(
+        "", encoding="utf-8"
+    )
+    (fake_home / MARKETPLACES).write_text(
+        json.dumps({"mp": {"installLocation": "relative-install"}}), encoding="utf-8"
+    )
+    expected = _seed_cache(fake_home, "3.3.1", func)
+
+    monkeypatch.chdir(cwd_checkout)
+    assert _resolver(text, func)() == expected
+
+
+# Multi-entry registries. Every shape in MALFORMED_REGISTRIES is single-entry,
+# and that is exactly what hid the loop-abort defect: with one entry there is
+# no way to tell "skip the bad entry and keep looking" from "give up on the
+# whole registry". A real registry has one entry per installed marketplace (9
+# on the author's machine), in an order obsidian-brain does not control — so a
+# third-party entry sorted first must not be able to shadow ours.
+MULTI_ENTRY_REGISTRIES = {
+    "bad-then-good": {"aaa-third-party": {"installLocation": None}},
+    "int-then-good": {"aaa-third-party": 7},
+    "null-then-good": {"aaa-third-party": None},
+    "list-then-good": {"aaa-third-party": []},
+    "no-key-then-good": {"aaa-third-party": {}},
+    "relative-then-good": {"aaa-third-party": {"installLocation": "some/where"}},
+}
+
+
+@pytest.mark.parametrize("text,func", _BLOCK_PARAMS)
+@pytest.mark.parametrize("shape", sorted(MULTI_ENTRY_REGISTRIES))
+def test_a_bad_entry_does_not_shadow_a_later_good_one(
+    text, func, shape, fake_home
+):
+    """C2 regression guard. ``json.load`` preserves insertion order, so the bad
+    entry below is iterated FIRST.
+
+    With the whole ``for`` loop inside one ``try``, the first entry that raises
+    (``os.path.join(None, "hooks")`` → TypeError, ``(7).get`` →
+    AttributeError) aborts iteration over every remaining entry and drops
+    straight to the cache — cache-first resolution restored silently, by
+    someone else's plugin, with no obsidian-brain misconfiguration involved.
+    That is this PR's own thesis failing.
+    """
+    _seed_cache(fake_home, "9.9.9", func)  # would win if the loop aborted
+    expected = _seed_install_location(fake_home, func)
+    registry = json.loads((fake_home / MARKETPLACES).read_text(encoding="utf-8"))
+    ordered = dict(MULTI_ENTRY_REGISTRIES[shape])
+    ordered.update(registry)
+    assert list(ordered)[0] != "user-chosen-name", "bad entry must be iterated first"
+    (fake_home / MARKETPLACES).write_text(json.dumps(ordered), encoding="utf-8")
+
+    assert _resolver(text, func)() == expected
 
 
 # ---------------------------------------------------------------------------

@@ -53,7 +53,10 @@ import glob, json, os, re
 def _ob_doctor():
     try:
         for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _h = os.path.join((_m or {}).get('installLocation', ''), 'hooks')
+            _i = (_m or {}).get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
             if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
                 _v = os.path.join(os.path.dirname(_h), 'scripts', 'vault_doctor.py')
                 if os.path.isfile(_v):
