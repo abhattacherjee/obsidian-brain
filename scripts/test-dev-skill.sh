@@ -98,8 +98,11 @@ fi
 #
 # Note which pattern catches which: the partial's real name ends in
 # `.partial.<pid>`, NOT in `.bak`, so the `\.bak$` arm does not match it --
-# the `\.partial\.[0-9]+$` arm is the one that does. Deleting either arm
-# leaves a truncated tree selectable.
+# the `\.partial\.` arm is the one that does. Deleting either arm leaves a
+# truncated tree selectable. Unanchored (not `\.partial\.[0-9]+$`) so it
+# matches the SAME set as `status`'s orphan-listing glob (`*.partial.*`,
+# below) -- the two features report on this class of directory and must
+# not be able to disagree about a given one.
 #
 # The `|| true` wraps the WHOLE pipeline, not just the `grep`, and that is
 # load-bearing rather than defensive noise. Two commands in here can exit
@@ -118,7 +121,7 @@ fi
 # WRONG version either: every failure mode yields the empty string, which is
 # exactly what the guard below tests for.
 PLUGIN_VERSION="$( { ls -1 "$CACHE_BASE" 2>/dev/null \
-    | grep -v -e '\.bak$' -e '\.partial\.[0-9][0-9]*$' \
+    | grep -v -e '\.bak$' -e '\.partial\.' \
     | sort -V | tail -1; } || true )"
 if [[ -z "$PLUGIN_VERSION" ]]; then
     echo "ERROR: No cached version found at $CACHE_BASE" >&2
@@ -200,7 +203,7 @@ case "$cmd" in
         # Keep the `exit 3` inside the trap: without it the trap only prints
         # and `set -e` then exits with the failing command's own status (1),
         # which is the code this arm exists to stop overloading.
-        trap 'echo "ERROR: Install failed partway. The cache was PARTIALLY overwritten and a backup of the original is in place. Run \"/dev-test restore\" to recover." >&2; exit 3' ERR
+        trap 'echo "ERROR: Install failed partway. A backup of the original is in place and the cache may hold a mix of released and dev files. Run \"/dev-test restore\" to recover." >&2; exit 3' ERR
 
         echo "Installing dev versions..."
 
@@ -377,7 +380,7 @@ case "$cmd" in
         if compgen -G "$CACHE_BASE/*.partial.*" > /dev/null 2>&1; then
             echo ""
             echo "Orphaned partial backups found (leftovers from an interrupted install)."
-            echo "They are never used by 'restore' and are safe to delete:"
+            echo "They are never used by 'restore'; safe to delete once no '/dev-test install' is running:"
             for _partial in "$CACHE_BASE"/*.partial.*; do
                 [[ -e "$_partial" ]] || continue
                 echo "  $_partial"

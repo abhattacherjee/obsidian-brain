@@ -671,6 +671,12 @@ def test_an_interrupted_backup_never_produces_a_bak(tmp_path: Path) -> None:
         # The shorter shape, kept so the filter stays correct if the partial is
         # ever built from the bare version rather than from BACKUP_DIR.
         ".partial.4242",
+        # Non-numeric suffix: unreachable via BACKUP_TMP (`$$` is always
+        # numeric) but hand-plantable, and it is the shape that made the
+        # version-scan filter and `status`'s orphan-listing glob
+        # (`*.partial.*`, unanchored) disagree before the scan filter was
+        # broadened to match. Pin that they now agree.
+        ".bak.partial.abc",
     ],
 )
 def test_a_leftover_partial_backup_is_not_selected_as_the_version(
@@ -781,9 +787,13 @@ def test_a_partway_install_exits_3_not_1(tmp_path: Path) -> None:
         f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
     assert "Install failed partway" in proc.stderr
-    assert "PARTIALLY overwritten" in proc.stderr, (
-        "the message must state that the cache WAS modified, not merely that "
+    assert "backup of the original is in place" in proc.stderr, (
+        "the message must state that a backup exists, not merely that "
         f"something failed; got {proc.stderr!r}"
+    )
+    assert "mix of released and dev files" in proc.stderr, (
+        "the message must warn the cache may be in a mixed state; got "
+        f"{proc.stderr!r}"
     )
     assert "/dev-test restore" in proc.stderr
     # The precondition the exit code is claiming: a backup really was published.
@@ -821,7 +831,10 @@ def test_status_discloses_orphaned_partial_backups(tmp_path: Path) -> None:
     assert "Orphaned partial backups" in proc.stdout, (
         f"status must disclose the leftovers, got {proc.stdout!r}"
     )
-    assert "safe to delete" in proc.stdout
+    assert "safe to delete once no '/dev-test install' is running" in proc.stdout, (
+        "the hint must be qualified -- the script never auto-deletes these "
+        f"because the pid may belong to a live install; got {proc.stdout!r}"
+    )
     for stale in orphans:
         assert stale.name in proc.stdout, f"{stale.name} not listed in {proc.stdout!r}"
     # Disclosure only: the pid may belong to a live install, so nothing is

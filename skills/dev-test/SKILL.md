@@ -88,9 +88,9 @@ Report the output, then **branch on the command's exit status** — the fenced b
 
   > The dev version was copied into the plugin cache, but the **security tests failed** (see above). Do **not** start a new session against this install. Run `/dev-test restore` to revert it, fix the failures, then re-install.
 
-- **Exit 3 — the install aborted partway and the cache WAS modified.** The backup was already published and the cache was being overwritten when a copy failed, so the cache now holds a mix of released and dev files. Relay the script's error output and tell the user:
+- **Exit 3 — the install aborted partway; a backup is in place.** The backup was already published before the copy that failed, so the cache may now hold a mix of released and dev files. Relay the script's error output and tell the user:
 
-  > The install **failed partway**. The plugin cache is in a **mixed state** (part original, part dev) and a backup of the original is in place. Run `/dev-test restore` to recover **before doing anything else** — until you do, the next `/dev-test install` will also refuse ("Backup already exists").
+  > The install **failed partway**. A backup of the original is in place and the cache **may hold a mix** of released and dev files. Run `/dev-test restore` to recover **before doing anything else** — until you do, the next `/dev-test install` will also refuse ("Backup already exists").
 
 - **Any other non-zero exit — the install did not complete.** These are the paths that refuse *before* the cache is written — a guard rejecting the source tree, no cache to install into, a `.bak` already present, or a backup copy that failed (which the script states explicitly leaves the cache unmodified). Do **not** say a dev version was installed, and do **not** tell the user to start a new session. Relay the error output verbatim and stop; the script names the offending path and the remedy.
 
