@@ -1,8 +1,8 @@
-"""Drift + behaviour guards for the 68 hand-copied hook resolvers (#278).
+"""Drift + behaviour guards for the 71 hand-copied resolvers (#278, #287).
 
 Every ``skills/*/SKILL.md`` bash block is its own shell, so the resolver that
 puts ``hooks/`` on ``sys.path`` cannot be hoisted into one shared definition —
-it is copied verbatim into 68 sites. This module is what makes that duplication
+it is copied verbatim into 71 sites. This module is what makes that duplication
 safe. It has two halves:
 
 **Drift (static).** Each site is extracted from the file, normalised by *its own
@@ -40,9 +40,29 @@ rewritten back to cache-only globbing, with the lambda's name untouched, passed
 the entire suite. ``test_every_resolver_site_consults_install_location_before_the_cache``
 is the test that now fails for that exact mutation.
 
+**Two resolver FAMILIES, deliberately not merged.** FORM A/A_SINGLE/B/C answer
+"where is the *installed* plugin tree?" and therefore fall back to the plugin
+cache. FORM D (#287, ``/dev-test``) answers a different question — "where is
+the local *checkout* I can copy *from*?" — and per that plan's D3 the cache is
+NOT a legal answer: ``scripts/test-dev-skill.sh`` derives its ``REPO_ROOT``
+from its own location, so resolving it out of the cache makes ``install`` copy
+the cache onto itself and print a full success transcript for a no-op. FORM D
+therefore has no cache branch at all and returns ``''`` so its shell caller can
+fail loudly. The behavioural parametrisations are split accordingly
+(``_BLOCK_PARAMS`` vs ``_REPO_BLOCK_PARAMS``); the split is by ``site.func``,
+not by canonical text, so a *drifted* FORM D copy is still executed against the
+FORM D assertions rather than escaping both sets.
+``test_block_partitions_cover_every_distinct_block`` pins that no block falls
+between the two.
+
 Nothing here reads this machine's real ``~/.claude`` — every fixture is built
 under ``tmp_path`` with ``$HOME`` monkeypatched, so the suite behaves the same
 on CI, where neither the marketplace registry nor the plugin cache exists.
+That matters twice as much for FORM D: this machine has a directory-source
+registration pointing at *this very checkout*, so the registry route and the
+``git rev-parse --show-toplevel`` fallback return the SAME path here. A test
+that only asserted "the resolver found the checkout" would pass with either
+layer deleted. Every FORM D case below is built so the two routes disagree.
 """
 
 from __future__ import annotations
@@ -52,6 +72,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -156,15 +177,63 @@ def _ob_doctor():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-3].split('.')], _p), default='')
 print(_ob_doctor())"""
 
-# The independently derived tally (see the plan's task-4 brief). EQUALITY, not
-# a floor: 56 + 2 + 9 + 1 = 68.
+# 3 sites (/dev-test steps 2-4): the REPO-ROOT family (#287). Copied from
+# docs/plans/287-dev-test-repo-root.md's canonical FORM_D listing. It differs
+# from FORM A/B/C in three deliberate ways, each pinned by a test below:
+#   * the sentinel is `scripts/test-dev-skill.sh`, not `hooks/obsidian_utils.py`
+#     — it is looking for a checkout to copy FROM, not an installed tree;
+#   * it returns the installLocation ROOT, not a subdirectory of it;
+#   * it has NO plugin-cache fallback and defaults to `''` (D3 — resolving the
+#     cache here would make `/dev-test install` copy the cache onto itself).
+# Single-quoted internals: its sites sit inside `python3 -c "..."` (D5).
+FORM_D = """\
+import json, os
+def _ob_repo():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            if os.path.isfile(os.path.join(_i, 'scripts', 'test-dev-skill.sh')):
+                return _i
+    except Exception:
+        pass
+    return ''
+print(_ob_repo())"""
+
+# The independently derived tally (see the plan's task-4 brief, and #287's
+# Global Constraints). EQUALITY, not a floor: 56 + 2 + 9 + 1 + 3 = 71.
 EXPECTED_FORM_COUNTS = {
     FORM_A: 56,
     FORM_A_SINGLE: 2,
     FORM_B: 9,
     FORM_C: 1,
+    FORM_D: 3,
 }
-EXPECTED_SITE_COUNT = 68
+EXPECTED_SITE_COUNT = 71
+
+#: Every canonical form, mapped to its constant NAME. One table, consulted by
+#: both ``_distinct_blocks()`` and ``test_canonical_form_family_counts_are_exact``
+#: — they used to carry separate copies, and a form added to one but not the
+#: other reports as ``NONCANONICAL`` in exactly one of them.
+FORM_NAMES = {
+    FORM_A: "FORM_A",
+    FORM_A_SINGLE: "FORM_A_SINGLE",
+    FORM_B: "FORM_B",
+    FORM_C: "FORM_C",
+    FORM_D: "FORM_D",
+}
+
+#: The resolver function name that marks the repo-root family. ``site.func`` —
+#: not canonical text — is what routes a block to the FORM D behavioural
+#: assertions, so a DRIFTED dev-test copy is still executed against them.
+REPO_FUNC = "_ob_repo"
+
+#: FORM D's sentinel, relative to the installLocation root.
+DEV_TEST_SENTINEL = ("scripts", "test-dev-skill.sh")
 
 # The resolver as it stood BEFORE #278 — cache-only, digit-scraping key, no
 # allowlist. Verbatim from `git show 4d3458c:skills/recall/SKILL.md` line 26
@@ -182,10 +251,16 @@ PRE_278_RESOLVER = (
 # Extraction
 # ---------------------------------------------------------------------------
 
-_DEF_RE = re.compile(r"^(\s*)def (_ob_hooks|_ob_doctor)\(\):$")
-_IMPORT_RE = re.compile(r"^\s*import glob, json, os, re(, sys)?$")
+# `_ob_repo` (#287) is here for the reason D4 spells out: a resolver named
+# anything this pattern does not list is INVISIBLE to `_SITES`, so the `== 71`
+# equality never moves, byte identity has nothing to compare, and hand-copies
+# ship unguarded. That is finding C1 from #278's final review.
+_DEF_RE = re.compile(r"^(\s*)def (_ob_hooks|_ob_doctor|_ob_repo)\(\):$")
+# FORM D needs neither `glob` nor `re` (no cache glob, no version allowlist),
+# so its import line is its own alternative rather than a loosened optional.
+_IMPORT_RE = re.compile(r"^\s*(?:import glob, json, os, re(?:, sys)?|import json, os)$")
 _TAIL_RE = re.compile(
-    r"^\s*(sys\.path\.insert\(0, _ob_hooks\(\)\)|print\(_ob_(?:hooks|doctor)\(\)\))$"
+    r"^\s*(sys\.path\.insert\(0, _ob_hooks\(\)\)|print\(_ob_(?:hooks|doctor|repo)\(\)\))$"
 )
 # A resolver block is 12-13 lines; 30 is generous headroom without letting a
 # runaway search swallow unrelated file content.
@@ -222,8 +297,9 @@ def _resolver_sites():
             start = i - 1
             assert start >= 0 and _IMPORT_RE.match(lines[start]), (
                 f"{skill_name}/SKILL.md:{i + 1}: `def {func}():` is not preceded "
-                f"by the canonical `import glob, json, os, re[, sys]` line "
-                f"(found {lines[start - 1] if start >= 0 else '<start of file>'!r})"
+                f"by a canonical import line (`import glob, json, os, re[, sys]` "
+                f"for FORM A/B/C, `import json, os` for FORM D) "
+                f"(found {lines[start] if start >= 0 else '<start of file>'!r})"
             )
             end = next(
                 (
@@ -262,18 +338,39 @@ def _distinct_blocks():
         if site.text in seen:
             continue
         seen[site.text] = True
-        canonical = {
-            FORM_A: "FORM_A",
-            FORM_A_SINGLE: "FORM_A_SINGLE",
-            FORM_B: "FORM_B",
-            FORM_C: "FORM_C",
-        }.get(site.text, f"NONCANONICAL@{site.label}")
+        canonical = FORM_NAMES.get(site.text, f"NONCANONICAL@{site.label}")
         out.append((canonical, site.text, site.func))
     return out
 
 
 _BLOCKS = _distinct_blocks()
-_BLOCK_PARAMS = [pytest.param(t, f, id=lbl) for lbl, t, f in _BLOCKS]
+# Split by FUNCTION NAME, not by canonical text. The two families answer
+# different questions (see the module docstring) and cannot satisfy each
+# other's assertions: FORM A/B/C must fall back to the plugin cache, FORM D
+# must never touch it. Keying on `func` means a DRIFTED dev-test block — one
+# that is no longer byte-identical to FORM_D — still lands in
+# `_REPO_BLOCK_PARAMS` and still has to pass every FORM D behaviour test,
+# rather than silently escaping both parametrisations.
+_BLOCK_PARAMS = [
+    pytest.param(t, f, id=lbl) for lbl, t, f in _BLOCKS if f != REPO_FUNC
+]
+_REPO_BLOCK_PARAMS = [
+    pytest.param(t, f, id=lbl) for lbl, t, f in _BLOCKS if f == REPO_FUNC
+]
+
+
+def test_block_partitions_cover_every_distinct_block():
+    """Guard on the split itself.
+
+    An empty ``parametrize`` list does not fail — pytest simply collects no
+    cases — so a typo in ``REPO_FUNC``, or a family whose function is renamed,
+    would delete a whole behavioural parametrisation while the summary line
+    still reads green. Both partitions must be non-empty and must together
+    account for every distinct block.
+    """
+    assert _BLOCK_PARAMS, "no cache-family blocks — the behavioural suite is empty"
+    assert _REPO_BLOCK_PARAMS, "no repo-root blocks — FORM D behaviour is untested"
+    assert len(_BLOCK_PARAMS) + len(_REPO_BLOCK_PARAMS) == len(_BLOCKS)
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +378,8 @@ _BLOCK_PARAMS = [pytest.param(t, f, id=lbl) for lbl, t, f in _BLOCKS]
 # ---------------------------------------------------------------------------
 
 
-def test_resolver_site_count_is_exactly_68():
-    """EQUALITY, deliberately — 68 is derived independently (56 + 2 + 9 + 1),
+def test_resolver_site_count_is_exactly_71():
+    """EQUALITY, deliberately — 71 is derived independently (56 + 2 + 9 + 1 + 3),
     not read back from the scan. A ``>=`` floor here would let a deleted site,
     or a site reformatted past the extractor, pass silently."""
     assert len(_SITES) == EXPECTED_SITE_COUNT, (
@@ -306,10 +403,10 @@ def test_no_cache_glob_lives_outside_an_extracted_resolver_block():
     ``_resolver_sites()`` keys on ``def _ob_hooks():`` / ``def _ob_doctor():``.
     A site that does not use that shape — a fresh copy of the PRE-#278
     one-liner, pasted in from an older skill or from documentation — is
-    invisible to ``_SITES``, so ``== 68`` never moves and byte identity has
+    invisible to ``_SITES``, so ``== 71`` never moves and byte identity has
     nothing to compare. It also still contains ``key=lambda p:``, so the older
     lexicographic guard in test_skill_snippets.py is satisfied, and that
-    module's site scan is a ``>= 67`` floor that only ever goes up. A 69th copy
+    module's site scan is a ``>= 67`` floor that only ever goes up. A 72nd copy
     of the OLD resolver is the same rot arriving by the front door.
 
     So: every line mentioning the plugin cache must lie INSIDE the line span of
@@ -322,8 +419,11 @@ def test_no_cache_glob_lives_outside_an_extracted_resolver_block():
     ``os.path.join(os.path.expanduser("~/.claude/plugins/cache"), ...)``, or
     the ``find "$CACHE_DIR" -maxdepth 2 -name hooks`` shape that this branch
     documents as having evaded an earlier audit, contains no such literal and
-    slips straight past. The literal is a good key for the shape the 68 copies
-    actually use, not a general-purpose detector.
+    slips straight past. The literal is a good key for the shape the 68
+    cache-family copies actually use, not a general-purpose detector. (FORM D
+    has no cache glob by design, so it contributes nothing to find here — the
+    guard that keeps it cache-free is
+    ``test_every_resolver_site_consults_install_location_before_the_cache``.)
     ``test_no_scripts_file_reaches_the_cache_without_the_registry`` covers
     ``scripts/**`` with a deliberately shape-agnostic key (any ``plugins/cache``
     mention) for exactly this reason.
@@ -345,7 +445,7 @@ def test_no_cache_glob_lives_outside_an_extracted_resolver_block():
     assert not offenders, (
         "plugin-cache glob outside a canonical resolver block: "
         + ", ".join(offenders)
-        + " — a resolver was added that is not one of the 68 canonical copies. "
+        + " — a resolver was added that is not one of the 71 canonical copies. "
         "Use FORM A/B/C verbatim; a hand-rolled or pre-#278 one-liner is "
         "invisible to every other test in this module."
     )
@@ -391,14 +491,14 @@ def test_cache_only_script_allowlist_has_no_dead_entries():
 
 
 def test_no_scripts_file_reaches_the_cache_without_the_registry():
-    """The 68 SKILL.md copies are pinned byte-for-byte; the ~13 copies under
+    """The 71 SKILL.md copies are pinned byte-for-byte; the ~13 copies under
     ``scripts/`` cannot be, so this is the weaker invariant that still bites.
 
     Byte identity is impossible there — different defaults, different path
     indices ([-2] vs [-3] vs [-4]), Python and shell hosts — but the property
     that matters survives: a file that reaches into the plugin cache must
     consult the marketplace registry too, and the resolver-shaped references
-    must consult it FIRST. Without this, the argument that made 68 hand-copies
+    must consult it FIRST. Without this, the argument that made 71 hand-copies
     acceptable ("the mitigation is a drift test") simply did not extend to
     them.
 
@@ -530,33 +630,29 @@ def test_no_converted_script_interpolates_a_resolved_path_into_python():
 
 
 def test_every_resolver_site_is_byte_identical_to_a_canonical_form():
-    """No 'close enough' copies. 68 hand-maintained duplicates only stay safe
+    """No 'close enough' copies. 71 hand-maintained duplicates only stay safe
     while they are literally the same bytes."""
     canonical = set(EXPECTED_FORM_COUNTS)
     offenders = [s.label for s in _SITES if s.text not in canonical]
     assert not offenders, (
         "Resolver site(s) drifted from every canonical form: "
         + ", ".join(offenders)
-        + ". Compare against FORM_A / FORM_A_SINGLE / FORM_B / FORM_C in this "
-        "module (and .superpowers/sdd/278-hooks-resolver/resolver-spec.md); the "
-        "difference is usually a quote character or a re-wrapped line."
+        + ". Compare against FORM_A / FORM_A_SINGLE / FORM_B / FORM_C / FORM_D "
+        "in this module (and .superpowers/sdd/278-hooks-resolver/resolver-spec.md, "
+        "docs/plans/287-dev-test-repo-root.md for FORM D); the difference is "
+        "usually a quote character or a re-wrapped line."
     )
 
 
 def test_canonical_form_family_counts_are_exact():
     """Each family's population is pinned, so moving a site between families —
     e.g. flipping one site's internal quote character — fails here even though
-    the total stays at 68."""
+    the total stays at 71."""
     observed = collections.Counter(s.text for s in _SITES)
-    names = {
-        FORM_A: "FORM_A",
-        FORM_A_SINGLE: "FORM_A_SINGLE",
-        FORM_B: "FORM_B",
-        FORM_C: "FORM_C",
-    }
+    names = FORM_NAMES
     # Aggregated, not a dict comprehension: several drifted families all map to
     # the "NONCANONICAL" key, and a comprehension would keep only the last
-    # one's count — reporting `{'NONCANONICAL': 1}` for 68 drifted sites.
+    # one's count — reporting `{'NONCANONICAL': 1}` for 71 drifted sites.
     got = collections.Counter()
     for text, n in observed.items():
         got[names.get(text, "NONCANONICAL")] += n
@@ -566,7 +662,8 @@ def test_canonical_form_family_counts_are_exact():
         f"resolver family populations changed: expected {want}, got {got}. "
         "56 = double-quoted sys.path.insert sites, 2 = /check-items' "
         "single-quoted sys.path.insert sites, 9 = FORM B print sites, "
-        "1 = /vault-doctor's FORM C dispatcher."
+        "1 = /vault-doctor's FORM C dispatcher, 3 = /dev-test's FORM D "
+        "repo-root sites."
     )
 
 
@@ -637,6 +734,58 @@ def test_form_c_is_the_scripts_variant_of_form_b():
     )
 
 
+def test_form_d_is_the_repo_root_variant():
+    """FORM D shares FORM A/B/C's registry preamble verbatim — the same
+    discriminator, the same ``installLocation`` validation — and then diverges
+    where #287 says it must.
+
+    The preamble is compared as TEXT rather than restated as prose so that a
+    future edit to the shared guards in one family and not the other is a
+    failure here, not a silent fork. The divergences (different sentinel,
+    returns the root, no cache) are each asserted individually so removing one
+    fails for its own reason.
+    """
+    d = _observed(FORM_D)
+    b = _observed(FORM_B)
+
+    # Everything from `def` through the `isabs` guard's `continue` is shared.
+    def _preamble(text):
+        lines = text.split("\n")
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("def "))
+        end = next(i for i, ln in enumerate(lines) if "os.path.isabs(_i)" in ln)
+        return "\n".join(lines[start + 1 : end + 2])
+
+    assert _preamble(d) == _preamble(b), (
+        "FORM D's registry preamble has forked from FORM B's — the "
+        "source-discriminator and installLocation guards must stay identical "
+        "across families or a fix applied to one silently misses the other"
+    )
+
+    assert d.startswith("import json, os\n"), (
+        "FORM D needs neither glob nor re; a stray import is drift"
+    )
+    assert "os.path.join(_i, 'scripts', 'test-dev-skill.sh')" in d, (
+        "FORM D's sentinel is the dev-test script, not hooks/obsidian_utils.py: "
+        "it is looking for a checkout to copy FROM"
+    )
+    assert "obsidian_utils.py" not in d
+    assert "\n                return _i\n" in d, (
+        "FORM D returns the installLocation ROOT — the caller appends "
+        "scripts/test-dev-skill.sh itself"
+    )
+    assert "plugins/cache" not in d, (
+        "D3: resolving the cache here makes `/dev-test install` copy the cache "
+        "onto itself and print a success transcript for a no-op"
+    )
+    assert "glob" not in d and "re.fullmatch" not in d, (
+        "no cache glob means no version allowlist to carry either"
+    )
+    assert d.endswith("\n    return ''\nprint(_ob_repo())"), (
+        "FORM D must default to the empty string so its shell caller's "
+        "`[ -z \"$REPO\" ]` guard fires and the fallback route is reached"
+    )
+
+
 # ---------------------------------------------------------------------------
 # (d) THE CARRIED FINDING: semantics, not naming
 # ---------------------------------------------------------------------------
@@ -652,18 +801,39 @@ def test_every_resolver_site_consults_install_location_before_the_cache():
     it requires the marketplace lookup to be PRESENT and to appear BEFORE the
     cache glob — a cache-only rewrite has no marketplace lookup at all, whatever
     its identifiers are named.
+
+    FORM D (``_ob_repo``) is held to a STRICTER rule, not a looser one: it must
+    mention no plugin cache at all. Per #287's D3 the cache is not a legal
+    answer for ``/dev-test``, because ``scripts/test-dev-skill.sh`` derives its
+    ``REPO_ROOT`` from its own location — resolved out of the cache, ``install``
+    copies the cache onto itself and reports success for a byte-for-byte no-op.
+    Its sentinel differs for the same reason: it is looking for a checkout to
+    copy FROM (``scripts/test-dev-skill.sh``), not an installed tree to import
+    (``hooks/obsidian_utils.py``).
     """
     offenders = []
     for site in _SITES:
         text = site.text
+        repo_family = site.func == REPO_FUNC
+        sentinel = "test-dev-skill.sh" if repo_family else "obsidian_utils.py"
         if "known_marketplaces.json" not in text:
             offenders.append(f"{site.label} (no marketplace lookup at all)")
             continue
         if "installLocation" not in text:
             offenders.append(f"{site.label} (no installLocation read)")
             continue
-        if "obsidian_utils.py" not in text:
-            offenders.append(f"{site.label} (no sentinel check)")
+        if sentinel not in text:
+            offenders.append(f"{site.label} (no {sentinel} sentinel check)")
+            continue
+        if repo_family:
+            if "plugins/cache" in text:
+                offenders.append(
+                    f"{site.label} (repo-root resolver reaches the plugin cache; "
+                    "D3 forbids it — that is the self-copy no-op)"
+                )
+            continue
+        if "plugins/cache/" not in text:
+            offenders.append(f"{site.label} (no plugin-cache fallback at all)")
             continue
         if text.index("known_marketplaces.json") > text.index("plugins/cache/"):
             offenders.append(f"{site.label} (cache consulted before installLocation)")
@@ -1308,3 +1478,836 @@ def test_probe_is_not_committed_to_the_repo():
     """The probe is a scratch artifact. If one is ever left behind in hooks/ it
     ships to every user through the plugin cache."""
     assert not os.path.exists(os.path.join(_REPO_ROOT, "hooks", "_probe_278.py"))
+
+
+# ---------------------------------------------------------------------------
+# (e) FORM D — /dev-test's repo-root resolver (#287)
+#
+# THE TRAP this section is built around: the author's machine registers a
+# directory-source marketplace pointing at THIS checkout, so the
+# `git rev-parse --show-toplevel` route (layer 1) and the registry route
+# (layer 2) return the same path here — the numbering is the shipped one, cwd
+# first, matching every test docstring below. "The resolver found the
+# checkout" is therefore not evidence of anything — it stays true with either
+# layer deleted. Every case below makes the two routes DISAGREE, or removes one
+# of them, so the assertion can only hold for one reason.
+# ---------------------------------------------------------------------------
+
+_GIT = shutil.which("git")
+_BASH = shutil.which("bash")
+_PYTHON3 = shutil.which("python3")
+_REQUIRES_GIT = pytest.mark.skipif(_GIT is None, reason="git not available")
+_REQUIRES_BASH = pytest.mark.skipif(_BASH is None, reason="bash not available")
+_REQUIRES_PYTHON3 = pytest.mark.skipif(
+    _PYTHON3 is None, reason="python3 not on PATH (the block invokes it by name)"
+)
+
+
+def _seed_checkout(root, *, sentinel=True):
+    """Build a plausible obsidian-brain checkout at ``root``.
+
+    ``hooks/obsidian_utils.py`` is written even when ``sentinel=False`` on
+    purpose: a tree that is missing EVERYTHING would be rejected by any
+    implementation, so the negative fixtures would prove nothing about the
+    guard they are named for. What distinguishes the two is exactly the one
+    file FORM D keys on.
+    """
+    (root / "hooks").mkdir(parents=True, exist_ok=True)
+    (root / "hooks" / "obsidian_utils.py").write_text("", encoding="utf-8")
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
+    if sentinel:
+        (root / "scripts" / "test-dev-skill.sh").write_text(
+            "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
+        )
+    return str(root)
+
+
+def _has_sentinel(root):
+    return os.path.isfile(os.path.join(str(root), *DEV_TEST_SENTINEL))
+
+
+def _write_registry(home, entries):
+    (home / MARKETPLACES).write_text(json.dumps(entries), encoding="utf-8")
+
+
+def _dir_entry(path):
+    return {"source": DIRECTORY_SOURCE, "installLocation": str(path)}
+
+
+# ---------------------------------------------------------------------------
+# FORM D, case 1: the registry beats the caller's location
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text,func", _REPO_BLOCK_PARAMS)
+def test_repo_resolver_prefers_the_registered_checkout_over_the_cwd(
+    text, func, fake_home, tmp_path, monkeypatch
+):
+    """Both trees carry the sentinel, and the cwd is one of them.
+
+    That is the discriminating construction: a resolver that looked at the
+    working directory would return ``other``, and one that read the registry
+    returns ``registered``. With only one tree in play the assertion would
+    hold either way.
+
+    Note this pins the PYTHON layer, which must stay cwd-independent — the
+    cwd is consulted by the shell wrapper around it (and, since the review
+    round P1 precedence fix — the revision recorded in
+    docs/plans/287-dev-test-repo-root.md — consulted FIRST; see the shell
+    section at the bottom of this module). If this body ever starts
+    answering with the cwd, the two
+    layers become indistinguishable and the wrapper's ordering is untestable.
+    """
+    registered = _seed_checkout(fake_home / "registered-checkout")
+    other = _seed_checkout(tmp_path / "some-other-checkout")
+    assert _has_sentinel(registered) and _has_sentinel(other)
+    _write_registry(fake_home, {"user-chosen-name": _dir_entry(registered)})
+
+    monkeypatch.chdir(other)
+    got = _resolver(text, func)()
+    assert got == registered, f"expected the registered checkout, got {got!r}"
+    assert got != other
+
+
+# ---------------------------------------------------------------------------
+# FORM D, case 2: a bad entry must not shadow a later good one (#278's C2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text,func", _REPO_BLOCK_PARAMS)
+def test_a_checkout_without_the_sentinel_does_not_shadow_a_later_good_one(
+    text, func, fake_home
+):
+    """``json.load`` preserves insertion order, so the sentinel-less entry is
+    iterated FIRST. It must be skipped, not treated as the answer and not
+    treated as the end of the search.
+
+    This is the case that gives the sentinel check teeth: delete
+    ``os.path.isfile(os.path.join(_i, 'scripts', 'test-dev-skill.sh'))`` and the
+    first entry — another plugin's directory-source checkout, which a real
+    registry is full of — is returned instead.
+    """
+    stranger = _seed_checkout(fake_home / "aaa-some-other-plugin", sentinel=False)
+    good = _seed_checkout(fake_home / "obsidian-brain")
+    assert not _has_sentinel(stranger), "fixture must lack the sentinel"
+    assert _has_sentinel(good)
+    entries = {"aaa-third-party": _dir_entry(stranger), "zzz-ours": _dir_entry(good)}
+    assert list(entries)[0] == "aaa-third-party", "bad entry must be iterated first"
+    _write_registry(fake_home, entries)
+
+    assert _resolver(text, func)() == good
+
+
+# ---------------------------------------------------------------------------
+# FORM D, case 3: github-source entries are ignored, sentinel or not
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text,func", _REPO_BLOCK_PARAMS)
+def test_a_github_source_entry_is_ignored_even_with_the_sentinel(
+    text, func, fake_home
+):
+    """Not theoretical. obsidian-brain's ``.claude-plugin/marketplace.json``
+    declares ``"source": "./"``, so the marketplace repo IS the plugin repo and
+    a github-source clone under ``~/.claude/plugins/marketplaces/<name>`` really
+    does carry ``scripts/test-dev-skill.sh`` at its root.
+
+    Copying *from* that clone is wrong for the same reason copying from the
+    cache is (#287 D3 / #278): it is a released tree that ``/plugin marketplace
+    update`` rewrites behind your back, not the working copy the user is
+    editing. ``''`` — and the loud shell failure it triggers — is the correct
+    answer.
+
+    The fixture's sentinel is asserted first, so a future refactor that stops
+    creating it cannot turn this into a test that passes for the wrong reason.
+    """
+    clone = _seed_checkout(fake_home / "marketplace-clone")
+    assert _has_sentinel(clone), "fixture must satisfy the sentinel, or it proves nothing"
+    _write_registry(
+        fake_home, {"mp": {"source": GITHUB_SOURCE, "installLocation": clone}}
+    )
+
+    assert _resolver(text, func)() == ""
+
+
+@pytest.mark.parametrize("text,func", _REPO_BLOCK_PARAMS)
+@pytest.mark.parametrize("shape", sorted(NON_DIRECTORY_SOURCES))
+def test_a_non_directory_source_does_not_shadow_a_later_good_one(
+    text, func, shape, fake_home
+):
+    """Every non-directory / malformed ``source`` shape is skipped WITHOUT
+    aborting the loop.
+
+    ``source`` is third-party-controlled like every other key: a bare string
+    (``"directory".get`` → AttributeError) or a list is enough to raise inside
+    the shared ``try``, and one raise takes out every remaining entry. Each
+    fixture's installLocation holds a real sentinel-bearing tree, so falling
+    through to the good entry proves the discriminator did the work rather than
+    the sentinel.
+    """
+    decoy = _seed_checkout(fake_home / "aaa-decoy")
+    good = _seed_checkout(fake_home / "obsidian-brain")
+    assert _has_sentinel(decoy), "decoy must satisfy the sentinel"
+    entry = {"installLocation": decoy}
+    source = NON_DIRECTORY_SOURCES[shape]
+    if source is not OMIT_SOURCE:
+        entry["source"] = source
+    entries = {"aaa-third-party": entry, "zzz-ours": _dir_entry(good)}
+    assert list(entries)[0] == "aaa-third-party", "bad entry must be iterated first"
+    _write_registry(fake_home, entries)
+
+    assert _resolver(text, func)() == good
+
+
+#: Registry VALUES that are not dicts at all — the shape ``NON_DIRECTORY_SOURCES``
+#: cannot reach, because every row there builds ``{"installLocation": …}`` and
+#: only varies the ``source`` key.
+#:
+#: These are what keep ``isinstance(_m, dict)`` honest. Measured before this
+#: fixture existed: dropping that guard from FORM D's three SKILL.md copies and
+#: the ``FORM_D`` constant together failed exactly ONE test — the byte-identity
+#: text pin — and **zero** FORM D behaviour tests. The behavioural safety net was
+#: transitive only (FORM B's ``int-then-good`` row fails, and the preamble pin
+#: forces the two families to stay byte-identical), which is weaker than a family
+#: that has its own direct cover.
+#:
+#: Consequence of the missing guard: ``_m.get('source')`` on a non-dict raises
+#: inside the SHARED ``try``, aborting iteration over every REMAINING entry — so
+#: one third-party plugin's malformed row silently takes out obsidian-brain's own
+#: and ``/dev-test`` stops finding the registered checkout.
+NON_DICT_ENTRIES = {
+    "entry-is-an-int": 7,
+    "entry-is-null": None,
+    "entry-is-a-list": [],
+    "entry-is-a-bare-string": "directory",
+}
+
+
+def test_the_non_dict_entry_fixtures_are_actually_non_dicts():
+    """Guard on the guard. A row that quietly became a dict would be skipped by
+    the ``source`` discriminator standing in front of ``isinstance(_m, dict)``,
+    so the test would keep passing while covering a different guard entirely —
+    the #278 fixture-drift defect in a new place."""
+    for shape, entry in NON_DICT_ENTRIES.items():
+        assert not isinstance(entry, dict), (
+            f"{shape} must NOT be a dict, or `isinstance(_m, dict)` is never "
+            "the guard under test"
+        )
+
+
+@pytest.mark.parametrize("text,func", _REPO_BLOCK_PARAMS)
+@pytest.mark.parametrize("shape", sorted(NON_DICT_ENTRIES))
+def test_a_non_dict_entry_does_not_shadow_a_later_good_one(
+    text, func, shape, fake_home
+):
+    """Bad entry FIRST, good entry second — the only framing that separates
+    "skipped it" from "gave up on the whole registry".
+
+    ``json.load`` preserves insertion order, and ``''`` is the answer BOTH a
+    correct resolver and a crashed one give for a registry with no usable entry
+    — which is why the good entry has to be there, and has to be second.
+    """
+    good = _seed_checkout(fake_home / "obsidian-brain")
+    assert _has_sentinel(good), "the good entry must satisfy the sentinel"
+    entries = {"aaa-third-party": NON_DICT_ENTRIES[shape], "zzz-ours": _dir_entry(good)}
+    assert list(entries)[0] == "aaa-third-party", "bad entry must be iterated first"
+    _write_registry(fake_home, entries)
+
+    assert _resolver(text, func)() == good
+
+
+# ---------------------------------------------------------------------------
+# FORM D, case 4: unusable installLocation values
+# ---------------------------------------------------------------------------
+
+#: Each row carries a VALID directory ``source``, so the guard under test is
+#: the installLocation validation rather than the discriminator standing in
+#: front of it. Note which clause stops which row — collapsing them is how the
+#: empty-string case went untested for a whole review cycle in #278:
+#:
+#:   * ``key-absent`` / ``null`` / ``int``  -> ``isinstance(_i, str)``
+#:   * ``empty-string`` / ``relative``      -> ``os.path.isabs(_i)``
+REPO_UNUSABLE_INSTALL_LOCATIONS = {
+    "key-absent": {"source": DIRECTORY_SOURCE},
+    "null": {"source": DIRECTORY_SOURCE, "installLocation": None},
+    "int": {"source": DIRECTORY_SOURCE, "installLocation": 3},
+    "empty-string": {"source": DIRECTORY_SOURCE, "installLocation": ""},
+    "relative": {
+        "source": DIRECTORY_SOURCE,
+        "installLocation": "relative-checkout",
+    },
+}
+
+
+def test_the_repo_unusable_install_location_fixtures_are_actually_unusable():
+    """Guard on the guards. The failure mode being prevented is not a wrong
+    assertion but a fixture that quietly stops constructing the condition its
+    test is named for."""
+    assert "installLocation" not in REPO_UNUSABLE_INSTALL_LOCATIONS["key-absent"]
+    assert REPO_UNUSABLE_INSTALL_LOCATIONS["null"]["installLocation"] is None
+    assert REPO_UNUSABLE_INSTALL_LOCATIONS["empty-string"]["installLocation"] == ""
+    assert not os.path.isabs(
+        REPO_UNUSABLE_INSTALL_LOCATIONS["relative"]["installLocation"]
+    )
+    for shape, entry in REPO_UNUSABLE_INSTALL_LOCATIONS.items():
+        assert entry["source"] == DIRECTORY_SOURCE, (
+            f"{shape} must carry a valid directory source, or the discriminator "
+            "skips it first and the installLocation guard is never reached"
+        )
+
+
+@pytest.mark.parametrize("text,func", _REPO_BLOCK_PARAMS)
+@pytest.mark.parametrize("shape", sorted(REPO_UNUSABLE_INSTALL_LOCATIONS))
+def test_an_unusable_install_location_does_not_shadow_a_later_good_one(
+    text, func, shape, fake_home, tmp_path, monkeypatch
+):
+    """Bad entry first, good entry second — the only framing that can tell
+    "skipped it" from "gave up on the whole registry".
+
+    The cwd is a decoy checkout that ALSO carries ``relative-checkout/`` beneath
+    it, and that construction is the whole point of the test rather than
+    scenery. ``os.path.join("", "scripts", "test-dev-skill.sh")`` is the
+    *relative* string ``scripts/test-dev-skill.sh``: with ``isabs`` deleted, the
+    ``empty-string`` row's sentinel check is evaluated against the working
+    directory, succeeds there, and the resolver returns ``''`` — which the shell
+    caller reads as "not found" and which is not the registered checkout either
+    way. Same for ``relative``. With a neutral cwd both rows would pass with the
+    guard deleted, and #287's whole thesis (resolution must not depend on where
+    you invoked from) would walk back in through the front door.
+    """
+    cwd_decoy = tmp_path / "cwd-decoy"
+    _seed_checkout(cwd_decoy)
+    _seed_checkout(cwd_decoy / "relative-checkout")
+    good = _seed_checkout(fake_home / "obsidian-brain")
+    entries = {
+        "aaa-third-party": REPO_UNUSABLE_INSTALL_LOCATIONS[shape],
+        "zzz-ours": _dir_entry(good),
+    }
+    assert list(entries)[0] == "aaa-third-party", "bad entry must be iterated first"
+    _write_registry(fake_home, entries)
+
+    monkeypatch.chdir(cwd_decoy)
+    got = _resolver(text, func)()
+    assert got == good, (
+        f"{shape}: expected the registered checkout {good!r}, got {got!r} — a "
+        "cwd-relative or aborted resolution"
+    )
+
+
+@pytest.mark.parametrize("text,func", _REPO_BLOCK_PARAMS)
+@pytest.mark.parametrize("shape", sorted(REPO_UNUSABLE_INSTALL_LOCATIONS))
+def test_an_unusable_install_location_alone_yields_the_empty_string(
+    text, func, shape, fake_home, tmp_path, monkeypatch
+):
+    """The same rows with no good entry behind them: the answer is ``''``, never
+    a cwd-relative path. FORM D has no cache to fall back to (D3), so ``''`` is
+    what makes the shell caller take its fallback route and then fail loudly."""
+    cwd_decoy = tmp_path / "cwd-decoy"
+    _seed_checkout(cwd_decoy)
+    _seed_checkout(cwd_decoy / "relative-checkout")
+    _write_registry(
+        fake_home, {"mp": REPO_UNUSABLE_INSTALL_LOCATIONS[shape]}
+    )
+
+    monkeypatch.chdir(cwd_decoy)
+    assert _resolver(text, func)() == ""
+
+
+# ---------------------------------------------------------------------------
+# FORM D, case 5: a malformed registry degrades, it does not raise
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text,func", _REPO_BLOCK_PARAMS)
+@pytest.mark.parametrize("shape", sorted(MALFORMED_REGISTRIES))
+def test_repo_resolver_never_raises_on_a_malformed_registry(
+    text, func, shape, fake_home
+):
+    """This block runs inside ``REPO="$(python3 -c "…")"``. An exception here
+    does not degrade gracefully — it puts a traceback on stderr, leaves ``$REPO``
+    empty anyway, and buries the actionable error message the shell wrapper was
+    going to print."""
+    (fake_home / MARKETPLACES).write_text(
+        MALFORMED_REGISTRIES[shape], encoding="utf-8"
+    )
+    assert _resolver(text, func)() == ""
+
+
+@pytest.mark.parametrize("text,func", _REPO_BLOCK_PARAMS)
+def test_repo_resolver_returns_empty_when_there_is_no_registry_at_all(
+    text, func, fake_home
+):
+    """The shape on CI and on a machine with no marketplaces installed: the
+    file does not exist, ``open`` raises, and the answer is ``''``."""
+    assert not (fake_home / MARKETPLACES).exists()
+    assert _resolver(text, func)() == ""
+
+
+# ---------------------------------------------------------------------------
+# FORM D, cases 6-7: the SHELL wrapper around the block
+#
+# The Python resolver is only layer 2. Layer 1 (the sentinel-gated git
+# toplevel, which the wrapper consults FIRST) and layer 3 (the loud failure)
+# live in the bash that wraps it, and nothing above can see them — including
+# which of the two layers answered, which is the whole question here.
+# These run the fenced block from skills/dev-test/SKILL.md verbatim
+# under a real bash, with only its final `bash "$REPO/scripts/test-dev-skill.sh"
+# <sub>` line swapped for an echo — asserted to be that line first, so the
+# rewrite cannot silently mis-fire on a block it does not understand.
+# ---------------------------------------------------------------------------
+
+_DEV_TEST_SKILL = os.path.join(_REPO_ROOT, "skills", "dev-test", "SKILL.md")
+_DEV_TEST_INVOCATION_RE = re.compile(
+    r'^bash "\$REPO/scripts/test-dev-skill\.sh" (install|restore|status)$'
+)
+_RESOLVED_MARKER = "OB_RESOLVED_REPO:"
+
+
+def _dev_test_shell_blocks():
+    """``[(lineno, script, subcommand)]`` — every ```bash fence in /dev-test
+    that resolves $REPO.
+
+    Parametrised over rather than sampled: the three copies are hand-maintained
+    and the whole point of this module is that hand-maintained copies drift.
+
+    The Python body is byte-pinned elsewhere (drift test), but the trailing
+    ``bash "$REPO/scripts/test-dev-skill.sh" <sub>`` line is the *only* thing
+    the three copies are allowed to differ on — Step 2 is ``install``, Step 3
+    ``restore``, Step 4 ``status`` — so the subcommand is extracted here too,
+    not just the body, and pinned as an ordered tuple by
+    ``test_dev_test_steps_map_to_the_right_subcommands`` below.
+    """
+    with open(_DEV_TEST_SKILL, encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    blocks = []
+    opened = None
+    for i, line in enumerate(lines):
+        if opened is None:
+            if line.strip() == "```bash":
+                opened = i
+            continue
+        if line.strip() == "```":
+            body = lines[opened + 1 : i]
+            if any("test-dev-skill.sh" in ln for ln in body):
+                match = _DEV_TEST_INVOCATION_RE.match(body[-1])
+                sub = match.group(1) if match else None
+                blocks.append((opened + 2, "\n".join(body), sub))
+            opened = None
+    return blocks
+
+
+def _prepare_dev_test_block(script):
+    """Swap the trailing installer invocation for an echo of the resolved path.
+
+    The precondition is asserted, not assumed. A silent no-op rewrite would
+    leave these tests running the REAL ``test-dev-skill.sh``, which writes the
+    plugin cache — the assertions would then be measuring a side effect on the
+    developer's machine instead of the resolver.
+    """
+    lines = script.split("\n")
+    assert _DEV_TEST_INVOCATION_RE.match(lines[-1]), (
+        f"dev-test block does not end in the expected installer invocation "
+        f"(found {lines[-1]!r}) — the harness rewrite would be a no-op and "
+        f"these tests would run the real script against the real plugin cache"
+    )
+    lines[-1] = f'echo "{_RESOLVED_MARKER}$REPO"'
+    return "\n".join(lines)
+
+
+_DEV_TEST_BLOCK_PARAMS = [
+    pytest.param(_prepare_dev_test_block(text), id=f"dev-test:{lineno}")
+    for lineno, text, _sub in _dev_test_shell_blocks()
+]
+
+
+def test_every_dev_test_step_has_an_extracted_shell_block():
+    """An empty parametrize list collects zero cases and still reads green, so
+    the count is pinned here: /dev-test has three steps that resolve $REPO."""
+    assert len(_DEV_TEST_BLOCK_PARAMS) == EXPECTED_FORM_COUNTS[FORM_D] == 3
+
+
+def test_dev_test_steps_map_to_the_right_subcommands():
+    """The Python resolver body is byte-pinned identical across all three
+    SKILL.md blocks (drift test above); the trailing subcommand is the ONE
+    thing that is allowed — and needed — to differ between them, which makes
+    it the one thing that can drift unnoticed. Pin it as an ORDERED tuple,
+    not a set: a set would still pass if Step 3 and Step 4 swapped answers.
+
+    Concretely: swapping Step 3 ("Restore original") from `restore` to
+    `install` passes the entire rest of this repo's test suite unchanged —
+    `/dev-test restore` would silently re-run `install` instead of undoing
+    it. This is the regression this test exists to catch.
+    """
+    subs = [sub for _lineno, _text, sub in _dev_test_shell_blocks()]
+    assert subs == ["install", "restore", "status"], (
+        f"expected the 3 /dev-test steps (Install/Restore/Status) to invoke "
+        f"test-dev-skill.sh with subcommands in that exact order, got {subs!r}"
+    )
+
+
+def _dev_test_report_prose():
+    """``{subcommand: prose}`` — what each step tells Claude to SAY afterwards.
+
+    The prose runs from the closing fence of a step's ```bash block to the next
+    ``### `` heading (or EOF). That text is the step's deliverable: the script's
+    exit status only reaches the user through it.
+    """
+    with open(_DEV_TEST_SKILL, encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    out = {}
+    opened = None
+    pending = None
+    start = None
+    for i, line in enumerate(lines):
+        if pending is not None and line.startswith("### "):
+            out[pending] = "\n".join(lines[start:i])
+            pending = None
+        if opened is None:
+            if line.strip() == "```bash":
+                opened = i
+            continue
+        if line.strip() == "```":
+            body = lines[opened + 1 : i]
+            match = (
+                _DEV_TEST_INVOCATION_RE.match(body[-1])
+                if any("test-dev-skill.sh" in ln for ln in body)
+                else None
+            )
+            if match:
+                pending, start = match.group(1), i + 1
+            opened = None
+    if pending is not None:
+        out[pending] = "\n".join(lines[start:])
+    return out
+
+
+#: The sentence each step is only allowed to say on ``Exit 0``, per step.
+#:
+#: The pin that bites is the ORDER: keyword-presence assertions ("exit status",
+#: "non-zero") are a proxy for prose semantics and survive the mutation that
+#: matters — hoisting the success sentence out of its arm and above the
+#: branching instruction, so it reads as the unconditional deliverable again.
+#: Measured on this module before ``restore``/``status`` were covered: moving
+#: Step 3's "Original version restored" above the branching instruction while
+#: leaving the keywords in place passed 262/262. That is this branch's own
+#: defect class ("stop the skill narrating over a refused install") surviving
+#: in the other two steps, so all three are pinned the same way.
+_EXIT_ZERO_ONLY_SENTENCE = {
+    "install": "Start a new Claude Code session",
+    "restore": "Original version restored",
+    # Step 4 has no banner; its exit-0-only claim is that the script's output
+    # IS a status report — the thing a non-zero exit means it is not.
+    "status": "report the status verbatim",
+}
+
+
+@pytest.mark.parametrize("sub", ["install", "restore", "status"])
+def test_dev_test_reporting_branches_on_the_exit_status(sub):
+    """`exit 2` was a signal with no receiver.
+
+    ``scripts/test-dev-skill.sh`` exits 2 when the dev version was copied into
+    the cache but the security tests failed, printing *"Do not run a live
+    session against this install until they pass."* Step 2 then instructed,
+    unconditionally, *"Dev version installed. Start a new Claude Code session
+    to pick up the changes."* — the direct contradiction of the script's own
+    warning, delivered as the last thing the user hears. Two reviewers found it
+    independently: the failure is surfaced by the script and then talked over
+    by its sole consumer.
+
+    This is the same defect the branch fixes one file over ("the install
+    transcript stops asserting work that did not happen"), reintroduced at the
+    layer where the scripted line IS the deliverable — so it is pinned here, in
+    the prose, not only in the script's exit code.
+    """
+    prose = _dev_test_report_prose()
+    assert set(prose) == {"install", "restore", "status"}, (
+        f"expected report prose after all three steps, got {sorted(prose)}"
+    )
+    text = prose[sub]
+
+    assert "exit status" in text, (
+        f"step {sub!r} must tell Claude to branch on the script's exit status"
+    )
+    assert "non-zero" in text, (
+        f"step {sub!r} must say what to do when the script exits non-zero"
+    )
+    if sub == "install":
+        # Exit 2 is install-only: it is the one status that means "the cache
+        # WAS written AND the result is unsafe", so it needs its own arm —
+        # collapsing it into the generic non-zero arm would tell the user
+        # nothing was installed when something was.
+        assert "Exit 2" in text
+        assert "/dev-test restore" in text
+        # Exit 3 is install-only for the same reason, from the other side: a
+        # partway install (backup published, cache half-overwritten) used to
+        # exit 1 and land in the catch-all arm, which asserted "nothing was
+        # installed" — the exact opposite of what the script had just printed.
+        # A user told nothing happened does not run `restore`.
+        assert "Exit 3" in text, (
+            "the partway-install exit code needs its own arm; folded into the "
+            "catch-all it becomes a claim the caller cannot know is true"
+        )
+        assert text.index("Exit 3") < text.index("Any other non-zero"), (
+            "the exit-3 arm must be read before the catch-all it is carved out of"
+        )
+        # And the catch-all must not re-assert the state it no longer knows.
+        assert "nothing was installed." not in text, (
+            "the catch-all arm covers every non-zero code that is not 2 or 3; "
+            "asserting 'nothing was installed' there is what exit 3 exists to fix"
+        )
+    if sub == "restore":
+        # Exit 4 is restore-only: "there was no backup, so nothing was
+        # restored". It shared exit 0 with a COMPLETED restore, which left this
+        # step's single exit-0 arm narrating "Original version restored. Start a
+        # new session" over a run that changed nothing — the same defect exit 3
+        # was carved out of the install catch-all to fix, in the arm that was
+        # left sharing.
+        # Anchored on the bullet marker, not the bare string "Exit 4": a plain
+        # substring test is satisfied by any code that merely STARTS with 4
+        # (measured — renumbering the arm to "Exit 44" passed 3/3), which is the
+        # vacuity class this module already fixed elsewhere.
+        assert "**Exit 4 —" in text, (
+            "the no-op restore needs its own arm; folded into exit 0 it becomes "
+            "a claim the caller cannot know is true"
+        )
+        assert text.index("**Exit 4 —") < text.index("Any other non-zero"), (
+            "the exit-4 arm must be read before the catch-all"
+        )
+        assert "no new session is needed" in text.lower(), (
+            "the exit-4 arm must say the opposite of the exit-0 banner — "
+            "nothing changed, so there is nothing to pick up"
+        )
+    # The exit-0-only sentence must live UNDER the exit-0 arm, never above the
+    # branching instruction — in every step, not just `install`.
+    banner = _EXIT_ZERO_ONLY_SENTENCE[sub]
+    assert banner in text, f"step {sub!r} lost its exit-0 sentence {banner!r}"
+    assert "Exit 0" in text, f"step {sub!r} must name the exit-0 arm"
+    assert text.index("Exit 0") < text.index(banner), (
+        f"step {sub!r}: {banner!r} must be reachable only on exit 0, not "
+        "hoisted above the branching instruction where it reads as the "
+        "unconditional deliverable"
+    )
+
+
+def _run_dev_test_block(script, home, cwd):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["HOME"] = str(home)
+    env.pop("USERPROFILE", None)
+    # GIT_DIR (and friends) would override `git -C`/cwd and make
+    # `git rev-parse --show-toplevel` answer for some other repo entirely, at
+    # exit 0 — the fallback layer would then be measured against the wrong tree.
+    return subprocess.run(
+        [_BASH, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(cwd),
+        timeout=120,
+    )
+
+
+def _resolved(result):
+    for line in result.stdout.split("\n"):
+        if line.startswith(_RESOLVED_MARKER):
+            return line[len(_RESOLVED_MARKER) :]
+    return None
+
+
+def _git_init(path):
+    subprocess.run(
+        [_GIT, "init", "-q"], cwd=str(path), check=True, capture_output=True, timeout=60
+    )
+
+
+@_REQUIRES_BASH
+@_REQUIRES_PYTHON3
+@_REQUIRES_GIT
+@pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
+def test_shell_prefers_the_cwd_checkout_over_the_registered_one(
+    script, fake_home, tmp_path
+):
+    """Layer 1 (cwd, sentinel-gated) beats layer 2 (registry) when they disagree.
+
+    Both trees are git repositories carrying the sentinel, so BOTH routes can
+    succeed and the answer says which one ran. On this machine the two routes
+    coincide, which is precisely why they are forced apart here.
+
+    This is the git-WORKTREE / second-clone case: standing in a checkout is a
+    deliberate context signal, and the registry can only ever name one of
+    them. With the original registry-first ordering, ``/dev-test install``
+    from a worktree silently installed the REGISTERED checkout's code at
+    exit 0 with a full success transcript — the silent-stale class this whole
+    change exists to kill, re-entering through layer ordering.
+    """
+    registered = _seed_checkout(fake_home / "registered-checkout")
+    _git_init(registered)
+    cwd_repo = _seed_checkout(tmp_path / "cwd-repo")
+    _git_init(cwd_repo)
+    _write_registry(fake_home, {"user-chosen-name": _dir_entry(registered)})
+
+    result = _run_dev_test_block(script, fake_home, cwd_repo)
+    assert result.returncode == 0, result.stderr
+    got = _resolved(result)
+    # Layer 1 hands back git's physical path for cwd_repo. Layer 2 would have
+    # produced the registry's installLocation string verbatim instead.
+    assert got == os.path.realpath(cwd_repo), result.stdout
+    assert os.path.realpath(got) != os.path.realpath(registered)
+
+
+@_REQUIRES_BASH
+@_REQUIRES_PYTHON3
+@_REQUIRES_GIT
+@pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
+def test_shell_uses_the_registry_when_the_cwd_toplevel_lacks_the_sentinel(
+    script, fake_home, tmp_path
+):
+    """Layer 2, reached because the cwd is a FOREIGN repo — bug #287 itself.
+
+    This is the invocation the issue was filed for: ``/dev-test`` run while
+    working on some other project (``control-tower`` in the live report). The
+    cwd toplevel is a perfectly good git repo that simply is not
+    obsidian-brain, so the layer-1 sentinel rejects it and the registered
+    checkout answers instead.
+
+    It is also the test that makes the layer-1 sentinel check load-bearing:
+    delete ``[ -f "$_T/scripts/test-dev-skill.sh" ]`` from the wrapper and the
+    stranger's toplevel wins outright, the registry is never consulted, and
+    this fails naming the wrong tree.
+    """
+    registered = _seed_checkout(fake_home / "registered-checkout")
+    _git_init(registered)
+    _write_registry(fake_home, {"user-chosen-name": _dir_entry(registered)})
+    stranger = _seed_checkout(tmp_path / "control-tower", sentinel=False)
+    _git_init(stranger)
+
+    result = _run_dev_test_block(script, fake_home, stranger)
+    assert result.returncode == 0, result.stderr
+    got = _resolved(result)
+    assert got == registered, result.stdout
+    assert os.path.realpath(got) != os.path.realpath(stranger)
+
+
+@_REQUIRES_BASH
+@_REQUIRES_PYTHON3
+@_REQUIRES_GIT
+@pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
+def test_shell_uses_a_cwd_toplevel_that_has_the_sentinel(
+    script, fake_home, tmp_path
+):
+    """Layer 1 with no registry at all — the unregistered local checkout.
+
+    Run from a SUBDIRECTORY of the repo, so a wrapper that used ``$PWD``
+    instead of ``git rev-parse --show-toplevel`` would resolve
+    ``<repo>/skills/dev-test`` and fail the sentinel check. #287's D2 keeps
+    this layer specifically to preserve the invocation that works today — an
+    unregistered local checkout with the cwd inside it — so deleting it must
+    fail something, and this is it.
+    """
+    assert not (fake_home / MARKETPLACES).exists()
+    cwd_repo = _seed_checkout(tmp_path / "cwd-repo")
+    _git_init(cwd_repo)
+    subdir = tmp_path / "cwd-repo" / "skills" / "dev-test"
+    subdir.mkdir(parents=True)
+
+    result = _run_dev_test_block(script, fake_home, subdir)
+    assert result.returncode == 0, result.stderr
+    assert _resolved(result) == os.path.realpath(cwd_repo), result.stdout
+
+
+@_REQUIRES_BASH
+@_REQUIRES_PYTHON3
+@_REQUIRES_GIT
+@pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
+def test_shell_announces_the_resolved_source_checkout(script, fake_home, tmp_path):
+    """The resolved tree must be PRINTED, not just used.
+
+    Several checkouts of this repo can coexist (worktrees, second clones, the
+    registered one) and they resolve to different answers. Without this line
+    an install from the wrong tree is byte-identical, on screen, to an install
+    from the right one: ``scripts/test-dev-skill.sh`` prints destinations
+    (``hooks/*.py -> cache``) and never its source. Ambiguity has to be
+    observable rather than inferred, so the echo is pinned here — including
+    the resolved path itself, so an echo of a stale or empty variable fails.
+    """
+    cwd_repo = _seed_checkout(tmp_path / "cwd-repo")
+    _git_init(cwd_repo)
+
+    result = _run_dev_test_block(script, fake_home, cwd_repo)
+    assert result.returncode == 0, result.stderr
+    assert f"Source checkout: {os.path.realpath(cwd_repo)}" in result.stdout, (
+        result.stdout
+    )
+
+
+@_REQUIRES_BASH
+@_REQUIRES_PYTHON3
+@_REQUIRES_GIT
+@pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
+def test_shell_rejects_a_cwd_toplevel_without_the_sentinel(
+    script, fake_home, tmp_path
+):
+    """Layer 3. The bug #287 fixes is exactly this shape: ``/dev-test`` invoked
+    while working on some OTHER project, whose git toplevel is a perfectly
+    valid repo that simply is not obsidian-brain.
+
+    The old code ``cd``'d there and ran ``./scripts/test-dev-skill.sh``, which
+    does not exist. The new code must exit non-zero and say which two routes it
+    tried, so the user can register the checkout instead of guessing.
+    """
+    assert not (fake_home / MARKETPLACES).exists()
+    stranger = _seed_checkout(tmp_path / "control-tower", sentinel=False)
+    _git_init(stranger)
+
+    result = _run_dev_test_block(script, fake_home, stranger)
+    assert result.returncode != 0, result.stdout
+    assert _resolved(result) is None, "must not report a resolved repo"
+    assert "known_marketplaces.json" in result.stderr, result.stderr
+    assert "scripts/test-dev-skill.sh" in result.stderr, result.stderr
+
+
+@_REQUIRES_BASH
+@_REQUIRES_PYTHON3
+@_REQUIRES_GIT
+@pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
+def test_shell_rejects_a_github_source_registry_with_no_usable_cwd(
+    script, fake_home, tmp_path
+):
+    """Case 3 carried through to the shell: a github-source entry whose clone
+    HAS the sentinel is ignored by layer 1, layer 2 finds nothing usable, and
+    the command fails loudly instead of copying the marketplace clone.
+
+    Without the ``source.source == 'directory'`` discriminator this returns the
+    clone at exit 0 — a green transcript for the wrong tree.
+    """
+    clone = _seed_checkout(fake_home / "marketplace-clone")
+    assert _has_sentinel(clone)
+    _write_registry(
+        fake_home, {"mp": {"source": GITHUB_SOURCE, "installLocation": clone}}
+    )
+    stranger = _seed_checkout(tmp_path / "control-tower", sentinel=False)
+    _git_init(stranger)
+
+    result = _run_dev_test_block(script, fake_home, stranger)
+    assert result.returncode != 0, result.stdout
+    assert _resolved(result) is None
+    assert "known_marketplaces.json" in result.stderr, result.stderr
+
+
+@_REQUIRES_BASH
+@_REQUIRES_PYTHON3
+@pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
+def test_shell_fails_cleanly_outside_any_git_repository(
+    script, fake_home, tmp_path
+):
+    """``git rev-parse --show-toplevel`` exits non-zero here. The wrapper runs
+    under whatever shell options Claude Code's Bash tool sets, and the ``|| true``
+    is what keeps that from taking the whole block down before the error message
+    is printed."""
+    assert not (fake_home / MARKETPLACES).exists()
+    nowhere = tmp_path / "not-a-repo"
+    nowhere.mkdir()
+
+    result = _run_dev_test_block(script, fake_home, nowhere)
+    assert result.returncode != 0, result.stdout
+    assert _resolved(result) is None
+    assert "ERROR" in result.stderr, result.stderr
