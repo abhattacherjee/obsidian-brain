@@ -79,7 +79,29 @@ def _run(script: Path, cmd: str, home: Path) -> subprocess.CompletedProcess:
     )
 
 
-def _stage_production_geometry(tmp_path: Path, version: str = "1.2.3"):
+#: Where a positive control stages the checkout, relative to ``$HOME``. Each
+#: entry pins one rung of the "just widen the prefix a bit" ladder:
+#:
+#:   * ``dev/obsidian-brain``        — catches widening to ``$HOME/``
+#:   * ``.claude/dev/obsidian-brain`` — catches widening to ``$HOME/.claude/``
+#:
+#: Measured before the second rung existed: widening ``PLUGIN_ROOT_PREFIX`` to
+#: ``$HOME/`` failed 8 tests, but widening it to ``$HOME/.claude/`` passed all
+#: 19 in this module. Working trees under ``~/.claude/`` are a real habit in
+#: this ecosystem (this repo's own CLAUDE.md dispatches
+#: ``~/.claude/skills/<name>/scripts/…``), so that middle rung would brick a
+#: live layout while the module stayed green.
+CHECKOUT_LOCATIONS = {
+    "home-dev": ("dev", "obsidian-brain"),
+    "home-dotclaude-dev": (".claude", "dev", "obsidian-brain"),
+}
+
+
+def _stage_production_geometry(
+    tmp_path: Path,
+    version: str = "1.2.3",
+    repo_rel: tuple = CHECKOUT_LOCATIONS["home-dev"],
+):
     """A checkout UNDER $HOME, plus a plugin cache — the real-world layout.
 
     The pre-existing fixtures put the checkout and ``$HOME`` in sibling
@@ -91,10 +113,12 @@ def _stage_production_geometry(tmp_path: Path, version: str = "1.2.3"):
     ``$HOME/.claude/plugins/`` to ``$HOME/`` — which would refuse
     ``/dev-test install`` for essentially everyone — passes the entire suite.
 
+    ``repo_rel`` selects the rung of that ladder; see ``CHECKOUT_LOCATIONS``.
+
     Returns ``(home, repo, script, cache_dir)``.
     """
     home = tmp_path / "home"
-    repo = home / "dev" / "obsidian-brain"
+    repo = home.joinpath(*repo_rel)
     script = _write_script(repo / "scripts")
     (repo / "hooks").mkdir(parents=True)
     (repo / "hooks" / "obsidian_utils.py").write_text("# dev hook\n")
@@ -369,12 +393,24 @@ def test_self_copy_guard_rejects_install_from_a_marketplace_clone(
 
     assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
     assert GUARD2_MSG in proc.stderr
-    assert "marketplace clone" in proc.stderr
+    # Shape-DISCRIMINATING, deliberately. The guard's text names both shapes
+    # (cache and marketplace clone) on every firing, so `"marketplace clone" in
+    # stderr` is equally true for the cache fixture above — the fixture path,
+    # not the assertion, was carrying this test. What actually distinguishes
+    # this shape is the offending path the guard echoes back, so assert on
+    # that: the clone's own location, under plugins/marketplaces/ rather than
+    # plugins/cache/.
+    assert os.path.realpath(clone) in proc.stderr
+    assert "/plugins/marketplaces/" in proc.stderr
+    assert "/plugins/cache/" not in proc.stderr
 
 
 @requires_bash
-def test_install_proceeds_from_a_checkout_under_home(tmp_path: Path) -> None:
-    """Guard 2's positive control, in the geometry users actually have.
+@pytest.mark.parametrize("location", sorted(CHECKOUT_LOCATIONS), ids=sorted(CHECKOUT_LOCATIONS))
+def test_install_proceeds_from_a_checkout_under_home(
+    tmp_path: Path, location: str
+) -> None:
+    """Guard 2's positive control, in the geometries users actually have.
 
     Every other guard-2 fixture asserts the guard FIRES, and the fixtures
     where it must not fire (tests/test_dev_skill_install.py) put the repo and
@@ -383,13 +419,20 @@ def test_install_proceeds_from_a_checkout_under_home(tmp_path: Path) -> None:
     passed all 2367 tests, while bricking ``/dev-test install`` for every
     developer whose checkout lives under their home directory.
 
+    Parametrized over ``CHECKOUT_LOCATIONS`` because the widening ladder has
+    more than one rung: the ``dev/`` row catches ``$HOME/``, the
+    ``.claude/dev/`` row catches ``$HOME/.claude/`` (which the ``dev/`` row
+    alone does not — measured 19 passed, 0 failed under that mutation).
+
     So: a checkout under ``$HOME`` but outside ``.claude/plugins/`` must
     install cleanly. Asserting the guard messages are ABSENT (not just
     ``returncode == 0``) is what makes this discriminating — a future guard
     that fires for a different reason cannot launder itself through an exit
     code that some other branch also produces.
     """
-    home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
+    home, _repo, script, cache_dir = _stage_production_geometry(
+        tmp_path, repo_rel=CHECKOUT_LOCATIONS[location]
+    )
 
     proc = _run(script, "install", home)
 
@@ -551,3 +594,129 @@ def test_install_fails_loudly_when_security_tests_fail(tmp_path: Path) -> None:
     assert "Start a NEW Claude Code session" not in proc.stdout, (
         "the success banner must not follow a security failure"
     )
+
+
+@requires_bash
+def test_an_interrupted_backup_never_produces_a_bak(tmp_path: Path) -> None:
+    """The reviewer's round-2 reproduction, at its source.
+
+    Shape-validating the ``.bak`` on the restore side samples the failure mode
+    rather than closing it: a ``cp -R`` interrupted anywhere INSIDE ``skills/``
+    — 19 directories, the bulk of the tree, and therefore the most likely
+    interrupt point — leaves ``hooks/obsidian_utils.py`` and a non-empty
+    ``skills/`` both present, passes the sentinel probe, and gets promoted over
+    a healthy cache at exit 0 (measured: a backup holding ``hooks/`` +
+    ``check-items`` destroyed ``recall`` and ``vault-ask``, printing
+    ``Original v3.4.0 restored.``).
+
+    So the backup is now built at ``$BACKUP_DIR.partial.$$`` and renamed into
+    place only after ``cp -R`` returns 0. The name ``.bak`` is therefore
+    reachable only for a copy that ran to completion, and the state above is
+    not producible at all.
+
+    This drives a REAL partial copy — an unreadable subdirectory makes ``cp
+    -R`` copy what it can and exit 1, exactly as an interrupt or a full disk
+    would — and asserts the aftermath: no ``.bak``, no leftover partial, and a
+    cache still holding every skill.
+    """
+    home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
+    # A multi-skill cache, matching the tree the reviewer destroyed.
+    for skill in ("check-items", "recall", "vault-ask"):
+        (cache_dir / "skills" / skill).mkdir(parents=True, exist_ok=True)
+        (cache_dir / "skills" / skill / "SKILL.md").write_text(f"# {skill}\n")
+    unreadable = cache_dir / "skills" / "vault-ask"
+
+    unreadable.chmod(0o000)
+    try:
+        proc = _run(script, "install", home)
+    finally:
+        unreadable.chmod(0o755)
+
+    assert proc.returncode != 0, f"a failed backup must not exit 0: {proc.stdout}"
+    assert "The cache was NOT modified" in proc.stderr, (
+        "a backup failure has changed nothing, so 'run restore' would be the "
+        f"wrong advice; got stderr={proc.stderr!r}"
+    )
+    # The whole point: the name `.bak` never appeared.
+    assert not list(cache_dir.parent.glob("*.bak")), (
+        "a partial copy was published under the .bak name — `restore` would "
+        "promote it over the live cache"
+    )
+    assert not list(cache_dir.parent.glob("*.partial.*")), (
+        "the ERR trap must remove the out-of-place partial"
+    )
+    # And the live cache is exactly as it was — every skill still present.
+    assert sorted(p.name for p in (cache_dir / "skills").iterdir()) == [
+        "check-items",
+        "dev-test",
+        "recall",
+        "vault-ask",
+    ]
+    assert "# released hook" in (cache_dir / "hooks" / "obsidian_utils.py").read_text()
+
+
+@requires_bash
+def test_a_leftover_partial_backup_is_not_selected_as_the_version(
+    tmp_path: Path,
+) -> None:
+    """A crashed backup leaves ``<version>.partial.<pid>`` beside the cache.
+
+    ``sort -V`` ranks that string ABOVE the bare version it derives from
+    (verified: ``3.4.1`` < ``3.4.1.bak`` < ``3.4.1.partial.9999``), so without
+    filtering it the version scan would select the truncated tree and every
+    subcommand would operate on it — the same class of silent-wrong-tree bug
+    the ``.bak`` filter already exists for.
+    """
+    home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
+    stale = cache_dir.parent / f"{cache_dir.name}.partial.4242"
+    (stale / "hooks").mkdir(parents=True)
+
+    proc = _run(script, "status", home)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Installed cache version: 1.2.3" in proc.stdout, (
+        f"the leftover partial was selected as a version: {proc.stdout!r}"
+    )
+    # Anchored to the leftover's own name, not the bare word: pytest's
+    # tmp_path is derived from the test name and contains "partial" itself.
+    assert stale.name not in proc.stdout
+
+
+@requires_bash
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses directory permissions, so chmod 000 cannot be staged",
+)
+@pytest.mark.parametrize("cmd", ["status", "install"])
+def test_unreadable_cache_base_reports_instead_of_exiting_silently(
+    tmp_path: Path, cmd: str
+) -> None:
+    """``ls -1`` inside a ``pipefail`` pipeline can still abort the assignment.
+
+    Scoping ``|| true`` to the ``grep`` alone (the first fix) covered only
+    "grep filtered everything". When ``$CACHE_BASE`` exists but is not
+    readable, ``ls -1`` itself exits non-zero, ``pipefail`` propagates it, and
+    ``set -e`` aborts on the assignment line — before the "no cached version"
+    guard can print. Reproduced against that version: ``status`` and
+    ``install`` both exited 1 with ZERO bytes of output, which is the least
+    useful possible answer to "what happened to my cache?".
+
+    The permission note is pinned too, not just the exit code: the exit code
+    was already non-zero while the bug was live.
+    """
+    home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
+    cache_base = cache_dir.parent
+
+    cache_base.chmod(0o000)
+    try:
+        proc = _run(script, cmd, home)
+    finally:
+        # Restore before teardown, or tmp_path cleanup fails on an
+        # unreadable directory and the failure is attributed to the wrong test.
+        cache_base.chmod(0o755)
+
+    assert proc.returncode != 0
+    assert "No cached version found" in proc.stderr, (
+        f"expected a diagnostic, got stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "is not readable" in proc.stderr

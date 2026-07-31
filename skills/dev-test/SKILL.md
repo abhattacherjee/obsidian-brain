@@ -78,9 +78,17 @@ echo "Source checkout: $REPO"
 bash "$REPO/scripts/test-dev-skill.sh" install
 ```
 
-Report the output. Then tell the user:
+Report the output, then **branch on the command's exit status** — the fenced block's last command *is* the script, so the block's exit status is the script's. Never tell the user the install succeeded without checking it.
 
-> Dev version installed. **Start a new Claude Code session** to pick up the changes. When done testing, run `/dev-test restore`.
+- **Exit 0 — installed.** Tell the user:
+
+  > Dev version installed. **Start a new Claude Code session** to pick up the changes. When done testing, run `/dev-test restore`.
+
+- **Exit 2 — installed, but the security tests failed.** The dev version *was* copied into the cache, so the install is not simply undone by ignoring it. Relay the script's error output and tell the user:
+
+  > The dev version was copied into the plugin cache, but the **security tests failed** (see above). Do **not** start a new session against this install. Run `/dev-test restore` to revert it, fix the failures, then re-install.
+
+- **Any other non-zero exit — nothing was installed.** One of the script's guards refused, or the install aborted partway. Do **not** say a dev version was installed, and do **not** tell the user to start a new session. Relay the error output verbatim and stop; the script names the offending path and the remedy.
 
 Stop here.
 
@@ -139,9 +147,13 @@ echo "Source checkout: $REPO"
 bash "$REPO/scripts/test-dev-skill.sh" restore
 ```
 
-Report the output. Then tell the user:
+Report the output, then **branch on the command's exit status** — the fenced block's last command *is* the script, so the block's exit status is the script's. Never tell the user the restore succeeded without checking it.
 
-> Original version restored. **Start a new session** to pick up the restored version.
+- **Exit 0 — restored.** Tell the user:
+
+  > Original version restored. **Start a new session** to pick up the restored version.
+
+- **Any non-zero exit — nothing was restored, or the restore aborted partway.** Do **not** say the original version is back. Relay the error output verbatim and stop. Two cases the script distinguishes and that are worth passing on in your own words: it *refused* an incomplete `.bak` (the live cache is untouched and still holds the dev version), or the swap *failed partway* (the cache may be missing and needs `/plugin marketplace update`).
 
 Stop here.
 
@@ -200,4 +212,7 @@ echo "Source checkout: $REPO"
 bash "$REPO/scripts/test-dev-skill.sh" status
 ```
 
-Report the output.
+Report the output, then **branch on the command's exit status** — the fenced block's last command *is* the script, so the block's exit status is the script's.
+
+- **Exit 0 — report the status verbatim** (installed cache version, cache dir, and whether the dev version is active).
+- **Any non-zero exit — this is not a status report, it is a failure.** Do **not** paraphrase it as "no dev version is installed". Relay the error output verbatim and stop; the script names the offending path and the remedy (for example, a cache directory holding nothing but a `.bak`, which needs one rename to recover).

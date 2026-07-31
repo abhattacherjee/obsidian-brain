@@ -1484,12 +1484,13 @@ def test_probe_is_not_committed_to_the_repo():
 # (e) FORM D — /dev-test's repo-root resolver (#287)
 #
 # THE TRAP this section is built around: the author's machine registers a
-# directory-source marketplace pointing at THIS checkout, so the registry route
-# (layer 1) and the `git rev-parse --show-toplevel` route (layer 2) return the
-# same path here. "The resolver found the checkout" is therefore not evidence
-# of anything — it stays true with either layer deleted. Every case below makes
-# the two routes DISAGREE, or removes one of them, so the assertion can only
-# hold for one reason.
+# directory-source marketplace pointing at THIS checkout, so the
+# `git rev-parse --show-toplevel` route (layer 1) and the registry route
+# (layer 2) return the same path here — the numbering is the shipped one, cwd
+# first, matching every test docstring below. "The resolver found the
+# checkout" is therefore not evidence of anything — it stays true with either
+# layer deleted. Every case below makes the two routes DISAGREE, or removes one
+# of them, so the assertion can only hold for one reason.
 # ---------------------------------------------------------------------------
 
 _GIT = shutil.which("git")
@@ -1883,6 +1884,87 @@ def test_dev_test_steps_map_to_the_right_subcommands():
         f"expected the 3 /dev-test steps (Install/Restore/Status) to invoke "
         f"test-dev-skill.sh with subcommands in that exact order, got {subs!r}"
     )
+
+
+def _dev_test_report_prose():
+    """``{subcommand: prose}`` — what each step tells Claude to SAY afterwards.
+
+    The prose runs from the closing fence of a step's ```bash block to the next
+    ``### `` heading (or EOF). That text is the step's deliverable: the script's
+    exit status only reaches the user through it.
+    """
+    with open(_DEV_TEST_SKILL, encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    out = {}
+    opened = None
+    pending = None
+    start = None
+    for i, line in enumerate(lines):
+        if pending is not None and line.startswith("### "):
+            out[pending] = "\n".join(lines[start:i])
+            pending = None
+        if opened is None:
+            if line.strip() == "```bash":
+                opened = i
+            continue
+        if line.strip() == "```":
+            body = lines[opened + 1 : i]
+            match = (
+                _DEV_TEST_INVOCATION_RE.match(body[-1])
+                if any("test-dev-skill.sh" in ln for ln in body)
+                else None
+            )
+            if match:
+                pending, start = match.group(1), i + 1
+            opened = None
+    if pending is not None:
+        out[pending] = "\n".join(lines[start:])
+    return out
+
+
+@pytest.mark.parametrize("sub", ["install", "restore", "status"])
+def test_dev_test_reporting_branches_on_the_exit_status(sub):
+    """`exit 2` was a signal with no receiver.
+
+    ``scripts/test-dev-skill.sh`` exits 2 when the dev version was copied into
+    the cache but the security tests failed, printing *"Do not run a live
+    session against this install until they pass."* Step 2 then instructed,
+    unconditionally, *"Dev version installed. Start a new Claude Code session
+    to pick up the changes."* — the direct contradiction of the script's own
+    warning, delivered as the last thing the user hears. Two reviewers found it
+    independently: the failure is surfaced by the script and then talked over
+    by its sole consumer.
+
+    This is the same defect the branch fixes one file over ("the install
+    transcript stops asserting work that did not happen"), reintroduced at the
+    layer where the scripted line IS the deliverable — so it is pinned here, in
+    the prose, not only in the script's exit code.
+    """
+    prose = _dev_test_report_prose()
+    assert set(prose) == {"install", "restore", "status"}, (
+        f"expected report prose after all three steps, got {sorted(prose)}"
+    )
+    text = prose[sub]
+
+    assert "exit status" in text, (
+        f"step {sub!r} must tell Claude to branch on the script's exit status"
+    )
+    assert "non-zero" in text, (
+        f"step {sub!r} must say what to do when the script exits non-zero"
+    )
+    if sub == "install":
+        # Exit 2 is install-only: it is the one status that means "the cache
+        # WAS written AND the result is unsafe", so it needs its own arm —
+        # collapsing it into the generic non-zero arm would tell the user
+        # nothing was installed when something was.
+        assert "Exit 2" in text
+        assert "/dev-test restore" in text
+        # The success sentence must live under the exit-0 arm, never above it.
+        banner = "Start a new Claude Code session"
+        assert banner in text
+        assert text.index("Exit 0") < text.index(banner), (
+            "the 'start a new session' line must be reachable only on exit 0"
+        )
 
 
 def _run_dev_test_block(script, home, cwd):

@@ -164,9 +164,14 @@ Every behavioural test must therefore drive the resolver against a **synthetic
 registry fixture** (a temp `known_marketplaces.json` and a temp tree), never
 against the live `~/.claude`. For each layer, assert the *discriminating* case:
 
-- layer 1 wins when registry and cwd point at **different** trees
-- layer 2 is reached only when the registry yields nothing
-- layer 2 rejects a toplevel **without** the sentinel
+(Numbering below follows the **shipped** order set by the D2 revision above —
+layer 1 is the sentinel-gated cwd toplevel, layer 2 is the registry. It was
+originally written the other way round, matching D2 as first drafted.)
+
+- layer 1 (cwd toplevel) wins when registry and cwd point at **different** trees
+- layer 2 (registry) is reached only when layer 1 yields nothing
+- layer 1 rejects a toplevel **without** the sentinel, so a foreign repo falls
+  through to layer 2 (this is #287's own bug, and what keeps it fixed)
 - neither → non-zero exit and an error naming both routes
 
 And for every guard added, run the mutation: delete that guard, re-run, confirm

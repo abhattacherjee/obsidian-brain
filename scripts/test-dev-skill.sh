@@ -89,19 +89,37 @@ if [[ -z "$CACHE_BASE" ]]; then
     echo "ERROR: No installed ${PLUGIN_NAME} plugin cache found under ~/.claude/plugins/cache/*/${PLUGIN_NAME}"
     exit 1
 fi
-# Pick the highest installed semver under that cache dir (excluding .bak backups).
+# Pick the highest installed semver under that cache dir, excluding both the
+# .bak backup and any *.partial.<pid> left behind by an interrupted backup
+# (see the install arm). Neither is a version, and `sort -V` ranks both ABOVE
+# the bare version string they are derived from -- so without the filter,
+# `3.4.1.partial.9999` would be selected as PLUGIN_VERSION and CACHE_DIR would
+# point at a truncated tree.
 #
-# The `|| true` is load-bearing, not defensive noise: `grep -v` exits 1 when it
-# filters out EVERYTHING (a cache dir holding nothing but a .bak -- the exact
-# aftermath of a restore interrupted between the rm and the mv). Under
-# `set -o pipefail` that status becomes the pipeline's, the bare assignment
-# takes it, and `set -e` aborts the script ON THIS LINE -- before the guard
-# below can print anything. Every subcommand then exits 1 with no output at
-# all, which is the least useful possible response to "what happened to my
-# cache?". Keeping the pipeline's status clean lets the guard actually report.
-PLUGIN_VERSION="$(ls -1 "$CACHE_BASE" 2>/dev/null | { grep -v '\.bak$' || true; } | sort -V | tail -1)"
+# The `|| true` wraps the WHOLE pipeline, not just the `grep`, and that is
+# load-bearing rather than defensive noise. Two commands in here can exit
+# non-zero on states the guard below is supposed to report:
+#   * `grep -v` exits 1 when it filters out EVERYTHING (a cache dir holding
+#     nothing but a .bak -- the exact aftermath of a restore interrupted
+#     between the rm and the mv);
+#   * `ls -1` exits non-zero when $CACHE_BASE exists but is not readable
+#     (a chmod/ownership accident under ~/.claude/plugins/cache).
+# Under `set -o pipefail` either status becomes the pipeline's, the bare
+# assignment takes it, and `set -e` aborts the script ON THIS LINE -- before
+# the guard below can print anything. Every subcommand then exits 1 with no
+# output at all, which is the least useful possible response to "what happened
+# to my cache?". Scoping `|| true` to `grep` alone (as a first fix did) closes
+# only the first of the two. Neutralising the whole pipeline cannot admit a
+# WRONG version either: every failure mode yields the empty string, which is
+# exactly what the guard below tests for.
+PLUGIN_VERSION="$( { ls -1 "$CACHE_BASE" 2>/dev/null \
+    | grep -v -e '\.bak$' -e '\.partial\.[0-9][0-9]*$' \
+    | sort -V | tail -1; } || true )"
 if [[ -z "$PLUGIN_VERSION" ]]; then
     echo "ERROR: No cached version found at $CACHE_BASE" >&2
+    if [[ ! -r "$CACHE_BASE" ]]; then
+        echo "($CACHE_BASE exists but is not readable -- check its permissions and ownership.)" >&2
+    fi
     if compgen -G "$CACHE_BASE/*.bak" > /dev/null 2>&1; then
         echo "Only a .bak backup is present -- a previous 'restore' was interrupted between" >&2
         echo "removing the cache and moving the backup into place. Recover by dropping the" >&2
@@ -132,10 +150,37 @@ case "$cmd" in
             exit 1
         fi
 
+        # Build the backup OUT OF PLACE, then publish it by rename.
+        #
+        # `cp -R` is not atomic. Interrupt it (Ctrl-C on a slow copy), fill the
+        # disk, or hit an EACCES partway and the destination is a truncated
+        # tree. Validating that tree's SHAPE afterwards samples the failure
+        # mode rather than closing it: an interrupt anywhere inside skills/ --
+        # 19 directories, the bulk of the tree, and therefore the MOST likely
+        # place a copy is interrupted -- leaves both hooks/obsidian_utils.py
+        # and a non-empty skills/ in place, so it passes any sentinel probe and
+        # `restore` promotes the fragment over a healthy cache at exit 0.
+        #
+        # Renaming into place makes completeness structural instead: `mv`
+        # within one directory is atomic, and it only runs after `cp -R`
+        # returned 0, so the name "$BACKUP_DIR" can ONLY ever appear on a copy
+        # that ran to completion. A crash leaves "$BACKUP_TMP" -- a name
+        # `restore` never looks at, `install`'s "backup already exists" check
+        # never sees, and the version scan above filters out -- so a stale
+        # partial is inert rather than promotable. It is safe to delete by hand.
+        BACKUP_TMP="${BACKUP_DIR}.partial.$$"
+        rm -rf "$BACKUP_TMP"
+        # A backup failure has changed NOTHING, so "run restore" (the message
+        # used once the cache is being written, below) would be exactly the
+        # wrong advice here.
+        trap 'rm -rf "$BACKUP_TMP"; echo "ERROR: Backup of $CACHE_DIR failed. The cache was NOT modified and no backup was kept." >&2' ERR
         echo "Backing up: $CACHE_DIR -> $BACKUP_DIR"
-        cp -R "$CACHE_DIR" "$BACKUP_DIR"
+        cp -R "$CACHE_DIR" "$BACKUP_TMP"
+        mv "$BACKUP_TMP" "$BACKUP_DIR"
+        trap - ERR
 
-        # On failure, warn user to restore manually
+        # From here the cache itself is being overwritten, so recovery means
+        # putting the backup back.
         trap 'echo "ERROR: Install failed partway. Run \"/dev-test restore\" to recover." >&2' ERR
 
         echo "Installing dev versions..."
@@ -240,15 +285,20 @@ case "$cmd" in
             exit 1
         fi
 
-        # A .bak DIRECTORY only proves an install started, not that the backup
-        # finished. `cp -R` above is not atomic and runs before that arm's ERR
-        # trap is installed, so an interrupt (Ctrl-C on a slow copy), a full
-        # disk, or an EACCES leaves a truncated .bak that is indistinguishable
-        # from a good one -- and the "Backup already exists / run restore
-        # first" message then steers the user straight into promoting it over
-        # a healthy cache, at exit 0, reporting "restored". Require the same
-        # sentinel shape guard 1 asks of a checkout before overwriting
-        # anything.
+        # SECONDARY check. The primary defence is on the install side: the
+        # backup is now built at "$BACKUP_DIR.partial.$$" and renamed into
+        # place only after `cp -R` succeeds, so a ".bak" produced by THIS
+        # script is complete by construction and this branch cannot fire for
+        # it. What remains for a shape probe to catch is everything that did
+        # not come from the current install path: a .bak left by an older
+        # version of this script (which copied straight to the final name and
+        # so could truncate), one hand-renamed or hand-edited by a user, or one
+        # carried over from a different plugin version. All of those are
+        # indistinguishable from a good backup by existence alone -- and the
+        # "Backup already exists / run restore first" message steers the user
+        # straight into promoting them over a healthy cache, at exit 0,
+        # reporting "restored". Kept because it costs two stat calls and its
+        # failure mode is silent data loss.
         if [[ ! -f "$BACKUP_DIR/hooks/obsidian_utils.py" ]] \
             || ! compgen -G "$BACKUP_DIR/skills/*" > /dev/null 2>&1; then
             echo "ERROR: $BACKUP_DIR is not a complete plugin backup (missing hooks/obsidian_utils.py" >&2
