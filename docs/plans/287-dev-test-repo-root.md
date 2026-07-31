@@ -54,15 +54,45 @@ a clone, not the working checkout you want to copy *from*.
 
 Three layers, in this order:
 
-1. **Registered directory-source install** in
+1. **`git rev-parse --show-toplevel`, but only if it contains the sentinel
+   `scripts/test-dev-skill.sh`.** You are standing in an obsidian-brain
+   checkout, so that is the one you mean. This preserves the case that works
+   today (an *unregistered* local checkout with the cwd inside it) and the
+   git-worktree / second-clone case.
+2. **Registered directory-source install** in
    `~/.claude/plugins/known_marketplaces.json` whose `installLocation` contains
-   the sentinel `scripts/test-dev-skill.sh`. Deterministic and cwd-independent —
-   the #278 precedent, already used by `vault-doctor` (FORM C).
-2. **`git rev-parse --show-toplevel`, but only if it contains the same
-   sentinel.** This preserves the case that works today: an *unregistered*
-   local checkout with the cwd inside it. Dropping this layer would regress a
-   currently-working invocation.
+   the same sentinel. Deterministic and cwd-independent — the #278 precedent,
+   already used by `vault-doctor` (FORM C).
 3. **Hard fail** with an actionable message naming both attempted routes.
+
+**Revision (2026-07-30, deep-review round P1 — the order above is the SHIPPED
+one; it was originally registry-first).** Two independent reviewers found that
+registry-first is wrong whenever a *second valid checkout* exists. D2 as first
+written considered only a *foreign* toplevel (the `control-tower` bug), not a
+second obsidian-brain one. This repo uses git worktrees: with registry-first,
+`/dev-test install` from a worktree resolves the **registered** checkout, copies
+`develop`'s hooks into the cache, prints a full success transcript at exit 0,
+and the maintainer then dogfoods code they did not write. That is a regression
+against the pre-PR `cd "$(git rev-parse --show-toplevel)"` behaviour and a fresh
+instance of the exact silent-stale class D3 rejects the cache for — *"it does
+not raise, it lies."*
+
+The **sentinel check is what makes layer 1 safe**: cwd can only ever select an
+obsidian-brain checkout, never an arbitrary repo. #287 is still fixed —
+invoked from `control-tower`, the toplevel has no sentinel and falls through to
+the registry exactly as before (pinned by
+`test_shell_uses_the_registry_when_the_cwd_toplevel_lacks_the_sentinel`).
+
+Two consequences of the inversion:
+
+- **The resolved tree is now echoed** (`echo "Source checkout: $REPO"`) before
+  the script is invoked. Several checkouts can coexist and resolve differently;
+  neither the skill nor `scripts/test-dev-skill.sh` printed its *source*, so a
+  wrong-tree install was indistinguishable on screen from a right-tree one.
+  Ambiguity must be observable, not inferred. Pinned by
+  `test_shell_announces_the_resolved_source_checkout`.
+- **The inner `[ -f "$_T/scripts/test-dev-skill.sh" ]` check is no longer
+  shadowed** — see the correction under Tasks 3+4 below.
 
 ### D3 — The plugin cache is deliberately NOT a fallback
 
@@ -171,7 +201,11 @@ def _ob_repo():
 print(_ob_repo())
 ```
 
-Shell wrapper (identical in all three steps except the final argument):
+Shell wrapper (identical in all three steps except the final argument).
+**Superseded by the D2 revision above** — the shipped wrapper tries the
+sentinel-bearing git toplevel *first*, falls back to the `python3 -c` registry
+resolver, and echoes `Source checkout: $REPO` before dispatching. The Python
+body below is unchanged and still byte-pinned:
 
 ```bash
 REPO="$(python3 -c "
@@ -210,6 +244,12 @@ root, rather than trusting the caller. Two guards, immediately after
    `~/.claude/plugins/cache/`, exit non-zero with an explicit message that
    installing the cache onto itself is a no-op and a real checkout is required
    (D3).
+   **Broadened in review round P1 to all of `~/.claude/plugins/`.** This repo's
+   `marketplace.json` declares `"source": "./"`, so a marketplace clone under
+   `~/.claude/plugins/marketplaces/<name>/` also carries
+   `scripts/test-dev-skill.sh` at its root and is equally wrong as an install
+   *source* — it is a released tree that `/plugin marketplace update` rewrites
+   behind your back. The cache-only prefix let that clone through.
 
 Both guards must fire *before* any `cp`, and before the `.bak` backup is taken —
 a guard that trips after the backup leaves the user with stray state.
@@ -250,15 +290,21 @@ it escape both sets, and `test_block_partitions_cover_every_distinct_block`
 fails if either partition is empty (an empty `parametrize` list collects zero
 cases and still reads green).
 
-**Mutation finding, recorded so it is not re-discovered as a defect.** Deleting
-the inner `[ -f "$_T/scripts/test-dev-skill.sh" ]` from the Task 1 shell wrapper
-fails **no** test — and correctly so. The final guard re-checks `-f` on `$REPO`,
-so the inner check has no observable effect: with it deleted, a sentinel-less
-toplevel is assigned to `$REPO` and then rejected one line later with the same
-message and the same exit code. It is belt-and-braces, not dead code, and it is
-deliberately *not* backed by a test rather than backed by one that cannot fail.
-Every other guard in both the Python body and the shell wrapper does have a
-named test that fails when it is removed.
+**Mutation finding, recorded so it is not re-discovered as a defect —
+SUPERSEDED by the D2 revision, kept because the reasoning is instructive.**
+Under the original *registry-first* ordering, deleting the inner
+`[ -f "$_T/scripts/test-dev-skill.sh" ]` from the Task 1 shell wrapper failed
+**no** test — and correctly so: the final guard re-checked `-f` on `$REPO`, so a
+sentinel-less toplevel was assigned and then rejected one line later with the
+same message and exit code. It was belt-and-braces, deliberately not backed by a
+test rather than backed by one that could not fail.
+
+**That is no longer true.** With cwd-first ordering the same check decides
+whether the registry is consulted at all: delete it and a foreign toplevel wins
+layer 1 outright, layer 2 never runs, and #287 regresses. It is now load-bearing
+and pinned by `test_shell_uses_the_registry_when_the_cwd_toplevel_lacks_the_sentinel`.
+Every guard in both the Python body and the shell wrapper now has a named test
+that fails when it is removed.
 
 Per D4. Concretely:
 

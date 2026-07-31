@@ -270,8 +270,9 @@ def test_note_writer_call_sites_guard_missing_cli():
             # left intact satisfied it (proved by mutation during #278 task 2 —
             # all 91 tests still passed). These two are the semantic half.
             # tests/test_hooks_resolver_drift.py enforces the same property
-            # over all 68 sites; this keeps it enforced at the note_writer call
-            # sites specifically, where the window is already in hand.
+            # over all 71 resolver sites (68 cache-family + #287's 3 repo-root
+            # ones); this keeps it enforced at the note_writer call sites
+            # specifically, where the window is already in hand.
             assert "known_marketplaces.json" in window, (
                 f"Skill {skill_name} line {lineno + 1} resolves $HOOKS from the "
                 "plugin cache only — it must consult the marketplace "

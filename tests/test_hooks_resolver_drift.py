@@ -1545,9 +1545,15 @@ def test_repo_resolver_prefers_the_registered_checkout_over_the_cwd(
     """Both trees carry the sentinel, and the cwd is one of them.
 
     That is the discriminating construction: a resolver that looked at the
-    working directory (which is what #287 exists to remove) would return
-    ``other``, and a resolver that read the registry returns ``registered``.
-    With only one tree in play the assertion would hold either way.
+    working directory would return ``other``, and one that read the registry
+    returns ``registered``. With only one tree in play the assertion would
+    hold either way.
+
+    Note this pins the PYTHON layer, which must stay cwd-independent — the
+    cwd is consulted by the shell wrapper around it (and, since the F1
+    precedence fix, consulted FIRST; see the shell section at the bottom of
+    this module). If this body ever starts answering with the cwd, the two
+    layers become indistinguishable and the wrapper's ordering is untestable.
     """
     registered = _seed_checkout(fake_home / "registered-checkout")
     other = _seed_checkout(tmp_path / "some-other-checkout")
@@ -1780,9 +1786,11 @@ def test_repo_resolver_returns_empty_when_there_is_no_registry_at_all(
 # ---------------------------------------------------------------------------
 # FORM D, cases 6-7: the SHELL wrapper around the block
 #
-# The Python resolver is only layer 1. Layers 2 (the git-toplevel fallback) and
-# 3 (the loud failure) live in the bash that wraps it, and nothing above can
-# see them. These run the fenced block from skills/dev-test/SKILL.md verbatim
+# The Python resolver is only layer 2. Layer 1 (the sentinel-gated git
+# toplevel, which the wrapper consults FIRST) and layer 3 (the loud failure)
+# live in the bash that wraps it, and nothing above can see them — including
+# which of the two layers answered, which is the whole question here.
+# These run the fenced block from skills/dev-test/SKILL.md verbatim
 # under a real bash, with only its final `bash "$REPO/scripts/test-dev-skill.sh"
 # <sub>` line swapped for an echo — asserted to be that line first, so the
 # rewrite cannot silently mis-fire on a block it does not understand.
@@ -1911,14 +1919,21 @@ def _git_init(path):
 @_REQUIRES_PYTHON3
 @_REQUIRES_GIT
 @pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
-def test_shell_prefers_the_registered_checkout_over_the_cwd_git_repo(
+def test_shell_prefers_the_cwd_checkout_over_the_registered_one(
     script, fake_home, tmp_path
 ):
-    """Layer 1 beats layer 2 when they disagree.
+    """Layer 1 (cwd, sentinel-gated) beats layer 2 (registry) when they disagree.
 
     Both trees are git repositories carrying the sentinel, so BOTH routes can
     succeed and the answer says which one ran. On this machine the two routes
     coincide, which is precisely why they are forced apart here.
+
+    This is the git-WORKTREE / second-clone case: standing in a checkout is a
+    deliberate context signal, and the registry can only ever name one of
+    them. With the original registry-first ordering, ``/dev-test install``
+    from a worktree silently installed the REGISTERED checkout's code at
+    exit 0 with a full success transcript — the silent-stale class this whole
+    change exists to kill, re-entering through layer ordering.
     """
     registered = _seed_checkout(fake_home / "registered-checkout")
     _git_init(registered)
@@ -1929,26 +1944,58 @@ def test_shell_prefers_the_registered_checkout_over_the_cwd_git_repo(
     result = _run_dev_test_block(script, fake_home, cwd_repo)
     assert result.returncode == 0, result.stderr
     got = _resolved(result)
-    # Layer 1 hands back the registry's installLocation string VERBATIM, so
-    # this is an exact comparison rather than a realpath one. Layer 2 would
-    # have produced git's physical path for cwd_repo instead.
-    assert got == registered, result.stdout
-    assert os.path.realpath(got) != os.path.realpath(cwd_repo)
+    # Layer 1 hands back git's physical path for cwd_repo. Layer 2 would have
+    # produced the registry's installLocation string verbatim instead.
+    assert got == os.path.realpath(cwd_repo), result.stdout
+    assert os.path.realpath(got) != os.path.realpath(registered)
 
 
 @_REQUIRES_BASH
 @_REQUIRES_PYTHON3
 @_REQUIRES_GIT
 @pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
-def test_shell_falls_back_to_a_cwd_toplevel_that_has_the_sentinel(
+def test_shell_uses_the_registry_when_the_cwd_toplevel_lacks_the_sentinel(
     script, fake_home, tmp_path
 ):
-    """Layer 2, reached only because layer 1 yields ``''``.
+    """Layer 2, reached because the cwd is a FOREIGN repo — bug #287 itself.
+
+    This is the invocation the issue was filed for: ``/dev-test`` run while
+    working on some other project (``control-tower`` in the live report). The
+    cwd toplevel is a perfectly good git repo that simply is not
+    obsidian-brain, so the layer-1 sentinel rejects it and the registered
+    checkout answers instead.
+
+    It is also the test that makes the layer-1 sentinel check load-bearing:
+    delete ``[ -f "$_T/scripts/test-dev-skill.sh" ]`` from the wrapper and the
+    stranger's toplevel wins outright, the registry is never consulted, and
+    this fails naming the wrong tree.
+    """
+    registered = _seed_checkout(fake_home / "registered-checkout")
+    _git_init(registered)
+    _write_registry(fake_home, {"user-chosen-name": _dir_entry(registered)})
+    stranger = _seed_checkout(tmp_path / "control-tower", sentinel=False)
+    _git_init(stranger)
+
+    result = _run_dev_test_block(script, fake_home, stranger)
+    assert result.returncode == 0, result.stderr
+    got = _resolved(result)
+    assert got == registered, result.stdout
+    assert os.path.realpath(got) != os.path.realpath(stranger)
+
+
+@_REQUIRES_BASH
+@_REQUIRES_PYTHON3
+@_REQUIRES_GIT
+@pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
+def test_shell_uses_a_cwd_toplevel_that_has_the_sentinel(
+    script, fake_home, tmp_path
+):
+    """Layer 1 with no registry at all — the unregistered local checkout.
 
     Run from a SUBDIRECTORY of the repo, so a wrapper that used ``$PWD``
     instead of ``git rev-parse --show-toplevel`` would resolve
-    ``<repo>/skills/dev-test`` and fail the sentinel check. #287's D2 keeps this
-    layer specifically to preserve the invocation that works today — an
+    ``<repo>/skills/dev-test`` and fail the sentinel check. #287's D2 keeps
+    this layer specifically to preserve the invocation that works today — an
     unregistered local checkout with the cwd inside it — so deleting it must
     fail something, and this is it.
     """
@@ -1961,6 +2008,31 @@ def test_shell_falls_back_to_a_cwd_toplevel_that_has_the_sentinel(
     result = _run_dev_test_block(script, fake_home, subdir)
     assert result.returncode == 0, result.stderr
     assert _resolved(result) == os.path.realpath(cwd_repo), result.stdout
+
+
+@_REQUIRES_BASH
+@_REQUIRES_PYTHON3
+@_REQUIRES_GIT
+@pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
+def test_shell_announces_the_resolved_source_checkout(script, fake_home, tmp_path):
+    """The resolved tree must be PRINTED, not just used.
+
+    Several checkouts of this repo can coexist (worktrees, second clones, the
+    registered one) and they resolve to different answers. Without this line
+    an install from the wrong tree is byte-identical, on screen, to an install
+    from the right one: ``scripts/test-dev-skill.sh`` prints destinations
+    (``hooks/*.py -> cache``) and never its source. Ambiguity has to be
+    observable rather than inferred, so the echo is pinned here — including
+    the resolved path itself, so an echo of a stale or empty variable fails.
+    """
+    cwd_repo = _seed_checkout(tmp_path / "cwd-repo")
+    _git_init(cwd_repo)
+
+    result = _run_dev_test_block(script, fake_home, cwd_repo)
+    assert result.returncode == 0, result.stderr
+    assert f"Source checkout: {os.path.realpath(cwd_repo)}" in result.stdout, (
+        result.stdout
+    )
 
 
 @_REQUIRES_BASH
