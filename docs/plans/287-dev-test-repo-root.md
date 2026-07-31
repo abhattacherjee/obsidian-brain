@@ -224,7 +224,41 @@ assert non-zero exit + the expected stderr substring. Use `pytest.mark.skipif`
 if the test shells out to `bash` and it may be unavailable, matching the
 existing `_REQUIRES_<BIN>` convention in this suite.
 
-### Task 3 — Register FORM_D in `tests/test_hooks_resolver_drift.py`
+### Tasks 3 + 4 — SHIPPED AS ONE COMMIT
+
+**Reconciliation (2026-07-30).** Tasks 3 and 4 were written as separate tasks
+but were dispatched and committed together. Both edit
+`tests/test_hooks_resolver_drift.py`, and Task 4's behaviour tests are driven
+by the extraction machinery Task 3 extends (`_DEF_RE`/`_IMPORT_RE`/`_TAIL_RE`
+→ `_SITES` → the block parametrisations). Running them as separate dispatches
+would have guaranteed a merge conflict in one file and left Task 4 briefly
+parametrising over a `_SITES` that could not see FORM D at all. Task 4's
+"implementer's call" on where the tests live was resolved as **extend
+`test_hooks_resolver_drift.py`** rather than adding a new module, for the same
+reason: the behaviour tests must execute the *file-derived* block text, which
+only that module extracts.
+
+One structural change beyond the two briefs was required and is recorded here
+because it is not a detail: the behavioural parametrisation `_BLOCK_PARAMS` was
+**split into two** (`_BLOCK_PARAMS` for FORM A/A_SINGLE/B/C, `_REPO_BLOCK_PARAMS`
+for FORM D), keyed on `site.func` rather than on canonical text. The two
+families cannot satisfy each other's assertions — FORM A/B/C must fall back to
+the plugin cache, FORM D must never touch it (D3) — so a single parametrisation
+would have forced one family's assertions to be weakened. Keying on `func`
+keeps a *drifted* dev-test copy inside the FORM D assertions instead of letting
+it escape both sets, and `test_block_partitions_cover_every_distinct_block`
+fails if either partition is empty (an empty `parametrize` list collects zero
+cases and still reads green).
+
+**Mutation finding, recorded so it is not re-discovered as a defect.** Deleting
+the inner `[ -f "$_T/scripts/test-dev-skill.sh" ]` from the Task 1 shell wrapper
+fails **no** test — and correctly so. The final guard re-checks `-f` on `$REPO`,
+so the inner check has no observable effect: with it deleted, a sentinel-less
+toplevel is assigned to `$REPO` and then rejected one line later with the same
+message and the same exit code. It is belt-and-braces, not dead code, and it is
+deliberately *not* backed by a test rather than backed by one that cannot fail.
+Every other guard in both the Python body and the shell wrapper does have a
+named test that fails when it is removed.
 
 Per D4. Concretely:
 
@@ -250,6 +284,8 @@ makes the count test fail — proving the new sites are genuinely discovered and
 not silently skipped.
 
 ### Task 4 — Behaviour tests for the FORM_D resolver
+
+*(Shipped in the same commit as Task 3 — see the reconciliation note above.)*
 
 New tests (extend `tests/test_hooks_resolver_drift.py`'s behavioural section,
 or a new module if that file's structure makes it awkward — implementer's call,
