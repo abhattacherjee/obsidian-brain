@@ -16,6 +16,15 @@ PLUGIN_NAME="obsidian-brain"
 
 # Guard 1 (sentinel): REPO_ROOT must actually be an obsidian-brain checkout,
 # not just whatever directory happens to be two levels above this script.
+#
+# NOTE: this sentinel (hooks/obsidian_utils.py + skills/) is deliberately
+# NOT the same one skills/dev-test/SKILL.md's _ob_repo() resolver checks
+# (scripts/test-dev-skill.sh itself). That asymmetry is intentional, not
+# drift to "harmonize" away -- the skill asks "can this tree run the
+# script?" (it needs the script to exist), this script asks "am I actually
+# sitting inside a real checkout?" (it needs its own source tree to copy
+# from). A tree that satisfies one and not the other fails loudly either
+# way; see MINOR-4 in the #287 final review.
 if [[ ! -f "$REPO_ROOT/hooks/obsidian_utils.py" ]] || [[ ! -d "$REPO_ROOT/skills" ]]; then
     echo "ERROR: $REPO_ROOT does not look like an obsidian-brain checkout (missing hooks/obsidian_utils.py or skills/)." >&2
     echo "This script must live inside a real obsidian-brain repo checkout; refusing to run." >&2
@@ -161,7 +170,7 @@ case "$cmd" in
         echo "Start a NEW Claude Code session to pick up the changes."
         echo ""
         echo "When done testing, run:"
-        echo "  ./scripts/test-dev-skill.sh restore"
+        echo "  /dev-test restore"
         ;;
 
     restore)

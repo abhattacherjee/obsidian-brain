@@ -1796,10 +1796,18 @@ _RESOLVED_MARKER = "OB_RESOLVED_REPO:"
 
 
 def _dev_test_shell_blocks():
-    """``[(id, script)]`` — every ```bash fence in /dev-test that resolves $REPO.
+    """``[(lineno, script, subcommand)]`` — every ```bash fence in /dev-test
+    that resolves $REPO.
 
     Parametrised over rather than sampled: the three copies are hand-maintained
     and the whole point of this module is that hand-maintained copies drift.
+
+    The Python body is byte-pinned elsewhere (drift test), but the trailing
+    ``bash "$REPO/scripts/test-dev-skill.sh" <sub>`` line is the *only* thing
+    the three copies are allowed to differ on — Step 2 is ``install``, Step 3
+    ``restore``, Step 4 ``status`` — so the subcommand is extracted here too,
+    not just the body, and pinned as an ordered tuple by
+    ``test_dev_test_steps_map_to_the_right_subcommands`` below.
     """
     with open(_DEV_TEST_SKILL, encoding="utf-8") as fh:
         lines = fh.read().split("\n")
@@ -1813,7 +1821,9 @@ def _dev_test_shell_blocks():
         if line.strip() == "```":
             body = lines[opened + 1 : i]
             if any("test-dev-skill.sh" in ln for ln in body):
-                blocks.append((opened + 2, "\n".join(body)))
+                match = _DEV_TEST_INVOCATION_RE.match(body[-1])
+                sub = match.group(1) if match else None
+                blocks.append((opened + 2, "\n".join(body), sub))
             opened = None
     return blocks
 
@@ -1838,7 +1848,7 @@ def _prepare_dev_test_block(script):
 
 _DEV_TEST_BLOCK_PARAMS = [
     pytest.param(_prepare_dev_test_block(text), id=f"dev-test:{lineno}")
-    for lineno, text in _dev_test_shell_blocks()
+    for lineno, text, _sub in _dev_test_shell_blocks()
 ]
 
 
@@ -1846,6 +1856,25 @@ def test_every_dev_test_step_has_an_extracted_shell_block():
     """An empty parametrize list collects zero cases and still reads green, so
     the count is pinned here: /dev-test has three steps that resolve $REPO."""
     assert len(_DEV_TEST_BLOCK_PARAMS) == EXPECTED_FORM_COUNTS[FORM_D] == 3
+
+
+def test_dev_test_steps_map_to_the_right_subcommands():
+    """The Python resolver body is byte-pinned identical across all three
+    SKILL.md blocks (drift test above); the trailing subcommand is the ONE
+    thing that is allowed — and needed — to differ between them, which makes
+    it the one thing that can drift unnoticed. Pin it as an ORDERED tuple,
+    not a set: a set would still pass if Step 3 and Step 4 swapped answers.
+
+    Concretely: swapping Step 3 ("Restore original") from `restore` to
+    `install` passes the entire rest of this repo's test suite unchanged —
+    `/dev-test restore` would silently re-run `install` instead of undoing
+    it. This is the regression this test exists to catch.
+    """
+    subs = [sub for _lineno, _text, sub in _dev_test_shell_blocks()]
+    assert subs == ["install", "restore", "status"], (
+        f"expected the 3 /dev-test steps (Install/Restore/Status) to invoke "
+        f"test-dev-skill.sh with subcommands in that exact order, got {subs!r}"
+    )
 
 
 def _run_dev_test_block(script, home, cwd):

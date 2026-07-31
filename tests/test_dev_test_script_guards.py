@@ -100,6 +100,55 @@ def test_sentinel_guard_fires_before_any_mutation(tmp_path: Path) -> None:
 
 
 @requires_bash
+def test_sentinel_guard_rejects_checkout_missing_skills_dir(tmp_path: Path) -> None:
+    """Guard 1's ``skills/`` half in isolation.
+
+    The only other guard-1 fixture (above) builds a tree with NEITHER
+    sentinel, so each half of the ``||`` is covered by the other -- deleting
+    either half alone still passes the suite. This tree carries the
+    ``hooks/obsidian_utils.py`` sentinel but deliberately omits ``skills/``,
+    so a failure here can only be attributed to the ``skills/`` half.
+
+    That half is genuinely load-bearing in production: with ``skills/``
+    absent, the install loop's ``"$REPO_ROOT/skills/"*/`` glob goes
+    unmatched and (with nullglob unset, the bash default) stays literal,
+    creating a junk ``skills/*`` directory under the cache instead of
+    failing loudly up front.
+    """
+    repo = tmp_path / "obsidian-brain"
+    script = _write_script(repo / "scripts")
+    (repo / "hooks").mkdir(parents=True)
+    (repo / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
+    # deliberately no skills/ dir
+    home = tmp_path / "home"
+
+    proc = _run(script, "status", home)
+
+    assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
+    assert "does not look like an obsidian-brain checkout" in proc.stderr
+
+
+@requires_bash
+def test_sentinel_guard_rejects_checkout_missing_hooks_file(tmp_path: Path) -> None:
+    """Guard 1's ``hooks/obsidian_utils.py`` half in isolation.
+
+    Mirror of the test above: this tree carries ``skills/`` but deliberately
+    omits ``hooks/obsidian_utils.py``, so a failure here can only be
+    attributed to the hooks-sentinel half.
+    """
+    repo = tmp_path / "obsidian-brain"
+    script = _write_script(repo / "scripts")
+    (repo / "skills" / "some-skill").mkdir(parents=True)
+    # deliberately no hooks/obsidian_utils.py
+    home = tmp_path / "home"
+
+    proc = _run(script, "status", home)
+
+    assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
+    assert "does not look like an obsidian-brain checkout" in proc.stderr
+
+
+@requires_bash
 def test_self_copy_guard_rejects_install_from_inside_cache(tmp_path: Path) -> None:
     """Guard 2 (D3): a script whose own REPO_ROOT resolves to a path under
     ~/.claude/plugins/cache/ must refuse "install" -- copying the cache onto
@@ -209,3 +258,32 @@ def test_status_still_works_from_inside_cache(tmp_path: Path) -> None:
 
     assert proc.returncode == 0, f"status should succeed from inside cache: {proc.stderr}"
     assert "Plugin: obsidian-brain" in proc.stdout
+
+
+@requires_bash
+def test_home_fail_closed_block_pins_its_custom_message(tmp_path: Path) -> None:
+    """M2: the `$HOME` fail-closed block (script lines ~45-50) is shadowed in
+    EXIT STATUS by `set -euo pipefail` -- delete the whole block and the
+    script still exits non-zero, because the very next line (`cd "$HOME" &&
+    pwd -P`) already fails under `set -u` (unset $HOME) or `set -e` ($HOME
+    names a missing directory). What the block adds is message quality, not
+    exit-status behaviour, so this test pins the MESSAGE rather than just the
+    exit code -- that is the one thing that actually distinguishes "block
+    present" from "block deleted" and makes it a real (rather than vacuous)
+    guard.
+
+    $HOME is deliberately set to a path that does not exist (not unset --
+    `_run` always sets $HOME) so the block's `[[ ! -d "$HOME" ]]` half fires.
+    """
+    repo = tmp_path / "obsidian-brain"
+    script = _write_script(repo / "scripts")
+    (repo / "hooks").mkdir(parents=True)
+    (repo / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
+    (repo / "skills" / "some-skill").mkdir(parents=True)
+
+    missing_home = tmp_path / "does-not-exist"
+
+    proc = _run(script, "install", missing_home)
+
+    assert proc.returncode != 0
+    assert "cannot verify this script isn't" in proc.stderr
