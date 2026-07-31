@@ -149,6 +149,47 @@ def test_self_copy_guard_rejects_restore_from_inside_cache(tmp_path: Path) -> No
 
 
 @requires_bash
+def test_self_copy_guard_fires_with_symlinked_home(tmp_path: Path) -> None:
+    """Guard 2 must canonicalize $HOME the same way REPO_ROOT is canonicalized
+    (`pwd -P`) before comparing prefixes. REPO_ROOT is resolved through
+    symlinks by `cd ... && pwd -P`; if $HOME is used raw, a symlinked $HOME
+    makes the string-prefix comparison silently fail to fire on exactly the
+    machine shape where it matters -- macOS's /var -> /private/var is a live
+    instance of this. pytest's tmp_path is already canonicalized, which is
+    why the other guard-2 tests above pass regardless of this bug and cannot
+    catch it; this test builds a genuinely symlinked $HOME to close that gap:
+    a real directory, a symlink pointing at it, $HOME set to the symlink, and
+    the fake cache tree laid out under the real directory (reached via the
+    symlink path, matching how the script is actually invoked).
+    """
+    real_home = tmp_path / "real_home"
+    real_home.mkdir()
+    home_link = tmp_path / "home_link"
+    home_link.symlink_to(real_home, target_is_directory=True)
+
+    cache_version_dir = (
+        home_link / ".claude" / "plugins" / "cache" / "some-marketplace" / "obsidian-brain" / "9.9.9"
+    )
+    script = _write_script(cache_version_dir / "scripts")
+    (cache_version_dir / "hooks").mkdir(parents=True)
+    (cache_version_dir / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
+    (cache_version_dir / "skills" / "some-skill").mkdir(parents=True)
+
+    proc = _run(script, "install", home_link)
+
+    assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
+    assert "inside the installed plugin cache" in proc.stderr
+    # No backup was created under the REAL (non-symlink) location either --
+    # the guard fired before the .bak step, regardless of which path string
+    # you check it through.
+    real_backup = (
+        real_home / ".claude" / "plugins" / "cache" / "some-marketplace"
+        / "obsidian-brain" / "9.9.9.bak"
+    )
+    assert not real_backup.exists()
+
+
+@requires_bash
 def test_status_still_works_from_inside_cache(tmp_path: Path) -> None:
     """Judgment call (see task-2-report.md): guard 2 is scoped to the
     mutating subcommands only. "status" is read-only and must keep

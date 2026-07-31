@@ -46,6 +46,12 @@ def _ob_repo():
     return ''
 print(_ob_repo())
 ")"
+# NOTE: the `[ -f "$_T/scripts/test-dev-skill.sh" ]` check just below is
+# fully shadowed by the final guard two lines down -- remove it and REPO
+# just falls through to the bare toplevel value, which the final guard
+# then rejects with the identical message and exit code. It's kept as
+# defense-in-depth, not because it's independently load-bearing: no test
+# can distinguish the two versions, so don't write one that assumes it can.
 if [ -z "$REPO" ]; then
     _T="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     if [ -n "$_T" ] && [ -f "$_T/scripts/test-dev-skill.sh" ]; then
@@ -88,6 +94,12 @@ def _ob_repo():
     return ''
 print(_ob_repo())
 ")"
+# NOTE: the `[ -f "$_T/scripts/test-dev-skill.sh" ]` check just below is
+# fully shadowed by the final guard two lines down -- remove it and REPO
+# just falls through to the bare toplevel value, which the final guard
+# then rejects with the identical message and exit code. It's kept as
+# defense-in-depth, not because it's independently load-bearing: no test
+# can distinguish the two versions, so don't write one that assumes it can.
 if [ -z "$REPO" ]; then
     _T="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     if [ -n "$_T" ] && [ -f "$_T/scripts/test-dev-skill.sh" ]; then
@@ -130,6 +142,12 @@ def _ob_repo():
     return ''
 print(_ob_repo())
 ")"
+# NOTE: the `[ -f "$_T/scripts/test-dev-skill.sh" ]` check just below is
+# fully shadowed by the final guard two lines down -- remove it and REPO
+# just falls through to the bare toplevel value, which the final guard
+# then rejects with the identical message and exit code. It's kept as
+# defense-in-depth, not because it's independently load-bearing: no test
+# can distinguish the two versions, so don't write one that assumes it can.
 if [ -z "$REPO" ]; then
     _T="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     if [ -n "$_T" ] && [ -f "$_T/scripts/test-dev-skill.sh" ]; then

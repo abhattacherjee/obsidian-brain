@@ -31,9 +31,24 @@ fi
 # subcommands (install/restore): `status` is a read-only report and stays
 # useful even when run from inside the cache (e.g. inspecting what's
 # installed on a machine with no local checkout).
-CACHE_ROOT_PREFIX="${HOME}/.claude/plugins/cache/"
 case "${1:-status}" in
     install|restore)
+        # REPO_ROOT above is resolved through symlinks (`pwd -P`). $HOME must
+        # be canonicalized the same way before being used as a prefix, or a
+        # symlinked $HOME (e.g. macOS /var -> /private/var) makes this
+        # comparison silently fail to fire on a machine where it should --
+        # the guard would compare a canonicalized path against an
+        # uncanonicalized one and never match. If $HOME can't be resolved at
+        # all, fail closed for these mutating subcommands rather than
+        # silently skipping the guard -- a guard that can't be evaluated is
+        # not a guard.
+        if [[ -z "${HOME:-}" ]] || [[ ! -d "$HOME" ]]; then
+            echo "ERROR: \$HOME is unset, empty, or not a directory; cannot verify this script isn't" >&2
+            echo "running from inside the installed plugin cache. Refusing to run '${1}' without a" >&2
+            echo "resolvable \$HOME." >&2
+            exit 1
+        fi
+        CACHE_ROOT_PREFIX="$(cd "$HOME" && pwd -P)/.claude/plugins/cache/"
         if [[ "$REPO_ROOT/" == "$CACHE_ROOT_PREFIX"* ]]; then
             echo "ERROR: $REPO_ROOT is inside the installed plugin cache ($CACHE_ROOT_PREFIX)." >&2
             echo "Installing the cache onto itself is a no-op. Run this script from a real" >&2
