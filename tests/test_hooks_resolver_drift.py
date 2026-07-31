@@ -1657,6 +1657,63 @@ def test_a_non_directory_source_does_not_shadow_a_later_good_one(
     assert _resolver(text, func)() == good
 
 
+#: Registry VALUES that are not dicts at all — the shape ``NON_DIRECTORY_SOURCES``
+#: cannot reach, because every row there builds ``{"installLocation": …}`` and
+#: only varies the ``source`` key.
+#:
+#: These are what keep ``isinstance(_m, dict)`` honest. Measured before this
+#: fixture existed: dropping that guard from FORM D's three SKILL.md copies and
+#: the ``FORM_D`` constant together failed exactly ONE test — the byte-identity
+#: text pin — and **zero** FORM D behaviour tests. The behavioural safety net was
+#: transitive only (FORM B's ``int-then-good`` row fails, and the preamble pin
+#: forces the two families to stay byte-identical), which is weaker than a family
+#: that has its own direct cover.
+#:
+#: Consequence of the missing guard: ``_m.get('source')`` on a non-dict raises
+#: inside the SHARED ``try``, aborting iteration over every REMAINING entry — so
+#: one third-party plugin's malformed row silently takes out obsidian-brain's own
+#: and ``/dev-test`` stops finding the registered checkout.
+NON_DICT_ENTRIES = {
+    "entry-is-an-int": 7,
+    "entry-is-null": None,
+    "entry-is-a-list": [],
+    "entry-is-a-bare-string": "directory",
+}
+
+
+def test_the_non_dict_entry_fixtures_are_actually_non_dicts():
+    """Guard on the guard. A row that quietly became a dict would be skipped by
+    the ``source`` discriminator standing in front of ``isinstance(_m, dict)``,
+    so the test would keep passing while covering a different guard entirely —
+    the #278 fixture-drift defect in a new place."""
+    for shape, entry in NON_DICT_ENTRIES.items():
+        assert not isinstance(entry, dict), (
+            f"{shape} must NOT be a dict, or `isinstance(_m, dict)` is never "
+            "the guard under test"
+        )
+
+
+@pytest.mark.parametrize("text,func", _REPO_BLOCK_PARAMS)
+@pytest.mark.parametrize("shape", sorted(NON_DICT_ENTRIES))
+def test_a_non_dict_entry_does_not_shadow_a_later_good_one(
+    text, func, shape, fake_home
+):
+    """Bad entry FIRST, good entry second — the only framing that separates
+    "skipped it" from "gave up on the whole registry".
+
+    ``json.load`` preserves insertion order, and ``''`` is the answer BOTH a
+    correct resolver and a crashed one give for a registry with no usable entry
+    — which is why the good entry has to be there, and has to be second.
+    """
+    good = _seed_checkout(fake_home / "obsidian-brain")
+    assert _has_sentinel(good), "the good entry must satisfy the sentinel"
+    entries = {"aaa-third-party": NON_DICT_ENTRIES[shape], "zzz-ours": _dir_entry(good)}
+    assert list(entries)[0] == "aaa-third-party", "bad entry must be iterated first"
+    _write_registry(fake_home, entries)
+
+    assert _resolver(text, func)() == good
+
+
 # ---------------------------------------------------------------------------
 # FORM D, case 4: unusable installLocation values
 # ---------------------------------------------------------------------------
@@ -1922,6 +1979,26 @@ def _dev_test_report_prose():
     return out
 
 
+#: The sentence each step is only allowed to say on ``Exit 0``, per step.
+#:
+#: The pin that bites is the ORDER: keyword-presence assertions ("exit status",
+#: "non-zero") are a proxy for prose semantics and survive the mutation that
+#: matters — hoisting the success sentence out of its arm and above the
+#: branching instruction, so it reads as the unconditional deliverable again.
+#: Measured on this module before ``restore``/``status`` were covered: moving
+#: Step 3's "Original version restored" above the branching instruction while
+#: leaving the keywords in place passed 262/262. That is this branch's own
+#: defect class ("stop the skill narrating over a refused install") surviving
+#: in the other two steps, so all three are pinned the same way.
+_EXIT_ZERO_ONLY_SENTENCE = {
+    "install": "Start a new Claude Code session",
+    "restore": "Original version restored",
+    # Step 4 has no banner; its exit-0-only claim is that the script's output
+    # IS a status report — the thing a non-zero exit means it is not.
+    "status": "report the status verbatim",
+}
+
+
 @pytest.mark.parametrize("sub", ["install", "restore", "status"])
 def test_dev_test_reporting_branches_on_the_exit_status(sub):
     """`exit 2` was a signal with no receiver.
@@ -1959,12 +2036,33 @@ def test_dev_test_reporting_branches_on_the_exit_status(sub):
         # nothing was installed when something was.
         assert "Exit 2" in text
         assert "/dev-test restore" in text
-        # The success sentence must live under the exit-0 arm, never above it.
-        banner = "Start a new Claude Code session"
-        assert banner in text
-        assert text.index("Exit 0") < text.index(banner), (
-            "the 'start a new session' line must be reachable only on exit 0"
+        # Exit 3 is install-only for the same reason, from the other side: a
+        # partway install (backup published, cache half-overwritten) used to
+        # exit 1 and land in the catch-all arm, which asserted "nothing was
+        # installed" — the exact opposite of what the script had just printed.
+        # A user told nothing happened does not run `restore`.
+        assert "Exit 3" in text, (
+            "the partway-install exit code needs its own arm; folded into the "
+            "catch-all it becomes a claim the caller cannot know is true"
         )
+        assert text.index("Exit 3") < text.index("Any other non-zero"), (
+            "the exit-3 arm must be read before the catch-all it is carved out of"
+        )
+        # And the catch-all must not re-assert the state it no longer knows.
+        assert "nothing was installed." not in text, (
+            "the catch-all arm covers every non-zero code that is not 2 or 3; "
+            "asserting 'nothing was installed' there is what exit 3 exists to fix"
+        )
+    # The exit-0-only sentence must live UNDER the exit-0 arm, never above the
+    # branching instruction — in every step, not just `install`.
+    banner = _EXIT_ZERO_ONLY_SENTENCE[sub]
+    assert banner in text, f"step {sub!r} lost its exit-0 sentence {banner!r}"
+    assert "Exit 0" in text, f"step {sub!r} must name the exit-0 arm"
+    assert text.index("Exit 0") < text.index(banner), (
+        f"step {sub!r}: {banner!r} must be reachable only on exit 0, not "
+        "hoisted above the branching instruction where it reads as the "
+        "unconditional deliverable"
+    )
 
 
 def _run_dev_test_block(script, home, cwd):

@@ -597,6 +597,10 @@ def test_install_fails_loudly_when_security_tests_fail(tmp_path: Path) -> None:
 
 
 @requires_bash
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses directory permissions, so chmod 000 cannot be staged",
+)
 def test_an_interrupted_backup_never_produces_a_bak(tmp_path: Path) -> None:
     """The reviewer's round-2 reproduction, at its source.
 
@@ -656,19 +660,32 @@ def test_an_interrupted_backup_never_produces_a_bak(tmp_path: Path) -> None:
 
 
 @requires_bash
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        # What the script actually creates: "${BACKUP_DIR}.partial.$$", and
+        # BACKUP_DIR already carries ".bak". This row is the production shape;
+        # note it does NOT end in ".bak", so the `\.bak$` arm of the filter
+        # cannot catch it — only the `\.partial\.` arm can.
+        ".bak.partial.4242",
+        # The shorter shape, kept so the filter stays correct if the partial is
+        # ever built from the bare version rather than from BACKUP_DIR.
+        ".partial.4242",
+    ],
+)
 def test_a_leftover_partial_backup_is_not_selected_as_the_version(
-    tmp_path: Path,
+    tmp_path: Path, suffix: str
 ) -> None:
-    """A crashed backup leaves ``<version>.partial.<pid>`` beside the cache.
+    """A crashed backup leaves ``<version>.bak.partial.<pid>`` beside the cache.
 
     ``sort -V`` ranks that string ABOVE the bare version it derives from
-    (verified: ``3.4.1`` < ``3.4.1.bak`` < ``3.4.1.partial.9999``), so without
-    filtering it the version scan would select the truncated tree and every
-    subcommand would operate on it — the same class of silent-wrong-tree bug
-    the ``.bak`` filter already exists for.
+    (verified: ``3.4.1`` < ``3.4.1.bak`` < ``3.4.1.bak.partial.9999``), so
+    without filtering it the version scan would select the truncated tree and
+    every subcommand would operate on it — the same class of silent-wrong-tree
+    bug the ``.bak`` filter already exists for.
     """
     home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
-    stale = cache_dir.parent / f"{cache_dir.name}.partial.4242"
+    stale = cache_dir.parent / f"{cache_dir.name}{suffix}"
     (stale / "hooks").mkdir(parents=True)
 
     proc = _run(script, "status", home)
@@ -677,9 +694,22 @@ def test_a_leftover_partial_backup_is_not_selected_as_the_version(
     assert "Installed cache version: 1.2.3" in proc.stdout, (
         f"the leftover partial was selected as a version: {proc.stdout!r}"
     )
-    # Anchored to the leftover's own name, not the bare word: pytest's
-    # tmp_path is derived from the test name and contains "partial" itself.
-    assert stale.name not in proc.stdout
+    # The leftover IS named in the orphan disclosure at the end of `status`
+    # (that report is deliberate — see test_status_discloses_orphaned_partial
+    # _backups), so a whole-stdout `not in` would now pass or fail for the
+    # wrong reason. Assert on the two lines that carry the selection instead,
+    # anchored to the leftover's own name rather than the bare word "partial":
+    # pytest's tmp_path is derived from the test name and contains it too.
+    selection_lines = [
+        ln
+        for ln in proc.stdout.splitlines()
+        if ln.startswith(("Installed cache version:", "Cache dir:"))
+    ]
+    assert len(selection_lines) == 2, f"status changed shape: {proc.stdout!r}"
+    for line in selection_lines:
+        assert stale.name not in line, (
+            f"the leftover partial was selected: {line!r}"
+        )
 
 
 @requires_bash
@@ -720,3 +750,98 @@ def test_unreadable_cache_base_reports_instead_of_exiting_silently(
         f"expected a diagnostic, got stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
     assert "is not readable" in proc.stderr
+
+
+@requires_bash
+def test_a_partway_install_exits_3_not_1(tmp_path: Path) -> None:
+    """The failure that leaves the cache MODIFIED needs its own exit code.
+
+    Every other non-zero path refuses before anything is written; this one
+    happens after the ``.bak`` is published and while the cache is being
+    overwritten, so the cache ends up holding a mix of original and dev files.
+    Sharing exit 1 with the refuse-first guards is what let ``/dev-test``'s
+    catch-all arm report it as *"nothing was installed"* — the exact opposite
+    of what this arm's ERR trap prints. A user told nothing happened does not
+    run ``restore``, and is left with a half-dev cache plus a stale ``.bak``
+    that blocks the next install.
+
+    Driven for real, not simulated: removing the cache's ``hooks/`` directory
+    lets the backup ``cp -R`` succeed (so the ``.bak`` really is published) and
+    makes the very next ``cp`` into the cache fail — the exact ordering the
+    exit code has to distinguish.
+    """
+    home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
+    shutil.rmtree(cache_dir / "hooks")
+
+    proc = _run(script, "install", home)
+
+    assert proc.returncode == 3, (
+        "a partway install must be distinguishable from a guard that refused "
+        f"before writing; got {proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "Install failed partway" in proc.stderr
+    assert "PARTIALLY overwritten" in proc.stderr, (
+        "the message must state that the cache WAS modified, not merely that "
+        f"something failed; got {proc.stderr!r}"
+    )
+    assert "/dev-test restore" in proc.stderr
+    # The precondition the exit code is claiming: a backup really was published.
+    assert list(cache_dir.parent.glob("*.bak")), (
+        "exit 3 asserts a backup exists to restore from — if none was "
+        "published this test is measuring the wrong failure"
+    )
+
+
+@requires_bash
+def test_status_discloses_orphaned_partial_backups(tmp_path: Path) -> None:
+    """``status`` used to say "cache is clean" beside full copies of the cache.
+
+    A hard kill (SIGKILL, power loss) skips the install arm's ERR trap, so
+    ``<version>.bak.partial.<pid>`` survives — and no later run removes it,
+    because ``rm -rf "$BACKUP_TMP"`` only ever clears the CURRENT pid's name.
+    The state is correctly inert (filtered from the version scan, never named
+    by ``restore``), but each orphan is a FULL copy of the plugin cache, so
+    they are real disk that nothing disclosed.
+
+    Two orphans, so a single-item report cannot pass by accident.
+    """
+    home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
+    orphans = []
+    for pid in ("88888", "99999"):
+        stale = cache_dir.parent / f"{cache_dir.name}.bak.partial.{pid}"
+        (stale / "hooks").mkdir(parents=True)
+        orphans.append(stale)
+
+    proc = _run(script, "status", home)
+
+    assert proc.returncode == 0, proc.stderr
+    # Still the correct headline — the orphans are not a backup.
+    assert "Status: ORIGINAL" in proc.stdout
+    assert "Orphaned partial backups" in proc.stdout, (
+        f"status must disclose the leftovers, got {proc.stdout!r}"
+    )
+    assert "safe to delete" in proc.stdout
+    for stale in orphans:
+        assert stale.name in proc.stdout, f"{stale.name} not listed in {proc.stdout!r}"
+    # Disclosure only: the pid may belong to a live install, so nothing is
+    # removed on the reporting path.
+    for stale in orphans:
+        assert stale.is_dir(), "status must not delete another process's partial"
+
+
+@requires_bash
+def test_status_says_nothing_about_partials_when_there_are_none(
+    tmp_path: Path,
+) -> None:
+    """Negative control for the disclosure above.
+
+    Without it, a report hardcoded to print unconditionally would satisfy the
+    positive test while adding a permanent false alarm to every ``status`` run.
+    """
+    home, _repo, script, _cache_dir = _stage_production_geometry(tmp_path)
+
+    proc = _run(script, "status", home)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Orphaned partial backups" not in proc.stdout

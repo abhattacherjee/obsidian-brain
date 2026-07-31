@@ -90,11 +90,16 @@ if [[ -z "$CACHE_BASE" ]]; then
     exit 1
 fi
 # Pick the highest installed semver under that cache dir, excluding both the
-# .bak backup and any *.partial.<pid> left behind by an interrupted backup
+# .bak backup and any *.bak.partial.<pid> left behind by an interrupted backup
 # (see the install arm). Neither is a version, and `sort -V` ranks both ABOVE
 # the bare version string they are derived from -- so without the filter,
-# `3.4.1.partial.9999` would be selected as PLUGIN_VERSION and CACHE_DIR would
-# point at a truncated tree.
+# `3.4.1.bak.partial.9999` would be selected as PLUGIN_VERSION and CACHE_DIR
+# would point at a truncated tree.
+#
+# Note which pattern catches which: the partial's real name ends in
+# `.partial.<pid>`, NOT in `.bak`, so the `\.bak$` arm does not match it --
+# the `\.partial\.[0-9]+$` arm is the one that does. Deleting either arm
+# leaves a truncated tree selectable.
 #
 # The `|| true` wraps the WHOLE pipeline, not just the `grep`, and that is
 # load-bearing rather than defensive noise. Two commands in here can exit
@@ -181,7 +186,21 @@ case "$cmd" in
 
         # From here the cache itself is being overwritten, so recovery means
         # putting the backup back.
-        trap 'echo "ERROR: Install failed partway. Run \"/dev-test restore\" to recover." >&2' ERR
+        #
+        # This is the ONLY failure path that leaves the cache modified, and it
+        # gets its own exit code (3) instead of sharing the generic 1 that
+        # every refuse-before-writing guard uses. Sharing it was a real defect:
+        # /dev-test's catch-all arm read "non-zero and not 2" as "nothing was
+        # installed" -- the exact opposite of what this trap prints -- and a
+        # user told nothing happened does not run `restore`, so they are left
+        # with a half-dev cache plus a stale .bak that blocks the next install
+        # with "Backup already exists". A distinct code lets the caller branch
+        # on the STATE rather than pattern-match this message's wording.
+        #
+        # Keep the `exit 3` inside the trap: without it the trap only prints
+        # and `set -e` then exits with the failing command's own status (1),
+        # which is the code this arm exists to stop overloading.
+        trap 'echo "ERROR: Install failed partway. The cache was PARTIALLY overwritten and a backup of the original is in place. Run \"/dev-test restore\" to recover." >&2; exit 3' ERR
 
         echo "Installing dev versions..."
 
@@ -344,6 +363,25 @@ case "$cmd" in
             echo "Status: ORIGINAL (no backup, cache is clean)"
         else
             echo "Status: NOT INSTALLED (cache dir missing)"
+        fi
+
+        # Orphaned out-of-place backups. A hard kill (SIGKILL, power loss)
+        # skips the install arm's ERR trap, so `${VERSION}.bak.partial.<pid>`
+        # survives -- and no later run removes it, because `rm -rf
+        # "$BACKUP_TMP"` only ever clears the CURRENT pid's name. The state is
+        # deliberately inert (filtered from the version scan, never named by
+        # `restore`, invisible to install's "backup already exists" check), but
+        # each one is a FULL copy of the plugin cache, so reporting "cache is
+        # clean" beside a pile of them understates real disk use. Disclose;
+        # never auto-delete, since the pid may belong to a live install.
+        if compgen -G "$CACHE_BASE/*.partial.*" > /dev/null 2>&1; then
+            echo ""
+            echo "Orphaned partial backups found (leftovers from an interrupted install)."
+            echo "They are never used by 'restore' and are safe to delete:"
+            for _partial in "$CACHE_BASE"/*.partial.*; do
+                [[ -e "$_partial" ]] || continue
+                echo "  $_partial"
+            done
         fi
         ;;
 
