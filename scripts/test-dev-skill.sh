@@ -11,8 +11,37 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 PLUGIN_NAME="obsidian-brain"
+
+# Guard 1 (sentinel): REPO_ROOT must actually be an obsidian-brain checkout,
+# not just whatever directory happens to be two levels above this script.
+if [[ ! -f "$REPO_ROOT/hooks/obsidian_utils.py" ]] || [[ ! -d "$REPO_ROOT/skills" ]]; then
+    echo "ERROR: $REPO_ROOT does not look like an obsidian-brain checkout (missing hooks/obsidian_utils.py or skills/)." >&2
+    echo "This script must live inside a real obsidian-brain repo checkout; refusing to run." >&2
+    exit 1
+fi
+
+# Guard 2 (self-copy, D3): if this script is itself running from inside the
+# installed plugin cache, REPO_ROOT resolves to the cache version directory
+# and "install" would copy the cache onto itself -- cp cache/hooks/*.py
+# cache/hooks/*.py -- a byte-for-byte no-op that prints a full success
+# transcript and leaves a .bak. That is silent-stale, not a hard failure, so
+# it must be refused loudly instead of "succeeding". Scoped to the mutating
+# subcommands (install/restore): `status` is a read-only report and stays
+# useful even when run from inside the cache (e.g. inspecting what's
+# installed on a machine with no local checkout).
+CACHE_ROOT_PREFIX="${HOME}/.claude/plugins/cache/"
+case "${1:-status}" in
+    install|restore)
+        if [[ "$REPO_ROOT/" == "$CACHE_ROOT_PREFIX"* ]]; then
+            echo "ERROR: $REPO_ROOT is inside the installed plugin cache ($CACHE_ROOT_PREFIX)." >&2
+            echo "Installing the cache onto itself is a no-op. Run this script from a real" >&2
+            echo "local obsidian-brain checkout, not from the plugin cache." >&2
+            exit 1
+        fi
+        ;;
+esac
 
 # Discover the plugin cache dir regardless of which marketplace installed it.
 # Matches ~/.claude/plugins/cache/<marketplace>/obsidian-brain ; newest wins.

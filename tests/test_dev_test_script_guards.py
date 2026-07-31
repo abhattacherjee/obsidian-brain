@@ -1,0 +1,170 @@
+"""Tests for the two repo-root guards in scripts/test-dev-skill.sh (#287).
+
+The script derives REPO_ROOT from its own location
+(``$(dirname "$0")/..``) and uses it as the source tree for ``install``.
+That is correct when the script is invoked from a real obsidian-brain
+checkout, but silently wrong in two other cases the caller cannot be
+trusted to rule out:
+
+1. The directory the script happens to sit two levels above isn't an
+   obsidian-brain checkout at all (missing ``hooks/obsidian_utils.py`` /
+   ``skills/``).
+2. The script is itself running from *inside* the installed plugin cache
+   (``~/.claude/plugins/cache/*/obsidian-brain/<version>/``). In that case
+   ``REPO_ROOT`` resolves to the cache version directory, and ``install``
+   would copy the cache onto itself -- a byte-for-byte no-op that still
+   prints a full success transcript (see D3 in
+   docs/plans/287-dev-test-repo-root.md).
+
+Both guards must fire before any ``cp`` and before the ``.bak`` backup is
+taken, so a bad invocation never leaves stray state behind.
+
+These tests drive the real script (copied into an isolated ``tmp_path``
+tree) under a real ``bash`` subprocess. ``$HOME`` is always redirected to a
+``tmp_path`` subdirectory -- the real ``~/.claude/plugins/cache/`` is never
+read or written.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_PATH = REPO_ROOT / "scripts" / "test-dev-skill.sh"
+
+_BASH = shutil.which("bash")
+requires_bash = pytest.mark.skipif(_BASH is None, reason="bash not available")
+
+
+def _write_script(dest_dir: Path) -> Path:
+    """Copy the real script into dest_dir/test-dev-skill.sh (mode 0755)."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    script_path = dest_dir / "test-dev-skill.sh"
+    script_path.write_bytes(SCRIPT_PATH.read_bytes())
+    script_path.chmod(0o755)
+    return script_path
+
+
+def _run(script: Path, cmd: str, home: Path) -> subprocess.CompletedProcess:
+    env = {**os.environ, "HOME": str(home)}
+    return subprocess.run(
+        ["bash", str(script), cmd],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+@requires_bash
+def test_sentinel_guard_rejects_non_checkout(tmp_path: Path) -> None:
+    """Guard 1: a directory two levels above the script that lacks
+    hooks/obsidian_utils.py and skills/ is not an obsidian-brain checkout --
+    the script must refuse rather than trust its own location blindly.
+
+    Deliberately placed OUTSIDE any ~/.claude/plugins/cache/ path, and run
+    with "status" (not install/restore), so this failure can only be
+    attributed to guard 1 -- guard 2 does not even apply to "status".
+    """
+    repo = tmp_path / "some-other-project"
+    script = _write_script(repo / "scripts")
+    home = tmp_path / "home"  # empty; never touched by this test
+
+    proc = _run(script, "status", home)
+
+    assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
+    assert "does not look like an obsidian-brain checkout" in proc.stderr
+
+
+@requires_bash
+def test_sentinel_guard_fires_before_any_mutation(tmp_path: Path) -> None:
+    """Guard 1 must fire even for "install" -- before the cache lookup, the
+    .bak backup, or any cp -- so a non-checkout invocation never mutates
+    anything under $HOME.
+    """
+    repo = tmp_path / "some-other-project"
+    script = _write_script(repo / "scripts")
+    home = tmp_path / "home"
+    home.mkdir()
+
+    proc = _run(script, "install", home)
+
+    assert proc.returncode != 0
+    assert "does not look like an obsidian-brain checkout" in proc.stderr
+    # Nothing was created under $HOME -- no cache probing, no .bak.
+    assert not any(home.rglob("*"))
+
+
+@requires_bash
+def test_self_copy_guard_rejects_install_from_inside_cache(tmp_path: Path) -> None:
+    """Guard 2 (D3): a script whose own REPO_ROOT resolves to a path under
+    ~/.claude/plugins/cache/ must refuse "install" -- copying the cache onto
+    itself is a no-op that would otherwise print a full success transcript.
+
+    The staged tree carries valid sentinel files (hooks/obsidian_utils.py,
+    skills/) so guard 1 passes and this failure can only be attributed to
+    guard 2 -- this is what keeps the fixture from being shadowed by guard 1
+    (the guard-ordering trap).
+    """
+    home = tmp_path / "home"
+    cache_version_dir = (
+        home / ".claude" / "plugins" / "cache" / "some-marketplace" / "obsidian-brain" / "9.9.9"
+    )
+    script = _write_script(cache_version_dir / "scripts")
+    (cache_version_dir / "hooks").mkdir(parents=True)
+    (cache_version_dir / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
+    (cache_version_dir / "skills" / "some-skill").mkdir(parents=True)
+
+    proc = _run(script, "install", home)
+
+    assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
+    assert "inside the installed plugin cache" in proc.stderr
+    # No backup was created -- the guard fired before the .bak step.
+    assert not (cache_version_dir.parent / "9.9.9.bak").exists()
+
+
+@requires_bash
+def test_self_copy_guard_rejects_restore_from_inside_cache(tmp_path: Path) -> None:
+    """Guard 2 also applies to "restore" -- restoring a .bak while REPO_ROOT
+    is the cache itself is equally nonsensical (there is no local checkout
+    to have diverged from).
+    """
+    home = tmp_path / "home"
+    cache_version_dir = (
+        home / ".claude" / "plugins" / "cache" / "some-marketplace" / "obsidian-brain" / "9.9.9"
+    )
+    script = _write_script(cache_version_dir / "scripts")
+    (cache_version_dir / "hooks").mkdir(parents=True)
+    (cache_version_dir / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
+    (cache_version_dir / "skills" / "some-skill").mkdir(parents=True)
+
+    proc = _run(script, "restore", home)
+
+    assert proc.returncode != 0
+    assert "inside the installed plugin cache" in proc.stderr
+
+
+@requires_bash
+def test_status_still_works_from_inside_cache(tmp_path: Path) -> None:
+    """Judgment call (see task-2-report.md): guard 2 is scoped to the
+    mutating subcommands only. "status" is read-only and must keep
+    reporting even when the script happens to be running from inside the
+    cache -- e.g. a machine with no local checkout that only has the cache.
+    """
+    home = tmp_path / "home"
+    cache_version_dir = (
+        home / ".claude" / "plugins" / "cache" / "some-marketplace" / "obsidian-brain" / "9.9.9"
+    )
+    script = _write_script(cache_version_dir / "scripts")
+    (cache_version_dir / "hooks").mkdir(parents=True)
+    (cache_version_dir / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
+    (cache_version_dir / "skills" / "some-skill").mkdir(parents=True)
+
+    proc = _run(script, "status", home)
+
+    assert proc.returncode == 0, f"status should succeed from inside cache: {proc.stderr}"
+    assert "Plugin: obsidian-brain" in proc.stdout
