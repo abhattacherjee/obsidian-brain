@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`/dev-test` no longer fails when invoked from a project other than obsidian-brain (#287):** the skill used to `cd "$(git rev-parse --show-toplevel)"` and run `./scripts/test-dev-skill.sh` relative to whatever repo the current session happened to be in, so calling it from any other project's checkout broke. It now resolves the obsidian-brain checkout via a dedicated `_ob_repo()` resolver: the registered directory-source install from `~/.claude/plugins/known_marketplaces.json` first, falling back to `git rev-parse --show-toplevel` only when that toplevel itself carries the `scripts/test-dev-skill.sh` sentinel, and otherwise failing loudly naming both attempted routes. The plugin cache is deliberately not a fallback here, unlike other resolvers in this repo — copying the working tree *from* a stale cache would defeat the point of `/dev-test install`. `scripts/test-dev-skill.sh` additionally now refuses to run outside a real checkout and refuses to install from inside the plugin cache.
+
 ## [3.4.0] - 2026-07-30
 
 ### Added
