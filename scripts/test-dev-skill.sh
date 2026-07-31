@@ -25,8 +25,20 @@ PLUGIN_NAME="obsidian-brain"
 # sitting inside a real checkout?" (it needs its own source tree to copy
 # from). A tree that satisfies one and not the other fails loudly either
 # way; see MINOR-4 in the #287 final review.
-if [[ ! -f "$REPO_ROOT/hooks/obsidian_utils.py" ]] || [[ ! -d "$REPO_ROOT/skills" ]]; then
-    echo "ERROR: $REPO_ROOT does not look like an obsidian-brain checkout (missing hooks/obsidian_utils.py or skills/)." >&2
+#
+# The skills/ half tests NON-EMPTY (`compgen -G`), not mere existence. `-d`
+# alone accepted an empty skills/ -- and an empty skills/ is not an inert
+# near-miss, it is the exact failure this half exists to stop: the install
+# loop's `"$REPO_ROOT/skills/"*/` glob goes unmatched, bash leaves it
+# literal (nullglob is off), and the run prints `  skills/*/ -> cache`,
+# creates a directory literally named `*` inside the plugin cache, publishes
+# a .bak that blocks the next install, and exits 0. Reproduced verbatim
+# during the #287 adversarial review. `restore`'s completeness check below
+# already used the non-empty predicate for this same property; the two must
+# not disagree about what "has skills" means.
+if [[ ! -f "$REPO_ROOT/hooks/obsidian_utils.py" ]] \
+    || ! compgen -G "$REPO_ROOT/skills/*" > /dev/null 2>&1; then
+    echo "ERROR: $REPO_ROOT does not look like an obsidian-brain checkout (missing hooks/obsidian_utils.py, or skills/ is missing or empty)." >&2
     echo "This script must live inside a real obsidian-brain repo checkout; refusing to run." >&2
     exit 1
 fi
@@ -56,28 +68,52 @@ fi
 # invocation, not for a "machine with no local checkout" scenario.)
 case "${1:-status}" in
     install|restore)
-        # REPO_ROOT above is resolved through symlinks (`pwd -P`). $HOME must
-        # be canonicalized the same way before being used as a prefix, or a
-        # symlinked $HOME (e.g. macOS /var -> /private/var) makes this
-        # comparison silently fail to fire on a machine where it should --
-        # the guard would compare a canonicalized path against an
-        # uncanonicalized one and never match. If $HOME can't be resolved at
-        # all, fail closed for these mutating subcommands rather than
-        # silently skipping the guard -- a guard that can't be evaluated is
-        # not a guard.
+        # REPO_ROOT above is resolved through symlinks (`pwd -P`), so the
+        # prefix it is compared against must be resolved to the SAME degree or
+        # the `==` never matches and the guard silently fails to fire. If
+        # $HOME can't be resolved at all, fail closed for these mutating
+        # subcommands rather than skipping the guard -- a guard that can't be
+        # evaluated is not a guard.
         if [[ -z "${HOME:-}" ]] || [[ ! -d "$HOME" ]]; then
             echo "ERROR: \$HOME is unset, empty, or not a directory; cannot verify this script isn't" >&2
             echo "running from inside the installed plugin tree. Refusing to run '${1}' without a" >&2
             echo "resolvable \$HOME." >&2
             exit 1
         fi
-        PLUGIN_ROOT_PREFIX="$(cd "$HOME" && pwd -P)/.claude/plugins/"
-        if [[ "$REPO_ROOT/" == "$PLUGIN_ROOT_PREFIX"* ]]; then
-            echo "ERROR: $REPO_ROOT is inside the installed plugin tree ($PLUGIN_ROOT_PREFIX)." >&2
-            echo "That covers both the plugin cache (installing it onto itself is a no-op) and a" >&2
-            echo "marketplace clone (a released tree that '/plugin marketplace update' rewrites)." >&2
-            echo "Run this script from a real local obsidian-brain checkout instead." >&2
-            exit 1
+        # Canonicalize the plugin root DIRECTORY, rather than composing a
+        # canonicalized $HOME with the literal segments /.claude/plugins/ and
+        # calling the result a resolved prefix. Composing a prefix that way
+        # resolves only its first component, so ANY symlink below $HOME defeats
+        # it -- and `~/.claude` being a symlink into a dotfiles tree is a
+        # standard stow/chezmoi layout, not an exotic one. Reproduced during the
+        # #287 adversarial review: with `~/.claude` symlinked, a marketplace
+        # clone installed itself over the cache at exit 0 with a full success
+        # banner (the released hook landed in the cache), while the identical
+        # fixture with a real `.claude` directory refused at exit 1. That was the
+        # third instance of this one root cause on this branch -- $HOME
+        # uncanonicalized, then the prefix too narrow, then this -- so `cd` into
+        # the real thing and let the filesystem do the resolving.
+        #
+        # No plugins directory means the guard has nothing to catch, and skipping
+        # it there is not fail-open: REPO_ROOT is an existing directory (its
+        # assignment at the top of this script `cd`s into it), and no existing
+        # directory can live under a path that does not exist. Skipping it is
+        # also what keeps the `cd` below evaluable at all -- `cd` into a missing
+        # directory fails, and under `set -euo pipefail` that would abort every
+        # `install`/`restore` on a machine that has no plugins tree yet, which
+        # is a refusal with no defect behind it. If the directory exists but
+        # cannot be entered, the
+        # `cd` fails, `set -e` aborts on the assignment, and the run stops before
+        # any mutation -- fail closed, as above.
+        if [[ -d "$HOME/.claude/plugins" ]]; then
+            PLUGIN_ROOT_PREFIX="$(cd "$HOME/.claude/plugins" && pwd -P)/"
+            if [[ "$REPO_ROOT/" == "$PLUGIN_ROOT_PREFIX"* ]]; then
+                echo "ERROR: $REPO_ROOT is inside the installed plugin tree ($PLUGIN_ROOT_PREFIX)." >&2
+                echo "That covers both the plugin cache (installing it onto itself is a no-op) and a" >&2
+                echo "marketplace clone (a released tree that '/plugin marketplace update' rewrites)." >&2
+                echo "Run this script from a real local obsidian-brain checkout instead." >&2
+                exit 1
+            fi
         fi
         ;;
 esac
@@ -181,7 +217,17 @@ case "$cmd" in
         # A backup failure has changed NOTHING, so "run restore" (the message
         # used once the cache is being written, below) would be exactly the
         # wrong advice here.
-        trap 'rm -rf "$BACKUP_TMP"; echo "ERROR: Backup of $CACHE_DIR failed. The cache was NOT modified and no backup was kept." >&2' ERR
+        #
+        # Message FIRST, cleanup second, and the cleanup cannot abort the body.
+        # Trap bodies run with `errexit` still in force, so a non-zero command
+        # inside one kills the rest of it (verified on bash 3.2.57: `trap
+        # 'false; echo REACHED >&2' ERR` never prints REACHED). With the `rm`
+        # first, an `rm` that cannot complete -- a root-owned entry inside the
+        # partial, a read-only parent -- would swallow the one diagnostic this
+        # arm exists to deliver, at exactly the moment the user most needs to be
+        # told the cache is intact. The `|| true` keeps that ordering true for
+        # any future command appended after it.
+        trap 'echo "ERROR: Backup of $CACHE_DIR failed. The cache was NOT modified and no backup was kept." >&2; rm -rf "$BACKUP_TMP" || true' ERR
         echo "Backing up: $CACHE_DIR -> $BACKUP_DIR"
         cp -R "$CACHE_DIR" "$BACKUP_TMP"
         mv "$BACKUP_TMP" "$BACKUP_DIR"
@@ -227,8 +273,19 @@ case "$cmd" in
             fi
         fi
 
-        # Copy skills
+        # Copy skills.
+        #
+        # `[[ -d ... ]] || continue` is the residual of guard 1's empty-skills/
+        # case, not redundancy with it. Guard 1 asks whether skills/ has ANY
+        # entry (matching restore's predicate); this loop globs only skills/*/,
+        # so a skills/ holding nothing but files -- a README, a half-finished
+        # rsync -- passes the guard and still leaves the glob unmatched, and an
+        # unmatched glob is literal here (nullglob is off). Without this line
+        # that shape mkdirs a directory named `*` into the plugin cache and
+        # narrates `  skills/*/ -> cache` for a copy that never happened;
+        # reproduced during the #287 adversarial review.
         for skill_dir in "$REPO_ROOT/skills/"*/; do
+            [[ -d "$skill_dir" ]] || continue
             skill_name=$(basename "$skill_dir")
             mkdir -p "$CACHE_DIR/skills/$skill_name"
             if compgen -G "$skill_dir"* > /dev/null 2>&1; then
@@ -295,10 +352,19 @@ case "$cmd" in
         ;;
 
     restore)
+        # Exit 4: there was nothing to restore. Distinct from the exit 0 a
+        # completed swap returns, for the same reason install's partway failure
+        # got exit 3 -- one exit code must name one state. Sharing 0 meant
+        # /dev-test's single exit-0 arm narrated "Original version restored.
+        # Start a new session" over a run that restored nothing and changed
+        # nothing, sending the user to restart a session for a state change that
+        # never happened. Not an error (nothing is wrong, and nothing is left to
+        # recover), just not a restore -- hence its own code rather than folding
+        # into the generic 1 that the refusal paths use.
         if [[ ! -d "$BACKUP_DIR" ]]; then
             echo "No backup found at $BACKUP_DIR — nothing to restore."
             echo "Current cache is the original version."
-            exit 0
+            exit 4
         fi
 
         # Sanity check: CACHE_DIR must be under CACHE_BASE
@@ -361,7 +427,25 @@ case "$cmd" in
             echo "Backup: $BACKUP_DIR"
             echo ""
             echo "Files changed from original:"
-            diff -rq "$BACKUP_DIR" "$CACHE_DIR" 2>/dev/null | head -20 || echo "  (diff failed)"
+            # `diff` exits 1 for "the inputs differ" -- which is not a failure,
+            # it is the ONLY outcome this branch is ever reached for: a dev
+            # version is active precisely because the cache differs from its
+            # backup. Under `set -o pipefail` (line 12) that 1 became the
+            # pipeline's status, so `|| echo "  (diff failed)"` fired after
+            # EVERY successful dev-active listing -- and /dev-test's Step 4 now
+            # relays this report verbatim, so the caller passed a failure that
+            # did not occur straight through to the user. `head -20` closing the
+            # pipe early (SIGPIPE, 141) was a second, independent trigger.
+            # Only status >= 2 means diff itself failed; branch on that alone.
+            diff_rc=0
+            diff_out="$(diff -rq "$BACKUP_DIR" "$CACHE_DIR" 2>/dev/null)" || diff_rc=$?
+            if [[ "$diff_rc" -ge 2 ]]; then
+                echo "  (diff failed)"
+            elif [[ -n "$diff_out" ]]; then
+                printf '%s\n' "$diff_out" | head -20 || true
+            else
+                echo "  (none — the cache is byte-identical to the backup)"
+            fi
         elif [[ -d "$CACHE_DIR" ]]; then
             echo "Status: ORIGINAL (no backup, cache is clean)"
         else

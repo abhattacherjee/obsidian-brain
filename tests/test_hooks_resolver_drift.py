@@ -1551,9 +1551,11 @@ def test_repo_resolver_prefers_the_registered_checkout_over_the_cwd(
     hold either way.
 
     Note this pins the PYTHON layer, which must stay cwd-independent — the
-    cwd is consulted by the shell wrapper around it (and, since the F1
-    precedence fix, consulted FIRST; see the shell section at the bottom of
-    this module). If this body ever starts answering with the cwd, the two
+    cwd is consulted by the shell wrapper around it (and, since the review
+    round P1 precedence fix — the revision recorded in
+    docs/plans/287-dev-test-repo-root.md — consulted FIRST; see the shell
+    section at the bottom of this module). If this body ever starts
+    answering with the cwd, the two
     layers become indistinguishable and the wrapper's ordering is untestable.
     """
     registered = _seed_checkout(fake_home / "registered-checkout")
@@ -2052,6 +2054,28 @@ def test_dev_test_reporting_branches_on_the_exit_status(sub):
         assert "nothing was installed." not in text, (
             "the catch-all arm covers every non-zero code that is not 2 or 3; "
             "asserting 'nothing was installed' there is what exit 3 exists to fix"
+        )
+    if sub == "restore":
+        # Exit 4 is restore-only: "there was no backup, so nothing was
+        # restored". It shared exit 0 with a COMPLETED restore, which left this
+        # step's single exit-0 arm narrating "Original version restored. Start a
+        # new session" over a run that changed nothing — the same defect exit 3
+        # was carved out of the install catch-all to fix, in the arm that was
+        # left sharing.
+        # Anchored on the bullet marker, not the bare string "Exit 4": a plain
+        # substring test is satisfied by any code that merely STARTS with 4
+        # (measured — renumbering the arm to "Exit 44" passed 3/3), which is the
+        # vacuity class this module already fixed elsewhere.
+        assert "**Exit 4 —" in text, (
+            "the no-op restore needs its own arm; folded into exit 0 it becomes "
+            "a claim the caller cannot know is true"
+        )
+        assert text.index("**Exit 4 —") < text.index("Any other non-zero"), (
+            "the exit-4 arm must be read before the catch-all"
+        )
+        assert "no new session is needed" in text.lower(), (
+            "the exit-4 arm must say the opposite of the exit-0 banner — "
+            "nothing changed, so there is nothing to pick up"
         )
     # The exit-0-only sentence must live UNDER the exit-0 arm, never above the
     # branching instruction — in every step, not just `install`.

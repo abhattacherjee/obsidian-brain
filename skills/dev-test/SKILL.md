@@ -157,7 +157,11 @@ Report the output, then **branch on the command's exit status** — the fenced b
 
   > Original version restored. **Start a new session** to pick up the restored version.
 
-- **Any non-zero exit — nothing was restored, or the restore aborted partway.** Do **not** say the original version is back. Relay the error output verbatim and stop. Two cases the script distinguishes and that are worth passing on in your own words: it *refused* an incomplete `.bak` (the live cache is untouched and still holds the dev version), or the swap *failed partway* (the cache may be missing and needs `/plugin marketplace update`).
+- **Exit 4 — there was nothing to restore.** No backup existed, so no dev version was installed and the cache already holds the released version. Nothing changed on disk. Do **not** claim a restore happened and do **not** send the user to restart a session for a state change that did not occur. Tell the user:
+
+  > There was no dev install to undo — the cache already holds the released version. Nothing changed, so **no new session is needed**.
+
+- **Any other non-zero exit — nothing was restored, or the restore aborted partway.** Do **not** say the original version is back. Relay the error output verbatim and stop. Two cases the script distinguishes and that are worth passing on in your own words: it *refused* an incomplete `.bak` (the live cache is untouched and still holds the dev version), or the swap *failed partway* (the cache may be missing and needs `/plugin marketplace update`).
 
 Stop here.
 

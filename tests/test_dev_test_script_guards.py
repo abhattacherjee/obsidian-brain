@@ -7,8 +7,8 @@ checkout, but silently wrong in two other cases the caller cannot be
 trusted to rule out:
 
 1. The directory the script happens to sit two levels above isn't an
-   obsidian-brain checkout at all (missing ``hooks/obsidian_utils.py`` /
-   ``skills/``).
+   obsidian-brain checkout at all (missing ``hooks/obsidian_utils.py``, or a
+   ``skills/`` that is missing or empty).
 2. The script is itself running from *inside* the installed plugin tree
    (anything under ``~/.claude/plugins/``). Two shapes live there and both
    are wrong as an install SOURCE: the cache
@@ -177,32 +177,83 @@ def test_sentinel_guard_fires_before_any_mutation(tmp_path: Path) -> None:
 
 
 @requires_bash
-def test_sentinel_guard_rejects_checkout_missing_skills_dir(tmp_path: Path) -> None:
-    """Guard 1's ``skills/`` half in isolation.
+@pytest.mark.parametrize("shape", ["absent-skills-dir", "empty-skills-dir"])
+def test_sentinel_guard_rejects_checkout_without_a_non_empty_skills_dir(
+    tmp_path: Path, shape: str
+) -> None:
+    """Guard 1's ``skills/`` half in isolation, in BOTH shapes it must reject.
 
     The only other guard-1 fixture (above) builds a tree with NEITHER
     sentinel, so each half of the ``||`` is covered by the other -- deleting
     either half alone still passes the suite. This tree carries the
-    ``hooks/obsidian_utils.py`` sentinel but deliberately omits ``skills/``,
-    so a failure here can only be attributed to the ``skills/`` half.
+    ``hooks/obsidian_utils.py`` sentinel but no usable ``skills/``, so a
+    failure here can only be attributed to the ``skills/`` half.
 
-    That half is genuinely load-bearing in production: with ``skills/``
-    absent, the install loop's ``"$REPO_ROOT/skills/"*/`` glob goes
-    unmatched and (with nullglob unset, the bash default) stays literal,
-    creating a junk ``skills/*`` directory under the cache instead of
-    failing loudly up front.
+    That half is genuinely load-bearing in production: with no skills to
+    match, the install loop's ``"$REPO_ROOT/skills/"*/`` glob goes unmatched
+    and (with nullglob unset, the bash default) stays literal, creating a
+    junk ``skills/*`` directory under the cache instead of failing loudly up
+    front.
+
+    ``empty-skills-dir`` is the row that makes that docstring true rather
+    than merely plausible. The guard used to test ``[[ ! -d
+    "$REPO_ROOT/skills" ]]``, which an EMPTY ``skills/`` satisfies -- so the
+    failure this test cites as the justification was reachable through the
+    guard that was supposed to close it, and only the ``absent`` row was
+    staged. Reproduced verbatim against that version: ``  skills/*/ ->
+    cache`` narrated for a copy that never happened, a directory literally
+    named ``*`` created in the plugin cache beside ``recall``, a ``.bak``
+    published, EXIT=0. The predicate is now ``compgen -G``, matching
+    ``restore``'s completeness check.
     """
     repo = tmp_path / "obsidian-brain"
     script = _write_script(repo / "scripts")
     (repo / "hooks").mkdir(parents=True)
     (repo / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
-    # deliberately no skills/ dir
+    if shape == "empty-skills-dir":
+        (repo / "skills").mkdir()  # present but EMPTY
+    # else: deliberately no skills/ dir at all
     home = tmp_path / "home"
 
     proc = _run(script, "status", home)
 
     assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
     assert GUARD1_MSG in proc.stderr
+
+
+@requires_bash
+def test_install_never_creates_a_literal_star_skill_dir(tmp_path: Path) -> None:
+    """The residual of guard 1's ``skills/`` half, closed in the loop itself.
+
+    Guard 1 asks whether ``skills/`` holds ANY entry (``compgen -G
+    "…/skills/*"``, the predicate ``restore`` uses). The install loop globs
+    ``skills/*/`` -- directories only. A ``skills/`` holding nothing but
+    FILES (a README, a half-finished rsync) therefore passes the guard and
+    still leaves the loop's glob unmatched, and an unmatched glob is literal
+    with nullglob off: reproduced against the guard-1 fix alone, the run
+    printed ``  skills/*/ -> cache`` and created a directory named ``*``
+    inside the plugin cache at exit 0.
+
+    So the loop skips anything that is not a real directory. Asserts on the
+    cache contents and the transcript, not just the exit code -- the
+    pre-fix run exited 0 too.
+    """
+    home, repo, script, cache_dir = _stage_production_geometry(tmp_path)
+    shutil.rmtree(repo / "skills")
+    (repo / "skills").mkdir()
+    (repo / "skills" / "README.md").write_text("# not a skill\n")
+
+    proc = _run(script, "install", home)
+
+    assert proc.returncode == 0, f"install refused: {proc.stderr}"
+    assert GUARD1_MSG not in proc.stderr, "a files-only skills/ is not empty"
+    assert "*" not in [p.name for p in (cache_dir / "skills").iterdir()], (
+        f"a literal '*' directory landed in the cache: "
+        f"{sorted(p.name for p in (cache_dir / 'skills').iterdir())}"
+    )
+    assert "skills/*/" not in proc.stdout, (
+        f"the transcript narrated a copy that never happened: {proc.stdout!r}"
+    )
 
 
 @requires_bash
@@ -316,6 +367,102 @@ def test_self_copy_guard_fires_with_symlinked_home(tmp_path: Path) -> None:
 
 
 @requires_bash
+def test_self_copy_guard_fires_with_symlinked_dot_claude(tmp_path: Path) -> None:
+    """Guard 2 must canonicalize the plugin root DIRECTORY, not just ``$HOME``.
+
+    The test above symlinks ``$HOME`` itself. That closes only the first
+    component: the prefix was then built as ``$(cd "$HOME" && pwd -P)`` plus the
+    LITERAL segments ``/.claude/plugins/``, so a symlink anywhere BELOW $HOME
+    left the two sides of the comparison canonicalized to different degrees and
+    the guard never fired. ``~/.claude`` pointing into a dotfiles tree is a
+    standard stow/chezmoi layout, not an exotic one.
+
+    Reproduced against the literal-append form, with this exact geometry:
+    ``Backing up: … -> ….bak`` / ``Installing dev versions…`` / ``Dev version
+    installed to cache (v3.4.0).`` at EXIT=0, after which the cache's
+    ``hooks/obsidian_utils.py`` held ``# RELEASED hook`` -- a marketplace clone,
+    the released tree ``/plugin marketplace update`` rewrites behind your back,
+    installed as "the dev version" with a full success banner. The identical
+    fixture with ``.claude`` as a real directory refused at exit 1, which
+    isolates the symlink as the sole cause.
+
+    A real plugin cache is staged deliberately: without one the pre-fix run
+    exits 1 on "No installed obsidian-brain plugin cache found" and a bare
+    ``returncode != 0`` assertion would pass for the wrong reason.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    real_claude = tmp_path / "dotfiles" / "claude"
+    real_claude.mkdir(parents=True)
+    (home / ".claude").symlink_to(real_claude, target_is_directory=True)
+
+    clone = home / ".claude" / "plugins" / "marketplaces" / "obsidian-brain-repo"
+    script = _write_script(clone / "scripts")
+    (clone / "hooks").mkdir(parents=True)
+    (clone / "hooks" / "obsidian_utils.py").write_text("# released hook\n")
+    (clone / "skills" / "recall").mkdir(parents=True)
+    (clone / "skills" / "recall" / "SKILL.md").write_text("# released skill\n")
+
+    cache_dir = (
+        home / ".claude" / "plugins" / "cache" / "some-marketplace"
+        / "obsidian-brain" / "3.4.0"
+    )
+    (cache_dir / "hooks").mkdir(parents=True)
+    (cache_dir / "hooks" / "obsidian_utils.py").write_text("# cached hook\n")
+    (cache_dir / "skills" / "recall").mkdir(parents=True)
+    (cache_dir / "skills" / "recall" / "SKILL.md").write_text("# cached skill\n")
+
+    proc = _run(script, "install", home)
+
+    assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
+    assert GUARD2_MSG in proc.stderr
+    # The guard fired BEFORE the backup, and the cache still holds its own
+    # bytes -- not the clone's.
+    assert not list(cache_dir.parent.glob("*.bak"))
+    assert "# cached hook" in (
+        cache_dir / "hooks" / "obsidian_utils.py"
+    ).read_text(), "the released clone was installed over the cache"
+
+
+@requires_bash
+def test_self_copy_guard_is_skipped_when_there_is_no_plugins_dir(
+    tmp_path: Path,
+) -> None:
+    """No ``~/.claude/plugins`` means the guard has nothing to catch.
+
+    ``cd``-ing into the plugin root to canonicalize it has to cope with that
+    directory not existing -- under ``set -euo pipefail`` a failing ``cd``
+    aborts the run. Skipping the comparison there is not fail-open: REPO_ROOT
+    is an existing directory (the script ``cd``s into it to compute it), and no
+    existing directory can live under a path that does not exist.
+
+    Asserts the guard message is ABSENT rather than just ``returncode != 0``:
+    this fixture has no plugin cache either, so the run must fail on THAT --
+    ``No installed obsidian-brain plugin cache found`` -- and not on a guard
+    that could not be evaluated.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "obsidian-brain"
+    script = _write_script(repo / "scripts")
+    (repo / "hooks").mkdir(parents=True)
+    (repo / "hooks" / "obsidian_utils.py").write_text("# dev hook\n")
+    (repo / "skills" / "dev-test").mkdir(parents=True)
+    (repo / "skills" / "dev-test" / "SKILL.md").write_text("# dev skill\n")
+    assert not (home / ".claude").exists()
+
+    proc = _run(script, "install", home)
+
+    assert GUARD2_MSG not in proc.stderr, (
+        f"the guard cannot fire with no plugin tree to be inside: {proc.stderr!r}"
+    )
+    assert "No installed obsidian-brain plugin cache found" in proc.stdout, (
+        f"expected the cache-discovery failure, got stdout={proc.stdout!r} "
+        f"stderr={proc.stderr!r}"
+    )
+
+
+@requires_bash
 def test_status_still_works_from_inside_cache(tmp_path: Path) -> None:
     """Judgment call (see task-2-report.md): guard 2 is scoped to the
     mutating subcommands only. "status" is read-only and must keep
@@ -339,7 +486,9 @@ def test_status_still_works_from_inside_cache(tmp_path: Path) -> None:
 
 @requires_bash
 def test_home_fail_closed_block_pins_its_custom_message(tmp_path: Path) -> None:
-    """M2: the `$HOME` fail-closed block (script lines ~45-50) is shadowed in
+    """The `$HOME` fail-closed block (the `[[ -z "${HOME:-}" ]] || [[ ! -d
+    "$HOME" ]]` guard on the mutating subcommands; M2 in the #287 final
+    review) is shadowed in
     EXIT STATUS by `set -euo pipefail` -- delete the whole block and the
     script still exits non-zero, because the very next line (`cd "$HOME" &&
     pwd -P`) already fails under `set -u` (unset $HOME) or `set -e` ($HOME
@@ -476,6 +625,78 @@ def test_restore_puts_the_original_content_back(tmp_path: Path) -> None:
         cache_dir / "skills" / "dev-test" / "SKILL.md"
     ).read_text()
     assert not backup_dir.exists(), "the promoted backup must be consumed"
+
+
+@requires_bash
+def test_restore_with_no_backup_exits_4_not_0(tmp_path: Path) -> None:
+    """"Nothing to restore" is not "restored", so it cannot share exit 0.
+
+    ``restore`` used to exit 0 both when it swapped the backup back in and when
+    there was no ``.bak`` at all -- verified: the no-backup run printed *"No
+    backup found … nothing to restore."* and returned EXIT=0. ``/dev-test``'s
+    Step 3 has one exit-0 arm and it asserts the first: *"Original version
+    restored. Start a new session to pick up the restored version."* So a run
+    that changed nothing got narrated as a successful restore, and the user was
+    sent to restart a session for a state change that never happened.
+
+    This is the same one-code-one-state contract install's exit 3 established,
+    applied to the arm that was left sharing.
+
+    Pins the STDOUT too: the exit code alone would be satisfied by any new
+    failure that happened to return 4.
+    """
+    home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
+    assert not list(cache_dir.parent.glob("*.bak")), "fixture must have no backup"
+
+    proc = _run(script, "restore", home)
+
+    assert proc.returncode == 4, (
+        "a no-op restore must be distinguishable from a completed one; got "
+        f"{proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "nothing to restore" in proc.stdout
+    assert "Original v" not in proc.stdout, "must not claim a restore happened"
+    # And it really was a no-op: the cache is untouched.
+    assert "# released hook" in (cache_dir / "hooks" / "obsidian_utils.py").read_text()
+
+
+@requires_bash
+def test_status_does_not_claim_the_diff_failed_when_a_dev_version_is_active(
+    tmp_path: Path,
+) -> None:
+    """``diff`` exit 1 means "they differ", which is this branch's whole point.
+
+    ``diff -rq … | head -20 || echo "  (diff failed)"`` under ``set -o
+    pipefail``: ``diff`` returns 1 whenever it finds differences -- the only
+    outcome reachable here, since a dev version is active precisely BECAUSE the
+    cache differs from its backup -- so the ``||`` arm fired after every
+    successful listing. Reproduced: the differing-file line printed, then ``
+    (diff failed)`` immediately under it, at exit 0.
+
+    That is consequential rather than cosmetic now: ``/dev-test``'s Step 4 tells
+    Claude to relay this report verbatim on exit 0, so the caller passes a
+    failure that did not occur straight through to the user.
+    """
+    home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
+    backup_dir = cache_dir.parent / f"{cache_dir.name}.bak"
+    (backup_dir / "hooks").mkdir(parents=True)
+    (backup_dir / "hooks" / "obsidian_utils.py").write_text("# original hook\n")
+    (backup_dir / "skills" / "dev-test").mkdir(parents=True)
+    (backup_dir / "skills" / "dev-test" / "SKILL.md").write_text("# original skill\n")
+    (cache_dir / "hooks" / "obsidian_utils.py").write_text("# dev hook\n")
+
+    proc = _run(script, "status", home)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Status: DEV VERSION ACTIVE" in proc.stdout
+    # The listing really is produced -- otherwise "(diff failed)" being absent
+    # would be satisfied by printing nothing at all.
+    assert "obsidian_utils.py differ" in proc.stdout, (
+        f"the changed-files listing is missing: {proc.stdout!r}"
+    )
+    assert "(diff failed)" not in proc.stdout, (
+        f"diff exit 1 means 'they differ', not 'diff failed': {proc.stdout!r}"
+    )
 
 
 @requires_bash
