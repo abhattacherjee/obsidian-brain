@@ -65,8 +65,23 @@ def _write_script(dest_dir: Path) -> Path:
     return script_path
 
 
-def _run(script: Path, cmd: str, home: Path) -> subprocess.CompletedProcess:
-    env = {**os.environ, "HOME": str(home)}
+#: Sentinel for `_run`'s `home` parameter: run the script with $HOME ABSENT
+#: from the child's environment entirely, rather than present-and-empty (for
+#: which callers pass `home=""` instead -- a distinct state; see
+#: `test_home_unset_fail_closed_block_pins_its_custom_message` and
+#: `test_home_empty_string_fail_closed_block_pins_its_custom_message`).
+_HOME_UNSET = object()
+
+
+def _run(script: Path, cmd: str, home: Path | str | object) -> subprocess.CompletedProcess:
+    """Run the script with $HOME set to `home` -- or, if `home` is the
+    `_HOME_UNSET` sentinel, with $HOME absent from the child's environment
+    altogether. Every pre-existing caller passes a `Path`, which is
+    unaffected: `str(home)` on a `Path` behaves exactly as before.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "HOME"}
+    if home is not _HOME_UNSET:
+        env["HOME"] = str(home)
     return subprocess.run(
         # _BASH, not the literal "bash": `requires_bash` skips on
         # shutil.which("bash"), so invoking anything else would let the skip
@@ -498,8 +513,15 @@ def test_home_fail_closed_block_pins_its_custom_message(tmp_path: Path) -> None:
     present" from "block deleted" and makes it a real (rather than vacuous)
     guard.
 
-    $HOME is deliberately set to a path that does not exist (not unset --
-    `_run` always sets $HOME) so the block's `[[ ! -d "$HOME" ]]` half fires.
+    $HOME is deliberately set to a path that does not exist, exercising only
+    the guard's SECOND half (`[[ ! -d "$HOME" ]]`) -- the first half
+    (`[[ -z "${HOME:-}" ]]`, $HOME unset or empty) is never reached here,
+    because `_run`'s default always sets $HOME to a concrete string. See
+    `test_home_unset_fail_closed_block_pins_its_custom_message` and
+    `test_home_empty_string_fail_closed_block_pins_its_custom_message`
+    immediately below for that half, added separately so mutating either
+    half of the `||` in isolation fails a distinctly-named test rather than
+    being covered by the other.
     """
     repo = tmp_path / "obsidian-brain"
     script = _write_script(repo / "scripts")
@@ -510,6 +532,70 @@ def test_home_fail_closed_block_pins_its_custom_message(tmp_path: Path) -> None:
     missing_home = tmp_path / "does-not-exist"
 
     proc = _run(script, "install", missing_home)
+
+    assert proc.returncode != 0
+    assert "cannot verify this script isn't" in proc.stderr
+
+
+@requires_bash
+def test_home_unset_fail_closed_block_pins_its_custom_message(tmp_path: Path) -> None:
+    """The `$HOME` fail-closed block's FIRST half (`[[ -z "${HOME:-}" ]]`),
+    exercised via $HOME genuinely ABSENT from the child's environment.
+
+    Without this test, that first half is never reached by anything in this
+    module: it can be deleted from the script and the whole suite still
+    passes, because `test_home_fail_closed_block_pins_its_custom_message`
+    above only ever reaches the second half (`_run` always sets $HOME to
+    something).
+
+    Confirmed empirically (bash 3.2.57 on macOS, this repo's CI/dev target,
+    via a standalone probe: `bash -c 'if [[ -z "${HOME:-}" ]]; then echo
+    EMPTY-OR-UNSET; else echo "SET=[$HOME]"; fi'` run with HOME absent from
+    the subprocess env) that a plain non-interactive, non-login `bash
+    script.sh` invocation -- exactly the shape `_run` uses: `_BASH` + argv,
+    no `-l`/`-i`, no login-shell or interactive-shell wrapper -- does NOT
+    get $HOME repopulated from the passwd database. The probe printed
+    `EMPTY-OR-UNSET`, i.e. the child genuinely saw $HOME as unset rather
+    than silently backfilled by bash itself. That empirical check is what
+    makes this test meaningful rather than accidentally-passing for the
+    wrong reason.
+    """
+    repo = tmp_path / "obsidian-brain"
+    script = _write_script(repo / "scripts")
+    (repo / "hooks").mkdir(parents=True)
+    (repo / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
+    (repo / "skills" / "some-skill").mkdir(parents=True)
+
+    proc = _run(script, "install", _HOME_UNSET)
+
+    assert proc.returncode != 0
+    assert "cannot verify this script isn't" in proc.stderr
+
+
+@requires_bash
+def test_home_empty_string_fail_closed_block_pins_its_custom_message(
+    tmp_path: Path,
+) -> None:
+    """The same first half (`[[ -z "${HOME:-}" ]]`), exercised via the OTHER
+    path that makes it true: $HOME present in the child's environment but
+    set to the empty string, rather than absent entirely.
+
+    Bash's `-z "${HOME:-}"` test treats "unset" and "empty string"
+    identically, but they are different states of the actual environment,
+    and a narrower fix that only checked for absence (e.g. testing
+    `${HOME+set}` instead of `-z`) would pass the unset test above while
+    leaving this one -- and real machines with `HOME=` in their environment
+    -- broken. Distinct from `test_home_unset_fail_closed_block_pins_its_custom_message`:
+    that test deletes the key from the environment mapping; this one sets
+    it to `""`.
+    """
+    repo = tmp_path / "obsidian-brain"
+    script = _write_script(repo / "scripts")
+    (repo / "hooks").mkdir(parents=True)
+    (repo / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
+    (repo / "skills" / "some-skill").mkdir(parents=True)
+
+    proc = _run(script, "install", "")
 
     assert proc.returncode != 0
     assert "cannot verify this script isn't" in proc.stderr
