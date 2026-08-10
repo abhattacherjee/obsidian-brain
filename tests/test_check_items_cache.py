@@ -409,6 +409,36 @@ def test_cache_preserves_action_required_on_warm_runs():
     assert known[0]["_cached_action_required"] == 'gh issue close 534 --comment "Fixed"'
 
 
+def test_partition_exposes_cached_classifier_source():
+    """#297 legacy-cache gap: partition() must surface the cached entry's
+    classifier_source (or its absence) so SKILL.md Step 6 can decide whether
+    a replayed cache hit is allowed to claim trusted provenance. Entries
+    written before #297 predate the field entirely and must surface None,
+    not silently default to a trusted value."""
+    from check_items_cache import partition
+    head = "abc1234"
+    groups = [_make_group("h1"), _make_group("h2")]
+    with_source = _make_cached_entry("h1")
+    with_source["classifier_source"] = "agent"
+    without_source = _make_cached_entry("h2")  # predates #297; no field at all
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": head,
+                "groups": [with_source, without_source],
+            }
+        },
+    }
+    known, needs = partition(groups, cache, project="obsidian-brain", head_sha=head)
+    assert len(known) == 2
+    assert len(needs) == 0
+    by_hash = {g["canonical_hash"]: g for g in known}
+    assert by_hash["h1"]["_cached_classifier_source"] == "agent"
+    assert by_hash["h2"]["_cached_classifier_source"] is None
+
+
 def test_partition_skips_corrupted_cache_entries():
     """Cache entries missing canonical_hash must not crash partition (Finding A2)."""
     from check_items_cache import partition

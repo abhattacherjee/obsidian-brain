@@ -138,7 +138,8 @@ def partition(
     Returns (known_unchanged, needs_reclassification). Groups routed to
     `needs` carry `_reason` for dashboard visibility. Groups routed to
     `known` carry `_cached_classification` / `_cached_confidence` /
-    `_cached_evidence_citation` / `_cached_action_required` (NOT `_reason`).
+    `_cached_evidence_citation` / `_cached_action_required` /
+    `_cached_classifier_source` (NOT `_reason`).
     """
     if now is None:
         now = time.time()
@@ -184,6 +185,7 @@ def partition(
         g["_cached_confidence"] = cached.get("confidence")
         g["_cached_evidence_citation"] = cached.get("evidence_citation")
         g["_cached_action_required"] = cached.get("action_required")
+        g["_cached_classifier_source"] = cached.get("classifier_source")
         known.append(g)
 
     return known, needs

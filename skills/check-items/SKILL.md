@@ -538,6 +538,7 @@ if _missing:
 classifications = list(primary)
 for g in all_merged:
     if g.get("_cached_classification"):
+        _src = g.get("_cached_classifier_source")
         classifications.append({
             "group_id": g.get("group_id"),
             "classification": g["_cached_classification"],
@@ -546,7 +547,15 @@ for g in all_merged:
             "evidence_citation": g.get("_cached_evidence_citation"),
             "action_required": g.get("_cached_action_required"),
             "project": g.get("project"),
-            "classifier_source": "cache",
+            # Only claim "cache" (a trusted source) when the cached entry
+            # actually recorded trusted provenance. Entries written before
+            # #297 have no classifier_source at all, and some of them are
+            # demonstrably heuristic-derived — stamping them "cache" would
+            # launder an untrusted verdict into the high-trust set and let it
+            # be auto-checked. "cache-legacy" is not in _HIGH_TRUST_SOURCES,
+            # so those cap at MED until they are re-classified with real
+            # provenance, at which point they become trusted again.
+            "classifier_source": "cache" if _src in ("agent", "prefilter", "cache") else "cache-legacy",
         })
 
 out = os.path.join(os.path.dirname(scope_path), "classifications.json")

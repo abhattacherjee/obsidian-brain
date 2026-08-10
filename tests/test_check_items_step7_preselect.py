@@ -88,6 +88,50 @@ def test_agent_done_with_literal_ref_is_preselected():
     assert _step7_mark(record) == "[x]"
 
 
+def test_legacy_cache_entry_without_provenance_is_not_preselected():
+    """#297 legacy-cache gap: a group cached before #297 existed has no
+    classifier_source at all, and some of those entries are demonstrably
+    heuristic-derived (production: citation 'heuristic: token 'v0.4.0' near
+    completion phrase 'release'' on an item whose text contains 'v0.4.0').
+    SKILL.md Step 6 must stamp such a replay 'cache-legacy', not 'cache' —
+    otherwise it launders an untrusted verdict into the high-trust set and
+    the item gets auto-checked off unverified, exactly the #297 failure
+    mode, just sourced from the pre-existing cache instead of a live
+    degraded run."""
+    citation = "heuristic: token 'v0.4.0' near completion phrase 'release'"
+    text = "Bump project to v0.4.0 and release."
+    record = {
+        "classification": "DONE",
+        "canonical_text": text,
+        "evidence_citation": citation,
+        "classifier_source": "cache-legacy",
+    }
+
+    record["tier"] = oid.assign_tier(
+        record.get("evidence_citation"),
+        record.get("canonical_text"),
+        record.get("classification"),
+        record.get("classifier_source"),
+    )
+
+    assert _step7_mark(record) == "[ ]"
+
+    # Contrast: the same record, but with classifier_source="cache" (i.e.
+    # the cached entry DID record trusted provenance) DOES preselect. This
+    # proves the outcome hinges on the provenance value, not on the citation
+    # shape or item text — without it, the assertion above could pass for
+    # unrelated reasons (e.g. assign_tier always returning MED for this
+    # citation shape regardless of source).
+    trusted = dict(record, classifier_source="cache")
+    trusted["tier"] = oid.assign_tier(
+        trusted.get("evidence_citation"),
+        trusted.get("canonical_text"),
+        trusted.get("classification"),
+        trusted.get("classifier_source"),
+    )
+    assert _step7_mark(trusted) == "[x]"
+
+
 def test_cache_sourced_done_is_preselected():
     """Step 6 stamps replayed cache hits classifier_source='cache' — a
     high-trust source per _HIGH_TRUST_SOURCES, so a cached DONE verdict with
