@@ -109,6 +109,13 @@ CONFIDENCE_TIER_RULES = {
     },
 }
 
+# Sources whose evidence_citation is independent of the item text and may
+# therefore reach tier HIGH. Anything else — including an absent or unknown
+# source — caps at MED, so a caller that has not been updated to thread
+# provenance degrades to "never auto-checked" rather than "always eligible".
+# (#297: the denylist form silently failed open.)
+_HIGH_TRUST_SOURCES = frozenset({"agent", "prefilter", "cache"})
+
 
 def _outer_subagent_timeout() -> int:
     """Return the outer subprocess.run timeout that wraps check_items_cli.py.
@@ -156,10 +163,15 @@ def assign_tier(evidence_citation, item_text, classification=None,
     # #297: a heuristic citation is BUILT FROM a token lifted out of the item
     # text, so "ref appears in both citation and text" is trivially true and
     # says nothing about completion. HIGH is what preselects a DONE item for
-    # auto-checkoff, so heuristic verdicts are capped at MED and can never be
-    # auto-checked. (Production case: token 'v3.4.0' near completion phrase
-    # 'release' on an unperformed validation task.)
-    _cap_at_med = classification == "REVIEW" or classifier_source == "heuristic"
+    # auto-checkoff, so anything short of a known high-trust source (agent,
+    # prefilter, or a cached agent-derived verdict) is capped at MED and can
+    # never be auto-checked. Allowlist, not denylist: an un-migrated caller
+    # that omits classifier_source degrades safely to MED rather than
+    # silently keeping the old unsafe HIGH behaviour. (Production case:
+    # token 'v3.4.0' near completion phrase 'release' on an unperformed
+    # validation task.)
+    _cap_at_med = (classification == "REVIEW"
+                   or classifier_source not in _HIGH_TRUST_SOURCES)
 
     for pattern in CONFIDENCE_TIER_RULES["HIGH"]["literal_ref_patterns"]:
         cit_match = re.search(pattern, citation)
@@ -1744,13 +1756,11 @@ def classify_groups_with_agent(merged_groups, evidence):
     # #297: stamp provenance on every record the agent path actually
     # returned, so a downstream heuristic-only cap (assign_tier) and cache
     # refusal (Task 5) can tell an agent verdict from a token-overlap guess.
-    # setdefault: _validate_classifier_response only requires a subset of
-    # keys, so a future classifier that already sets this is respected.
+    # Stamp unconditionally (not setdefault) — the sub-agent's own JSON must
+    # never be able to declare its own provenance, which under assign_tier's
+    # allowlist would let a payload self-assert into the high-trust set.
     for r in parsed:
-        r.setdefault(
-            "classifier_source",
-            "prefilter" if r.get("prefiltered") else "agent",
-        )
+        r["classifier_source"] = "prefilter" if r.get("prefiltered") else "agent"
 
     # Outer telemetry: summary of this classification run.
     # cache_hit is intentionally NOT emitted here — the orchestration layer
@@ -1832,7 +1842,12 @@ def classify_groups_heuristic(merged_groups, evidence):
                 distance = abs(tok_match.start() - phr_match.start())
                 if distance <= _HEURISTIC_PROXIMITY_CHARS:
                     classification = "DONE"
-                    confidence = "HIGH" if distance <= 60 else "MED"
+                    # #297: the heuristic's own token-co-occurrence evidence
+                    # cannot justify HIGH confidence at any distance —
+                    # confidence is written to the dashboard and the cache,
+                    # and a consumer keying off it (rather than the
+                    # assign_tier-derived tier) must not read it as HIGH.
+                    confidence = "MED"
                     evidence_citation = (
                         f"heuristic: token '{tok_match.group(0)}' "
                         f"near completion phrase '{phr_match.group(0)}'"
