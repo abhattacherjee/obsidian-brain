@@ -208,6 +208,25 @@ def update_cache(
     """
     if now is None:
         now = time.time()
+
+    # #297 defect 5: heuristic verdicts must never be persisted. partition()
+    # replays cached verdicts as `known` until the project's HEAD moves, so a
+    # single degraded run would poison every later run with token-co-occurrence
+    # citations. Enforced here rather than only in SKILL.md because skills are
+    # advisory and code is not (memory: feedback_skills_advisory_not_enforcement).
+    _heuristic = [fc for fc in (fresh_classifications or [])
+                  if fc.get("classifier_source") == "heuristic"]
+    if _heuristic:
+        print(
+            f"[check-items-cache] refusing to cache {len(_heuristic)} "
+            f"heuristic-derived verdict(s) for {project}; they will be "
+            f"re-classified on the next run",
+            file=sys.stderr,
+        )
+    _heuristic_hashes = {fc.get("canonical_hash") for fc in _heuristic}
+    fresh_classifications = [fc for fc in (fresh_classifications or [])
+                             if fc.get("classifier_source") != "heuristic"]
+
     current_hashes = {g.get("canonical_hash") for g in all_groups}
     fresh_by_hash = {fc.get("canonical_hash"): fc for fc in fresh_classifications}
 
@@ -221,6 +240,10 @@ def update_cache(
     for g in existing_groups:
         h = g.get("canonical_hash")
         if h not in current_hashes:
+            continue
+        if h in _heuristic_hashes:
+            # This run could not verify the group — do not let an older entry
+            # be revalidated by the unconditional project_head_at_classify bump.
             continue
         if h in fresh_by_hash:
             surviving.append(_freeze_classification(fresh_by_hash[h], now))
@@ -250,4 +273,5 @@ def _freeze_classification(fc: dict, now: float) -> dict:
         "evidence_citation": fc.get("evidence_citation"),
         "action_required": fc.get("action_required"),
         "classified_ts": fc.get("classified_ts", int(now)),
+        "classifier_source": fc.get("classifier_source"),
     }
