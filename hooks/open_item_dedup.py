@@ -1576,8 +1576,19 @@ def classify_groups_with_agent(merged_groups, evidence):
     check_items_cli.run_classifier with one retry on schema-validation
     failure. Returns the parsed list on success.
 
-    On 2 consecutive failures, returns [] and sets
-    `_LAST_CLASSIFIER_MODE = 'heuristic-fallback'`.
+    Sets `_LAST_CLASSIFIER_MODE` to one of three values:
+      - 'ok': every input group_id came back classified.
+      - 'partial': validation succeeded but some group_ids in
+        `merged_groups` are missing from the returned records (a chunked
+        run can now succeed partially, #297 defect 2). Returns the
+        records that did come back; the caller fills the missing
+        group_ids from the heuristic.
+      - 'heuristic-fallback': both attempts failed (non-zero return code,
+        missing output, or schema validation failure). Returns [].
+
+    Diagnostics for every failed attempt (including the child's captured
+    stderr) and the terminal outcome are printed to stderr so a classifier
+    failure is never silent (#297 defect 1).
 
     Spec §§ Pipeline architecture Stage 4 + Expected output.
     """
@@ -1651,6 +1662,13 @@ def classify_groups_with_agent(merged_groups, evidence):
                 timeout=_outer_subagent_timeout(),
             )
             if cp.returncode != 0 or not out_path.exists():
+                _tail = (cp.stderr or "").strip()[-800:]
+                print(
+                    f"[check-items] classifier attempt {attempt}/2 failed: "
+                    f"rc={cp.returncode} output_written={out_path.exists()}"
+                    + (f"; child stderr: {_tail}" if _tail else ""),
+                    file=sys.stderr,
+                )
                 continue
             candidate = json.loads(out_path.read_text())
             # I4: warn early (pre-validation) so the diagnostic is always
@@ -1665,6 +1683,12 @@ def classify_groups_with_agent(merged_groups, evidence):
                         file=sys.stderr,
                     )
             if not _validate_classifier_response(candidate):
+                print(
+                    f"[check-items] classifier attempt {attempt}/2 failed: "
+                    f"schema validation rejected the response (missing "
+                    f"required fields or an invalid classification value)",
+                    file=sys.stderr,
+                )
                 continue
             parsed = candidate
             break
@@ -1680,8 +1704,29 @@ def classify_groups_with_agent(merged_groups, evidence):
             pass
 
     if parsed is None:
+        print(
+            f"[check-items] classifier FAILED after {attempt} attempt(s); "
+            f"falling back to the token-overlap heuristic for all "
+            f"{len(merged_groups)} group(s). Heuristic citations are token "
+            f"co-occurrence, not evidence — verify before accepting any DONE.",
+            file=sys.stderr,
+        )
         _LAST_CLASSIFIER_MODE = "heuristic-fallback"
         return []
+
+    _returned_ids = {r.get("group_id") for r in parsed}
+    _missing = [g.get("group_id") for g in merged_groups
+                if g.get("group_id") not in _returned_ids]
+    if _missing:
+        # A chunked run can now succeed partially (#297 defect 2). The caller
+        # fills exactly these group_ids from the heuristic.
+        _LAST_CLASSIFIER_MODE = "partial"
+        print(
+            f"[check-items] classifier PARTIAL: {len(_missing)} of "
+            f"{len(merged_groups)} group(s) were not classified by the agent "
+            f"and will fall back to the heuristic.",
+            file=sys.stderr,
+        )
 
     # Outer telemetry: summary of this classification run.
     # cache_hit is intentionally NOT emitted here — the orchestration layer
@@ -1715,8 +1760,11 @@ _LAST_CLASSIFIER_MODE = "ok"
 
 
 def get_last_classifier_mode():
-    """Returns 'ok' on success or 'heuristic-fallback' if Task 17's
-    heuristic must be invoked."""
+    """Returns 'ok' if every group was classified, 'partial' if the
+    classifier succeeded but some group_ids came back missing (the
+    caller must fill those from Task 17's heuristic), or
+    'heuristic-fallback' if the classifier failed entirely and Task 17's
+    heuristic must be invoked for all groups."""
     return _LAST_CLASSIFIER_MODE
 
 
