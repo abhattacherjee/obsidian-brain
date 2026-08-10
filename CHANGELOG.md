@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`scripts/bump-version.sh` no longer executes injected commands from the version source (harden-repo#55):** the script fed the parsed version components straight into bash arithmetic with only an is-it-empty check in front. `$(( ))` recursively expands the *contents* of the variables it evaluates, so an array-subscript payload in the version source — e.g. `x[$(rm -rf ~)].0.0` — ran as a command substitution during a bump, and the mangled result was then written back to the version file at exit 0. All three bump types were exploitable, each with the payload in the component that bump evaluates.
+
+  The fix has two layers, because the first one alone was not enough:
+
+  - `CURRENT_VERSION` is semver-validated before it reaches any arithmetic, with each core component bounded to 9 digits so a long component cannot overflow into a wrapped value.
+  - The `-prerelease` / `+build` suffix is **stripped before the components are split**, so only digit runs ever reach `$(( ))`. This is the property that actually makes the arithmetic safe. Validating the string alone is not sufficient: arithmetic does not need a literal `$` or backtick to execute something, because a bare identifier inside `$(( ))` is looked up and its *value* re-evaluated as an arithmetic expression. A version of `1.2.3-zz` with `zz='x[$(cmd)]'` in the environment therefore still ran `cmd` and exited 0 reporting success. The same suffix path also silently **downgraded** `1.2.3-4` to `1.2.0` (`10#3-4 + 1` = 0), which is semver-shaped and so slipped past the write guard.
+
+  Alongside those: the three arithmetic expansions force base 10 (`10#`), so a zero-padded component like `08` is no longer read as an invalid octal literal; carried-through components are normalized through `10#` as well, so `01.02.03` no longer yields `01.02.4`; and a symmetric guard refuses to write a `NEW_VERSION` that is not semver-shaped.
+
 ## [3.4.1] - 2026-08-03
 
 ### Fixed
