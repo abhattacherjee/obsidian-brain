@@ -34,6 +34,12 @@ CLASSIFIER_CHUNK_SIZE = max(
     1, int(os.environ.get("CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE", "25"))
 )
 
+# rc 6: the sub-agent exited cleanly but produced no parseable output at all
+# (empty file AND empty stdout). Distinct from rc 4 (output present but
+# malformed) so operators can tell "sub-agent returned nothing" from
+# "sub-agent returned garbage" — see #297 defect 1.
+RC_NO_OUTPUT = 6
+
 
 _FENCE_OPEN_RE = re.compile(r"^\s*```(?:json|JSON)?\s*\n?")
 _FENCE_CLOSE_RE = re.compile(r"\n?\s*```\s*$")
@@ -489,8 +495,10 @@ def _dispatch_classifier_chunk(
     sub_results is [].
 
     rc semantics: 0 success; 3 subprocess timeout; 4 invalid JSON or
-    wrong payload shape from sub-agent; any other value = passthrough
-    of claude -p's non-zero returncode.
+    wrong payload shape from sub-agent; RC_NO_OUTPUT (6) the sub-agent
+    exited cleanly but wrote nothing parseable to either the output file
+    or stdout; any other value = passthrough of claude -p's non-zero
+    returncode.
     """
     workdir = _safe_workdir()
     in_tmp = tempfile.NamedTemporaryFile(
@@ -540,9 +548,17 @@ def _dispatch_classifier_chunk(
         )
         return cp.returncode, []
 
-    if Path(output_path).exists():
+    # The chunked caller pre-creates a 0-byte temp file to allocate a safe
+    # path, so `.exists()` is unconditionally true there and cannot tell
+    # "sub-agent wrote nothing" from "sub-agent wrote garbage" (#297 defect 1).
+    try:
+        file_text = Path(output_path).read_text(encoding="utf-8")
+    except OSError:
+        file_text = ""
+
+    if file_text.strip():
         try:
-            parsed = json.loads(Path(output_path).read_text(encoding="utf-8"))
+            parsed = json.loads(file_text)
         except json.JSONDecodeError as exc:
             print(
                 f"[check-items-cli] {chunk_label}classifier output invalid "
@@ -560,8 +576,18 @@ def _dispatch_classifier_chunk(
             return 4, []
         return 0, parsed
 
+    stdout_text = _strip_json_fences(cp.stdout or "")
+    if not stdout_text.strip():
+        print(
+            f"[check-items-cli] {chunk_label}classifier wrote no output "
+            f"(output file {len(file_text)} bytes, stdout "
+            f"{len(cp.stdout or '')} bytes)",
+            file=sys.stderr,
+        )
+        return RC_NO_OUTPUT, []
+
     try:
-        parsed = json.loads(_strip_json_fences(cp.stdout))
+        parsed = json.loads(stdout_text)
     except json.JSONDecodeError as exc:
         print(
             f"[check-items-cli] {chunk_label}classifier output invalid "
