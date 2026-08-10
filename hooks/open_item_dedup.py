@@ -127,7 +127,8 @@ def _outer_subagent_timeout() -> int:
     return inner * 6
 
 
-def assign_tier(evidence_citation, item_text, classification=None):
+def assign_tier(evidence_citation, item_text, classification=None,
+                classifier_source=None):
     """Deterministically assign HIGH | MED | LOW from evidence citation shape.
 
     HIGH requires a literal ref (sha, #N, vX.Y) appearing in BOTH the citation
@@ -141,6 +142,10 @@ def assign_tier(evidence_citation, item_text, classification=None):
     even in the edge case where its weak evidence_citation happens to contain
     a literal ref that also appears in item_text (#264 Task 1).
 
+    `classifier_source` is optional and defaults to None (backward compatible
+    with existing callers, appended rather than inserted — all 23 pre-#297
+    call sites pass 1-3 positional args). See the #297 comment below the cap.
+
     Spec § Confidence tiers (lines 324-332).
     """
     if not evidence_citation or not item_text:
@@ -148,13 +153,21 @@ def assign_tier(evidence_citation, item_text, classification=None):
     citation = str(evidence_citation)
     text = str(item_text)
 
+    # #297: a heuristic citation is BUILT FROM a token lifted out of the item
+    # text, so "ref appears in both citation and text" is trivially true and
+    # says nothing about completion. HIGH is what preselects a DONE item for
+    # auto-checkoff, so heuristic verdicts are capped at MED and can never be
+    # auto-checked. (Production case: token 'v3.4.0' near completion phrase
+    # 'release' on an unperformed validation task.)
+    _cap_at_med = classification == "REVIEW" or classifier_source == "heuristic"
+
     for pattern in CONFIDENCE_TIER_RULES["HIGH"]["literal_ref_patterns"]:
         cit_match = re.search(pattern, citation)
         if not cit_match:
             continue
         ref = cit_match.group(0)
         if ref in text:
-            return "MED" if classification == "REVIEW" else "HIGH"
+            return "MED" if _cap_at_med else "HIGH"
 
     for pattern in CONFIDENCE_TIER_RULES["MED"]["inferred_ref_patterns"]:
         if re.search(pattern, citation):
@@ -1728,6 +1741,17 @@ def classify_groups_with_agent(merged_groups, evidence):
             file=sys.stderr,
         )
 
+    # #297: stamp provenance on every record the agent path actually
+    # returned, so a downstream heuristic-only cap (assign_tier) and cache
+    # refusal (Task 5) can tell an agent verdict from a token-overlap guess.
+    # setdefault: _validate_classifier_response only requires a subset of
+    # keys, so a future classifier that already sets this is respected.
+    for r in parsed:
+        r.setdefault(
+            "classifier_source",
+            "prefilter" if r.get("prefiltered") else "agent",
+        )
+
     # Outer telemetry: summary of this classification run.
     # cache_hit is intentionally NOT emitted here — the orchestration layer
     # is SKILL.md prose: Step 3 heredoc owns partition()'s `known` list,
@@ -1822,6 +1846,7 @@ def classify_groups_heuristic(merged_groups, evidence):
             "canonical_text": canonical_text,
             "evidence_citation": evidence_citation,
             "action_required": None,
+            "classifier_source": "heuristic",
         })
     return out
 
