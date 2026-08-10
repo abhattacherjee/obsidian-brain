@@ -342,6 +342,7 @@ def test_cache_evicts_removed_items():
             "confidence": "LOW",
             "evidence_citation": None,
             "classified_ts": 1735000000,
+            "classifier_source": "agent",
         }
     ]
     updated = update_cache(cache, project="obsidian-brain",
@@ -397,6 +398,7 @@ def test_cache_preserves_action_required_on_warm_runs():
         "evidence_citation": "Story 11.12",
         "action_required": 'gh issue close 534 --comment "Fixed"',
         "classified_ts": int(time.time()) - 60,
+        "classifier_source": "agent",
     }]
     updated = update_cache(cache, project="p", all_groups=all_groups,
                            fresh_classifications=fresh, head_sha="h")
@@ -409,34 +411,118 @@ def test_cache_preserves_action_required_on_warm_runs():
     assert known[0]["_cached_action_required"] == 'gh issue close 534 --comment "Fixed"'
 
 
-def test_partition_exposes_cached_classifier_source():
-    """#297 legacy-cache gap: partition() must surface the cached entry's
-    classifier_source (or its absence) so SKILL.md Step 6 can decide whether
-    a replayed cache hit is allowed to claim trusted provenance. Entries
-    written before #297 predate the field entirely and must surface None,
-    not silently default to a trusted value."""
+def test_cached_heuristic_verdict_is_not_replayed_as_known():
+    """#297 legacy-cache gap: a cached entry explicitly stamped
+    classifier_source='heuristic' must never be replayed as `known`, even
+    when it matches HEAD, mtime, and TTL — everything that would otherwise
+    make it a cache hit. Routing it to `needs` re-classifies it with real
+    evidence instead of letting SKILL.md stamp a trusted 'cache' source onto
+    a heuristic verdict."""
     from check_items_cache import partition
     head = "abc1234"
-    groups = [_make_group("h1"), _make_group("h2")]
-    with_source = _make_cached_entry("h1")
-    with_source["classifier_source"] = "agent"
-    without_source = _make_cached_entry("h2")  # predates #297; no field at all
+    groups = [_make_group("h1")]
+    entry = _make_cached_entry("h1")
+    entry["classifier_source"] = "heuristic"
     cache = {
         "schema_version": 1,
         "runs": {
             "obsidian-brain": {
                 "last_run_ts": int(time.time()),
                 "project_head_at_classify": head,
-                "groups": [with_source, without_source],
+                "groups": [entry],
             }
         },
     }
     known, needs = partition(groups, cache, project="obsidian-brain", head_sha=head)
-    assert len(known) == 2
-    assert len(needs) == 0
-    by_hash = {g["canonical_hash"]: g for g in known}
-    assert by_hash["h1"]["_cached_classifier_source"] == "agent"
-    assert by_hash["h2"]["_cached_classifier_source"] is None
+    assert known == []
+    assert len(needs) == 1
+    assert needs[0]["_reason"] == "heuristic_cached"
+
+
+def test_legacy_heuristic_citation_is_not_replayed_as_known():
+    """Live-data case: entries written before #297 carry no classifier_source
+    field at all, so the heuristic must be detected from the evidence
+    citation's shape instead. classify_groups_heuristic always emits
+    "heuristic: token '<t>' near completion phrase '<p>'", so that prefix is
+    the tell for a pre-#297 entry that was actually heuristic-derived."""
+    from check_items_cache import partition
+    head = "abc1234"
+    groups = [_make_group("h1")]
+    entry = _make_cached_entry("h1")
+    entry.pop("classifier_source", None)  # predates #297; no field at all
+    entry["evidence_citation"] = "heuristic: token 'v0.4.0' near completion phrase 'release'"
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": head,
+                "groups": [entry],
+            }
+        },
+    }
+    known, needs = partition(groups, cache, project="obsidian-brain", head_sha=head)
+    assert known == []
+    assert len(needs) == 1
+    assert needs[0]["_reason"] == "heuristic_cached"
+
+
+def test_legacy_agent_entry_still_replays_as_known():
+    """Contrast for the two tests above: 369 of the 373 live cached entries
+    have no classifier_source but are legitimately agent-derived. A
+    provenance-less entry whose citation does NOT look heuristic must still
+    replay as `known` — otherwise the heuristic_cached guard would be
+    indistinguishable from "invalidate every legacy entry", which would
+    throw away all of that agent-derived work and suppress preselection for
+    days until everything re-classifies."""
+    from check_items_cache import partition
+    head = "abc1234"
+    groups = [_make_group("h1")]
+    entry = _make_cached_entry("h1")
+    entry.pop("classifier_source", None)  # predates #297; no field at all
+    entry["evidence_citation"] = "Merged as 5dfaf98; PR #68 closed."
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": head,
+                "groups": [entry],
+            }
+        },
+    }
+    known, needs = partition(groups, cache, project="obsidian-brain", head_sha=head)
+    assert needs == []
+    assert len(known) == 1
+    assert known[0]["_cached_classification"] == entry["classification"]
+
+
+def test_update_cache_allowlist_rejects_unknown_source(capsys):
+    """update_cache must persist only classifier_source values in
+    {"agent", "prefilter", "cache"} — an allowlist, not a denylist. An
+    absent, empty, or misspelled source (e.g. "Heuristic") must be refused
+    exactly like an explicit "heuristic" would be, since a caller that has
+    not been updated to thread provenance should degrade to "never
+    persisted" rather than "persisted by default"."""
+    from check_items_cache import update_cache
+    cache = {"schema_version": 1, "runs": {}}
+    all_groups = [
+        _make_group("agent-h"), _make_group("heuristic-h"),
+        _make_group("empty-h"), _make_group("none-h"), _make_group("mixed-case-h"),
+    ]
+    fresh_classifications = [
+        _make_fresh("agent-h", classifier_source="agent"),
+        _make_fresh("heuristic-h", classifier_source="heuristic"),
+        _make_fresh("empty-h", classifier_source=""),
+        _make_fresh("none-h", classifier_source=None),
+        _make_fresh("mixed-case-h", classifier_source="Heuristic"),
+    ]
+    updated = update_cache(cache, project="obsidian-brain", all_groups=all_groups,
+                           fresh_classifications=fresh_classifications, head_sha="h")
+    hashes = {g["canonical_hash"] for g in updated["runs"]["obsidian-brain"]["groups"]}
+    assert hashes == {"agent-h"}
+    err = capsys.readouterr().err
+    assert "refusing to cache 4 verdict" in err
 
 
 def test_partition_skips_corrupted_cache_entries():
