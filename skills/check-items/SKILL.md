@@ -517,8 +517,22 @@ to_classify = [g for g in all_merged if g.get("_reason")]
 
 primary = classify_groups_with_agent(to_classify, evidence)
 mode = get_last_classifier_mode()
-if mode == "heuristic-fallback":
-    primary = classify_groups_heuristic(to_classify, evidence)
+
+# Provenance travels with each verdict: Step 7 refuses to auto-check a
+# heuristic one, Step 10 refuses to cache it.
+for c in primary:
+    c.setdefault("classifier_source", "agent")
+
+# Gap-fill. classify_groups_with_agent may return a PARTIAL list when only
+# some chunks failed (#297). Fill exactly the groups it did not cover rather
+# than discarding the agent's good work. On total failure primary == [], so
+# this degenerates to the old whole-set heuristic fallback.
+_done_ids = {c.get("group_id") for c in primary}
+_missing = [g for g in to_classify if g.get("group_id") not in _done_ids]
+if _missing:
+    for c in classify_groups_heuristic(_missing, evidence):
+        c["classifier_source"] = "heuristic"
+        primary.append(c)
 
 # Merge cached classifications (known_unchanged) with fresh.
 classifications = list(primary)
@@ -532,6 +546,7 @@ for g in all_merged:
             "evidence_citation": g.get("_cached_evidence_citation"),
             "action_required": g.get("_cached_action_required"),
             "project": g.get("project"),
+            "classifier_source": "cache",
         })
 
 out = os.path.join(os.path.dirname(scope_path), "classifications.json")
@@ -575,20 +590,38 @@ classifications_path = os.environ["CLASSIFICATIONS_PATH"]
 scope = json.load(open(scope_path))
 data = json.load(open(classifications_path))
 for item in data["classifications"]:
-    item["tier"] = assign_tier(item.get("evidence_citation"), item.get("canonical_text"),
-                                item.get("classification"))
+    item["tier"] = assign_tier(item.get("evidence_citation"),
+                               item.get("canonical_text"),
+                               item.get("classification"),
+                               item.get("classifier_source"))
 
 buckets = partition_for_review(data["classifications"], show_all=scope["show_all"])
+
+mode = data.get("classifier_mode", "ok")
+if mode != "ok":
+    _deg = sum(1 for i in data["classifications"]
+               if i.get("classifier_source") == "heuristic")
+    print(f"\n!! CLASSIFIER DEGRADED (mode={mode}) — {_deg} of "
+          f"{len(data['classifications'])} verdict(s) come from the "
+          f"token-overlap heuristic, not evidence.", file=sys.stderr)
+    print("   Heuristic citations read 'token X near completion phrase Y'. "
+          "That is co-occurrence, NOT proof the item is done.", file=sys.stderr)
+    print("   They are capped at tier MED and are never preselected. "
+          "Verify each one manually before accepting.", file=sys.stderr)
+
 # Format: HIGH first, MED next, LOW (only if show_all). DONE preselected [x],
 # NEEDS-ACTION [ ] with action_required command surfaced. REVIEW always [ ]
 # (never auto-checked — assign_tier caps REVIEW at MED, so it never sorts
-# into the HIGH+DONE preselected group either).
+# into the HIGH+DONE preselected group either). Same cap applies to any
+# verdict whose classifier_source is not agent/prefilter/cache (#297) — a
+# heuristic verdict can never reach HIGH, so it can never be preselected.
 print("\n=== Review ===", file=sys.stderr)
 for item in sorted(buckets["review"],
                    key=lambda x: ("HIGH MED LOW".split().index(x.get("tier", "LOW")),
                                   x.get("classification"))):
     mark = "[x]" if item["classification"] == "DONE" and item["tier"] == "HIGH" else "[ ]"
-    print(f"  {mark} ({item['classification']}/{item['tier']}) {item['canonical_text']}", file=sys.stderr)
+    _marker = " [heuristic]" if item.get("classifier_source") == "heuristic" else ""
+    print(f"  {mark} ({item['classification']}/{item['tier']}) {item['canonical_text']}{_marker}", file=sys.stderr)
     print(f"      evidence: {item.get('evidence_citation')}", file=sys.stderr)
     if item.get("action_required"):
         print(f"      action:   {item['action_required']}", file=sys.stderr)
@@ -812,6 +845,7 @@ for c in data["classifications"]:
         "classification": c.get("classification"),
         "confidence": c.get("confidence"),
         "evidence_citation": c.get("evidence_citation"),
+        "classifier_source": c.get("classifier_source", "agent"),
         "classified_ts": int(time.time()),
         "_group_project": group.get("project", "unknown"),  # carried for fresh_by_proj attribution
     })
