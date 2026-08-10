@@ -313,3 +313,73 @@ def test_prefiltered_results_survive_a_failed_chunk(tmp_path, monkeypatch):
     assert rc == 0
     out = json.loads(Path(output_path).read_text())
     assert {r["group_id"] for r in out} == {"s1", "s2", "g1", "g2"}
+
+
+def test_truncation_before_retry_prevents_stale_read(tmp_path, monkeypatch):
+    """A garbage/partial write from a failed attempt must never be read as
+    the next attempt's output (run_classifier's truncate-before-every-
+    attempt guard, hooks/check_items_cli.py:742-745).
+
+    Unlike the tests above, this one stubs `subprocess.run` rather than
+    `_dispatch_classifier_chunk` — it exists specifically to exercise the
+    REAL Path.read_text()/json.loads() path inside _dispatch_classifier_chunk
+    against the real per-chunk temp output file, since stubbing
+    _dispatch_classifier_chunk wholesale (as every other test here does)
+    never touches disk and so can never catch a truncation regression.
+
+    Chunk 1 (g1), attempt 1: writes garbage to the chunk's output file AND
+    returns a non-zero rc. _dispatch_classifier_chunk's `cp.returncode != 0`
+    check returns early WITHOUT ever reading the file, so the garbage
+    survives on disk for the retry.
+    Chunk 1 (g1), attempt 2: writes nothing to the output file; returns rc 0
+    with valid JSON on stdout instead.
+
+    With truncation present: the file is blank at attempt 2, so the code
+    falls through to the stdout fallback and succeeds. With truncation
+    deleted: the file still holds the attempt-1 garbage, `file_text.strip()`
+    is truthy, `json.loads` raises, and the chunk fails (rc 4) — this test
+    goes red.
+    """
+    import re as _re
+
+    monkeypatch.setattr(check_items_cli, "CLASSIFIER_CHUNK_SIZE", 1)
+
+    # CLASSIFIER_CHUNK_SIZE=1 -> 2 single-group chunks: chunk 1 = [g1] (the
+    # one under test), chunk 2 = [g2] (must succeed normally, proving the
+    # rest of the run is unaffected).
+    groups = [_ref_group(1), _ref_group(2)]
+
+    call_index = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        idx = call_index["n"]
+        call_index["n"] += 1
+
+        prompt = kwargs.get("input", "")
+        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
+        assert out_match, f"output path missing from prompt: {prompt[:200]!r}"
+        out_path = out_match.group(1)
+
+        if idx == 0:
+            # chunk 1 (g1), attempt 1: garbage on disk + non-zero rc, so
+            # _dispatch_classifier_chunk returns early and never reads it.
+            Path(out_path).write_text("{partial", encoding="utf-8")
+            return _make_stub(returncode=3, stdout="")
+
+        if idx == 1:
+            # chunk 1 (g1), attempt 2: nothing written to the file; success
+            # comes via the stdout fallback.
+            return _make_stub(returncode=0, stdout=json.dumps([_classifier_result("g1")]))
+
+        # chunk 2 (g2): ordinary single-attempt success, own output file.
+        Path(out_path).write_text(json.dumps([_classifier_result("g2")]), encoding="utf-8")
+        return _make_stub(returncode=0, stdout="")
+
+    monkeypatch.setattr(check_items_cli.subprocess, "run", fake_run)
+
+    output_path = str(tmp_path / "out.json")
+    rc = check_items_cli.run_classifier(_payload(groups), output_path)
+
+    assert rc == 0
+    out = json.loads(Path(output_path).read_text())
+    assert {r["group_id"] for r in out} == {"g1", "g2"}
