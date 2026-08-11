@@ -309,7 +309,18 @@ def update_cache(
         seen.add(h)
 
     for h, fc in fresh_by_hash.items():
-        if h in seen or h not in current_hashes:
+        # `h in _rejected_hashes` must be checked here too, not just in the
+        # loop above: a hash rejected in loop 1 (e.g. this run's verdict for
+        # it was "heuristic") was deliberately left OUT of `seen` so its
+        # prior entry could be evicted. Without this check, if the SAME hash
+        # also has a trusted "cache" record in fresh_by_hash (fresh_by_hash
+        # is last-write-wins over fresh_classifications, so either ordering
+        # of the two records for one hash collapses to one here), this loop
+        # would re-insert it immediately -- undoing the eviction loop 1 just
+        # performed, in the same function call, and defeating both #297's
+        # "do not let an unverified verdict be replayed" guard and #302's
+        # inheritance (a fresh insert here restarts the TTL at `now`).
+        if h in seen or h in _rejected_hashes or h not in current_hashes:
             continue
         # The common case: a brand-new canonical_hash that partition() routed
         # here with _reason "new", so there is no prior entry and `now` is the
@@ -353,15 +364,22 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
     _is_replay = fc.get("classifier_source") == "cache"
     if _is_replay and isinstance(prior, dict) and "classified_ts" in prior:
         classified_ts = prior["classified_ts"]
-        # A future-dated inherited stamp is permanently un-expirable:
-        # partition()'s `now - classified_ts > ttl` can never be true while the
-        # value is ahead of the clock, so a clock-skewed or hand-edited entry
-        # would pin the verdict as "known" forever -- the very failure #302
-        # exists to prevent. Clamp it to 0 (ancient) rather than to `now`:
-        # this run did NOT verify the verdict, so granting it a fresh full TTL
-        # would be a bounded restatement of the same "measuring last read, not
-        # last verification" bug. 0 forces re-derivation on the next run, which
-        # is exactly how partition() already treats a non-numeric stamp.
+        # Under partition()'s OLD one-sided `now - classified_ts > ttl` check,
+        # a future-dated inherited stamp was permanently un-expirable -- that
+        # comparison can never be true while the value is ahead of the clock,
+        # so a clock-skewed or hand-edited entry would pin the verdict as
+        # "known" forever, the very failure #302 exists to prevent.
+        # partition() now uses the symmetric `0 <= age <= ttl` range, so a
+        # future-dated stamp already fails on read (a negative age) and is
+        # rejected there as unusable_ts. This clamp is therefore
+        # defense-in-depth, same as the NaN clamp below: it stops a bad value
+        # from ever reaching disk, rather than relying solely on the
+        # read-time guard to catch it every time a stale entry is read.
+        # Clamp to 0 (ancient) rather than to `now`: this run did NOT verify
+        # the verdict, so granting it a fresh full TTL would be a bounded
+        # restatement of the same "measuring last read, not last
+        # verification" bug. 0 forces re-derivation on the next run, which is
+        # exactly how partition() already treats a non-numeric stamp.
         # Non-numeric values are deliberately NOT coerced: partition() reads
         # them as ancient already, and comparing a str to a float would raise
         # TypeError and take down the entire cache update.
@@ -379,6 +397,16 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
         # rather than relying solely on the read-time guard to catch it every
         # time. `not (x <= now)` routes both NaN and future values into the
         # clamp below while leaving past and exactly-equal values untouched.
+        # With the read-side guard in place, this whole clamp branch is
+        # unreachable in the normal single-run flow: partition() would have
+        # already routed a future-dated or NaN prior to `needs` as
+        # unusable_ts, so classifier_source="cache" (which only partition()'s
+        # known-hit path produces) could never carry a bad prior ts here in
+        # the first place. It is reachable only via a concurrent writer
+        # racing this run's load/save, or a caller that builds
+        # classifier_source="cache" records directly without going through
+        # partition() first -- so the tests below guard a defense-in-depth
+        # branch, not a path this process's own single-run flow can hit.
         if _numeric_ts is not None and not (_numeric_ts <= now):
             print(
                 f"[check-items-cache] WARNING: cached classified_ts "

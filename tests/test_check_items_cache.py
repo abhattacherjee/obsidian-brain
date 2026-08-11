@@ -422,7 +422,10 @@ def test_partition_ttl_boundary_is_inclusive():
     `age == ttl` stayed known. An age of exactly TTL_DONE must still be
     known; TTL_DONE + 1 must be ttl_expired. Both halves are asserted in one
     test so a boundary-shifting edit fails immediately on whichever side it
-    moved."""
+    moved -- but only for the UPPER boundary of `0 <= _age <= ttl`; see
+    test_partition_zero_age_entry_is_known for the LOWER boundary, which
+    this test does not reach (mutating `0 <= _age` to `0 < _age` survives
+    this test unchanged)."""
     from check_items_cache import partition, TTL_DONE
     now = 1735100000.0
     cache_at_boundary = {
@@ -459,6 +462,33 @@ def test_partition_ttl_boundary_is_inclusive():
     assert len(known2) == 0
     assert len(needs2) == 1
     assert needs2[0]["_reason"] == "ttl_expired"
+
+
+def test_partition_zero_age_entry_is_known():
+    """#302 round 4: the LOWER bound of partition()'s `0 <= _age <= ttl`
+    range, which test_partition_ttl_boundary_is_inclusive does not reach --
+    it pins both sides of the UPPER bound only. An age of exactly 0
+    (classified_ts == now, i.e. an entry written by update_cache in this same
+    run, or two calls inside one clock tick) is a valid just-verified stamp,
+    NOT an unusable future one, so it must come back `known`. Mirrors
+    test_prior_ts_equal_to_now_is_not_clamped on the write side."""
+    from check_items_cache import partition
+    now = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE",
+                                              classified_ts=now)],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=now)
+    assert len(known) == 1
+    assert len(needs) == 0
 
 
 def test_cache_evicts_removed_items():
@@ -933,6 +963,56 @@ def test_evicted_group_reclassifies_next_run():
     assert needs[0]["_reason"] == "new"
 
 
+def test_rejected_hash_is_not_reinserted_by_the_second_loop():
+    """Final round: loop 1 evicts a hash carrying a classifier_source=
+    "heuristic" verdict (the #297 guard) via a bare `continue` that
+    deliberately does NOT add it to `seen`. Without the fix, loop 2's guard
+    is only `h in seen or h not in current_hashes`, so when the SAME
+    canonical_hash also has a trusted classifier_source="cache" record in
+    this run's fresh_classifications, loop 2 re-inserts it immediately --
+    undoing the eviction loop 1 just performed, in the same function call,
+    and defeating both #297's "an unverified verdict must not be replayed"
+    guard and #302's inheritance (a fresh insert here restarts the TTL at
+    `now`). The fix adds `h in _rejected_hashes` to loop 2's guard. Test both
+    orderings of the two fresh records for h1, since fresh_by_hash is
+    last-write-wins -- a fix that only works for one ordering is not a
+    fix."""
+    from check_items_cache import update_cache, partition
+
+    for order in ("heuristic_then_cache", "cache_then_heuristic"):
+        cache = {
+            "schema_version": 1,
+            "runs": {
+                "obsidian-brain": {
+                    "last_run_ts": 1734000000,
+                    "project_head_at_classify": "OLDHEAD",
+                    "groups": [_make_cached_entry("h1", classification="DONE")],
+                }
+            },
+        }
+        heuristic_fc = _make_fresh("h1", classifier_source="heuristic")
+        cache_fc = _make_fresh("h1", classifier_source="cache", classification="DONE")
+        fresh_classifications = (
+            [heuristic_fc, cache_fc] if order == "heuristic_then_cache"
+            else [cache_fc, heuristic_fc]
+        )
+        updated = update_cache(
+            cache, project="obsidian-brain", all_groups=[_make_group("h1")],
+            fresh_classifications=fresh_classifications, head_sha="NEWHEAD",
+        )
+        hashes = {g["canonical_hash"] for g in updated["runs"]["obsidian-brain"]["groups"]}
+        assert "h1" not in hashes, f"order={order}: h1 must be absent, not re-inserted"
+
+        # Must be re-derived from scratch on the next run, exactly like
+        # test_evicted_group_reclassifies_next_run.
+        known, needs = partition([_make_group("h1")], updated, project="obsidian-brain",
+                                 head_sha="NEWHEAD")
+        assert len(known) == 0, f"order={order}"
+        assert len(needs) == 1, f"order={order}"
+        assert needs[0]["canonical_hash"] == "h1", f"order={order}"
+        assert needs[0]["_reason"] == "new", f"order={order}"
+
+
 def test_agent_verdicts_unaffected():
     """A run with no heuristic verdicts produces the same cache content as
     today's (pre-#297-Task-5) behaviour: GC, overwrite-by-hash, and the HEAD
@@ -1124,7 +1204,7 @@ def test_prior_ts_equal_to_now_is_not_clamped(capsys):
 
 
 def test_nan_prior_ts_is_clamped_and_expires(capsys):
-    """#303 round 3: with the old `_numeric_ts > now` comparison, a NaN prior
+    """#302 round 3: with the old `_numeric_ts > now` comparison, a NaN prior
     classified_ts is inherited verbatim -- every comparison against NaN is
     False, so `nan > now` is False and NaN slips past the clamp as if it were
     a valid, non-future timestamp. That is strictly worse than a future date:
@@ -1168,7 +1248,7 @@ def test_nan_prior_ts_is_clamped_and_expires(capsys):
 
 
 def test_overflow_prior_ts_is_treated_as_ancient(capsys):
-    """#303 round 3: `float()` raises OverflowError (not ValueError) on a
+    """#302 round 3: `float()` raises OverflowError (not ValueError) on a
     sufficiently large Python int, e.g. a 400-digit integer that could arrive
     via a hand-edited or corrupted JSON cache file. Both _freeze_classification
     and partition() must catch OverflowError alongside TypeError/ValueError so
@@ -1207,6 +1287,10 @@ def test_overflow_prior_ts_is_treated_as_ancient(capsys):
     )
     persisted = updated["runs"]["obsidian-brain"]["groups"][0]
     assert persisted["classified_ts"] == huge
+    # The write side is deliberately silent for an OverflowError value: it
+    # cannot compare the value to `now` (that comparison is what raised), so
+    # it cannot call it future-dated the way the NaN/future-date clamp does.
+    assert "not a usable past timestamp" not in capsys.readouterr().err
 
     _known, needs = partition([_make_group("h1")], updated, project="obsidian-brain",
                               head_sha="abc1234", now=t0)
