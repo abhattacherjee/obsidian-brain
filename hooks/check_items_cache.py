@@ -174,8 +174,12 @@ def partition(
             needs.append(g)
             continue
         try:
+            # A sufficiently large int (e.g. a 400-digit JSON integer) makes
+            # float() raise OverflowError rather than ValueError -- treat it
+            # the same as any other unusable value: ancient, so the group
+            # re-derives.
             classified_ts = float(cached.get("classified_ts", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             classified_ts = 0.0
         if now - classified_ts > _ttl_for(cached.get("classification", "ACTIVE")):
             g["_reason"] = "ttl_expired"
@@ -317,7 +321,7 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
     # stamping `now` would re-introduce exactly this bug. That tolerance
     # has one gap: a *numeric* bad value (a millisecond-valued stamp, a
     # hand-edited future date) parses fine and is NOT read as ancient, so the
-    # clamp below handles the future-dated case explicitly.
+    # clamp below handles the future-dated and NaN cases explicitly.
     _is_replay = fc.get("classifier_source") == "cache"
     if _is_replay and isinstance(prior, dict) and "classified_ts" in prior:
         classified_ts = prior["classified_ts"]
@@ -335,13 +339,22 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
         # TypeError and take down the entire cache update.
         try:
             _numeric_ts = float(classified_ts)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _numeric_ts = None
-        if _numeric_ts is not None and _numeric_ts > now:
+        # Every comparison against NaN is False, so `_numeric_ts > now` would
+        # let a NaN prior stamp pass through as a valid inherited value. NaN
+        # is strictly worse than a future date here: partition()'s
+        # `now - nan > ttl` is also False, so the entry would never expire
+        # and never self-heal as the clock advances -- a future date at
+        # least becomes valid once `now` catches up. `not (x <= now)` routes
+        # both NaN and future values into the clamp below while leaving past
+        # and exactly-equal values untouched.
+        if _numeric_ts is not None and not (_numeric_ts <= now):
             print(
                 f"[check-items-cache] WARNING: cached classified_ts "
-                f"({classified_ts}) for {fc.get('canonical_hash')} is in the "
-                f"future; treating it as unverified so it re-derives next run",
+                f"({classified_ts}) for {fc.get('canonical_hash')} is not a "
+                f"usable past timestamp; treating it as unverified so it "
+                f"re-derives next run",
                 file=sys.stderr,
             )
             classified_ts = 0

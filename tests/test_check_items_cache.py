@@ -934,7 +934,7 @@ def test_future_dated_prior_ts_is_clamped_and_expires(capsys):
     )
     persisted = updated["runs"]["obsidian-brain"]["groups"][0]
     assert persisted["classified_ts"] == 0
-    assert "future" in capsys.readouterr().err
+    assert "not a usable past timestamp" in capsys.readouterr().err
 
     # The round-trip is the load-bearing half: clamped to 0 (ancient) the
     # group is immediately ttl_expired at the very `now` the clamp happened.
@@ -974,7 +974,114 @@ def test_prior_ts_equal_to_now_is_not_clamped(capsys):
     )
     persisted = updated["runs"]["obsidian-brain"]["groups"][0]
     assert persisted["classified_ts"] == now
-    assert "future" not in capsys.readouterr().err
+    assert "not a usable past timestamp" not in capsys.readouterr().err
+
+
+def test_nan_prior_ts_is_clamped_and_expires(capsys):
+    """#303 round 3: with the old `_numeric_ts > now` comparison, a NaN prior
+    classified_ts is inherited verbatim -- every comparison against NaN is
+    False, so `nan > now` is False and NaN slips past the clamp as if it were
+    a valid, non-future timestamp. That is strictly worse than a future date:
+    partition()'s `now - nan > ttl` is ALSO False for every possible `now`,
+    since NaN poisons any arithmetic it touches, so the entry would never
+    expire and never self-heal as the clock advances -- a future-dated entry
+    at least self-heals once `now` catches up to it. The fix compares with
+    `not (x <= now)`, which is True for both NaN and future values (NaN
+    fails `<=` too), routing both into the clamp."""
+    from check_items_cache import update_cache, partition
+
+    t0 = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE",
+                                              classified_ts=float("nan"))],
+            }
+        },
+    }
+    updated = update_cache(
+        cache=cache, project="obsidian-brain", all_groups=[_make_group("h1")],
+        fresh_classifications=[_make_fresh("h1", classifier_source="cache",
+                                           classification="DONE",
+                                           classified_ts=int(t0))],
+        head_sha="abc1234", now=t0,
+    )
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == 0
+    assert "not a usable past timestamp" in capsys.readouterr().err
+
+    # Round-trip at the SAME now: clamped to 0 (ancient) must be immediately
+    # ttl_expired, proving the clamp -- not merely a persisted 0 -- is what
+    # makes the entry re-derive.
+    _known, needs = partition([_make_group("h1")], updated, project="obsidian-brain",
+                              head_sha="abc1234", now=t0)
+    assert [n["_reason"] for n in needs] == ["ttl_expired"]
+
+
+def test_overflow_prior_ts_is_treated_as_ancient(capsys):
+    """#303 round 3: `float()` raises OverflowError (not ValueError) on a
+    sufficiently large Python int, e.g. a 400-digit integer that could arrive
+    via a hand-edited or corrupted JSON cache file. Both _freeze_classification
+    and partition() must catch OverflowError alongside TypeError/ValueError so
+    a huge int degrades to 'ancient' like any other unusable value, instead of
+    crashing the whole cache write/read.
+
+    Mirrors test_cache_replay_with_unusable_prior_ts's non-numeric-string
+    case: _freeze_classification's guard only clamps a value it can compare
+    against `now` (a real float). An OverflowError means it could not even
+    get that far, so -- like the non-numeric-string case -- it round-trips
+    the huge value verbatim rather than clamping it; partition() is the one
+    that must independently treat it as ancient on the next read, which is
+    what the OverflowError catch there is for."""
+    from check_items_cache import update_cache, partition
+
+    huge = 10**400
+    t0 = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE",
+                                              classified_ts=huge)],
+            }
+        },
+    }
+    # Must not raise despite the OverflowError-triggering prior value.
+    updated = update_cache(
+        cache=cache, project="obsidian-brain", all_groups=[_make_group("h1")],
+        fresh_classifications=[_make_fresh("h1", classifier_source="cache",
+                                           classification="DONE",
+                                           classified_ts=int(t0))],
+        head_sha="abc1234", now=t0,
+    )
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == huge
+
+    _known, needs = partition([_make_group("h1")], updated, project="obsidian-brain",
+                              head_sha="abc1234", now=t0)
+    assert [n["_reason"] for n in needs] == ["ttl_expired"]
+
+    # partition() must also tolerate reading a huge int directly from a cache
+    # entry without going through update_cache's clamp first.
+    direct_cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE",
+                                              classified_ts=huge)],
+            }
+        },
+    }
+    _known2, needs2 = partition([_make_group("h1")], direct_cache, project="obsidian-brain",
+                                head_sha="abc1234", now=t0)
+    assert [n["_reason"] for n in needs2] == ["ttl_expired"]
 
 
 def test_replay_with_prior_missing_ts_warns_and_stamps_now(capsys):
