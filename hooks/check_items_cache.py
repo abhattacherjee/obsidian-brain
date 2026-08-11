@@ -181,7 +181,17 @@ def partition(
             classified_ts = float(cached.get("classified_ts", 0))
         except (TypeError, ValueError, OverflowError):
             classified_ts = 0.0
-        if now - classified_ts > _ttl_for(cached.get("classification", "ACTIVE")):
+        _age = now - classified_ts
+        # Symmetric range, not a one-sided `> ttl`: an age outside [0, ttl] is
+        # unusable, not merely old. A NEGATIVE age means the stamp is ahead of
+        # the clock (skew, a hand-edit, a cache synced from a faster machine)
+        # and a one-sided check would trust it forever; a NaN age fails every
+        # comparison, so `0 <= _age` is False and it lands here too. Both are
+        # re-derived instead of replayed. _freeze_classification clamps the
+        # stored value on write; this closes the same hole on read, in the
+        # SAME run rather than the next one -- which matters because a
+        # replayed verdict is high-trust and can preselect for auto-checkoff.
+        if not (0 <= _age <= _ttl_for(cached.get("classification", "ACTIVE"))):
             g["_reason"] = "ttl_expired"
             needs.append(g)
             continue
@@ -363,16 +373,20 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
             # A replay whose prior entry cannot supply a timestamp -- either no
             # prior at all, or a prior carrying no classified_ts. Both are the
             # same invariant violation: partition() can only have emitted
-            # "cache" by finding a usable entry, so reaching here means the
-            # cache changed between Step 3's load_cache() and Step 10's (they
-            # run in separate processes), or a caller bug. This is the one
-            # place the #302 fix silently reverts to re-stamping, so it must
-            # not be silent.
+            # "cache" by finding a usable entry, so reaching here means one of
+            # two things happened: the cache changed between Step 3's
+            # load_cache() and Step 10's (they run in separate processes, or a
+            # caller bug), OR -- the route update_cache's own comment above
+            # names for this same call site -- the #297 _rejected_hashes
+            # branch evicted this hash's prior entry earlier in THIS run. This
+            # is the one place the #302 fix silently reverts to re-stamping,
+            # so it must not be silent.
             print(
                 f"[check-items-cache] WARNING: classifier_source='cache' for "
                 f"{fc.get('canonical_hash')} but no prior on-disk "
                 f"classified_ts to inherit; stamping now, so its TTL restarts "
-                f"(cache changed mid-run?)",
+                f"(cache changed mid-run, or its prior entry was evicted this "
+                f"run)",
                 file=sys.stderr,
             )
         classified_ts = fc.get("classified_ts", int(now))

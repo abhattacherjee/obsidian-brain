@@ -315,6 +315,114 @@ def test_ttl_for_review_matches_active():
     assert _ttl_for("REVIEW") not in (TTL_DONE, TTL_STALE, TTL_NEEDS_ACTION)
 
 
+def test_partition_rejects_future_dated_entry_in_the_same_run():
+    """#302 round 4: before this guard, a cached entry whose classified_ts is
+    ahead of `now` (clock skew, a hand-edit, a cache synced from a faster
+    machine) came back `known` on partition()'s READ side for the CURRENT
+    run -- the old one-sided `now - ts > ttl` check is negative for a future
+    timestamp, so it can never exceed the TTL. And because a replayed verdict
+    is stamped classifier_source='cache', which is inside assign_tier's
+    _HIGH_TRUST_SOURCES, that `known` result could preselect the item for
+    auto-checkoff. _freeze_classification's write-side clamp did not help
+    here: it only fires on the NEXT run's write, so only the next run's
+    partition() call saw ttl_expired -- this test pins that the very FIRST
+    partition() call on a future-dated entry already routes to `needs`, with
+    no update_cache round-trip in between."""
+    from check_items_cache import partition
+    now = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE", classified_ts=now + 3600,
+                )],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=now)
+    assert len(known) == 0
+    assert len(needs) == 1
+    assert needs[0]["_reason"] == "ttl_expired"
+
+
+def test_partition_rejects_nan_classified_ts():
+    """#302 round 4: a cached entry with classified_ts = NaN must route to
+    `needs` with _reason='ttl_expired' on the very first partition() call.
+    Every comparison against NaN is False, so the old one-sided
+    `now - classified_ts > ttl` check never fired for a NaN age -- the entry
+    was un-expirable for all time, not merely until the next run. The
+    symmetric range check routes it to ttl_expired because `0 <= _age` is
+    also False for a NaN age."""
+    from check_items_cache import partition
+    now = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE", classified_ts=float("nan"),
+                )],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=now)
+    assert len(known) == 0
+    assert len(needs) == 1
+    assert needs[0]["_reason"] == "ttl_expired"
+
+
+def test_partition_ttl_boundary_is_inclusive():
+    """#302 round 4: pins that the symmetric range check in CHANGE 1 did not
+    shift the TTL boundary. The old check expired when `age > ttl`, so
+    `age == ttl` stayed known. An age of exactly TTL_DONE must still be
+    known; TTL_DONE + 1 must be ttl_expired. Both halves are asserted in one
+    test so a boundary-shifting edit fails immediately on whichever side it
+    moved."""
+    from check_items_cache import partition, TTL_DONE
+    now = 1735100000.0
+    cache_at_boundary = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE", classified_ts=now - TTL_DONE,
+                )],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache_at_boundary,
+                             project="obsidian-brain", head_sha="abc1234", now=now)
+    assert len(known) == 1
+    assert len(needs) == 0
+
+    cache_past_boundary = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE", classified_ts=now - (TTL_DONE + 1),
+                )],
+            }
+        },
+    }
+    known2, needs2 = partition([_make_group("h1")], cache_past_boundary,
+                               project="obsidian-brain", head_sha="abc1234", now=now)
+    assert len(known2) == 0
+    assert len(needs2) == 1
+    assert needs2[0]["_reason"] == "ttl_expired"
+
+
 def test_cache_evicts_removed_items():
     """Test 20 - cached entries whose canonical_hash is not in current run are GC'd."""
     from check_items_cache import update_cache
