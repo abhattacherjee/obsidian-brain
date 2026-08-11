@@ -134,8 +134,10 @@ def partition(
 ) -> tuple[list[dict], list[dict]]:
     """
     Apply invalidation rules in spec order (first match wins):
-        force -> new -> head_changed -> mtime_changed -> ttl_expired ->
-        heuristic_cached.
+        force -> new -> head_changed -> mtime_changed ->
+        ttl_expired (or unusable_ts for a negative/NaN age -- a corrupt,
+        hand-edited, or clock-skewed stamp, reported distinctly from routine
+        expiry) -> heuristic_cached.
     Returns (known_unchanged, needs_reclassification). Groups routed to
     `needs` carry `_reason` for dashboard visibility. Groups routed to
     `known` carry `_cached_classification` / `_cached_confidence` /
@@ -192,7 +194,23 @@ def partition(
         # SAME run rather than the next one -- which matters because a
         # replayed verdict is high-trust and can preselect for auto-checkoff.
         if not (0 <= _age <= _ttl_for(cached.get("classification", "ACTIVE"))):
-            g["_reason"] = "ttl_expired"
+            # Separate "unusable" from "merely old". A negative or NaN age means
+            # the stored stamp is not a valid past time (clock skew, a hand-edit,
+            # an external writer) -- an environmental fault worth reporting, not
+            # the routine expiry that a bare "ttl_expired" implies. Rejecting on
+            # read means the replay never forms, so _freeze_classification's
+            # clamp warning cannot fire for this entry; the signal has to live
+            # here.
+            if not (0 <= _age):
+                print(
+                    f"[check-items-cache] WARNING: unusable classified_ts "
+                    f"({cached.get('classified_ts')!r}) for {h} in {project}; "
+                    f"re-deriving instead of replaying",
+                    file=sys.stderr,
+                )
+                g["_reason"] = "unusable_ts"
+            else:
+                g["_reason"] = "ttl_expired"
             needs.append(g)
             continue
         # #297: a cached verdict that was produced by the token-overlap
@@ -352,13 +370,15 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
         except (TypeError, ValueError, OverflowError):
             _numeric_ts = None
         # Every comparison against NaN is False, so `_numeric_ts > now` would
-        # let a NaN prior stamp pass through as a valid inherited value. NaN
-        # is strictly worse than a future date here: partition()'s
-        # `now - nan > ttl` is also False, so the entry would never expire
-        # and never self-heal as the clock advances -- a future date at
-        # least becomes valid once `now` catches up. `not (x <= now)` routes
-        # both NaN and future values into the clamp below while leaving past
-        # and exactly-equal values untouched.
+        # let a NaN prior stamp pass through as a valid inherited value. Under
+        # partition()'s OLD one-sided `now - ts > ttl` check, a NaN age would
+        # have been permanently un-expirable (every comparison against NaN is
+        # False). partition() now uses a symmetric `0 <= age <= ttl` range, so
+        # a NaN age already fails on read and is caught there. This clamp is
+        # defense-in-depth: it stops a bad value from ever reaching disk,
+        # rather than relying solely on the read-time guard to catch it every
+        # time. `not (x <= now)` routes both NaN and future values into the
+        # clamp below while leaving past and exactly-equal values untouched.
         if _numeric_ts is not None and not (_numeric_ts <= now):
             print(
                 f"[check-items-cache] WARNING: cached classified_ts "

@@ -315,7 +315,7 @@ def test_ttl_for_review_matches_active():
     assert _ttl_for("REVIEW") not in (TTL_DONE, TTL_STALE, TTL_NEEDS_ACTION)
 
 
-def test_partition_rejects_future_dated_entry_in_the_same_run():
+def test_partition_rejects_future_dated_entry_in_the_same_run(capsys):
     """#302 round 4: before this guard, a cached entry whose classified_ts is
     ahead of `now` (clock skew, a hand-edit, a cache synced from a faster
     machine) came back `known` on partition()'s READ side for the CURRENT
@@ -327,7 +327,10 @@ def test_partition_rejects_future_dated_entry_in_the_same_run():
     here: it only fires on the NEXT run's write, so only the next run's
     partition() call saw ttl_expired -- this test pins that the very FIRST
     partition() call on a future-dated entry already routes to `needs`, with
-    no update_cache round-trip in between."""
+    no update_cache round-trip in between. #302 round 5: a negative age is
+    reported as 'unusable_ts', not the ordinary 'ttl_expired', with a stderr
+    warning -- it's an environmental fault (clock skew, hand-edit, external
+    writer), not routine expiry."""
     from check_items_cache import partition
     now = 1735100000.0
     cache = {
@@ -346,17 +349,20 @@ def test_partition_rejects_future_dated_entry_in_the_same_run():
                              head_sha="abc1234", now=now)
     assert len(known) == 0
     assert len(needs) == 1
-    assert needs[0]["_reason"] == "ttl_expired"
+    assert needs[0]["_reason"] == "unusable_ts"
+    assert "unusable classified_ts" in capsys.readouterr().err
 
 
-def test_partition_rejects_nan_classified_ts():
+def test_partition_rejects_nan_classified_ts(capsys):
     """#302 round 4: a cached entry with classified_ts = NaN must route to
-    `needs` with _reason='ttl_expired' on the very first partition() call.
-    Every comparison against NaN is False, so the old one-sided
-    `now - classified_ts > ttl` check never fired for a NaN age -- the entry
-    was un-expirable for all time, not merely until the next run. The
-    symmetric range check routes it to ttl_expired because `0 <= _age` is
-    also False for a NaN age."""
+    `needs` on the very first partition() call. Every comparison against NaN
+    is False, so the old one-sided `now - classified_ts > ttl` check never
+    fired for a NaN age -- the entry was un-expirable for all time, not
+    merely until the next run. The symmetric range check catches it because
+    `0 <= _age` is also False for a NaN age. #302 round 5: that catch is
+    reported as 'unusable_ts', not 'ttl_expired' -- a NaN stamp is not a
+    valid past time at all, so labeling it as routine expiry would hide the
+    corruption, and a stderr warning is emitted."""
     from check_items_cache import partition
     now = 1735100000.0
     cache = {
@@ -375,7 +381,39 @@ def test_partition_rejects_nan_classified_ts():
                              head_sha="abc1234", now=now)
     assert len(known) == 0
     assert len(needs) == 1
+    assert needs[0]["_reason"] == "unusable_ts"
+    assert "unusable classified_ts" in capsys.readouterr().err
+
+
+def test_partition_genuinely_old_entry_reports_ttl_expired_silently(capsys):
+    """#302 round 5: a discriminating control for the unusable_ts/ttl_expired
+    split. An entry whose age is TTL_DONE + 60 is genuinely old -- NOT
+    corrupt, NOT clock-skewed, just past its TTL -- and must still report
+    the ordinary 'ttl_expired' with NO warning. Without this control, a
+    future edit could collapse both labels into one (or make the routine
+    path noisy) and nothing would notice: this test pins both the label AND
+    the silence of the routine path."""
+    from check_items_cache import partition, TTL_DONE
+    now = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE",
+                    classified_ts=now - (TTL_DONE + 60),
+                )],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=now)
+    assert len(known) == 0
+    assert len(needs) == 1
     assert needs[0]["_reason"] == "ttl_expired"
+    assert capsys.readouterr().err == ""
 
 
 def test_partition_ttl_boundary_is_inclusive():
