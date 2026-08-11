@@ -134,7 +134,8 @@ def partition(
 ) -> tuple[list[dict], list[dict]]:
     """
     Apply invalidation rules in spec order (first match wins):
-        force -> new -> head_changed -> mtime_changed -> ttl_expired.
+        force -> new -> head_changed -> mtime_changed -> ttl_expired ->
+        heuristic_cached.
     Returns (known_unchanged, needs_reclassification). Groups routed to
     `needs` carry `_reason` for dashboard visibility. Groups routed to
     `known` carry `_cached_classification` / `_cached_confidence` /
@@ -180,6 +181,19 @@ def partition(
             g["_reason"] = "ttl_expired"
             needs.append(g)
             continue
+        # #297: a cached verdict that was produced by the token-overlap
+        # heuristic must never be replayed as `known`. Entries written before
+        # #297 carry no classifier_source at all, so fall back to the
+        # citation's shape — classify_groups_heuristic always emits
+        # "heuristic: token '<t>' near completion phrase '<p>'". Replaying one
+        # would let SKILL.md stamp it "cache" (a trusted source) and
+        # preselect it for auto-checkoff, which is the exact defect #297 is
+        # about. Routing to `needs` re-classifies it with real evidence.
+        if (cached.get("classifier_source") == "heuristic"
+                or str(cached.get("evidence_citation") or "").startswith("heuristic:")):
+            g["_reason"] = "heuristic_cached"
+            needs.append(g)
+            continue
         g["_cached_classification"] = cached.get("classification")
         g["_cached_confidence"] = cached.get("confidence")
         g["_cached_evidence_citation"] = cached.get("evidence_citation")
@@ -208,6 +222,30 @@ def update_cache(
     """
     if now is None:
         now = time.time()
+
+    # #297 defect 5: only known-trusted verdicts may be persisted. partition()
+    # replays cached verdicts as `known` until the project's HEAD moves, so a
+    # single degraded run would poison every later run with token-co-occurrence
+    # citations. Allowlist, not denylist: an un-migrated or misspelled source
+    # (absent, "", "Heuristic", a future value nobody has audited yet) must be
+    # refused rather than silently persisted — the same allowlist-over-denylist
+    # reasoning as assign_tier's _HIGH_TRUST_SOURCES cap (open_item_dedup.py).
+    # Enforced here rather than only in SKILL.md because skills are advisory
+    # and code is not (memory: feedback_skills_advisory_not_enforcement).
+    _TRUSTED_SOURCES = {"agent", "prefilter", "cache"}
+    _rejected = [fc for fc in (fresh_classifications or [])
+                 if fc.get("classifier_source") not in _TRUSTED_SOURCES]
+    if _rejected:
+        print(
+            f"[check-items-cache] refusing to cache {len(_rejected)} "
+            f"verdict(s) with untrusted/unknown classifier_source for "
+            f"{project}; they will be re-classified on the next run",
+            file=sys.stderr,
+        )
+    _rejected_hashes = {fc.get("canonical_hash") for fc in _rejected}
+    fresh_classifications = [fc for fc in (fresh_classifications or [])
+                             if fc.get("classifier_source") in _TRUSTED_SOURCES]
+
     current_hashes = {g.get("canonical_hash") for g in all_groups}
     fresh_by_hash = {fc.get("canonical_hash"): fc for fc in fresh_classifications}
 
@@ -221,6 +259,10 @@ def update_cache(
     for g in existing_groups:
         h = g.get("canonical_hash")
         if h not in current_hashes:
+            continue
+        if h in _rejected_hashes:
+            # This run could not verify the group — do not let an older entry
+            # be revalidated by the unconditional project_head_at_classify bump.
             continue
         if h in fresh_by_hash:
             surviving.append(_freeze_classification(fresh_by_hash[h], now))
@@ -250,4 +292,5 @@ def _freeze_classification(fc: dict, now: float) -> dict:
         "evidence_citation": fc.get("evidence_citation"),
         "action_required": fc.get("action_required"),
         "classified_ts": fc.get("classified_ts", int(now)),
+        "classifier_source": fc.get("classifier_source"),
     }

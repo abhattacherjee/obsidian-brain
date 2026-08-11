@@ -109,6 +109,13 @@ CONFIDENCE_TIER_RULES = {
     },
 }
 
+# Sources whose evidence_citation is independent of the item text and may
+# therefore reach tier HIGH. Anything else — including an absent or unknown
+# source — caps at MED, so a caller that has not been updated to thread
+# provenance degrades to "never auto-checked" rather than "always eligible".
+# (#297: the denylist form silently failed open.)
+_HIGH_TRUST_SOURCES = frozenset({"agent", "prefilter", "cache"})
+
 
 def _outer_subagent_timeout() -> int:
     """Return the outer subprocess.run timeout that wraps check_items_cli.py.
@@ -127,7 +134,8 @@ def _outer_subagent_timeout() -> int:
     return inner * 6
 
 
-def assign_tier(evidence_citation, item_text, classification=None):
+def assign_tier(evidence_citation, item_text, classification=None,
+                classifier_source=None):
     """Deterministically assign HIGH | MED | LOW from evidence citation shape.
 
     HIGH requires a literal ref (sha, #N, vX.Y) appearing in BOTH the citation
@@ -141,6 +149,10 @@ def assign_tier(evidence_citation, item_text, classification=None):
     even in the edge case where its weak evidence_citation happens to contain
     a literal ref that also appears in item_text (#264 Task 1).
 
+    `classifier_source` is optional and defaults to None (backward compatible
+    with existing callers, appended rather than inserted — all 23 pre-#297
+    call sites pass 1-3 positional args). See the #297 comment below the cap.
+
     Spec § Confidence tiers (lines 324-332).
     """
     if not evidence_citation or not item_text:
@@ -148,13 +160,26 @@ def assign_tier(evidence_citation, item_text, classification=None):
     citation = str(evidence_citation)
     text = str(item_text)
 
+    # #297: a heuristic citation is BUILT FROM a token lifted out of the item
+    # text, so "ref appears in both citation and text" is trivially true and
+    # says nothing about completion. HIGH is what preselects a DONE item for
+    # auto-checkoff, so anything short of a known high-trust source (agent,
+    # prefilter, or a cached agent-derived verdict) is capped at MED and can
+    # never be auto-checked. Allowlist, not denylist: an un-migrated caller
+    # that omits classifier_source degrades safely to MED rather than
+    # silently keeping the old unsafe HIGH behaviour. (Production case:
+    # token 'v3.4.0' near completion phrase 'release' on an unperformed
+    # validation task.)
+    _cap_at_med = (classification == "REVIEW"
+                   or classifier_source not in _HIGH_TRUST_SOURCES)
+
     for pattern in CONFIDENCE_TIER_RULES["HIGH"]["literal_ref_patterns"]:
         cit_match = re.search(pattern, citation)
         if not cit_match:
             continue
         ref = cit_match.group(0)
         if ref in text:
-            return "MED" if classification == "REVIEW" else "HIGH"
+            return "MED" if _cap_at_med else "HIGH"
 
     for pattern in CONFIDENCE_TIER_RULES["MED"]["inferred_ref_patterns"]:
         if re.search(pattern, citation):
@@ -1576,8 +1601,19 @@ def classify_groups_with_agent(merged_groups, evidence):
     check_items_cli.run_classifier with one retry on schema-validation
     failure. Returns the parsed list on success.
 
-    On 2 consecutive failures, returns [] and sets
-    `_LAST_CLASSIFIER_MODE = 'heuristic-fallback'`.
+    Sets `_LAST_CLASSIFIER_MODE` to one of three values:
+      - 'ok': every input group_id came back classified.
+      - 'partial': validation succeeded but some group_ids in
+        `merged_groups` are missing from the returned records (a chunked
+        run can now succeed partially, #297 defect 2). Returns the
+        records that did come back; the caller fills the missing
+        group_ids from the heuristic.
+      - 'heuristic-fallback': both attempts failed (non-zero return code,
+        missing output, or schema validation failure). Returns [].
+
+    Diagnostics for every failed attempt (including the child's captured
+    stderr) and the terminal outcome are printed to stderr so a classifier
+    failure is never silent (#297 defect 1).
 
     Spec §§ Pipeline architecture Stage 4 + Expected output.
     """
@@ -1651,6 +1687,13 @@ def classify_groups_with_agent(merged_groups, evidence):
                 timeout=_outer_subagent_timeout(),
             )
             if cp.returncode != 0 or not out_path.exists():
+                _tail = (cp.stderr or "").strip()[-800:]
+                print(
+                    f"[check-items] classifier attempt {attempt}/2 failed: "
+                    f"rc={cp.returncode} output_written={out_path.exists()}"
+                    + (f"; child stderr: {_tail}" if _tail else ""),
+                    file=sys.stderr,
+                )
                 continue
             candidate = json.loads(out_path.read_text())
             # I4: warn early (pre-validation) so the diagnostic is always
@@ -1665,6 +1708,12 @@ def classify_groups_with_agent(merged_groups, evidence):
                         file=sys.stderr,
                     )
             if not _validate_classifier_response(candidate):
+                print(
+                    f"[check-items] classifier attempt {attempt}/2 failed: "
+                    f"schema validation rejected the response (missing "
+                    f"required fields or an invalid classification value)",
+                    file=sys.stderr,
+                )
                 continue
             parsed = candidate
             break
@@ -1680,8 +1729,38 @@ def classify_groups_with_agent(merged_groups, evidence):
             pass
 
     if parsed is None:
+        print(
+            f"[check-items] classifier FAILED after {attempt} attempt(s); "
+            f"falling back to the token-overlap heuristic for all "
+            f"{len(merged_groups)} group(s). Heuristic citations are token "
+            f"co-occurrence, not evidence — verify before accepting any DONE.",
+            file=sys.stderr,
+        )
         _LAST_CLASSIFIER_MODE = "heuristic-fallback"
         return []
+
+    _returned_ids = {r.get("group_id") for r in parsed}
+    _missing = [g.get("group_id") for g in merged_groups
+                if g.get("group_id") not in _returned_ids]
+    if _missing:
+        # A chunked run can now succeed partially (#297 defect 2). The caller
+        # fills exactly these group_ids from the heuristic.
+        _LAST_CLASSIFIER_MODE = "partial"
+        print(
+            f"[check-items] classifier PARTIAL: {len(_missing)} of "
+            f"{len(merged_groups)} group(s) were not classified by the agent "
+            f"and will fall back to the heuristic.",
+            file=sys.stderr,
+        )
+
+    # #297: stamp provenance on every record the agent path actually
+    # returned, so a downstream heuristic-only cap (assign_tier) and cache
+    # refusal (Task 5) can tell an agent verdict from a token-overlap guess.
+    # Stamp unconditionally (not setdefault) — the sub-agent's own JSON must
+    # never be able to declare its own provenance, which under assign_tier's
+    # allowlist would let a payload self-assert into the high-trust set.
+    for r in parsed:
+        r["classifier_source"] = "prefilter" if r.get("prefiltered") else "agent"
 
     # Outer telemetry: summary of this classification run.
     # cache_hit is intentionally NOT emitted here — the orchestration layer
@@ -1715,8 +1794,11 @@ _LAST_CLASSIFIER_MODE = "ok"
 
 
 def get_last_classifier_mode():
-    """Returns 'ok' on success or 'heuristic-fallback' if Task 17's
-    heuristic must be invoked."""
+    """Returns 'ok' if every group was classified, 'partial' if the
+    classifier succeeded but some group_ids came back missing (the
+    caller must fill those from Task 17's heuristic), or
+    'heuristic-fallback' if the classifier failed entirely and Task 17's
+    heuristic must be invoked for all groups."""
     return _LAST_CLASSIFIER_MODE
 
 
@@ -1760,7 +1842,12 @@ def classify_groups_heuristic(merged_groups, evidence):
                 distance = abs(tok_match.start() - phr_match.start())
                 if distance <= _HEURISTIC_PROXIMITY_CHARS:
                     classification = "DONE"
-                    confidence = "HIGH" if distance <= 60 else "MED"
+                    # #297: the heuristic's own token-co-occurrence evidence
+                    # cannot justify HIGH confidence at any distance —
+                    # confidence is written to the dashboard and the cache,
+                    # and a consumer keying off it (rather than the
+                    # assign_tier-derived tier) must not read it as HIGH.
+                    confidence = "MED"
                     evidence_citation = (
                         f"heuristic: token '{tok_match.group(0)}' "
                         f"near completion phrase '{phr_match.group(0)}'"
@@ -1774,6 +1861,7 @@ def classify_groups_heuristic(merged_groups, evidence):
             "canonical_text": canonical_text,
             "evidence_citation": evidence_citation,
             "action_required": None,
+            "classifier_source": "heuristic",
         })
     return out
 
