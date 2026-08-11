@@ -338,31 +338,37 @@ def update_cache(
     return cache
 
 
-def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> dict:
-    """Normalize a fresh classification dict into the on-disk cache entry shape.
+def _resolve_replay_ts(fc: dict, prior: dict | None, now: float):
+    """Decide the classified_ts an entry should be persisted with.
 
-    `prior` is the existing on-disk cache entry for the same canonical_hash
-    (or None if there isn't one).
+    `fc` is the fresh classification record for this run, `prior` is the
+    existing on-disk cache entry for the same canonical_hash (or None if
+    there isn't one), and `now` is this run's timestamp. Returns the value
+    to store as classified_ts.
+
+    #302: classifier_source == "cache" means this run *replayed* a verdict
+    from partition()'s known-hit path without re-deriving it (Step 6 of
+    check-items/SKILL.md). SKILL.md Step 10 unconditionally stamps
+    classified_ts=int(time.time()) on every record it hands to
+    update_cache, including these replays. If we accepted that stamp here,
+    a replayed verdict's TTL clock would reset on every run that merely
+    *reads* it, so partition()'s ttl_expired check would never fire on a
+    repo whose HEAD is static — measuring "last read" instead of "last
+    verification". Inherit the prior on-disk classified_ts verbatim
+    instead: partition() already tolerates a non-numeric classified_ts by
+    treating it as ancient (see
+    test_partition_handles_non_numeric_classified_ts), so round-tripping a
+    possibly-corrupt prior value is fail-safe, whereas "healing" it by
+    stamping `now` would re-introduce exactly this bug. That tolerance
+    has one gap: a *numeric* bad value (a millisecond-valued stamp, a
+    hand-edited future date) parses fine and is NOT read as ancient, so the
+    clamp below handles the future-dated and NaN cases explicitly.
     """
-    # #302: classifier_source == "cache" means this run *replayed* a verdict
-    # from partition()'s known-hit path without re-deriving it (Step 6 of
-    # check-items/SKILL.md). SKILL.md Step 10 unconditionally stamps
-    # classified_ts=int(time.time()) on every record it hands to
-    # update_cache, including these replays. If we accepted that stamp here,
-    # a replayed verdict's TTL clock would reset on every run that merely
-    # *reads* it, so partition()'s ttl_expired check would never fire on a
-    # repo whose HEAD is static — measuring "last read" instead of "last
-    # verification". Inherit the prior on-disk classified_ts verbatim
-    # instead: partition() already tolerates a non-numeric classified_ts by
-    # treating it as ancient (see
-    # test_partition_handles_non_numeric_classified_ts), so round-tripping a
-    # possibly-corrupt prior value is fail-safe, whereas "healing" it by
-    # stamping `now` would re-introduce exactly this bug. That tolerance
-    # has one gap: a *numeric* bad value (a millisecond-valued stamp, a
-    # hand-edited future date) parses fine and is NOT read as ancient, so the
-    # clamp below handles the future-dated and NaN cases explicitly.
     _is_replay = fc.get("classifier_source") == "cache"
-    if _is_replay and isinstance(prior, dict) and "classified_ts" in prior:
+    if not _is_replay:
+        return fc.get("classified_ts", int(now))
+
+    if isinstance(prior, dict) and "classified_ts" in prior:
         classified_ts = prior["classified_ts"]
         # Under partition()'s OLD one-sided `now - classified_ts > ttl` check,
         # a future-dated inherited stamp was permanently un-expirable -- that
@@ -416,29 +422,37 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
                 file=sys.stderr,
             )
             classified_ts = 0
-    else:
-        if _is_replay:
-            # A replay whose prior entry cannot supply a timestamp -- either no
-            # prior at all, or a prior carrying no classified_ts. Both are the
-            # same invariant violation: partition() can only have emitted
-            # "cache" by finding a usable entry, so reaching here means one of
-            # two things happened: the cache changed between Step 3's
-            # load_cache() and Step 10's (they run in separate processes, or a
-            # caller bug), OR -- the route update_cache's own comment above
-            # names for this same call site -- the #297 _rejected_hashes
-            # branch evicted this hash's prior entry earlier in THIS run. This
-            # is the one place the #302 fix silently reverts to re-stamping,
-            # so it must not be silent.
-            print(
-                f"[check-items-cache] WARNING: classifier_source='cache' for "
-                f"{fc.get('canonical_hash')} but no prior on-disk "
-                f"classified_ts to inherit; stamping now, so its TTL restarts "
-                f"(cache changed mid-run, or its prior entry was evicted this "
-                f"run)",
-                file=sys.stderr,
-            )
-        classified_ts = fc.get("classified_ts", int(now))
+        return classified_ts
 
+    # A replay whose prior entry cannot supply a timestamp -- either no
+    # prior at all, or a prior carrying no classified_ts. Both are the
+    # same invariant violation: partition() can only have emitted
+    # "cache" by finding a usable entry, so reaching here means one of
+    # two things happened: the cache changed between Step 3's
+    # load_cache() and Step 10's (they run in separate processes, or a
+    # caller bug), OR -- the route update_cache's own comment above
+    # names for this same call site -- the #297 _rejected_hashes
+    # branch evicted this hash's prior entry earlier in THIS run. This
+    # is the one place the #302 fix silently reverts to re-stamping,
+    # so it must not be silent.
+    print(
+        f"[check-items-cache] WARNING: classifier_source='cache' for "
+        f"{fc.get('canonical_hash')} but no prior on-disk "
+        f"classified_ts to inherit; stamping now, so its TTL restarts "
+        f"(cache changed mid-run, or its prior entry was evicted this "
+        f"run)",
+        file=sys.stderr,
+    )
+    return fc.get("classified_ts", int(now))
+
+
+def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> dict:
+    """Normalize a fresh classification dict into the on-disk cache entry shape.
+
+    `prior` is the existing on-disk cache entry for the same canonical_hash
+    (or None if there isn't one). Timestamp policy lives in
+    _resolve_replay_ts(); this function only shapes the resulting dict.
+    """
     return {
         "canonical_hash": fc.get("canonical_hash"),
         "canonical_text": fc.get("canonical_text") or fc.get("representative", ""),
@@ -447,6 +461,6 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
         "confidence": fc.get("confidence"),
         "evidence_citation": fc.get("evidence_citation"),
         "action_required": fc.get("action_required"),
-        "classified_ts": classified_ts,
+        "classified_ts": _resolve_replay_ts(fc, prior, now),
         "classifier_source": fc.get("classifier_source"),
     }
