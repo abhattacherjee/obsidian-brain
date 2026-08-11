@@ -854,7 +854,10 @@ for c in data["classifications"]:
         # #302: this stamp is authoritative only for freshly-derived
         # verdicts. For classifier_source == "cache" replays (Step 6),
         # update_cache ignores this value and inherits the prior on-disk
-        # entry's classified_ts instead, so a replayed verdict's TTL keeps
+        # entry's classified_ts instead — but only when such an entry still
+        # exists. If it does not (see the "no prior on-disk entry" branch in
+        # update_cache, which warns), this stamp IS used as-is and the TTL
+        # restarts. In the normal case a replayed verdict's TTL keeps
         # measuring from its last real verification, not its last read.
         "classified_ts": int(time.time()),
         "_group_project": group.get("project", "unknown"),  # carried for fresh_by_proj attribution

@@ -257,6 +257,12 @@ def update_cache(
     surviving: list[dict] = []
     seen: set[str] = set()
     for g in existing_groups:
+        # Mirrors partition()'s isinstance(g, dict) filter when it builds
+        # cached_groups_by_hash: a corrupt cache file (a stray scalar or
+        # list inside `groups`) degrades to a skipped entry rather than
+        # crashing the whole cache write with AttributeError.
+        if not isinstance(g, dict):
+            continue
         h = g.get("canonical_hash")
         if h not in current_hashes:
             continue
@@ -273,10 +279,21 @@ def update_cache(
     for h, fc in fresh_by_hash.items():
         if h in seen or h not in current_hashes:
             continue
-        # No prior entry to inherit from: this canonical_hash was not in
-        # existing_groups (e.g. a classifier_source="cache" replay whose
-        # backing entry was evicted mid-run — a degenerate case). Falling
-        # back to `now` inside _freeze_classification is correct here.
+        # The common case: a brand-new canonical_hash that partition() routed
+        # here with _reason "new", so there is no prior entry and `now` is the
+        # right stamp. Two rarer routes also land here: a
+        # classifier_source="cache" replay whose backing entry vanished between
+        # this run's two load_cache() calls (a concurrent run — warned below),
+        # and a hash whose prior entry was just evicted by the #297
+        # _rejected_hashes branch earlier in this function.
+        if fc.get("classifier_source") == "cache":
+            print(
+                f"[check-items-cache] WARNING: replayed (cache) verdict {h} "
+                f"in {project} has no prior on-disk entry to inherit "
+                f"classified_ts from; stamping now, so its TTL restarts "
+                f"(cache changed mid-run?)",
+                file=sys.stderr,
+            )
         surviving.append(_freeze_classification(fc, now))
 
     run["groups"] = surviving
@@ -304,13 +321,33 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
     # treating it as ancient (see
     # test_partition_handles_non_numeric_classified_ts), so round-tripping a
     # possibly-corrupt prior value is fail-safe, whereas "healing" it by
-    # stamping `now` would re-introduce exactly this bug.
+    # stamping `now` would re-introduce exactly this bug. That tolerance
+    # has one gap: a *numeric* bad value (a millisecond-valued stamp, a
+    # hand-edited future date) parses fine and is NOT read as ancient, so the
+    # clamp below handles the future-dated case explicitly.
     if (
         fc.get("classifier_source") == "cache"
         and isinstance(prior, dict)
         and "classified_ts" in prior
     ):
         classified_ts = prior["classified_ts"]
+        # A stamp ahead of wall clock (clock skew, a corrected RTC, a cache
+        # file synced from a faster machine, a millisecond-valued stamp) can
+        # never expire, because partition() tests now - ts > ttl. The old
+        # refresh-on-replay self-healed that; inheritance does not. Clamping
+        # only ever moves a stamp EARLIER, so it cannot re-introduce #302 --
+        # that bug is caused by moving a stamp LATER.
+        try:
+            if float(classified_ts) > now:
+                print(
+                    f"[check-items-cache] WARNING: cached verdict "
+                    f"{fc.get('canonical_hash')} has a future classified_ts "
+                    f"({classified_ts}); clamping to now",
+                    file=sys.stderr,
+                )
+                classified_ts = int(now)
+        except (TypeError, ValueError):
+            pass  # non-numeric: partition() treats as ancient -> re-verified
     else:
         classified_ts = fc.get("classified_ts", int(now))
 
