@@ -283,17 +283,10 @@ def update_cache(
         # here with _reason "new", so there is no prior entry and `now` is the
         # right stamp. Two rarer routes also land here: a
         # classifier_source="cache" replay whose backing entry vanished between
-        # this run's two load_cache() calls (a concurrent run — warned below),
-        # and a hash whose prior entry was just evicted by the #297
-        # _rejected_hashes branch earlier in this function.
-        if fc.get("classifier_source") == "cache":
-            print(
-                f"[check-items-cache] WARNING: replayed (cache) verdict {h} "
-                f"in {project} has no prior on-disk entry to inherit "
-                f"classified_ts from; stamping now, so its TTL restarts "
-                f"(cache changed mid-run?)",
-                file=sys.stderr,
-            )
+        # this run's two load_cache() calls (a concurrent run — warned by
+        # _freeze_classification's else-branch below), and a hash whose prior
+        # entry was just evicted by the #297 _rejected_hashes branch earlier
+        # in this function.
         surviving.append(_freeze_classification(fc, now))
 
     run["groups"] = surviving
@@ -325,30 +318,50 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
     # has one gap: a *numeric* bad value (a millisecond-valued stamp, a
     # hand-edited future date) parses fine and is NOT read as ancient, so the
     # clamp below handles the future-dated case explicitly.
-    if (
-        fc.get("classifier_source") == "cache"
-        and isinstance(prior, dict)
-        and "classified_ts" in prior
-    ):
+    _is_replay = fc.get("classifier_source") == "cache"
+    if _is_replay and isinstance(prior, dict) and "classified_ts" in prior:
         classified_ts = prior["classified_ts"]
-        # A stamp ahead of wall clock (clock skew, a corrected RTC, a cache
-        # file synced from a faster machine, a millisecond-valued stamp) can
-        # never expire, because partition() tests now - ts > ttl. The old
-        # refresh-on-replay self-healed that; inheritance does not. Clamping
-        # only ever moves a stamp EARLIER, so it cannot re-introduce #302 --
-        # that bug is caused by moving a stamp LATER.
+        # A future-dated inherited stamp is permanently un-expirable:
+        # partition()'s `now - classified_ts > ttl` can never be true while the
+        # value is ahead of the clock, so a clock-skewed or hand-edited entry
+        # would pin the verdict as "known" forever -- the very failure #302
+        # exists to prevent. Clamp it to 0 (ancient) rather than to `now`:
+        # this run did NOT verify the verdict, so granting it a fresh full TTL
+        # would be a bounded restatement of the same "measuring last read, not
+        # last verification" bug. 0 forces re-derivation on the next run, which
+        # is exactly how partition() already treats a non-numeric stamp.
+        # Non-numeric values are deliberately NOT coerced: partition() reads
+        # them as ancient already, and comparing a str to a float would raise
+        # TypeError and take down the entire cache update.
         try:
-            if float(classified_ts) > now:
-                print(
-                    f"[check-items-cache] WARNING: cached verdict "
-                    f"{fc.get('canonical_hash')} has a future classified_ts "
-                    f"({classified_ts}); clamping to now",
-                    file=sys.stderr,
-                )
-                classified_ts = int(now)
+            _numeric_ts = float(classified_ts)
         except (TypeError, ValueError):
-            pass  # non-numeric: partition() treats as ancient -> re-verified
+            _numeric_ts = None
+        if _numeric_ts is not None and _numeric_ts > now:
+            print(
+                f"[check-items-cache] WARNING: cached classified_ts "
+                f"({classified_ts}) for {fc.get('canonical_hash')} is in the "
+                f"future; treating it as unverified so it re-derives next run",
+                file=sys.stderr,
+            )
+            classified_ts = 0
     else:
+        if _is_replay:
+            # A replay whose prior entry cannot supply a timestamp -- either no
+            # prior at all, or a prior carrying no classified_ts. Both are the
+            # same invariant violation: partition() can only have emitted
+            # "cache" by finding a usable entry, so reaching here means the
+            # cache changed between Step 3's load_cache() and Step 10's (they
+            # run in separate processes), or a caller bug. This is the one
+            # place the #302 fix silently reverts to re-stamping, so it must
+            # not be silent.
+            print(
+                f"[check-items-cache] WARNING: classifier_source='cache' for "
+                f"{fc.get('canonical_hash')} but no prior on-disk "
+                f"classified_ts to inherit; stamping now, so its TTL restarts "
+                f"(cache changed mid-run?)",
+                file=sys.stderr,
+            )
         classified_ts = fc.get("classified_ts", int(now))
 
     return {

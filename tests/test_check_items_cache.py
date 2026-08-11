@@ -485,7 +485,7 @@ def test_cache_replay_without_prior_entry_uses_now(capsys):
                            head_sha="abc1234", now=t1)
     persisted = updated["runs"]["obsidian-brain"]["groups"][0]
     assert persisted["classified_ts"] == int(t1)
-    assert "has no prior on-disk entry to inherit" in capsys.readouterr().err
+    assert "no prior on-disk" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -903,10 +903,14 @@ def test_cache_replay_with_unusable_prior_ts():
 def test_future_dated_prior_ts_is_clamped_and_expires(capsys):
     """#302 follow-up: an inherited classified_ts ahead of wall clock can never
     satisfy partition()'s `now - ts > ttl`. WITHOUT the clamp this entry is
-    un-expirable for the full ten years it is dated into the future — the old
-    refresh-on-replay stamp self-healed clock skew in a single run, and
-    inheritance removed that self-heal, so the clamp must do it explicitly."""
-    from check_items_cache import update_cache, partition, TTL_DONE
+    un-expirable for as long as the skew lasts — the old refresh-on-replay
+    stamp self-healed clock skew in a single run, and inheritance removed
+    that self-heal, so the clamp must do it explicitly. The clamp target is
+    0 (ancient), not `now`: this run did not verify the verdict, so it must
+    not be granted a fresh full TTL either — partition() must therefore see
+    ttl_expired immediately, at the SAME `now` the clamp happened at, with no
+    need to advance the clock."""
+    from check_items_cache import update_cache, partition
 
     t0 = 1735100000.0
     ten_years_ahead = t0 + 10 * 365 * 86400
@@ -929,22 +933,24 @@ def test_future_dated_prior_ts_is_clamped_and_expires(capsys):
         head_sha="abc1234", now=t0,
     )
     persisted = updated["runs"]["obsidian-brain"]["groups"][0]
-    assert persisted["classified_ts"] == int(t0)
-    assert "future classified_ts" in capsys.readouterr().err
+    assert persisted["classified_ts"] == 0
+    assert "future" in capsys.readouterr().err
 
-    # The round-trip is the load-bearing half: clamped to t0 the group expires
-    # one TTL later; left ten years ahead it would never expire.
+    # The round-trip is the load-bearing half: clamped to 0 (ancient) the
+    # group is immediately ttl_expired at the very `now` the clamp happened.
     _known, needs = partition([_make_group("h1")], updated, project="obsidian-brain",
-                              head_sha="abc1234", now=t0 + TTL_DONE + 60)
+                              head_sha="abc1234", now=t0)
     assert [n["_reason"] for n in needs] == ["ttl_expired"]
 
 
 def test_prior_ts_equal_to_now_is_not_clamped(capsys):
     """Boundary fixture for the clamp's strict `>`: a prior classified_ts
     EXACTLY equal to `now` is not in the future, so it is preserved verbatim
-    and emits no warning. `now` is deliberately non-integral, so a `>=`/`>`
-    mix-up changes the stored value (to int(now)) as well as warning — a
-    wide-gap fixture alone cannot catch that."""
+    and emits no warning. `now` is deliberately non-integral: with an
+    integral `now`, a `>=`-instead-of-`>` mutation clamps to a numerically
+    identical value, so a value-only assertion is vacuous; a non-integral
+    `now` makes both the stored value AND the absence of the warning
+    discriminate the mutation."""
     from check_items_cache import update_cache
 
     now = 1735100000.5
@@ -968,7 +974,38 @@ def test_prior_ts_equal_to_now_is_not_clamped(capsys):
     )
     persisted = updated["runs"]["obsidian-brain"]["groups"][0]
     assert persisted["classified_ts"] == now
-    assert "future classified_ts" not in capsys.readouterr().err
+    assert "future" not in capsys.readouterr().err
+
+
+def test_replay_with_prior_missing_ts_warns_and_stamps_now(capsys):
+    """A prior entry that exists but carries no classified_ts is the same
+    invariant violation as no prior at all: nothing to inherit, so the
+    caller's stamp is used AND the diagnostic fires."""
+    from check_items_cache import update_cache
+
+    now = 1735100100.0
+    prior = _make_cached_entry("h1", classification="DONE")
+    del prior["classified_ts"]
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [prior],
+            }
+        },
+    }
+    updated = update_cache(
+        cache=cache, project="obsidian-brain", all_groups=[_make_group("h1")],
+        fresh_classifications=[_make_fresh("h1", classifier_source="cache",
+                                           classification="DONE",
+                                           classified_ts=int(now))],
+        head_sha="abc1234", now=now,
+    )
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == int(now)
+    assert "no prior on-disk" in capsys.readouterr().err
 
 
 def test_update_cache_tolerates_non_dict_cached_entry():
