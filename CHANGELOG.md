@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-08-11
+
 ### Fixed
 - **`/check-items` no longer fails an entire classification run when one chunk of items errors out (#297):** each chunk now gets up to 2 attempts, and a chunk that still fails degrades only its own groups — every other chunk (already-completed or still queued) keeps dispatching normally. The run as a whole only reports failure if every chunk failed.
 - **`/check-items` no longer fails silently when the classifier sub-agent misbehaves (#297):** the sub-agent's captured stderr is now forwarded and printed as a diagnostic on every failed attempt, and "the sub-agent produced no output at all" is now distinguished from "the sub-agent produced output that didn't parse" instead of being reported identically.
