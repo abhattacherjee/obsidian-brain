@@ -265,7 +265,7 @@ def update_cache(
             # be revalidated by the unconditional project_head_at_classify bump.
             continue
         if h in fresh_by_hash:
-            surviving.append(_freeze_classification(fresh_by_hash[h], now))
+            surviving.append(_freeze_classification(fresh_by_hash[h], now, prior=g))
         else:
             surviving.append(g)
         seen.add(h)
@@ -273,6 +273,10 @@ def update_cache(
     for h, fc in fresh_by_hash.items():
         if h in seen or h not in current_hashes:
             continue
+        # No prior entry to inherit from: this canonical_hash was not in
+        # existing_groups (e.g. a classifier_source="cache" replay whose
+        # backing entry was evicted mid-run — a degenerate case). Falling
+        # back to `now` inside _freeze_classification is correct here.
         surviving.append(_freeze_classification(fc, now))
 
     run["groups"] = surviving
@@ -281,8 +285,35 @@ def update_cache(
     return cache
 
 
-def _freeze_classification(fc: dict, now: float) -> dict:
-    """Normalize a fresh classification dict into the on-disk cache entry shape."""
+def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> dict:
+    """Normalize a fresh classification dict into the on-disk cache entry shape.
+
+    `prior` is the existing on-disk cache entry for the same canonical_hash
+    (or None if there isn't one).
+    """
+    # #302: classifier_source == "cache" means this run *replayed* a verdict
+    # from partition()'s known-hit path without re-deriving it (Step 6 of
+    # check-items/SKILL.md). SKILL.md Step 10 unconditionally stamps
+    # classified_ts=int(time.time()) on every record it hands to
+    # update_cache, including these replays. If we accepted that stamp here,
+    # a replayed verdict's TTL clock would reset on every run that merely
+    # *reads* it, so partition()'s ttl_expired check would never fire on a
+    # repo whose HEAD is static — measuring "last read" instead of "last
+    # verification". Inherit the prior on-disk classified_ts verbatim
+    # instead: partition() already tolerates a non-numeric classified_ts by
+    # treating it as ancient (see
+    # test_partition_handles_non_numeric_classified_ts), so round-tripping a
+    # possibly-corrupt prior value is fail-safe, whereas "healing" it by
+    # stamping `now` would re-introduce exactly this bug.
+    if (
+        fc.get("classifier_source") == "cache"
+        and isinstance(prior, dict)
+        and "classified_ts" in prior
+    ):
+        classified_ts = prior["classified_ts"]
+    else:
+        classified_ts = fc.get("classified_ts", int(now))
+
     return {
         "canonical_hash": fc.get("canonical_hash"),
         "canonical_text": fc.get("canonical_text") or fc.get("representative", ""),
@@ -291,6 +322,6 @@ def _freeze_classification(fc: dict, now: float) -> dict:
         "confidence": fc.get("confidence"),
         "evidence_citation": fc.get("evidence_citation"),
         "action_required": fc.get("action_required"),
-        "classified_ts": fc.get("classified_ts", int(now)),
+        "classified_ts": classified_ts,
         "classifier_source": fc.get("classifier_source"),
     }

@@ -380,6 +380,108 @@ def test_cache_update_preserves_unchanged_classifications():
     assert out["evidence_citation"] == "test"
 
 
+def test_cache_replay_does_not_refresh_ttl():
+    """#302: a classifier_source="cache" replay must inherit the prior
+    on-disk classified_ts, not the caller's stamp — otherwise a group's TTL
+    clock resets every time it is merely *read* back out of the cache, and
+    ttl_expired never fires on a repo whose HEAD is static."""
+    from check_items_cache import partition, update_cache, TTL_DONE
+
+    t0 = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE", classified_ts=t0)],
+            }
+        },
+    }
+
+    # Still within TTL at t1: comes back as a known (cache) hit.
+    t1 = t0 + 100
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=t1)
+    assert len(known) == 1
+    assert len(needs) == 0
+
+    # Build the replay payload the way SKILL.md Step 10 actually builds it:
+    # classifier_source="cache", carrying the *refreshed* t1 stamp. This is
+    # exactly what the real caller sends, so the fixture must include it —
+    # a fixture that omitted classified_ts here would pass even with the
+    # fix reverted.
+    replay = _make_fresh("h1", classifier_source="cache", classification="DONE",
+                         classified_ts=int(t1))
+    updated = update_cache(cache=cache, project="obsidian-brain",
+                           all_groups=[_make_group("h1")],
+                           fresh_classifications=[replay],
+                           head_sha="abc1234", now=t1)
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == t0, (
+        "cache replay must inherit the prior classified_ts, not the caller's stamp"
+    )
+
+    # t2 is chosen to discriminate old vs new behavior: with the old
+    # refresh-on-replay behavior the stored ts would be t1, making the age
+    # at t2 equal TTL_DONE - 40 — still within TTL, so the group would
+    # wrongly come back as known. With the fix, the stored ts stays t0, so
+    # the age at t2 is TTL_DONE + 60, which is past TTL_DONE.
+    t2 = t0 + TTL_DONE + 60
+    known2, needs2 = partition([_make_group("h1")], updated, project="obsidian-brain",
+                               head_sha="abc1234", now=t2)
+    assert len(needs2) == 1
+    assert needs2[0]["_reason"] == "ttl_expired"
+
+
+def test_fresh_agent_verdict_still_refreshes_ttl():
+    """Excluding negative control for #302: a genuinely re-derived
+    (classifier_source="agent") verdict MUST still refresh its
+    classified_ts — the inheritance rule must not be over-applied to
+    non-replay sources."""
+    from check_items_cache import update_cache
+
+    t0 = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE", classified_ts=t0)],
+            }
+        },
+    }
+
+    t1 = t0 + 100
+    fresh = _make_fresh("h1", classifier_source="agent", classification="DONE",
+                        classified_ts=int(t1))
+    updated = update_cache(cache=cache, project="obsidian-brain",
+                           all_groups=[_make_group("h1")],
+                           fresh_classifications=[fresh],
+                           head_sha="abc1234", now=t1)
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == int(t1)
+
+
+def test_cache_replay_without_prior_entry_uses_now():
+    """Degenerate case for #302: a classifier_source="cache" replay with no
+    prior on-disk entry (e.g. evicted mid-run) has nothing to inherit, so it
+    correctly falls back to `now`."""
+    from check_items_cache import update_cache
+
+    cache = {"schema_version": 1, "runs": {}}
+    t1 = 1735100100.0
+    replay = _make_fresh("h1", classifier_source="cache", classification="DONE",
+                         classified_ts=int(t1))
+    updated = update_cache(cache=cache, project="obsidian-brain",
+                           all_groups=[_make_group("h1")],
+                           fresh_classifications=[replay],
+                           head_sha="abc1234", now=t1)
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == int(t1)
+
+
 # ---------------------------------------------------------------------------
 # R3 regression tests: Finding A1 + A2
 # ---------------------------------------------------------------------------

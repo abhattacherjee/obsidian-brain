@@ -851,6 +851,11 @@ for c in data["classifications"]:
         # through to "" and gets refused rather than silently cached as if
         # it were agent-derived.
         "classifier_source": c.get("classifier_source", ""),
+        # #302: this stamp is authoritative only for freshly-derived
+        # verdicts. For classifier_source == "cache" replays (Step 6),
+        # update_cache ignores this value and inherits the prior on-disk
+        # entry's classified_ts instead, so a replayed verdict's TTL keeps
+        # measuring from its last real verification, not its last read.
         "classified_ts": int(time.time()),
         "_group_project": group.get("project", "unknown"),  # carried for fresh_by_proj attribution
     })
