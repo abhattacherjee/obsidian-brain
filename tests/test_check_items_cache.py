@@ -315,6 +315,182 @@ def test_ttl_for_review_matches_active():
     assert _ttl_for("REVIEW") not in (TTL_DONE, TTL_STALE, TTL_NEEDS_ACTION)
 
 
+def test_partition_rejects_future_dated_entry_in_the_same_run(capsys):
+    """#302 round 4: before this guard, a cached entry whose classified_ts is
+    ahead of `now` (clock skew, a hand-edit, a cache synced from a faster
+    machine) came back `known` on partition()'s READ side for the CURRENT
+    run -- the old one-sided `now - ts > ttl` check is negative for a future
+    timestamp, so it can never exceed the TTL. And because a replayed verdict
+    is stamped classifier_source='cache', which is inside assign_tier's
+    _HIGH_TRUST_SOURCES, that `known` result could preselect the item for
+    auto-checkoff. _freeze_classification's write-side clamp did not help
+    here: it only fires on the NEXT run's write, so only the next run's
+    partition() call saw ttl_expired -- this test pins that the very FIRST
+    partition() call on a future-dated entry already routes to `needs`, with
+    no update_cache round-trip in between. #302 round 5: a negative age is
+    reported as 'unusable_ts', not the ordinary 'ttl_expired', with a stderr
+    warning -- it's an environmental fault (clock skew, hand-edit, external
+    writer), not routine expiry."""
+    from check_items_cache import partition
+    now = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE", classified_ts=now + 3600,
+                )],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=now)
+    assert len(known) == 0
+    assert len(needs) == 1
+    assert needs[0]["_reason"] == "unusable_ts"
+    assert "unusable classified_ts" in capsys.readouterr().err
+
+
+def test_partition_rejects_nan_classified_ts(capsys):
+    """#302 round 4: a cached entry with classified_ts = NaN must route to
+    `needs` on the very first partition() call. Every comparison against NaN
+    is False, so the old one-sided `now - classified_ts > ttl` check never
+    fired for a NaN age -- the entry was un-expirable for all time, not
+    merely until the next run. The symmetric range check catches it because
+    `0 <= _age` is also False for a NaN age. #302 round 5: that catch is
+    reported as 'unusable_ts', not 'ttl_expired' -- a NaN stamp is not a
+    valid past time at all, so labeling it as routine expiry would hide the
+    corruption, and a stderr warning is emitted."""
+    from check_items_cache import partition
+    now = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE", classified_ts=float("nan"),
+                )],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=now)
+    assert len(known) == 0
+    assert len(needs) == 1
+    assert needs[0]["_reason"] == "unusable_ts"
+    assert "unusable classified_ts" in capsys.readouterr().err
+
+
+def test_partition_genuinely_old_entry_reports_ttl_expired_silently(capsys):
+    """#302 round 5: a discriminating control for the unusable_ts/ttl_expired
+    split. An entry whose age is TTL_DONE + 60 is genuinely old -- NOT
+    corrupt, NOT clock-skewed, just past its TTL -- and must still report
+    the ordinary 'ttl_expired' with NO warning. Without this control, a
+    future edit could collapse both labels into one (or make the routine
+    path noisy) and nothing would notice: this test pins both the label AND
+    the silence of the routine path."""
+    from check_items_cache import partition, TTL_DONE
+    now = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE",
+                    classified_ts=now - (TTL_DONE + 60),
+                )],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=now)
+    assert len(known) == 0
+    assert len(needs) == 1
+    assert needs[0]["_reason"] == "ttl_expired"
+    assert capsys.readouterr().err == ""
+
+
+def test_partition_ttl_boundary_is_inclusive():
+    """#302 round 4: pins that the symmetric range check in CHANGE 1 did not
+    shift the TTL boundary. The old check expired when `age > ttl`, so
+    `age == ttl` stayed known. An age of exactly TTL_DONE must still be
+    known; TTL_DONE + 1 must be ttl_expired. Both halves are asserted in one
+    test so a boundary-shifting edit fails immediately on whichever side it
+    moved -- but only for the UPPER boundary of `0 <= _age <= ttl`; see
+    test_partition_zero_age_entry_is_known for the LOWER boundary, which
+    this test does not reach (mutating `0 <= _age` to `0 < _age` survives
+    this test unchanged)."""
+    from check_items_cache import partition, TTL_DONE
+    now = 1735100000.0
+    cache_at_boundary = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE", classified_ts=now - TTL_DONE,
+                )],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache_at_boundary,
+                             project="obsidian-brain", head_sha="abc1234", now=now)
+    assert len(known) == 1
+    assert len(needs) == 0
+
+    cache_past_boundary = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry(
+                    "h1", classification="DONE", classified_ts=now - (TTL_DONE + 1),
+                )],
+            }
+        },
+    }
+    known2, needs2 = partition([_make_group("h1")], cache_past_boundary,
+                               project="obsidian-brain", head_sha="abc1234", now=now)
+    assert len(known2) == 0
+    assert len(needs2) == 1
+    assert needs2[0]["_reason"] == "ttl_expired"
+
+
+def test_partition_zero_age_entry_is_known():
+    """#302 round 4: the LOWER bound of partition()'s `0 <= _age <= ttl`
+    range, which test_partition_ttl_boundary_is_inclusive does not reach --
+    it pins both sides of the UPPER bound only. An age of exactly 0
+    (classified_ts == now, i.e. an entry written by update_cache in this same
+    run, or two calls inside one clock tick) is a valid just-verified stamp,
+    NOT an unusable future one, so it must come back `known`. Mirrors
+    test_prior_ts_equal_to_now_is_not_clamped on the write side."""
+    from check_items_cache import partition
+    now = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE",
+                                              classified_ts=now)],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=now)
+    assert len(known) == 1
+    assert len(needs) == 0
+
+
 def test_cache_evicts_removed_items():
     """Test 20 - cached entries whose canonical_hash is not in current run are GC'd."""
     from check_items_cache import update_cache
@@ -378,6 +554,114 @@ def test_cache_update_preserves_unchanged_classifications():
     assert out["canonical_hash"] == "h1"
     assert out["classification"] == "DONE"
     assert out["evidence_citation"] == "test"
+
+
+def test_cache_replay_does_not_refresh_ttl():
+    """#302: a classifier_source="cache" replay must inherit the prior
+    on-disk classified_ts, not the caller's stamp — otherwise a group's TTL
+    clock resets every time it is merely *read* back out of the cache, and
+    ttl_expired never fires on a repo whose HEAD is static."""
+    from check_items_cache import partition, update_cache, TTL_DONE
+
+    t0 = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE", classified_ts=t0)],
+            }
+        },
+    }
+
+    # Still within TTL at t1: comes back as a known (cache) hit.
+    t1 = t0 + 100
+    known, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                             head_sha="abc1234", now=t1)
+    assert len(known) == 1
+    assert len(needs) == 0
+
+    # Build the replay payload the way SKILL.md Step 10 actually builds it:
+    # classifier_source="cache", carrying the *refreshed* t1 stamp. This is
+    # exactly what the real caller sends, so the fixture must include it —
+    # a fixture that omitted classified_ts here would pass even with the
+    # fix reverted.
+    replay = _make_fresh("h1", classifier_source="cache", classification="DONE",
+                         classified_ts=int(t1))
+    updated = update_cache(cache=cache, project="obsidian-brain",
+                           all_groups=[_make_group("h1")],
+                           fresh_classifications=[replay],
+                           head_sha="abc1234", now=t1)
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == t0, (
+        "cache replay must inherit the prior classified_ts, not the caller's stamp"
+    )
+
+    # t2 is chosen to discriminate old vs new behavior: with the old
+    # refresh-on-replay behavior the stored ts would be t1, making the age
+    # at t2 equal TTL_DONE - 40 — still within TTL, so the group would
+    # wrongly come back as known. With the fix, the stored ts stays t0, so
+    # the age at t2 is TTL_DONE + 60, which is past TTL_DONE.
+    t2 = t0 + TTL_DONE + 60
+    known2, needs2 = partition([_make_group("h1")], updated, project="obsidian-brain",
+                               head_sha="abc1234", now=t2)
+    assert len(needs2) == 1
+    assert needs2[0]["_reason"] == "ttl_expired"
+
+
+def test_fresh_agent_verdict_still_refreshes_ttl():
+    """Excluding negative control for #302: a genuinely re-derived
+    (classifier_source="agent") verdict MUST still refresh its
+    classified_ts — the inheritance rule must not be over-applied to
+    non-replay sources."""
+    from check_items_cache import update_cache
+
+    t0 = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE", classified_ts=t0)],
+            }
+        },
+    }
+
+    t1 = t0 + 100
+    fresh = _make_fresh("h1", classifier_source="agent", classification="DONE",
+                        classified_ts=int(t1))
+    updated = update_cache(cache=cache, project="obsidian-brain",
+                           all_groups=[_make_group("h1")],
+                           fresh_classifications=[fresh],
+                           head_sha="abc1234", now=t1)
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == int(t1)
+
+
+def test_cache_replay_without_prior_entry_uses_now(capsys):
+    """#302: a classifier_source="cache" replay with no prior on-disk entry
+    (evicted mid-run by the #297 branch, or a concurrent run between this
+    run's two load_cache() calls) has nothing to inherit, so
+    _freeze_classification's `int(now)` DEFAULT is used — and update_cache
+    warns, because that entry's TTL silently restarts. The replay payload
+    deliberately carries no classified_ts: with one, the assertion would be
+    satisfied through fc.get("classified_ts", ...) and the default would
+    never be exercised."""
+    from check_items_cache import update_cache
+
+    cache = {"schema_version": 1, "runs": {}}
+    t1 = 1735100100.0
+    replay = _make_fresh("h1", classifier_source="cache", classification="DONE")
+    del replay["classified_ts"]
+    updated = update_cache(cache=cache, project="obsidian-brain",
+                           all_groups=[_make_group("h1")],
+                           fresh_classifications=[replay],
+                           head_sha="abc1234", now=t1)
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == int(t1)
+    assert "no prior on-disk" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +963,56 @@ def test_evicted_group_reclassifies_next_run():
     assert needs[0]["_reason"] == "new"
 
 
+def test_rejected_hash_is_not_reinserted_by_the_second_loop():
+    """Final round: loop 1 evicts a hash carrying a classifier_source=
+    "heuristic" verdict (the #297 guard) via a bare `continue` that
+    deliberately does NOT add it to `seen`. Without the fix, loop 2's guard
+    is only `h in seen or h not in current_hashes`, so when the SAME
+    canonical_hash also has a trusted classifier_source="cache" record in
+    this run's fresh_classifications, loop 2 re-inserts it immediately --
+    undoing the eviction loop 1 just performed, in the same function call,
+    and defeating both #297's "an unverified verdict must not be replayed"
+    guard and #302's inheritance (a fresh insert here restarts the TTL at
+    `now`). The fix adds `h in _rejected_hashes` to loop 2's guard. Test both
+    orderings of the two fresh records for h1, since fresh_by_hash is
+    last-write-wins -- a fix that only works for one ordering is not a
+    fix."""
+    from check_items_cache import update_cache, partition
+
+    for order in ("heuristic_then_cache", "cache_then_heuristic"):
+        cache = {
+            "schema_version": 1,
+            "runs": {
+                "obsidian-brain": {
+                    "last_run_ts": 1734000000,
+                    "project_head_at_classify": "OLDHEAD",
+                    "groups": [_make_cached_entry("h1", classification="DONE")],
+                }
+            },
+        }
+        heuristic_fc = _make_fresh("h1", classifier_source="heuristic")
+        cache_fc = _make_fresh("h1", classifier_source="cache", classification="DONE")
+        fresh_classifications = (
+            [heuristic_fc, cache_fc] if order == "heuristic_then_cache"
+            else [cache_fc, heuristic_fc]
+        )
+        updated = update_cache(
+            cache, project="obsidian-brain", all_groups=[_make_group("h1")],
+            fresh_classifications=fresh_classifications, head_sha="NEWHEAD",
+        )
+        hashes = {g["canonical_hash"] for g in updated["runs"]["obsidian-brain"]["groups"]}
+        assert "h1" not in hashes, f"order={order}: h1 must be absent, not re-inserted"
+
+        # Must be re-derived from scratch on the next run, exactly like
+        # test_evicted_group_reclassifies_next_run.
+        known, needs = partition([_make_group("h1")], updated, project="obsidian-brain",
+                                 head_sha="NEWHEAD")
+        assert len(known) == 0, f"order={order}"
+        assert len(needs) == 1, f"order={order}"
+        assert needs[0]["canonical_hash"] == "h1", f"order={order}"
+        assert needs[0]["_reason"] == "new", f"order={order}"
+
+
 def test_agent_verdicts_unaffected():
     """A run with no heuristic verdicts produces the same cache content as
     today's (pre-#297-Task-5) behaviour: GC, overwrite-by-hash, and the HEAD
@@ -707,3 +1041,336 @@ def test_agent_verdicts_unaffected():
                  if g["canonical_hash"] == "kept1")
     assert kept1["classification"] == "NEEDS-ACTION"
     assert updated["runs"]["obsidian-brain"]["project_head_at_classify"] == "NEWHEAD"
+
+
+def test_cache_replay_inherits_its_own_prior_not_a_neighbours():
+    """#302 cross-talk guard: when several groups are replayed in one run,
+    each must inherit the classified_ts of *its own* prior entry. A single-
+    group fixture cannot tell `prior=g` apart from `prior=existing_groups[0]`."""
+    from check_items_cache import update_cache
+
+    t_old, t_mid = 1735100000.0, 1735150000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t_mid),
+                "project_head_at_classify": "abc1234",
+                "groups": [
+                    _make_cached_entry("h1", classification="DONE", classified_ts=t_old),
+                    _make_cached_entry("h2", classification="ACTIVE", classified_ts=t_mid),
+                ],
+            }
+        },
+    }
+    t1 = t_mid + 100
+    updated = update_cache(
+        cache=cache, project="obsidian-brain",
+        all_groups=[_make_group("h1"), _make_group("h2")],
+        fresh_classifications=[
+            _make_fresh("h1", classifier_source="cache", classification="DONE",
+                        classified_ts=int(t1)),
+            _make_fresh("h2", classifier_source="cache", classification="ACTIVE",
+                        classified_ts=int(t1)),
+        ],
+        head_sha="abc1234", now=t1,
+    )
+    by_hash = {g["canonical_hash"]: g for g in updated["runs"]["obsidian-brain"]["groups"]}
+    assert by_hash["h1"]["classified_ts"] == t_old
+    assert by_hash["h2"]["classified_ts"] == t_mid
+
+
+def test_cache_replay_with_unusable_prior_ts():
+    """#302: the inheritance guard's two defensive conditions. A prior entry
+    with no classified_ts at all falls back to the caller's stamp (there is
+    nothing to inherit); a prior entry with a non-numeric classified_ts is
+    round-tripped verbatim rather than 'healed' to now — partition() reads a
+    non-numeric ts as ancient, so verbatim is fail-safe while healing would
+    re-introduce #302."""
+    from check_items_cache import update_cache, partition
+
+    t1 = 1735100100.0
+
+    missing = _make_cached_entry("h1", classification="DONE")
+    del missing["classified_ts"]
+    corrupt = _make_cached_entry("h2", classification="DONE",
+                                 classified_ts="not-a-number")
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t1),
+                "project_head_at_classify": "abc1234",
+                "groups": [missing, corrupt],
+            }
+        },
+    }
+    updated = update_cache(
+        cache=cache, project="obsidian-brain",
+        all_groups=[_make_group("h1"), _make_group("h2")],
+        fresh_classifications=[
+            _make_fresh("h1", classifier_source="cache", classification="DONE",
+                        classified_ts=int(t1)),
+            _make_fresh("h2", classifier_source="cache", classification="DONE",
+                        classified_ts=int(t1)),
+        ],
+        head_sha="abc1234", now=t1,
+    )
+    by_hash = {g["canonical_hash"]: g for g in updated["runs"]["obsidian-brain"]["groups"]}
+    assert by_hash["h1"]["classified_ts"] == int(t1)
+    assert by_hash["h2"]["classified_ts"] == "not-a-number"
+
+    # The corrupt entry must re-derive on the next run rather than be replayed.
+    _known, needs = partition([_make_group("h2")], updated, project="obsidian-brain",
+                              head_sha="abc1234", now=t1)
+    assert [n["_reason"] for n in needs] == ["ttl_expired"]
+
+
+def test_future_dated_prior_ts_is_clamped_and_expires(capsys):
+    """#302 follow-up: an inherited classified_ts ahead of wall clock can never
+    satisfy partition()'s `now - ts > ttl`. WITHOUT the clamp this entry is
+    un-expirable for as long as the skew lasts — the old refresh-on-replay
+    stamp self-healed clock skew in a single run, and inheritance removed
+    that self-heal, so the clamp must do it explicitly. The clamp target is
+    0 (ancient), not `now`: this run did not verify the verdict, so it must
+    not be granted a fresh full TTL either — partition() must therefore see
+    ttl_expired immediately, at the SAME `now` the clamp happened at, with no
+    need to advance the clock."""
+    from check_items_cache import update_cache, partition
+
+    t0 = 1735100000.0
+    ten_years_ahead = t0 + 10 * 365 * 86400
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE",
+                                              classified_ts=ten_years_ahead)],
+            }
+        },
+    }
+    updated = update_cache(
+        cache=cache, project="obsidian-brain", all_groups=[_make_group("h1")],
+        fresh_classifications=[_make_fresh("h1", classifier_source="cache",
+                                           classification="DONE",
+                                           classified_ts=int(t0))],
+        head_sha="abc1234", now=t0,
+    )
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == 0
+    assert "not a usable past timestamp" in capsys.readouterr().err
+
+    # The round-trip is the load-bearing half: clamped to 0 (ancient) the
+    # group is immediately ttl_expired at the very `now` the clamp happened.
+    _known, needs = partition([_make_group("h1")], updated, project="obsidian-brain",
+                              head_sha="abc1234", now=t0)
+    assert [n["_reason"] for n in needs] == ["ttl_expired"]
+
+
+def test_prior_ts_equal_to_now_is_not_clamped(capsys):
+    """Boundary fixture for the clamp's strict `>`: a prior classified_ts
+    EXACTLY equal to `now` is not in the future, so it is preserved verbatim
+    and emits no warning. `now` is deliberately non-integral: with an
+    integral `now`, a `>=`-instead-of-`>` mutation clamps to a numerically
+    identical value, so a value-only assertion is vacuous; a non-integral
+    `now` makes both the stored value AND the absence of the warning
+    discriminate the mutation."""
+    from check_items_cache import update_cache
+
+    now = 1735100000.5
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE",
+                                              classified_ts=now)],
+            }
+        },
+    }
+    updated = update_cache(
+        cache=cache, project="obsidian-brain", all_groups=[_make_group("h1")],
+        fresh_classifications=[_make_fresh("h1", classifier_source="cache",
+                                           classification="DONE",
+                                           classified_ts=int(now))],
+        head_sha="abc1234", now=now,
+    )
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == now
+    assert "not a usable past timestamp" not in capsys.readouterr().err
+
+
+def test_nan_prior_ts_is_clamped_and_expires(capsys):
+    """#302 round 3: with the old `_numeric_ts > now` comparison, a NaN prior
+    classified_ts is inherited verbatim -- every comparison against NaN is
+    False, so `nan > now` is False and NaN slips past the clamp as if it were
+    a valid, non-future timestamp. That is strictly worse than a future date:
+    partition()'s `now - nan > ttl` is ALSO False for every possible `now`,
+    since NaN poisons any arithmetic it touches, so the entry would never
+    expire and never self-heal as the clock advances -- a future-dated entry
+    at least self-heals once `now` catches up to it. The fix compares with
+    `not (x <= now)`, which is True for both NaN and future values (NaN
+    fails `<=` too), routing both into the clamp."""
+    from check_items_cache import update_cache, partition
+
+    t0 = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE",
+                                              classified_ts=float("nan"))],
+            }
+        },
+    }
+    updated = update_cache(
+        cache=cache, project="obsidian-brain", all_groups=[_make_group("h1")],
+        fresh_classifications=[_make_fresh("h1", classifier_source="cache",
+                                           classification="DONE",
+                                           classified_ts=int(t0))],
+        head_sha="abc1234", now=t0,
+    )
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == 0
+    assert "not a usable past timestamp" in capsys.readouterr().err
+
+    # Round-trip at the SAME now: clamped to 0 (ancient) must be immediately
+    # ttl_expired, proving the clamp -- not merely a persisted 0 -- is what
+    # makes the entry re-derive.
+    _known, needs = partition([_make_group("h1")], updated, project="obsidian-brain",
+                              head_sha="abc1234", now=t0)
+    assert [n["_reason"] for n in needs] == ["ttl_expired"]
+
+
+def test_overflow_prior_ts_is_treated_as_ancient(capsys):
+    """#302 round 3: `float()` raises OverflowError (not ValueError) on a
+    sufficiently large Python int, e.g. a 400-digit integer that could arrive
+    via a hand-edited or corrupted JSON cache file. Both _freeze_classification
+    and partition() must catch OverflowError alongside TypeError/ValueError so
+    a huge int degrades to 'ancient' like any other unusable value, instead of
+    crashing the whole cache write/read.
+
+    Mirrors test_cache_replay_with_unusable_prior_ts's non-numeric-string
+    case: _freeze_classification's guard only clamps a value it can compare
+    against `now` (a real float). An OverflowError means it could not even
+    get that far, so -- like the non-numeric-string case -- it round-trips
+    the huge value verbatim rather than clamping it; partition() is the one
+    that must independently treat it as ancient on the next read, which is
+    what the OverflowError catch there is for."""
+    from check_items_cache import update_cache, partition
+
+    huge = 10**400
+    t0 = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE",
+                                              classified_ts=huge)],
+            }
+        },
+    }
+    # Must not raise despite the OverflowError-triggering prior value.
+    updated = update_cache(
+        cache=cache, project="obsidian-brain", all_groups=[_make_group("h1")],
+        fresh_classifications=[_make_fresh("h1", classifier_source="cache",
+                                           classification="DONE",
+                                           classified_ts=int(t0))],
+        head_sha="abc1234", now=t0,
+    )
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == huge
+    # The write side is deliberately silent for an OverflowError value: it
+    # cannot compare the value to `now` (that comparison is what raised), so
+    # it cannot call it future-dated the way the NaN/future-date clamp does.
+    assert "not a usable past timestamp" not in capsys.readouterr().err
+
+    _known, needs = partition([_make_group("h1")], updated, project="obsidian-brain",
+                              head_sha="abc1234", now=t0)
+    assert [n["_reason"] for n in needs] == ["ttl_expired"]
+
+    # partition() must also tolerate reading a huge int directly from a cache
+    # entry without going through update_cache's clamp first.
+    direct_cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [_make_cached_entry("h1", classification="DONE",
+                                              classified_ts=huge)],
+            }
+        },
+    }
+    _known2, needs2 = partition([_make_group("h1")], direct_cache, project="obsidian-brain",
+                                head_sha="abc1234", now=t0)
+    assert [n["_reason"] for n in needs2] == ["ttl_expired"]
+
+
+def test_replay_with_prior_missing_ts_warns_and_stamps_now(capsys):
+    """A prior entry that exists but carries no classified_ts is the same
+    invariant violation as no prior at all: nothing to inherit, so the
+    caller's stamp is used AND the diagnostic fires."""
+    from check_items_cache import update_cache
+
+    now = 1735100100.0
+    prior = _make_cached_entry("h1", classification="DONE")
+    del prior["classified_ts"]
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(now),
+                "project_head_at_classify": "abc1234",
+                "groups": [prior],
+            }
+        },
+    }
+    updated = update_cache(
+        cache=cache, project="obsidian-brain", all_groups=[_make_group("h1")],
+        fresh_classifications=[_make_fresh("h1", classifier_source="cache",
+                                           classification="DONE",
+                                           classified_ts=int(now))],
+        head_sha="abc1234", now=now,
+    )
+    persisted = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert persisted["classified_ts"] == int(now)
+    assert "no prior on-disk" in capsys.readouterr().err
+
+
+def test_update_cache_tolerates_non_dict_cached_entry():
+    """A corrupt cache file whose `groups` list holds a non-dict entry must
+    degrade to a skipped entry rather than crash the whole cache write with
+    AttributeError — mirrors partition()'s isinstance(g, dict) filter. The
+    valid entries in the same list still round-trip."""
+    from check_items_cache import update_cache
+
+    t0 = 1735100000.0
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(t0),
+                "project_head_at_classify": "abc1234",
+                "groups": [
+                    "not-a-dict",
+                    None,
+                    _make_cached_entry("h1", classification="DONE", classified_ts=t0),
+                ],
+            }
+        },
+    }
+    updated = update_cache(cache=cache, project="obsidian-brain",
+                           all_groups=[_make_group("h1")],
+                           fresh_classifications=[],
+                           head_sha="abc1234", now=t0 + 100)
+    groups = updated["runs"]["obsidian-brain"]["groups"]
+    assert [g["canonical_hash"] for g in groups] == ["h1"]
+    assert groups[0]["classified_ts"] == t0
