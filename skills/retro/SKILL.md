@@ -140,11 +140,15 @@ rm -f "$_OB_BUNDLE" "$_OB_ERR"
 
 Parse the JSON output. The bundle has these fields: `session_id`, `snapshots`, `insights`, `decisions`, `error_fixes`, `discovery_errors`, and `_ctx` (the cached `get_session_context()` result reused by Step 5).
 
-**Empty-bundle fallback.** If `bundle["_ctx"]["session_id"] == "unknown"` AND `bundle["discovery_errors"] == []`, print:
+**Unresolved-session fallback.** If `bundle["_ctx"]["session_id"] == "unknown"` AND `bundle["discovery_errors"] == []`, print:
+
+> Note: this session could not be identified (no Claude Code transcript resolves to the current directory), so session-scoped evidence could not be looked up — falling back to active-conversation-only retro. This is **not** evidence that the vault is empty.
+
+**Empty-bundle fallback.** If the session id IS resolved (`bundle["_ctx"]["session_id"] != "unknown"`), `bundle["discovery_errors"] == []`, and `snapshots`, `insights`, `decisions` and `error_fixes` are all empty, print:
 
 > Note: no prior-session evidence found — falling back to active-conversation-only retro.
 
-…and proceed with Step 3 using only the active conversation buffer. Do not include the `## Evidence Consulted` section in Step 4 in that case.
+Keep the two apart. "No evidence found" asserts a fact about the **vault** ("there is nothing"); an unresolved session id is a fact about the **resolver** ("I could not identify this session"), and reporting the second as the first is what let a session-resolution failure read as a genuinely fresh session (#260 I4). The behaviour is identical either way — proceed with Step 3 using only the active conversation buffer, and do not include the `## Evidence Consulted` section in Step 4 in either case.
 
 **Helper crash / partial failure.** If `bundle["discovery_errors"]` is non-empty, do **not** silently fall back to "no prior-session evidence found." Instead emit:
 

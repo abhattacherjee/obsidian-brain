@@ -22,6 +22,28 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, os.path.abspath(_REPO_ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _reset_session_resolution_state():
+    """Clear obsidian_utils' one-shot WARN registries and transcript memo (#260).
+
+    They are module-level BY DESIGN — _get_session_id_fast() runs once per note
+    inside read_note_metadata(), so a WARN on that path must be said once per
+    process, not once per note. That same statefulness makes tests order-
+    dependent: a test asserting "this WARN is emitted" would silently pass or
+    fail depending on whether an earlier test already consumed the key.
+    """
+    import obsidian_utils
+
+    for name in (
+        "_ambiguous_project_dirs_warned",
+        "_sole_match_not_cwd_warned",
+        "_unknown_sid_warned",
+        "_transcript_dir_arbitration",
+    ):
+        getattr(obsidian_utils, name).clear()
+    yield
+
+
 @pytest.fixture
 def tmp_vault(tmp_path):
     """Create a temp vault with sessions and insights directories."""

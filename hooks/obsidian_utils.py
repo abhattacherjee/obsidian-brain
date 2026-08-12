@@ -788,33 +788,57 @@ def _safe_getcwd() -> str:
         return ""
 
 
-def _resolve_project_basename() -> str | None:
-    """Project basename for CC-path lookups (~/.claude/projects/, sid-* bootstraps).
+def _resolve_project_basename_with_source() -> tuple[str | None, str]:
+    """Project basename for CC-path lookups, plus WHERE it came from.
+
+    Returns ``(basename, source)`` with source one of:
+      * ``"cwd"``  — os.getcwd() answered; the working directory is readable
+      * ``"env"``  — cwd raised, CLAUDE_PROJECT_DIR answered; the working
+        directory is GONE (that is the only way this branch is reached)
+      * ``"none"`` — neither produced a usable basename
+
+    The source is load-bearing, not decoration: #260 closes the cross-project
+    bootstrap scan only for the case where cwd is READABLE and merely has no
+    transcript yet. A basename from the env var already means cwd is gone,
+    which is precisely the deleted-worktree case that scan was built for in
+    #105 — and hooks are exactly where Claude Code sets that variable, so
+    keying the gate on "basename is None" alone would have silently narrowed
+    #105 to the subset where the env var is also unset (see _resolve_session_id).
 
     Resolution order:
       1. os.getcwd() — normal case
       2. CLAUDE_PROJECT_DIR env var — when cwd is gone (worktree deleted
          mid-session via `gh pr merge --delete-branch`); see issue #105
-      3. None — caller should treat as 'cannot determine project' and
-         fall through to project-agnostic fallbacks
+      3. (None, "none") — caller should treat as 'cannot determine project'
+         and fall through to project-agnostic fallbacks
 
     Never raises. Preserves a lazy fallback order: consult CLAUDE_PROJECT_DIR
     only after cwd resolution fails.
 
     Falsy basenames (empty string from cwd='/' or env var with trailing slash)
-    are normalized to None so callers fall through to safer fallback layers
-    instead of triggering an unscoped cross-project glob (which would
+    are normalized to (None, "none") so callers fall through to safer fallback
+    layers instead of triggering an unscoped cross-project glob (which would
     silently mis-attribute the active session).
     """
     try:
         cwd_base = os.path.basename(os.getcwd())
-        return cwd_base if cwd_base else None
+        return (cwd_base, "cwd") if cwd_base else (None, "none")
     except OSError:
         env = os.environ.get("CLAUDE_PROJECT_DIR")
         if not env:
-            return None
+            return None, "none"
         env_base = os.path.basename(env.rstrip("/"))
-        return env_base if env_base else None
+        return (env_base, "env") if env_base else (None, "none")
+
+
+def _resolve_project_basename() -> str | None:
+    """Project basename for CC-path lookups (~/.claude/projects/, sid-* bootstraps).
+
+    Thin wrapper over _resolve_project_basename_with_source() for callers that
+    do not care which source answered. See that function for the resolution
+    order and for why the source matters to _resolve_session_id.
+    """
+    return _resolve_project_basename_with_source()[0]
 
 
 def _recent_bootstrap_sid(window_seconds: int = 600) -> str | None:
@@ -825,6 +849,16 @@ def _recent_bootstrap_sid(window_seconds: int = 600) -> str | None:
     window). Returns the SID iff exactly ONE recent file is found. Strict by
     design: zero or 2+ matches return None to prevent silent mis-attribution
     across projects (the same bug class as issue #101).
+
+    "Exactly one" is a weaker guarantee than it reads, which is why
+    _resolve_session_id now calls this ONLY when cwd is genuinely gone — either
+    it produced no basename at all, or the basename came from
+    CLAUDE_PROJECT_DIR, which is only consulted after os.getcwd() raised.
+    This scan is cross-project by
+    construction — it reads every sid-* in the directory — and on a machine
+    with a single other repo open, exactly-one is the common case rather than
+    the strict one. With no readable cwd there is nothing better to go on; with
+    a readable cwd there is, so the caller must not ask (#260).
 
     NOTE: bootstrap files are written exactly once by SessionStart and immutable
     thereafter — so mtime IS capture time for them. This is the opposite of the
@@ -1247,22 +1281,389 @@ def canonical_project_name(cwd: str | None = None) -> str:
     return name.lower().replace(" ", "-").replace("_", "-")
 
 
-def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str]:
-    """Glob ~/.claude/projects/*<project>/<suffix>, with underscore-to-hyphen fallback.
+# One-shot WARN registries for the session-id resolution path (#260 I3/S6).
+#
+# WHY a registry and not a bare print: _get_session_id_fast() is called once per
+# NOTE by read_note_metadata(), BEFORE its own cache lookup, so a /check-items
+# or /standup sweep over a few hundred notes re-runs the whole resolution chain
+# a few hundred times. A WARN emitted inside it is therefore emitted a few
+# hundred times, and every copy lands in the model's context. Keyed by the
+# evidence (the sorted dir tuple / the cwd), not a bare bool, so a genuinely
+# DIFFERENT ambiguity later in the same process still gets said once.
+# Same discipline as _git_fallback_warned above.
+_ambiguous_project_dirs_warned: set[tuple[str, ...]] = set()
+_sole_match_not_cwd_warned: set[tuple[str, ...]] = set()
+_unknown_sid_warned: set[str] = set()
 
-    Claude Code normalizes underscores to hyphens in project directory names,
-    so a project at ``personal_ws/`` gets stored as ``personal-ws/``.
+
+def _warn_once(registry: set, key, message: str) -> None:
+    """Print `message` to stderr the first time `key` is seen in `registry`."""
+    if key in registry:
+        return
+    registry.add(key)
+    print(message, file=sys.stderr)
+
+
+def _transcript_cwd(path: str, max_bytes: int = 65536) -> str | None:
+    """The `cwd` Claude Code recorded inside a transcript JSONL, or None.
+
+    Every CC transcript line carries the session's working directory as an
+    authoritative `cwd` field. That is ground truth about which directory a
+    project dir belongs to — immune to spaces, unicode, symlinks and any future
+    change in how CC path-encodes the directory name — where
+    _cc_encoded_dirnames() can only ever guess at the encoding.
+
+    Bounded on purpose: reads at most `max_bytes` from the head of the file and
+    parses only the COMPLETE lines in that window (a truncated trailing line is
+    discarded), so a multi-hundred-megabyte transcript costs one 64 KB read.
+    Hooks run at session boundaries and must stay fast, so callers restrict this
+    to the branches where the directory name alone is ambiguous or already
+    suspect — never the common path, which does no I/O at all.
+
+    Returns None on any failure (unreadable, not JSON, no cwd field) — the
+    caller must treat None as "cannot tell", never as "does not match".
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(max_bytes)
+    except OSError:
+        return None
+    lines = head.split("\n")
+    if len(lines) > 1:
+        lines = lines[:-1]  # drop the possibly-truncated tail
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(rec, dict):
+            cwd = rec.get("cwd")
+            if isinstance(cwd, str) and cwd:
+                return cwd.rstrip("/") or "/"
+    return None
+
+
+def _cc_encoded_dirnames(path: str) -> set[str]:
+    """Candidate ~/.claude/projects/ directory names Claude Code may use for `path`.
+
+    CC path-encodes the session's cwd into ONE directory name by replacing the
+    path separators with '-' (``/a/b`` -> ``-a-b``). The exact character class
+    it folds has drifted between CC versions, and BOTH encodings survive on
+    disk for the same physical checkout — a machine can carry both
+    ``-Users-me-dev-claude_workspace-obsidian-brain`` (older: '_' kept) and
+    ``-Users-me-dev-claude-workspace-obsidian-brain`` (current: '_' -> '-')
+    for one directory; hidden worktree dirs show up with '.' folded to '-'.
+
+    So rather than commit to one scheme and mis-reject a directory that is
+    genuinely ours, enumerate every observed combination and treat them all as
+    belonging to `path`.
+
+    Over-generating is NOT free, which is why this is only a PRE-FILTER. A
+    generated variant can collide with a genuinely different directory: cwd
+    ``/Users/x/dev/a_b`` folds to the same candidate as an unrelated repo at
+    ``/Users/x/dev/a-b``, so a candidate here can keep the WRONG directory.
+    _restrict_matches_to_cwd_project() therefore arbitrates the ambiguous case
+    against the authoritative `cwd` field inside the transcripts themselves
+    (_transcript_cwd) and only falls back to this encoding guess when the
+    transcripts cannot answer (#260 Fix 3 / S7).
+    """
+    if not path:
+        return set()
+    variants: set[str] = set()
+    for fold_dot in (False, True):
+        for fold_underscore in (False, True):
+            enc = path.replace("/", "-")
+            if fold_dot:
+                enc = enc.replace(".", "-")
+            if fold_underscore:
+                enc = enc.replace("_", "-")
+            variants.add(enc)
+    return variants
+
+
+def _cwd_project_dirnames() -> set[str]:
+    """Encoded ~/.claude/projects/ dir names for the CURRENT session's cwd.
+
+    Takes its path from the same sources in the same order as
+    _resolve_project_basename (cwd first, CLAUDE_PROJECT_DIR only when cwd
+    cannot be read) so the disambiguator can never disagree with the layer that
+    produced the basename being globbed.
+
+    One deliberate divergence, for cwd == "/": _resolve_project_basename sees an
+    empty basename and returns None — its "cannot determine project" signal,
+    which unlocks the #105 cross-project fallback — while this function returns
+    an empty set, which callers read as "nothing to compare against, refuse".
+    Neither consults CLAUDE_PROJECT_DIR there, since cwd was readable.
+
+    Returns an empty set when neither source is available — the caller must
+    then refuse rather than guess, since it has nothing to compare against.
+
+    os.getcwd() resolves symlinks, while CC encodes the path it was launched
+    with, so a session started inside a symlinked directory can encode to a
+    name none of these candidates match. That costs a refusal ("unknown") in
+    the ambiguous case, never a wrong project — which is the direction this
+    whole change trades in. $PWD would carry the unresolved form, but it is
+    inherited from whatever shell spawned the process and can be stale, i.e.
+    it could just as easily vouch for the WRONG directory; a guess that can
+    be wrong is exactly what is being removed here.
+    """
+    cwd = _safe_getcwd()
+    if cwd:
+        return _cc_encoded_dirnames(cwd.rstrip("/"))
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env:
+        return _cc_encoded_dirnames(env.rstrip("/"))
+    return set()
+
+
+def _current_session_cwd() -> str:
+    """The directory THIS session is running in, or "" if it cannot be known.
+
+    Same sources and order as _cwd_project_dirnames (cwd, then
+    CLAUDE_PROJECT_DIR) so the transcript comparison and the encoding pre-filter
+    can never be judging against two different directories.
+    """
+    cwd = _safe_getcwd()
+    if cwd:
+        return cwd.rstrip("/") or "/"
+    env = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if env:
+        return env.rstrip("/") or "/"
+    return ""
+
+
+# Memo for the transcript-arbitration below, keyed by (our cwd, the dirs tuple).
+#
+# WHY: _get_session_id_fast() runs once per NOTE inside read_note_metadata(), so
+# a /check-items sweep would otherwise re-read a transcript head for every
+# candidate dir, for every note. The `cwd` recorded inside a transcript never
+# changes, and any new directory changes the key, so memoizing is safe for the
+# life of the process. The non-ambiguous (cached) path never reaches this.
+_transcript_dir_arbitration: dict[tuple, tuple[frozenset, frozenset, dict]] = {}
+
+
+def _dirs_by_transcript_cwd(
+    dirs: list[str],
+    matches: list[str],
+    here: str,
+    max_dirs: int = 8,
+    max_files_per_dir: int = 2,
+) -> tuple[frozenset, frozenset, dict[str, str]]:
+    """Split `dirs` into (confirmed, contradicted, observed) by the transcripts' own cwd.
+
+    Every CC transcript JSONL records the session's working directory verbatim,
+    so reading one line of one file per candidate directory answers "is this
+    directory ours?" as fact rather than as an inference about CC's path
+    encoding — which is what makes it immune to spaces, unicode, symlinked
+    checkouts and any future change of encoding scheme.
+
+    A directory whose transcripts cannot be read or carry no cwd field appears
+    in NEITHER set: "cannot tell" must not be mistaken for "not ours".
+
+    `observed` maps each directory that answered to the cwd it reported, so a
+    caller can name the other directory in a WARN without re-reading the file
+    that happened to answer (which is not necessarily the first one).
+
+    Bounded twice over (at most `max_dirs` directories, at most
+    `max_files_per_dir` files each, 64 KB per file — see _transcript_cwd) so a
+    pathological ~/.claude/projects/ cannot stall a session-boundary hook. The
+    caller reaches this only where the encoding guess is ambiguous (several
+    directories matched) or already suspect (a sole match that is none of this
+    cwd's encodings) — i.e. where it was otherwise about to refuse or to hand
+    back a directory it could not vouch for.
+    """
+    if not here:
+        return frozenset(), frozenset(), {}  # nothing to compare against
+    key = (here, tuple(sorted(dirs)))
+    memo = _transcript_dir_arbitration.get(key)
+    if memo is not None:
+        return memo
+
+    by_dir: dict[str, list[str]] = {}
+    for path in matches:
+        by_dir.setdefault(os.path.dirname(path), []).append(path)
+
+    confirmed: set[str] = set()
+    contradicted: set[str] = set()
+    observed: dict[str, str] = {}
+    for d in sorted(dirs)[:max_dirs]:
+        for f in sorted(by_dir.get(d, ()))[:max_files_per_dir]:
+            tc = _transcript_cwd(f)
+            if tc is None:
+                continue  # unreadable/no cwd field — try the next file
+            observed[d] = tc
+            (confirmed if tc == here else contradicted).add(d)
+            break  # one authoritative answer per directory is enough
+
+    result = (frozenset(confirmed), frozenset(contradicted), observed)
+    _transcript_dir_arbitration[key] = result
+    return result
+
+
+def _restrict_matches_to_cwd_project(matches: list[str]) -> list[str]:
+    """Drop cross-project matches when the suffix glob straddles >1 project dir.
+
+    ``~/.claude/projects/*<project>/`` is a SUFFIX match, not an exact one: a
+    bare cwd basename of ``docs`` matches EVERY encoded project dir ending in
+    ``-docs``. Callers then take ``max()`` over the union by mtime, which
+    silently returns the newest session of an unrelated repo and attributes
+    this session's notes to it (#260 Defect 3 — the same mis-attribution class
+    as #101/#105, but sourced from the glob instead of the bootstrap scan).
+
+    Policy, narrowest thing that fixes it:
+      * one directory matched, and it is one of this cwd's encodings ->
+        unchanged, with no I/O at all (the overwhelmingly common case, and the
+        path every cached resolution takes);
+      * one directory matched and it is NOT -> ask its transcripts. Confirmed
+        ours (a symlinked checkout, an encoding we do not generate) -> keep,
+        silently. Positively contradicted -> refuse: that is the shape of the
+        live ``~/.openclaw`` case, where folding '.' makes the suffix glob
+        reach ``-Users-me-dev-claude-workspace-openclaw``, a different repo
+        whose transcripts say so in as many words. Cannot tell -> keep, but
+        say so once (#260 S6). Blanket-restricting the sole match broke 11
+        pre-existing tests, and an unobserved cwd encoding would strand a
+        correct sole match — so only PROOF, never absence of proof, rejects it;
+      * several matched -> ask the transcripts, which carry an authoritative
+        `cwd` field, and keep the directories that say they are ours;
+      * several matched and the transcripts cannot answer -> fall back to the
+        encoding pre-filter (_cc_encoded_dirnames), minus any directory the
+        transcripts positively contradicted. Plural is normal here: the
+        '_'/'-' encoding variants of one checkout are both legitimately ours
+        and each may hold JSONLs;
+      * nothing survives -> refuse, returning no matches so the caller reports
+        'unknown'. A correct "I don't know" beats a confident answer from
+        someone else's repo.
+
+    Callers must be able to tell the refusal apart from a genuine no-match —
+    see _glob_project_jsonls, which is the only caller.
+    """
+    dirs = sorted({os.path.dirname(p) for p in matches})
+    wanted = _cwd_project_dirnames()
+    here = _current_session_cwd()
+
+    if len(dirs) <= 1:
+        if not dirs or not wanted or os.path.basename(dirs[0]) in wanted:
+            return matches  # nothing to suspect — and no transcript read
+        confirmed, contradicted, observed = _dirs_by_transcript_cwd(
+            dirs, matches, here
+        )
+        if dirs[0] in confirmed:
+            return matches  # proof it is ours, whatever its name looks like
+        if dirs[0] in contradicted:
+            _warn_once(
+                _sole_match_not_cwd_warned,
+                (dirs[0], "contradicted"),
+                f"[obsidian-brain] WARN: the only project directory matching this "
+                f"project name ({os.path.basename(dirs[0])}) belongs to a "
+                f"different working directory according to its own transcripts "
+                f"({observed.get(dirs[0], '?')}), not "
+                f"{here or '<cwd unavailable>'}; refusing to use it",
+            )
+            return []
+        _warn_once(
+            _sole_match_not_cwd_warned,
+            (dirs[0], "unverifiable"),
+            f"[obsidian-brain] WARN: the only project directory matching this "
+            f"project name ({os.path.basename(dirs[0])}) does not encode the "
+            f"current cwd ({here or '<cwd unavailable>'}) and its transcripts "
+            f"do not say which directory they belong to; using it anyway (a "
+            f"sole match is usually an unrecognized encoding, not a different "
+            f"project) — verify the session id if notes look mis-filed",
+        )
+        return matches
+
+    confirmed, contradicted, _observed = _dirs_by_transcript_cwd(
+        dirs, matches, here
+    )
+    if confirmed:
+        keep = set(confirmed)  # ground truth wins over the encoding guess
+    else:
+        keep = {
+            d for d in dirs
+            if os.path.basename(d) in wanted and d not in contradicted
+        }
+    if not keep:
+        _warn_once(
+            _ambiguous_project_dirs_warned,
+            tuple(dirs),
+            f"[obsidian-brain] WARN: {len(dirs)} project directories match this "
+            f"project name and none is the current cwd "
+            f"({_safe_getcwd() or '<cwd unavailable>'}); refusing to guess "
+            f"(dirs: {[os.path.basename(d) for d in dirs]})",
+        )
+        return []
+    return [p for p in matches if os.path.dirname(p) in keep]
+
+
+def _project_glob_variants(safe_project: str) -> list[str]:
+    """`safe_project` plus the '_'- and '.'-folded forms CC may have written.
+
+    CC folds BOTH characters into '-' when it path-encodes a cwd into a project
+    directory name — verified on this machine, where
+    ``/Users/me/.claude/obsidian-brain/check-items-_kne1ab3`` is stored as
+    ``-Users-me--claude-obsidian-brain-check-items--kne1ab3`` — and older
+    versions folded fewer of them, so both spellings survive on disk. All four
+    combinations are generated for the same reason _cc_encoded_dirnames()
+    generates them: a glob can only ever match a directory that exists, so an
+    extra variant costs one failed glob, while a missing one loses real
+    transcripts (#260 C2).
+
+    Safe on an escaped string: glob.escape() only wraps '*', '?' and '[', none
+    of which is '_' or '.', so folding cannot corrupt an escape sequence.
+    Sorted for deterministic glob order.
+    """
+    variants = {safe_project}
+    for fold_dot in (False, True):
+        for fold_underscore in (False, True):
+            variant = safe_project
+            if fold_dot:
+                variant = variant.replace(".", "-")
+            if fold_underscore:
+                variant = variant.replace("_", "-")
+            variants.add(variant)
+    return sorted(variants)
+
+
+def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str]:
+    """Glob ~/.claude/projects/*<project>/<suffix> over every encoding CC may use.
+
+    Claude Code normalizes both underscores and dots to hyphens in project
+    directory names, so a project at ``personal_ws/`` is stored as
+    ``personal-ws/`` and a hidden directory such as ``.openclaw`` as
+    ``-openclaw`` — see _project_glob_variants.
+
+    Every variant is globbed and the results are UNIONed, rather than trying a
+    folded form only when the literal one came up empty. An empty-only fallback
+    is defeated by a primary glob that matches exactly ONE wrong directory: the
+    sole-match leniency in _restrict_matches_to_cwd_project then returns that
+    wrong directory as fact and the retry that would have found the right one
+    never runs (#260 S9 — the same union-don't-overwrite reasoning already used
+    for redundant filter queries in the vault index).
+
+    The leading ``*`` makes this a suffix match over the path-encoded dir name,
+    so the union is filtered through _restrict_matches_to_cwd_project before it
+    is returned — see that function for why (#260).
+
+    An empty result means EITHER "nothing matched" OR "matches were refused as
+    ambiguous", and callers cannot tell them apart — so no caller may act on the
+    difference. _try_slow_jsonl_glob reports 'unknown' for both, and
+    _try_bootstrap_fast_path derives its cached-sid view by filtering THIS list
+    instead of globbing a second time, so it can no longer read a refusal as
+    "no other JSONLs exist, trust the bootstrap" (#260 C1).
     """
     import glob as _glob
-    pattern = os.path.expanduser(
-        f"~/.claude/projects/*{safe_project}/{suffix}"
-    )
-    matches = _glob.glob(pattern)
-    if not matches and "_" in safe_project:
-        alt = safe_project.replace("_", "-")
-        pattern = os.path.expanduser(f"~/.claude/projects/*{alt}/{suffix}")
-        matches = _glob.glob(pattern)
-    return matches
+    seen: set[str] = set()
+    matches: list[str] = []
+    for variant in _project_glob_variants(safe_project):
+        pattern = os.path.expanduser(f"~/.claude/projects/*{variant}/{suffix}")
+        for path in _glob.glob(pattern):
+            if path not in seen:
+                seen.add(path)
+                matches.append(path)
+    return _restrict_matches_to_cwd_project(matches)
 
 
 def _try_slow_jsonl_glob(project: str) -> str:
@@ -1303,7 +1704,8 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
 
     Validation strategy:
       1. Read bootstrap file (~0.1 ms)
-      2. Verify cached JSONL still exists
+      2. Verify the cached JSONL is among the project's JSONLs — derived by
+         filtering the single restricted glob, never a second glob (#260 C1)
       3. Determine the newest JSONL deterministically via (mtime, path)
          tuple comparison. Ties broken by path string so the result is
          reproducible on filesystems with 1-second mtime resolution.
@@ -1334,14 +1736,25 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
     if not _SID_FILENAME_SAFE.fullmatch(cached_sid):
         return None
 
-    safe_cached = _glob.escape(cached_sid)
-    cached_matches = _glob_project_jsonls(safe_project, f"{safe_cached}.jsonl")
+    # ONE glob, ONE restriction, then two VIEWS of the same list (#260 C1).
+    #
+    # WHY: globbing the cached sid separately gave the two views different
+    # directory sets. The single-filename glob usually lands in ONE directory
+    # and so takes _restrict_matches_to_cwd_project's sole-match leniency, while
+    # the all-filenames glob sees several directories and refuses — and that
+    # refusal came back as an empty list indistinguishable from "this project
+    # has no other JSONLs", which this function read as "trust the cache" and
+    # returned a cross-project bootstrap sid, ahead of the layer that had just
+    # refused to guess. Filtering one restricted list cannot disagree with
+    # itself, and an empty all_matches now necessarily empties cached_matches
+    # too, so the refusal exits via the miss below.
+    all_matches = _glob_project_jsonls(safe_project)
+    cached_filename = f"{cached_sid}.jsonl"
+    cached_matches = [
+        p for p in all_matches if os.path.basename(p) == cached_filename
+    ]
     if not cached_matches:
         return None
-
-    all_matches = _glob_project_jsonls(safe_project)
-    if not all_matches:
-        return cached_sid  # no other JSONLs; trust cache
 
     entries = [(_safe_mtime(p), p) for p in all_matches]
     viable = [(m, p) for m, p in entries if m >= 0]
@@ -1369,15 +1782,41 @@ def _resolve_session_id(allow_bootstrap: bool = True) -> str:
       1. Project basename via _resolve_project_basename (cwd → env → None)
       2. Bootstrap fast path (skipped if allow_bootstrap=False)
       3. Slow-path JSONL glob
-      4. Recent-bootstrap best-effort scan (skipped if allow_bootstrap=False)
-         — issue #105 fallback for cwd-gone
+      4. Recent-bootstrap best-effort scan — issue #105 fallback, reachable
+         ONLY when cwd is gone: layer 1 produced no basename at all, or it
+         produced one from CLAUDE_PROJECT_DIR (which is consulted only after
+         os.getcwd() raised) (skipped if allow_bootstrap=False)
       5. 'unknown' sentinel
 
     The `allow_bootstrap` flag gates BOTH bootstrap-reading layers (2 and 4),
     so callers that need a bootstrap-blind result (e.g., health checks via
     _slow_path_newest_sid) get a JSONL-only resolution.
+
+    Layer 4 is scoped to the cwd-gone case ON PURPOSE (#260). It scans
+    ~/.claude/obsidian-brain/sid-* across EVERY project and returns a sid when
+    exactly one is recent — which is cross-project by construction, and on a
+    machine with one other repo open "exactly one" is the COMMON case, not a
+    rare one. That is an acceptable trade only for the case #105 built it for:
+    cwd was deleted mid-session (`gh pr merge --delete-branch`), so there is
+    nothing left to contradict the guess. When layer 1 DID return a basename,
+    cwd is readable and demonstrably disagrees with whatever the other repo's
+    bootstrap says — layers 2 and 3 merely found no JSONL for it yet (a
+    non-git subdirectory, or a transcript not written yet). Consulting the
+    cross-project scan there returned another session entirely: wrong sid,
+    wrong project, wrong snapshots mined as /retro evidence, and no collision
+    WARN because from the resolver's point of view it looked clean. 'unknown'
+    is a supported, handled outcome (get_session_context refuses to cache it
+    and falls back to the live canonical_project_name()), so a correct "I
+    don't know" strictly beats a confident answer from another repo.
+
+    The gate is on the SOURCE of the basename, not merely on "a basename
+    exists" (#260 I5). A basename from CLAUDE_PROJECT_DIR already means
+    os.getcwd() raised, i.e. cwd is gone — #105's case exactly — and CC sets
+    that variable in hooks, so gating on `project is not None` would have
+    narrowed #105 to "worktree deleted AND the env var happens to be unset",
+    silently returning 'unknown' where it used to recover the sid.
     """
-    project = _resolve_project_basename()
+    project, source = _resolve_project_basename_with_source()
     if project is not None:
         if allow_bootstrap:
             sid = _try_bootstrap_fast_path(project)
@@ -1386,6 +1825,12 @@ def _resolve_session_id(allow_bootstrap: bool = True) -> str:
         sid = _try_slow_jsonl_glob(project)
         if sid != "unknown":
             return sid
+        if source == "cwd":
+            # cwd is readable but has no session of its own — do NOT fall
+            # through to the cross-project scan below. See the docstring (#260).
+            return "unknown"
+        # source == "env": cwd is gone, so there is nothing left to contradict
+        # the cross-project scan — #105's original case. Fall through to it.
     if allow_bootstrap:
         sid = _recent_bootstrap_sid()
         if sid:
@@ -1678,20 +2123,79 @@ def check_hook_status() -> dict:
 def get_session_context(vault_path: str | None = None, sessions_folder: str | None = None) -> dict:
     """Get session ID, hash, project, and session note name. Cached.
 
-    Returns {session_id, hash, project, session_note_name} or
-    {session_id: 'unknown', hash: '', project: <canonical-project>, session_note_name: ''}.
+    Returns {session_id, hash, project, session_note_name, cwd} or
+    {session_id: 'unknown', hash: '', project: <canonical-project>,
+    session_note_name: '', cwd: <cwd>}.
+
+    `cwd` is the working directory the entry was resolved from. It is a guard,
+    not a payload (see below); callers read the other four fields.
     """
     sid = _get_session_id_fast()
+    cwd_now = _safe_getcwd()
     # Include args in cache key so different call signatures don't collide
     cache_key = f"session_context:{vault_path or ''}:{sessions_folder or ''}"
     cached = cache_get(sid, cache_key)
     if cached is not None:
-        return cached
+        # Defense-in-depth for #260: the cache file is keyed by SID ALONE
+        # (~/.claude/obsidian-brain/cache-<sid>.json), so a mis-resolved sid
+        # hands back another session's ENTIRE context — project, hash and
+        # session_note_name all from a different repo — before
+        # canonical_project_name() below ever gets a chance to contradict it.
+        # Stamping the resolving cwd and comparing it on read converts that
+        # silent wrong answer into a visible one plus a recompute.
+        #
+        # Compared as a plain string via _safe_getcwd(), deliberately NOT via
+        # canonical_project_name(): that shells out to `git rev-parse`, and a
+        # subprocess on every cached call is exactly the cost the cache exists
+        # to avoid (hooks run at session boundaries). A string compare is
+        # stricter than needed — cd'ing between two worktrees of one repo
+        # invalidates too — but the false-invalidation cost is one recompute,
+        # while the false-acceptance cost is notes filed under another
+        # project's graph.
+        has_stamp = isinstance(cached, dict) and "cwd" in cached
+        if has_stamp and cached["cwd"] == cwd_now:
+            return cached
+        if has_stamp:
+            print(
+                f"[obsidian-brain] WARN: cached session context for sid {sid} was "
+                f"resolved from {cached.get('cwd') or '<cwd unavailable>'} but this "
+                f"call is from {cwd_now or '<cwd unavailable>'}; discarding it and "
+                f"recomputing (project was {cached.get('project')!r})",
+                file=sys.stderr,
+            )
+        # No stamp at all = an entry written before this guard existed. That is
+        # a format upgrade, not evidence of mis-attribution, so it recomputes
+        # quietly; the recomputed entry carries the stamp from here on.
 
     project = canonical_project_name()
     if sid == "unknown":
+        # Announce it — once (#260 I4).
+        #
+        # WHY: 'unknown' is the most common route out of this resolver and the
+        # only one with no diagnostic of its own; the cwd-mismatch and
+        # ambiguous-glob paths both WARN. Downstream, gather_session_evidence
+        # returns an empty bundle and /retro prints "no prior-session evidence
+        # found" — a claim about the VAULT ("there is nothing") when the truth
+        # is a claim about the RESOLVER ("I could not identify this session").
+        # Without this line a resolution failure is indistinguishable from a
+        # genuinely fresh session: the same silent-failure shape as #260 itself.
+        #
+        # Keyed by cwd and emitted here rather than in the resolver on purpose:
+        # get_session_context() is called about once per skill invocation, while
+        # _get_session_id_fast() runs once per NOTE inside read_note_metadata(),
+        # where the same message would arrive hundreds of times (#260 I3).
+        _warn_once(
+            _unknown_sid_warned,
+            cwd_now,
+            f"[obsidian-brain] WARN: could not identify the current session for "
+            f"{cwd_now or '<cwd unavailable>'} (no Claude Code transcript "
+            f"resolves to it); session-scoped evidence and session-note linking "
+            f"are unavailable this run — notes will still be written, filed "
+            f"under project {project!r}",
+        )
         # Don't cache "unknown" — would pollute cache shared across projects
-        return {"session_id": "unknown", "hash": "", "project": project, "session_note_name": ""}
+        return {"session_id": "unknown", "hash": "", "project": project,
+                "session_note_name": "", "cwd": cwd_now}
 
     h = hashlib.sha256(sid.encode()).hexdigest()[:4]
 
@@ -1725,7 +2229,8 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
             _first_seen_date(sid), slugify(project), sid
         )[:-3]
 
-    ctx = {"session_id": sid, "hash": h, "project": project, "session_note_name": session_note_name}
+    ctx = {"session_id": sid, "hash": h, "project": project,
+           "session_note_name": session_note_name, "cwd": cwd_now}
     cache_set(sid, cache_key, ctx)
     return ctx
 
