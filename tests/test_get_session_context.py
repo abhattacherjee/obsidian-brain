@@ -570,6 +570,113 @@ def test_peek_frontmatter_field_oversized_frontmatter_returns_none(tmp_path):
     assert obsidian_utils._peek_frontmatter_type(note) is None
 
 
+# ---------------------------------------------------------------------------
+# #283 follow-up: _build_existing_sid_set read every session note three times
+# (type, project, session_id) on the SessionStart hook. _peek_frontmatter_fields
+# is the one-read/one-parse variant; _peek_frontmatter_field wraps it, so there
+# is exactly one parsing implementation.
+# ---------------------------------------------------------------------------
+
+
+def test_peek_frontmatter_fields_reads_the_file_once(tmp_path, monkeypatch):
+    """N fields, one open. Three single-field peeks meant three reads."""
+    import builtins
+
+    note = tmp_path / "n.md"
+    _write_note(note, {
+        "type": "claude-session",
+        "project": "obsidian-brain",
+        "session_id": "SID-XYZ",
+    })
+
+    opens = []
+    real_open = builtins.open
+
+    def counting_open(file, *args, **kwargs):
+        if str(file) == str(note):
+            opens.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    result = obsidian_utils._peek_frontmatter_fields(
+        note, ("type", "project", "session_id")
+    )
+
+    assert result == {
+        "type": "claude-session",
+        "project": "obsidian-brain",
+        "session_id": "SID-XYZ",
+    }
+    assert len(opens) == 1, f"expected one read, got {len(opens)}"
+
+
+def test_peek_frontmatter_fields_missing_field_is_none(tmp_path):
+    """A field the note does not have comes back None, not absent."""
+    note = tmp_path / "n.md"
+    _write_note(note, {"type": "claude-session"})
+
+    result = obsidian_utils._peek_frontmatter_fields(note, ("type", "nope"))
+
+    assert result == {"type": "claude-session", "nope": None}
+
+
+def test_peek_frontmatter_fields_empty_value_is_none_and_warns(tmp_path, capsys):
+    """Per-field behaviour is preserved exactly: an empty scalar warns and
+    normalizes to None, and the OTHER fields still resolve."""
+    note = tmp_path / "n.md"
+    _write_note(note, {"type": "", "project": "obsidian-brain"})
+
+    result = obsidian_utils._peek_frontmatter_fields(note, ("type", "project"))
+
+    assert result == {"type": None, "project": "obsidian-brain"}
+    err = capsys.readouterr().err
+    assert "empty" in err.lower(), err
+    assert "'type'" in err, err
+
+
+def test_peek_frontmatter_fields_first_match_wins(tmp_path):
+    """Duplicate keys: the first one inside the fence pair wins, as in the
+    single-field scan (which returned on its first match)."""
+    note = tmp_path / "dup.md"
+    note.write_text(
+        "---\ntype: claude-session\ntype: claude-snapshot\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+
+    assert obsidian_utils._peek_frontmatter_fields(note, ("type",)) == {
+        "type": "claude-session"
+    }
+
+
+def test_peek_frontmatter_fields_unclosed_fence_returns_all_none(tmp_path):
+    """No frontmatter region means no field may be harvested — for every
+    requested field, not just the one that happened to be below the break."""
+    note = tmp_path / "unclosed.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: real\n# My Note\n\nstatus: prose\n",
+        encoding="utf-8",
+    )
+
+    assert obsidian_utils._peek_frontmatter_fields(
+        note, ("type", "project", "status")
+    ) == {"type": None, "project": None, "status": None}
+
+
+def test_peek_frontmatter_fields_unreadable_names_the_cause(tmp_path, capsys):
+    """The "cannot read" diagnostic must name the errno cause again — but via
+    exc.strerror, so the absolute vault path never reaches stderr."""
+    missing = tmp_path / "does-not-exist.md"
+
+    result = obsidian_utils._peek_frontmatter_fields(missing, ("type", "project"))
+
+    assert result == {"type": None, "project": None}
+    err = capsys.readouterr().err
+    assert "cannot read" in err.lower(), err
+    assert "No such file" in err, err
+    assert str(missing) not in err, f"leaked the absolute path: {err!r}"
+
+
 def test_peek_frontmatter_field_logs_empty_value(tmp_path, capsys):
     """Empty-but-present field is logged as a possible corruption signal."""
     note = tmp_path / "n.md"

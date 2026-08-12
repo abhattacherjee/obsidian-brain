@@ -168,22 +168,31 @@ def _build_existing_sid_set(vault_path: str, sessions_folder: str, project: str)
     project.  The lookup uses full SIDs to eliminate the collision risk of the
     previous 8-char prefix set.
     """
-    from obsidian_utils import _peek_frontmatter_field, _peek_frontmatter_type
+    from obsidian_utils import _peek_frontmatter_fields
 
     sessions = Path(vault_path) / sessions_folder
     if not sessions.is_dir():
         return set()
     sids: set = set()
     for note in sessions.glob("*.md"):
-        note_type = _peek_frontmatter_type(note) or "claude-session"
-        if note_type != "claude-session":
+        # ONE read + ONE parse per note, not three. This loop runs on the
+        # SessionStart hook inside reaper_max_runtime_seconds (5s) over every
+        # session note in the vault (~1000), so three single-field peeks meant
+        # reading and re-parsing the same bytes three times. Reading all three
+        # fields up front (rather than short-circuiting on `type`) is what
+        # makes that possible; the only visible difference is that an
+        # empty-but-present `project:`/`session_id:` on a non-session note now
+        # emits its corruption warning too.
+        fields = _peek_frontmatter_fields(note, ("type", "project", "session_id"))
+        # Legacy notes without a `type` are treated as claude-session (see
+        # this function's docstring).
+        if (fields["type"] or "claude-session") != "claude-session":
             continue  # skip snapshots, insights, etc.
         # Project filter: only count notes belonging to this project.
-        # Reduces I/O on multi-project vaults by skipping unrelated notes.
-        note_project = _peek_frontmatter_field(note, "project")
+        note_project = fields["project"]
         if note_project and note_project != project:
             continue
-        raw_sid = _peek_frontmatter_field(note, "session_id")
+        raw_sid = fields["session_id"]
         if raw_sid:
             sids.add(raw_sid)
     return sids

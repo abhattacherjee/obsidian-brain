@@ -44,6 +44,32 @@ _FM_ITEM_RE = re.compile(r"^\s*-\s")
 # and nested mappings all produce these.
 _FM_CONT_RE = re.compile(r"^\s+\S")
 
+# The verdict returned when the file does not open with a ``---`` fence at
+# line index 0 -- "this is not a note", as distinct from "this note is
+# broken". Exported for the same reason as the constant below: the
+# ``/retro`` evidence loop in ``obsidian_utils.gather_session_evidence``
+# filters exactly this reason out of ``discovery_errors``, and it must be
+# able to do so by exact comparison against the producing module rather than
+# through a classifier that can degrade, or via a hand-copied literal that
+# can drift.
+NO_OPENING_FENCE_REASON = (
+    "malformed frontmatter (file does not open with a '---' fence)"
+)
+
+# The verdict returned when the closing-fence scan simply RUNS OUT of lines:
+# no shape violation, no line-cap trip, just exhaustion. Exported as a named
+# constant -- rather than left as a literal in the return below -- because
+# ``obsidian_utils.read_note_metadata_detailed`` has to recognise this one
+# reason and no other: it is the only one of the three verdicts below that a
+# size-truncated read can invalidate (the other two are derived from lines
+# that were actually read and inspected). A hand-copied literal at that call
+# site would silently stop matching the day this wording changes, restoring
+# the bug the gate exists to prevent -- so the return below must keep using
+# the constant.
+NO_CLOSING_FENCE_EXHAUSTED_REASON = (
+    "malformed or missing frontmatter (no closing '---')"
+)
+
 
 def split_lines_lf_crlf(text: str) -> list[str]:
     """Split ``text`` into lines, each with its terminator attached,
@@ -118,9 +144,7 @@ def split_frontmatter(lines: list[str]):
     is ~2x headroom over the deepest observed. Raise it, do not remove it.
     """
     if not lines or lines[0].rstrip("\r\n") != "---":
-        return None, None, None, None, (
-            "malformed frontmatter (file does not open with a '---' fence)"
-        )
+        return None, None, None, None, NO_OPENING_FENCE_REASON
     for i in range(1, min(len(lines), MAX_FRONTMATTER_LINES + 1)):
         stripped = lines[i].rstrip("\r\n")
         if stripped == "---":
@@ -143,4 +167,4 @@ def split_frontmatter(lines: list[str]):
             "before the frontmatter block ended -- the note may be fine; this "
             "is a size limit, not a missing fence)"
         )
-    return None, None, None, None, "malformed or missing frontmatter (no closing '---')"
+    return None, None, None, None, NO_CLOSING_FENCE_EXHAUSTED_REASON
