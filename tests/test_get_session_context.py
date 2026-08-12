@@ -1080,3 +1080,723 @@ def test_resolve_session_id_slow_path_skips_layer_4_recent_bootstrap(isolated_ho
     monkeypatch.chdir(target)
 
     assert obsidian_utils._resolve_session_id(allow_bootstrap=False) == "unknown"
+
+
+# ─── Issue #260: cross-project session-id / cached-context mis-resolution ──
+#
+# Reported twice, seven weeks apart: during a /retro in an active session,
+# get_session_context() returned a completely different, prior session — wrong
+# sid, wrong project, and that session's snapshots mined as first-class /retro
+# evidence — with no discovery_errors entry and no collision WARN.
+#
+# Three defects, one class (silently guessing across projects):
+#   1. _resolve_session_id fell through to the cross-project bootstrap scan
+#      (layer 4, built for #105's cwd-gone case) whenever layers 1-3 failed for
+#      ANY reason, including "cwd is fine, this project just has no JSONL yet".
+#   2. get_session_context returned the sid-keyed cache before computing the
+#      live project, so one wrong sid yielded another repo's whole context.
+#   3. ~/.claude/projects/*<project>/ is a SUFFIX glob, so a bare basename
+#      matched every project dir ending in that segment.
+
+
+def _redirect_secure_paths(monkeypatch, home: Path) -> None:
+    """Point the module-level secure-dir constants at a redirected HOME.
+
+    _SECURE_DIR / _CACHE_PREFIX / _BOOTSTRAP_PREFIX are frozen at import time
+    from the REAL $HOME, so a HOME-only redirect still reads and writes the
+    user's live cache and bootstrap files. Tests that touch either must patch
+    the constants too.
+    """
+    secure = home / ".claude" / "obsidian-brain"
+    monkeypatch.setattr(obsidian_utils, "_SECURE_DIR", str(secure))
+    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(secure / "cache-"))
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(secure / "sid-"))
+
+
+def _encoded_project_dir(home: Path, path: str) -> Path:
+    """~/.claude/projects/ dir name Claude Code would use for `path`."""
+    return home / ".claude" / "projects" / path.replace("/", "-").replace("_", "-")
+
+
+def test_get_session_context_readable_subdir_never_borrows_other_project_session(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """Headline #260 repro, end to end.
+
+    cwd is a readable, non-git subdirectory with no JSONLs of its own
+    (`.../sonno-tiny-homes-pitch/docs`), and exactly ONE other project has a
+    recent sid-* bootstrap plus a poisoned cache entry (`wealth-management`).
+    get_session_context() must not return ANY of that other session's fields.
+    """
+    other_sid = "0524bab1-1111-2222-3333-444455556666"
+    other_hash = "976b"
+    other_note = "2026-06-28-wealth-management-976b"
+
+    _redirect_secure_paths(monkeypatch, isolated_home)
+
+    # The other project: recent bootstrap + a real JSONL + a cached context.
+    _seed_bootstrap(isolated_home, "wealth-management", other_sid)
+    other_cc = _encoded_project_dir(isolated_home, "/Users/x/dev/wealth-management")
+    other_cc.mkdir(parents=True)
+    (other_cc / f"{other_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    cache_key = f"session_context:{vault}:claude-sessions"
+    (isolated_home / ".claude" / "obsidian-brain" / f"cache-{other_sid}.json").write_text(
+        json.dumps({cache_key: {
+            "session_id": other_sid,
+            "hash": other_hash,
+            "project": "wealth-management",
+            "session_note_name": other_note,
+            "cwd": "/Users/x/dev/wealth-management",
+        }}),
+        encoding="utf-8",
+    )
+
+    # This session: a readable subdirectory of a project with no JSONLs.
+    here = tmp_path / "sonno-tiny-homes-pitch" / "docs"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+
+    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+
+    assert ctx["session_id"] == "unknown", (
+        f"resolved another project's session: {ctx['session_id']}"
+    )
+    assert ctx["hash"] == ""
+    assert ctx["session_note_name"] == ""
+    assert ctx["project"] == "docs"
+    assert other_sid not in json.dumps(ctx)
+    assert "wealth-management" not in json.dumps(ctx)
+
+
+def test_resolve_session_id_readable_cwd_without_jsonl_refuses_bootstrap_scan(
+    isolated_home, tmp_path, monkeypatch
+):
+    """Fix 1 in isolation: cwd readable + no JSONL for it + exactly one recent
+    cross-project bootstrap → 'unknown', NOT the other project's sid."""
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    other_sid = _unique_sid()
+    _seed_bootstrap(isolated_home, "some-other-project", other_sid)
+
+    here = tmp_path / "pitch" / "docs"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+
+    assert obsidian_utils._resolve_session_id() == "unknown"
+
+
+def test_resolve_session_id_cwd_gone_still_uses_recent_bootstrap_after_260(
+    isolated_home, monkeypatch
+):
+    """#105 regression guard restated for #260: the gate keys on 'cwd produced
+    no basename at all', so the cwd-gone path layer 4 exists for still works."""
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    sid = _unique_sid()
+    _seed_bootstrap(isolated_home, "deleted-worktree", sid)
+
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+
+    assert obsidian_utils._resolve_session_id() == sid
+
+
+def test_resolve_session_id_cwd_gone_with_env_dir_resolves_via_jsonl(
+    isolated_home, monkeypatch
+):
+    """The other half of the #105 path: cwd gone but CLAUDE_PROJECT_DIR names a
+    project whose JSONL still exists → layer 3 resolves it. The #260 gate must
+    not need layer 4 here (and must not consult it, since the env var IS a
+    readable answer)."""
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    real_sid = _unique_sid()
+    decoy_sid = _unique_sid()
+    _seed_bootstrap(isolated_home, "unrelated-project", decoy_sid)
+
+    worktree = "/Users/x/dev/repo--feature-branch"
+    cc_dir = _encoded_project_dir(isolated_home, worktree)
+    cc_dir.mkdir(parents=True)
+    (cc_dir / f"{real_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", worktree)
+
+    assert obsidian_utils._resolve_session_id() == real_sid
+
+
+def test_get_session_context_rejects_cached_context_from_a_different_cwd(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """Fix 2: a cache-<sid>.json entry stamped with another cwd is discarded,
+    recomputed, and the discard is announced on stderr (never silent)."""
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    sid = "11111111-2222-3333-4444-555555555555"
+    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid)
+
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    secure = isolated_home / ".claude" / "obsidian-brain"
+    secure.mkdir(parents=True, exist_ok=True)
+    cache_key = f"session_context:{vault}:claude-sessions"
+    (secure / f"cache-{sid}.json").write_text(
+        json.dumps({cache_key: {
+            "session_id": sid,
+            "hash": "dead",
+            "project": "wealth-management",
+            "session_note_name": "2026-06-28-wealth-management-976b",
+            "cwd": "/Users/x/dev/wealth-management",
+        }}),
+        encoding="utf-8",
+    )
+
+    here = tmp_path / "sonno-tiny-homes-pitch"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+
+    assert ctx["project"] == "sonno-tiny-homes-pitch", (
+        f"returned another cwd's cached context: {ctx}"
+    )
+    assert ctx["session_note_name"] != "2026-06-28-wealth-management-976b"
+    assert ctx["hash"] != "dead"
+    assert ctx["cwd"] == os.getcwd()
+    err = capsys.readouterr().err
+    assert "WARN" in err and "wealth-management" in err, err
+
+
+def test_get_session_context_recomputes_pre_260_cache_entry_quietly(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """A cache entry written before the cwd stamp existed has no `cwd` key.
+    That is a format upgrade, not evidence of mis-attribution: recompute, but
+    do not cry wolf on stderr."""
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    sid = "99999999-8888-7777-6666-555555555555"
+    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid)
+
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    secure = isolated_home / ".claude" / "obsidian-brain"
+    secure.mkdir(parents=True, exist_ok=True)
+    cache_key = f"session_context:{vault}:claude-sessions"
+    (secure / f"cache-{sid}.json").write_text(
+        json.dumps({cache_key: {
+            "session_id": sid, "hash": "abcd", "project": "legacy-proj",
+            "session_note_name": "2026-01-01-legacy-proj-abcd",
+        }}),
+        encoding="utf-8",
+    )
+
+    here = tmp_path / "current-proj"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+    assert ctx["project"] == "current-proj"
+    assert "WARN" not in capsys.readouterr().err
+
+    # The recomputed entry carries the stamp, so the next call is a clean hit.
+    ctx2 = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+    assert ctx2 == ctx
+    assert "WARN" not in capsys.readouterr().err
+
+
+def test_get_session_context_unknown_is_not_cached_and_returns_live_project(
+    isolated_home, tmp_path, monkeypatch
+):
+    """'unknown' round-trips: no cache file is written for it, and the project
+    comes from the live canonical_project_name() rather than a stale entry."""
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: "unknown")
+
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    here = tmp_path / "live-project"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+    assert ctx == {
+        "session_id": "unknown",
+        "hash": "",
+        "project": "live-project",
+        "session_note_name": "",
+        "cwd": os.getcwd(),
+    }
+    secure = isolated_home / ".claude" / "obsidian-brain"
+    assert list(secure.glob("cache-unknown*")) == []
+
+
+def test_glob_project_jsonls_prefers_the_dir_encoding_this_cwd(
+    isolated_home, tmp_path, monkeypatch
+):
+    """Fix 3: two project dirs end in '-docs'; only the one encoding this cwd
+    counts, even though the unrelated one holds a strictly newer session."""
+    import time
+
+    here = tmp_path / "sonno-tiny-homes-pitch" / "docs"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+
+    mine = _encoded_project_dir(isolated_home, os.getcwd())
+    theirs = isolated_home / ".claude" / "projects" / "-Users-x-dev-claude-workspace-docs"
+    mine.mkdir(parents=True)
+    theirs.mkdir(parents=True)
+
+    my_sid = "aaaaaaaa-0000-0000-0000-000000000001"
+    their_sid = "bbbbbbbb-0000-0000-0000-000000000002"
+    (mine / f"{my_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+    (theirs / f"{their_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+    now = time.time()
+    os.utime(mine / f"{my_sid}.jsonl", (now - 3600, now - 3600))
+    os.utime(theirs / f"{their_sid}.jsonl", (now, now))  # newest overall
+
+    matches = obsidian_utils._glob_project_jsonls("docs")
+    assert [os.path.basename(m) for m in matches] == [f"{my_sid}.jsonl"]
+    assert obsidian_utils._try_slow_jsonl_glob("docs") == my_sid
+
+
+def test_glob_project_jsonls_refuses_when_no_dir_encodes_cwd(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """Ambiguous → refuse: several dirs match the suffix, none is ours. Return
+    nothing (caller reports 'unknown') and say so on stderr."""
+    here = tmp_path / "elsewhere" / "docs"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+
+    projects = isolated_home / ".claude" / "projects"
+    for name, sid in (
+        ("-Users-x-dev-claude_workspace-docs", "cccccccc-0000-0000-0000-000000000003"),
+        ("-Users-x-dev-other-workspace-docs", "dddddddd-0000-0000-0000-000000000004"),
+    ):
+        d = projects / name
+        d.mkdir(parents=True)
+        (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert obsidian_utils._glob_project_jsonls("docs") == []
+    assert obsidian_utils._try_slow_jsonl_glob("docs") == "unknown"
+    err = capsys.readouterr().err
+    assert "WARN" in err and "refusing to guess" in err, err
+
+
+def test_glob_project_jsonls_keeps_every_encoding_variant_of_this_cwd(
+    isolated_home, tmp_path, monkeypatch
+):
+    """A single checkout legitimately owns more than one project dir: CC has
+    changed how it folds '_' in the encoded name, and both survive on disk
+    (verified on this machine for claude_workspace/obsidian-brain). Both must
+    be kept — refusing them would strand the live session."""
+    here = tmp_path / "claude_workspace" / "obsidian-brain"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+    cwd = os.getcwd()
+
+    projects = isolated_home / ".claude" / "projects"
+    kept_underscore = projects / cwd.replace("/", "-")
+    folded = projects / cwd.replace("/", "-").replace("_", "-")
+    assert kept_underscore != folded
+    kept_underscore.mkdir(parents=True)
+    folded.mkdir(parents=True)
+    (kept_underscore / "sid-old.jsonl").write_text("{}\n", encoding="utf-8")
+    (folded / "sid-new.jsonl").write_text("{}\n", encoding="utf-8")
+
+    matches = obsidian_utils._glob_project_jsonls("obsidian-brain")
+    assert sorted(os.path.basename(m) for m in matches) == ["sid-new.jsonl", "sid-old.jsonl"]
+
+
+# ─── #260 review round 2: the mis-resolution was still reachable ──────────
+#
+# The first pass fixed the layer-3 glob but left three ways back to a
+# cross-project answer, all verified as live repros before these tests existed:
+#   C1  the bootstrap fast path globbed the cached sid SEPARATELY, so the
+#       "refusing to guess" empty list came back indistinguishable from "this
+#       project has no other JSONLs" and was read as "trust the cache".
+#   C2  the encoding fallback folded '_' but not '.', so a dot-named directory
+#       (/Users/me/.openclaw, 17 transcripts on disk) resolved to 'unknown'.
+#   S9  the folded glob only ran when the literal one came up EMPTY, so a
+#       literal glob matching one WRONG directory suppressed the retry.
+
+
+def _jsonl_line(cwd: str) -> str:
+    """One CC transcript line, carrying the `cwd` field CC actually records."""
+    return json.dumps({"type": "user", "cwd": cwd, "message": {"role": "user"}}) + "\n"
+
+
+def test_bootstrap_under_current_basename_never_borrows_another_project(
+    isolated_home, tmp_path, monkeypatch
+):
+    """C1: SessionStart writes sid-<cwd basename>, so the bootstrap file collides
+    on a generic basename exactly as easily as the suffix glob does.
+
+    cwd is `.../sonno-tiny-homes-pitch/docs`; two unrelated project dirs end in
+    `-docs`; `sid-docs` holds the sid of one of them. The cached-sid glob lands
+    in ONE directory and takes the sole-match leniency, while the all-JSONLs
+    glob sees both and refuses — and the fast path used to resolve that
+    disagreement in favour of the stale bootstrap, printing "refusing to guess"
+    and then guessing through the other branch.
+    """
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    decoy_sid = "aaaaaaa-1111-2222-3333-444444444444"
+    other_sid = "bbbbbbb-2222-3333-4444-555555555555"
+
+    projects = isolated_home / ".claude" / "projects"
+    decoy = projects / "-Users-x-dev-vendor-pitch-docs"
+    other = projects / "-Users-x-dev-other-workspace-docs"
+    decoy.mkdir(parents=True)
+    other.mkdir(parents=True)
+    (decoy / f"{decoy_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+    (other / f"{other_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    # SessionStart's bootstrap for THIS cwd basename names the decoy's session.
+    _seed_bootstrap(isolated_home, "docs", decoy_sid)
+
+    here = tmp_path / "sonno-tiny-homes-pitch" / "docs"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+
+    assert obsidian_utils._resolve_session_id() == "unknown", (
+        "the refusal was read as 'no other JSONLs exist' and the stale "
+        "cross-project bootstrap was returned"
+    )
+
+
+def test_bootstrap_fast_path_returns_none_when_the_glob_refused(
+    isolated_home, tmp_path, monkeypatch
+):
+    """C1 in isolation, at the function that owned the defect."""
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    decoy_sid = "ccccccc-1111-2222-3333-444444444444"
+
+    projects = isolated_home / ".claude" / "projects"
+    for name, sid in (
+        ("-Users-x-dev-vendor-pitch-docs", decoy_sid),
+        ("-Users-x-dev-other-workspace-docs", "ddddddd-2222-3333-4444-555555555555"),
+    ):
+        d = projects / name
+        d.mkdir(parents=True)
+        (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    _seed_bootstrap(isolated_home, "docs", decoy_sid)
+    here = tmp_path / "pitch" / "docs"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+
+    assert obsidian_utils._try_bootstrap_fast_path("docs") is None
+
+
+def test_glob_project_jsonls_folds_a_dot_in_the_cwd_basename(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """C2: Claude Code folds '.' to '-' when it encodes a cwd, so a dot-named
+    directory's transcripts are on disk under a name the literal glob cannot
+    see. Verified live from /Users/<me>/.openclaw: 17 JSONLs exist, the literal
+    glob found 0, and the resolver answered 'unknown' for an active session.
+    """
+    here = tmp_path / ".openclaw"
+    here.mkdir()
+    monkeypatch.chdir(here)
+    cwd = os.getcwd()
+
+    sid = "eeeeeee-1111-2222-3333-444444444444"
+    encoded = cwd.replace("/", "-").replace(".", "-").replace("_", "-")
+    d = isolated_home / ".claude" / "projects" / encoded
+    d.mkdir(parents=True)
+    (d / f"{sid}.jsonl").write_text(_jsonl_line(cwd), encoding="utf-8")
+
+    assert obsidian_utils._resolve_session_id() == sid
+    # The directory IS one of this cwd's encodings, so nothing is announced.
+    assert "WARN" not in capsys.readouterr().err
+
+
+def test_glob_project_jsonls_unions_the_folded_variant_instead_of_falling_back(
+    isolated_home, tmp_path, monkeypatch
+):
+    """S9: the folded glob used to run only when the literal one came up EMPTY.
+
+    Here the literal glob matches exactly ONE directory — an unrelated repo —
+    so the fallback never fired and the sole-match leniency returned that
+    stranger as fact. Both globs must run and their results be UNIONed.
+    """
+    here = tmp_path / "ws" / "a_b"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+    cwd = os.getcwd()
+
+    projects = isolated_home / ".claude" / "projects"
+    stranger = projects / "-Users-x-dev-vendor-a_b"       # literal glob only
+    mine = projects / cwd.replace("/", "-").replace("_", "-")  # folded glob only
+    stranger.mkdir(parents=True)
+    mine.mkdir(parents=True)
+    stranger_sid = "fffffff-1111-2222-3333-444444444444"
+    my_sid = "9999999-1111-2222-3333-444444444444"
+    (stranger / f"{stranger_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+    (mine / f"{my_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert obsidian_utils._try_slow_jsonl_glob("a_b") == my_sid
+
+
+def test_transcript_cwd_wins_over_the_encoding_guess_on_a_fold_collision(
+    isolated_home, monkeypatch
+):
+    """S7: over-generating encodings is NOT free.
+
+    cwd `/Users/x/dev/a_b` and an unrelated repo at `/Users/x/dev/a-b` collide:
+    the stranger's real project-dir name is byte-identical to one of our
+    generated fold variants, so the encoding pre-filter keeps it and its newer
+    session wins the mtime max. The transcripts' own `cwd` field — which Claude
+    Code records on every line — settles it as fact rather than inference.
+
+    cwd is synthesized rather than taken from tmp_path because pytest's tmp
+    directories carry the test name, underscores and all, and folding those
+    would destroy the very collision under test.
+    """
+    import time
+
+    our_cwd = "/Users/x/dev/a_b"
+    their_cwd = "/Users/x/dev/a-b"
+    monkeypatch.setattr(os, "getcwd", lambda: our_cwd)
+
+    projects = isolated_home / ".claude" / "projects"
+    dir_ours = projects / our_cwd.replace("/", "-")
+    dir_theirs = projects / their_cwd.replace("/", "-")
+    assert dir_theirs.name == our_cwd.replace("/", "-").replace("_", "-"), (
+        "fixture premise: their real dir name equals one of our fold variants"
+    )
+    dir_ours.mkdir(parents=True)
+    dir_theirs.mkdir(parents=True)
+
+    my_sid = "1212121-1111-2222-3333-444444444444"
+    their_sid = "3434343-1111-2222-3333-444444444444"
+    mine = dir_ours / f"{my_sid}.jsonl"
+    stranger = dir_theirs / f"{their_sid}.jsonl"
+    mine.write_text(_jsonl_line(our_cwd), encoding="utf-8")
+    stranger.write_text(_jsonl_line(their_cwd), encoding="utf-8")
+    now = time.time()
+    os.utime(mine, (now - 3600, now - 3600))
+    os.utime(stranger, (now, now))  # strictly newer, and kept by the pre-filter
+
+    assert obsidian_utils._try_slow_jsonl_glob("a_b") == my_sid
+
+
+def test_transcript_arbitration_ignores_a_transcript_with_no_cwd_field(
+    isolated_home, tmp_path, monkeypatch
+):
+    """"Cannot tell" must not read as "not ours": a transcript with no usable
+    cwd leaves its directory to the encoding pre-filter, which still keeps it.
+    """
+    here = tmp_path / "ws" / "docs"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+    cwd = os.getcwd()
+
+    projects = isolated_home / ".claude" / "projects"
+    mine = projects / cwd.replace("/", "-")
+    stranger = projects / "-Users-x-dev-other-docs"
+    mine.mkdir(parents=True)
+    stranger.mkdir(parents=True)
+    my_sid = "5656565-1111-2222-3333-444444444444"
+    (mine / f"{my_sid}.jsonl").write_text("not json at all\n", encoding="utf-8")
+    (stranger / "7878787-1111-2222-3333-444444444444.jsonl").write_text(
+        "{}\n", encoding="utf-8"
+    )
+
+    assert obsidian_utils._try_slow_jsonl_glob("docs") == my_sid
+
+
+def test_transcript_cwd_reads_only_the_head_of_a_huge_transcript(tmp_path):
+    """The S7 read is bounded: a transcript larger than the window still yields
+    its cwd from the first line, and the window never grows with the file."""
+    big = tmp_path / "huge.jsonl"
+    with open(big, "w", encoding="utf-8") as f:
+        f.write(_jsonl_line("/Users/x/dev/repo"))
+        f.write(json.dumps({"pad": "z" * 500_000}) + "\n")
+    assert obsidian_utils._transcript_cwd(str(big)) == "/Users/x/dev/repo"
+    # A cwd that only appears past the window is deliberately not found.
+    late = tmp_path / "late.jsonl"
+    with open(late, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"pad": "z" * 200_000}) + "\n")
+        f.write(_jsonl_line("/Users/x/dev/repo"))
+    assert obsidian_utils._transcript_cwd(str(late)) is None
+
+
+def test_ambiguous_glob_warns_once_not_once_per_note(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """I3: the refusal WARN sits on a path _get_session_id_fast() re-runs once
+    per NOTE (read_note_metadata calls it before its own cache lookup), so a
+    /check-items sweep over a few hundred notes emitted a few hundred copies,
+    all of them into the model's context. One per distinct ambiguity.
+    """
+    here = tmp_path / "elsewhere" / "docs"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+
+    projects = isolated_home / ".claude" / "projects"
+    for name, sid in (
+        ("-Users-x-dev-one-workspace-docs", "1111111-aaaa-bbbb-cccc-dddddddddddd"),
+        ("-Users-x-dev-two-workspace-docs", "2222222-aaaa-bbbb-cccc-dddddddddddd"),
+    ):
+        d = projects / name
+        d.mkdir(parents=True)
+        (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    for _ in range(200):
+        assert obsidian_utils._resolve_session_id() == "unknown"
+
+    err = capsys.readouterr().err
+    assert err.count("refusing to guess") == 1, (
+        f"expected exactly one refusal WARN, got {err.count('refusing to guess')}"
+    )
+
+
+def test_sole_matching_dir_that_is_not_this_cwd_is_used_but_announced(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """S6: the sole-match leniency stays (restricting it broke 11 pre-existing
+    tests, and an unobserved encoding would strand a correct match) — but with
+    a known, encodable cwd that the sole directory does not match, the code has
+    positive evidence of a probable mis-match and must not stay silent.
+    """
+    here = tmp_path / "cc-token-router"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    sid = "8888888-aaaa-bbbb-cccc-dddddddddddd"
+    d = (isolated_home / ".claude" / "projects"
+         / "-Users-x-dev-claude-workspace-cc-token-router")
+    d.mkdir(parents=True)
+    (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert obsidian_utils._try_slow_jsonl_glob("cc-token-router") == sid
+    assert obsidian_utils._try_slow_jsonl_glob("cc-token-router") == sid
+    err = capsys.readouterr().err
+    assert err.count("does not encode the current cwd") == 1, err
+
+
+def test_sole_matching_dir_contradicted_by_its_transcripts_is_refused(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """The live ~/.openclaw case, and the reason the '.' fold needs a backstop.
+
+    Folding '.' is correct — Claude Code really does fold it — but it turns the
+    basename of `/Users/me/.openclaw` into the suffix `-openclaw`, which the
+    glob then matches against `-Users-me-dev-claude-workspace-openclaw`: a
+    DIFFERENT repo that happens to end in the same segment, and the only match,
+    so the sole-match leniency would hand back its session as fact. Verified on
+    this machine: the dot-encoded dir for ~/.openclaw exists with 0 transcripts,
+    while those 17 transcripts say `cwd: /Users/me/dev/claude_workspace/openclaw`
+    on every line. Proof beats leniency — refuse, and say why.
+    """
+    here = tmp_path / ".openclaw"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    stranger = (isolated_home / ".claude" / "projects"
+                / "-Users-x-dev-claude-workspace-openclaw")
+    stranger.mkdir(parents=True)
+    (stranger / "7171717-1111-2222-3333-444444444444.jsonl").write_text(
+        _jsonl_line("/Users/x/dev/claude_workspace/openclaw"), encoding="utf-8"
+    )
+
+    assert obsidian_utils._resolve_session_id() == "unknown"
+    err = capsys.readouterr().err
+    assert "refusing to use it" in err, err
+    assert "/Users/x/dev/claude_workspace/openclaw" in err
+
+
+def test_sole_matching_dir_confirmed_by_its_transcripts_is_kept_silently(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """The mirror image: a directory whose name is none of the encodings we
+    generate (a symlinked checkout, a future CC scheme) but whose transcripts
+    name this exact cwd. Proof keeps it, and there is nothing to warn about.
+    """
+    here = tmp_path / "weird-project"
+    here.mkdir()
+    monkeypatch.chdir(here)
+    cwd = os.getcwd()
+
+    sid = "6262626-1111-2222-3333-444444444444"
+    d = (isolated_home / ".claude" / "projects"
+         / "-some-entirely-unguessable-encoding-of-weird-project")
+    d.mkdir(parents=True)
+    (d / f"{sid}.jsonl").write_text(_jsonl_line(cwd), encoding="utf-8")
+
+    assert obsidian_utils._try_slow_jsonl_glob("weird-project") == sid
+    assert "WARN" not in capsys.readouterr().err
+
+
+def test_resolve_session_id_cwd_gone_with_env_dir_still_reaches_recent_bootstrap(
+    isolated_home, monkeypatch
+):
+    """I5: gating layer 4 on 'basename is None' narrowed #105 more than the
+    docs claimed. CLAUDE_PROJECT_DIR is only consulted AFTER os.getcwd() raised
+    — so a basename from it already means cwd is gone, which is #105's case —
+    and hooks are exactly where Claude Code sets that variable. With layer 3
+    missing (a dot-named worktree with no transcripts of its own), develop
+    recovered the sid here and the first fix returned 'unknown'.
+    """
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    sid = _unique_sid()
+    _seed_bootstrap(isolated_home, "deleted-worktree", sid)
+
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/Users/x/dev/.hidden-worktree")
+
+    assert obsidian_utils._resolve_session_id() == sid
+
+
+def test_resolve_session_id_readable_cwd_still_refuses_the_recent_bootstrap(
+    isolated_home, tmp_path, monkeypatch
+):
+    """The other side of I5's gate: a READABLE cwd (the actual #260 bug) must
+    still never reach the cross-project scan, however the basename was spelled.
+    """
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    _seed_bootstrap(isolated_home, "some-other-project", _unique_sid())
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/Users/x/dev/whatever")
+
+    here = tmp_path / "pitch" / "docs"
+    here.mkdir(parents=True)
+    monkeypatch.chdir(here)
+
+    assert obsidian_utils._resolve_session_id() == "unknown"
+
+
+def test_get_session_context_announces_an_unresolvable_session_once(
+    isolated_home, tmp_path, monkeypatch, capsys
+):
+    """I4: 'unknown' is the most common exit from the resolver and was the only
+    one with no diagnostic. Downstream, /retro prints "no prior-session evidence
+    found", asserting a fact about the VAULT when the truth is a fact about the
+    RESOLVER — the user cannot tell a fresh session from a resolution failure.
+    """
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: "unknown")
+
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+    here = tmp_path / "live-project"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    for _ in range(5):
+        ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
+        assert ctx["session_id"] == "unknown"
+
+    err = capsys.readouterr().err
+    assert err.count("could not identify the current session") == 1, err
+    assert os.getcwd() in err
+    assert "session-scoped evidence" in err

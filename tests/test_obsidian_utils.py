@@ -2624,15 +2624,43 @@ def test_get_session_id_fast_same_second_tiebreaker(tmp_path, monkeypatch):
 
 def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypatch):
     """When multiple project dirs contain the cached sid's JSONL, at least one
-    must tie the newest mtime for the cache to be trusted."""
+    must tie the newest mtime for the cache to be trusted.
+
+    The competing JSONL is named so that it sorts AFTER the cached sid. That is
+    load-bearing: `max(viable)` breaks an mtime tie on the path string, so with
+    a lexicographically smaller competitor the cached sid would come back as
+    `newest_sid` and the function would return one branch EARLIER — the
+    tiebreaker this test is named for would never execute (it did not, before
+    this rename).
+
+    The two directories are the two path ENCODINGS Claude Code has used for
+    this same cwd (older CC kept '_' in the encoded name, current CC folds it
+    to '-'), which is how a single checkout legitimately owns more than one
+    dir under ~/.claude/projects/ — verified on a live machine, where both
+    `-Users-<me>-...-claude_workspace-obsidian-brain` and
+    `-Users-<me>-...-claude-workspace-obsidian-brain` exist. Unrelated dirs that
+    merely share the basename suffix are NOT the same project and are refused
+    outright since #260 — see
+    test_glob_project_jsonls_refuses_when_no_dir_encodes_cwd.
+    """
     import obsidian_utils
     import os
     import time
 
     project_basename = "multi-proj"
-    # Two project-dir variants (like worktrees)
-    dir_a = tmp_path / ".claude" / "projects" / f"-alpha-{project_basename}"
-    dir_b = tmp_path / ".claude" / "projects" / f"-beta-{project_basename}"
+    # The '_' lives in a PARENT segment, so both encodings still END in
+    # "-multi-proj" and the `*<basename>` suffix glob matches both dirs —
+    # which is what makes this a multi-match tiebreaker test at all.
+    proj_dir = tmp_path / "multi_ws" / project_basename
+    proj_dir.mkdir(parents=True)
+    monkeypatch.chdir(proj_dir)
+    cwd = os.getcwd()  # resolved (macOS /private/... ) — encode from the real cwd
+
+    projects_root = tmp_path / ".claude" / "projects"
+    # Variant A keeps '_', variant B folds it to '-' — both encode THIS cwd.
+    dir_a = projects_root / cwd.replace("/", "-")
+    dir_b = projects_root / cwd.replace("/", "-").replace("_", "-")
+    assert dir_a != dir_b, "fixture needs two distinct encodings of one cwd"
     dir_a.mkdir(parents=True)
     dir_b.mkdir(parents=True)
 
@@ -2640,7 +2668,7 @@ def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypa
     # Put the cached sid's jsonl in BOTH project dirs
     a_jsonl = dir_a / f"{cached_sid}.jsonl"
     b_jsonl = dir_b / f"{cached_sid}.jsonl"
-    other_jsonl = dir_b / "other-sid-5678.jsonl"
+    other_jsonl = dir_b / "zzz-other-sid-5678.jsonl"  # sorts after cached_sid
     a_jsonl.write_text("{}", encoding="utf-8")
     b_jsonl.write_text("{}", encoding="utf-8")
     other_jsonl.write_text("{}", encoding="utf-8")
@@ -2653,9 +2681,6 @@ def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypa
     os.utime(b_jsonl, (now, now))  # tied with other
     os.utime(other_jsonl, (now, now))  # tied with b
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
