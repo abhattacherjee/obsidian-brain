@@ -213,6 +213,200 @@ class TestReadNoteMetadata:
         assert result is None
 
 
+# ---------------------------------------------------------------------------
+# #283: read_note_metadata used to read only the first 40 lines and never
+# checked that a closing '---' was actually found. Both failure modes were
+# measured on the live vault: 26 notes lost their `tags` (the block starts
+# past line 40) and 28 notes had no closing fence within 40 lines, so body
+# prose was harvested into fields. These tests pin both, plus the bound the
+# fix is allowed to keep (a bounded read, not a whole-file slurp).
+# ---------------------------------------------------------------------------
+
+
+class TestReadNoteMetadataFrontmatterBounds:
+    def test_tags_block_past_line_40_is_recovered(self, tmp_path, monkeypatch):
+        """A `tags:` block starting below line 40 must still parse.
+
+        Restoring the old `if i >= 40: break` bound makes this fail: the
+        reader never reaches the tags block or the closing fence.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        filler = "\n".join(f"field_{i:02d}: value-{i:02d}" for i in range(45))
+        note = tmp_path / "deep.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            f"{filler}\n"
+            "project: deep-project\n"
+            "tags:\n"
+            "  - claude/session\n"
+            "  - claude/project/deep-project\n"
+            "---\n"
+            "\n# Body\n",
+            encoding="utf-8",
+        )
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is not None
+        assert meta["project"] == "deep-project"
+        assert meta["tags"] == ["claude/session", "claude/project/deep-project"]
+
+    def test_unclosed_fence_returns_none_and_forges_no_fields(
+        self, tmp_path, monkeypatch
+    ):
+        """The issue's own fixture: an opening fence, no closing fence.
+
+        Without the split_frontmatter guard the old parser walked into the
+        body and manufactured fields out of prose — `status` here is a
+        sentence, not a field, and `Note:` is a paragraph opener.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "unclosed.md"
+        note.write_text(
+            "---\n"
+            "type: session\n"
+            "# My Note\n"
+            "\n"
+            "Note: this is body prose\n"
+            "status: NOT REALLY A FIELD\n",
+            encoding="utf-8",
+        )
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is None, f"expected None for an unfenced note, got {meta!r}"
+
+    def test_unclosed_fence_result_is_cached_as_no_frontmatter(
+        self, tmp_path, monkeypatch
+    ):
+        """Second call must also return None (sentinel cached, not a dict)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: "fixed-sid-283")
+
+        note = tmp_path / "unclosed-cached.md"
+        note.write_text("---\ntype: session\n# My Note\n\nprose\n", encoding="utf-8")
+
+        assert obsidian_utils.read_note_metadata(str(note)) is None
+        assert obsidian_utils.read_note_metadata(str(note)) is None
+
+    def test_bare_cr_inside_a_value_is_not_a_line_terminator(
+        self, tmp_path, monkeypatch
+    ):
+        """`newline=""` guarantee: a bare \\r inside a value stays in the value.
+
+        This fixture is built so universal-newline mode gives a DIFFERENT
+        parse, not just different whitespace: with newline=None the \\r is
+        translated to \\n before split_lines_lf_crlf runs, splitting one
+        `title:` line into two frontmatter lines and forging a `status`
+        field. Dropping `newline=""` from _read_frontmatter_region makes
+        both assertions below fail.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "bare-cr.md"
+        note.write_bytes(
+            b'---\ntype: claude-session\ntitle: "before\rstatus: forged"\n---\n\nbody\n'
+        )
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is not None
+        assert meta["title"] == "before\rstatus: forged"
+        assert "status" not in meta, (
+            "a bare \\r was treated as a line break, forging a status field"
+        )
+
+    def test_frontmatter_over_the_line_limit_returns_none(self, tmp_path, monkeypatch):
+        """Past MAX_FRONTMATTER_LINES the block is rejected, not truncated."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        limit = obsidian_utils.MAX_FRONTMATTER_LINES
+        bulk = "\n".join(f"field_{i:05d}: v{i}" for i in range(limit + 100))
+        note = tmp_path / "oversized.md"
+        note.write_text(f"---\n{bulk}\n---\n\n# Body\n", encoding="utf-8")
+
+        assert obsidian_utils.read_note_metadata(str(note)) is None
+
+    def test_read_is_bounded_and_does_not_slurp_the_whole_file(
+        self, tmp_path, monkeypatch
+    ):
+        """The reader must stop once the frontmatter region can't extend.
+
+        read_note_metadata is called in a loop over the whole vault by
+        build_context_brief, so a whole-file read would add tens of MB of
+        decode per /recall. Spy on the file object and assert we read a
+        small fraction of a deliberately huge note.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "huge.md"
+        # >MAX_FRONTMATTER_LINES body lines so the block-scan can terminate
+        # before EOF, each line fat enough that a full read is unmistakable.
+        body = "".join("z" * 400 + "\n" for _ in range(20_000))
+        note.write_text(
+            "---\ntype: claude-session\nproject: huge\nstatus: summarized\n---\n" + body,
+            encoding="utf-8",
+        )
+        file_size = note.stat().st_size
+        assert file_size > 6_000_000  # ~8 MB fixture
+
+        spy = _install_read_spy(monkeypatch, str(note))
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is not None and meta["project"] == "huge"
+        assert spy["chars"] > 0, "spy never saw a read — instrumentation broke"
+        assert spy["chars"] < file_size / 4, (
+            f"read {spy['chars']} of {file_size} chars — the read is not bounded"
+        )
+
+
+def _install_read_spy(monkeypatch, target_path: str) -> dict:
+    """Patch builtins.open so reads of ``target_path`` are counted.
+
+    Every other path (session cache, config) passes through untouched, so
+    this stays safe to install for the duration of one call.
+    """
+    import builtins
+
+    stats = {"chars": 0, "calls": 0}
+    real_open = builtins.open
+
+    class _CountingReader:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def read(self, size=-1):
+            data = self._fh.read(size)
+            stats["calls"] += 1
+            stats["chars"] += len(data)
+            return data
+
+        def __iter__(self):
+            return iter(self._fh)
+
+        def __enter__(self):
+            self._fh.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._fh.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
+
+    def fake_open(file, *args, **kwargs):
+        fh = real_open(file, *args, **kwargs)
+        if str(file) == target_path:
+            return _CountingReader(fh)
+        return fh
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    return stats
+
+
 # ===========================================================================
 # Section 3: Message extraction
 # ===========================================================================

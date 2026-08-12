@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Vault notes with long frontmatter no longer lose their tags, and notes with broken frontmatter no longer have fields invented for them (#283):** the metadata reader shared by `/recall`, snapshot discovery and `/retro`'s evidence bundle only ever looked at the first 40 lines of a note (30 for the lighter field peek), so any field below that — most often the `tags:` block on `/emerge` and `/standup` notes, whose frontmatter runs as deep as line 460 — was silently invisible. Measured on the live vault: **26 notes were losing their tags entirely**. The same reader also never checked that a note's frontmatter was actually closed, so on a note with a broken fence it would keep reading into the body and hand back prose as though it were metadata — including manufacturing a `status:` field out of a sentence that merely started with the word. Both readers now use the same bounded, shape-checked frontmatter parser as the search index (#277) and return nothing at all for a note they cannot parse, rather than something wrong.
+
 ## [3.5.0] - 2026-08-11
 
 ### Fixed

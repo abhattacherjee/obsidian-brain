@@ -15,10 +15,6 @@ is a follow-up, not done here:
 - ``scripts/vault_doctor_checks/missing_frontmatter_fence.py`` (needs
   ``_FM_KEY_RE``/``_FM_ITEM_RE``/``_FM_CONT_RE`` individually, which this
   module does not yet export as public names)
-- ``obsidian_utils.read_note_metadata`` (40-line bound, no shape check, no
-  guard if the closing fence never appears within the bound)
-- ``obsidian_utils._peek_frontmatter_field`` (30-line bound, no shape check;
-  returns None either way, so a missing closing fence is harmless here)
 - the ``/recall`` note-upgrade path in ``obsidian_utils.py`` (no bound, no
   shape check, but does fail loudly if no closing fence is found)
 - ``compress_guard.topic_snippet`` (no bound, no shape check; leaves the

@@ -32,6 +32,17 @@ except ImportError as exc:
     print(f"[obsidian-brain] vault_index not available, access tracking disabled: {exc}",
           file=sys.stderr)
 
+# Unguarded (unlike vault_index above) and imported the same way vault_index.py
+# imports it: frontmatter.py is stdlib-`re`-only and has no siblings to fail on,
+# so there is nothing for a try/except to degrade to — a caller that cannot
+# import it cannot parse frontmatter at all. No cycle: this module already
+# imports vault_index, which imports frontmatter.
+from frontmatter import (  # noqa: E402
+    MAX_FRONTMATTER_LINES,
+    split_frontmatter,
+    split_lines_lf_crlf,
+)
+
 # Session IDs are CC UUIDs (or test fixtures). Restrict to safe filename chars
 # so the marker path never escapes ~/.claude/obsidian-brain/sessions/.
 _SID_FILENAME_SAFE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
@@ -355,50 +366,110 @@ def get_retro_classification_pending(session_id: str) -> dict | None:
         return None
 
 
-def _peek_frontmatter_field(path: Path, field: str) -> str | None:
-    """Return the unquoted YAML scalar for ``field:`` from a vault note's
-    frontmatter, or None. Reads at most 30 lines to keep the cost negligible
-    even when called on hash-collision (which is rare).
+def _read_frontmatter_region(path: str | Path) -> list[str] | None:
+    """Read at most ``MAX_FRONTMATTER_LINES + 1`` logical lines from *path*
+    and return them in ``split_lines_lf_crlf`` form (terminators attached),
+    or None if the file cannot be read.
 
-    Stops at the closing ``---`` marker. Quote-stripping handles the common
-    cases ``"value"`` and ``'value'``; unquoted scalars are returned verbatim.
-    Empty values (``field:`` with no scalar) are normalized to None for clean
-    truthy-checks at call sites.
+    Bounded on purpose. The callers below run in loops over the whole vault
+    (``build_context_brief`` touches ~1000 session notes + ~1100 insight
+    notes, p90 50 KB each), so slurping whole files to find a fence that
+    lives in the first few dozen lines would add tens of MB of decode per
+    ``/recall``. The old bounds (40 and 30 lines) were cheap for the same
+    reason — they were just too tight to contain a real frontmatter block,
+    which is the bug this replaces (#283).
+
+    Truncating to ``MAX_FRONTMATTER_LINES + 1`` lines is semantics-preserving
+    for ``split_frontmatter``: it only ever inspects
+    ``lines[1:min(len(lines), MAX_FRONTMATTER_LINES + 1)]`` (so index
+    ``MAX_FRONTMATTER_LINES`` is the deepest line it can read), and its
+    "frontmatter exceeds N lines" branch triggers on
+    ``len(lines) > MAX_FRONTMATTER_LINES`` — a ``MAX + 1``-line prefix
+    reproduces both exactly. Body lines past the fence are dropped, which is
+    fine: neither caller uses ``body_lines``.
+
+    The block-sized reads stop only once the accumulated text holds MORE than
+    ``MAX_FRONTMATTER_LINES`` newlines, i.e. at least ``MAX + 1`` fully
+    terminated lines. So the possibly-partial final line sitting at a block
+    boundary always lands at index ``>= MAX + 1`` and is discarded by the
+    slice — a truncated line can never be handed to the parser.
     """
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            in_frontmatter = False
-            for i, line in enumerate(fh):
-                if i >= 30:
+        # newline="" (universal-newline translation OFF) is required here,
+        # not cosmetic: split_lines_lf_crlf below is documented to treat a
+        # bare "\r" as NOT a line terminator. Opening with the default
+        # newline=None translates every bare "\r" to "\n" before the
+        # splitter ever sees it, silently defeating that guarantee. Same
+        # reasoning as vault_index._parse_note_detailed (#277 follow-up).
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+            chunks: list[str] = []
+            newlines = 0
+            while newlines <= MAX_FRONTMATTER_LINES:
+                block = fh.read(8192)
+                if not block:
                     break
-                stripped = line.strip()
-                if stripped == "---":
-                    if not in_frontmatter:
-                        in_frontmatter = True
-                        continue
-                    break  # closing marker
-                if not in_frontmatter:
-                    continue
-                if stripped.startswith(f"{field}:"):
-                    value = stripped[len(field) + 1:].strip()
-                    if (value.startswith('"') and value.endswith('"')) or \
-                       (value.startswith("'") and value.endswith("'")):
-                        value = value[1:-1]
-                    if not value:
-                        print(
-                            f"[obsidian-brain] _peek_frontmatter_field: {path.name} has empty "
-                            f"{field!r} field — possible mid-write or corruption",
-                            file=sys.stderr,
-                        )
-                        return None
-                    return value
-    except (OSError, UnicodeDecodeError) as exc:
+                chunks.append(block)
+                # "\r\n" contains "\n", so this counts CRLF lines correctly;
+                # a bare "\r" is deliberately not counted (see above).
+                newlines += block.count("\n")
+    except OSError:
+        return None
+
+    lines = split_lines_lf_crlf("".join(chunks))
+    return lines[:MAX_FRONTMATTER_LINES + 1]
+
+
+def _peek_frontmatter_field(path: Path, field: str) -> str | None:
+    """Return the unquoted YAML scalar for ``field:`` from a vault note's
+    frontmatter, or None.
+
+    The frontmatter block is located by ``frontmatter.split_frontmatter`` (via
+    ``_read_frontmatter_region``), the same bounded, shape-checked scan the
+    index uses. This replaces a 30-line bound that missed fields in any note
+    with a long ``tags:``/``projects:`` block, and — more dangerously — a scan
+    that returned whatever ``field:``-shaped line it found even when no
+    closing ``---`` was ever seen, i.e. a value scavenged from body prose
+    (#283).
+
+    Quote-stripping handles the common cases ``"value"`` and ``'value'``;
+    unquoted scalars are returned verbatim. Empty values (``field:`` with no
+    scalar) are normalized to None for clean truthy-checks at call sites.
+    """
+    lines = _read_frontmatter_region(path)
+    if lines is None:
+        # The shared reader normalizes OSError to None, so the errno string
+        # is no longer available here; the diagnostic stays because a file
+        # silently dropped from resolver filtering is the thing that needs
+        # to be observable, not the specific errno.
         print(
             f"[obsidian-brain] _peek_frontmatter_field: cannot read {path.name} "
-            f"for field={field!r}: {exc}; this file will be excluded from filtering",
+            f"for field={field!r}; this file will be excluded from filtering",
             file=sys.stderr,
         )
         return None
+
+    _open_fence, fm_lines, _close_fence, _body_lines, split_err = split_frontmatter(lines)
+    if split_err:
+        # No opening fence, no closing fence, or an oversized block: there is
+        # no frontmatter region to read a field out of. Returning a match from
+        # the unfenced region would be the forged-field bug (#283).
+        return None
+
+    for raw_line in fm_lines:
+        stripped = raw_line.strip()
+        if stripped.startswith(f"{field}:"):
+            value = stripped[len(field) + 1:].strip()
+            if (value.startswith('"') and value.endswith('"')) or \
+               (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            if not value:
+                print(
+                    f"[obsidian-brain] _peek_frontmatter_field: {path.name} has empty "
+                    f"{field!r} field — possible mid-write or corruption",
+                    file=sys.stderr,
+                )
+                return None
+            return value
     return None
 
 
@@ -1442,7 +1513,17 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
 def read_note_metadata(file_path: str) -> dict | None:
     """Parse YAML frontmatter from a vault note. Returns dict or None.
 
-    Reads first 40 lines, extracts fields between --- markers.
+    The frontmatter block is located by ``frontmatter.split_frontmatter`` (via
+    ``_read_frontmatter_region``), so a note whose fields sit deep in a long
+    ``tags:``/``projects:`` block parses like any other, and a note whose
+    closing ``---`` is missing returns None instead of harvesting body prose
+    into fields — an unfenced ``Note: this is body prose`` line used to become
+    a real ``meta['Note']`` entry, and a prose line beginning ``status:``
+    used to forge a ``status`` field the note never had (#283).
+
+    ``tags`` is returned as a **list** here, unlike the index's parser which
+    joins it to a comma string — callers of this function index into it.
+
     Cached per file path within the session.
     """
     sid = _get_session_id_fast()
@@ -1452,17 +1533,18 @@ def read_note_metadata(file_path: str) -> dict | None:
     if cached is not None:
         return None if cached == _CACHE_SENTINEL else cached
 
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            lines = []
-            for i, line in enumerate(f):
-                if i >= 40:
-                    break
-                lines.append(line)
-    except OSError:
+    lines = _read_frontmatter_region(file_path)
+    if lines is None:
+        # Unreadable file: return None WITHOUT caching the sentinel — the
+        # failure is about the read, not about the note's content, and a
+        # transient error must not pin "no frontmatter" for the session.
         return None
 
-    if not lines or lines[0].strip() != '---':
+    _open_fence, fm_lines, _close_fence, _body_lines, split_err = split_frontmatter(lines)
+    if split_err:
+        # Covers all three malformed shapes: no opening fence, no closing
+        # fence, and an oversized frontmatter block. Each means "this note
+        # has no parsable frontmatter", which is what the sentinel records.
         cache_set(sid, cache_key, _CACHE_SENTINEL)
         return None
 
@@ -1470,10 +1552,8 @@ def read_note_metadata(file_path: str) -> dict | None:
     tags: list[str] = []
     in_tags = False
 
-    for line in lines[1:]:
+    for line in fm_lines:
         stripped = line.strip()
-        if stripped == '---':
-            break
         if stripped.startswith('- ') and in_tags:
             tags.append(stripped[2:].strip())
             continue

@@ -485,15 +485,89 @@ def test_is_resumed_session_handles_collision_pair(tmp_path, monkeypatch, capsys
     assert "WARN" in captured.err or "collide" in captured.err.lower()  # 'collide' (singular)
 
 
-def test_peek_frontmatter_field_handles_invalid_utf8(tmp_path, capsys):
-    """A file with invalid UTF-8 bytes returns None and logs to stderr,
-    rather than raising and breaking the resolver chain."""
+def test_peek_frontmatter_field_handles_invalid_utf8(tmp_path):
+    """Invalid UTF-8 bytes in one field must not take out the whole file.
+
+    Before #283 this decoded strictly, raised UnicodeDecodeError, and the
+    note was dropped from resolver filtering entirely. The shared reader
+    decodes with errors="replace" (same as the index's parser), so the
+    corrupt bytes become U+FFFD in *that* field and every other field still
+    resolves. The unreadable-file diagnostic still exists — see
+    test_peek_frontmatter_field_unreadable_file_logs — it just no longer
+    fires for a byte-level decode problem, which is recoverable."""
     note = tmp_path / "n.md"
     note.write_bytes(b"---\ntype: claude-session\nbad: \xff\xfe\n---\n")
-    result = obsidian_utils._peek_frontmatter_type(note)
-    assert result is None
+    assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
+
+
+def test_peek_frontmatter_field_unreadable_file_logs(tmp_path, capsys):
+    """An unreadable file returns None and says so on stderr, so a note
+    silently dropped from filtering stays observable."""
+    missing = tmp_path / "does-not-exist.md"
+    assert obsidian_utils._peek_frontmatter_type(missing) is None
     captured = capsys.readouterr()
-    assert "cannot read" in captured.err.lower() or "decode" in captured.err.lower()
+    assert "cannot read" in captured.err.lower()
+
+
+# ---------------------------------------------------------------------------
+# #283: _peek_frontmatter_field used to read 30 lines and return whatever
+# `field:`-shaped line it found, even when no closing '---' was ever seen.
+# ---------------------------------------------------------------------------
+
+
+def test_peek_frontmatter_field_reads_field_past_line_30(tmp_path):
+    """A field below the old 30-line bound must still be found.
+
+    Restoring `if i >= 30: break` makes this fail."""
+    note = tmp_path / "deep.md"
+    filler = "\n".join(f"field_{i:02d}: v{i}" for i in range(60))
+    note.write_text(
+        f"---\n{filler}\nproject_path: \"/Users/a/dev/deep\"\n---\n\n# Body\n",
+        encoding="utf-8",
+    )
+    assert obsidian_utils._peek_frontmatter_project_path(note) == "/Users/a/dev/deep"
+
+
+def test_peek_frontmatter_field_unclosed_fence_returns_none(tmp_path):
+    """The issue's fixture: no closing fence, so `status:` in the body is
+    prose, not a field. Returning it would be reading a value out of the
+    note's text."""
+    note = tmp_path / "unclosed.md"
+    note.write_text(
+        "---\n"
+        "type: session\n"
+        "# My Note\n"
+        "\n"
+        "Note: this is body prose\n"
+        "status: NOT REALLY A FIELD\n",
+        encoding="utf-8",
+    )
+    assert obsidian_utils._peek_frontmatter_field(note, "status") is None
+    # …and the fields *above* the break are refused too: the file has no
+    # valid frontmatter region at all, so nothing in it can be trusted.
+    assert obsidian_utils._peek_frontmatter_type(note) is None
+
+
+def test_peek_frontmatter_field_bare_cr_is_not_a_line_terminator(tmp_path):
+    """`newline=""` guarantee, in a form that changes the parse result:
+    under universal-newline translation the bare \\r splits the `title:`
+    line and a bogus `status` field appears."""
+    note = tmp_path / "bare-cr.md"
+    note.write_bytes(
+        b'---\ntype: claude-session\ntitle: "before\rstatus: forged"\n---\n\nbody\n'
+    )
+    assert obsidian_utils._peek_frontmatter_field(note, "status") is None
+    assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
+
+
+def test_peek_frontmatter_field_oversized_frontmatter_returns_none(tmp_path):
+    """Past MAX_FRONTMATTER_LINES the block is rejected rather than
+    half-parsed."""
+    note = tmp_path / "oversized.md"
+    limit = obsidian_utils.MAX_FRONTMATTER_LINES
+    bulk = "\n".join(f"field_{i:05d}: v{i}" for i in range(limit + 100))
+    note.write_text(f"---\ntype: claude-session\n{bulk}\n---\n\n# Body\n", encoding="utf-8")
+    assert obsidian_utils._peek_frontmatter_type(note) is None
 
 
 def test_peek_frontmatter_field_logs_empty_value(tmp_path, capsys):
