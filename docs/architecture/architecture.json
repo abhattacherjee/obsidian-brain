@@ -1,7 +1,7 @@
 {
   "name": "obsidian-brain",
   "displayName": "Obsidian Brain",
-  "version": "3.4.2",
+  "version": "3.5.0",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
   "lastUpdated": "2026-08-11",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
