@@ -1815,6 +1815,195 @@ _COMPLETION_PHRASE_RE = re.compile(
 )
 _HEURISTIC_PROXIMITY_CHARS = 120
 
+# ---------------------------------------------------------------------------
+# #299: conditional / forward-looking guard on the heuristic's DONE verdict
+#
+# Token-near-phrase co-occurrence cannot tell a CLAIM of past completion
+# ("Fixed in #51") from a REFERENCE to a completion that has not happened yet
+# ("Waiting on #51 to be closed", "Blocked until #64 is resolved"). Both shapes
+# put a distinctive token within 120 chars of a completion phrase, so the
+# pre-#299 rule called every one of them DONE. Production case from the issue:
+#   "Confirm whether a fresh /plugin update on adversarial-review will pull
+#    the new version once #51 is resolved"
+# The guard therefore looks at what GOVERNS the co-occurrence, in two tiers.
+#
+# Tier 1 — pending-intent cues. These name an outstanding action by the
+# author of the item (waiting/blocking, or verification-intent). If one governs
+# the co-occurrence, the item is about *reaching* the completion, whatever the
+# tense of the phrase, so the cue alone rejects DONE. "Confirm #51 was merged"
+# is an open verification task even though "was merged" is past tense.
+#
+# Tier 2 — time/condition subordinators. These appear just as often inside
+# genuine completion claims ("After the outage we finally fixed #51"), so on
+# their own they would cost real DONEs. They reject only when the completion
+# phrase is ALSO in a forward-looking form (see _FORWARD_FORM_RE).
+#
+# Both tiers are searched only in the text to the LEFT of the completion phrase,
+# because a cue governs what follows it: "Fixed in #51 — confirm with the team"
+# is a completion claim with a follow-up note attached, not a pending item. Cost
+# of that scoping: a cue placed after the co-occurrence never fires. That is
+# deliberate — it is the difference between narrowing DONE and rejecting it
+# everywhere, and an over-corrected heuristic that only ever says ACTIVE is a
+# silent failure of its own.
+#
+# The two tiers differ in how far left they look, and the split is grounded in
+# what each kind of cue scopes over:
+#   * A tier-1 cue describes the ITEM's own action, so it is searched across the
+#     whole enclosing SENTENCE, clause boundaries included. Live vault case:
+#     "Monitor when PR #228 merges to main; auto-promote #227 on next release" —
+#     'Monitor' sits two clauses before the #227/'release' pair it governs, and
+#     clause-clipping let that one through as DONE.
+#   * A tier-2 subordinator scopes over its own CLAUSE, so it is clipped at
+#     ';'/':' as well. Widened to the sentence, "Fix #99 merged - this work is
+#     done; release shipped." style notes start losing real DONEs.
+# A (token, phrase) pair must itself sit within one sentence to qualify at all —
+# "Blocked until #64 is resolved. Fixed #12." pairs #12 with 'Fixed', not with
+# the governed 'resolved' in the sentence next door.
+# ---------------------------------------------------------------------------
+
+# Sentence and clause terminators. The `(?=\s|$)` lookahead is load-bearing: it
+# stops "v1.2.0" and "3.4.1" from being split into separate sentences.
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?](?=\s|$))|\n")
+_CLAUSE_BOUNDARY_RE = re.compile(r"(?:[.;:!?](?=\s|$))|\n")
+
+# Tier 1 — self-sufficient. Waiting/blocking language plus verification-intent
+# verbs. Grounded in the reported failures ("Waiting on #51...", "Blocked until
+# #64...", "Check back after v1.2.0...", "Track whether abc1234...", "Confirm
+# whether ... once #51 ...") and their immediate inflections. `validate` is in
+# the set for the #297 production case documented on assign_tier: token 'v3.4.0'
+# near completion phrase 'release' on an *unperformed* validation task.
+# `(?<![\w./-])` / `(?![./-])` keep the cue anchored to prose. Live vault case:
+# "Implement fix in git-flow#21: modify `check-pr-base.py` to allow `release/*`"
+# — a bare \b let 'check' match inside the FILENAME and reject the item for a
+# reason that has nothing to do with its meaning. A guard that fires for the
+# wrong reason is not a guard, it is a coincidence.
+_PENDING_INTENT_CUE_RE = re.compile(
+    r"(?<![\w./-])("
+    r"waiting\s+(?:on|for)|waiting|awaiting|await|"
+    r"blocked(?:\s+(?:on|by|until))?|blocker|"
+    r"pending|"
+    r"depends?\s+on|depending\s+on|dependent\s+on|"
+    r"confirm|verify|validate|ensure|double-?check|check(?:\s+back)?|"
+    r"track|monitor|revisit|follow[\s-]?up"
+    r")(?![\w./-])",
+    re.IGNORECASE,
+)
+
+# Tier 2 — needs corroboration from _FORWARD_FORM_RE.
+_CONDITIONAL_CUE_RE = re.compile(
+    r"\b(once|until|till|unless|if|when|whenever|after|before|whether)\b",
+    re.IGNORECASE,
+)
+
+# Forward-looking verb forms: copula/non-finite/modal constructions that put the
+# completion in the future or in question ("is resolved", "to be closed",
+# "will be merged", "gets merged"). Deliberately EXCLUDES past forms — "was
+# fixed", "were closed", "has been merged" are completion claims, and a tense
+# test that swept them in would turn "After the outage #51 was fixed" into a
+# false ACTIVE. That exclusion is why tense discrimination is not redundant with
+# the tier-2 cue list: it is what keeps bare-past claims out of the guard.
+_FORWARD_FORM_RE = re.compile(
+    r"\b(be|is|are|isn't|aren't|get|gets|getting|will|won't|would|should|"
+    r"shall|can|could|may|might|must|needs?|going\s+to|gonna)\b",
+    re.IGNORECASE,
+)
+
+# How far back from the completion phrase a forward-looking form may sit.
+# "will finally be closed" is 3 words; 24 chars covers that without reaching
+# across an unrelated clause.
+_FORWARD_FORM_LOOKBACK_CHARS = 24
+
+# Bound on regex matches scanned per member text, so a pathologically long
+# member cannot make the pair sweep quadratic-with-a-big-constant.
+_HEURISTIC_MAX_MATCHES = 20
+
+
+def _segment_start(text, pos, boundary_re):
+    """Index of the start of the `boundary_re`-delimited segment holding `pos`."""
+    start = 0
+    for boundary in boundary_re.finditer(text, 0, pos):
+        start = boundary.end()
+    return start
+
+
+def _sentence_start(text, pos):
+    """Index of the start of the sentence containing `pos`."""
+    return _segment_start(text, pos, _SENTENCE_BOUNDARY_RE)
+
+
+def _clause_start(text, pos):
+    """Index of the start of the clause containing `pos` (';' and ':' split)."""
+    return _segment_start(text, pos, _CLAUSE_BOUNDARY_RE)
+
+
+def _conditional_rejection(text, tok_match, phr_match):
+    """Return a human-readable reason when this token/phrase co-occurrence is
+    a forward-looking or pending reference rather than a completion claim,
+    else None (#299). See the block comment above for the two-tier rule."""
+    span_start = min(tok_match.start(), phr_match.start())
+    sent_start = _sentence_start(text, span_start)
+
+    # Tier 1: the whole sentence ahead of the phrase, clauses included.
+    pending = _PENDING_INTENT_CUE_RE.search(text, sent_start, phr_match.start())
+    if pending:
+        return (f"pending-intent cue '{pending.group(0).strip()}' governs it "
+                f"(the item's own action is still outstanding)")
+
+    # Tier 2: clipped to the clause holding the co-occurrence.
+    clause_start = _clause_start(text, span_start)
+    conditional = _CONDITIONAL_CUE_RE.search(text, clause_start, phr_match.start())
+    if not conditional:
+        return None
+
+    # Tier 2 needs a forward-looking verb form immediately before the phrase.
+    look_from = max(sent_start, phr_match.start() - _FORWARD_FORM_LOOKBACK_CHARS)
+    forward = _FORWARD_FORM_RE.search(text, look_from, phr_match.start())
+    if forward:
+        return (f"conditional cue '{conditional.group(0).strip()}' + "
+                f"forward-looking form '{forward.group(0).strip()}' make it a "
+                f"reference to future completion")
+    return None
+
+
+def _heuristic_member_verdict(text):
+    """Scan one member text for a DONE-qualifying co-occurrence (#299).
+
+    Returns (tok_match, phr_match, rejection):
+      (tok, phr, None)   - an ungoverned co-occurrence: DONE.
+      (tok, phr, reason) - every qualifying pair was governed by a
+                           conditional/pending cue: not DONE, reason for the
+                           citation.
+      (None, None, None) - no token/phrase pair within the proximity window.
+
+    All (token, phrase) pairs are considered, not just the first of each. The
+    pre-#299 code searched once for each and tested that single pair, so with
+    the guard bolted on, one governed mention ("Blocked until #64 is resolved.
+    Fixed #12.") would have suppressed a genuine claim elsewhere in the same
+    text purely because of regex match order. Widening to all pairs makes the
+    verdict a property of the content instead.
+    """
+    tokens = list(_DISTINCTIVE_TOKEN_RE.finditer(text))[:_HEURISTIC_MAX_MATCHES]
+    phrases = list(_COMPLETION_PHRASE_RE.finditer(text))[:_HEURISTIC_MAX_MATCHES]
+    first_rejection = None
+    for tok_match in tokens:
+        for phr_match in phrases:
+            if abs(tok_match.start() - phr_match.start()) > _HEURISTIC_PROXIMITY_CHARS:
+                continue
+            # A pair split across a sentence boundary is not a co-occurrence
+            # the guard can reason about: the cue region for one half would
+            # reach into the other half's clause (#299).
+            if (_sentence_start(text, tok_match.start())
+                    != _sentence_start(text, phr_match.start())):
+                continue
+            reason = _conditional_rejection(text, tok_match, phr_match)
+            if reason is None:
+                return tok_match, phr_match, None
+            if first_rejection is None:
+                first_rejection = (tok_match, phr_match, reason)
+    if first_rejection is not None:
+        return first_rejection
+    return None, None, None
+
 
 def classify_groups_heuristic(merged_groups, evidence):
     """
@@ -1823,6 +2012,10 @@ def classify_groups_heuristic(merged_groups, evidence):
     Spec § Interim coexistence Patch 2 + memory feedback_check_items_filter_tightening:
     DONE requires BOTH a distinctive token AND a completion phrase within
     +/- 120 chars in the same member text. Otherwise -> ACTIVE.
+
+    #299: that co-occurrence is additionally rejected when a conditional or
+    pending-intent cue governs it, so forward-looking items ("Blocked until #64
+    is resolved") no longer read as completions. See the block comment above.
 
     NEEDS-ACTION and STALE are not assigned by the heuristic (they need
     cross-source evidence the sub-agent provides).
@@ -1833,26 +2026,56 @@ def classify_groups_heuristic(merged_groups, evidence):
         confidence = "LOW"
         evidence_citation = None
         canonical_text = g.get("representative", "")
+        rejection = None
 
         for m in g.get("members", []) or []:
             text = m.get("text", "") or ""
-            tok_match = _DISTINCTIVE_TOKEN_RE.search(text)
-            phr_match = _COMPLETION_PHRASE_RE.search(text)
-            if tok_match and phr_match:
-                distance = abs(tok_match.start() - phr_match.start())
-                if distance <= _HEURISTIC_PROXIMITY_CHARS:
-                    classification = "DONE"
-                    # #297: the heuristic's own token-co-occurrence evidence
-                    # cannot justify HIGH confidence at any distance —
-                    # confidence is written to the dashboard and the cache,
-                    # and a consumer keying off it (rather than the
-                    # assign_tier-derived tier) must not read it as HIGH.
-                    confidence = "MED"
-                    evidence_citation = (
-                        f"heuristic: token '{tok_match.group(0)}' "
-                        f"near completion phrase '{phr_match.group(0)}'"
-                    )
-                    break
+            tok_match, phr_match, reason = _heuristic_member_verdict(text)
+            if tok_match and reason is None:
+                classification = "DONE"
+                # #297: the heuristic's own token-co-occurrence evidence
+                # cannot justify HIGH confidence at any distance —
+                # confidence is written to the dashboard and the cache,
+                # and a consumer keying off it (rather than the
+                # assign_tier-derived tier) must not read it as HIGH.
+                confidence = "MED"
+                evidence_citation = (
+                    f"heuristic: token '{tok_match.group(0)}' "
+                    f"near completion phrase '{phr_match.group(0)}'"
+                )
+                rejection = None
+                break
+            if tok_match and rejection is None:
+                rejection = (tok_match.group(0), phr_match.group(0), reason)
+
+        if classification == "ACTIVE" and rejection is not None:
+            # #299: a rejected DONE must not become an indistinguishable
+            # ACTIVE. The reason rides on the record's evidence_citation so
+            # classifications.json (and any consumer reading it before
+            # partition_for_review) keeps it, and is ALSO logged to stderr
+            # because partition_for_review deliberately scrubs
+            # evidence_citation on ACTIVE before the dashboard write (spec
+            # § Classification semantics line 322) — without the log line the
+            # reason would die at that boundary, which is exactly the silent
+            # failure this guard exists to avoid.
+            #
+            # ACTIVE, not REVIEW: REVIEW (#264) means "distinctive open item
+            # with a weak POSITIVE signal the classifier could not confirm",
+            # and it is routed to the visible review bucket for adjudication.
+            # Here the signal is explicitly negative — the guard has a reason
+            # to believe the item is not done — so promoting it to a review row
+            # would ask the human to re-adjudicate a verdict already decided.
+            _tok, _phr, _reason = rejection
+            evidence_citation = (
+                f"heuristic: DONE rejected — token '{_tok}' near completion "
+                f"phrase '{_phr}', but {_reason}"
+            )
+            print(
+                f"[check-items] heuristic-guard: group "
+                f"{g.get('group_id')} DONE rejected — token '{_tok}' near "
+                f"'{_phr}', but {_reason}",
+                file=sys.stderr,
+            )
 
         out.append({
             "group_id": g.get("group_id"),

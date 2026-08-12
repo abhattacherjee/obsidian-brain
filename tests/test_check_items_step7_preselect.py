@@ -14,6 +14,11 @@ heuristic citation that reached tier HIGH under the pre-fix denylist and was
 preselected [x] despite the validation never having been performed. Task 4
 closed that with a classifier_source allowlist; this test is the guard that
 Step 7's wiring (the 4th positional arg to assign_tier) does not regress it.
+
+#299 added a second, earlier line of defence for that same production item:
+'Validate ...' is a pending-intent cue, so the heuristic no longer even calls
+it DONE. Both layers are asserted below — the guard on the production text,
+and the assign_tier cap on a heuristic DONE that survives the guard.
 """
 
 from __future__ import annotations
@@ -28,13 +33,22 @@ _PRODUCTION_TEXT = (
     "(v3.4.1) are correctly categorized by release tag post-promotion."
 )
 
+# A completion CLAIM the #299 guard must leave alone, so the assign_tier cap
+# below is still exercised on a real heuristic DONE rather than vacuously
+# passing because nothing reaches DONE any more.
+_UNGOVERNED_DONE_TEXT = "Fix bug #87 — done; merged in v2.5.0 release."
+
 
 def _step7_mark(item: dict) -> str:
     """Reproduce SKILL.md Step 7's exact preselect predicate."""
     return "[x]" if item["classification"] == "DONE" and item["tier"] == "HIGH" else "[ ]"
 
 
-def test_heuristic_done_is_never_preselected():
+def test_production_validation_item_no_longer_reaches_done():
+    """#299: the #297 production item is an unperformed validation task.
+    'Validate' is a pending-intent cue governing the v3.4.0/'release'
+    co-occurrence, so the heuristic must not call it DONE at all — and the
+    rejection reason must survive on the record."""
     merged_groups = [
         {
             "group_id": "g1",
@@ -47,9 +61,44 @@ def test_heuristic_done_is_never_preselected():
     out = oid.classify_groups_heuristic(merged_groups, {})
     assert len(out) == 1
     record = out[0]
+    assert record["classification"] == "ACTIVE"
+    assert record["classifier_source"] == "heuristic"
+    assert "DONE rejected" in (record["evidence_citation"] or "")
+    assert "Validate" in record["evidence_citation"]
+
+    record["tier"] = oid.assign_tier(
+        record.get("evidence_citation"),
+        record.get("canonical_text"),
+        record.get("classification"),
+        record.get("classifier_source"),
+    )
+    assert _step7_mark(record) == "[ ]"
+
+
+def test_heuristic_done_is_never_preselected():
+    """A heuristic DONE that the #299 guard leaves standing still must not
+    preselect: its citation is built from a token lifted out of the item text,
+    so assign_tier's literal-ref rule would otherwise hand it HIGH."""
+    merged_groups = [
+        {
+            "group_id": "g1",
+            "project": "obsidian-brain",
+            "representative": _UNGOVERNED_DONE_TEXT,
+            "members": [{"file": "a.md", "line": 1,
+                         "text": _UNGOVERNED_DONE_TEXT}],
+        },
+    ]
+
+    out = oid.classify_groups_heuristic(merged_groups, {})
+    assert len(out) == 1
+    record = out[0]
     assert record["classification"] == "DONE"
     assert record["classifier_source"] == "heuristic"
     assert record["confidence"] == "MED"
+    # The citation really does carry a literal ref that appears in the item
+    # text — without the #297 cap this record would tier HIGH.
+    assert "#87" in record["evidence_citation"]
+    assert "#87" in record["canonical_text"]
 
     # Step 7's exact call shape.
     record["tier"] = oid.assign_tier(
@@ -59,6 +108,7 @@ def test_heuristic_done_is_never_preselected():
         record.get("classifier_source"),
     )
 
+    assert record["tier"] == "MED"
     assert _step7_mark(record) == "[ ]"
 
 
