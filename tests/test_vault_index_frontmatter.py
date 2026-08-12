@@ -458,6 +458,65 @@ def test_classifier_prefixes_match_split_frontmatter_actual_output():
     assert err.startswith(vault_index._UNREADABLE_PREFIX)
 
 
+def test_exported_reason_constants_are_what_split_frontmatter_returns():
+    """`frontmatter.py` exports two of its three verdicts as constants because
+    `obsidian_utils` matches them by EXACT equality, not by prefix:
+
+    - `NO_OPENING_FENCE_REASON` — `gather_session_evidence` filters exactly
+      this reason out of `discovery_errors` ("this file is not a note"),
+      without going through the classifier, which can degrade to
+      "unknown (classifier unavailable)" and fail the filter open.
+    - `NO_CLOSING_FENCE_EXHAUSTED_REASON` — `read_note_metadata_detailed`
+      lets the character-cap size caveat override this verdict and ONLY this
+      verdict, since it is the only one a truncated read can invalidate.
+
+    Both gates are exact matches, so a constant that stops being what
+    `split_frontmatter` actually returns turns them into gates that silently
+    never fire — the bug restored, with the code still reading correctly.
+    Derived from REAL calls here, never from a hand-copied literal.
+    """
+    assert frontmatter.split_frontmatter([])[4] == (
+        frontmatter.NO_OPENING_FENCE_REASON
+    )
+    assert frontmatter.split_frontmatter(
+        frontmatter.split_lines_lf_crlf("---\nk: v\n")
+    )[4] == frontmatter.NO_CLOSING_FENCE_EXHAUSTED_REASON
+
+    # And that the two "no closing fence" verdicts remain DISTINCT strings
+    # sharing a prefix: that shared prefix is exactly why the size-caveat gate
+    # must not be written as `startswith`.
+    shape_stop = frontmatter.split_frontmatter(
+        frontmatter.split_lines_lf_crlf("---\nk: v\n# Title\n")
+    )[4]
+    assert shape_stop != frontmatter.NO_CLOSING_FENCE_EXHAUSTED_REASON
+    assert shape_stop.startswith(vault_index._NO_CLOSING_FENCE_PREFIX)
+    assert frontmatter.NO_CLOSING_FENCE_EXHAUSTED_REASON.startswith(
+        vault_index._NO_CLOSING_FENCE_PREFIX
+    )
+
+
+def test_classifier_symbol_exists_for_obsidian_utils():
+    """`obsidian_utils._classify_note_parse_failure` delegates to this
+    `_`-prefixed private across a module boundary, so a rename here is a
+    plausible refactor that no vault_index test would notice.
+
+    obsidian_utils guards the call with `getattr(..., None)` and degrades to
+    "unknown (classifier unavailable)" rather than letting `AttributeError`
+    escape `gather_session_evidence` — but degrading is a fallback, not the
+    intent: every /retro would silently stop naming WHY a note failed to
+    parse. Pin the symbol so the rename fails in CI instead of in a user's
+    /retro.
+    """
+    classifier = getattr(vault_index, "_classify_parse_failure", None)
+    assert callable(classifier), (
+        "obsidian_utils._classify_note_parse_failure depends on this symbol; "
+        "renaming it silently degrades every /retro to "
+        "'unknown (classifier unavailable)'"
+    )
+    # And that it still answers with the closed set obsidian_utils filters on.
+    assert classifier(None) == "unknown"
+
+
 def test_rebuild_index_reports_no_opening_fence_end_to_end(tmp_path):
     sessions = tmp_path / "claude-sessions"
     sessions.mkdir()

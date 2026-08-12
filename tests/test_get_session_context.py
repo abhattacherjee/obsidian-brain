@@ -485,15 +485,196 @@ def test_is_resumed_session_handles_collision_pair(tmp_path, monkeypatch, capsys
     assert "WARN" in captured.err or "collide" in captured.err.lower()  # 'collide' (singular)
 
 
-def test_peek_frontmatter_field_handles_invalid_utf8(tmp_path, capsys):
-    """A file with invalid UTF-8 bytes returns None and logs to stderr,
-    rather than raising and breaking the resolver chain."""
+def test_peek_frontmatter_field_handles_invalid_utf8(tmp_path):
+    """Invalid UTF-8 bytes in one field must not take out the whole file.
+
+    Before #283 this decoded strictly, raised UnicodeDecodeError, and the
+    note was dropped from resolver filtering entirely. The shared reader
+    decodes with errors="replace" (same as the index's parser), so the
+    corrupt bytes become U+FFFD in *that* field and every other field still
+    resolves. The unreadable-file diagnostic still exists — see
+    test_peek_frontmatter_field_unreadable_file_logs — it just no longer
+    fires for a byte-level decode problem, which is recoverable."""
     note = tmp_path / "n.md"
     note.write_bytes(b"---\ntype: claude-session\nbad: \xff\xfe\n---\n")
-    result = obsidian_utils._peek_frontmatter_type(note)
-    assert result is None
+    assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
+
+
+def test_peek_frontmatter_field_unreadable_file_logs(tmp_path, capsys):
+    """An unreadable file returns None and says so on stderr, so a note
+    silently dropped from filtering stays observable."""
+    missing = tmp_path / "does-not-exist.md"
+    assert obsidian_utils._peek_frontmatter_type(missing) is None
     captured = capsys.readouterr()
-    assert "cannot read" in captured.err.lower() or "decode" in captured.err.lower()
+    assert "cannot read" in captured.err.lower()
+
+
+# ---------------------------------------------------------------------------
+# #283: _peek_frontmatter_field used to read 30 lines and return whatever
+# `field:`-shaped line it found, even when no closing '---' was ever seen.
+# ---------------------------------------------------------------------------
+
+
+def test_peek_frontmatter_field_reads_field_past_line_30(tmp_path):
+    """A field below the old 30-line bound must still be found.
+
+    Restoring `if i >= 30: break` makes this fail."""
+    note = tmp_path / "deep.md"
+    filler = "\n".join(f"field_{i:02d}: v{i}" for i in range(60))
+    note.write_text(
+        f"---\n{filler}\nproject_path: \"/Users/a/dev/deep\"\n---\n\n# Body\n",
+        encoding="utf-8",
+    )
+    assert obsidian_utils._peek_frontmatter_project_path(note) == "/Users/a/dev/deep"
+
+
+def test_peek_frontmatter_field_unclosed_fence_returns_none(tmp_path):
+    """The issue's fixture: no closing fence, so `status:` in the body is
+    prose, not a field. Returning it would be reading a value out of the
+    note's text."""
+    note = tmp_path / "unclosed.md"
+    note.write_text(
+        "---\n"
+        "type: session\n"
+        "# My Note\n"
+        "\n"
+        "Note: this is body prose\n"
+        "status: NOT REALLY A FIELD\n",
+        encoding="utf-8",
+    )
+    assert obsidian_utils._peek_frontmatter_field(note, "status") is None
+    # …and the fields *above* the break are refused too: the file has no
+    # valid frontmatter region at all, so nothing in it can be trusted.
+    assert obsidian_utils._peek_frontmatter_type(note) is None
+
+
+def test_peek_frontmatter_field_bare_cr_is_not_a_line_terminator(tmp_path):
+    """`newline=""` guarantee, in a form that changes the parse result:
+    under universal-newline translation the bare \\r splits the `title:`
+    line and a bogus `status` field appears."""
+    note = tmp_path / "bare-cr.md"
+    note.write_bytes(
+        b'---\ntype: claude-session\ntitle: "before\rstatus: forged"\n---\n\nbody\n'
+    )
+    assert obsidian_utils._peek_frontmatter_field(note, "status") is None
+    assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
+
+
+def test_peek_frontmatter_field_oversized_frontmatter_returns_none(tmp_path):
+    """Past MAX_FRONTMATTER_LINES the block is rejected rather than
+    half-parsed."""
+    note = tmp_path / "oversized.md"
+    limit = obsidian_utils.MAX_FRONTMATTER_LINES
+    bulk = "\n".join(f"field_{i:05d}: v{i}" for i in range(limit + 100))
+    note.write_text(f"---\ntype: claude-session\n{bulk}\n---\n\n# Body\n", encoding="utf-8")
+    assert obsidian_utils._peek_frontmatter_type(note) is None
+
+
+# ---------------------------------------------------------------------------
+# #283 follow-up: _build_existing_sid_set read every session note three times
+# (type, project, session_id) on the SessionStart hook. _peek_frontmatter_fields
+# is the one-read/one-parse variant; _peek_frontmatter_field wraps it, so there
+# is exactly one parsing implementation.
+# ---------------------------------------------------------------------------
+
+
+def test_peek_frontmatter_fields_reads_the_file_once(tmp_path, monkeypatch):
+    """N fields, one open. Three single-field peeks meant three reads."""
+    import builtins
+
+    note = tmp_path / "n.md"
+    _write_note(note, {
+        "type": "claude-session",
+        "project": "obsidian-brain",
+        "session_id": "SID-XYZ",
+    })
+
+    opens = []
+    real_open = builtins.open
+
+    def counting_open(file, *args, **kwargs):
+        if str(file) == str(note):
+            opens.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    result = obsidian_utils._peek_frontmatter_fields(
+        note, ("type", "project", "session_id")
+    )
+
+    assert result == {
+        "type": "claude-session",
+        "project": "obsidian-brain",
+        "session_id": "SID-XYZ",
+    }
+    assert len(opens) == 1, f"expected one read, got {len(opens)}"
+
+
+def test_peek_frontmatter_fields_missing_field_is_none(tmp_path):
+    """A field the note does not have comes back None, not absent."""
+    note = tmp_path / "n.md"
+    _write_note(note, {"type": "claude-session"})
+
+    result = obsidian_utils._peek_frontmatter_fields(note, ("type", "nope"))
+
+    assert result == {"type": "claude-session", "nope": None}
+
+
+def test_peek_frontmatter_fields_empty_value_is_none_and_warns(tmp_path, capsys):
+    """Per-field behaviour is preserved exactly: an empty scalar warns and
+    normalizes to None, and the OTHER fields still resolve."""
+    note = tmp_path / "n.md"
+    _write_note(note, {"type": "", "project": "obsidian-brain"})
+
+    result = obsidian_utils._peek_frontmatter_fields(note, ("type", "project"))
+
+    assert result == {"type": None, "project": "obsidian-brain"}
+    err = capsys.readouterr().err
+    assert "empty" in err.lower(), err
+    assert "'type'" in err, err
+
+
+def test_peek_frontmatter_fields_first_match_wins(tmp_path):
+    """Duplicate keys: the first one inside the fence pair wins, as in the
+    single-field scan (which returned on its first match)."""
+    note = tmp_path / "dup.md"
+    note.write_text(
+        "---\ntype: claude-session\ntype: claude-snapshot\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+
+    assert obsidian_utils._peek_frontmatter_fields(note, ("type",)) == {
+        "type": "claude-session"
+    }
+
+
+def test_peek_frontmatter_fields_unclosed_fence_returns_all_none(tmp_path):
+    """No frontmatter region means no field may be harvested — for every
+    requested field, not just the one that happened to be below the break."""
+    note = tmp_path / "unclosed.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: real\n# My Note\n\nstatus: prose\n",
+        encoding="utf-8",
+    )
+
+    assert obsidian_utils._peek_frontmatter_fields(
+        note, ("type", "project", "status")
+    ) == {"type": None, "project": None, "status": None}
+
+
+def test_peek_frontmatter_fields_unreadable_names_the_cause(tmp_path, capsys):
+    """The "cannot read" diagnostic must name the errno cause again — but via
+    exc.strerror, so the absolute vault path never reaches stderr."""
+    missing = tmp_path / "does-not-exist.md"
+
+    result = obsidian_utils._peek_frontmatter_fields(missing, ("type", "project"))
+
+    assert result == {"type": None, "project": None}
+    err = capsys.readouterr().err
+    assert "cannot read" in err.lower(), err
+    assert "No such file" in err, err
+    assert str(missing) not in err, f"leaked the absolute path: {err!r}"
 
 
 def test_peek_frontmatter_field_logs_empty_value(tmp_path, capsys):

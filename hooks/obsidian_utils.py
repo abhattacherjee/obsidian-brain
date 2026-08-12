@@ -32,6 +32,19 @@ except ImportError as exc:
     print(f"[obsidian-brain] vault_index not available, access tracking disabled: {exc}",
           file=sys.stderr)
 
+# Unguarded (unlike vault_index above) and imported the same way vault_index.py
+# imports it: frontmatter.py is stdlib-`re`-only and has no siblings to fail on,
+# so there is nothing for a try/except to degrade to — a caller that cannot
+# import it cannot parse frontmatter at all. No cycle: this module already
+# imports vault_index, which imports frontmatter.
+from frontmatter import (  # noqa: E402
+    MAX_FRONTMATTER_LINES,
+    NO_CLOSING_FENCE_EXHAUSTED_REASON,
+    NO_OPENING_FENCE_REASON,
+    split_frontmatter,
+    split_lines_lf_crlf,
+)
+
 # Session IDs are CC UUIDs (or test fixtures). Restrict to safe filename chars
 # so the marker path never escapes ~/.claude/obsidian-brain/sessions/.
 _SID_FILENAME_SAFE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
@@ -355,51 +368,329 @@ def get_retro_classification_pending(session_id: str) -> dict | None:
         return None
 
 
-def _peek_frontmatter_field(path: Path, field: str) -> str | None:
-    """Return the unquoted YAML scalar for ``field:`` from a vault note's
-    frontmatter, or None. Reads at most 30 lines to keep the cost negligible
-    even when called on hash-collision (which is rare).
+# One read block. Measured against the live vault (2098 notes): 2082 of them
+# close their frontmatter fence inside the FIRST block, and the deepest fence
+# in the vault (index 460 -- the 461st line -- of an /emerge note, 23.7 KB
+# in) needs three.
+_FRONTMATTER_READ_BLOCK = 8192
 
-    Stops at the closing ``---`` marker. Quote-stripping handles the common
-    cases ``"value"`` and ``'value'``; unquoted scalars are returned verbatim.
-    Empty values (``field:`` with no scalar) are normalized to None for clean
-    truthy-checks at call sites.
+# Second, cruder backstop on the same read. MAX_FRONTMATTER_LINES is counted
+# in "\n"s, so a file that contains NO "\n" at all -- a CR-only (classic-Mac)
+# note, or a single-line minified blob -- never trips it and would be read to
+# EOF at any size. 2 MB is ~17x the largest note in the live vault (117 KB)
+# and ~85x its deepest frontmatter region (24 KB).
+_FRONTMATTER_MAX_CHARS = 2_000_000
+
+# The stable prefix every "the read itself failed" reason starts with, shared
+# by this module's reader and vault_index._parse_note_detailed. Kept as a
+# constant because two different things key off the exact wording: the egress
+# helper (_describe_note_parse_failure) lets reasons with this prefix through
+# uncategorized because they are content-free by construction, and
+# vault_index._classify_parse_failure maps it to "unreadable".
+_UNREADABLE_REASON_PREFIX = "unreadable file:"
+
+# Reported when _FRONTMATTER_MAX_CHARS -- NOT the line cap -- stops the read.
+# The "frontmatter exceeds" prefix is load-bearing: it is what
+# vault_index._classify_parse_failure maps to "frontmatter_too_long", which is
+# what actually happened. Letting split_frontmatter diagnose this instead
+# yields "no closing '---'" for a note whose fence may sit just past the cut,
+# i.e. the wrong-diagnosis failure frontmatter.py's own docstring calls out as
+# the one that "sends someone to repair a file that is not broken".
+_FRONTMATTER_TOO_LARGE_REASON = (
+    f"frontmatter exceeds {_FRONTMATTER_MAX_CHARS} characters (read limit "
+    "reached before the frontmatter block ended -- the note may be fine; "
+    "this is a size limit, not a missing fence)"
+)
+
+# A COMPLETE closing-fence line, expressed as raw text rather than as a line
+# index. Every "\n" in a file is a line terminator (either on its own or as
+# the second half of a "\r\n"), so a match means: the previous line ended,
+# then a line whose entire content is "---" began AND ended. That is exactly
+# "a terminated line at index >= 1 whose rstrip('\r\n') == '---'", which is
+# the only thing split_frontmatter accepts as a closing fence. Matching on
+# raw text instead of splitting the accumulated block into lines after every
+# read is a performance requirement, not a style choice: split_lines_lf_crlf
+# is a per-character Python loop, so splitting each 8 KB block would cost
+# ~8000 iterations per note in the reaper's hot path, where the whole budget
+# is 5 seconds for ~1000 notes. str.find is C-speed and lets us split only
+# the frontmatter region itself (typically a few hundred characters).
+_CLOSING_FENCE_MARKERS = ("\n---\n", "\n---\r\n")
+
+
+def _find_closing_fence_end(text: str, start: int) -> int:
+    """Return the index just past the earliest complete closing-fence line in
+    ``text`` at or after ``start``, or -1 if there is none.
+
+    "Complete" is load-bearing: the marker includes the fence's OWN
+    terminator, so a fence straddling a read-block boundary ("\\n--" in one
+    block, "-\\n" in the next) is not mistaken for a finished one. Callers
+    that resume the search must rewind by ``len(marker) - 1`` for the same
+    reason -- see _read_frontmatter_region.
     """
+    best_start = -1
+    best_end = -1
+    for marker in _CLOSING_FENCE_MARKERS:
+        i = text.find(marker, start)
+        if i != -1 and (best_start == -1 or i < best_start):
+            best_start, best_end = i, i + len(marker)
+    return best_end
+
+
+def _read_frontmatter_region(
+    path: str | Path,
+) -> tuple[list[str] | None, str | None, str | None]:
+    """Read only as far into *path* as ``split_frontmatter`` can look.
+
+    Returns ``(lines, read_error, size_caveat)``:
+
+    * ``lines`` in ``split_lines_lf_crlf`` form (terminators attached), or
+      None if the file could not be read at all.
+    * ``read_error`` -- set only when ``lines`` is None, using the same
+      ``"unreadable file: ..."`` shape as ``vault_index._parse_note_detailed``.
+    * ``size_caveat`` -- set (to ``_FRONTMATTER_TOO_LARGE_REASON``) when the
+      CHARACTER cap cut the read short, i.e. the returned lines are a prefix.
+      Callers must prefer this string over ``split_frontmatter``'s
+      BARE-EXHAUSTION verdict (``NO_CLOSING_FENCE_EXHAUSTED_REASON``) and over
+      that one only -- see (3) below. The other two verdicts survive
+      truncation intact: each is derived from a line that was actually read
+      and inspected (``lines[0]`` for the missing opening fence, the named
+      offending line for the shape stop), so the prefix cannot have hidden
+      what they report.
+
+    Three return values rather than an early return on the character cap, and
+    that is load-bearing rather than a wide type for its own sake. Under the
+    LINE cap, ``newlines > MAX_FRONTMATTER_LINES`` must fire first, so at
+    least ``MAX + 1`` TERMINATED lines already occupy indices 0..MAX and any
+    unterminated tail necessarily sits at index >= ``MAX + 1``, where the
+    ``lines[:MAX_FRONTMATTER_LINES + 1]`` slice discards it regardless. Only
+    the CHARACTER cap can seat a fragment at a low index. So bailing out early
+    on ``char_capped`` -- returning the caveat without lines -- would make the
+    ``lines.pop()`` fragment-drop below provably unreachable, and a dead guard
+    is worse than a wide return type: the next reader deletes it as obviously
+    redundant, and it stops being dead the moment the caps change.
+
+    Bounded on purpose, and bounded three ways. The callers run in loops over
+    the whole vault -- ``build_context_brief`` touches ~1000 session notes +
+    ~1100 insight notes, and ``obsidian_session_reaper._build_existing_sid_set``
+    runs on the SessionStart hook inside a 5-second budget -- so reading whole
+    files to find a fence that lives in the first few lines is not affordable.
+    The read stops at whichever of these comes first:
+
+    1. **A complete closing fence** (``_find_closing_fence_end``). This is the
+       bound that actually fires on real notes, and it is the whole point:
+       0 of 2098 live vault notes exceed ``MAX_FRONTMATTER_LINES``, so a
+       line-count-only stop degenerates into a whole-file slurp -- measured at
+       99.3% of the vault's 24.1 MB, and a 47-53x slowdown of
+       ``_build_existing_sid_set``. Stopping at the fence is parse-identical:
+       ``split_frontmatter`` returns at the first such line and never inspects
+       anything past it, and no caller of this function uses ``body_lines``.
+    2. **``MAX_FRONTMATTER_LINES`` newlines** -- the backstop for a
+       pathological file whose fence never arrives. Truncating to
+       ``MAX_FRONTMATTER_LINES + 1`` lines is semantics-preserving for
+       ``split_frontmatter``: it only ever inspects
+       ``lines[1:min(len(lines), MAX_FRONTMATTER_LINES + 1)]`` (so index
+       ``MAX_FRONTMATTER_LINES`` is the deepest line it can read), and its
+       "frontmatter exceeds N lines" branch triggers on
+       ``len(lines) > MAX_FRONTMATTER_LINES`` -- a ``MAX + 1``-line prefix
+       reproduces both exactly.
+    3. **``_FRONTMATTER_MAX_CHARS``** -- because (2) counts ``"\\n"`` only, so
+       a CR-only note or a minified single-line blob has zero newlines and
+       would otherwise be read to EOF at any size.
+
+    (3) is the one stop that is NOT semantics-preserving: for a file holding
+    >2 MB of text before its 1001st newline, an unbounded read could still
+    have found a fence further in. That shape does not exist in the live vault
+    (largest note: 117 KB; deepest frontmatter region: 24 KB) and a bounded
+    read is the deliberate trade -- but the note must not then be ACCUSED of
+    being broken, which is why (3) reports ``size_caveat``. Left to
+    ``split_frontmatter``, a char-capped read renders as "no closing '---'"
+    for a note whose fence is merely past the cut: the wrong-diagnosis failure
+    ``frontmatter.py``'s own docstring calls out as the one that "sends
+    someone to repair a file that is not broken". (2) needs no such caveat --
+    a MAX+1-line prefix reproduces ``split_frontmatter``'s own "frontmatter
+    exceeds N lines" branch exactly.
+
+    A possibly-truncated trailing line is never handed to the parser either
+    way: the tail is kept only on a clean EOF, and dropped whenever a cap cut
+    the read short.
+    """
+    text = ""
+    scan_from = 0
+    fence_end = -1
+    truncated = False
+    char_capped = False
+    newlines = 0
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            in_frontmatter = False
-            for i, line in enumerate(fh):
-                if i >= 30:
+        # newline="" (universal-newline translation OFF) is required here,
+        # not cosmetic: split_lines_lf_crlf below is documented to treat a
+        # bare "\r" as NOT a line terminator. Opening with the default
+        # newline=None translates every bare "\r" to "\n" before the
+        # splitter ever sees it, silently defeating that guarantee. Same
+        # reasoning as vault_index._parse_note_detailed (#277 follow-up).
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+            while True:
+                block = fh.read(_FRONTMATTER_READ_BLOCK)
+                if not block:
+                    break  # clean EOF
+                text += block
+                # "\r\n" contains "\n", so this counts CRLF lines correctly;
+                # a bare "\r" is deliberately not counted (see above).
+                newlines += block.count("\n")
+                fence_end = _find_closing_fence_end(text, scan_from)
+                if fence_end != -1:
                     break
-                stripped = line.strip()
-                if stripped == "---":
-                    if not in_frontmatter:
-                        in_frontmatter = True
-                        continue
-                    break  # closing marker
-                if not in_frontmatter:
-                    continue
-                if stripped.startswith(f"{field}:"):
-                    value = stripped[len(field) + 1:].strip()
-                    if (value.startswith('"') and value.endswith('"')) or \
-                       (value.startswith("'") and value.endswith("'")):
-                        value = value[1:-1]
-                    if not value:
-                        print(
-                            f"[obsidian-brain] _peek_frontmatter_field: {path.name} has empty "
-                            f"{field!r} field — possible mid-write or corruption",
-                            file=sys.stderr,
-                        )
-                        return None
-                    return value
-    except (OSError, UnicodeDecodeError) as exc:
+                # Rewind by len("\n---\r\n") - 1 so a fence split across this
+                # boundary is still found on the next pass.
+                scan_from = max(0, len(text) - 5)
+                if newlines > MAX_FRONTMATTER_LINES:
+                    truncated = True
+                    break
+                if len(text) >= _FRONTMATTER_MAX_CHARS:
+                    # Checked AFTER the line cap so that when both would fire
+                    # the semantics-preserving path wins: a MAX+1-line prefix
+                    # lets split_frontmatter reach its own "frontmatter exceeds
+                    # N lines" branch. The char cap has no such equivalent, so
+                    # it is the one that has to be reported -- but the lines
+                    # are still returned, because the caller still has to
+                    # decide whether the prefix parses at all.
+                    truncated = True
+                    char_capped = True
+                    break
+    except OSError as exc:
+        # exc.strerror (e.g. "No such file or directory"), NOT str(exc):
+        # str(OSError) embeds the full path argument, which would leak the
+        # absolute vault path into this reason string and, from there, into
+        # /retro's discovery_errors and the model's context. Same rule (and
+        # same reason) as vault_index._parse_note_detailed.
+        return None, f"{_UNREADABLE_REASON_PREFIX} {exc.strerror or type(exc).__name__}", None
+
+    if fence_end != -1:
+        # Cut at the fence: everything past it is body, and splitting it
+        # would be the per-character cost this function exists to avoid.
+        text = text[:fence_end]
+    lines = split_lines_lf_crlf(text)
+    if truncated and lines and not lines[-1].endswith("\n"):
+        # A cap stopped the read mid-line. That trailing element is a
+        # fragment, not a line, so it must never reach the parser -- a
+        # fragment that happens to read "---" would forge a closing fence and
+        # hand back body prose as fields, which is #283 itself.
+        #
+        # This matters for the CHARACTER cap specifically. Under the line cap
+        # the fragment necessarily sits at index >= MAX_FRONTMATTER_LINES + 1
+        # (the cap needs MAX+1 newlines before it fires, so the unterminated
+        # tail is line MAX+2 at the earliest) and the slice below would drop
+        # it anyway; under the char cap a 2 MB file of few long lines puts the
+        # fragment at a low index, well inside the slice.
+        #
+        # Under the char cap this pop is not merely live but OBSERVABLE, and
+        # it is what makes the caveat above always consumed rather than
+        # silently discarded. Reaching here with char_capped set means
+        # fence_end == -1, and the rewind (`len(text) - 5`) guarantees no
+        # marker was skipped across a block boundary -- so `text` contains no
+        # complete "\n---\n"/"\n---\r\n" at all. A TERMINATED fence line at
+        # index >= 1 would have produced one, therefore the only fence that
+        # can exist here is a final UNTERMINATED "---", which is exactly what
+        # this pop removes. Hence split_frontmatter can never succeed on a
+        # char-capped read: it always returns an error, and the caller always
+        # has a verdict to weigh the caveat against. Remove the pop and
+        # split_frontmatter SUCCEEDS instead, returning fabricated fields
+        # harvested from a truncated prefix -- a loud, testable failure rather
+        # than a quiet one.
+        lines.pop()
+    return (
+        lines[:MAX_FRONTMATTER_LINES + 1],
+        None,
+        _FRONTMATTER_TOO_LARGE_REASON if char_capped else None,
+    )
+
+
+def _peek_frontmatter_fields(
+    path: Path, fields: tuple[str, ...]
+) -> dict[str, str | None]:
+    """Return ``{field: unquoted YAML scalar or None}`` for each name in
+    *fields*, from a single read + single parse of *path*'s frontmatter.
+
+    This is the only implementation; ``_peek_frontmatter_field`` is a
+    one-field wrapper over it. It exists because
+    ``obsidian_session_reaper._build_existing_sid_set`` needs ``type``,
+    ``project`` and ``session_id`` from every session note on the SessionStart
+    hook: three single-field calls meant three uncached reads and three
+    parses of the same bytes, ~1000 notes deep, inside a 5-second budget.
+
+    The frontmatter block is located by ``frontmatter.split_frontmatter`` (via
+    ``_read_frontmatter_region``), the same bounded, shape-checked scan the
+    index uses. Per field, the FIRST ``field:``-prefixed line inside the fence
+    pair wins; quote-stripping handles the common cases ``"value"`` and
+    ``'value'``; unquoted scalars are returned verbatim. Empty values
+    (``field:`` with no scalar) are reported to stderr and normalized to None
+    for clean truthy-checks at call sites.
+    """
+    result: dict[str, str | None] = {field: None for field in fields}
+    lines, read_err, _size_caveat = _read_frontmatter_region(path)
+    if lines is None:
         print(
             f"[obsidian-brain] _peek_frontmatter_field: cannot read {path.name} "
-            f"for field={field!r}: {exc}; this file will be excluded from filtering",
+            f"for fields={list(fields)!r}: {read_err}; this file will be "
+            f"excluded from filtering",
             file=sys.stderr,
         )
-        return None
-    return None
+        return result
+
+    _open_fence, fm_lines, _close_fence, _body_lines, split_err = split_frontmatter(lines)
+    if split_err:
+        # No opening fence, no closing fence, or an oversized block: there is
+        # no frontmatter region to read a field out of. Returning a match from
+        # the unfenced region would be the forged-field bug (#283).
+        return result
+
+    remaining = set(fields)
+    for raw_line in fm_lines:
+        if not remaining:
+            break
+        stripped = raw_line.strip()
+        for field in tuple(remaining):
+            if not stripped.startswith(f"{field}:"):
+                continue
+            remaining.discard(field)  # first match wins, as in the 1-field scan
+            value = stripped[len(field) + 1:].strip()
+            if (value.startswith('"') and value.endswith('"')) or \
+               (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            if not value:
+                print(
+                    f"[obsidian-brain] _peek_frontmatter_field: {path.name} has empty "
+                    f"{field!r} field — possible mid-write or corruption",
+                    file=sys.stderr,
+                )
+                break
+            result[field] = value
+            break
+    return result
+
+
+def _peek_frontmatter_field(path: Path, field: str) -> str | None:
+    """Return the unquoted YAML scalar for ``field:`` from a vault note's
+    frontmatter, or None. One-field wrapper over ``_peek_frontmatter_fields``
+    so there is exactly one parsing implementation.
+
+    The frontmatter block is located by ``frontmatter.split_frontmatter``, the
+    same bounded, shape-checked scan the index uses. This replaces a 30-line
+    bound that missed fields in any note with a long ``tags:``/``projects:``
+    block, and — more dangerously — a scan that returned whatever
+    ``field:``-shaped line it found even when no closing ``---`` was ever
+    seen, i.e. a value scavenged from body prose (#283).
+
+    Two shape rules are TIGHTER than the old hand-rolled scan, both inherited
+    from the shared parser and both affecting 0 of 2098 live vault notes:
+
+    - The opening ``---`` must be at line index 0. The old scan accepted it
+      anywhere in the first 30 lines, so a note with leading blank lines (or
+      any preamble) used to parse; now it returns None.
+    - The closing fence is matched with ``rstrip("\\r\\n")``, not ``.strip()``.
+      A fence written with trailing spaces (``---␣␣``) no longer closes the
+      block, so such a note returns None instead of its field values.
+    """
+    return _peek_frontmatter_fields(path, (field,))[field]
 
 
 def _peek_frontmatter_type(path: Path) -> str | None:
@@ -1439,41 +1730,196 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     return ctx
 
 
-def read_note_metadata(file_path: str) -> dict | None:
-    """Parse YAML frontmatter from a vault note. Returns dict or None.
+def _classify_note_parse_failure(reason: str | None) -> str:
+    """Content-free category for a ``read_note_metadata_detailed`` reason.
 
-    Reads first 40 lines, extracts fields between --- markers.
-    Cached per file path within the session.
+    Delegates to ``vault_index._classify_parse_failure``, which exists for
+    exactly this: ``split_frontmatter``'s "no closing '---'" reason embeds up
+    to 60 characters of the note's OWN text, and vault notes are user/LLM
+    authored content. Every reason that leaves this module for stderr or for
+    ``/retro``'s ``discovery_errors`` — both of which reach the model's
+    context and the session transcript — must go through here first. Because
+    the output is a fixed word from a closed set, ``scrub_secrets()`` on top
+    would be redundant: no note text survives to be scrubbed.
+
+    Falls back to "unknown (classifier unavailable)" when ``vault_index``
+    could not be imported (the same degraded mode the access-tracking import
+    already tolerates) rather than re-implementing the classifier here — one
+    copy, like the parser. The fallback names WHERE to look instead of
+    colliding with the classifier's own "unknown", which means the opposite
+    ("the classifier ran and did not recognise this wording").
+
+    ``getattr``, not a direct attribute access: ``_classify_parse_failure`` is
+    a ``_``-prefixed private of another module, so a rename there is a
+    plausible refactor. A bare access would let ``AttributeError`` escape
+    ``gather_session_evidence``, whose contract is that file-read failures are
+    captured in ``discovery_errors`` and never raised — that half is the real
+    hazard. In ``find_snapshots_for_session`` the cost is smaller: that call
+    sits inside ``if not meta:``, i.e. it only ever runs for a snapshot
+    ALREADY known to be unparseable, so no healthy snapshot is at risk; the
+    escaping ``AttributeError`` would be swallowed by that function's
+    ``except Exception`` and the snapshot logged with a bare exception type
+    instead of a category — a degraded diagnostic for an already-malformed
+    file, still correctly skipped. A missing symbol is the same degraded mode
+    as a missing module, so it takes the same branch.
+    (``tests/test_vault_index_frontmatter.py`` pins the symbol's existence so
+    the rename fails in CI rather than in a user's /retro.)
+    """
+    if _vault_index is not None:
+        classifier = getattr(_vault_index, "_classify_parse_failure", None)
+        if classifier is not None:
+            return classifier(reason)
+    return "unknown (classifier unavailable)"
+
+
+def _describe_note_parse_failure(reason: str | None) -> str:
+    """Egress-safe rendering of a ``read_note_metadata_detailed`` reason, for
+    anything that reaches a user, stderr, or the model's context.
+
+    Two tiers, because the reasons are not all equally dangerous:
+
+    * The three ``split_frontmatter`` reasons all get the closed-set category
+      and nothing else. Only ONE of them actually embeds note content — the
+      "no closing '---'; stopped at a line that is not frontmatter:
+      '<excerpt>'" variant, up to 60 characters of the note's OWN text; the
+      missing-opening-fence and "frontmatter exceeds N" reasons are fixed
+      strings with at most a number in them. Categorizing all three is
+      deliberate conservatism: which of the three a reason is, is itself
+      decided by the classifier this tier calls, so a per-reason carve-out
+      would have to re-derive that here and would rot the day a fourth reason
+      (or a new excerpt) is added.
+    * ``"unreadable file: <strerror>"`` is content-free AND path-free by
+      construction — that is exactly why ``_read_frontmatter_region`` and
+      ``vault_index._parse_note_detailed`` build it from ``exc.strerror``
+      instead of ``str(exc)``. Collapsing it to the bare word "unreadable" is
+      pure loss: "Permission denied" (fix your perms) and "Input/output error"
+      (your vault mount is flaky) demand opposite responses, and the user can
+      no longer tell them apart. So it passes through intact.
+
+    ``_FRONTMATTER_TOO_LARGE_REASON`` is this module's own fixed string and is
+    likewise content-free, but it classifies cleanly as "frontmatter_too_long"
+    and there is nothing extra to preserve, so it takes the categorized tier.
+    """
+    if reason is not None and reason.startswith(_UNREADABLE_REASON_PREFIX):
+        return reason
+    return _classify_note_parse_failure(reason)
+
+
+def read_note_metadata_detailed(file_path: str) -> tuple[dict | None, str | None]:
+    """Parse YAML frontmatter from a vault note.
+
+    Returns ``(meta, None)`` on success, or ``(None, reason)`` when the note
+    has no parsable frontmatter — mirroring
+    ``vault_index._parse_note_detailed``, whose ``(meta, reason)`` shape this
+    is deliberately copying. ``reason`` is either ``"unreadable file: ..."``
+    or the ``frontmatter.split_frontmatter`` error verbatim (missing opening
+    fence / missing closing fence + the offending line / oversized block).
+
+    Keeping the reason matters because a bare None conflates "this note is
+    fine and simply has no frontmatter" with "this note is broken": callers
+    that used to re-probe the file to tell them apart cannot, since a note
+    with broken-but-present frontmatter re-reads without error and so
+    vanishes from ``/retro``'s evidence bundle with an empty
+    ``discovery_errors``. Pass the reason through
+    ``_classify_note_parse_failure`` before it reaches a user, stderr, or the
+    model — it can embed note text.
+
+    The frontmatter block is located by ``frontmatter.split_frontmatter`` (via
+    ``_read_frontmatter_region``), so a note whose fields sit deep in a long
+    ``tags:``/``projects:`` block parses like any other, and a note whose
+    closing ``---`` is missing returns None instead of harvesting body prose
+    into fields — an unfenced ``Note: this is body prose`` line used to become
+    a real ``meta['Note']`` entry, and a prose line beginning ``status:``
+    used to forge a ``status`` field the note never had (#283).
+
+    One shape rule is TIGHTER than the old hand-rolled scan, inherited from
+    the shared parser and affecting 0 of 2098 live vault notes (the same
+    tightening ``_peek_frontmatter_field`` documents, because the old
+    ``read_note_metadata`` compared with ``.strip()`` too): the closing fence
+    is matched with ``rstrip("\r\n")``, so a fence written with trailing
+    spaces (``---␣␣``) no longer closes the block and such a note returns
+    ``(None, reason)`` instead of its field values.
+
+    ``tags`` is returned as a **list** here, unlike the index's parser which
+    joins it to a comma string — callers of this function index into it.
+
+    Cached per file path within the session (the failure reason is cached
+    alongside the sentinel, so a cache hit is as informative as a miss).
+    What is cached is the RAW reason, deliberately, and it must stay raw:
+    ``_classify_parse_failure`` recognises reasons by prefix-matching
+    ``split_frontmatter``'s exact wording, so caching the CLASSIFIED value
+    would make the second call re-classify a category word like
+    "no_closing_fence" as "unknown" — a silent, cache-warmth-dependent bug
+    where the first /retro of a session reports the right category and every
+    later one reports none. Classify at egress instead
+    (``_describe_note_parse_failure``), never on the way in.
     """
     sid = _get_session_id_fast()
     cache_key = f"metadata:{os.path.realpath(file_path)}"
-    _CACHE_SENTINEL = {"__no_frontmatter__": True}
     cached = cache_get(sid, cache_key)
     if cached is not None:
-        return None if cached == _CACHE_SENTINEL else cached
+        # `is True` and not a truthy check: every parsed frontmatter value is
+        # a str, so a note that literally declares `__no_frontmatter__: true`
+        # yields the *string* "true" and cannot impersonate the sentinel.
+        if isinstance(cached, dict) and cached.get("__no_frontmatter__") is True:
+            return None, cached.get("__reason__")
+        return cached, None
 
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            lines = []
-            for i, line in enumerate(f):
-                if i >= 40:
-                    break
-                lines.append(line)
-    except OSError:
-        return None
+    lines, read_err, size_caveat = _read_frontmatter_region(file_path)
+    if lines is None:
+        # Unreadable file: return None WITHOUT caching the sentinel — the
+        # failure is about the read, not about the note's content, and a
+        # transient error must not pin "no frontmatter" for the session.
+        return None, read_err
 
-    if not lines or lines[0].strip() != '---':
-        cache_set(sid, cache_key, _CACHE_SENTINEL)
-        return None
+    _open_fence, fm_lines, _close_fence, _body_lines, split_err = split_frontmatter(lines)
+    if split_err:
+        # Covers all three malformed shapes: no opening fence, no closing
+        # fence, and an oversized frontmatter block. Each means "this note
+        # has no parsable frontmatter", which is what the sentinel records.
+        #
+        # size_caveat wins ONLY over the bare-exhaustion verdict. A truncated
+        # read makes exactly one of split_frontmatter's three reasons
+        # untrustworthy: the one produced by running off the end of a prefix,
+        # where the real fence may simply sit past the cut. Reporting that as
+        # "no closing '---'" accuses a note that may be fine -- the
+        # wrong-diagnosis failure frontmatter.py's docstring calls out -- so
+        # the caveat ("frontmatter exceeds ... characters") replaces it.
+        #
+        # The other two verdicts are DEFINITIVE regardless of truncation,
+        # because each is derived from a line that was actually read and
+        # inspected: "does not open with a '---' fence" reads lines[0], always
+        # in the first block; the "stopped at a line that is not frontmatter"
+        # variant names the offending line. Overwriting those mislabels a file
+        # that is not a note as an oversized note (which defeats the
+        # no_opening_fence filter in gather_session_evidence for any file over
+        # the char cap) and tells someone whose frontmatter demonstrably dies
+        # at line 3 that "the note may be fine".
+        #
+        # Exact equality, NEVER startswith: `==` here does not depend on the
+        # constant's trailing ')' happening to fall exactly where the
+        # shape-stop variant's text diverges (into "; stopped at ..."). A
+        # hand-truncated or reworded literal could silently start matching
+        # the shape-stop variant too, which is precisely why the literal is
+        # imported from frontmatter.py (and used by the return that produces
+        # it) rather than copied — the two cannot drift apart into a gate
+        # that silently never matches.
+        #
+        # Still the RAW wording either way, so the cached reason re-classifies
+        # correctly on the next hit (see the docstring).
+        if size_caveat and split_err == NO_CLOSING_FENCE_EXHAUSTED_REASON:
+            reason = size_caveat
+        else:
+            reason = split_err
+        cache_set(sid, cache_key, {"__no_frontmatter__": True, "__reason__": reason})
+        return None, reason
 
     meta: dict = {}
     tags: list[str] = []
     in_tags = False
 
-    for line in lines[1:]:
+    for line in fm_lines:
         stripped = line.strip()
-        if stripped == '---':
-            break
         if stripped.startswith('- ') and in_tags:
             tags.append(stripped[2:].strip())
             continue
@@ -1491,7 +1937,17 @@ def read_note_metadata(file_path: str) -> dict | None:
         meta['tags'] = tags
 
     cache_set(sid, cache_key, meta)
-    return meta
+    return meta, None
+
+
+def read_note_metadata(file_path: str) -> dict | None:
+    """Parse YAML frontmatter from a vault note. Returns dict or None.
+
+    Thin wrapper over ``read_note_metadata_detailed`` for the call sites that
+    only need "did it parse". Use the detailed variant when a None must be
+    explainable to a user (see its docstring).
+    """
+    return read_note_metadata_detailed(file_path)[0]
 
 
 def find_snapshots_for_session(
@@ -1526,8 +1982,28 @@ def find_snapshots_for_session(
         glob_pattern = f"{date}-{slug}-*-snapshot*.md"
     for p in sorted(sessions_folder_path.glob(glob_pattern)):
         try:
-            meta = read_note_metadata(str(p))
+            meta, reason = read_note_metadata_detailed(str(p))
             if not meta:
+                # Honour this function's "malformed snapshots are logged to
+                # stderr and skipped" contract. That logging used to arrive
+                # via the except below, which only fired because the old
+                # reader let UnicodeDecodeError escape; with errors="replace"
+                # plus split_frontmatter's (None, reason) path nothing raises
+                # any more, so a malformed snapshot would drop in silence.
+                # `reason` is None only when the fence pair parsed fine but
+                # held no `key: value` lines — an empty dict, not a defect.
+                if reason:
+                    # Never the raw reason: it can embed up to 60 characters
+                    # of the note's own text, and this line reaches the model's
+                    # context via the transcript. _describe_note_parse_failure
+                    # categorizes those and passes the content-free
+                    # "unreadable file: <strerror>" shape through, so a flaky
+                    # mount still reads as a mount problem.
+                    print(
+                        f"[obsidian-brain] skipping malformed snapshot {p.name}: "
+                        f"{_describe_note_parse_failure(reason)}",
+                        file=sys.stderr,
+                    )
                 continue
             if meta.get("session_id") == session_id and (
                 meta.get("project", "").lower() == project.lower()
@@ -1535,7 +2011,14 @@ def find_snapshots_for_session(
             ):
                 wikilinks.append(f"[[{p.stem}]]")
         except Exception as exc:  # noqa: BLE001
-            print(f"[obsidian-brain] skipping malformed snapshot {p.name}: {exc}",
+            # The exception TYPE (plus strerror when there is one), never
+            # str(exc): str(OSError) embeds the full path argument, which
+            # would leak the absolute vault path into the transcript and the
+            # model's context, and an arbitrary exception's message can carry
+            # note text. This is the last unclassified egress in this function
+            # — same rule as the `reason` branch above.
+            detail = getattr(exc, "strerror", None) or type(exc).__name__
+            print(f"[obsidian-brain] skipping malformed snapshot {p.name}: {detail}",
                   file=sys.stderr)
             continue
     return wikilinks
@@ -1736,7 +2219,18 @@ def gather_session_evidence(
             try:
                 body = snap_path.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
-                bundle["discovery_errors"].append(f"{snap_path.name}: {exc}")
+                # exc.strerror, NOT str(exc): str(OSError) embeds the full
+                # path argument, leaking the absolute vault path into
+                # discovery_errors and from there into the model's context.
+                # Same shape (and same reason) as _read_frontmatter_region's
+                # reason — and newly reachable, because that reader only pulls
+                # ~8 KB of frontmatter while this read pulls the whole file, so
+                # on a cloud-synced vault a partially-materialized note can
+                # succeed there and fail EIO here.
+                bundle["discovery_errors"].append(
+                    f"{snap_path.name}: {_UNREADABLE_REASON_PREFIX} "
+                    f"{exc.strerror or type(exc).__name__}"
+                )
                 continue
             meta = read_note_metadata(str(snap_path)) or {}
             bundle["snapshots"].append({
@@ -1755,17 +2249,60 @@ def gather_session_evidence(
             "claude-error-fix": bundle["error_fixes"],
         }
         for note_path in sorted(insights_path.glob("*.md")):
-            meta = read_note_metadata(str(note_path))
+            meta, reason = read_note_metadata_detailed(str(note_path))
             if meta is None:
-                # read_note_metadata returns None on OSError (suppressed) or
-                # if the file has no frontmatter. Probe ourselves so unreadable
-                # files surface in discovery_errors instead of silently being
-                # skipped. No-frontmatter files do not contribute to evidence,
-                # so the additional probe only fires when meta is None.
-                try:
-                    note_path.read_text(encoding="utf-8", errors="replace")
-                except OSError as exc:
-                    bundle["discovery_errors"].append(f"{note_path.name}: {exc}")
+                # Record WHY. The old code re-probed the file and only logged
+                # an OSError, so a note with broken-but-present frontmatter
+                # (which re-reads perfectly) vanished from the bundle with an
+                # empty discovery_errors — /retro then reported "no insights
+                # captured this session" and the note was invisible. The
+                # detailed reader distinguishes "unreadable" from "malformed"
+                # on its own, so the probe goes with it.
+                #
+                # Classified, never raw: the reason can embed up to 60
+                # characters of the note's own text and discovery_errors flows
+                # straight into the model's context.
+                # A missing OPENING fence is filtered because it does not
+                # mean "this note is broken" — it means "this file is not a
+                # note". Nothing stops such a file from sitting in the
+                # insights folder: a Dataview dashboard copied or moved there
+                # (this plugin installs its own 6 into the separate
+                # `dashboards_folder`, which this loop never globs — the live
+                # insights folder measures 0 of them today), a pasted export,
+                # a scratch file. This parse runs BEFORE the source_session
+                # filter below, so ONE such file would raise /retro's
+                # "evidence discovery partially or fully failed" banner in
+                # every project, every session, permanently
+                # (skills/retro/SKILL.md turns any non-empty discovery_errors
+                # into that warning). There is no consumer that would act on
+                # a not-a-note file sitting in the insights folder, and
+                # /retro is not a vault linter, so filtering it here rather
+                # than surfacing it stands on its own merits — it is not
+                # covered by /vault-doctor's missing_frontmatter_fence check,
+                # which only repairs a narrower case: a genuine former note
+                # that lost precisely its opening '---' line, where every
+                # line above the closing fence is still frontmatter-shaped.
+                # A Dataview dashboard, a pasted export, or a scratch file
+                # fails that check's own precondition that the first line be
+                # key:-shaped, so it is left untouched either way.
+                #
+                # no_closing_fence / frontmatter_too_long / unreadable are
+                # kept: those DO mean "this is a note and it is broken",
+                # which is exactly what /retro should surface.
+                #
+                # Keyed off the RAW reason (an exact match against the
+                # producing module's own constant), not off
+                # _classify_note_parse_failure: that classifier degrades to
+                # "unknown (classifier unavailable)" when vault_index cannot
+                # be imported, which compares unequal to every category and
+                # would fail the filter OPEN — re-raising the permanent banner
+                # this filter exists to prevent, in an already-degraded mode.
+                # The classifier is still what RENDERS the message below,
+                # where degrading costs only the wording.
+                if reason and reason != NO_OPENING_FENCE_REASON:
+                    bundle["discovery_errors"].append(
+                        f"{note_path.name}: {_describe_note_parse_failure(reason)}"
+                    )
                 continue
             if meta.get("source_session") != session_id:
                 continue
@@ -1776,7 +2313,12 @@ def gather_session_evidence(
             try:
                 body = note_path.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
-                bundle["discovery_errors"].append(f"{note_path.name}: {exc}")
+                # exc.strerror, not str(exc) — see the snapshot-body read
+                # above for why the absolute path must not reach here.
+                bundle["discovery_errors"].append(
+                    f"{note_path.name}: {_UNREADABLE_REASON_PREFIX} "
+                    f"{exc.strerror or type(exc).__name__}"
+                )
                 continue
             title_match = re.search(r"^# (.+?)$", body, re.MULTILINE)
             title = title_match.group(1).strip() if title_match else note_path.stem

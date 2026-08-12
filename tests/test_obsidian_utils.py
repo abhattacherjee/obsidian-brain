@@ -19,6 +19,7 @@ _REQUIRES_GIT = pytest.mark.skipif(
     not _GIT_AVAILABLE, reason="git binary not available on PATH"
 )
 
+import frontmatter
 import obsidian_utils
 
 
@@ -211,6 +212,809 @@ class TestReadNoteMetadata:
 
         result = obsidian_utils.read_note_metadata(str(note))
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# #283: read_note_metadata used to read only the first 40 lines and never
+# checked that a closing '---' was actually found. Both failure modes were
+# measured on the live vault: 26 notes lost their `tags` (the block starts
+# past line 40) and 28 notes had no closing fence within 40 lines, so body
+# prose was harvested into fields. These tests pin both, plus the bound the
+# fix is allowed to keep (a bounded read, not a whole-file slurp).
+# ---------------------------------------------------------------------------
+
+
+class TestReadNoteMetadataFrontmatterBounds:
+    def test_tags_block_past_line_40_is_recovered(self, tmp_path, monkeypatch):
+        """A `tags:` block starting below line 40 must still parse.
+
+        Restoring the old `if i >= 40: break` bound makes this fail: the
+        reader never reaches the tags block or the closing fence.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        filler = "\n".join(f"field_{i:02d}: value-{i:02d}" for i in range(45))
+        note = tmp_path / "deep.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            f"{filler}\n"
+            "project: deep-project\n"
+            "tags:\n"
+            "  - claude/session\n"
+            "  - claude/project/deep-project\n"
+            "---\n"
+            "\n# Body\n",
+            encoding="utf-8",
+        )
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is not None
+        assert meta["project"] == "deep-project"
+        # Type, not only value: a future "just reuse vault_index's parser"
+        # refactor would return tags as a comma-joined STRING, which still
+        # compares unequal here but for a reason nobody would recognise.
+        assert isinstance(meta["tags"], list)
+        assert meta["tags"] == ["claude/session", "claude/project/deep-project"]
+
+    def test_unclosed_fence_returns_none_and_forges_no_fields(
+        self, tmp_path, monkeypatch
+    ):
+        """The issue's own fixture: an opening fence, no closing fence.
+
+        Without the split_frontmatter guard the old parser walked into the
+        body and manufactured fields out of prose — `status` here is a
+        sentence, not a field, and `Note:` is a paragraph opener.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "unclosed.md"
+        note.write_text(
+            "---\n"
+            "type: session\n"
+            "# My Note\n"
+            "\n"
+            "Note: this is body prose\n"
+            "status: NOT REALLY A FIELD\n",
+            encoding="utf-8",
+        )
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is None, f"expected None for an unfenced note, got {meta!r}"
+
+    def test_unclosed_fence_result_is_cached_as_no_frontmatter(
+        self, tmp_path, monkeypatch
+    ):
+        """Second call must also return None (sentinel cached, not a dict)."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: "fixed-sid-283")
+
+        note = tmp_path / "unclosed-cached.md"
+        note.write_text("---\ntype: session\n# My Note\n\nprose\n", encoding="utf-8")
+
+        assert obsidian_utils.read_note_metadata(str(note)) is None
+        assert obsidian_utils.read_note_metadata(str(note)) is None
+
+    def test_bare_cr_inside_a_value_is_not_a_line_terminator(
+        self, tmp_path, monkeypatch
+    ):
+        """`newline=""` guarantee: a bare \\r inside a value stays in the value.
+
+        This fixture is built so universal-newline mode gives a DIFFERENT
+        parse, not just different whitespace: with newline=None the \\r is
+        translated to \\n before split_lines_lf_crlf runs, splitting one
+        `title:` line into two frontmatter lines and forging a `status`
+        field. Dropping `newline=""` from _read_frontmatter_region makes
+        both assertions below fail.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "bare-cr.md"
+        note.write_bytes(
+            b'---\ntype: claude-session\ntitle: "before\rstatus: forged"\n---\n\nbody\n'
+        )
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is not None
+        assert meta["title"] == "before\rstatus: forged"
+        assert "status" not in meta, (
+            "a bare \\r was treated as a line break, forging a status field"
+        )
+
+    def test_frontmatter_over_the_line_limit_returns_none(self, tmp_path, monkeypatch):
+        """Past MAX_FRONTMATTER_LINES the block is rejected, not truncated."""
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        limit = obsidian_utils.MAX_FRONTMATTER_LINES
+        bulk = "\n".join(f"field_{i:05d}: v{i}" for i in range(limit + 100))
+        note = tmp_path / "oversized.md"
+        note.write_text(f"---\n{bulk}\n---\n\n# Body\n", encoding="utf-8")
+
+        assert obsidian_utils.read_note_metadata(str(note)) is None
+
+    def test_read_stops_at_the_closing_fence_on_a_realistic_note(
+        self, tmp_path, monkeypatch
+    ):
+        """The bound that has to fire on REAL notes: the closing fence.
+
+        This is the p90 vault shape — fence at line 4, ~300 lines / ~90 KB of
+        body — and it is the shape the line-count cap never touches: 0 of 2098
+        live notes exceed MAX_FRONTMATTER_LINES, so a reader that stops only
+        on the newline count reads 100% of every note in the vault (measured:
+        23.9 MB of 24.1 MB) and makes the reaper's SessionStart scan 47-53x
+        slower. Assert the read is a block or two, not a file.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "realistic.md"
+        body = "".join("word " * 60 + "\n" for _ in range(300))  # ~90 KB
+        note.write_text(
+            "---\ntype: claude-session\nproject: realistic\nstatus: summarized\n---\n"
+            + body,
+            encoding="utf-8",
+        )
+        file_size = note.stat().st_size
+        assert file_size > 80_000, file_size
+
+        spy = _install_read_spy(monkeypatch, str(note))
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is not None and meta["project"] == "realistic"
+        assert spy["chars"] > 0, "spy never saw a read — instrumentation broke"
+        # ONE block, not two. The fence is at line 4, so a second block means
+        # a regression — and the 100%-headroom version of this assertion let
+        # the missing-block-seam rewind through unnoticed, since that mutant
+        # costs exactly one extra block on this shape. The 2-block case has
+        # its own fixture now
+        # (test_closing_fence_straddling_a_read_block_boundary_is_found).
+        assert spy["chars"] <= obsidian_utils._FRONTMATTER_READ_BLOCK, (
+            f"read {spy['chars']} of {file_size} chars — the read did not stop "
+            "at the closing fence"
+        )
+
+    def test_read_is_bounded_when_the_fence_never_arrives(
+        self, tmp_path, monkeypatch
+    ):
+        """Pathological backstop: frontmatter-shaped lines with no fence.
+
+        Nothing stops the fence-scan here, so MAX_FRONTMATTER_LINES has to.
+        The threshold is the contract — MAX + 1 lines plus at most the block
+        that carried the last of them — not a fraction of the file size.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        line_len = 400  # + "\n"
+        note = tmp_path / "no-fence.md"
+        filler = "".join(f"key_{i:05d}: " + "z" * (line_len - 12) + "\n"
+                         for i in range(2 * obsidian_utils.MAX_FRONTMATTER_LINES))
+        note.write_text("---\n" + filler, encoding="utf-8")
+        file_size = note.stat().st_size
+
+        spy = _install_read_spy(monkeypatch, str(note))
+
+        meta, reason = obsidian_utils.read_note_metadata_detailed(str(note))
+
+        assert meta is None
+        assert reason.startswith("frontmatter exceeds"), reason
+        budget = ((obsidian_utils.MAX_FRONTMATTER_LINES + 1) * (line_len + 1)
+                  + obsidian_utils._FRONTMATTER_READ_BLOCK)
+        assert spy["chars"] <= budget, (
+            f"read {spy['chars']} of {file_size} chars, budget {budget}"
+        )
+
+    def test_read_is_capped_in_bytes_for_a_file_with_no_newlines(
+        self, tmp_path, monkeypatch
+    ):
+        """The newline cap counts "\n", so a file without any never trips it.
+
+        A CR-only (classic-Mac) note or a single-line minified blob has zero
+        newlines; without the character cap this is read to EOF at any size.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "cr-only.md"
+        # write_bytes, not write_text(newline=...): the latter is 3.13+ only.
+        note.write_bytes(b"---\r" + b"x" * 2_500_000)
+        file_size = note.stat().st_size
+        assert file_size > obsidian_utils._FRONTMATTER_MAX_CHARS
+
+        spy = _install_read_spy(monkeypatch, str(note))
+
+        assert obsidian_utils.read_note_metadata(str(note)) is None
+        assert spy["chars"] > 0, "spy never saw a read — instrumentation broke"
+        assert spy["chars"] <= (obsidian_utils._FRONTMATTER_MAX_CHARS
+                                + obsidian_utils._FRONTMATTER_READ_BLOCK), (
+            f"read {spy['chars']} of {file_size} chars — the byte cap is inert"
+        )
+
+    def test_fence_at_exactly_the_line_limit_parses(self, tmp_path, monkeypatch):
+        """Fence at index exactly MAX_FRONTMATTER_LINES is INSIDE the bound.
+
+        split_frontmatter reads up to index MAX_FRONTMATTER_LINES, so the
+        region reader must hand it MAX + 1 lines, not MAX. Slicing one line
+        short converts this well-formed note into "no closing '---'" — the
+        exact misdiagnosis frontmatter.py's docstring calls out as the one
+        that sends someone to repair a file that is not broken.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        limit = obsidian_utils.MAX_FRONTMATTER_LINES
+        # index 0 = open fence, 1..limit-1 = fields, index `limit` = close fence
+        fields = "".join(f"field_{i:05d}: v{i}\n" for i in range(1, limit))
+        note = tmp_path / "fence-at-limit.md"
+        note.write_text("---\n" + fields + "---\n\n# Body\n", encoding="utf-8")
+
+        meta, reason = obsidian_utils.read_note_metadata_detailed(str(note))
+
+        assert reason is None, reason
+        assert meta is not None
+        assert meta[f"field_{limit - 1:05d}"] == f"v{limit - 1}"
+
+    def test_fence_one_past_the_line_limit_is_reported_as_a_size_error(
+        self, tmp_path, monkeypatch
+    ):
+        """Fence at index MAX + 1 is out of bounds — and must say WHY.
+
+        "frontmatter exceeds N lines" tells the user their note may be fine
+        and the limit is the problem; "no closing '---'" tells them their
+        note is corrupt. Reporting the wrong one is the whole point of
+        keeping split_frontmatter's distinct diagnoses.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        limit = obsidian_utils.MAX_FRONTMATTER_LINES
+        fields = "".join(f"field_{i:05d}: v{i}\n" for i in range(1, limit + 1))
+        note = tmp_path / "fence-past-limit.md"
+        note.write_text("---\n" + fields + "---\n\n# Body\n", encoding="utf-8")
+
+        meta, reason = obsidian_utils.read_note_metadata_detailed(str(note))
+
+        assert meta is None
+        assert reason.startswith("frontmatter exceeds"), (
+            f"expected the SIZE diagnosis, got {reason!r}"
+        )
+
+    def test_unreadable_file_is_not_cached_as_no_frontmatter(
+        self, tmp_path, monkeypatch
+    ):
+        """A transient read failure must not pin "no frontmatter" for the session.
+
+        The cache is keyed by session id, so caching the sentinel here would
+        make every later read of this path in the same session return None —
+        a note that exists and parses fine would stay invisible until the
+        session ended. Replacing that branch with `cache_set(...); return None`
+        passes every other test in the suite; this is the one that catches it.
+        """
+        import builtins
+        import errno
+
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: "fixed-sid-283-eio")
+
+        note = tmp_path / "flaky.md"
+        note.write_text(
+            "---\ntype: claude-session\nproject: flaky\n---\n\n# Body\n",
+            encoding="utf-8",
+        )
+
+        real_open = builtins.open
+        state = {"failed": False}
+
+        def flaky_open(file, *args, **kwargs):
+            if str(file) == str(note) and not state["failed"]:
+                state["failed"] = True
+                raise OSError(errno.EIO, "Input/output error", str(file))
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", flaky_open)
+
+        first = obsidian_utils.read_note_metadata(str(note))
+        second = obsidian_utils.read_note_metadata(str(note))
+
+        assert state["failed"], "the flaky open never fired — instrumentation broke"
+        assert first is None
+        assert second is not None and second["project"] == "flaky", (
+            "the OSError was cached as 'no frontmatter' and pinned for the session"
+        )
+
+    def test_unreadable_file_reason_names_the_cause_not_the_path(self, tmp_path):
+        """The reason has to say WHY, without leaking the absolute vault path.
+
+        str(OSError) renders as "[Errno 2] No such file or directory:
+        '/Users/.../secret-note.md'"; that string flows into discovery_errors
+        and from there into the model's context. exc.strerror does not.
+        """
+        missing = tmp_path / "does-not-exist.md"
+
+        meta, reason = obsidian_utils.read_note_metadata_detailed(str(missing))
+
+        assert meta is None
+        assert reason.startswith("unreadable file: "), reason
+        assert "No such file" in reason, reason
+        assert str(missing) not in reason, f"leaked the absolute path: {reason!r}"
+
+    def test_corrupt_utf8_is_accepted_verbatim_as_the_replacement_char(
+        self, tmp_path, monkeypatch
+    ):
+        """errors="replace" is a deliberate trade, pinned in BOTH directions.
+
+        The upside (a bad byte no longer takes out the whole note) is already
+        covered. The downside is that corruption is SILENTLY ACCEPTED: the
+        field keeps parsing and its value now carries U+FFFD. Assert that,
+        so switching to errors="strict" — or adding a validity check —
+        registers as a behaviour change rather than passing unnoticed.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "corrupt.md"
+        note.write_bytes(
+            b"---\ntype: claude-session\nproject: caf\xff\xfe\nstatus: summarized\n---\n"
+        )
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is not None
+        assert meta["project"] == "caf\ufffd\ufffd", repr(meta["project"])
+        assert meta["status"] == "summarized"
+
+    def test_all_crlf_note_with_a_deep_tags_block_parses_cleanly(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end CRLF: every terminator is \r\n, tags start past line 40.
+
+        Covers the two halves together — the CRLF-aware splitter and the
+        removal of the 40-line bound — and asserts no value keeps a stray
+        \r, which is what a splitter that only knows "\n" would leave behind.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        filler = "".join(f"field_{i:02d}: value-{i:02d}\r\n" for i in range(45))
+        note = tmp_path / "crlf.md"
+        note.write_bytes(
+            (
+                "---\r\n"
+                "type: claude-session\r\n"
+                + filler
+                + "project: crlf-project\r\n"
+                "tags:\r\n"
+                "  - claude/session\r\n"
+                "  - claude/project/crlf-project\r\n"
+                "---\r\n"
+                "\r\n"
+                "# Body\r\n"
+            ).encode("utf-8")
+        )
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is not None
+        assert meta["project"] == "crlf-project"
+        assert meta["field_44"] == "value-44"
+        assert isinstance(meta["tags"], list)
+        assert meta["tags"] == ["claude/session", "claude/project/crlf-project"]
+        assert not any("\r" in v for v in meta.values() if isinstance(v, str))
+        assert not any("\r" in t for t in meta["tags"])
+
+    def test_frontmatter_line_longer_than_one_read_block(
+        self, tmp_path, monkeypatch
+    ):
+        """A single frontmatter line wider than the 8 KB read block.
+
+        The fence then lands in a later block, so the block-boundary handling
+        (rewind the fence search, never treat a partial trailing line as a
+        line) is what has to hold.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        wide = "w" * (obsidian_utils._FRONTMATTER_READ_BLOCK * 3)
+        note = tmp_path / "wide.md"
+        note.write_text(
+            f"---\ntype: claude-session\nsummary: {wide}\nproject: wide\n---\n\n# Body\n",
+            encoding="utf-8",
+        )
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is not None
+        assert meta["project"] == "wide"
+        assert meta["summary"] == wide
+
+    def test_column_zero_yaml_comment_inside_frontmatter_returns_none(
+        self, tmp_path, monkeypatch
+    ):
+        """Shape-check tightening, pinned as intended rather than discovered.
+
+        `# note` at column 0 is not blank, not `key:`-shaped, not a `- ` item
+        and not an indented continuation, so split_frontmatter stops there and
+        the whole note is refused — where develop returned a partial dict of
+        the fields above the comment. 0 live vault notes do this; the point of
+        the test is that the change is recorded, not that it is desirable.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "commented.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "# note: this is a YAML comment at column 0\n"
+            "project: commented\n"
+            "---\n"
+            "\n# Body\n",
+            encoding="utf-8",
+        )
+
+        meta, reason = obsidian_utils.read_note_metadata_detailed(str(note))
+
+        assert meta is None
+        assert reason.startswith("malformed or missing frontmatter (no closing"), reason
+
+    def test_body_horizontal_rule_never_closes_an_unfenced_block(
+        self, tmp_path, monkeypatch
+    ):
+        """A `----------` rule in the BODY must not be read as a closing fence.
+
+        _CLOSING_FENCE_MARKERS carries the fence's OWN terminator
+        ("\n---\n"/"\n---\r\n") for exactly this note. Shorten it to a bare
+        "\n---" prefix and _find_closing_fence_end matches inside the rule,
+        cutting `text` mid-line so the truncated tail reads exactly "---" —
+        which split_frontmatter then accepts as a real closing fence. The text
+        is severed BEFORE the shape check can ever see the prose, so
+        frontmatter.py's "a paragraph is not frontmatter" backstop never runs
+        and every field above is forged. That is #283 itself, re-entered
+        through the new fence finder, which is why the terminator is pinned
+        here and not only described in a docstring.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "hr-in-body.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "project: forged\n"
+            "status: summarized\n"
+            "----------\n"
+            "\n"
+            "real body prose here\n",
+            encoding="utf-8",
+        )
+
+        meta, reason = obsidian_utils.read_note_metadata_detailed(str(note))
+
+        assert meta is None, (
+            f"a body horizontal rule was accepted as a closing fence: {meta!r}"
+        )
+        assert reason.startswith("malformed or missing frontmatter (no closing"), reason
+
+    def test_closing_fence_with_trailing_spaces_does_not_close_the_block(
+        self, tmp_path, monkeypatch
+    ):
+        """`---␣␣` is not a closing fence — the promise, pinned.
+
+        _peek_frontmatter_field's docstring states this tightening (the shared
+        parser compares with rstrip("\r\n"), not .strip()), and
+        read_note_metadata_detailed inherits it. Nothing tested it: a marker
+        tuple that matched a bare "\n---" prefix would treat this line as a
+        fence and hand back the fields above it.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "fence-trailing-spaces.md"
+        note.write_text(
+            "---\n"
+            "type: claude-session\n"
+            "project: trailing-spaces\n"
+            "---  \n"
+            "\n"
+            "# Body\n",
+            encoding="utf-8",
+        )
+
+        meta, reason = obsidian_utils.read_note_metadata_detailed(str(note))
+
+        assert meta is None, f"'---  ' was accepted as a closing fence: {meta!r}"
+        assert reason.startswith("malformed or missing frontmatter (no closing"), reason
+        # Same note through the lighter peek path, which is where the promise
+        # is actually written down.
+        assert obsidian_utils._peek_frontmatter_field(note, "project") is None
+
+    def test_char_capped_read_forges_no_fence_and_reports_the_size(
+        self, tmp_path, monkeypatch
+    ):
+        """The character cap: a truncation fragment reading "---" is not a fence.
+
+        Two guards meet here and the fixture is built to need both.
+
+        1. The read stops mid-line at the cap, leaving a trailing element that
+           is a FRAGMENT, not a line. Here it reads exactly "---" at index 4 —
+           well inside the MAX_FRONTMATTER_LINES+1 slice, so the slice cannot
+           save us — and split_frontmatter would accept it as a closing fence
+           and hand back the fields above. Skipping the `lines.pop()` forges
+           `project: forged-by-fragment`.
+        2. The verdict must name the SIZE. Deriving it from the truncated
+           prefix gives "no closing '---'", i.e. accusing a note whose fence
+           may sit just past the cut — frontmatter.py's own docstring calls
+           that the failure that "sends someone to repair a file that is not
+           broken". _FRONTMATTER_TOO_LARGE_REASON is what
+           vault_index._classify_parse_failure maps to frontmatter_too_long.
+
+        The existing CR-only byte-cap test cannot cover either: its fragment
+        is 2.5 MB of "x", so the shape check rejects the note long before the
+        fragment matters.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        cap = obsidian_utils._FRONTMATTER_MAX_CHARS
+        block = obsidian_utils._FRONTMATTER_READ_BLOCK
+        # The read stops at the first block boundary at or past the cap, so
+        # place the fragment by OFFSET rather than by guessing a file size.
+        stop = ((cap + block - 1) // block) * block
+
+        head = ("---\n"
+                "type: claude-session\n"
+                "project: forged-by-fragment\n")
+        tail = "\n---"
+        # An indented continuation: frontmatter-shaped (so the scan does not
+        # stop on it) and newline-free (so the LINE cap never fires and the
+        # character cap is the one under test).
+        pad = "  " + "z" * (stop - len(head) - len(tail) - 2)
+        note = tmp_path / "char-capped.md"
+        note.write_text(
+            head + pad + tail + "-------\nreal body prose\n" + "q" * 100,
+            encoding="utf-8",
+        )
+        assert note.stat().st_size > cap
+
+        meta, reason = obsidian_utils.read_note_metadata_detailed(str(note))
+
+        assert meta is None, (
+            f"a truncation fragment was accepted as a closing fence: {meta!r}"
+        )
+        assert obsidian_utils._classify_note_parse_failure(reason) == (
+            "frontmatter_too_long"
+        ), f"the size cap was reported as a fence verdict: {reason!r}"
+
+    def test_over_cap_file_with_no_opening_fence_still_reports_no_opening_fence(
+        self, tmp_path, monkeypatch
+    ):
+        """The size caveat must not overwrite a verdict truncation cannot reach.
+
+        "does not open with a '---' fence" is derived from lines[0], which is
+        always inside the FIRST 8 KB block — no read cap can change it. Letting
+        the caveat win here relabels a file that is not a note at all (a pasted
+        minified blob, an exported log) as an oversized NOTE, and that is not
+        cosmetic: gather_session_evidence filters exactly the no_opening_fence
+        reason out of discovery_errors, so the relabel makes that filter
+        size-dependent and re-raises /retro's "evidence discovery partially or
+        fully failed" banner — in every project, every session, permanently —
+        for any such file over the char cap.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "data-dump.md"
+        # One newline, then a single line long enough to trip the CHARACTER
+        # cap (the line cap counts "\n"s and never fires here).
+        note.write_text(
+            "# Data dump\n" + "x" * (obsidian_utils._FRONTMATTER_MAX_CHARS + 500_000),
+            encoding="utf-8",
+        )
+        assert note.stat().st_size > obsidian_utils._FRONTMATTER_MAX_CHARS
+
+        meta, reason = obsidian_utils.read_note_metadata_detailed(str(note))
+
+        assert meta is None
+        assert obsidian_utils._classify_note_parse_failure(reason) == (
+            "no_opening_fence"
+        ), f"the size caveat overwrote a definitive verdict: {reason!r}"
+
+    def test_over_cap_file_with_a_shape_violation_still_reports_no_closing_fence(
+        self, tmp_path, monkeypatch
+    ):
+        """Same guard, second masked verdict — and this one inverts the advice.
+
+        The "stopped at a line that is not frontmatter" verdict names a line
+        that was actually read and inspected (here index 2, "# Title"), so
+        truncation cannot invalidate it either. Overwritten by the caveat, a
+        note whose frontmatter demonstrably dies at line 3 is reported as
+        "the note may be fine; this is a size limit, not a missing fence".
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        note = tmp_path / "broken-note.md"
+        note.write_text(
+            "---\ntype: claude-insight\n# Title\n"
+            + "x" * (obsidian_utils._FRONTMATTER_MAX_CHARS + 500_000),
+            encoding="utf-8",
+        )
+        assert note.stat().st_size > obsidian_utils._FRONTMATTER_MAX_CHARS
+
+        meta, reason = obsidian_utils.read_note_metadata_detailed(str(note))
+
+        assert meta is None
+        assert obsidian_utils._classify_note_parse_failure(reason) == (
+            "no_closing_fence"
+        ), f"the size caveat overwrote a definitive verdict: {reason!r}"
+
+    def test_size_caveat_gate_matches_the_exhaustion_reason_exactly(self):
+        """Exact equality, not startswith — the trap this gate is built around.
+
+        The shape-stop verdict SHARES the bare-exhaustion verdict's prefix
+        ("malformed or missing frontmatter (no closing '---'") and differs only
+        by the "; stopped at ..." tail. A `startswith` gate would therefore
+        re-admit the shape-stop case while looking correct, and the two tests
+        above are the only thing that would notice. Pin the relationship
+        directly, against REAL split_frontmatter output rather than literals,
+        so the trap is documented where the gate is.
+        """
+        shape_stop = frontmatter.split_frontmatter(
+            frontmatter.split_lines_lf_crlf("---\ntype: x\n# Title\n")
+        )[4]
+        exhausted = frontmatter.split_frontmatter(
+            frontmatter.split_lines_lf_crlf("---\ntype: x\n")
+        )[4]
+
+        assert exhausted == frontmatter.NO_CLOSING_FENCE_EXHAUSTED_REASON
+        assert shape_stop != frontmatter.NO_CLOSING_FENCE_EXHAUSTED_REASON
+        assert shape_stop.startswith(
+            "malformed or missing frontmatter (no closing '---'"
+        ), (
+            "the shared prefix is gone, so a startswith gate would no longer "
+            "be wrong here — re-derive what this test is protecting"
+        )
+
+    def test_closing_fence_straddling_a_read_block_boundary_is_found(
+        self, tmp_path, monkeypatch
+    ):
+        """The rewind: a fence split across two 8 KB reads must still be seen.
+
+        `scan_from = max(0, len(text) - 5)` is what makes the next pass
+        re-examine the boundary. Drop the rewind (`scan_from = len(text)`) and
+        the fence at block1-tail "x\n--" / block2-head "-\nbo" is missed
+        FOREVER: the read then runs on to the line cap — measured 40,960 chars
+        against 16,384 here — which is the 47-53x reaper regression this stop
+        exists to prevent, and it is silent, because the note still parses.
+        So the assertion has to be on how much was READ, not on the metadata.
+        """
+        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+
+        block = obsidian_utils._FRONTMATTER_READ_BLOCK
+        head = "---\ntype: claude-session\nproject: seam\nsummary: "
+        # "\n---\n" starts at block - 3, so the first read ends mid-marker.
+        pad = "s" * (block - 3 - len(head))
+        body = "".join(f"prose line {i} with several words\n" for i in range(2000))
+        text = head + pad + "\n---\n" + body
+        assert text.index("\n---\n") == block - 3
+        note = tmp_path / "seam.md"
+        note.write_text(text, encoding="utf-8")
+
+        spy = _install_read_spy(monkeypatch, str(note))
+
+        meta = obsidian_utils.read_note_metadata(str(note))
+
+        assert meta is not None and meta["project"] == "seam"
+        assert spy["chars"] > 0, "spy never saw a read — instrumentation broke"
+        # Two blocks: the first ends inside the marker, the second completes
+        # it. Anything more means the rewind did not happen.
+        assert spy["chars"] <= block * 2, (
+            f"read {spy['chars']} chars of {note.stat().st_size} — the fence "
+            "was missed at the block seam"
+        )
+
+    def test_cache_hit_reports_the_same_reason_as_the_cache_miss(
+        self, tmp_path, monkeypatch
+    ):
+        """"A cache hit is as informative as a miss" — the docstring's promise.
+
+        Reachable in one /retro: gather_session_evidence and
+        build_context_brief both scan the insights folder in the same session,
+        so the second read of a poisoned note is a cache hit. Drop the reason
+        from the hit (`return None, None`) and that second pass records
+        nothing — the note vanishes from the bundle with an empty
+        discovery_errors, which is the exact failure the reason exists to
+        prevent.
+        """
+        monkeypatch.setattr(
+            obsidian_utils, "_get_session_id_fast", lambda: "fixed-sid-283-cachehit"
+        )
+
+        note = tmp_path / "broken-twice.md"
+        note.write_text(
+            "---\ntype: claude-insight\n# My Note\n\nprose, not frontmatter\n",
+            encoding="utf-8",
+        )
+
+        first_meta, first_reason = obsidian_utils.read_note_metadata_detailed(str(note))
+        second_meta, second_reason = obsidian_utils.read_note_metadata_detailed(str(note))
+
+        assert first_meta is None and second_meta is None
+        assert first_reason is not None
+        assert second_reason is not None, (
+            "the cache hit dropped the failure reason — the note is now "
+            "invisible with no explanation"
+        )
+        assert second_reason == first_reason
+
+    @pytest.mark.parametrize(
+        "name,content",
+        [
+            ("well-formed", "---\ntype: claude-session\nproject: p1\n---\n\nbody\n"),
+            ("field-absent", "---\ntype: claude-session\n---\n\nbody\n"),
+            ("empty-value", "---\ntype: claude-session\nproject:\n---\n\nbody\n"),
+            ("no-closing-fence", "---\ntype: claude-session\nproject: p4\n# Title\n"),
+            ("no-opening-fence", "# Title\n\nproject: p5\n"),
+        ],
+    )
+    def test_single_and_multi_field_peek_agree(self, tmp_path, name, content):
+        """_peek_frontmatter_field is a wrapper today; pin that it stays one.
+
+        The reaper reads three fields per note through the multi-field call
+        while every other call site reads one through the wrapper. If a future
+        change re-implements either side, these two must not drift — a
+        divergence would mean the SessionStart scan and the rest of the plugin
+        disagree about what a note says.
+        """
+        note = tmp_path / f"{name}.md"
+        note.write_text(content, encoding="utf-8")
+
+        assert (
+            obsidian_utils._peek_frontmatter_fields(note, ("project",))["project"]
+            == obsidian_utils._peek_frontmatter_field(note, "project")
+        )
+
+    def test_peek_on_a_missing_file_agrees_across_both_entry_points(self, tmp_path):
+        """Same parity, for the path that never opens: a file that isn't there."""
+        missing = tmp_path / "gone.md"
+
+        assert (
+            obsidian_utils._peek_frontmatter_fields(missing, ("project",))["project"]
+            == obsidian_utils._peek_frontmatter_field(missing, "project")
+            is None
+        )
+
+
+def _install_read_spy(monkeypatch, target_path: str) -> dict:
+    """Patch builtins.open so reads of ``target_path`` are counted.
+
+    Every other path (session cache, config) passes through untouched, so
+    this stays safe to install for the duration of one call.
+    """
+    import builtins
+
+    stats = {"chars": 0, "calls": 0}
+    real_open = builtins.open
+
+    class _CountingReader:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def read(self, size=-1):
+            data = self._fh.read(size)
+            stats["calls"] += 1
+            stats["chars"] += len(data)
+            return data
+
+        def __iter__(self):
+            return iter(self._fh)
+
+        def __enter__(self):
+            self._fh.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._fh.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
+
+    def fake_open(file, *args, **kwargs):
+        fh = real_open(file, *args, **kwargs)
+        if str(file) == target_path:
+            return _CountingReader(fh)
+        return fh
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    return stats
 
 
 # ===========================================================================
