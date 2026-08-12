@@ -134,7 +134,10 @@ def partition(
 ) -> tuple[list[dict], list[dict]]:
     """
     Apply invalidation rules in spec order (first match wins):
-        force -> new -> head_changed -> mtime_changed -> ttl_expired.
+        force -> new -> head_changed -> mtime_changed ->
+        ttl_expired (or unusable_ts for a negative/NaN age -- a corrupt,
+        hand-edited, or clock-skewed stamp, reported distinctly from routine
+        expiry) -> heuristic_cached.
     Returns (known_unchanged, needs_reclassification). Groups routed to
     `needs` carry `_reason` for dashboard visibility. Groups routed to
     `known` carry `_cached_classification` / `_cached_confidence` /
@@ -173,11 +176,54 @@ def partition(
             needs.append(g)
             continue
         try:
+            # A sufficiently large int (e.g. a 400-digit JSON integer) makes
+            # float() raise OverflowError rather than ValueError -- treat it
+            # the same as any other unusable value: ancient, so the group
+            # re-derives.
             classified_ts = float(cached.get("classified_ts", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             classified_ts = 0.0
-        if now - classified_ts > _ttl_for(cached.get("classification", "ACTIVE")):
-            g["_reason"] = "ttl_expired"
+        _age = now - classified_ts
+        # Symmetric range, not a one-sided `> ttl`: an age outside [0, ttl] is
+        # unusable, not merely old. A NEGATIVE age means the stamp is ahead of
+        # the clock (skew, a hand-edit, a cache synced from a faster machine)
+        # and a one-sided check would trust it forever; a NaN age fails every
+        # comparison, so `0 <= _age` is False and it lands here too. Both are
+        # re-derived instead of replayed. _freeze_classification clamps the
+        # stored value on write; this closes the same hole on read, in the
+        # SAME run rather than the next one -- which matters because a
+        # replayed verdict is high-trust and can preselect for auto-checkoff.
+        if not (0 <= _age <= _ttl_for(cached.get("classification", "ACTIVE"))):
+            # Separate "unusable" from "merely old". A negative or NaN age means
+            # the stored stamp is not a valid past time (clock skew, a hand-edit,
+            # an external writer) -- an environmental fault worth reporting, not
+            # the routine expiry that a bare "ttl_expired" implies. Rejecting on
+            # read means the replay never forms, so _freeze_classification's
+            # clamp warning cannot fire for this entry; the signal has to live
+            # here.
+            if not (0 <= _age):
+                print(
+                    f"[check-items-cache] WARNING: unusable classified_ts "
+                    f"({cached.get('classified_ts')!r}) for {h} in {project}; "
+                    f"re-deriving instead of replaying",
+                    file=sys.stderr,
+                )
+                g["_reason"] = "unusable_ts"
+            else:
+                g["_reason"] = "ttl_expired"
+            needs.append(g)
+            continue
+        # #297: a cached verdict that was produced by the token-overlap
+        # heuristic must never be replayed as `known`. Entries written before
+        # #297 carry no classifier_source at all, so fall back to the
+        # citation's shape — classify_groups_heuristic always emits
+        # "heuristic: token '<t>' near completion phrase '<p>'". Replaying one
+        # would let SKILL.md stamp it "cache" (a trusted source) and
+        # preselect it for auto-checkoff, which is the exact defect #297 is
+        # about. Routing to `needs` re-classifies it with real evidence.
+        if (cached.get("classifier_source") == "heuristic"
+                or str(cached.get("evidence_citation") or "").startswith("heuristic:")):
+            g["_reason"] = "heuristic_cached"
             needs.append(g)
             continue
         g["_cached_classification"] = cached.get("classification")
@@ -208,6 +254,30 @@ def update_cache(
     """
     if now is None:
         now = time.time()
+
+    # #297 defect 5: only known-trusted verdicts may be persisted. partition()
+    # replays cached verdicts as `known` until the project's HEAD moves, so a
+    # single degraded run would poison every later run with token-co-occurrence
+    # citations. Allowlist, not denylist: an un-migrated or misspelled source
+    # (absent, "", "Heuristic", a future value nobody has audited yet) must be
+    # refused rather than silently persisted — the same allowlist-over-denylist
+    # reasoning as assign_tier's _HIGH_TRUST_SOURCES cap (open_item_dedup.py).
+    # Enforced here rather than only in SKILL.md because skills are advisory
+    # and code is not (memory: feedback_skills_advisory_not_enforcement).
+    _TRUSTED_SOURCES = {"agent", "prefilter", "cache"}
+    _rejected = [fc for fc in (fresh_classifications or [])
+                 if fc.get("classifier_source") not in _TRUSTED_SOURCES]
+    if _rejected:
+        print(
+            f"[check-items-cache] refusing to cache {len(_rejected)} "
+            f"verdict(s) with untrusted/unknown classifier_source for "
+            f"{project}; they will be re-classified on the next run",
+            file=sys.stderr,
+        )
+    _rejected_hashes = {fc.get("canonical_hash") for fc in _rejected}
+    fresh_classifications = [fc for fc in (fresh_classifications or [])
+                             if fc.get("classifier_source") in _TRUSTED_SOURCES]
+
     current_hashes = {g.get("canonical_hash") for g in all_groups}
     fresh_by_hash = {fc.get("canonical_hash"): fc for fc in fresh_classifications}
 
@@ -219,18 +289,47 @@ def update_cache(
     surviving: list[dict] = []
     seen: set[str] = set()
     for g in existing_groups:
+        # Mirrors partition()'s isinstance(g, dict) filter when it builds
+        # cached_groups_by_hash: a corrupt cache file (a stray scalar or
+        # list inside `groups`) degrades to a skipped entry rather than
+        # crashing the whole cache write with AttributeError.
+        if not isinstance(g, dict):
+            continue
         h = g.get("canonical_hash")
         if h not in current_hashes:
             continue
+        if h in _rejected_hashes:
+            # This run could not verify the group — do not let an older entry
+            # be revalidated by the unconditional project_head_at_classify bump.
+            continue
         if h in fresh_by_hash:
-            surviving.append(_freeze_classification(fresh_by_hash[h], now))
+            surviving.append(_freeze_classification(fresh_by_hash[h], now, prior=g))
         else:
             surviving.append(g)
         seen.add(h)
 
     for h, fc in fresh_by_hash.items():
-        if h in seen or h not in current_hashes:
+        # `h in _rejected_hashes` must be checked here too, not just in the
+        # loop above: a hash rejected in loop 1 (e.g. this run's verdict for
+        # it was "heuristic") was deliberately left OUT of `seen` so its
+        # prior entry could be evicted. Without this check, if the SAME hash
+        # also has a trusted "cache" record in fresh_by_hash (fresh_by_hash
+        # is last-write-wins over fresh_classifications, so either ordering
+        # of the two records for one hash collapses to one here), this loop
+        # would re-insert it immediately -- undoing the eviction loop 1 just
+        # performed, in the same function call, and defeating both #297's
+        # "do not let an unverified verdict be replayed" guard and #302's
+        # inheritance (a fresh insert here restarts the TTL at `now`).
+        if h in seen or h in _rejected_hashes or h not in current_hashes:
             continue
+        # The common case: a brand-new canonical_hash that partition() routed
+        # here with _reason "new", so there is no prior entry and `now` is the
+        # right stamp. Two rarer routes also land here: a
+        # classifier_source="cache" replay whose backing entry vanished between
+        # this run's two load_cache() calls (a concurrent run — warned by
+        # _freeze_classification's else-branch below), and a hash whose prior
+        # entry was just evicted by the #297 _rejected_hashes branch earlier
+        # in this function.
         surviving.append(_freeze_classification(fc, now))
 
     run["groups"] = surviving
@@ -239,8 +338,121 @@ def update_cache(
     return cache
 
 
-def _freeze_classification(fc: dict, now: float) -> dict:
-    """Normalize a fresh classification dict into the on-disk cache entry shape."""
+def _resolve_replay_ts(fc: dict, prior: dict | None, now: float):
+    """Decide the classified_ts an entry should be persisted with.
+
+    `fc` is the fresh classification record for this run, `prior` is the
+    existing on-disk cache entry for the same canonical_hash (or None if
+    there isn't one), and `now` is this run's timestamp. Returns the value
+    to store as classified_ts.
+
+    #302: classifier_source == "cache" means this run *replayed* a verdict
+    from partition()'s known-hit path without re-deriving it (Step 6 of
+    check-items/SKILL.md). SKILL.md Step 10 unconditionally stamps
+    classified_ts=int(time.time()) on every record it hands to
+    update_cache, including these replays. If we accepted that stamp here,
+    a replayed verdict's TTL clock would reset on every run that merely
+    *reads* it, so partition()'s ttl_expired check would never fire on a
+    repo whose HEAD is static — measuring "last read" instead of "last
+    verification". Inherit the prior on-disk classified_ts verbatim
+    instead: partition() already tolerates a non-numeric classified_ts by
+    treating it as ancient (see
+    test_partition_handles_non_numeric_classified_ts), so round-tripping a
+    possibly-corrupt prior value is fail-safe, whereas "healing" it by
+    stamping `now` would re-introduce exactly this bug. That tolerance
+    has one gap: a *numeric* bad value (a millisecond-valued stamp, a
+    hand-edited future date) parses fine and is NOT read as ancient, so the
+    clamp below handles the future-dated and NaN cases explicitly.
+    """
+    _is_replay = fc.get("classifier_source") == "cache"
+    if not _is_replay:
+        return fc.get("classified_ts", int(now))
+
+    if isinstance(prior, dict) and "classified_ts" in prior:
+        classified_ts = prior["classified_ts"]
+        # Under partition()'s OLD one-sided `now - classified_ts > ttl` check,
+        # a future-dated inherited stamp was permanently un-expirable -- that
+        # comparison can never be true while the value is ahead of the clock,
+        # so a clock-skewed or hand-edited entry would pin the verdict as
+        # "known" forever, the very failure #302 exists to prevent.
+        # partition() now uses the symmetric `0 <= age <= ttl` range, so a
+        # future-dated stamp already fails on read (a negative age) and is
+        # rejected there as unusable_ts. This clamp is therefore
+        # defense-in-depth, same as the NaN clamp below: it stops a bad value
+        # from ever reaching disk, rather than relying solely on the
+        # read-time guard to catch it every time a stale entry is read.
+        # Clamp to 0 (ancient) rather than to `now`: this run did NOT verify
+        # the verdict, so granting it a fresh full TTL would be a bounded
+        # restatement of the same "measuring last read, not last
+        # verification" bug. 0 forces re-derivation on the next run, which is
+        # exactly how partition() already treats a non-numeric stamp.
+        # Non-numeric values are deliberately NOT coerced: partition() reads
+        # them as ancient already, and comparing a str to a float would raise
+        # TypeError and take down the entire cache update.
+        try:
+            _numeric_ts = float(classified_ts)
+        except (TypeError, ValueError, OverflowError):
+            _numeric_ts = None
+        # Every comparison against NaN is False, so `_numeric_ts > now` would
+        # let a NaN prior stamp pass through as a valid inherited value. Under
+        # partition()'s OLD one-sided `now - ts > ttl` check, a NaN age would
+        # have been permanently un-expirable (every comparison against NaN is
+        # False). partition() now uses a symmetric `0 <= age <= ttl` range, so
+        # a NaN age already fails on read and is caught there. This clamp is
+        # defense-in-depth: it stops a bad value from ever reaching disk,
+        # rather than relying solely on the read-time guard to catch it every
+        # time. `not (x <= now)` routes both NaN and future values into the
+        # clamp below while leaving past and exactly-equal values untouched.
+        # With the read-side guard in place, this whole clamp branch is
+        # unreachable in the normal single-run flow: partition() would have
+        # already routed a future-dated or NaN prior to `needs` as
+        # unusable_ts, so classifier_source="cache" (which only partition()'s
+        # known-hit path produces) could never carry a bad prior ts here in
+        # the first place. It is reachable only via a concurrent writer
+        # racing this run's load/save, or a caller that builds
+        # classifier_source="cache" records directly without going through
+        # partition() first -- so the tests below guard a defense-in-depth
+        # branch, not a path this process's own single-run flow can hit.
+        if _numeric_ts is not None and not (_numeric_ts <= now):
+            print(
+                f"[check-items-cache] WARNING: cached classified_ts "
+                f"({classified_ts}) for {fc.get('canonical_hash')} is not a "
+                f"usable past timestamp; treating it as unverified so it "
+                f"re-derives next run",
+                file=sys.stderr,
+            )
+            classified_ts = 0
+        return classified_ts
+
+    # A replay whose prior entry cannot supply a timestamp -- either no
+    # prior at all, or a prior carrying no classified_ts. Both are the
+    # same invariant violation: partition() can only have emitted
+    # "cache" by finding a usable entry, so reaching here means one of
+    # two things happened: the cache changed between Step 3's
+    # load_cache() and Step 10's (they run in separate processes, or a
+    # caller bug), OR -- the route update_cache's own comment above
+    # names for this same call site -- the #297 _rejected_hashes
+    # branch evicted this hash's prior entry earlier in THIS run. This
+    # is the one place the #302 fix silently reverts to re-stamping,
+    # so it must not be silent.
+    print(
+        f"[check-items-cache] WARNING: classifier_source='cache' for "
+        f"{fc.get('canonical_hash')} but no prior on-disk "
+        f"classified_ts to inherit; stamping now, so its TTL restarts "
+        f"(cache changed mid-run, or its prior entry was evicted this "
+        f"run)",
+        file=sys.stderr,
+    )
+    return fc.get("classified_ts", int(now))
+
+
+def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> dict:
+    """Normalize a fresh classification dict into the on-disk cache entry shape.
+
+    `prior` is the existing on-disk cache entry for the same canonical_hash
+    (or None if there isn't one). Timestamp policy lives in
+    _resolve_replay_ts(); this function only shapes the resulting dict.
+    """
     return {
         "canonical_hash": fc.get("canonical_hash"),
         "canonical_text": fc.get("canonical_text") or fc.get("representative", ""),
@@ -249,5 +461,6 @@ def _freeze_classification(fc: dict, now: float) -> dict:
         "confidence": fc.get("confidence"),
         "evidence_citation": fc.get("evidence_citation"),
         "action_required": fc.get("action_required"),
-        "classified_ts": fc.get("classified_ts", int(now)),
+        "classified_ts": _resolve_replay_ts(fc, prior, now),
+        "classifier_source": fc.get("classifier_source"),
     }

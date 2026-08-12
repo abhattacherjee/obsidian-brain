@@ -282,6 +282,10 @@ def test_confidence_tier_rules_high_requires_literal_ref():
     tier_high = assign_tier(
         evidence_citation="Merged as 5dfaf98 on 2026-04-24; PR #68 closed.",
         item_text="PR #68 write-path cross-midnight backlink fix",
+        # #297: absent/unknown classifier_source now caps at MED too, so an
+        # explicit trusted source is required to prove this citation shape
+        # genuinely reaches HIGH.
+        classifier_source="agent",
     )
     assert tier_high == "HIGH"
 

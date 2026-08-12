@@ -1313,9 +1313,12 @@ def test_assign_tier_review_never_high_even_with_literal_ref_overlap():
     still being unsure and choosing REVIEW over DONE)."""
     citation = "similarly-named tag v2.0.0 (unconfirmed)"
     text = "Ship the v2.0.0 polish pass"
-    # Sanity: the same inputs WOULD be HIGH for a DONE/no-classification call.
-    assert assign_tier(citation, text) == "HIGH"
-    assert assign_tier(citation, text, "REVIEW") == "MED"
+    # Sanity: the same inputs WOULD be HIGH for a DONE/no-classification call
+    # from a high-trust source (#297: absent/unknown source now caps at MED
+    # too, so this must pass an explicit trusted classifier_source to prove
+    # the REVIEW cap specifically, not the provenance cap).
+    assert assign_tier(citation, text, None, "agent") == "HIGH"
+    assert assign_tier(citation, text, "REVIEW", "agent") == "MED"
 
 
 def test_assign_tier_review_defaults_low_with_no_citation():

@@ -1205,7 +1205,7 @@ def test_strip_unreleased_unreleased_at_end_with_no_released_section():
 # ---------------------------------------------------------------------------
 
 def _make_chunking_fake_run(output_path: str, return_rcs: list | None = None,
-                            timeout_on: int | None = None):
+                            timeout_on: int | set | None = None):
     """Build a subprocess.run stub that handles chunked dispatch.
 
     For each call, the stub:
@@ -1217,16 +1217,21 @@ def _make_chunking_fake_run(output_path: str, return_rcs: list | None = None,
       - writes one DONE-classification record per group_id to the per-chunk
         output path
     Optionally returns a non-zero rc for the call index in `return_rcs`, or
-    raises TimeoutExpired for the call index in `timeout_on`.
+    raises TimeoutExpired for the call index (or any index in the set) given
+    by `timeout_on` — a set lets a test time out BOTH of a chunk's retry
+    attempts (see run_classifier's CHUNK_MAX_ATTEMPTS) rather than just one.
     """
     import re as _re
     call_index = {"n": 0}
+    timeout_indices = (
+        {timeout_on} if isinstance(timeout_on, int) else set(timeout_on or [])
+    )
 
     def fake_run(*args, **kwargs):
         idx = call_index["n"]
         call_index["n"] += 1
 
-        if timeout_on is not None and idx == timeout_on:
+        if idx in timeout_indices:
             raise subprocess.TimeoutExpired(cmd=args[0] if args else "claude", timeout=1)
 
         prompt = kwargs.get("input", "")
@@ -1326,25 +1331,35 @@ def test_classifier_chunking_above_threshold_splits(tmp_path, monkeypatch, capsy
     )
 
 
-def test_classifier_chunking_chunk_failure_returns_rc(tmp_path, monkeypatch):
-    """If any chunk times out, run_classifier returns rc=3 (all-or-nothing)."""
+def test_classifier_chunking_chunk_failure_degrades_not_aborts(tmp_path, monkeypatch):
+    """A chunk that times out on BOTH retry attempts degrades — its groups are
+    dropped, but chunk 1 (already completed) and chunk 3 (still to run) are
+    unaffected, so run_classifier returns 0 (#297 defect 2, superseding the
+    old all-or-nothing `return rc` this test used to pin)."""
     import check_items_cli
 
     monkeypatch.setattr("check_items_cli.CLASSIFIER_CHUNK_SIZE", 10)
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
 
-    # 30 groups → 3 chunks of 10. Time out the 2nd chunk.
+    # 30 groups → 3 chunks of 10. Time out BOTH attempts of the 2nd chunk
+    # (call indices 1 and 2 — chunk 1 takes index 0 on its lone attempt).
     groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(30)]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
     output_path = str(tmp_path / "out.json")
 
-    fake_run, calls = _make_chunking_fake_run(output_path, timeout_on=1)
+    fake_run, calls = _make_chunking_fake_run(output_path, timeout_on={1, 2})
     with patch("check_items_cli.subprocess.run", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
-    assert rc == 3, f"Expected rc=3 (timeout) when chunk 2/3 times out, got {rc}"
-    # Dispatch stopped at the failing chunk (no chunk 3 attempted)
-    assert calls["n"] == 2, f"Expected 2 dispatches before bail-out, got {calls['n']}"
+    assert rc == 0, f"Expected 0 (partial failure degrades, doesn't abort), got {rc}"
+    # chunk 1 (1 attempt) + chunk 2 (2 attempts, both time out) + chunk 3 (1 attempt)
+    assert calls["n"] == 4, f"Expected 4 dispatches (1+2+1), got {calls['n']}"
+
+    out = json.loads(Path(output_path).read_text())
+    kept_ids = {r["group_id"] for r in out}
+    assert kept_ids == {f"g{i:03d}" for i in list(range(10)) + list(range(20, 30))}, (
+        "chunk 2's group_ids (g010..g019) must be dropped; chunks 1 and 3 kept"
+    )
 
 
 def test_classifier_chunking_env_override(tmp_path, monkeypatch, capsys):
@@ -1476,8 +1491,9 @@ def test_classifier_chunking_merge_preserves_input_order_across_chunks(tmp_path,
 
 
 def test_classifier_chunking_failure_cleans_up_chunk_outputs(tmp_path, monkeypatch):
-    """Chunk-failure path's `finally` must unlink every chunk output temp
-    that was created, including the one from the failing chunk.
+    """The chunk loop's `finally` must unlink every chunk output temp that
+    was created, including the one from a chunk that degrades (fails both
+    retry attempts).
 
     Guards against a future refactor that moves cleanup inside the loop
     body or drops the `finally`. Without cleanup, 0o600 temp files
@@ -1496,11 +1512,14 @@ def test_classifier_chunking_failure_cleans_up_chunk_outputs(tmp_path, monkeypat
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
     output_path = str(tmp_path / "out.json")
 
-    fake_run, _ = _make_chunking_fake_run(output_path, timeout_on=1)
+    # Time out BOTH attempts of chunk 2 so it degrades (partial failure) —
+    # cleanup must still fire for its temp output even though it never
+    # produced a rc==0 result.
+    fake_run, _ = _make_chunking_fake_run(output_path, timeout_on={1, 2})
     with patch("check_items_cli.subprocess.run", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
-    assert rc == 3
+    assert rc == 0, f"Expected 0 (partial failure degrades, doesn't abort), got {rc}"
     post_classouts = set(workdir.glob("*.classout.json"))
     leaked = post_classouts - pre_classouts
     assert not leaked, (

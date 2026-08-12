@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-08-11
+
+### Fixed
+- **`/check-items` no longer fails an entire classification run when one chunk of items errors out (#297):** each chunk now gets up to 2 attempts, and a chunk that still fails degrades only its own groups — every other chunk (already-completed or still queued) keeps dispatching normally. The run as a whole only reports failure if every chunk failed.
+- **`/check-items` no longer fails silently when the classifier sub-agent misbehaves (#297):** the sub-agent's captured stderr is now forwarded and printed as a diagnostic on every failed attempt, and "the sub-agent produced no output at all" is now distinguished from "the sub-agent produced output that didn't parse" instead of being reported identically.
+- **`/check-items` no longer auto-checks off items that were only classified by the degraded heuristic fallback (#297):** every verdict now carries where it came from (the full AI classifier, the deterministic prefilter, the cache, or the heuristic fallback), and an item classified by the heuristic can never be auto-checked at high confidence — it's capped at MED and shown with a `[heuristic]` marker in the review output, along with a degradation banner whenever any part of the run fell back to the heuristic.
+- **`/check-items` no longer caches (or later trusts) a heuristic-derived verdict (#297):** heuristic classifications are never written to the persistence cache, and any older cached verdict for the same item is evicted rather than left to be silently revalidated by a later run — items the heuristic covered are re-classified from scratch next time instead of being locked in.
+- **Cached `/check-items` verdicts no longer have their expiry refreshed just by being re-read, or trusted forever by an unusable timestamp (#302):** a verdict replayed from the cache now keeps the timestamp of its last real verification instead of picking up the current run's time, so it is genuinely re-verified once its TTL elapses rather than staying "known" indefinitely on a repo whose HEAD never moves; a stamp that's corrupted, non-numeric, NaN, or dated ahead of the clock is now treated as maximally stale rather than trusted indefinitely, whether it's caught on the write that would have persisted it or the read that would have replayed it.
+
+### Security
+
+- **`scripts/bump-version.sh` no longer executes injected commands from the version source (harden-repo#55):** the script fed the parsed version components straight into bash arithmetic with only an is-it-empty check in front. `$(( ))` recursively expands the *contents* of the variables it evaluates, so an array-subscript payload in the version source — e.g. `x[$(rm -rf ~)].0.0` — ran as a command substitution during a bump, and the mangled result was then written back to the version file at exit 0. All three bump types were exploitable, each with the payload in the component that bump evaluates.
+
+  The fix has two layers, because the first one alone was not enough:
+
+  - `CURRENT_VERSION` is semver-validated before it reaches any arithmetic, with each core component bounded to 9 digits so a long component cannot overflow into a wrapped value.
+  - The `-prerelease` / `+build` suffix is **stripped before the components are split**, so only digit runs ever reach `$(( ))`. This is the property that actually makes the arithmetic safe. Validating the string alone is not sufficient: arithmetic does not need a literal `$` or backtick to execute something, because a bare identifier inside `$(( ))` is looked up and its *value* re-evaluated as an arithmetic expression. A version of `1.2.3-zz` with `zz='x[$(cmd)]'` in the environment therefore still ran `cmd` and exited 0 reporting success. The same suffix path also silently **downgraded** `1.2.3-4` to `1.2.0` (`10#3-4 + 1` = 0), which is semver-shaped and so slipped past the write guard.
+
+  Alongside those: the three arithmetic expansions force base 10 (`10#`), so a zero-padded component like `08` is no longer read as an invalid octal literal; carried-through components are normalized through `10#` as well, so `01.02.03` no longer yields `01.02.4`; and a symmetric guard refuses to write a `NEW_VERSION` that is not semver-shaped.
+
 ## [3.4.1] - 2026-08-03
 
 ### Fixed

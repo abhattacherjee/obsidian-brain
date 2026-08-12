@@ -69,7 +69,12 @@ the cache.
 - [ ] Step 3 partition log shows the majority of groups routed to `known` with
       `_cached_classification` / `_cached_confidence` / `_cached_action_required`
       hydrated. Only groups that genuinely changed (mtime, HEAD, TTL) carry a
-      `_reason` from {`mtime_changed`, `head_changed`, `ttl_expired`}.
+      `_reason` from {`mtime_changed`, `head_changed`, `ttl_expired`,
+      `unusable_ts` (#302 — a negative or NaN age: a corrupt, hand-edited, or
+      clock-skewed stamp reported distinctly from routine `ttl_expired`, with
+      a stderr warning), `heuristic_cached`} (the last added in #297 — a
+      cached verdict produced by the token-overlap heuristic is never
+      replayed, it is re-classified).
 - [ ] No semantic-merge or classifier sub-agent fires for cached groups.
 - [ ] Dashboard regenerates with the same classifications. Diff the two
       dashboards: `diff` should be empty except for the timestamp and any

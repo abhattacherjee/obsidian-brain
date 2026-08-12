@@ -34,6 +34,17 @@ CLASSIFIER_CHUNK_SIZE = max(
     1, int(os.environ.get("CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE", "25"))
 )
 
+# rc 6: the sub-agent exited cleanly but produced no parseable output at all
+# (empty file AND empty stdout). Distinct from rc 4 (output present but
+# malformed) so operators can tell "sub-agent returned nothing" from
+# "sub-agent returned garbage" — see #297 defect 1.
+RC_NO_OUTPUT = 6
+
+# Per-chunk retry budget. A chunk that fails twice degrades only its OWN
+# groups; the run keeps every completed chunk and still dispatches the
+# remaining ones (#297 defect 2).
+CHUNK_MAX_ATTEMPTS = 2
+
 
 _FENCE_OPEN_RE = re.compile(r"^\s*```(?:json|JSON)?\s*\n?")
 _FENCE_CLOSE_RE = re.compile(r"\n?\s*```\s*$")
@@ -489,8 +500,10 @@ def _dispatch_classifier_chunk(
     sub_results is [].
 
     rc semantics: 0 success; 3 subprocess timeout; 4 invalid JSON or
-    wrong payload shape from sub-agent; any other value = passthrough
-    of claude -p's non-zero returncode.
+    wrong payload shape from sub-agent; RC_NO_OUTPUT (6) the sub-agent
+    exited cleanly but wrote nothing parseable to either the output file
+    or stdout; any other value = passthrough of claude -p's non-zero
+    returncode.
     """
     workdir = _safe_workdir()
     in_tmp = tempfile.NamedTemporaryFile(
@@ -540,9 +553,17 @@ def _dispatch_classifier_chunk(
         )
         return cp.returncode, []
 
-    if Path(output_path).exists():
+    # The chunked caller pre-creates a 0-byte temp file to allocate a safe
+    # path, so `.exists()` is unconditionally true there and cannot tell
+    # "sub-agent wrote nothing" from "sub-agent wrote garbage" (#297 defect 1).
+    try:
+        file_text = Path(output_path).read_text(encoding="utf-8")
+    except OSError:
+        file_text = ""
+
+    if file_text.strip():
         try:
-            parsed = json.loads(Path(output_path).read_text(encoding="utf-8"))
+            parsed = json.loads(file_text)
         except json.JSONDecodeError as exc:
             print(
                 f"[check-items-cli] {chunk_label}classifier output invalid "
@@ -560,8 +581,18 @@ def _dispatch_classifier_chunk(
             return 4, []
         return 0, parsed
 
+    stdout_text = _strip_json_fences(cp.stdout or "")
+    if not stdout_text.strip():
+        print(
+            f"[check-items-cli] {chunk_label}classifier wrote no output "
+            f"(output file {len(file_text)} bytes, stdout "
+            f"{len(cp.stdout or '')} bytes)",
+            file=sys.stderr,
+        )
+        return RC_NO_OUTPUT, []
+
     try:
-        parsed = json.loads(_strip_json_fences(cp.stdout))
+        parsed = json.loads(stdout_text)
     except json.JSONDecodeError as exc:
         print(
             f"[check-items-cli] {chunk_label}classifier output invalid "
@@ -655,6 +686,8 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
     # -----------------------------------------------------------------------
     sub_results: list = []
     chunk_count = 0
+    failed_chunks = 0
+    unclassified_groups = 0
 
     if to_classify:
         if len(to_classify) <= CLASSIFIER_CHUNK_SIZE:
@@ -685,6 +718,7 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
             workdir = _safe_workdir()
             chunk_outputs: list = []
             completed_chunks = 0
+            last_failure_rc = 0
             try:
                 for idx, chunk in enumerate(chunks):
                     out_tmp = tempfile.NamedTemporaryFile(
@@ -694,30 +728,72 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
                     chunk_outputs.append(out_tmp.name)
                     out_tmp.close()
                     chunk_model = _pick_classifier_model(len(chunk))
-                    label = f"chunk {idx + 1}/{chunk_count} (model={chunk_model}): "
-                    rc, chunk_results = _dispatch_classifier_chunk(
-                        chunk, evidence, chunk_model, out_tmp.name,
-                        chunk_label=label,
-                    )
-                    if rc != 0:
-                        # Discarded earlier-chunk classifications surfaced so
-                        # operators can tell partial chunking from total failure.
+
+                    # A chunk that fails is retried up to CHUNK_MAX_ATTEMPTS
+                    # times before it is allowed to degrade — only its OWN
+                    # groups are dropped; every other chunk (already-completed
+                    # or still-to-run) is unaffected (#297 defect 2).
+                    rc = None
+                    chunk_results: list = []
+                    for attempt in range(1, CHUNK_MAX_ATTEMPTS + 1):
+                        # Truncate before every attempt: a partial/garbage
+                        # write from a prior attempt must never be read as
+                        # this attempt's output.
+                        try:
+                            Path(out_tmp.name).write_text("", encoding="utf-8")
+                        except OSError:
+                            pass
+                        label = (
+                            f"chunk {idx + 1}/{chunk_count} "
+                            f"(model={chunk_model}, attempt {attempt}/{CHUNK_MAX_ATTEMPTS}): "
+                        )
+                        rc, chunk_results = _dispatch_classifier_chunk(
+                            chunk, evidence, chunk_model, out_tmp.name,
+                            chunk_label=label,
+                        )
+                        if rc == 0:
+                            break
+
+                    if rc == 0:
+                        sub_results.extend(chunk_results)
+                        completed_chunks += 1
+                    else:
+                        failed_chunks += 1
+                        unclassified_groups += len(chunk)
+                        last_failure_rc = rc
                         print(
-                            f"[check-items-cli] classifier: aborting after "
-                            f"chunk {idx + 1}/{chunk_count} rc={rc} "
-                            f"(completed={completed_chunks}, "
-                            f"discarded_groups={len(sub_results)})",
+                            f"[check-items-cli] classifier: chunk "
+                            f"{idx + 1}/{chunk_count} failed rc={rc} after "
+                            f"{CHUNK_MAX_ATTEMPTS} attempt(s); {len(chunk)} "
+                            f"group(s) left unclassified, continuing "
+                            f"(completed={completed_chunks})",
                             file=sys.stderr,
                         )
-                        return rc
-                    sub_results.extend(chunk_results)
-                    completed_chunks += 1
+                        continue
             finally:
                 for path in chunk_outputs:
                     try:
                         os.unlink(path)
                     except OSError:
                         pass
+
+            if failed_chunks == chunk_count:
+                # Total failure keeps today's semantics: the caller falls
+                # back to the whole-run heuristic.
+                print(
+                    f"[check-items-cli] classifier: aborting — all "
+                    f"{chunk_count} chunk(s) failed, last rc={last_failure_rc}",
+                    file=sys.stderr,
+                )
+                return last_failure_rc
+
+            if failed_chunks:
+                print(
+                    f"[check-items-cli] classifier: {failed_chunks}/{chunk_count} "
+                    f"chunk(s) failed; {unclassified_groups} group(s) "
+                    f"unclassified, {len(sub_results)} kept",
+                    file=sys.stderr,
+                )
 
     # -----------------------------------------------------------------------
     # Merge in input order and write final output
@@ -743,10 +819,14 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
     prefiltered_count = len(synthetic)
     subagent_count = len(sub_results)
     chunks_field = f" chunks={chunk_count}" if chunk_count > 1 else ""
+    failed_field = (
+        f" failed_chunks={failed_chunks} unclassified={unclassified_groups}"
+        if failed_chunks else ""
+    )
     print(
         f"[check-items-cli] classifier: total={total} cache_hit=- "
         f"prefiltered={prefiltered_count} subagent={subagent_count}"
-        f"{chunks_field} wall={_wall}s",
+        f"{chunks_field}{failed_field} wall={_wall}s",
         file=sys.stderr,
     )
 
