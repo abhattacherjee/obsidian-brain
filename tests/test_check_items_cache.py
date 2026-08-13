@@ -1457,9 +1457,17 @@ def test_partition_replays_freshly_verified_entry_without_per_entry_head():
     per-entry stamp must not leak onto entries update_cache actually
     verified. Without this test, a mutation that stamps head_at_classify on
     every entry (not just un-reclassified survivors) would still pass the
-    laundering tests above while destroying the cache's whole purpose."""
+    laundering tests above while destroying the cache's whole purpose.
+
+    Both halves are exercised deliberately: update_cache freezes a fresh
+    record at TWO call sites -- one for a brand-new canonical_hash and one
+    for a hash that already had an on-disk entry -- and a fixture that only
+    ever starts from an empty cache reaches the first. A stamp-everything
+    mutation on the second would slip past a single-phase version of this
+    test, so phase 2 below re-runs the same hash as an EXISTING entry."""
     from check_items_cache import update_cache, partition
 
+    # Phase 1: brand-new canonical_hash (update_cache's no-prior-entry path).
     cache = {"schema_version": 1, "runs": {}}
     updated = update_cache(
         cache=cache, project="obsidian-brain",
@@ -1471,6 +1479,22 @@ def test_partition_replays_freshly_verified_entry_without_per_entry_head():
 
     known, needs = partition([_make_group("h1")], updated,
                              project="obsidian-brain", head_sha="HEAD1")
+    assert len(known) == 1
+    assert len(needs) == 0
+
+    # Phase 2: the SAME hash now has a prior on-disk entry, so this run takes
+    # update_cache's has-a-prior path. It is genuinely re-verified at HEAD2,
+    # so it must still carry no per-entry stamp and must still replay.
+    updated = update_cache(
+        cache=updated, project="obsidian-brain",
+        all_groups=[_make_group("h1")],
+        fresh_classifications=[_make_fresh("h1", classifier_source="agent")],
+        head_sha="HEAD2",
+    )
+    assert "head_at_classify" not in updated["runs"]["obsidian-brain"]["groups"][0]
+
+    known, needs = partition([_make_group("h1")], updated,
+                             project="obsidian-brain", head_sha="HEAD2")
     assert len(known) == 1
     assert len(needs) == 0
 
