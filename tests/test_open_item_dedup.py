@@ -1248,8 +1248,13 @@ def test_cascade_group_members_skips_already_checked_line(tmp_path, capsys):
     assert "no longer contains expected checkbox" in captured.err
     # File content unchanged (still [x])
     assert "- [x] Fix issue #42" in note.read_text(encoding="utf-8")
-    # Nothing was flipped, so summary is the empty-result form
-    assert "No member lines to cascade." in summary
+    # #320 F3: a target existed and was refused, so this is NOT the same as
+    # a genuinely empty run -- it must not read as "nothing to cascade".
+    assert "Cascaded 0 member-line(s) — every candidate was refused or failed to save." in summary
+    # #320 F4: the checkbox-gone skip is named in the RETURN VALUE too, not
+    # only stderr.
+    assert "note.md:6" in summary
+    assert "whose checkbox is gone" in summary
 
 
 def test_cascade_group_members_empty_groups_returns_empty_summary():
@@ -1360,7 +1365,9 @@ def test_cascade_group_members_blank_text_skipped_and_surfaced(tmp_path, capsys)
 
     captured = capsys.readouterr()
     assert "unverifiable" in captured.err.lower()
-    assert "No member lines to cascade." in summary
+    # #320 F3: a target existed (blank text) and was refused, so this reads
+    # as "refused", not as the genuinely-empty-run message.
+    assert "Cascaded 0 member-line(s) — every candidate was refused or failed to save." in summary
     assert "note.md:6" in summary  # surfaced even though nothing flipped
 
 
@@ -1375,7 +1382,9 @@ def test_cascade_group_members_missing_text_key_treated_as_blank(tmp_path):
 
     content = note.read_text(encoding="utf-8")
     assert "- [ ] Some open item" in content
-    assert "No member lines to cascade." in summary
+    # #320 F3: a target existed (missing text key -> blank) and was
+    # refused, so this reads as "refused", not as genuinely empty.
+    assert "Cascaded 0 member-line(s) — every candidate was refused or failed to save." in summary
 
 
 def test_cascade_group_members_monotonicity_happy_path(tmp_path):
@@ -1414,7 +1423,9 @@ def test_cascade_group_members_skip_list_capped_with_more_tail(tmp_path):
     }]
     summary = cascade_group_members(groups)
 
-    assert "No member lines to cascade." in summary
+    # #320 F3: 7 targets existed and were all refused (drift), so this
+    # reads as "refused", not as genuinely empty.
+    assert "Cascaded 0 member-line(s) — every candidate was refused or failed to save." in summary
     assert "+2 more" in summary
 
 
@@ -1433,6 +1444,137 @@ def test_cascade_group_members_skips_surfaced_in_return_value(tmp_path):
 
     assert "note.md:6" in summary
     assert "text verification" in summary
+
+
+# ---------------------------------------------------------------------------
+# #320 F2 — a failed atomic write must be named, not read as "nothing to do"
+# ---------------------------------------------------------------------------
+
+def test_cascade_group_members_write_failure_surfaced_not_silent(tmp_path, monkeypatch):
+    """A verified flip that fails to reach disk (os.replace OSError) must be
+    named in the summary as a lost write, not collapsed into the
+    empty-input 'No member lines to cascade.' message (#320 F2)."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Fix issue #42"])
+
+    original_replace = os.replace
+
+    def failing_replace(src, dst):
+        if str(dst) == str(note):
+            raise OSError(28, "No space left on device")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+
+    groups = [{"members": [{"file": str(note), "line": 6, "text": "Fix issue #42"}]}]
+    summary = cascade_group_members(groups)
+
+    # Nothing actually landed on disk.
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Fix issue #42" in content
+
+    # The old bug: total_flipped stays 0 because it's only incremented AFTER
+    # a successful write, so this collapsed into the false "nothing to
+    # cascade" message even though a flip WAS computed and lost.
+    assert "No member lines to cascade." not in summary
+    assert "Cascaded 0 member-line(s)" in summary
+    assert "WRITE FAILED" in summary
+    assert "1 verified flip(s) were NOT saved" in summary
+    assert "note.md" in summary
+
+
+def test_batch_cascade_checkoff_write_failure_surfaced_not_silent(tmp_vault, monkeypatch):
+    """Same as above for batch_cascade_checkoff: a lost write must be named,
+    not reported as 'No duplicates found for cascading.' (#320 F2)."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = _create_session_note(
+        sessions_dir, "2026-04-09-proj-wlost.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+
+    original_replace = os.replace
+
+    def patched_replace(src, dst):
+        if ".ob-cascade-" in src:
+            raise OSError("cascade write failed")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", patched_replace)
+    result = batch_cascade_checkoff(
+        str(tmp_vault), "claude-sessions", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Fix hooks/obsidian_utils.py import error" in content
+    assert "No duplicates found for cascading." not in result
+    assert "WRITE FAILED" in result
+    assert "verified flip(s) were NOT saved" in result
+
+
+# ---------------------------------------------------------------------------
+# #320 F6 — dedup rule coverage: first non-blank text wins over a later blank
+# ---------------------------------------------------------------------------
+
+def test_cascade_group_members_first_nonblank_text_wins_over_later_blank(tmp_path):
+    """A later blank-text entry for the SAME (file, line) key must not
+    clobber an earlier usable anchor (#250's dedup rule, previously
+    untested -- mutating it to plain last-write-wins left the suite green)."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Some open item"])
+    groups = [{"members": [
+        {"file": str(note), "line": 6, "text": "Some open item"},
+        {"file": str(note), "line": 6, "text": ""},          # later blank must not clobber
+    ]}]
+    assert "Cascaded 1 member-line(s)" in cascade_group_members(groups)
+
+
+# ---------------------------------------------------------------------------
+# #320 F7 — non-string stored text must not crash the cascade mid-loop
+# ---------------------------------------------------------------------------
+
+def test_cascade_group_members_non_string_text_does_not_crash(tmp_path):
+    """A member whose stored 'text' is a non-string (int/list/dict) -- e.g.
+    a corrupted merged.json entry -- must not raise AttributeError; it is
+    treated as unverifiable (blank) and skipped, not flipped (#320 F7)."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Some open item"])
+
+    for bad_text in (12345, ["a", "list"], {"k": "v"}):
+        groups = [{"members": [{"file": str(note), "line": 6, "text": bad_text}]}]
+        summary = cascade_group_members(groups)  # must not raise
+        assert isinstance(summary, str)
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content  # never blindly flipped
+
+
+def test_batch_cascade_checkoff_non_string_text_does_not_crash(tmp_vault, monkeypatch):
+    """Same as above for batch_cascade_checkoff's high_targets path -- a
+    non-string item_text (simulated corrupted upstream data) must not
+    crash with AttributeError (#320 F7)."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = sessions_dir / "2026-04-09-proj-nonstr.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Some open item\n",
+        encoding="utf-8",
+    )
+
+    import open_item_dedup as oid_module
+
+    def fake_cascade_checkoff(checked_text, existing, source_file=None, source_line=None):
+        return [(str(note), 7, 12345, "high")]  # non-string text
+
+    monkeypatch.setattr(oid_module, "cascade_checkoff", fake_cascade_checkoff)
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault), "claude-sessions", "myproject", ["Some open item"],
+    )  # must not raise
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content  # untouched
+    assert isinstance(result, str)
 
 
 # ---------------------------------------------------------------------------

@@ -917,8 +917,9 @@ def test_sibling_done_keeps_the_rejected_member_s_objection(capsys):
     """A DONE on one member must not erase the guard's objection to another.
 
     SKILL.md Step 8 builds groups_to_cascade from ALL raw_members of a DONE
-    group and cascade_group_members flips every (file, line) target — so the
-    member the guard judged NOT done gets checked off on its sibling's
+    group and cascade_group_members flips every target whose stored text
+    still anchors — so the member the guard judged NOT done gets checked off
+    on its sibling's
     evidence. Discarding the rejection deleted the only record that anyone
     had objected. Both member orders are asserted: the DONE-first order used
     to `break` out of the loop before the rejection was ever seen."""

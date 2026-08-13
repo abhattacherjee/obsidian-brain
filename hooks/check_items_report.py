@@ -31,7 +31,7 @@ def _safe_filename_component(s: str) -> str:
 
 def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
                  classifications, applied, cascaded,
-                 semantic_merge_mode, classifier_mode):
+                 semantic_merge_mode, classifier_mode, skipped=0):
     counts = {"done": 0, "needs_action": 0, "stale": 0, "active": 0, "review": 0}
     for c in classifications:
         kind = c.get("classification", "")
@@ -62,6 +62,7 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
         f"  review: {counts['review']}\n"
         f"applied: {applied}\n"
         f"cascaded: {cascaded}\n"
+        f"skipped: {skipped}\n"
         "tags:\n"
         "  - claude/check-items\n"
         f"  - claude/project/{safe_scope}\n"
@@ -70,7 +71,7 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
 
 
 def _body(scope_name, date_str, window_days, raw_count, group_count,
-          classifications, applied, cascaded, merges):
+          classifications, applied, cascaded, merges, skipped=0):
     by_kind = {"DONE": [], "NEEDS-ACTION": [], "STALE": [], "ACTIVE": [], "REVIEW": []}
     for c in classifications:
         by_kind.setdefault(c.get("classification", "ACTIVE"), []).append(c)
@@ -83,7 +84,7 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
         f"{len(by_kind['DONE'])} DONE, {len(by_kind['NEEDS-ACTION'])} NEEDS-ACTION, "
         f"{len(by_kind['STALE'])} STALE, {len(by_kind['ACTIVE'])} ACTIVE, "
         f"{len(by_kind['REVIEW'])} REVIEW. "
-        f"{applied} applied, {cascaded} cascaded."
+        f"{applied} applied, {cascaded} cascaded, {skipped} skipped."
     )
     parts.append("")
 
@@ -151,10 +152,15 @@ def write_check_items_dashboard(
     semantic_merge_mode,
     classifier_mode,
     dry_run,
+    skipped=0,
 ):
     """
     Write the check-items dashboard report and return the path.
     Always writes (dry_run only affects upstream pipeline behavior).
+
+    ``skipped`` (#320 F1) is the count of cascade candidates that were
+    refused or lost (drifted, unverifiable, checkbox-gone, or a failed
+    write) — optional with a 0 default so existing callers are unaffected.
     """
     # Folder name comes from user config. Reject empty / absolute / parent-
     # escape values explicitly, and anchor the containment check on
@@ -191,9 +197,9 @@ def write_check_items_dashboard(
     # markdown headings with newlines/colons.
     content = (_frontmatter(safe_scope, date_str, window_days, raw_count, group_count,
                             classifications, applied, cascaded,
-                            semantic_merge_mode, classifier_mode)
+                            semantic_merge_mode, classifier_mode, skipped=skipped)
                + _body(safe_scope, date_str, window_days, raw_count, group_count,
-                       classifications, applied, cascaded, merges))
+                       classifications, applied, cascaded, merges, skipped=skipped))
 
     tmp = tempfile.NamedTemporaryFile(
         mode="w", delete=False, dir=str(target_dir),

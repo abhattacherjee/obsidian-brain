@@ -770,7 +770,39 @@ print(f"[cascade] {summary}")
 m = re.search(r"Cascaded (\d+)", summary)
 cascade_total = int(m.group(1)) if m else 0
 print(f"cascaded_total={cascade_total}")
+
+# #320 F1/F2: `summary` can carry Skipped/WRITE FAILED lines beyond the bare
+# count above -- surface them as distinct fields instead of letting them
+# disappear once cascade_total is extracted, and treat a lost write as a
+# hard failure rather than a silent success (0 exit code, "nothing to do").
+skipped_lines = [
+    ln for ln in summary.splitlines()
+    if ln.startswith("Skipped ") or ln.startswith("WRITE FAILED")
+]
+cascade_skipped_total = 0
+for ln in skipped_lines:
+    sm = re.match(r"Skipped (\d+)", ln)
+    if sm:
+        cascade_skipped_total += int(sm.group(1))
+    print(f"[cascade-skip] {ln}")
+print(f"cascade_skipped_total={cascade_skipped_total}")
+
+if "WRITE FAILED" in summary:
+    print(
+        "[cascade] FATAL: a verified checkoff flip failed to save to disk "
+        "-- do not report this run as fully successful",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 PYEOF
+
+# #320 F2: if the block above exited non-zero (WRITE FAILED), STOP here --
+# do not report the run as fully successful. Tell the user which file(s)
+# lost a verified flip (see the printed [cascade-skip] WRITE FAILED line
+# and stderr) and that they should re-run /check-items to retry the
+# cascade once the underlying disk/permission issue is resolved. The
+# confirmed checkoffs from steps 1-4 above are still on disk; only the
+# cascade to sibling copies failed to save.
 
 # Clean up source-skips tempfile.
 rm -f "$_skips_file"
@@ -778,9 +810,11 @@ rm -f "$_skips_file"
 
 **Note on primary-flip loop tracking:** After each successful Edit in steps 1–4, append the flipped item's full file path and line number as `[path, line]` to a Python list, then write that list as JSON to `$_skips_file` before running the cascade block. This prevents the cascade from double-flipping lines the SKILL already handled. `batch_cascade_checkoff` is retained for ad-hoc text-search use outside this SKILL flow.
 
+**Reading `cascade_total` and `cascade_skipped_total`:** carry both forward to Step 9's `write_check_items_dashboard()` call (`cascaded=cascade_total`, `skipped=cascade_skipped_total`) and to the terminal Output format's `Cascaded:` and `Skipped:` lines. If the python block above exited non-zero, its `WRITE FAILED` line is the reason — report it to the user verbatim rather than proceeding as if the cascade fully succeeded.
+
 ## Step 9 — Write dashboard report (Stage 8) — ALWAYS
 
-(Implemented in Task 22.) Call `write_check_items_dashboard()` with the scope, classifications, applied count, cascade count, semantic-merge mode, and classifier mode. Path: `<vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md` (folder configurable, default `claude-check-items`).
+(Implemented in Task 22.) Call `write_check_items_dashboard()` with the scope, classifications, applied count, cascade count, semantic-merge mode, and classifier mode, plus `skipped=cascade_skipped_total` (#320 F1 — the count of cascade candidates that were refused or lost, so the dashboard doesn't collapse to only the auto-checked count). Path: `<vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md` (folder configurable, default `claude-check-items`).
 
 ## Step 10 — Persist cache updates
 
@@ -922,7 +956,10 @@ PYEOF
   Result: 3 DONE (auto-checked), 2 NEEDS-ACTION (commands below), 4 REVIEW (needs a look), 19 ACTIVE (silent)
   Report: ~/Obsidian/claude-check-items/check-items-obsidian-brain-2026-05-11.md
   Cascaded: 2 sibling notes
+  Skipped: 3 sibling(s) refused or lost — see report for basename:line detail
 ```
+
+`Skipped:` (#320 F1) is populated from `cascade_skipped_total` (Step 8) — the count of cascade candidates that were refused (drift, unverifiable stored text, checkbox already gone) or lost (a failed write), summed across every `Skipped ...`/`WRITE FAILED` line in the cascade summary. Omit the line entirely when `cascade_skipped_total` is 0 — don't print `Skipped: 0`.
 
 ## Notes
 
