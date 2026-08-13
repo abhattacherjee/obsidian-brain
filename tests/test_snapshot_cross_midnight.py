@@ -186,6 +186,61 @@ def test_index_mode_does_not_log_malformed_snapshots_of_other_projects(
     assert "skipping malformed snapshot" not in capsys.readouterr().err
 
 
+def _snapshot_without_session_id(sessions_dir: Path, hhmmss: str, sid4: str = "ffff") -> Path:
+    """A snapshot whose frontmatter has NO `session_id:` key at all."""
+    path = sessions_dir / f"{SESSION_DATE}-demo-{sid4}-snapshot-{hhmmss}.md"
+    path.write_text(
+        f"---\ntype: claude-snapshot\ndate: {SESSION_DATE}\n"
+        "project: demo\ntrigger: compact\nstatus: summarized\n---\n\n"
+        "# Context Snapshot: demo\n\n## Summary\nno session_id key\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture
+def absent_and_empty_session_ids(tmp_path):
+    """Two snapshots the index used to conflate: one with the `session_id:` key
+    MISSING entirely, one with the key present but empty."""
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    _snapshot_without_session_id(sessions, "160000", sid4="ffff")
+    _snapshot(sessions, SESSION_DATE, "170000", "", sid4="gggg")
+    return sessions
+
+
+def test_index_does_not_attribute_a_key_absent_snapshot_to_an_empty_session_id(
+    absent_and_empty_session_ids,
+):
+    """A snapshot with NO `session_id:` key yields None from meta.get(), which
+    the uncached scan never equates to "". Defaulting the index key to ""
+    silently attached every key-absent snapshot to an empty-string query — and
+    `$SESSION_ID` reaches find_snapshots_for_session unguarded from
+    skills/vault-search and skills/vault-ask, so an empty value is reachable.
+    """
+    sessions = absent_and_empty_session_ids
+    uncached = find_snapshots_for_session(sessions, "", None, "demo")
+    indexed = find_snapshots_for_session(sessions, "", None, "demo", use_index=True)
+
+    assert uncached == [f"[[{SESSION_DATE}-demo-gggg-snapshot-170000]]"]
+    assert indexed == uncached
+
+
+def test_index_returns_the_key_absent_snapshot_for_a_none_session_id(
+    absent_and_empty_session_ids,
+):
+    """The other divergence direction: the uncached scan's
+    `meta.get("session_id") == session_id` DOES match a None query against a
+    key-absent snapshot, so the index must file it under None, not "".
+    """
+    sessions = absent_and_empty_session_ids
+    uncached = find_snapshots_for_session(sessions, None, None, "demo")
+    indexed = find_snapshots_for_session(sessions, None, None, "demo", use_index=True)
+
+    assert uncached == [f"[[{SESSION_DATE}-demo-ffff-snapshot-160000]]"]
+    assert indexed == uncached
+
+
 # --------------------------------------------------------------------------
 # Performance guard: the memo, not wall-clock
 # --------------------------------------------------------------------------
@@ -276,6 +331,106 @@ def test_index_rebuilds_when_a_new_snapshot_lands(tmp_path, monkeypatch):
     os.utime(sessions, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
 
     assert len(fetch_snapshot_summaries(sessions, "s-1", SESSION_DATE, "demo")) == 2
+
+
+def test_a_real_atomic_write_bumps_the_folder_mtime(tmp_path):
+    """The whole invalidation guard rests on "an atomic vault write bumps the
+    sessions-folder mtime". The test above forces that with os.utime (anti-flake
+    by design), which cannot fail if the property is false — so pin the property
+    itself against a REAL write_vault_note, skipping only when the filesystem's
+    own timestamp granularity swallows the change.
+    """
+    import os
+
+    from obsidian_utils import write_vault_note
+
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    _snapshot(sessions, SESSION_DATE, "100000", "s-1")
+    before = os.stat(sessions).st_mtime_ns
+
+    err = write_vault_note(
+        str(tmp_path),
+        "claude-sessions",
+        f"{SESSION_DATE}-demo-abcd-snapshot-110000.md",
+        f"---\ntype: claude-snapshot\ndate: {SESSION_DATE}\nsession_id: s-1\n"
+        "project: demo\ntrigger: compact\nstatus: summarized\n---\n\n"
+        "# Context Snapshot: demo\n\n## Summary\nreal atomic write\n",
+    )
+    assert err is None, err
+    # Assert the note actually landed in THIS folder before consulting mtime:
+    # the pytest.skip below is an escape hatch for coarse filesystem timestamp
+    # granularity, and without this assert a writer that never created the
+    # dirent would take that hatch instead of failing.
+    assert (sessions / f"{SESSION_DATE}-demo-abcd-snapshot-110000.md").exists()
+
+    after = os.stat(sessions).st_mtime_ns
+    if after == before:
+        pytest.skip(
+            "filesystem directory-mtime granularity swallowed the change; "
+            "the documented coarse-granularity window, not a regression"
+        )
+    assert after > before
+
+
+def test_index_self_heals_after_a_real_atomic_write(tmp_path):
+    """End-to-end companion: warm the memo, write a second snapshot through the
+    real atomic writer, and the next lookup must see it — no os.utime."""
+    import os
+
+    from obsidian_utils import write_vault_note
+
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    _snapshot(sessions, SESSION_DATE, "100000", "s-1")
+
+    assert len(fetch_snapshot_summaries(sessions, "s-1", SESSION_DATE, "demo")) == 1
+    before = os.stat(sessions).st_mtime_ns
+
+    write_vault_note(
+        str(tmp_path),
+        "claude-sessions",
+        f"{SESSION_DATE}-demo-abcd-snapshot-110000.md",
+        f"---\ntype: claude-snapshot\ndate: {SESSION_DATE}\nsession_id: s-1\n"
+        "project: demo\ntrigger: compact\nstatus: summarized\n---\n\n"
+        "# Context Snapshot: demo\n\n## Summary\nreal atomic write\n",
+    )
+    assert (sessions / f"{SESSION_DATE}-demo-abcd-snapshot-110000.md").exists()
+    if os.stat(sessions).st_mtime_ns == before:
+        pytest.skip("filesystem directory-mtime granularity swallowed the change")
+
+    assert len(fetch_snapshot_summaries(sessions, "s-1", SESSION_DATE, "demo")) == 2
+
+
+def test_unstattable_folder_leaves_no_cache_entry(tmp_path, monkeypatch):
+    """When os.stat(folder) fails the sentinel mtime is never served, so storing
+    it would only leave a permanently unusable entry behind."""
+    import os
+
+    sessions = tmp_path / "claude-sessions"
+    sessions.mkdir()
+    _snapshot(sessions, SESSION_DATE, "100000", "s-1")
+
+    real_stat = os.stat
+
+    def failing_stat(path, *a, **kw):
+        if str(path) == os.path.realpath(sessions):
+            raise OSError("stat refused")
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(os, "stat", failing_stat)
+
+    # Called directly: fetch_snapshot_summaries' own Path.is_dir() stats the
+    # same folder, and the point here is the memo's stat guard, not that one.
+    by_sid, malformed = obsidian_utils._snapshot_index(sessions)
+
+    assert malformed == []
+    assert [n for n, _ in by_sid["s-1"]] == [
+        f"{SESSION_DATE}-demo-abcd-snapshot-100000.md"
+    ]
+    assert obsidian_utils._snapshot_index_cache == {}, (
+        "an mtime == -1 entry is never served, so it must never be stored"
+    )
 
 
 # --------------------------------------------------------------------------

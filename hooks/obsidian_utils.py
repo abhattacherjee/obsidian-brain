@@ -2502,21 +2502,38 @@ def read_note_metadata(file_path: str) -> dict | None:
 # invalidated whenever the sessions folder's own mtime changes — creating,
 # renaming or atomically replacing a note bumps the directory mtime, so a new
 # snapshot self-heals the memo on the next lookup at the cost of one stat().
-# Two residual windows are accepted deliberately:
+# Three residual windows are accepted deliberately:
 #   * a filesystem with coarse (1 s) directory-mtime granularity can hide a
 #     snapshot written in the same tick as the build;
-#   * a snapshot landing between two lookups in the same process is not seen.
-# Both are only reachable from READ paths — /recall, vault-search, vault-ask
-# and summarization — which never write a snapshot themselves and run as fresh
-# short-lived processes. The SessionEnd write path in obsidian_session_log.py
-# deliberately does NOT opt in (it calls find_snapshots_for_session without
-# use_index), because a hook that writes a snapshot and then reads back a
-# memoized list would be a new bug.
+#   * a snapshot landing between two lookups in the same process is not seen;
+#   * an IN-PLACE content rewrite of an existing snapshot does not bump the
+#     directory mtime at all, so an edited `session_id:`/`project:` would be
+#     served from a stale index for the life of the process. Unreachable today
+#     — every in-repo path that rewrites a note goes through
+#     tempfile.mkstemp(dir=<note's own dir>) + os.rename (write_vault_note,
+#     flip_note_status, and every scripts/vault_doctor_checks fixer), and an
+#     atomic rename bumps the directory mtime whether it creates a new name or
+#     replaces an existing one. A future writer that edits a note IN PLACE
+#     (open("r+"), sed -i) would silently break this guard; keep vault writes
+#     atomic.
+# The first two are only reachable from READ paths — /recall, vault-search,
+# vault-ask and summarization — which never write a snapshot themselves and run
+# as fresh short-lived processes. The SessionEnd write path in
+# obsidian_session_log.py deliberately does NOT opt in (it calls
+# find_snapshots_for_session without use_index), because a hook that writes a
+# snapshot and then reads back a memoized list would be a new bug.
 #
 # ``(by_session_id, malformed)`` — the two halves every consumer unpacks.
 # ``malformed`` carries snapshots whose frontmatter would not parse, so the
 # "log malformed to stderr and skip" contract survives the memo.
-_SnapshotIndex = tuple[dict[str, list[tuple[str, str]]], list[tuple[str, str]]]
+#
+# The key is ``str | None``, NOT ``str``: a snapshot with no ``session_id:`` key
+# at all yields None from ``meta.get()``, and the uncached path compares
+# ``meta.get("session_id") == session_id`` — so such a note matches a None query
+# and never matches an empty-string one. Defaulting the key to "" here would
+# diverge in BOTH directions (a "" query would wrongly collect key-absent
+# snapshots; a None query would wrongly return nothing).
+_SnapshotIndex = tuple[dict[str | None, list[tuple[str, str]]], list[tuple[str, str]]]
 _snapshot_index_cache: dict[str, tuple[int, _SnapshotIndex]] = {}
 
 
@@ -2530,7 +2547,7 @@ def _build_snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
     raw reason, which can embed up to 60 characters of the note's own text)
     so the caller only decides WHETHER to print, not what.
     """
-    by_sid: dict[str, list[tuple[str, str]]] = {}
+    by_sid: dict[str | None, list[tuple[str, str]]] = {}
     malformed: list[tuple[str, str]] = []
     for p in sorted(sessions_folder_path.glob("*-snapshot*.md")):
         try:
@@ -2541,7 +2558,10 @@ def _build_snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
                 if reason:
                     malformed.append((p.name, _describe_note_parse_failure(reason)))
                 continue
-            by_sid.setdefault(meta.get("session_id", ""), []).append(
+            # No default: a missing key must stay None so the index answers
+            # exactly as the uncached `meta.get("session_id") == session_id`
+            # test does. See ``_SnapshotIndex``.
+            by_sid.setdefault(meta.get("session_id"), []).append(
                 (p.name, meta.get("project", ""))
             )
         except Exception as exc:  # noqa: BLE001
@@ -2567,6 +2587,11 @@ def _snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
     if cached is not None and cached[0] == mtime and mtime != -1:
         return cached[1]
     index = _build_snapshot_index(sessions_folder_path)
+    if mtime == -1:
+        # The sentinel is never served (the guard above rejects it), so storing
+        # it would only leave a permanently unusable entry behind. Return the
+        # fresh build without polluting the memo.
+        return index
     _snapshot_index_cache[key] = (mtime, index)
     return index
 
@@ -2621,9 +2646,14 @@ def find_snapshots_for_session(
         by_sid, malformed = _snapshot_index(sessions_folder_path)
         # fnmatchcase, not fnmatch: fnmatch() normalises case through
         # os.path.normcase, which is identity on POSIX but lowercases on
-        # Windows — that would silently widen matching relative to
-        # Path.glob() on the uncached path. The slug and the filenames both
-        # come from slugify()/make_filename() and are already lowercase.
+        # Windows, so fnmatch() would make this one branch platform-dependent.
+        # fnmatchcase buys a single POSIX-identical rule everywhere, which is
+        # what parity with the uncached path needs on the platforms we run on.
+        # The cost is Windows-only and in the NARROWING direction: Path.glob()
+        # is case-insensitive there, so a hand-renamed `...-SNAPSHOT-...md`
+        # would be found by the uncached scan and missed here. Accepted because
+        # both the slug and the filenames come from slugify()/make_filename()
+        # and are lowercase by construction.
         for name, detail in malformed:
             if fnmatch.fnmatchcase(name, glob_pattern):
                 print(f"[obsidian-brain] skipping malformed snapshot {name}: {detail}",
