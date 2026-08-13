@@ -606,6 +606,9 @@ if mode != "ok":
           f"token-overlap heuristic, not evidence.", file=sys.stderr)
     print("   Heuristic citations read 'token X near completion phrase Y'. "
           "That is co-occurrence, NOT proof the item is done.", file=sys.stderr)
+    print("   A citation reading 'DONE rejected — ... but <cue> governs it' is "
+          "the #299 conditional guard: the co-occurrence was a pending or "
+          "forward-looking reference, so the item stayed open.", file=sys.stderr)
     print("   They are capped at tier MED and are never preselected. "
           "Verify each one manually before accepting.", file=sys.stderr)
 
