@@ -22,6 +22,7 @@ from open_item_dedup import (
     verify_before_edit,
     assign_tier,
     partition_for_review,
+    parse_cascade_skipped_total,
 )
 
 
@@ -1575,6 +1576,113 @@ def test_batch_cascade_checkoff_non_string_text_does_not_crash(tmp_vault, monkey
     content = note.read_text(encoding="utf-8")
     assert "- [ ] Some open item" in content  # untouched
     assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# #320 R1 (Gemini) — non-int stored 'line' must not crash the cascade
+# mid-loop. The text-sanitization guard above validates 'text'; 'line' was
+# still unhardened, so a str/float line raised TypeError inside the
+# per-file loop AFTER earlier files were already committed via os.replace,
+# leaving a half-applied cascade. isinstance(True, int) is True in Python,
+# so a bool must be excluded explicitly -- otherwise True silently reads as
+# line 1 and flips the wrong line.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad_line", ["10", 1.5, True])
+def test_cascade_group_members_bad_line_type_skipped_sibling_still_flips(tmp_path, capsys, bad_line):
+    """A member whose stored 'line' is a str, a float, or a bool must not
+    raise, and must be skipped rather than flipped. A legitimate sibling
+    member in the SAME group still flips, proving the bad member is
+    skipped, not the whole run aborted (#320 R1 Gemini)."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Some open item", "Sibling item"])
+
+    groups = [{
+        "members": [
+            {"file": str(note), "line": bad_line, "text": "Some open item"},
+            {"file": str(note), "line": 7, "text": "Sibling item"},
+        ]
+    }]
+    summary = cascade_group_members(groups)  # must not raise
+    assert isinstance(summary, str)
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content  # bad member never touched
+    assert "- [x] Sibling item" in content  # sibling still flips
+
+    captured = capsys.readouterr()
+    assert "malformed line number" in captured.err
+
+
+@pytest.mark.parametrize("bad_line", ["10", 1.5, True])
+def test_batch_cascade_checkoff_bad_line_type_skipped_sibling_still_flips(tmp_vault, monkeypatch, capsys, bad_line):
+    """Same as above for batch_cascade_checkoff's high_targets collection
+    loop (#320 R1 Gemini)."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = sessions_dir / "2026-04-09-proj-badline.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Some open item\n"
+        "- [ ] Sibling item\n",
+        encoding="utf-8",
+    )
+
+    import open_item_dedup as oid_module
+
+    def fake_cascade_checkoff(checked_text, existing, source_file=None, source_line=None):
+        return [
+            (str(note), bad_line, "Some open item", "high"),
+            (str(note), 8, "Sibling item", "high"),
+        ]
+
+    monkeypatch.setattr(oid_module, "cascade_checkoff", fake_cascade_checkoff)
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault), "claude-sessions", "myproject", ["Some open item"],
+    )  # must not raise
+    assert isinstance(result, str)
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content  # bad member never touched
+    assert "- [x] Sibling item" in content  # sibling still flips
+
+    captured = capsys.readouterr()
+    assert "malformed line number" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# #320 R1 (Gemini) — parse_cascade_skipped_total: code/doc parity
+# ---------------------------------------------------------------------------
+# SKILL.md's Output format section documents cascade_skipped_total as
+# summing every "Skipped ..."/"WRITE FAILED" line in the cascade summary,
+# but the inline parsing only summed "Skipped" lines -- the WRITE FAILED
+# line's lost-flip count never reached the total. parse_cascade_skipped_total()
+# is now the single source of truth for both skills/check-items/SKILL.md and
+# this test, so the two can no longer drift apart.
+
+def test_parse_cascade_skipped_total_sums_skipped_and_write_failed():
+    """Pin N + M: a summary with both a 'Skipped N ...' line and a
+    'WRITE FAILED for ...; M verified flip(s) were NOT saved: ...' line
+    must sum to N + M, not just N (#320 R1 Gemini)."""
+    summary = (
+        "Cascaded 2 member-line(s) across 1 file(s).\n"
+        "Skipped 3 member-line(s) failing text verification: a.md:5, b.md:9\n"
+        "WRITE FAILED for 1 file(s); 4 verified flip(s) were NOT saved: c.md"
+    )
+    assert parse_cascade_skipped_total(summary) == 3 + 4
+
+
+def test_parse_cascade_skipped_total_write_failed_only():
+    """A summary with only a WRITE FAILED line (no Skipped line) still
+    contributes its lost-flip count."""
+    summary = "WRITE FAILED for 2 file(s); 5 verified flip(s) were NOT saved: a.md, b.md"
+    assert parse_cascade_skipped_total(summary) == 5
+
+
+def test_parse_cascade_skipped_total_no_matching_lines_is_zero():
+    summary = "Cascaded 3 member-line(s) across 1 file(s)."
+    assert parse_cascade_skipped_total(summary) == 0
 
 
 # ---------------------------------------------------------------------------

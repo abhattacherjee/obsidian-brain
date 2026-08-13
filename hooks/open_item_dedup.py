@@ -104,6 +104,41 @@ def _format_text_verification_skips(
     return f"Skipped {len(skips)} {unit}(s) {reason}: {enumerated}{tail}"
 
 
+_RE_SKIPPED_COUNT = re.compile(r"^Skipped (\d+)")
+# Matches the exact WRITE FAILED shape built by cascade_group_members /
+# batch_cascade_checkoff:
+#   f"WRITE FAILED for {len(write_failures)} file(s); "
+#   f"{total_lost} verified flip(s) were NOT saved: {names}"
+# Group 1 captures the lost-flip count (M), not the file count (N).
+_RE_WRITE_FAILED_COUNT = re.compile(
+    r"^WRITE FAILED for \d+ file\(s\); (\d+) verified flip\(s\) were NOT saved"
+)
+
+
+def parse_cascade_skipped_total(summary: str) -> int:
+    """Sum every skip/loss count out of a cascade summary string.
+
+    Adds each ``Skipped N ...`` line's N and each ``WRITE FAILED for N
+    file(s); M verified flip(s) were NOT saved: ...`` line's M (the lost
+    verified-flip count). This is the single source of truth for
+    skills/check-items/SKILL.md's ``cascade_skipped_total``, whose doc
+    (Output format section) promises a sum across every ``Skipped ...``/
+    ``WRITE FAILED`` line -- the inline parsing there previously summed
+    only ``Skipped`` lines, silently diverging from that doc (#320 R1
+    Gemini).
+    """
+    total = 0
+    for line in summary.splitlines():
+        sm = _RE_SKIPPED_COUNT.match(line)
+        if sm:
+            total += int(sm.group(1))
+            continue
+        wm = _RE_WRITE_FAILED_COUNT.match(line)
+        if wm:
+            total += int(wm.group(1))
+    return total
+
+
 _STOPWORDS = frozenset({
     'the', 'a', 'an', 'to', 'for', 'in', 'on', 'of', 'and', 'or',
     'but', 'is', 'are', 'was', 'were', 'be', 'not', 'this', 'that',
@@ -525,6 +560,23 @@ def batch_cascade_checkoff(
     for checked_text in checked_texts:
         dupes = cascade_checkoff(checked_text, existing)
         for fpath, line_num, item_text, confidence in dupes:
+            # #320 R1 (Gemini): same line_num hardening as
+            # cascade_group_members above -- line_num is a hint carried
+            # from find_duplicates/existing_items and is not guaranteed to
+            # be a genuine positive int. Reject at the boundary instead of
+            # letting a bad value reach `idx = ln - 1` / `lines[idx]` in the
+            # write loop below, which raises TypeError mid-loop and can
+            # leave a cascade half-applied after earlier files were already
+            # committed via os.replace. isinstance(True, int) is True in
+            # Python, so bool must be excluded explicitly.
+            if not isinstance(line_num, int) or isinstance(line_num, bool) or line_num <= 0:
+                print(
+                    f"[obsidian-brain] batch_cascade_checkoff: candidate in "
+                    f"{os.path.basename(fpath)} has a malformed line number "
+                    f"({line_num!r}, type {type(line_num).__name__}); skipping.",
+                    file=sys.stderr,
+                )
+                continue
             key = (fpath, line_num)
             if confidence == "high":
                 # #320 F7: item_text is a hint carried from upstream grouping
@@ -728,7 +780,27 @@ def cascade_group_members(
         for m in group.get("members", []) or []:
             fpath = m.get("file", "")
             line_num = m.get("line")
-            if not fpath or line_num is None:
+            if not fpath:
+                continue
+            # #320 R1 (Gemini): line_num is a hint carried from merged.json,
+            # not guaranteed to be a genuine positive int (a corrupted cache
+            # entry could hand back a str/float/bool). `not isinstance(...,
+            # int) or isinstance(..., bool) or line_num <= 0` mirrors the
+            # non-string `text` sanitization above -- reject at the boundary
+            # instead of letting a bad value reach `idx = ln - 1` /
+            # `lines[idx]` below, which raises TypeError mid-loop and can
+            # leave a cascade half-applied after earlier files were already
+            # committed via os.replace. isinstance(True, int) is True in
+            # Python, so bool must be excluded explicitly -- a bool must
+            # NOT be accepted as a line number (True would silently flip
+            # line 0).
+            if not isinstance(line_num, int) or isinstance(line_num, bool) or line_num <= 0:
+                print(
+                    f"[obsidian-brain] cascade_group_members: member in "
+                    f"{os.path.basename(fpath)} has a malformed line number "
+                    f"({line_num!r}, type {type(line_num).__name__}); skipping.",
+                    file=sys.stderr,
+                )
                 continue
             key = (fpath, line_num)
             if key in source_skips:

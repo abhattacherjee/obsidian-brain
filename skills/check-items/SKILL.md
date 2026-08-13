@@ -690,7 +690,7 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
-from open_item_dedup import cascade_group_members
+from open_item_dedup import cascade_group_members, parse_cascade_skipped_total
 
 scope_path = os.environ["SCOPE_PATH"]
 buckets_path = os.environ["BUCKETS_PATH"]
@@ -779,11 +779,14 @@ skipped_lines = [
     ln for ln in summary.splitlines()
     if ln.startswith("Skipped ") or ln.startswith("WRITE FAILED")
 ]
-cascade_skipped_total = 0
+# #320 R1 (Gemini): the doc below (Output format section) promises
+# cascade_skipped_total sums every Skipped AND WRITE FAILED line -- the
+# inline parsing here previously only summed Skipped lines, silently
+# diverging from that doc. parse_cascade_skipped_total() (hooks/
+# open_item_dedup.py) is the single source of truth for both this script
+# and its unit tests, so the two can no longer drift apart.
+cascade_skipped_total = parse_cascade_skipped_total(summary)
 for ln in skipped_lines:
-    sm = re.match(r"Skipped (\d+)", ln)
-    if sm:
-        cascade_skipped_total += int(sm.group(1))
     print(f"[cascade-skip] {ln}")
 print(f"cascade_skipped_total={cascade_skipped_total}")
 
