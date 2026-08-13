@@ -1523,3 +1523,101 @@ def test_partition_prefers_per_entry_head_over_run_level():
     assert len(known) == 0
     assert len(needs) == 1
     assert needs[0].get("_reason") == "head_changed"
+
+
+def test_update_cache_survivor_with_no_prior_run_head_is_pinned_to_none():
+    """#305 (S2): a run dict carrying `groups` but NO `project_head_at_classify`
+    -- a hand-edited or partially-written cache -- must still fail safe. The
+    survivor is pinned to None, which can never equal a real sha, so it routes
+    to needs/head_changed rather than being replayed against a head nothing
+    recorded. It self-heals on the next run: once it gets a fresh record,
+    _freeze_classification rebuilds the entry without the key and the
+    run-level fallback takes over again.
+    """
+    from check_items_cache import update_cache, partition
+
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                # project_head_at_classify deliberately absent
+                "groups": [_make_cached_entry("h1")],
+            }
+        },
+    }
+    updated = update_cache(
+        cache=cache, project="obsidian-brain",
+        all_groups=[_make_group("h1")],
+        fresh_classifications=[],          # nothing re-verified this run
+        head_sha="HEAD2",
+    )
+    survivor = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert survivor["head_at_classify"] is None
+
+    # Survives a JSON round-trip as null, and still refuses to replay.
+    roundtripped = json.loads(json.dumps(updated))
+    known, needs = partition([_make_group("h1")], roundtripped,
+                             project="obsidian-brain", head_sha="HEAD2")
+    assert len(known) == 0
+    assert needs[0].get("_reason") == "head_changed"
+
+
+def test_pinned_survivor_with_corrupt_ts_still_warns(capsys):
+    """#305 (S5): the per-entry head check runs BEFORE the classified_ts range
+    check, so a pinned survivor short-circuits to head_changed and would
+    otherwise skip the corrupt-stamp WARNING entirely.
+
+    That population is the one most likely to carry a bad stamp -- nothing
+    re-verified it -- so losing the signal there is the worst place to lose
+    it. Routing is identical either way (both land in `needs`); this test
+    pins the DIAGNOSTIC, which no routing assertion can catch.
+    """
+    from check_items_cache import partition
+
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "HEAD2",
+                "groups": [{
+                    **_make_cached_entry("h1"),
+                    "head_at_classify": "HEAD1",          # pinned, un-re-verified
+                    "classified_ts": time.time() + 90_000,  # future-dated
+                }],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache,
+                             project="obsidian-brain", head_sha="HEAD2")
+    assert len(known) == 0
+    assert needs[0].get("_reason") == "head_changed"
+    err = capsys.readouterr().err
+    assert "unusable classified_ts" in err, (
+        "a pinned survivor carrying a future-dated stamp must still report it"
+    )
+
+
+def test_unusable_ts_is_reported_once_not_twice(capsys):
+    """The two guards that can report a bad stamp are mutually exclusive
+    (each `continue`s), so the warning must fire exactly once. A refactor
+    that let both run would double-report every corrupt entry."""
+    from check_items_cache import partition
+
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "HEAD1",
+                "groups": [{
+                    **_make_cached_entry("h1"),
+                    "classified_ts": time.time() + 90_000,
+                }],
+            }
+        },
+    }
+    # head matches, so this reaches the TTL guard rather than the head guard
+    partition([_make_group("h1")], cache, project="obsidian-brain", head_sha="HEAD1")
+    assert capsys.readouterr().err.count("unusable classified_ts") == 1

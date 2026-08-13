@@ -124,6 +124,41 @@ def _mtime_matches(cached_members: list[dict], current_members: list[dict]) -> b
     return True
 
 
+def _classified_ts_age(cached: dict, now: float) -> float:
+    """Seconds between `now` and a cached entry's stored classified_ts.
+
+    A sufficiently large int (e.g. a 400-digit JSON integer) makes float()
+    raise OverflowError rather than ValueError -- treat it the same as any
+    other unusable value: ancient, so the group re-derives. A NaN stamp
+    yields a NaN age, which fails every comparison; callers must test
+    `0 <= age`, never `age < 0`.
+    """
+    try:
+        classified_ts = float(cached.get("classified_ts", 0))
+    except (TypeError, ValueError, OverflowError):
+        classified_ts = 0.0
+    return now - classified_ts
+
+
+def _warn_if_unusable_ts(cached: dict, now: float, h: str, project: str) -> None:
+    """Report a stored classified_ts that is not a valid past time.
+
+    A negative or NaN age means clock skew, a hand-edit, or an external
+    writer -- an environmental fault worth reporting, distinct from routine
+    expiry. Rejecting on read means the replay never forms, so
+    _freeze_classification's write-side clamp warning cannot fire for this
+    entry; the signal has to live here. Called from BOTH guards that can
+    route such an entry to `needs` (#305), which are mutually exclusive.
+    """
+    if not (0 <= _classified_ts_age(cached, now)):
+        print(
+            f"[check-items-cache] WARNING: unusable classified_ts "
+            f"({cached.get('classified_ts')!r}) for {h} in {project}; "
+            f"re-deriving instead of replaying",
+            file=sys.stderr,
+        )
+
+
 def partition(
     groups: list[dict],
     cache: dict,
@@ -174,6 +209,16 @@ def partition(
         # to.
         entry_head = cached.get("head_at_classify", cached_head)
         if entry_head != head_sha:
+            # #305: a pinned survivor short-circuits HERE, before the
+            # classified_ts range check below that reports a corrupt or
+            # clock-skewed stamp. Routing is unaffected (both land in
+            # `needs`), but the diagnostic would be silently lost -- and
+            # pinned survivors are exactly the population most likely to
+            # carry a stale stamp, since by definition nothing re-verified
+            # them. Emit the same warning here so reordering the guards does
+            # not cost the signal. Mutually exclusive with the call below:
+            # each branch `continue`s, so a stamp is never reported twice.
+            _warn_if_unusable_ts(cached, now, h, project)
             g["_reason"] = "head_changed"
             needs.append(g)
             continue
@@ -181,15 +226,7 @@ def partition(
             g["_reason"] = "mtime_changed"
             needs.append(g)
             continue
-        try:
-            # A sufficiently large int (e.g. a 400-digit JSON integer) makes
-            # float() raise OverflowError rather than ValueError -- treat it
-            # the same as any other unusable value: ancient, so the group
-            # re-derives.
-            classified_ts = float(cached.get("classified_ts", 0))
-        except (TypeError, ValueError, OverflowError):
-            classified_ts = 0.0
-        _age = now - classified_ts
+        _age = _classified_ts_age(cached, now)
         # Symmetric range, not a one-sided `> ttl`: an age outside [0, ttl] is
         # unusable, not merely old. A NEGATIVE age means the stamp is ahead of
         # the clock (skew, a hand-edit, a cache synced from a faster machine)
@@ -208,12 +245,7 @@ def partition(
             # clamp warning cannot fire for this entry; the signal has to live
             # here.
             if not (0 <= _age):
-                print(
-                    f"[check-items-cache] WARNING: unusable classified_ts "
-                    f"({cached.get('classified_ts')!r}) for {h} in {project}; "
-                    f"re-deriving instead of replaying",
-                    file=sys.stderr,
-                )
+                _warn_if_unusable_ts(cached, now, h, project)
                 g["_reason"] = "unusable_ts"
             else:
                 g["_reason"] = "ttl_expired"

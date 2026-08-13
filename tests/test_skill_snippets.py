@@ -441,9 +441,52 @@ def test_check_items_skill_captures_head_only_once():
     path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
     with open(path, encoding="utf-8") as f:
         content = f.read()
-    occurrences = re.findall(r'rev-parse["\']?,?\s*["\']HEAD', content)
+    # The pattern must tolerate BOTH the argv-list form this file uses today
+    # (`["git", "-C", p, "rev-parse", "HEAD"]`) and the bare shell form
+    # (`git rev-parse HEAD`, `head=$(git -C "$r" rev-parse HEAD)`) — SKILL.md
+    # is mostly bash, so a re-derivation reintroduced there is the likelier
+    # regression, and an argv-only pattern would let it back in silently.
+    # `HEAD(?![\w~^])` keeps revision expressions (HEAD~1, HEAD^) out: those
+    # name a specific past commit and are not a re-derivation of current HEAD.
+    # Step 3's `git rev-parse --show-toplevel` (line ~129) never matches.
+    occurrences = re.findall(r'''rev-parse[\s,"']+HEAD(?![\w~^])''', content)
     assert len(occurrences) == 1, (
         f"expected exactly one `rev-parse ... HEAD` call in {path}, "
         f"found {len(occurrences)} — Step 10 must reuse Step 3's captured "
         "head, not re-derive it"
+    )
+
+
+def test_check_items_heads_handoff_key_matches():
+    """#305: Step 3 captures each project's HEAD into partition.json and Step
+    10 reads it back instead of re-deriving it. Nothing else pins that
+    cross-block contract, and breaking it FAILS SILENTLY IN THE WORST
+    DIRECTION: Step 10's `heads.get(proj)` returns None for every project, so
+    every project hits `continue` and /check-items stops persisting
+    classifications entirely — announced only on stderr, which this repo
+    documents as ignorable. Verified by mutation: deleting `"heads": heads`
+    from Step 3's json.dump leaves the entire 2645-test suite green.
+
+    Both sides are extracted and compared rather than string-matched, so
+    reformatting the dict or the call does not break the test — only an
+    actual rename or removal on either end does.
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+
+    write = re.search(r'json\.dump\(\{[^}]*"([A-Za-z_]\w*)": heads\}', content)
+    assert write, (
+        "Step 3 must serialize the captured per-project HEADs into "
+        "partition.json (expected a `\"<key>\": heads` entry in its json.dump)"
+    )
+    read = re.search(r'heads\s*=\s*part\.get\(\s*"([A-Za-z_]\w*)"', content)
+    assert read, (
+        "Step 10 must read the HEADs Step 3 captured out of partition.json "
+        "(expected `heads = part.get(\"<key>\", ...)`)"
+    )
+    assert write.group(1) == read.group(1), (
+        f"partition.json heads-key mismatch: Step 3 writes "
+        f"{write.group(1)!r} but Step 10 reads {read.group(1)!r} — every "
+        "cache update would be silently skipped"
     )
