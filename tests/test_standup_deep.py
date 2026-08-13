@@ -982,3 +982,133 @@ class TestBatchCascadeEncoding:
             str(tmp_vault), "claude-sessions", "p", ["Fix encoding bug"])
         # Should not crash — either finds the item or reports no duplicates
         assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# #243 — deep presentation classification order
+# ---------------------------------------------------------------------------
+
+
+def _classification_fixture(tmp_vault, classifications):
+    """Write the two JSON inputs build_deep_presentation reads and render."""
+    pipeline_path = str(tmp_vault / "pipeline-243.json")
+    with open(pipeline_path, "w") as f:
+        json.dump({
+            "link_suggestions": [],
+            "merge_suggestions": [],
+            "items": {"total_raw": len(classifications), "groups": [], "group_count": 0},
+            "evidence": {},
+        }, f)
+
+    classifications_path = str(tmp_vault / "classifications-243.json")
+    with open(classifications_path, "w") as f:
+        json.dump(classifications, f)
+
+    return open_item_dedup.build_deep_presentation(
+        pipeline_path=pipeline_path,
+        classifications_path=classifications_path,
+        basenames_json="[]",
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+    )
+
+
+def _every_label_item():
+    """One item per valid classification, each with a distinct project + location."""
+    return [
+        {
+            "classification": cls,
+            "canonical": f"Item for {cls}",
+            "evidence": f"evidence for {cls}",
+            "project": f"proj-{cls.lower()}",
+            "instances": [{"file": f"notes/{cls.lower()}.md", "line": idx + 1}],
+        }
+        for idx, cls in enumerate(sorted(open_item_dedup._VALID_CLASSIFICATIONS))
+    ]
+
+
+class TestDeepClassOrder:
+    def test_order_covers_exactly_the_valid_classifications(self):
+        """The render order and the validator agree, by construction.
+
+        #243: they did not. class_order still listed the pre-#264 labels
+        COMPLETED/REDUNDANT, so DONE / NEEDS-ACTION / REVIEW matched nothing.
+        """
+        assert set(open_item_dedup._DEEP_CLASS_ORDER) == set(
+            open_item_dedup._VALID_CLASSIFICATIONS
+        )
+        # Ordered tuple, no duplicates — a repeated label would render twice.
+        assert len(open_item_dedup._DEEP_CLASS_ORDER) == len(
+            set(open_item_dedup._DEEP_CLASS_ORDER)
+        )
+
+    def test_check_items_cli_agrees_with_open_item_dedup(self):
+        """The duplicate label set in check_items_cli must not drift.
+
+        Two modules validate classifier output against their own copy of the
+        set. If they disagree, one accepts a label the other rejects.
+        """
+        import check_items_cli
+
+        assert set(check_items_cli._VALID_CLASSIFICATIONS) == set(
+            open_item_dedup._VALID_CLASSIFICATIONS
+        )
+
+    def test_every_classification_keeps_project_and_location(self, tmp_vault):
+        """Every valid label renders through the PRIORITIZED branch.
+
+        The trailing "remaining" branch emits only canonical + evidence — it
+        drops the project label and the "Found in `file:line`" provenance. So
+        this asserts on those two fields rather than on section presence:
+        before #243, DONE / NEEDS-ACTION / REVIEW rendered without any way to
+        locate the item, which is the actual user-visible harm.
+        """
+        result = _classification_fixture(tmp_vault, _every_label_item())
+
+        for cls in open_item_dedup._VALID_CLASSIFICATIONS:
+            assert f"(proj-{cls.lower()})" in result, (
+                f"{cls} lost its project label — it fell through to the "
+                f"un-prioritized 'remaining' branch"
+            )
+            assert f"notes/{cls.lower()}.md:" in result, (
+                f"{cls} lost its file:line provenance — it fell through to "
+                f"the un-prioritized 'remaining' branch"
+            )
+
+    def test_sections_render_in_priority_order(self, tmp_vault):
+        """Sections appear in _DEEP_CLASS_ORDER, not alphabetically."""
+        result = _classification_fixture(tmp_vault, _every_label_item())
+
+        positions = []
+        for cls in open_item_dedup._DEEP_CLASS_ORDER:
+            heading = f"### {cls.title()} ("
+            idx = result.find(heading)
+            assert idx != -1, f"no section rendered for {cls}"
+            positions.append((cls, idx))
+
+        assert positions == sorted(positions, key=lambda p: p[1]), (
+            f"sections out of priority order: "
+            f"{[c for c, _ in sorted(positions, key=lambda p: p[1])]} "
+            f"!= {list(open_item_dedup._DEEP_CLASS_ORDER)}"
+        )
+
+    def test_unknown_label_still_renders_in_the_remaining_branch(self, tmp_vault):
+        """A label outside the valid set is not silently dropped.
+
+        The "remaining" branch is the safety net for classifier output that
+        does not match any known label; #243 removed its use for VALID labels
+        but must not remove the net itself.
+        """
+        result = _classification_fixture(tmp_vault, [
+            {
+                "classification": "SOMETHING-NEW",
+                "canonical": "Unrecognized label item",
+                "evidence": "still surfaced",
+                "project": "proj-x",
+                "instances": [{"file": "notes/x.md", "line": 1}],
+            },
+        ])
+
+        assert "Unrecognized label item" in result
+        assert "still surfaced" in result

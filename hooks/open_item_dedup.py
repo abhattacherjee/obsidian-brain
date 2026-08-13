@@ -1293,7 +1293,7 @@ def build_deep_presentation(
                         f"**{total_raw}** raw items classified: {count_parts}.\n")
 
         # Render each classification group in priority order
-        class_order = ["COMPLETED", "REDUNDANT", "STALE", "ACTIVE"]
+        class_order = _DEEP_CLASS_ORDER
         for cls in class_order:
             items_in_class = by_class.get(cls, [])
             if not items_in_class:
@@ -1573,7 +1573,25 @@ def get_last_semantic_merge_mode():
 # Stage 4: classify_groups_with_agent orchestrator (Task 16)
 # ---------------------------------------------------------------------------
 
-_VALID_CLASSIFICATIONS = {"DONE", "NEEDS-ACTION", "STALE", "ACTIVE", "REVIEW"}
+# Priority order for /standup deep's classification sections, and the single
+# source of truth for which labels are valid at all (#243).
+#
+# These MUST be one definition, not two. They were two: class_order in
+# build_deep_presentation still listed the pre-#264 labels COMPLETED/REDUNDANT,
+# which no classifier has emitted since, so DONE / NEEDS-ACTION / REVIEW matched
+# nothing and fell through to the trailing "remaining" branch. That branch is
+# not merely unordered — it renders only canonical + evidence, dropping the
+# project label and the "Found in `file:line`" provenance that the prioritized
+# branch emits. The three buckets a standup is actually read for were the three
+# rendered with no way to locate the item.
+#
+# Deriving the valid set from the ordered tuple makes that drift impossible:
+# adding a label here is what makes it valid, so a new label cannot be accepted
+# by the validator while being invisible to the renderer. check_items_cli.py
+# keeps its own copy of the set for import-independence; a test pins the two
+# together.
+_DEEP_CLASS_ORDER = ("DONE", "NEEDS-ACTION", "REVIEW", "STALE", "ACTIVE")
+_VALID_CLASSIFICATIONS = frozenset(_DEEP_CLASS_ORDER)
 _REQUIRED_CLASSIFIER_FIELDS = {
     "group_id", "classification", "confidence",
     "canonical_text", "evidence_citation", "action_required",
