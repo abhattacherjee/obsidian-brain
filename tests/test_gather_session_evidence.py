@@ -30,10 +30,12 @@ def test_gather_session_evidence_unknown_sid_returns_empty(tmp_vault: Path) -> N
         project="obsidian-brain",
     )
     assert bundle["session_id"] == "unknown"
+    assert bundle["session_ids"] == []
     assert bundle["snapshots"] == []
     assert bundle["insights"] == []
     assert bundle["decisions"] == []
     assert bundle["error_fixes"] == []
+    assert bundle["retros"] == []
     assert bundle["discovery_errors"] == []
 
 
@@ -573,10 +575,12 @@ def test_gather_session_evidence_empty_when_no_matches(tmp_vault: Path) -> None:
     )
 
     assert bundle["session_id"] == "SID-Z"
+    assert bundle["session_ids"] == ["SID-Z"]
     assert bundle["snapshots"] == []
     assert bundle["insights"] == []
     assert bundle["decisions"] == []
     assert bundle["error_fixes"] == []
+    assert bundle["retros"] == []
     assert bundle["discovery_errors"] == []
 
 
@@ -763,3 +767,316 @@ def test_gather_session_evidence_pre_spec_snapshot_sorts_first(tmp_vault: Path) 
     assert hhmmss_seq == ["??????", "100000"], (
         "Pre-spec snapshot ('??????') must sort before post-spec ones"
     )
+
+
+# ---------------------------------------------------------------------------
+# #184 — also_session_ids widens WHOSE artifacts are discovered
+# ---------------------------------------------------------------------------
+
+
+def test_gather_session_evidence_default_call_unchanged(tmp_vault: Path) -> None:
+    """A call with no also_session_ids behaves exactly as before, plus the
+    new session_ids/retros keys."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    snap = _make_snapshot(sessions_dir, sid="SID-A", hhmmss="100000")
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+    )
+
+    assert bundle["session_id"] == "SID-A"
+    assert bundle["session_ids"] == ["SID-A"]
+    assert [s["path"] for s in bundle["snapshots"]] == [str(snap)]
+    assert bundle["retros"] == []
+
+
+def test_gather_session_evidence_also_session_ids_snapshots_interleaved(
+    tmp_vault: Path,
+) -> None:
+    """Snapshots from both arcs are returned, sorted by stem — not by which
+    id found them. Stems are chosen so naive concatenation (all of SID-A's
+    matches, then all of SID-B's) would produce the WRONG order, which is
+    what makes this test meaningful."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    # SID-B (also_session_ids, the pre-compact arc) has an earlier-dated
+    # snapshot AND a later-dated one, straddling SID-A's snapshot by stem.
+    pre_early = _make_snapshot_dated(
+        sessions_dir, sid="SID-B", date="2026-05-01", hhmmss="100000"
+    )
+    current = _make_snapshot_dated(
+        sessions_dir, sid="SID-A", date="2026-05-02", hhmmss="100000"
+    )
+    pre_late = _make_snapshot_dated(
+        sessions_dir, sid="SID-B", date="2026-05-03", hhmmss="100000"
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+        also_session_ids=["SID-B"],
+    )
+
+    paths = [s["path"] for s in bundle["snapshots"]]
+    assert paths == [str(pre_early), str(current), str(pre_late)], paths
+    session_ids = [s["session_id"] for s in bundle["snapshots"]]
+    assert session_ids == ["SID-B", "SID-A", "SID-B"], session_ids
+
+
+def test_gather_session_evidence_also_session_ids_insights_across_both(
+    tmp_vault: Path,
+) -> None:
+    """Insights/decisions/error-fixes are discovered across both ids, and each
+    entry carries the session_id it actually belongs to."""
+    insights_dir = tmp_vault / "claude-insights"
+    ins_a = _make_insight(
+        insights_dir, filename="2026-05-02-a-aaaa.md", note_type="claude-insight", sid="SID-A"
+    )
+    ins_b = _make_insight(
+        insights_dir, filename="2026-05-01-b-bbbb.md", note_type="claude-insight", sid="SID-B"
+    )
+    dec_b = _make_insight(
+        insights_dir, filename="2026-05-01-c-cccc-decision.md", note_type="claude-decision", sid="SID-B"
+    )
+    err_a = _make_insight(
+        insights_dir, filename="2026-05-02-d-dddd-error-fix.md", note_type="claude-error-fix", sid="SID-A"
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+        also_session_ids=["SID-B"],
+    )
+
+    assert {i["path"] for i in bundle["insights"]} == {str(ins_a), str(ins_b)}
+    assert [d["path"] for d in bundle["decisions"]] == [str(dec_b)]
+    assert [e["path"] for e in bundle["error_fixes"]] == [str(err_a)]
+    by_path = {i["path"]: i["session_id"] for i in bundle["insights"]}
+    assert by_path[str(ins_a)] == "SID-A"
+    assert by_path[str(ins_b)] == "SID-B"
+
+
+def test_gather_session_evidence_also_session_ids_normalization(tmp_vault: Path) -> None:
+    """Empty string, 'unknown', and a duplicate of the primary id are all
+    dropped from also_session_ids; session_ids reflects the survivors only."""
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+        also_session_ids=["", "unknown", "SID-A", "SID-B"],
+    )
+    assert bundle["session_id"] == "SID-A"
+    assert bundle["session_ids"] == ["SID-A", "SID-B"]
+
+
+def test_gather_session_evidence_unknown_primary_with_valid_also_id(
+    tmp_vault: Path,
+) -> None:
+    """Primary 'unknown' + a valid also_session_ids entry DOES discover
+    evidence — session_id stays 'unknown' but session_ids picks up the
+    valid id and scanning proceeds."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    snap = _make_snapshot(sessions_dir, sid="SID-B", hhmmss="100000")
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="unknown",
+        project="obsidian-brain",
+        also_session_ids=["SID-B"],
+    )
+
+    assert bundle["session_id"] == "unknown"
+    assert bundle["session_ids"] == ["SID-B"]
+    assert [s["path"] for s in bundle["snapshots"]] == [str(snap)]
+
+
+def test_gather_session_evidence_unknown_sid_no_also_ids_still_empty(
+    tmp_vault: Path,
+) -> None:
+    """Regression: the plain unknown-sid case (no also_session_ids at all)
+    must still short-circuit to an empty bundle, including session_ids."""
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="unknown",
+        project="obsidian-brain",
+    )
+    assert bundle["session_ids"] == []
+    assert bundle["snapshots"] == []
+
+
+def test_gather_session_evidence_also_session_ids_cross_project_decoy_excluded(
+    tmp_vault: Path,
+) -> None:
+    """A decoy snapshot from a different project is excluded even while
+    scanning two session ids."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    own = _make_snapshot(sessions_dir, sid="SID-B", hhmmss="100000", project="obsidian-brain")
+    _make_snapshot(
+        sessions_dir,
+        sid="SID-B",
+        hhmmss="200000",
+        project="other-project",
+        project_slug="other-project",
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+        also_session_ids=["SID-B"],
+    )
+
+    assert [s["path"] for s in bundle["snapshots"]] == [str(own)]
+
+
+# ---------------------------------------------------------------------------
+# #285 — prior claude-retro notes get their own bucket
+# ---------------------------------------------------------------------------
+
+
+def test_gather_session_evidence_no_prior_retros(tmp_vault: Path) -> None:
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+    )
+    assert bundle["retros"] == []
+
+
+def test_gather_session_evidence_one_prior_retro_found(tmp_vault: Path) -> None:
+    insights_dir = tmp_vault / "claude-insights"
+    retro = _make_insight(
+        insights_dir,
+        filename="2026-05-03-retro-aaaa.md",
+        note_type="claude-retro",
+        sid="SID-A",
+        title="Session Retrospective",
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+    )
+
+    assert [r["path"] for r in bundle["retros"]] == [str(retro)]
+    assert bundle["retros"][0]["title"] == "Session Retrospective"
+
+
+def test_gather_session_evidence_retro_different_session_excluded(tmp_vault: Path) -> None:
+    insights_dir = tmp_vault / "claude-insights"
+    _make_insight(
+        insights_dir,
+        filename="2026-05-03-retro-bbbb.md",
+        note_type="claude-retro",
+        sid="SID-OTHER",
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+    )
+
+    assert bundle["retros"] == []
+
+
+def test_gather_session_evidence_retro_different_project_excluded(tmp_vault: Path) -> None:
+    """A retro belonging to a different project has a different source_session
+    (sessions are per-project), so it is excluded the same way any other
+    cross-project note would be."""
+    insights_dir = tmp_vault / "claude-insights"
+    _make_insight(
+        insights_dir,
+        filename="2026-05-03-retro-cccc.md",
+        note_type="claude-retro",
+        sid="SID-OTHER-PROJECT",
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+    )
+
+    assert bundle["retros"] == []
+
+
+def test_gather_session_evidence_retro_found_via_also_session_ids(tmp_vault: Path) -> None:
+    """A retro written under a prior session id is found when that id is
+    passed via also_session_ids."""
+    insights_dir = tmp_vault / "claude-insights"
+    retro = _make_insight(
+        insights_dir,
+        filename="2026-05-01-retro-dddd.md",
+        note_type="claude-retro",
+        sid="SID-B",
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+        also_session_ids=["SID-B"],
+    )
+
+    assert [r["path"] for r in bundle["retros"]] == [str(retro)]
+
+
+def test_gather_session_evidence_retro_not_in_other_buckets(tmp_vault: Path) -> None:
+    """Regression guard: adding the retros bucket must not change insights /
+    decisions / error_fixes — a claude-retro note must not leak into any of
+    them."""
+    insights_dir = tmp_vault / "claude-insights"
+    _make_insight(
+        insights_dir,
+        filename="2026-05-03-retro-eeee.md",
+        note_type="claude-retro",
+        sid="SID-A",
+    )
+    ins = _make_insight(
+        insights_dir,
+        filename="2026-05-03-real-insight-ffff.md",
+        note_type="claude-insight",
+        sid="SID-A",
+    )
+
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+    )
+
+    assert len(bundle["retros"]) == 1
+    assert [i["path"] for i in bundle["insights"]] == [str(ins)]
+    assert bundle["decisions"] == []
+    assert bundle["error_fixes"] == []

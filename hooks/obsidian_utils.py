@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 try:
@@ -2886,74 +2887,124 @@ def gather_session_evidence(
     insights_folder: str,
     session_id: str,
     project: str,
+    *,
+    also_session_ids: Sequence[str] = (),
 ) -> dict:
     """Discover and load all artifacts written during this session.
 
     Returns a structured bundle of snapshots (from sessions_folder) and
-    insights/decisions/error-fixes (from insights_folder) whose frontmatter
-    `source_session` matches the given session_id.
+    insights/decisions/error-fixes/retros (from insights_folder) whose
+    frontmatter `source_session` matches `session_id` OR any id in
+    `also_session_ids`.
+
+    `also_session_ids` exists for post-compact /retro resume: when the
+    active conversation is a summary continuation, the arc being retro'd
+    was written under the PRIOR session id (found in the transcript path
+    the continuation summary cites), not the current one. Pass that prior
+    id here to fold its evidence into the same bundle. `session_id` and
+    `also_session_ids` are normalized together, in order, dropping any id
+    that is empty, `"unknown"`, or a duplicate of one already kept; the
+    result is exposed as `session_ids` (see below). Ids equal to `""` or
+    `"unknown"` are dropped even when they appear in `also_session_ids`.
+
+    `bundle["session_id"]` keeps its original meaning: the primary
+    `session_id` exactly as passed, even when that is `"unknown"`.
+    `bundle["session_ids"]` is the ordered, de-duplicated list actually
+    scanned — it is `[]` when nothing survives normalization (including the
+    plain `session_id == "unknown"`, no-also-ids case), and it MAY be
+    non-empty even when `session_id == "unknown"`, if a valid id was passed
+    via `also_session_ids`.
+
+    `bundle["retros"]` holds prior `claude-retro` notes matched the same way
+    as insights/decisions/error-fixes. These are a BOUNDARY MARKER for
+    /retro (see #285) — the most recent one demarcates where a previous
+    retro's analysis left off — and are not themselves evidence to mine.
 
     Snapshots are returned sorted ascending by stem (YYYY-MM-DD-... prefix),
     which gives correct chronological order including across-midnight sessions.
     Pre-spec snapshots (hhmmss == '??????') sort before all post-spec ones.
-    Insights/decisions/error-fixes are returned sorted ascending by filename.
-    File-read failures are captured in `discovery_errors` and never raised.
+    Insights/decisions/error-fixes/retros are returned sorted ascending by
+    filename. File-read failures are captured in `discovery_errors` and
+    never raised.
 
     Used by /retro to ground retrospective analysis in the full session
     arc (pre-compact + post-compact) rather than just the active conversation.
     """
     bundle: dict = {
         "session_id": session_id,
+        "session_ids": [],
         "snapshots": [],
         "insights": [],
         "decisions": [],
         "error_fixes": [],
+        "retros": [],
         "discovery_errors": [],
     }
-    if session_id == "unknown" or not session_id:
+    ids: list[str] = []
+    for sid in (session_id, *also_session_ids):
+        if not sid or sid == "unknown" or sid in ids:
+            continue
+        ids.append(sid)
+    bundle["session_ids"] = ids
+    if not ids:
         return bundle
+    id_set = set(ids)
     sessions_path = Path(vault_path) / sessions_folder
     if sessions_path.is_dir():
         # Pass date=None for date-agnostic discovery so cross-midnight sessions
         # (snapshots written on YYYY-MM-DD and YYYY-MM-(DD+1)) are both found.
         # Frontmatter session_id+project filters inside find_snapshots_for_session
         # exclude any cross-project or cross-session decoys the broader glob picks up.
-        for link in find_snapshots_for_session(sessions_path, session_id, None, project):
-            stem = link.strip("[]")
-            snap_path = sessions_path / f"{stem}.md"
-            if not snap_path.exists():
-                continue
-            try:
-                body = snap_path.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
-                # exc.strerror, NOT str(exc): str(OSError) embeds the full
-                # path argument, leaking the absolute vault path into
-                # discovery_errors and from there into the model's context.
-                # Same shape (and same reason) as _read_frontmatter_region's
-                # reason — and newly reachable, because that reader only pulls
-                # ~8 KB of frontmatter while this read pulls the whole file, so
-                # on a cloud-synced vault a partially-materialized note can
-                # succeed there and fail EIO here.
-                bundle["discovery_errors"].append(
-                    f"{snap_path.name}: {_UNREADABLE_REASON_PREFIX} "
-                    f"{exc.strerror or type(exc).__name__}"
-                )
-                continue
-            meta = read_note_metadata(str(snap_path)) or {}
-            bundle["snapshots"].append({
-                "path": str(snap_path),
-                "stem": stem,
-                "hhmmss": _extract_hhmmss_from_filename(snap_path.name),
-                "trigger": meta.get("trigger", "auto"),
-                "body": body,
-            })
-        bundle["snapshots"].sort(key=lambda s: (0 if s["hhmmss"] == "??????" else 1, s["stem"]))
+        #
+        # Not use_index=True: that memo (added in #70) is deliberately opt-in
+        # and must stay unreachable from any path that could read back a
+        # snapshot written earlier in the same run. ids is 1-2 entries here,
+        # so the per-id glob cost this would save isn't worth that coupling.
+        snap_by_stem: dict[str, dict] = {}
+        for sid in ids:
+            for link in find_snapshots_for_session(sessions_path, sid, None, project):
+                stem = link.strip("[]")
+                if stem in snap_by_stem:
+                    continue
+                snap_path = sessions_path / f"{stem}.md"
+                if not snap_path.exists():
+                    continue
+                try:
+                    body = snap_path.read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    # exc.strerror, NOT str(exc): str(OSError) embeds the full
+                    # path argument, leaking the absolute vault path into
+                    # discovery_errors and from there into the model's context.
+                    # Same shape (and same reason) as _read_frontmatter_region's
+                    # reason — and newly reachable, because that reader only pulls
+                    # ~8 KB of frontmatter while this read pulls the whole file, so
+                    # on a cloud-synced vault a partially-materialized note can
+                    # succeed there and fail EIO here.
+                    bundle["discovery_errors"].append(
+                        f"{snap_path.name}: {_UNREADABLE_REASON_PREFIX} "
+                        f"{exc.strerror or type(exc).__name__}"
+                    )
+                    continue
+                meta = read_note_metadata(str(snap_path)) or {}
+                snap_by_stem[stem] = {
+                    "path": str(snap_path),
+                    "stem": stem,
+                    "hhmmss": _extract_hhmmss_from_filename(snap_path.name),
+                    "trigger": meta.get("trigger", "auto"),
+                    "body": body,
+                    "session_id": meta.get("session_id", ""),
+                }
+        bundle["snapshots"] = sorted(
+            snap_by_stem.values(),
+            key=lambda s: (0 if s["hhmmss"] == "??????" else 1, s["stem"]),
+        )
     insights_path = Path(vault_path) / insights_folder
     if insights_path.is_dir():
         type_buckets = {
             "claude-insight": bundle["insights"],
             "claude-decision": bundle["decisions"],
             "claude-error-fix": bundle["error_fixes"],
+            "claude-retro": bundle["retros"],
         }
         for note_path in sorted(insights_path.glob("*.md")):
             meta, reason = read_note_metadata_detailed(str(note_path))
@@ -3011,7 +3062,7 @@ def gather_session_evidence(
                         f"{note_path.name}: {_describe_note_parse_failure(reason)}"
                     )
                 continue
-            if meta.get("source_session") != session_id:
+            if meta.get("source_session") not in id_set:
                 continue
             note_type = meta.get("type", "")
             target = type_buckets.get(note_type)
@@ -3034,6 +3085,7 @@ def gather_session_evidence(
                 "stem": note_path.stem,
                 "title": title,
                 "body": body,
+                "session_id": meta.get("source_session", ""),
             })
     return bundle
 
