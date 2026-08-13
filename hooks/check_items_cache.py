@@ -7,6 +7,7 @@ Python stdlib only.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -59,26 +60,56 @@ def _empty_cache() -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "runs": {}}
 
 
-def load_cache() -> dict[str, Any]:
+def load_cache(*, with_status: bool = False):
     """
     Load the cache. On corruption or schema-version mismatch, warn to stderr
     and return an empty cache. Never blocks the pipeline.
+
+    With `with_status=True`, returns `(data, status)` instead of bare `data`.
+    `status` is one of:
+
+      None              -- loaded cleanly (including "file does not exist yet").
+      "corrupt"         -- json.JSONDecodeError: the file itself IS the
+                            garbage, so overwriting it on save is the correct
+                            recovery.
+      "unreadable"      -- an OSError reading an otherwise-possibly-fine file
+                            (EACCES, EIO, EMFILE, ...). The file was not
+                            proven bad, only unreadable *right now* --
+                            overwriting it would destroy data this call
+                            merely failed to read.
+      "foreign_schema"  -- valid JSON, but not this schema (wrong type, or a
+                            schema_version this code does not recognise --
+                            e.g. written by a newer version). Overwriting
+                            would be a silent downgrade.
+
+    Existing callers that pass no arguments are unaffected -- they keep
+    getting bare `data`, exactly as before. A caller that opts into
+    `with_status=True` and gets back anything other than `None`/"corrupt"
+    must NOT blindly save over the (empty) result it was handed -- see
+    `locked_cache()`, the only caller that currently does (#323 F1).
     """
+    def _ret(data, status):
+        return (data, status) if with_status else data
+
     if not CACHE_PATH.exists():
-        return _empty_cache()
+        return _ret(_empty_cache(), None)
     try:
         with CACHE_PATH.open("r", encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
+    except json.JSONDecodeError as exc:
         print(f"[check-items-cache] WARNING: cache load failed ({exc}); using empty cache",
               file=sys.stderr)
-        return _empty_cache()
+        return _ret(_empty_cache(), "corrupt")
+    except OSError as exc:
+        print(f"[check-items-cache] WARNING: cache load failed ({exc}); using empty cache",
+              file=sys.stderr)
+        return _ret(_empty_cache(), "unreadable")
     if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
         print(f"[check-items-cache] WARNING: cache schema mismatch; using empty cache",
               file=sys.stderr)
-        return _empty_cache()
+        return _ret(_empty_cache(), "foreign_schema")
     data.setdefault("runs", {})
-    return data
+    return _ret(data, None)
 
 
 def save_cache(data: dict[str, Any]) -> None:
@@ -91,7 +122,18 @@ def save_cache(data: dict[str, Any]) -> None:
         json.dump(data, tmp, indent=2, default=str)
         tmp.flush()
         os.fsync(tmp.fileno())
-    finally:
+    except Exception:
+        # A failed write (disk full mid-json.dump, a bad fsync, ...) never
+        # reaches os.replace() below, so the temp file is orphaned unless we
+        # clean it up here. Disk-full is exactly the condition likely to
+        # produce a whole run of these (#323 F5). Suppress a failure from the
+        # unlink itself -- the disk may still be full -- rather than masking
+        # the original error by raising that one instead.
+        tmp.close()
+        with contextlib.suppress(OSError):
+            os.unlink(tmp.name)
+        raise
+    else:
         tmp.close()
     os.replace(tmp.name, str(CACHE_PATH))
     os.chmod(str(CACHE_PATH), 0o600)
@@ -112,6 +154,21 @@ def save_cache(data: dict[str, Any]) -> None:
 _LOCK_TIMEOUT_SECONDS = 10.0   # max time locked_cache() waits for a contended lock
 _LOCK_STALE_SECONDS = 30.0     # age past which a lock is presumed abandoned (crashed holder)
 _LOCK_POLL_INTERVAL_SECONDS = 0.05
+# #323 F7: _lock_payload() formats its timestamp with `.3f` (millisecond
+# precision), which ROUNDS -- up to ~0.5ms toward the future. A lock read
+# back and aged microseconds later can therefore see a genuinely fresh
+# payload as up to ~0.5ms "ahead" of time.time(), a pure formatting
+# artifact with no bearing on staleness. Measured empirically: naively
+# gating on `0 <= age` made a freshly-written payload fall through to the
+# st_mtime fallback in roughly HALF of all checks (956,812 / 2,000,000
+# trials of `time.time() - float(f"{time.time():.3f}")` came back
+# negative) -- reintroducing the exact single-read mis-pairing hazard the
+# docstring above describes as already fixed, since mtime and the payload
+# can differ. 10ms is two orders of magnitude past the ~0.5ms formatting
+# error and many orders of magnitude short of the minutes-to-hours a real
+# clock stepped back by NTP or a resumed VM would show, so it cannot mask
+# an actual unusable timestamp.
+_LOCK_AGE_ROUNDING_TOLERANCE_SECONDS = 0.01
 
 
 def _lock_payload() -> bytes:
@@ -142,17 +199,68 @@ def _lock_age(lock_path: Path, holder: bytes) -> float:
     invariant is the actual fix, not the re-read confirmation below it.
 
     Falls back to st_mtime for a payload this version cannot parse (an older
-    format, or a hand-created file), and to 0.0 -- "fresh", so never taken
-    over -- when even that fails.
+    format, or a hand-created file).
+
+    #323 F7: only a valid PAST time is trusted, from EITHER source. This is
+    a regression #306 (9cfc2bf) introduced when it moved age off st_mtime
+    and onto the payload's own embedded timestamp -- that made age a parsed
+    value from file content, and float() happily accepts "nan"/"inf", while
+    a future-dated stamp (a backward clock step: NTP correction, a suspended
+    VM resuming) yields a negative age. All three compare `> _LOCK_STALE_SECONDS`
+    as False forever, so takeover never fires and nothing ever unlinks the
+    lock again -- every later run stalls the full timeout and then writes
+    UNLOCKED, permanently, which is strictly worse than the pre-#306
+    baseline (that at least never stalled). Verified by execution against
+    the pre-fix 9cfc2bf: a future-ts, NaN-ts, or +inf-ts payload each wedged
+    (age stayed "not stale" and _acquire_lock took the full timeout every
+    time), while a normal stale payload and an unparseable-payload fallback
+    both still recovered via takeover.
+
+    This mirrors a convention this module already applies to
+    classified_ts (_classified_ts_age / partition()'s `0 <= age` range
+    check, guarded by four tests) -- an unusable stamp must never read as
+    "fresh forever". Unlike classified_ts, where an unusable value means
+    "re-derive it", an unusable LOCK timestamp must resolve to STALE, not
+    fresh: "fresh forever" is exactly what wedges the lock, and treating it
+    as fresh is the one choice with no self-healing path. A wrongful
+    takeover this produces is still detectable after the fact --
+    `_release_lock` warns when it finds the lock was taken from under it.
+
+    The acceptance gate is `-_LOCK_AGE_ROUNDING_TOLERANCE_SECONDS <= age`,
+    not the bare `0 <= age` classified_ts uses: `_lock_payload()` formats
+    its timestamp with millisecond precision (`.3f`), which rounds, so a
+    lock read back and aged microseconds after being written can compute
+    as up to ~0.5ms "ahead" of `time.time()` -- a pure formatting artifact.
+    A bare `0 <= age` gate turned that artifact into a real bug: roughly
+    HALF of freshly-written payloads (measured: 956,812 / 2,000,000 trials)
+    failed the gate and fell through to the st_mtime fallback, reintroducing
+    the exact single-read mis-pairing this function exists to prevent. See
+    `_LOCK_AGE_ROUNDING_TOLERANCE_SECONDS`'s own comment for why 10ms is
+    safe on both sides.
     """
     try:
-        return time.time() - float(holder.split()[1])
+        age = time.time() - float(holder.split()[1])
+        if -_LOCK_AGE_ROUNDING_TOLERANCE_SECONDS <= age:
+            # Clamp a rounding-negative age to 0.0 rather than returning it
+            # raw: callers (and this function's own contract, "age ... in
+            # seconds") reasonably expect a non-negative result, and a
+            # sub-millisecond negative value is formatting noise, not a
+            # real measurement.
+            return max(0.0, age)
     except (IndexError, ValueError):
         pass
     try:
-        return time.time() - lock_path.stat().st_mtime
+        age = time.time() - lock_path.stat().st_mtime
+        if -_LOCK_AGE_ROUNDING_TOLERANCE_SECONDS <= age:
+            return max(0.0, age)
     except OSError:
-        return 0.0
+        pass
+    # Neither source yielded a usable past time (both unparseable/missing,
+    # or both parsed to something NaN/future-dated). Resolve to stale so the
+    # lock self-heals on the next acquire attempt instead of wedging.
+    print(f"[check-items-cache] WARNING: cache lock {lock_path} carries no "
+          f"usable timestamp; treating it as stale", file=sys.stderr)
+    return _LOCK_STALE_SECONDS + 1.0
 
 
 def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
@@ -170,12 +278,25 @@ def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
               f"({exc}); proceeding without the cache lock", file=sys.stderr)
         return None
 
-    payload = _lock_payload()
     # Monotonic, not wall clock: an NTP correction mid-wait would otherwise
-    # stretch or collapse the timeout arbitrarily. Staleness below MUST stay
-    # on the wall clock, because it compares against st_mtime.
+    # stretch or collapse the timeout arbitrarily. Staleness stays on the
+    # wall clock instead -- it compares a stamp WRITTEN BY ANOTHER PROCESS
+    # (the payload, else st_mtime) against time.time(), and two processes
+    # share no monotonic epoch, so the two clocks cannot be unified. (This
+    # comment used to justify the split by st_mtime alone; since the payload
+    # became the primary source in 9cfc2bf, the value being trusted is one
+    # an external writer controls -- which is what made the #323 F7 guard
+    # above necessary.)
     deadline = time.monotonic() + timeout
     while True:
+        # #323 F8: built fresh on EVERY attempt, not once before the loop.
+        # A payload timestamped before the wait began is already up to
+        # `timeout` seconds old the moment a contended winner's create
+        # finally succeeds -- silently cutting its effective stale grace
+        # period from _LOCK_STALE_SECONDS down to
+        # _LOCK_STALE_SECONDS - timeout. Timestamping at the moment of the
+        # attempt that actually succeeds keeps the grace period intact.
+        payload = _lock_payload()
         try:
             _try_create_lock(lock_path, payload)
             return payload
@@ -217,10 +338,28 @@ def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
                     # case -- the lock was replaced while we deliberated --
                     # is caught here.
                     if lock_path.read_bytes() == holder:
-                        lock_path.unlink()
+                        try:
+                            lock_path.unlink()
+                        except OSError as exc:
+                            # Distinct from the read failure below: we DID
+                            # confirm the lock is stale and ours to take, but
+                            # could not remove it (a foreign owner, a
+                            # read-only volume, a macOS uchg flag, a
+                            # directory sitting at the lock path). Silently
+                            # swallowing this makes every later run pay the
+                            # full timeout and then run unlocked, forever,
+                            # with nothing distinguishing it from ordinary
+                            # contention (#323 F4).
+                            print(
+                                f"[check-items-cache] WARNING: could not "
+                                f"remove the cache lock {lock_path} ({exc}); "
+                                f"later runs will stall {timeout:.0f}s and "
+                                f"run unlocked until it is removed",
+                                file=sys.stderr,
+                            )
                 except OSError:
-                    # Cannot read or remove it: a foreign owner, a read-only
-                    # volume, a macOS uchg flag, or a directory sitting at
+                    # Cannot even READ it to confirm staleness: a foreign
+                    # owner, a read-only volume, or a directory sitting at
                     # the lock path. Fall through to the bounded poll rather
                     # than retrying forever.
                     pass
@@ -240,6 +379,31 @@ def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
         time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
 
 
+def _read_lock(lock_path: Path) -> bytes | None:
+    """Read the lock file's current payload, or None if it cannot be read.
+
+    ENOENT (the lock is simply gone -- released, or never existed) returns
+    None silently, the ordinary case. Any OTHER OSError (EACCES, EIO, a
+    directory sitting at the path) also returns None but is reported first:
+    that is NOT "cleanly released", it is "could not be verified", and
+    treating the two identically is exactly the swallow that let an
+    un-removable/unreadable lock degrade every future run silently and
+    forever (#323 F4). Shared by `_release_lock` and `locked_cache`'s
+    pre-save ownership check (#323 F2) so the narrowing lives in one place.
+    """
+    try:
+        with open(lock_path, "rb") as f:
+            return f.read()
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            print(
+                f"[check-items-cache] WARNING: could not read the cache "
+                f"lock {lock_path} ({exc}); treating it as unverifiable",
+                file=sys.stderr,
+            )
+        return None
+
+
 def _release_lock(lock_path: Path, payload: bytes) -> None:
     """Release a lock this process still owns.
 
@@ -249,11 +413,9 @@ def _release_lock(lock_path: Path, payload: bytes) -> None:
     THEIR lock, letting a third writer race in unprotected. Tolerates the
     file already being gone. Never raises.
     """
-    try:
-        with open(lock_path, "rb") as f:
-            current = f.read()
-    except OSError:
-        return  # already gone -- nothing to release
+    current = _read_lock(lock_path)
+    if current is None:
+        return  # already gone, or unreadable -- _read_lock already warned
     if current != payload:
         # Our lock was taken over as stale while we still believed we held
         # it -- meaning another writer was inside the critical section
@@ -261,7 +423,11 @@ def _release_lock(lock_path: Path, payload: bytes) -> None:
         # lock), and do not stay silent: this is the one observable trace
         # that mutual exclusion was actually violated, and swallowing it
         # would leave a real concurrent-write window with no evidence at
-        # all. Reaching this means the body outran _LOCK_STALE_SECONDS.
+        # all. Reaching this usually means the body outran
+        # _LOCK_STALE_SECONDS, but not always -- the documented residual
+        # window in _acquire_lock's takeover branch, between its
+        # confirm-read and the unlink, can also land a rival's fresh lock
+        # here after a body that ran for microseconds (#323 F9).
         print(
             f"[check-items-cache] WARNING: this run's cache lock was taken "
             f"over by another process while still held ({lock_path}); the "
@@ -271,8 +437,17 @@ def _release_lock(lock_path: Path, payload: bytes) -> None:
         return
     try:
         lock_path.unlink()
-    except OSError:
-        pass
+    except OSError as exc:
+        # Confirmed we still own it, but could not remove it -- same failure
+        # mode as the stale-takeover unlink in _acquire_lock, and the same
+        # reason it must not be silent (#323 F4).
+        print(
+            f"[check-items-cache] WARNING: could not remove the cache lock "
+            f"{lock_path} ({exc}); later runs will stall "
+            f"{_LOCK_TIMEOUT_SECONDS:.0f}s and run unlocked until it is "
+            f"removed",
+            file=sys.stderr,
+        )
 
 
 @contextlib.contextmanager
@@ -283,6 +458,14 @@ def locked_cache(timeout: float = _LOCK_TIMEOUT_SECONDS):
     yields it for the caller to mutate (typically via update_cache()), and
     saves + releases once the `with` block exits -- so the whole
     read-modify-write is one operation a caller cannot half-perform.
+
+    IMPORTANT: the yielded object must be mutated IN PLACE. `save_cache()`
+    below saves THIS function's own `cache` binding -- a caller that does
+    `cache = update_cache(cache=cache, ...)` and relies on the rebind is
+    saving nothing extra today only because `update_cache()` happens to
+    mutate its argument and return that same object; a caller that rebinds
+    the local name inside the `with` block would silently persist the
+    pre-mutation snapshot the day that stops being true (#323 F6).
 
     The lock path is derived from CACHE_PATH at call time, not a
     module-level constant: tests monkeypatch CACHE_PATH, and a constant
@@ -302,6 +485,29 @@ def locked_cache(timeout: float = _LOCK_TIMEOUT_SECONDS):
     matching the pre-existing behaviour where save_cache(cache) was a
     separate statement after the caller's work and was never reached on an
     exception either.
+
+    Two additional guards run just before the save (#323):
+
+    F1 -- `load_cache(with_status=True)` distinguishes WHY the on-disk cache
+    came back empty. A `status` of "corrupt" (the file itself is garbage) is
+    the one case where overwriting it IS the recovery, so it still saves.
+    "unreadable" (a transient OSError -- EACCES, EIO, EMFILE -- reading an
+    otherwise possibly-fine file) or "foreign_schema" (valid JSON written by
+    a newer/different version) means the on-disk data was never proven bad;
+    saving over it would silently erase every other project's cache entries
+    under a lock, with no warning that an overwrite was even happening. Both
+    refuse to save instead -- fail-safe, since a dropped cache update just
+    means everything re-classifies next run.
+
+    F2 -- even when the lock WAS acquired, the body can outrun
+    `_LOCK_STALE_SECONDS` and have it taken over as stale mid-run (see
+    `_acquire_lock`'s takeover branch and `_release_lock`'s post-save check
+    for the existing after-the-fact detection). Checking `_read_lock(lock_path)
+    != payload` HERE, before the save, means the warning describes a race
+    the user can still reason about -- "this save could overwrite it" --
+    rather than reporting a fait accompli after `save_cache()` has already
+    run. This still saves regardless (fail-open is deliberate here too), it
+    only adds a warning.
     """
     lock_path = CACHE_PATH.with_suffix(".lock")
     payload = _acquire_lock(lock_path, timeout)
@@ -312,10 +518,27 @@ def locked_cache(timeout: float = _LOCK_TIMEOUT_SECONDS):
             f"silently drop this run's cache update",
             file=sys.stderr,
         )
-    cache = load_cache()
+    cache, status = load_cache(with_status=True)
     try:
         yield cache
-        save_cache(cache)
+        if payload is not None and _read_lock(lock_path) != payload:
+            print(
+                f"[check-items-cache] WARNING: lost the cache lock mid-run "
+                f"({lock_path}) -- held longer than the stale threshold "
+                f"(e.g. the machine slept); another run may have written "
+                f"since, and this save could overwrite it",
+                file=sys.stderr,
+            )
+        if status in (None, "corrupt"):
+            save_cache(cache)
+        else:
+            print(
+                f"[check-items-cache] WARNING: refusing to save -- the "
+                f"on-disk cache could not be loaded ({status}); this run's "
+                f"cache update is being dropped, the existing on-disk cache "
+                f"is left untouched, and every group re-classifies next run",
+                file=sys.stderr,
+            )
     finally:
         if payload is not None:
             _release_lock(lock_path, payload)

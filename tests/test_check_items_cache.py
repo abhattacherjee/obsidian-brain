@@ -1,4 +1,5 @@
 import os
+import pathlib
 import sys
 import textwrap
 import subprocess
@@ -2053,3 +2054,637 @@ def test_lock_age_falls_back_to_mtime_for_an_unparseable_payload(tmp_path):
     lock.write_bytes(b"garbage-with-no-timestamp\n")
     os.utime(lock, None)
     assert _lock_age(lock, b"garbage-with-no-timestamp\n") < _LOCK_STALE_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# #323 F1: load_cache(with_status=True) distinguishes WHY the on-disk cache
+# came back empty, so locked_cache() can refuse to overwrite proven-good
+# data it merely failed to read this run.
+# ---------------------------------------------------------------------------
+
+def test_load_cache_with_status_corrupt(tmp_path, monkeypatch):
+    """json.JSONDecodeError -> 'corrupt': the file itself IS the garbage,
+    so overwriting it is the correct recovery."""
+    from check_items_cache import load_cache, SCHEMA_VERSION
+    fake_cache = tmp_path / "c.json"
+    fake_cache.write_text("{not valid json at all", encoding="utf-8")
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_cache)
+
+    data, status = load_cache(with_status=True)
+    assert status == "corrupt"
+    assert data == {"schema_version": SCHEMA_VERSION, "runs": {}}
+
+
+def test_load_cache_with_status_unreadable(tmp_path, monkeypatch, capsys):
+    """An OSError reading an otherwise possibly-fine file (simulated here
+    with a directory sitting at CACHE_PATH, since IsADirectoryError is an
+    OSError but NOT a JSONDecodeError) must be reported as 'unreadable',
+    distinct from 'corrupt' -- the file was never proven bad."""
+    from check_items_cache import load_cache
+    fake_dir = tmp_path / "cache-is-a-directory"
+    fake_dir.mkdir()
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_dir)
+
+    data, status = load_cache(with_status=True)
+    assert status == "unreadable"
+    assert "cache load failed" in capsys.readouterr().err
+
+
+def test_load_cache_with_status_foreign_schema(tmp_path, monkeypatch):
+    """Valid JSON, wrong schema_version (e.g. written by a newer version)
+    -> 'foreign_schema': overwriting would be a silent downgrade."""
+    from check_items_cache import load_cache
+    fake_cache = tmp_path / "c.json"
+    fake_cache.write_text(json.dumps({"schema_version": 99, "runs": {}}), encoding="utf-8")
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_cache)
+
+    data, status = load_cache(with_status=True)
+    assert status == "foreign_schema"
+
+
+def test_load_cache_with_status_none_on_clean_load_and_missing_file(tmp_path, monkeypatch):
+    """Positive control: a clean load (file exists and parses) and a
+    missing file (nothing to load) both report status=None -- neither is
+    a refuse-to-save case."""
+    from check_items_cache import load_cache, SCHEMA_VERSION
+    fake_cache = tmp_path / "c.json"
+    fake_cache.write_text(json.dumps({"schema_version": SCHEMA_VERSION, "runs": {"p": {}}}),
+                          encoding="utf-8")
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_cache)
+    data, status = load_cache(with_status=True)
+    assert status is None
+    assert data["runs"]["p"] == {}
+
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", tmp_path / "does-not-exist.json")
+    data2, status2 = load_cache(with_status=True)
+    assert status2 is None
+
+
+def test_load_cache_bare_call_returns_a_dict_not_a_tuple(tmp_path, monkeypatch):
+    """Existing callers (Step 3, scripts/dev-test/test-issue-87-manual.py,
+    and several tests above) call load_cache() with no arguments and must
+    keep getting a bare dict -- with_status defaults to False."""
+    from check_items_cache import load_cache, SCHEMA_VERSION
+    fake_cache = tmp_path / "c.json"
+    fake_cache.write_text(json.dumps({"schema_version": SCHEMA_VERSION, "runs": {}}),
+                          encoding="utf-8")
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_cache)
+    result = load_cache()
+    assert isinstance(result, dict)
+    assert "runs" in result
+
+
+def test_locked_cache_refuses_to_save_on_unreadable_status(tmp_path, monkeypatch, capsys):
+    """F1's actual guard, in locked_cache(): an 'unreadable' status must
+    NOT be overwritten. The on-disk cache holds proven-good data (another
+    project's real entries) that this run merely failed to read -- saving
+    over it would silently erase that data under the lock, with no warning
+    that an overwrite was even happening."""
+    import check_items_cache as cic
+    fake_cache = tmp_path / "check-items-classifications.json"
+    original = {
+        "schema_version": cic.SCHEMA_VERSION,
+        "runs": {"real-project": {"groups": [{"canonical_hash": "keepme"}]}},
+    }
+    fake_cache.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setattr(cic, "CACHE_PATH", fake_cache)
+    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
+
+    def _fake_load_cache(*, with_status=False):
+        empty = cic._empty_cache()
+        return (empty, "unreadable") if with_status else empty
+    monkeypatch.setattr(cic, "load_cache", _fake_load_cache)
+
+    with cic.locked_cache(timeout=5.0) as cache:
+        cache["runs"]["other-project"] = {"groups": [{"canonical_hash": "poison"}]}
+
+    on_disk = json.loads(fake_cache.read_text())
+    assert on_disk == original, "an 'unreadable' status must leave the on-disk cache untouched"
+    err = capsys.readouterr().err
+    assert "refusing to save" in err
+
+
+def test_locked_cache_refuses_to_save_on_foreign_schema_status(tmp_path, monkeypatch, capsys):
+    """Same guard, other refuse-status: 'foreign_schema' must also not be
+    overwritten -- a newer version's data must not be downgraded."""
+    import check_items_cache as cic
+    fake_cache = tmp_path / "check-items-classifications.json"
+    original = {"schema_version": 99, "runs": {"real-project": {"groups": []}}}
+    fake_cache.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setattr(cic, "CACHE_PATH", fake_cache)
+    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
+
+    def _fake_load_cache(*, with_status=False):
+        empty = cic._empty_cache()
+        return (empty, "foreign_schema") if with_status else empty
+    monkeypatch.setattr(cic, "load_cache", _fake_load_cache)
+
+    with cic.locked_cache(timeout=5.0) as cache:
+        cache["runs"]["other-project"] = {"groups": []}
+
+    on_disk = json.loads(fake_cache.read_text())
+    assert on_disk == original
+    assert "refusing to save" in capsys.readouterr().err
+
+
+def test_locked_cache_saves_over_corrupt_status(tmp_path, monkeypatch, capsys):
+    """Negative control for the two tests above: 'corrupt' is NOT a refuse
+    status -- the file itself is the garbage, so overwriting it IS the
+    recovery, and locked_cache() must still save."""
+    import check_items_cache as cic
+    fake_cache = tmp_path / "check-items-classifications.json"
+    monkeypatch.setattr(cic, "CACHE_PATH", fake_cache)
+    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
+
+    def _fake_load_cache(*, with_status=False):
+        empty = cic._empty_cache()
+        return (empty, "corrupt") if with_status else empty
+    monkeypatch.setattr(cic, "load_cache", _fake_load_cache)
+
+    with cic.locked_cache(timeout=5.0) as cache:
+        cache["runs"]["p"] = {"groups": []}
+
+    assert json.loads(fake_cache.read_text())["runs"]["p"]["groups"] == []
+    assert "refusing to save" not in capsys.readouterr().err
+
+
+def test_locked_cache_saves_a_legitimately_empty_cache(tmp_path, monkeypatch):
+    """F1's guard rail, exercised end to end (no mocking of load_cache):
+    a legitimately empty-but-present cache (reachable after GC evicts
+    everything) carries status=None, not a refuse status -- it must save
+    normally, or the cache could never repopulate once it went empty."""
+    from check_items_cache import locked_cache, SCHEMA_VERSION
+    fake_cache = tmp_path / "check-items-classifications.json"
+    fake_cache.write_text(json.dumps({"schema_version": SCHEMA_VERSION, "runs": {}}),
+                          encoding="utf-8")
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_cache)
+    monkeypatch.setattr("check_items_cache.CACHE_DIR", tmp_path)
+
+    with locked_cache(timeout=5.0) as cache:
+        cache["runs"]["p"] = {"groups": [{"canonical_hash": "new"}]}
+
+    on_disk = json.loads(fake_cache.read_text())
+    assert on_disk["runs"]["p"]["groups"] == [{"canonical_hash": "new"}]
+
+
+# ---------------------------------------------------------------------------
+# #323 F2: ownership loss must be detected and warned about BEFORE
+# save_cache() runs, not only after -- the pre-existing _release_lock check
+# fires post-save and is too late for the warning to describe an avoidable
+# race.
+# ---------------------------------------------------------------------------
+
+def test_locked_cache_warns_before_save_when_lock_lost_mid_run(tmp_path, monkeypatch, capsys):
+    """A rival takes the lock over as stale WHILE the body is still
+    running (mirrors test_locked_cache_does_not_delete_a_lock_it_no_longer_owns,
+    which pins the non-deletion behaviour) -- this test pins the NEW
+    pre-save warning specifically, by its distinctive wording. The save
+    still happens regardless (fail-open is deliberate here too)."""
+    from check_items_cache import locked_cache
+    fake_cache = tmp_path / "check-items-classifications.json"
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_cache)
+    monkeypatch.setattr("check_items_cache.CACHE_DIR", tmp_path)
+    lock_path = tmp_path / "check-items-classifications.lock"
+
+    rival_payload = b"999999 12345.000\n"
+    with locked_cache(timeout=5.0) as cache:
+        cache["runs"]["p"] = {"groups": []}
+        lock_path.write_bytes(rival_payload)
+
+    err = capsys.readouterr().err
+    assert "lost the cache lock mid-run" in err
+    assert json.loads(fake_cache.read_text())["runs"]["p"]["groups"] == []
+
+
+# test_locked_cache_warning_is_silent_on_the_happy_path (above) is the
+# negative control for this guard: an ordinary uncontended run must emit
+# NO warning at all, including this new pre-save one.
+
+
+# ---------------------------------------------------------------------------
+# #323 F4: an un-removable/unreadable lock must not degrade every future
+# run silently and forever -- _release_lock's read swallow is narrowed to
+# errno.ENOENT, and a failed unlink (in both _release_lock and
+# _acquire_lock) is reported distinctly rather than swallowed.
+# ---------------------------------------------------------------------------
+
+def test_read_lock_returns_none_silently_for_a_missing_lock(tmp_path, capsys):
+    """Positive control / negative warning control: ENOENT -- the ordinary
+    'already released, or never existed' case -- must stay silent."""
+    from check_items_cache import _read_lock
+    result = _read_lock(tmp_path / "does-not-exist.lock")
+    assert result is None
+    assert capsys.readouterr().err == ""
+
+
+def test_read_lock_warns_on_a_non_enoent_error(tmp_path, capsys):
+    """Any OTHER OSError (standing in for EACCES/EIO, which are awkward to
+    force portably in a test running as the file's own owner) must be
+    reported, not silently folded into 'already gone' -- that conflation
+    is exactly what let an unreadable lock degrade every later run with no
+    distinguishing signal."""
+    from check_items_cache import _read_lock
+    lock_dir = tmp_path / "lock-is-a-directory"
+    lock_dir.mkdir()
+    result = _read_lock(lock_dir)
+    assert result is None
+    assert "could not read the cache lock" in capsys.readouterr().err
+
+
+def test_release_lock_warns_on_a_failed_unlink(tmp_path, monkeypatch, capsys):
+    """_release_lock confirms it still owns the lock (read succeeds, bytes
+    match) but the unlink() call itself fails: this must be reported by
+    name and exception, not silently swallowed the way the pre-#323 code
+    did -- the lock is left behind, wedging every later run's acquire for
+    the full timeout with no clue why."""
+    from pathlib import Path
+    from check_items_cache import _release_lock
+
+    lock_path = tmp_path / "cache.lock"
+    payload = b"123 999.000\n"
+    lock_path.write_bytes(payload)
+
+    original_unlink = Path.unlink
+
+    def _boom(self, *a, **kw):
+        if self == lock_path:
+            raise OSError("simulated: read-only volume")
+        return original_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+
+    _release_lock(lock_path, payload)  # must not raise
+
+    err = capsys.readouterr().err
+    assert "could not remove the cache lock" in err
+    assert lock_path.exists(), "the lock is still there since removal failed"
+
+
+def test_release_lock_silent_when_unlink_succeeds(tmp_path, capsys):
+    """Negative control: an ordinary successful release emits no warning
+    and actually removes the file."""
+    from check_items_cache import _release_lock
+
+    lock_path = tmp_path / "cache.lock"
+    payload = b"123 999.000\n"
+    lock_path.write_bytes(payload)
+
+    _release_lock(lock_path, payload)
+
+    assert capsys.readouterr().err == ""
+    assert not lock_path.exists()
+
+
+def test_acquire_lock_warns_on_failed_stale_takeover_unlink(tmp_path, monkeypatch, capsys):
+    """The OTHER unlink-failure site: _acquire_lock's stale-takeover
+    branch. Fully confirmed stale (read succeeds, re-read still matches)
+    but unlink() itself fails -- distinct from
+    test_acquire_lock_is_bounded_when_a_stale_lock_cannot_be_removed, which
+    never reaches the unlink call at all because read_bytes() fails first
+    on a directory. Here the lock is a real, readable FILE, so only the
+    unlink is broken."""
+    from pathlib import Path
+    import check_items_cache as cic
+
+    lock_path = tmp_path / "cache.lock"
+    stale_payload = f"424242 {time.time() - 10_000:.3f}\n".encode()
+    lock_path.write_bytes(stale_payload)
+
+    original_unlink = Path.unlink
+
+    def _boom(self, *a, **kw):
+        if self == lock_path:
+            raise OSError("simulated: foreign owner")
+        return original_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+
+    result = cic._acquire_lock(lock_path, timeout=0.3)
+    assert result is None, "an unremovable stale lock must fall open, not be claimed"
+    assert "could not remove the cache lock" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# #323 F5: save_cache must not leak its temp file when the write itself
+# fails (e.g. disk full mid-json.dump) -- the original code's `finally`
+# closed the handle but never unlinked it, and os.replace() is never
+# reached to clean it up.
+# ---------------------------------------------------------------------------
+
+def _boom_fsync(*a, **kw):
+    """Stand-in for a disk-full fsync -- json.dump(..., default=str) never
+    raises TypeError on its own (default=str stringifies anything), so an
+    unserializable payload cannot exercise this path. os.fsync() failing is
+    also the more faithful simulation of the real scenario named in the
+    spec (disk full mid-write)."""
+    raise OSError(28, "simulated: No space left on device")
+
+
+def test_save_cache_unlinks_temp_file_on_failed_write(tmp_path, monkeypatch):
+    import check_items_cache as cic
+    fake_cache = tmp_path / "check-items-classifications.json"
+    monkeypatch.setattr(cic, "CACHE_PATH", fake_cache)
+    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(cic.os, "fsync", _boom_fsync)
+
+    with pytest.raises(OSError):
+        cic.save_cache({"schema_version": 1, "runs": {}})
+
+    leftovers = list(tmp_path.glob("*.tmp"))
+    assert leftovers == [], f"orphaned temp file(s) left behind: {leftovers}"
+    assert not fake_cache.exists()
+
+
+def test_save_cache_succeeds_normally_after_a_prior_failure(tmp_path, monkeypatch):
+    """Negative control / round-trip: the failure-cleanup path leaves no
+    state behind that would break a subsequent, successful save_cache()
+    call -- and a normal successful write leaves no .tmp file behind
+    either."""
+    import check_items_cache as cic
+    fake_cache = tmp_path / "check-items-classifications.json"
+    monkeypatch.setattr(cic, "CACHE_PATH", fake_cache)
+    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(cic.os, "fsync", _boom_fsync)
+
+    with pytest.raises(OSError):
+        cic.save_cache({"schema_version": 1, "runs": {}})
+
+    monkeypatch.undo()  # restore the real os.fsync for the successful save below
+    monkeypatch.setattr(cic, "CACHE_PATH", fake_cache)
+    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
+
+    cic.save_cache({"schema_version": 1, "runs": {"p": {"groups": []}}})
+    assert cic.load_cache()["runs"]["p"]["groups"] == []
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+# ---------------------------------------------------------------------------
+# #323 F7: _lock_age must resolve an unusable timestamp (future-dated, NaN,
+# +inf, or a future-dated mtime) to STALE, not "fresh forever" -- a
+# regression #306 (9cfc2bf) introduced when it moved age off st_mtime onto
+# the payload's own embedded timestamp, and float() accepts nan/inf while a
+# backward clock step (NTP correction, a resumed VM) yields a negative age.
+# All three previously compared `> _LOCK_STALE_SECONDS` as False forever, so
+# takeover never fired and the lock wedged permanently: every later run
+# stalled the full timeout and then wrote UNLOCKED, with no self-healing --
+# strictly worse than the pre-#306 baseline, which never stalled at all.
+# Mirrors the `0 <= age` idiom partition() already applies to classified_ts
+# (four existing tests guard that side).
+# ---------------------------------------------------------------------------
+
+def _write_lock_with_future_mtime(lock, payload: bytes) -> None:
+    """A payload whose OWN timestamp is unusable falls back to st_mtime --
+    which, for a file this test just wrote, is genuinely fresh (correct:
+    the file really was just written, regardless of what garbage its
+    payload carries). The real-world failure this guards is a BACKWARD
+    CLOCK STEP (NTP correction, a resumed VM): both the payload and the
+    file's mtime were written under the OLD clock, so after the step BOTH
+    read as future-dated relative to the new `time.time()` -- not just the
+    payload. Setting mtime to the future here reproduces that combined
+    state deterministically, exercising the path where NEITHER source is
+    usable, instead of accidentally exercising the (working-as-intended)
+    single-source fallback.
+    """
+    lock.write_bytes(payload)
+    future_mtime = time.time() + 3600
+    os.utime(lock, (future_mtime, future_mtime))
+
+
+def test_lock_age_treats_future_dated_payload_as_stale(tmp_path, capsys):
+    from check_items_cache import _lock_age, _LOCK_STALE_SECONDS
+    lock = tmp_path / "cache.lock"
+    future_payload = f"4242 {time.time() + 3600:.3f}\n".encode()
+    _write_lock_with_future_mtime(lock, future_payload)
+
+    age = _lock_age(lock, future_payload)
+    assert age > _LOCK_STALE_SECONDS, (
+        "a future-dated payload (clock stepped back) must read as stale, "
+        "not fresh forever -- it would otherwise wedge the lock permanently"
+    )
+    assert "carries no usable timestamp" in capsys.readouterr().err
+
+
+def test_lock_age_treats_nan_payload_as_stale(tmp_path, capsys):
+    from check_items_cache import _lock_age, _LOCK_STALE_SECONDS
+    lock = tmp_path / "cache.lock"
+    nan_payload = b"4242 nan\n"
+    _write_lock_with_future_mtime(lock, nan_payload)
+
+    age = _lock_age(lock, nan_payload)
+    assert age > _LOCK_STALE_SECONDS, (
+        "every comparison against NaN is False, so `age > STALE` alone "
+        "never fires for a NaN age -- it must be resolved to stale here"
+    )
+    assert "carries no usable timestamp" in capsys.readouterr().err
+
+
+def test_lock_age_treats_inf_payload_as_stale(tmp_path, capsys):
+    from check_items_cache import _lock_age, _LOCK_STALE_SECONDS
+    lock = tmp_path / "cache.lock"
+    inf_payload = b"4242 inf\n"
+    _write_lock_with_future_mtime(lock, inf_payload)
+
+    age = _lock_age(lock, inf_payload)
+    assert age > _LOCK_STALE_SECONDS
+    assert "carries no usable timestamp" in capsys.readouterr().err
+
+
+def test_lock_age_falls_back_to_a_genuinely_fresh_mtime_when_payload_ts_is_bad(tmp_path, capsys):
+    """Contrast for the three tests above, pinning the fallback itself
+    (not just the final-sentinel path): a payload with an unusable
+    timestamp (NaN here) whose file mtime IS a genuinely fresh, valid past
+    time must resolve to that fresh mtime-derived age, NOT to the stale
+    sentinel -- the file really was just written, mtime is ground truth
+    for that, and treating every bad payload as an automatic takeover
+    would defeat the single-read-identity invariant the docstring above
+    describes for the ordinary case."""
+    from check_items_cache import _lock_age, _LOCK_STALE_SECONDS
+    lock = tmp_path / "cache.lock"
+    nan_payload = b"4242 nan\n"
+    lock.write_bytes(nan_payload)  # mtime left as "just now" -- genuinely fresh
+
+    age = _lock_age(lock, nan_payload)
+    assert age < _LOCK_STALE_SECONDS
+    assert capsys.readouterr().err == ""
+
+
+def test_lock_age_treats_future_mtime_as_stale(tmp_path, capsys):
+    """The st_mtime FALLBACK path needs the same `0 <= age` guard: an
+    unparseable payload with a future mtime (a hand-set mtime, or a clock
+    step between the payload being written and this read) must not read as
+    fresh either -- covers the second try/except in _lock_age, which the
+    payload-timestamp tests above never reach."""
+    from check_items_cache import _lock_age, _LOCK_STALE_SECONDS
+    lock = tmp_path / "cache.lock"
+    unparseable = b"garbage-with-no-timestamp\n"
+    lock.write_bytes(unparseable)
+    future_mtime = time.time() + 3600
+    os.utime(lock, (future_mtime, future_mtime))
+
+    age = _lock_age(lock, unparseable)
+    assert age > _LOCK_STALE_SECONDS
+    assert "carries no usable timestamp" in capsys.readouterr().err
+
+
+def test_lock_age_fresh_payload_is_not_stale_and_silent(tmp_path, capsys):
+    """Negative control, mandatory per the guard-both-directions rule: a
+    genuinely fresh, valid payload must NOT be treated as stale and must
+    emit no warning -- without this, a mutation that always returns the
+    stale sentinel would pass every test above."""
+    from check_items_cache import _lock_age, _LOCK_STALE_SECONDS
+    lock = tmp_path / "cache.lock"
+    fresh_payload = f"4242 {time.time():.3f}\n".encode()
+    lock.write_bytes(fresh_payload)
+
+    age = _lock_age(lock, fresh_payload)
+    assert age < _LOCK_STALE_SECONDS
+    assert capsys.readouterr().err == ""
+
+
+def test_acquire_lock_takes_over_a_future_dated_stale_lock(tmp_path):
+    """End-to-end: a future-dated payload -- combined with a future mtime,
+    reproducing the real backward-clock-step scenario, see
+    _write_lock_with_future_mtime -- must not wedge _acquire_lock. It must
+    be taken over quickly -- the same shape as
+    test_locked_cache_takes_over_a_stale_lock for an ordinary stale lock --
+    not stall the full timeout and then fall open unlocked (which is what
+    the pre-fix code did: the reviewer's table shows ~1.0-1.03s against a
+    bounded timeout, i.e. the full wait, for exactly this payload)."""
+    from check_items_cache import _acquire_lock
+    lock_path = tmp_path / "cache.lock"
+    _write_lock_with_future_mtime(lock_path, f"999999 {time.time() + 3600:.3f}\n".encode())
+
+    start = time.time()
+    result = _acquire_lock(lock_path, timeout=5.0)
+    elapsed = time.time() - start
+
+    assert result is not None, "a future-dated stale lock must be taken over, not fail open"
+    assert elapsed < 2.0, f"takeover took {elapsed:.2f}s -- looks wedged, not taken over"
+
+
+def test_acquire_lock_takes_over_a_nan_dated_stale_lock(tmp_path):
+    """Same shape, NaN payload -- also combined with a future mtime, since
+    an NaN-payload lock whose mtime is genuinely fresh SHOULD be left alone
+    (see test_lock_age_falls_back_to_a_genuinely_fresh_mtime_when_payload_ts_is_bad);
+    this test isolates the case where neither source is usable."""
+    from check_items_cache import _acquire_lock
+    lock_path = tmp_path / "cache.lock"
+    _write_lock_with_future_mtime(lock_path, b"999999 nan\n")
+
+    start = time.time()
+    result = _acquire_lock(lock_path, timeout=5.0)
+    elapsed = time.time() - start
+
+    assert result is not None, "a NaN-dated stale lock must be taken over, not fail open"
+    assert elapsed < 2.0, f"takeover took {elapsed:.2f}s -- looks wedged, not taken over"
+
+
+# ---------------------------------------------------------------------------
+# #323 F8: a contended winner's payload must be timestamped at the moment
+# its create attempt actually succeeds, not once before the wait started --
+# otherwise it is born already `wait time` seconds old, silently shrinking
+# its effective stale grace period from _LOCK_STALE_SECONDS.
+# ---------------------------------------------------------------------------
+
+def test_acquire_lock_generates_a_fresh_payload_per_retry(tmp_path, monkeypatch):
+    """Mocks _lock_payload to return a distinguishable, incrementing value
+    per call. Under the pre-#323-F8 code (payload built once before the
+    loop), _lock_payload is called exactly ONCE no matter how many times
+    the loop retries -- this test's `calls['n'] >= 2` assertion alone kills
+    that mutation. The returned payload must also be the LAST one
+    generated (the attempt that actually succeeded), not the first."""
+    import check_items_cache as cic
+    lock_path = tmp_path / "cache.lock"
+    # A rival, FRESH lock (not stale) so ordinary contention -- not
+    # takeover -- is what drives the retries.
+    lock_path.write_bytes(f"1 {time.time():.3f}\n".encode())
+
+    calls = {"n": 0}
+
+    def _counting_payload():
+        calls["n"] += 1
+        return f"COUNTER-{calls['n']}\n".encode()
+
+    monkeypatch.setattr(cic, "_lock_payload", _counting_payload)
+
+    import threading
+    def _release_rival():
+        time.sleep(0.2)
+        lock_path.unlink(missing_ok=True)
+    threading.Thread(target=_release_rival, daemon=True).start()
+
+    payload = cic._acquire_lock(lock_path, timeout=5.0)
+
+    assert payload is not None
+    assert calls["n"] >= 2, (
+        "test setup did not exercise multiple attempts, or _lock_payload "
+        "is only being called once (the F8 regression)"
+    )
+    assert payload == f"COUNTER-{calls['n']}\n".encode(), (
+        "the returned payload must be the one generated on the attempt "
+        "that actually succeeded, not a stale one built before the wait"
+    )
+
+
+def test_acquire_lock_payload_is_timestamped_at_the_winning_attempt(tmp_path):
+    """#323 F8 — the payload was minted once before the wait loop, so a
+    contended winner's lock was born up to `timeout` seconds old, silently
+    cutting its stale grace from _LOCK_STALE_SECONDS to
+    (_LOCK_STALE_SECONDS - timeout) and coupling two constants that read as
+    independent. The winning attempt's payload must be stamped when it
+    actually succeeds."""
+    from check_items_cache import _acquire_lock
+
+    lock = tmp_path / "cache.lock"
+    rival = f"999 {time.time():.3f}\n".encode()
+    lock.write_bytes(rival)
+
+    import threading
+    def release_after(delay):
+        time.sleep(delay)
+        lock.unlink()
+    t = threading.Thread(target=release_after, args=(0.4,))
+    t.start()
+    started = time.time()
+    payload = _acquire_lock(lock, timeout=5.0)
+    t.join()
+
+    assert payload is not None
+    stamp = float(payload.split()[1])
+    waited = time.time() - started
+    assert waited > 0.3, "the test did not actually contend"
+    assert stamp - started > 0.3, (
+        f"payload stamp {stamp - started:.2f}s after start, but the acquire "
+        f"waited {waited:.2f}s — the payload was minted before the wait"
+    )
+
+
+def test_lock_age_tolerates_the_payload_rounding_artifact_deterministically(tmp_path):
+    """The `-_LOCK_AGE_ROUNDING_TOLERANCE_SECONDS` gate, pinned so it cannot
+    fail intermittently.
+
+    `_lock_payload()` formats its timestamp with `.3f`, so a lock read back
+    microseconds after being written computes as slightly NEGATIVE age --
+    measured at 48.3% of 200,000 fresh payloads on this machine. A bare
+    `0 <= age` gate therefore sends roughly half of all fresh payloads down
+    the st_mtime fallback, reintroducing the identity/age mis-pairing that
+    let a stale-takeover delete a live lock.
+
+    Detection has to be looped, not single-shot: at ~45% per attempt, one
+    call catches a broken gate only about half the time, which is a flaky
+    guard rather than a guard. Fifty write-read round trips against an
+    ANCIENT mtime make it deterministic -- under a bare gate any single
+    fall-through returns the ancient mtime age and fails immediately.
+    """
+    from check_items_cache import _lock_age, _lock_payload, _LOCK_STALE_SECONDS
+
+    lock = tmp_path / "cache.lock"
+    ancient = time.time() - 10_000
+    for i in range(50):
+        lock.write_bytes(_lock_payload())
+        os.utime(lock, (ancient, ancient))   # mtime lies; only the payload is true
+        age = _lock_age(lock, lock.read_bytes())
+        assert 0 <= age < _LOCK_STALE_SECONDS, (
+            f"iteration {i}: fresh payload read as age {age:.0f}s — the gate "
+            "rejected a rounding-negative age and fell through to st_mtime"
+        )
