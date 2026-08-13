@@ -6,6 +6,7 @@ Python stdlib only.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -94,6 +95,160 @@ def save_cache(data: dict[str, Any]) -> None:
         tmp.close()
     os.replace(tmp.name, str(CACHE_PATH))
     os.chmod(str(CACHE_PATH), 0o600)
+
+
+# #306: load_cache() -> save_cache() is an unlocked read-modify-write. Nothing
+# stops a run on project B from loading a stale snapshot, a run on project A
+# completing in between, and B's save overwriting the whole document --
+# silently erasing A's entry. locked_cache() below wraps the cycle in mutual
+# exclusion, following the shape of claim_hook_run() in obsidian_utils.py
+# (O_EXCL create, stale-TTL takeover, fail-open on any filesystem error) but
+# NOT importing from it -- this module has no such dependency today and must
+# keep none. The two differ in one deliberate way: claim_hook_run() is a
+# dedup where a contended loser correctly abandons its own work; this is
+# mutual exclusion where a contended caller's write must still land, so
+# contention here polls until timeout rather than giving up immediately.
+
+_LOCK_TIMEOUT_SECONDS = 10.0   # max time locked_cache() waits for a contended lock
+_LOCK_STALE_SECONDS = 30.0     # age past which a lock is presumed abandoned (crashed holder)
+_LOCK_POLL_INTERVAL_SECONDS = 0.05
+
+
+def _lock_payload() -> bytes:
+    """Identifies the current holder so a release can verify it still owns
+    the lock (see _release_lock) before unlinking."""
+    return f"{os.getpid()} {time.time():.3f}\n".encode("utf-8")
+
+
+def _try_create_lock(lock_path: Path, payload: bytes) -> None:
+    """O_EXCL create. Raises FileExistsError if already locked, or another
+    OSError for e.g. a permission failure -- both are handled by the caller."""
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+
+
+def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
+    """Acquire the lock, waiting up to `timeout` seconds under contention.
+
+    Returns the payload written on success, or None if the lock could not be
+    acquired -- on a timeout, or on any OSError (e.g. an unwritable lock
+    directory) -- so the caller must proceed WITHOUT the lock (see
+    locked_cache()'s fail-open handling).
+    """
+    try:
+        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"[check-items-cache] WARNING: cache lock directory unavailable "
+              f"({exc}); proceeding without the cache lock", file=sys.stderr)
+        return None
+
+    payload = _lock_payload()
+    deadline = time.time() + timeout
+    while True:
+        try:
+            _try_create_lock(lock_path, payload)
+            return payload
+        except FileExistsError:
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+            except OSError:
+                # Lock vanished between the failed create and this stat (the
+                # holder just released it) -- retry the create immediately.
+                continue
+            if age > _LOCK_STALE_SECONDS:
+                # Stale lock: a crashed holder must not wedge the cache
+                # permanently unwritable. Takeover is inherently racy --
+                # multiple waiters can all observe staleness at once and
+                # race to unlink + recreate. Losing that race raises
+                # FileExistsError again on the very next loop iteration (a
+                # rival's fresh lock, not our own), which routes back into
+                # this same branch and falls through to ordinary polling --
+                # so the failure direction is always "keep waiting", never
+                # "assume ownership and write unprotected while a
+                # legitimate new holder is mid-write".
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.time() >= deadline:
+                return None
+            time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+        except OSError as exc:
+            print(f"[check-items-cache] WARNING: cache lock acquire failed "
+                  f"({exc}); proceeding without the cache lock", file=sys.stderr)
+            return None
+
+
+def _release_lock(lock_path: Path, payload: bytes) -> None:
+    """Release a lock this process still owns.
+
+    Re-reads the on-disk payload first: if another process took the lock
+    over as stale (see _acquire_lock) while we still believed we held it,
+    the on-disk payload no longer matches ours, and unlinking would delete
+    THEIR lock, letting a third writer race in unprotected. Tolerates the
+    file already being gone. Never raises.
+    """
+    try:
+        with open(lock_path, "rb") as f:
+            current = f.read()
+    except OSError:
+        return  # already gone -- nothing to release
+    if current != payload:
+        return  # a rival process took this lock over as stale; not ours anymore
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def locked_cache(timeout: float = _LOCK_TIMEOUT_SECONDS):
+    """Context manager for the full cache load-mutate-save cycle, under a lock.
+
+    Acquires an O_EXCL lock file derived from CACHE_PATH, loads the cache,
+    yields it for the caller to mutate (typically via update_cache()), and
+    saves + releases once the `with` block exits -- so the whole
+    read-modify-write is one operation a caller cannot half-perform.
+
+    The lock path is derived from CACHE_PATH at call time, not a
+    module-level constant: tests monkeypatch CACHE_PATH, and a constant
+    computed at import time would leave every test contending on one real
+    lock file under the user's actual ~/.claude/obsidian-brain/.
+
+    Fail-open: if the lock cannot be acquired within `timeout` (contention)
+    or acquisition hits any OSError, a warning goes to stderr and the body
+    proceeds WITHOUT the lock -- the pre-existing unlocked behaviour, which
+    is the worst acceptable outcome here. #306's race is fail-safe (a lost
+    write just means the entry re-classifies next run), so failing to lock
+    must never raise or block the pipeline.
+
+    The lock is released in a `finally`, so a body that raises still
+    releases it before the exception propagates. The save itself is NOT in
+    that `finally`: it only runs if the body completed without raising,
+    matching the pre-existing behaviour where save_cache(cache) was a
+    separate statement after the caller's work and was never reached on an
+    exception either.
+    """
+    lock_path = CACHE_PATH.with_suffix(".lock")
+    payload = _acquire_lock(lock_path, timeout)
+    if payload is None:
+        print(
+            f"[check-items-cache] WARNING: proceeding without the cache lock "
+            f"({lock_path}); a concurrent writer to a different project could "
+            f"silently drop this run's cache update",
+            file=sys.stderr,
+        )
+    cache = load_cache()
+    try:
+        yield cache
+        save_cache(cache)
+    finally:
+        if payload is not None:
+            _release_lock(lock_path, payload)
 
 
 def _ttl_for(classification: str) -> int:

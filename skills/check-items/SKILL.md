@@ -844,7 +844,7 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
-from check_items_cache import load_cache, save_cache, update_cache, canonical_hash
+from check_items_cache import locked_cache, update_cache, canonical_hash
 
 scope_path = os.environ["SCOPE_PATH"]
 classifications_path = os.environ["CLASSIFICATIONS_PATH"]
@@ -916,28 +916,32 @@ for fc in fresh_classifications:
     proj = fc.pop("_group_project", "unknown")
     fresh_by_proj.setdefault(proj, []).append(fc)
 
-cache = load_cache()
 # #305: reuse the HEAD captured at Step 3 rather than re-deriving it here. A
 # commit landing between Step 3 and Step 10 would otherwise stamp a mid-run
 # HEAD onto verdicts that were actually derived against the OLD head —
 # laundering them as verified-current when they were never checked against
 # this newer commit.
 heads = part.get("heads", {})
-for proj, proj_groups in groups_by_proj.items():
-    head = heads.get(proj)
-    if not head:
-        print(f"[check-items] no head captured at Step 3 for {proj}; skipping cache update",
-              file=sys.stderr)
-        continue
-    cache = update_cache(
-        cache=cache,
-        project=proj,
-        all_groups=proj_groups,
-        fresh_classifications=fresh_by_proj.get(proj, []),
-        head_sha=head,
-    )
+# #306: locked_cache() serializes the whole load-mutate-save cycle behind a
+# lock, so a concurrent run on a different project (same shared
+# cross-project cache file) cannot overwrite this run's update with a stale
+# snapshot. It loads, yields the cache to mutate below, and saves + releases
+# once this block exits.
+with locked_cache() as cache:
+    for proj, proj_groups in groups_by_proj.items():
+        head = heads.get(proj)
+        if not head:
+            print(f"[check-items] no head captured at Step 3 for {proj}; skipping cache update",
+                  file=sys.stderr)
+            continue
+        cache = update_cache(
+            cache=cache,
+            project=proj,
+            all_groups=proj_groups,
+            fresh_classifications=fresh_by_proj.get(proj, []),
+            head_sha=head,
+        )
 
-save_cache(cache)
 print("cache updated")
 PYEOF
 ```

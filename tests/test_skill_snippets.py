@@ -490,3 +490,39 @@ def test_check_items_heads_handoff_key_matches():
         f"{write.group(1)!r} but Step 10 reads {read.group(1)!r} — every "
         "cache update would be silently skipped"
     )
+
+
+def test_check_items_step10_uses_locked_cache_not_bare_save():
+    """#306: Step 10 must persist cache updates through locked_cache(), the
+    context manager that serializes the whole load-mutate-save cycle behind
+    a lock, not the old unlocked `load_cache()` ... `save_cache(cache)`
+    pair. Skills are advisory prose, not enforced code (memory:
+    feedback_skills_advisory_not_enforcement) — a future edit could
+    silently drop back to the bare calls without anyone noticing; this pins
+    the call shape so that regresses as a failing test instead.
+
+    Extracted from the Step 10 block specifically (bounded by the next
+    `## ` header), not the whole file, so Step 3's own unlocked
+    load_cache() call — deliberately read-only per the #306 spec — cannot
+    false-positive this check.
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+
+    step10_start = content.index("## Step 10")
+    rest = content[step10_start + len("## Step 10"):]
+    next_header = re.search(r"\n## ", rest)
+    step10 = rest[:next_header.start()] if next_header else rest
+
+    assert re.search(r"from check_items_cache import[^\n]*\blocked_cache\b", step10), (
+        "Step 10 must import locked_cache from check_items_cache"
+    )
+    assert re.search(r"\bwith\s+locked_cache\s*\(", step10), (
+        "Step 10 must persist cache updates via `with locked_cache(...)`, "
+        "not a bare load_cache()/save_cache() pair"
+    )
+    assert not re.search(r"(?<!\w)save_cache\s*\(\s*cache\s*\)", step10), (
+        "Step 10 must not call save_cache(cache) directly — locked_cache() "
+        "saves internally as part of its lock-protected cycle"
+    )

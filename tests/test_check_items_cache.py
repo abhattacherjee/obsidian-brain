@@ -1666,3 +1666,223 @@ def test_healthy_stamp_never_reports_unusable_ts(capsys):
                           head_sha="HEAD1", now=now)
     assert needs[0]["_reason"] == "ttl_expired"
     assert "unusable classified_ts" not in capsys.readouterr().err
+
+
+# --- #306: locked_cache() -- lock the shared cache read-modify-write ---
+
+import multiprocessing as mp
+
+
+def _lock_race_worker(cache_path_str, project, delay, barrier, timeout):
+    """Runs in a spawned child process (see
+    test_locked_cache_serializes_concurrent_cross_project_writes below).
+
+    Must import check_items_cache and set CACHE_PATH itself: a spawned child
+    re-imports the module fresh and never sees the parent's pytest
+    monkeypatch, so setting CACHE_PATH here -- not in the parent -- is the
+    only way the child's load_cache()/save_cache() touch the tmp_path file
+    instead of the user's real ~/.claude/obsidian-brain/ cache.
+    """
+    import os as _os
+    import sys as _sys
+    import time as _time
+    from pathlib import Path as _Path
+
+    _hooks = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "hooks")
+    if _hooks not in _sys.path:
+        _sys.path.insert(0, _hooks)
+    import check_items_cache as _cic
+
+    _cic.CACHE_PATH = _Path(cache_path_str)
+    _cic.CACHE_DIR = _cic.CACHE_PATH.parent
+
+    # Both processes reach this point together, then race to acquire the
+    # lock and load, so contention is real rather than incidental.
+    barrier.wait(timeout=timeout)
+    with _cic.locked_cache(timeout=timeout) as cache:
+        cache.setdefault("runs", {})[project] = {"groups": [{"canonical_hash": project}]}
+        _time.sleep(delay)  # held while inside the critical section
+
+
+def test_locked_cache_serializes_concurrent_cross_project_writes(tmp_path):
+    """Test 1 (#306) -- the issue's exact scenario, with real OS processes.
+
+    Two processes update DIFFERENT projects in the one shared cross-project
+    cache file. One holds its critical section open (via a sleep) after
+    mutating but before the block exits. Without locking, the other
+    process's faster, unprotected save would land and then get silently
+    clobbered when the delayed process saves its own stale-loaded snapshot
+    on top -- this is the exact defect reproduced in the #306 spec ("RACE
+    REPRODUCED"). With locked_cache() serializing the two critical sections,
+    the second process's load always happens AFTER the first's save, so
+    both projects must survive regardless of which one wins the actual
+    acquisition race.
+
+    Uses the "spawn" start method (not "fork") so the child always
+    re-imports check_items_cache fresh rather than inheriting whatever
+    CACHE_PATH the parent's other pytest fixtures may have monkeypatched at
+    fork time. Bounded by process-level join timeouts and a `finally` that
+    terminates any process still alive, so a regression here fails as a
+    test failure, not a hung CI job.
+    """
+    ctx = mp.get_context("spawn")
+    cache_path = tmp_path / "check-items-classifications.json"
+    barrier = ctx.Barrier(2)
+
+    procs = [
+        ctx.Process(target=_lock_race_worker, args=(str(cache_path), "alpha", 1.0, barrier, 15.0)),
+        ctx.Process(target=_lock_race_worker, args=(str(cache_path), "beta", 0.0, barrier, 15.0)),
+    ]
+    try:
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=30)
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+
+    for p in procs:
+        assert not p.is_alive(), "worker process hung past its join timeout"
+        assert p.exitcode == 0, f"worker process exited with code {p.exitcode}"
+
+    data = json.loads(cache_path.read_text())
+    assert set(data["runs"].keys()) == {"alpha", "beta"}, (
+        f"expected both projects to survive, got {sorted(data['runs'].keys())} "
+        "-- one project's cache update was silently clobbered by the other's"
+    )
+
+
+def test_locked_cache_releases_on_exception(tmp_path, monkeypatch):
+    """Test 2 (#306) -- a body exception still releases the lock and still
+    propagates. The save is NOT expected to have happened: it mirrors the
+    pre-existing unlocked code, where `save_cache(cache)` was a separate
+    statement after the caller's work and was never reached on an
+    exception either.
+    """
+    from check_items_cache import locked_cache
+    fake_cache = tmp_path / "check-items-classifications.json"
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_cache)
+    monkeypatch.setattr("check_items_cache.CACHE_DIR", tmp_path)
+    lock_path = tmp_path / "check-items-classifications.lock"
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        with locked_cache(timeout=5.0) as cache:
+            cache["runs"]["p"] = {"groups": []}
+            raise _Boom("kaboom")
+
+    assert not lock_path.exists(), "lock file must be released even when the body raises"
+    assert not fake_cache.exists(), "save_cache must not run when the body raised"
+
+
+def test_locked_cache_takes_over_a_stale_lock(tmp_path, monkeypatch, capsys):
+    """Test 3 (#306) -- a pre-existing lock file far older than the stale
+    TTL must not deadlock the run; it is taken over and the cache is still
+    written.
+
+    Asserts more than "eventually succeeds": if stale takeover were broken,
+    _acquire_lock would poll for the full `timeout` and then fail open
+    (still writing the cache, but with a stderr warning) -- which would
+    make a weaker "cache got written" assertion pass even with takeover
+    deleted. Bounding elapsed time well under `timeout` and asserting no
+    warning was printed both distinguish "took the lock over quickly" from
+    "gave up and fell open slowly".
+    """
+    from check_items_cache import locked_cache
+    fake_cache = tmp_path / "check-items-classifications.json"
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_cache)
+    monkeypatch.setattr("check_items_cache.CACHE_DIR", tmp_path)
+    lock_path = tmp_path / "check-items-classifications.lock"
+
+    lock_path.write_bytes(b"424242 0.000\n")
+    stale_time = time.time() - 3600
+    os.utime(lock_path, (stale_time, stale_time))
+
+    start = time.time()
+    with locked_cache(timeout=5.0) as cache:
+        cache["runs"]["p"] = {"groups": []}
+    elapsed = time.time() - start
+
+    assert elapsed < 2.0, f"stale takeover took {elapsed:.2f}s -- looks like it fell open instead"
+    assert capsys.readouterr().err == "", "a successful takeover must not warn"
+    data = json.loads(fake_cache.read_text())
+    assert data["runs"]["p"]["groups"] == []
+
+
+def test_locked_cache_does_not_delete_a_lock_it_no_longer_owns(tmp_path, monkeypatch):
+    """Test 4 (#306) -- guard (6): release must only unlink a lock this
+    process still owns. While the body runs, simulate a rival process
+    taking the lock over as stale (rewriting the file with a different
+    payload); on exit the file must still exist, untouched, because it is
+    no longer ours to delete.
+    """
+    from check_items_cache import locked_cache
+    fake_cache = tmp_path / "check-items-classifications.json"
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_cache)
+    monkeypatch.setattr("check_items_cache.CACHE_DIR", tmp_path)
+    lock_path = tmp_path / "check-items-classifications.lock"
+
+    rival_payload = b"999999 12345.000\n"
+    with locked_cache(timeout=5.0) as cache:
+        cache["runs"]["p"] = {"groups": []}
+        lock_path.write_bytes(rival_payload)
+
+    assert lock_path.exists(), "must not delete a lock another process now owns"
+    assert lock_path.read_bytes() == rival_payload
+    data = json.loads(fake_cache.read_text())
+    assert data["runs"]["p"]["groups"] == []
+
+
+def test_locked_cache_fails_open_when_the_lock_cannot_be_acquired(tmp_path, monkeypatch, capsys):
+    """Test 5 (#306) -- fail-open is the whole safety story: if the lock
+    truly cannot be acquired, the cache must STILL be written (unprotected,
+    matching the pre-existing behaviour) and a warning must reach stderr.
+    Forces the acquire path to fail by making _try_create_lock always
+    raise, rather than patching the global os.open (which would also break
+    save_cache's own tempfile-based writes and invalidate the test).
+    """
+    import check_items_cache as cic
+    fake_cache = tmp_path / "check-items-classifications.json"
+    monkeypatch.setattr(cic, "CACHE_PATH", fake_cache)
+    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
+
+    def _boom(lock_path, payload):
+        raise OSError("simulated: cache lock directory is unwritable")
+
+    monkeypatch.setattr(cic, "_try_create_lock", _boom)
+
+    with cic.locked_cache(timeout=1.0) as cache:
+        cache["runs"]["p"] = {"groups": []}
+
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "lock" in err.lower()
+    data = json.loads(fake_cache.read_text())
+    assert data["runs"]["p"]["groups"] == []
+
+
+def test_locked_cache_warning_is_silent_on_the_happy_path(tmp_path, monkeypatch, capsys):
+    """Test 6 (#306) -- negative control, mandatory. An ordinary uncontended
+    run must emit NO lock warning, and must leave no lock file behind.
+    Three separate tests in #305 turned out to be stuck-OFF-tested only
+    (a guard that never fires in any test looks present but proves
+    nothing); every guard here needs both a positive and a negative test.
+    """
+    from check_items_cache import locked_cache
+    fake_cache = tmp_path / "check-items-classifications.json"
+    monkeypatch.setattr("check_items_cache.CACHE_PATH", fake_cache)
+    monkeypatch.setattr("check_items_cache.CACHE_DIR", tmp_path)
+    lock_path = tmp_path / "check-items-classifications.lock"
+
+    with locked_cache(timeout=5.0) as cache:
+        cache["runs"]["p"] = {"groups": []}
+
+    assert capsys.readouterr().err == ""
+    assert not lock_path.exists(), "lock must be released on the happy path"
+    data = json.loads(fake_cache.read_text())
+    assert data["runs"]["p"]["groups"] == []
+    assert "unusable classified_ts" not in capsys.readouterr().err
