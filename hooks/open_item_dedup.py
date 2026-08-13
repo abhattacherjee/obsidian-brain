@@ -1806,11 +1806,65 @@ def get_last_classifier_mode():
 # Stage 4: classify_groups_heuristic (Task 17 — long-term fallback)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The PHRASE GATE and the TOKEN GATE below sit UPSTREAM of the pair loop in
+# _heuristic_member_verdict, and that placement makes any narrowing of either
+# one SILENT BY CONSTRUCTION. The #299 reporting contract only covers the pair
+# loop: a pair rejected there returns (tok, phr, reason) and the reason reaches
+# the citation and stderr. But if a narrowing here suppresses the ONLY token or
+# the ONLY completion phrase in a member text, no pair is ever built —
+# _heuristic_member_verdict returns (None, None, None), the cue and boundary
+# machinery never runs, and the record is ACTIVE with evidence_citation None and
+# nothing logged. Indistinguishable from a text that simply had no completion
+# language in it.
+#
+# That is not hypothetical. The trailing compound anchor added to
+# _COMPLETION_PHRASE_RE for #299 suppressed the only completion word in "This
+# was merged-in with #51", turning a real DONE into exactly such a silent
+# ACTIVE; it took a cross-model review to find, because there was no output to
+# notice. The particle allowlist below fixes those instances — it does not
+# remove the hazard, which belongs to the position of these gates, not to their
+# current contents.
+#
+# So: ANY future narrowing of these two regexes must be justified against a
+# replay of the live corpora, not against intuition or a synthetic fixture. The
+# question to answer is not "does this block the compound I have in mind" but
+# "which live texts lose their ONLY match, and is each of those genuinely not a
+# completion" — because the ones that are will disappear without a trace.
+# ---------------------------------------------------------------------------
 _DISTINCTIVE_TOKEN_RE = re.compile(
     r"(#\d+|\b[0-9a-f]{7,40}\b|\bv\d+\.\d+(?:\.\d+)?\b)"
 )
+# Verb particles allowed to follow a completion word across a hyphen. Chosen as
+# the particles that form a completion phrasal verb with the words below —
+# "merged-in", "merged-into", "closed-out", "fixed-up", "shipped-off",
+# "merged-back", "closed-down", "done-over", "seen-through". `on` is
+# deliberately absent: the live vault carries "Development-Complete-on-board",
+# a compound modifier, and no completion word here takes `on` as a particle.
+# The particle must be the WHOLE final hyphen-segment (`(?![\w-])`), so
+# "release-overhaul" and "closed-out-of-scope" stay compound modifiers.
+_COMPLETION_PARTICLES = r"in|into|out|up|off|over|back|through|down"
+
+# The trailing anchor is load-bearing, and the leading `\b` deliberately is not
+# symmetric with it. A completion word followed by a hyphen is USUALLY part of a
+# compound modifier, not a claim: live vault item "the post-release-verification
+# DoD item will flip" put 'release' within 120 chars of '#101' and the all-pairs
+# sweep turned it into a false DONE — the exact #299 defect class. All 10 live
+# member texts carrying a `<completion-word>-<word>` shape are compounds of that
+# kind (release-notes, closed-range, release-version-sweep,
+# github-release-board-promote, ...), so dropping the anchor is not an option. A
+# LEADING hyphen, by contrast, still reads as a claim ("auto-merged",
+# "back-merged"), so `\b` stays on the left.
+#
+# The one exception on the right is a verb PARTICLE. "This was merged-in with
+# #51" and "Issue #77 was closed-out last week" are completion claims, and a
+# bare `(?![-\w])` rejected both SILENTLY — no other pair in either text
+# qualified, so the guard produced an ACTIVE with no rejection to cite.
+# `(?!-(?!particle))` reads as: reject a following hyphen UNLESS a particle
+# follows it.
 _COMPLETION_PHRASE_RE = re.compile(
-    r"\b(done|merged|shipped|closed|fixed|complete[d]?|resolved|release[d]?)\b",
+    r"\b(done|merged|shipped|closed|fixed|complete[d]?|resolved|release[d]?)\b"
+    r"(?!-(?!(?:" + _COMPLETION_PARTICLES + r")(?![\w-])))",
     re.IGNORECASE,
 )
 _HEURISTIC_PROXIMITY_CHARS = 120
@@ -1858,13 +1912,58 @@ _HEURISTIC_PROXIMITY_CHARS = 120
 #     done; release shipped." style notes start losing real DONEs.
 # A (token, phrase) pair must itself sit within one sentence to qualify at all —
 # "Blocked until #64 is resolved. Fixed #12." pairs #12 with 'Fixed', not with
-# the governed 'resolved' in the sentence next door.
+# the governed 'resolved' in the sentence next door. That gate REPORTS the pairs
+# it drops (as a lower-priority rejection than a real cue) instead of dropping
+# them silently: it is the one path that can turn a pre-#299 DONE into an ACTIVE
+# with no cue to blame, and an unexplained downgrade is the same silent failure
+# the guard exists to remove. Precedence: an ungoverned pair (DONE) beats a cue
+# rejection, which beats a boundary rejection.
+#
+# Finally, a rejection recorded against one member survives even when a SIBLING
+# member of the same group yields DONE. The group verdict stays DONE, but
+# skills/check-items/SKILL.md Step 8 cascades a DONE group's checkoff to every
+# member (file, line) it has — so the objection against the member the guard
+# judged NOT done has to reach the citation and the log, or the cascade ticks
+# that line off on another member's evidence with the reason already deleted.
 # ---------------------------------------------------------------------------
 
-# Sentence and clause terminators. The `(?=\s|$)` lookahead is load-bearing: it
-# stops "v1.2.0" and "3.4.1" from being split into separate sentences.
-_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?](?=\s|$))|\n")
-_CLAUSE_BOUNDARY_RE = re.compile(r"(?:[.;:!?](?=\s|$))|\n")
+# Sentence and clause terminators. Three things here are load-bearing:
+#   * `(?=\s|$)` stops "v1.2.0" and "3.4.1" from being split into sentences.
+#   * `_ABBREV_LOOKBEHINDS` stops a KNOWN abbreviation's trailing dot from
+#     splitting. "Waiting on infra, e.g. #51 to be closed" is one sentence;
+#     splitting at "e.g." clipped the tier-1 window so the item read as DONE.
+#     Covered set: `e.g.`, `i.e.`, `etc.`, `vs.` — and nothing else. Any other
+#     dot, including an initial ("A.B.") or a title ("Dr."), intentionally ENDS
+#     the sentence. See the allowlist comment below.
+#   * A BLANK line, not a bare newline, terminates a sentence. A wrapped line is
+#     one sentence, and treating `\n` as a terminator silently dropped pairs
+#     ("Fixed in\n#51") that the pre-#299 code called DONE. Accepted cost: a
+#     multi-line member whose lines are separate list items is now read as ONE
+#     sentence, so a tier-1 cue reaches across the newline and can reject a pair
+#     on the next line. That widening is not reachable on current data — of 1437
+#     live member texts, 0 contain a newline at all — so the change is
+#     latent-only today in both directions.
+# Abbreviations whose trailing dot must NOT end a sentence, as an ALLOWLIST of
+# literal spellings rather than a shape. The shape this replaces,
+# `(?<![A-Za-z]\.[A-Za-z])`, also matched INITIALS: "Awaiting update from A.B.
+# The fix for #51 is merged." collapsed into ONE sentence, so the tier-1 cue
+# 'Awaiting' in the first half governed the '#51'/'merged' pair in the second
+# and a real completion read ACTIVE. Same discipline as `_HIGH_TRUST_SOURCES`
+# and the #297 note on assign_tier: a shape/denylist fails open, an allowlist
+# fails closed. Of 43 live member texts carrying an `X.Y.` dot the sampled ones
+# are all `e.g.`, so the allowlist keeps the benefit and drops the initials
+# false positive. Python lookbehinds are fixed-width, hence one per spelling;
+# the zero-width `\b` keeps "Netc." from reading as "etc.".
+_ABBREV_LOOKBEHINDS = (
+    r"(?<!\b[Ee]\.[Gg])(?<!\b[Ii]\.[Ee])"
+    r"(?<!\b[Ee][Tt][Cc])(?<!\b[Vv][Ss])"
+)
+_SENTENCE_BOUNDARY_RE = re.compile(
+    r"(?:" + _ABBREV_LOOKBEHINDS + r"[.!?](?=\s|$))|\r?\n[ \t]*\r?\n"
+)
+_CLAUSE_BOUNDARY_RE = re.compile(
+    r"(?:" + _ABBREV_LOOKBEHINDS + r"[.;:!?](?=\s|$))|\r?\n[ \t]*\r?\n"
+)
 
 # Tier 1 — self-sufficient. Waiting/blocking language plus verification-intent
 # verbs. Grounded in the reported failures ("Waiting on #51...", "Blocked until
@@ -1872,26 +1971,59 @@ _CLAUSE_BOUNDARY_RE = re.compile(r"(?:[.;:!?](?=\s|$))|\n")
 # whether ... once #51 ...") and their immediate inflections. `validate` is in
 # the set for the #297 production case documented on assign_tier: token 'v3.4.0'
 # near completion phrase 'release' on an *unperformed* validation task.
-# `(?<![\w./-])` / `(?![./-])` keep the cue anchored to prose. Live vault case:
+# `(?<![\w./-])` / `(?![\w./-])` keep the cue anchored to prose. Live vault case:
 # "Implement fix in git-flow#21: modify `check-pr-base.py` to allow `release/*`"
 # — a bare \b let 'check' match inside the FILENAME and reject the item for a
 # reason that has nothing to do with its meaning. A guard that fires for the
 # wrong reason is not a guard, it is a coincidence.
+#
+# The optional `(?:re|cross|double|self)-` prefix exists because the leading
+# anchor rejects a preceding '-': without it `re-verify`, `re-check`,
+# `cross-check`, `re-confirm` and `self-check` never fired at all, and only the
+# hand-spelled `double-?check` worked. The TRAILING `(?![\w./-])` is what
+# actually protects `check-pr-base.py`, so the leading '-' was costing those
+# cues for nothing.
 _PENDING_INTENT_CUE_RE = re.compile(
-    r"(?<![\w./-])("
+    r"(?<![\w./-])((?:(?:re|cross|double|self)-)?(?:"
     r"waiting\s+(?:on|for)|waiting|awaiting|await|"
     r"blocked(?:\s+(?:on|by|until))?|blocker|"
     r"pending|"
     r"depends?\s+on|depending\s+on|dependent\s+on|"
     r"confirm|verify|validate|ensure|double-?check|check(?:\s+back)?|"
     r"track|monitor|revisit|follow[\s-]?up"
-    r")(?![\w./-])",
+    r"))(?![\w./-])",
     re.IGNORECASE,
 )
 
-# Tier 2 — needs corroboration from _FORWARD_FORM_RE.
+# Tier 2 — needs corroboration from _FORWARD_FORM_RE. Anchored like tier 1, but
+# with `/` deliberately LEFT OUT of both classes. A slash joins prose
+# alternatives at least as often as it joins path segments, and including it
+# made the most explicitly conditional phrasing there is match NOTHING: in
+# "Bump the cache if/when #51 is merged", 'if' failed the TRAILING anchor and
+# 'when' failed the LEADING one, so tier 2 went silent and the item read DONE
+# ("when/if", "before/after" the same way).
+#
+# The asymmetry against tier 1, which keeps `/`, is principled rather than an
+# oversight. A tier-1 cue rejects on its own, so a path segment that happens to
+# read as a cue ('scripts/verify.sh', 'docs/track') must not fire — that is the
+# live case the anchoring was added for. Tier 2 cannot reject on a cue alone;
+# it also needs a forward-looking verb form, and _FORWARD_FORM_RE KEEPS `/` in
+# its classes. So re-admitting a path segment such as `hooks/after/x` as a
+# tier-2 cue costs nothing on its own.
+#
+# The DOT stays in both classes, and it is the dot — not the slash — that
+# protects the case this anchoring exists for: "After `go.get.it`, #123 was
+# closed." keeps its DONE because 'get' cannot match inside the dotted
+# filename and corroborate 'After'.
+#
+# Known limit, deliberate: a slash-joined TIER-1 pair ("confirm/verify #51 is
+# merged") still matches neither cue, because tier 1 keeps `/` for the reason
+# above. Under-firing there yields a false DONE, but the fix is not to drop `/`
+# from tier 1 — that would let a filename reject an item outright, which is the
+# worse failure and the one already observed on live data.
 _CONDITIONAL_CUE_RE = re.compile(
-    r"\b(once|until|till|unless|if|when|whenever|after|before|whether)\b",
+    r"(?<![\w.-])(once|until|till|unless|if|when|whenever|after|before|whether)"
+    r"(?![\w.-])",
     re.IGNORECASE,
 )
 
@@ -1903,8 +2035,9 @@ _CONDITIONAL_CUE_RE = re.compile(
 # false ACTIVE. That exclusion is why tense discrimination is not redundant with
 # the tier-2 cue list: it is what keeps bare-past claims out of the guard.
 _FORWARD_FORM_RE = re.compile(
-    r"\b(be|is|are|isn't|aren't|get|gets|getting|will|won't|would|should|"
-    r"shall|can|could|may|might|must|needs?|going\s+to|gonna)\b",
+    r"(?<![\w./-])(be|is|are|isn't|aren't|get|gets|getting|will|won't|would|"
+    r"should|shall|can|could|may|might|must|needs?|going\s+to|gonna)"
+    r"(?![\w./-])",
     re.IGNORECASE,
 )
 
@@ -1919,10 +2052,23 @@ _HEURISTIC_MAX_MATCHES = 20
 
 
 def _segment_start(text, pos, boundary_re):
-    """Index of the start of the `boundary_re`-delimited segment holding `pos`."""
+    """Index of the start of the `boundary_re`-delimited segment holding `pos`.
+
+    The scan runs over the FULL text and stops at the first boundary ending
+    past `pos`, rather than handing `pos` to finditer as an endpos. An endpos
+    makes `$` match there, so a '.' at `pos - 1` reads as a terminator even
+    when the real text has no whitespace after it: `_sentence_start("Waiting on
+    the fix.#51 is closed", 19)` returned 19 instead of 0. That artifact can
+    only ever DROP a pair, never manufacture a DONE — but a dropped pair is now
+    a reported rejection rather than a no-op, and any future relaxation of the
+    same-sentence gate would turn it into a false-DONE vector.
+    """
     start = 0
-    for boundary in boundary_re.finditer(text, 0, pos):
-        start = boundary.end()
+    for boundary in boundary_re.finditer(text):
+        end = boundary.end()
+        if end > pos:
+            break
+        start = end
     return start
 
 
@@ -1965,35 +2111,55 @@ def _conditional_rejection(text, tok_match, phr_match):
     return None
 
 
+_CROSS_SENTENCE_REASON = (
+    "the token and the completion phrase sit in different sentences, so "
+    "neither governs the other"
+)
+
+
 def _heuristic_member_verdict(text):
     """Scan one member text for a DONE-qualifying co-occurrence (#299).
 
     Returns (tok_match, phr_match, rejection):
       (tok, phr, None)   - an ungoverned co-occurrence: DONE.
-      (tok, phr, reason) - every qualifying pair was governed by a
-                           conditional/pending cue: not DONE, reason for the
-                           citation.
+      (tok, phr, reason) - no pair reached DONE: either every qualifying pair
+                           was governed by a conditional/pending cue, or the
+                           only pairs in range straddled a sentence boundary.
+                           Not DONE; `reason` goes on the citation.
       (None, None, None) - no token/phrase pair within the proximity window.
 
-    All (token, phrase) pairs are considered, not just the first of each. The
-    pre-#299 code searched once for each and tested that single pair, so with
-    the guard bolted on, one governed mention ("Blocked until #64 is resolved.
-    Fixed #12.") would have suppressed a genuine claim elsewhere in the same
-    text purely because of regex match order. Widening to all pairs makes the
-    verdict a property of the content instead.
+    All (token, phrase) pairs are considered, up to `_HEURISTIC_MAX_MATCHES`
+    of each. The pre-#299 code searched once for each and tested that single
+    pair, so with the guard bolted on, one governed mention ("Blocked until #64
+    is resolved. Fixed #12.") would have suppressed a genuine claim elsewhere
+    in the same text purely because of regex match order. Widening to all pairs
+    makes the verdict a property of the content instead. The cap is the cost of
+    that widening: a qualifying pair past the 20th token or 20th phrase is not
+    seen, which can only lose a DONE, never invent one.
+
+    A cue rejection outranks a cross-sentence rejection: the cue says WHY the
+    item is still open, while the boundary only says the pair proves nothing
+    either way.
     """
     tokens = list(_DISTINCTIVE_TOKEN_RE.finditer(text))[:_HEURISTIC_MAX_MATCHES]
     phrases = list(_COMPLETION_PHRASE_RE.finditer(text))[:_HEURISTIC_MAX_MATCHES]
     first_rejection = None
+    boundary_rejection = None
     for tok_match in tokens:
         for phr_match in phrases:
             if abs(tok_match.start() - phr_match.start()) > _HEURISTIC_PROXIMITY_CHARS:
                 continue
             # A pair split across a sentence boundary is not a co-occurrence
             # the guard can reason about: the cue region for one half would
-            # reach into the other half's clause (#299).
+            # reach into the other half's clause (#299). Recorded rather than
+            # dropped — this is the one path that downgrades a pre-#299 DONE
+            # with no cue to name, so dropping it silently would leave an
+            # unexplained ACTIVE with evidence_citation None.
             if (_sentence_start(text, tok_match.start())
                     != _sentence_start(text, phr_match.start())):
+                if boundary_rejection is None:
+                    boundary_rejection = (tok_match, phr_match,
+                                          _CROSS_SENTENCE_REASON)
                 continue
             reason = _conditional_rejection(text, tok_match, phr_match)
             if reason is None:
@@ -2002,6 +2168,8 @@ def _heuristic_member_verdict(text):
                 first_rejection = (tok_match, phr_match, reason)
     if first_rejection is not None:
         return first_rejection
+    if boundary_rejection is not None:
+        return boundary_rejection
     return None, None, None
 
 
@@ -2026,27 +2194,78 @@ def classify_groups_heuristic(merged_groups, evidence):
         confidence = "LOW"
         evidence_citation = None
         canonical_text = g.get("representative", "")
-        rejection = None
+        cue_rejection = None
+        boundary_rejection = None
+        done_match = None
+        # Both guard log lines quote the item, because a bare group_id makes an
+        # operator map an opaque id back to an item by hand. Whitespace is
+        # collapsed first: the log contract is one line per event, and a
+        # representative carrying a newline would split the line in two and
+        # break the grep the lines exist for.
+        _log_text = " ".join(canonical_text.split())[:80]
 
+        # Every member is scanned even after one yields DONE: a rejection
+        # recorded against a LATER member still has to be reported, because
+        # SKILL.md Step 8 cascades the group's checkoff to that member's
+        # (file, line) too.
         for m in g.get("members", []) or []:
             text = m.get("text", "") or ""
             tok_match, phr_match, reason = _heuristic_member_verdict(text)
-            if tok_match and reason is None:
-                classification = "DONE"
-                # #297: the heuristic's own token-co-occurrence evidence
-                # cannot justify HIGH confidence at any distance —
-                # confidence is written to the dashboard and the cache,
-                # and a consumer keying off it (rather than the
-                # assign_tier-derived tier) must not read it as HIGH.
-                confidence = "MED"
-                evidence_citation = (
-                    f"heuristic: token '{tok_match.group(0)}' "
-                    f"near completion phrase '{phr_match.group(0)}'"
+            if not tok_match:
+                continue
+            if reason is None:
+                if done_match is None:
+                    done_match = (tok_match.group(0), phr_match.group(0))
+            elif reason is _CROSS_SENTENCE_REASON:
+                if boundary_rejection is None:
+                    boundary_rejection = (tok_match.group(0),
+                                          phr_match.group(0), reason)
+            elif cue_rejection is None:
+                cue_rejection = (tok_match.group(0), phr_match.group(0), reason)
+
+        # Precedence across members, kept in explicit buckets so it mirrors the
+        # within-member contract in _heuristic_member_verdict rather than
+        # restating it as a conditional overwrite: ungoverned DONE beats a cue
+        # rejection beats a boundary rejection. A cue says WHY the item is
+        # open; the boundary only says the pair proves nothing either way.
+        # Choosing first-come across members, as the code used to, made the
+        # reported reason depend on member ORDER — the same group with the same
+        # two members cited the uninformative boundary reason or the governing
+        # cue purely by list position, and that reason is what rides on the
+        # citation and, for a DONE group, on the sibling-objection parenthetical.
+        rejection = cue_rejection or boundary_rejection
+
+        if done_match is not None:
+            classification = "DONE"
+            # #297: the heuristic's own token-co-occurrence evidence
+            # cannot justify HIGH confidence at any distance —
+            # confidence is written to the dashboard and the cache,
+            # and a consumer keying off it (rather than the
+            # assign_tier-derived tier) must not read it as HIGH.
+            confidence = "MED"
+            _dtok, _dphr = done_match
+            evidence_citation = (
+                f"heuristic: token '{_dtok}' "
+                f"near completion phrase '{_dphr}'"
+            )
+            if rejection is not None:
+                # The group is DONE on this member's evidence, but another
+                # member was judged NOT done. Keep that objection: Step 8
+                # cascades the checkoff to every member line of a DONE group,
+                # so the rejected line gets ticked off on a sibling's evidence
+                # — the human needs to see which line the guard disputed.
+                _rtok, _rphr, _rreason = rejection
+                evidence_citation += (
+                    f" (sibling member rejected: token '{_rtok}' near "
+                    f"completion phrase '{_rphr}', but {_rreason})"
                 )
-                rejection = None
-                break
-            if tok_match and rejection is None:
-                rejection = (tok_match.group(0), phr_match.group(0), reason)
+                print(
+                    f"[check-items] heuristic-guard DONE-DISPUTED: group "
+                    f"{g.get('group_id')} [{_log_text}]: classified DONE, but "
+                    f"sibling member rejected — token '{_rtok}' near "
+                    f"'{_rphr}', but {_rreason}",
+                    file=sys.stderr,
+                )
 
         if classification == "ACTIVE" and rejection is not None:
             # #299: a rejected DONE must not become an indistinguishable
@@ -2071,9 +2290,9 @@ def classify_groups_heuristic(merged_groups, evidence):
                 f"phrase '{_phr}', but {_reason}"
             )
             print(
-                f"[check-items] heuristic-guard: group "
-                f"{g.get('group_id')} DONE rejected — token '{_tok}' near "
-                f"'{_phr}', but {_reason}",
+                f"[check-items] heuristic-guard DONE-REJECTED: group "
+                f"{g.get('group_id')} [{_log_text}]: DONE rejected — token "
+                f"'{_tok}' near '{_phr}', but {_reason}",
                 file=sys.stderr,
             )
 

@@ -160,3 +160,33 @@ def test_cache_sourced_done_is_preselected():
 
     assert record["tier"] == "HIGH"
     assert _step7_mark(record) == "[x]"
+
+
+def test_production_item_is_capped_even_if_the_guard_is_bypassed():
+    """Defence in depth on the #297 production item itself.
+
+    The test above asserts layer 1 (#299's guard never lets this item reach
+    DONE). This asserts layer 2 independently: if a future change to the guard
+    ever let this exact text through as a heuristic DONE, assign_tier must
+    still cap it at MED so Step 7 cannot preselect it. Asserting the two layers
+    on the SAME text is the point — layer 2 was previously only exercised on a
+    different fixture, so a regression that re-broke it on the production item
+    would have gone unnoticed.
+
+    The 'agent' positive control is what stops this passing vacuously: without
+    it, a citation that simply carried no literal ref would tier LOW/MED for
+    the wrong reason and the classifier_source cap would go untested.
+    """
+    citation = (
+        "heuristic: token 'v3.4.0' near completion phrase 'release'"
+    )
+    # Layer 2: the heuristic source is capped regardless of the literal ref.
+    assert "v3.4.0" in _PRODUCTION_TEXT
+    assert oid.assign_tier(citation, _PRODUCTION_TEXT, "DONE", "heuristic") == "MED"
+    assert _step7_mark({"classification": "DONE", "tier": "MED"}) == "[ ]"
+
+    # Positive control: the same citation and text from a high-trust source
+    # DOES reach HIGH, so the MED above is the classifier_source cap doing the
+    # work and not an unrelated LOW/inferred fallthrough.
+    assert oid.assign_tier(citation, _PRODUCTION_TEXT, "DONE", "agent") == "HIGH"
+    assert _step7_mark({"classification": "DONE", "tier": "HIGH"}) == "[x]"
