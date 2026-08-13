@@ -1956,7 +1956,15 @@ _HEURISTIC_PROXIMITY_CHARS = 120
 #     clause-clipping let that one through as DONE.
 #   * A tier-2 subordinator scopes over its own CLAUSE, so it is clipped at
 #     ';'/':' as well. Widened to the sentence, "Fix #99 merged - this work is
-#     done; release shipped." style notes start losing real DONEs.
+#     done; release shipped." style notes start losing real DONEs. The CLAUSE
+#     clip covers BOTH halves of the tier-2 test — the cue search and the
+#     forward-form search that corroborates it. Clipping only the cue left the
+#     lookback anchored at the sentence, so a modal in a PRECEDING clause could
+#     corroborate a cue in this one: "It will ship; once #51 merged." rejected
+#     a bare-past claim by citing the 'will' from the clause next door. The
+#     verdict was reported, not silent, but the reason named corroboration the
+#     documented scope excludes, and a reason that cites the wrong evidence is
+#     the same class of defect as no reason at all.
 # A (token, phrase) pair must itself sit within one sentence to qualify at all —
 # "Blocked until #64 is resolved. Fixed #12." pairs #12 with 'Fixed', not with
 # the governed 'resolved' in the sentence next door. That gate REPORTS the pairs
@@ -2106,8 +2114,10 @@ _FORWARD_FORM_RE = re.compile(
 )
 
 # How far back from the completion phrase a forward-looking form may sit.
-# "will finally be closed" is 3 words; 24 chars covers that without reaching
-# across an unrelated clause.
+# "will finally be closed" is 3 words; 24 chars covers that. The window is the
+# TIGHTER of this distance and the enclosing clause, so it bounds the reach
+# WITHIN a clause while the clause start bounds it across clauses — the char
+# count alone would still walk past a ';' on a short leading clause.
 _FORWARD_FORM_LOOKBACK_CHARS = 24
 
 # Bound on regex matches scanned per member text, so a pathologically long
@@ -2165,8 +2175,11 @@ def _conditional_rejection(text, tok_match, phr_match):
     if not conditional:
         return None
 
-    # Tier 2 needs a forward-looking verb form immediately before the phrase.
-    look_from = max(sent_start, phr_match.start() - _FORWARD_FORM_LOOKBACK_CHARS)
+    # Tier 2 needs a forward-looking verb form immediately before the phrase,
+    # and that form is clipped to the same CLAUSE as the cue it corroborates —
+    # `clause_start`, not `sent_start`. See the block comment above.
+    look_from = max(clause_start,
+                    phr_match.start() - _FORWARD_FORM_LOOKBACK_CHARS)
     forward = _FORWARD_FORM_RE.search(text, look_from, phr_match.start())
     if forward:
         return (f"conditional cue '{conditional.group(0).strip()}' + "

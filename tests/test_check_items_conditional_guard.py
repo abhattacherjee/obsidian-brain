@@ -118,6 +118,15 @@ TRUE_DONE_CORPUS = [
     # Cross-model (Gemini) case: the forward-form regex must not match 'get'
     # inside a dotted identifier and corroborate 'After' into a false ACTIVE.
     ("bd-dotted-identifier", "After `go.get.it`, #123 was closed."),
+    # Cross-model (Gemini) case: a modal in a PRECEDING clause must not
+    # corroborate a tier-2 cue in this one. The cue search was clause-clipped
+    # while its forward-form lookback still ran to the sentence start, so the
+    # 'will'/'should' before the ';' rejected these bare-past claims. See
+    # test_tier2_forward_form_is_clause_scoped_like_its_cue.
+    ("bd-modal-prior-clause-be", "The team will be happy; after #51 fixed."),
+    ("bd-modal-prior-clause-will", "It will ship; once #51 merged."),
+    ("bd-modal-prior-clause-should", "This should land; after #77 closed."),
+    ("bd-modal-prior-clause-retry", "We will retry; when v1.2.0 released."),
     # Pre-#299 fixtures from test_check_items_smart.py that must not move.
     ("reg-smart-g3", "Fix #99 merged - this work is done; release shipped."),
     ("reg-smart-fallback", "Fix bug #87 — done; merged in v2.5.0 release."),
@@ -203,7 +212,7 @@ def test_confusion_matrix_over_full_corpus():
         1 for cid, _ in TRUE_DONE_CORPUS
         if by_id[cid]["classification"] == "DONE")
     assert false_done_eliminated == len(FALSE_DONE_CORPUS) == 22
-    assert true_done_preserved == len(TRUE_DONE_CORPUS) == 18
+    assert true_done_preserved == len(TRUE_DONE_CORPUS) == 22
 
 
 def test_rejected_done_keeps_the_reason_on_the_record():
@@ -792,6 +801,64 @@ def test_tier2_is_clipped_to_the_clause_not_the_sentence():
         assert _classify([("t2", text)])["t2"]["classification"] == "ACTIVE"
     finally:
         oid._clause_start = original
+
+
+def test_tier2_forward_form_is_clause_scoped_like_its_cue():
+    """Tier 2's two halves share one scope. The cue search was clipped to the
+    clause while its corroborating forward-form lookback still clamped to the
+    SENTENCE start, so a modal in a preceding clause could corroborate a cue in
+    this one and reject a bare-past completion claim — the block comment's own
+    clause-scoping contract, violated by the half of the test that enforces it.
+
+    The rejection was reported rather than silent, so the failure was a wrong
+    REASON, not a lost verdict: each of these cited a forward form from the
+    clause next door. Mutation: restoring `max(sent_start, ...)` as the
+    lookback floor turns all four back into ACTIVE."""
+    cases = [
+        "The team will be happy; after #51 fixed.",
+        "It will ship; once #51 merged.",
+        "This should land; after #77 closed.",
+        "We will retry; when v1.2.0 released.",
+    ]
+    by_id = _classify([(f"cs{i}", t) for i, t in enumerate(cases)])
+    wrong = {t: by_id[f"cs{i}"]["classification"]
+             for i, t in enumerate(cases)
+             if by_id[f"cs{i}"]["classification"] != "DONE"}
+    assert wrong == {}, f"prior-clause modal still corroborates: {wrong}"
+
+    # The ingredients really are present — it is the SCOPE, not their absence,
+    # that keeps these DONE. Both the cue and a forward form exist in the text,
+    # and the forward form is within the raw char lookback of the phrase.
+    for text in cases:
+        phr = oid._COMPLETION_PHRASE_RE.search(text)
+        assert oid._CONDITIONAL_CUE_RE.search(text, 0, phr.start()) is not None
+        sent_floor = max(oid._sentence_start(text, phr.start()),
+                         phr.start() - oid._FORWARD_FORM_LOOKBACK_CHARS)
+        assert oid._FORWARD_FORM_RE.search(text, sent_floor, phr.start())
+        # ... and it sits before the clause boundary, which is what excludes it.
+        assert oid._clause_start(text, phr.start()) > sent_floor
+
+
+def test_forward_form_inside_the_clause_still_corroborates():
+    """The other direction of the clause clip: narrowing the lookback must not
+    disarm tier 2 into never rejecting. A forward form in the SAME clause as
+    its cue still corroborates, including when an earlier clause is present so
+    the clip is actually doing work.
+
+    Mutation: making the lookback window empty (`look_from = phr.start()`)
+    turns both of these into DONE."""
+    same_clause = "Bump the cache; once #51 is merged"
+    assert _classify([("sc", same_clause)])["sc"]["classification"] == "ACTIVE"
+    citation = _classify([("sc", same_clause)])["sc"]["evidence_citation"]
+    assert "forward-looking form 'is'" in citation
+    # The corroborating form is genuinely inside the clause the cue sits in.
+    phr = oid._COMPLETION_PHRASE_RE.search(same_clause)
+    assert same_clause.index(" is ") > oid._clause_start(same_clause, phr.start())
+
+    # And with no leading clause at all, so the clip is a no-op.
+    assert _classify(
+        [("nc", "Once #51 is merged we bump the cache")]
+    )["nc"]["classification"] == "ACTIVE"
 
 
 def test_tier2_cue_search_is_bounded_on_the_right():
