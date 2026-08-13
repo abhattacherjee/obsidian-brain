@@ -78,6 +78,21 @@ def anchor_text_matches(line_text: str, reference_text: str, min_chars: int = _A
         return a == b and bool(a)
     return _longest_common_substring_len(a, b) >= min_chars
 
+
+def _format_text_verification_skips(skips: "list[tuple[str, int]]", unit: str, cap: int = 5) -> str:
+    """Build a compact 'Skipped N <unit>(s) failing text verification: ...' line.
+
+    Caps the enumerated ``basename:line`` list at ``cap`` entries with a
+    ``+N more`` tail so a large drift event can't produce an unbounded
+    summary string (#250 Task 3).
+    """
+    shown = skips[:cap]
+    enumerated = ", ".join(f"{os.path.basename(fp)}:{ln}" for fp, ln in shown)
+    extra = len(skips) - len(shown)
+    tail = f", +{extra} more" if extra > 0 else ""
+    return f"Skipped {len(skips)} {unit}(s) failing text verification: {enumerated}{tail}"
+
+
 _STOPWORDS = frozenset({
     'the', 'a', 'an', 'to', 'for', 'in', 'on', 'of', 'and', 'or',
     'but', 'is', 'are', 'was', 'were', 'be', 'not', 'this', 'that',
@@ -514,16 +529,19 @@ def batch_cascade_checkoff(
     if not high_targets and not fuzzy_suggestions:
         return "No duplicates found for cascading."
 
-    # Edit files for high-confidence targets
-    # Group by file to minimize file rewrites
-    files_to_edit: dict[str, list[int]] = {}
-    for (fpath, line_num), _ in high_targets.items():
-        files_to_edit.setdefault(fpath, []).append(line_num)
+    # Edit files for high-confidence targets. Carry each target's stored item
+    # text through so the flip site can verify it, not just trust the index
+    # (#250 -- verify-don't-re-resolve, mirroring the group-member cascade).
+    # Group by file to minimize file rewrites.
+    files_to_edit: dict[str, list[tuple[int, str]]] = {}
+    for (fpath, line_num), item_text in high_targets.items():
+        files_to_edit.setdefault(fpath, []).append((line_num, item_text))
 
     edited_count = 0
     edited_files: set[str] = set()
+    drift_skips: list[tuple[str, int]] = []
 
-    for fpath, line_nums in files_to_edit.items():
+    for fpath, line_refs in files_to_edit.items():
         try:
             with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
@@ -532,11 +550,30 @@ def batch_cascade_checkoff(
             continue
 
         file_edit_count = 0
-        for ln in line_nums:
+        for ln, ref_text in line_refs:
             idx = ln - 1  # 0-indexed
             if 0 <= idx < len(lines) and lines[idx].lstrip().startswith('- [ ] '):
-                lines[idx] = lines[idx].replace('- [ ] ', '- [x] ', 1)
-                file_edit_count += 1
+                # Checkbox guard passed (unchanged -- this is what prevents
+                # prose corruption). Verify the line still IS the item we
+                # mean to check off before flipping it: never re-resolve to
+                # a different line, only confirm or refuse this one (#250).
+                if not ref_text.strip():
+                    drift_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade: line {ln} in {os.path.basename(fpath)} "
+                        f"has no reference text to verify against (unverifiable); skipping.",
+                        file=sys.stderr,
+                    )
+                elif anchor_text_matches(lines[idx].rstrip("\n"), ref_text):
+                    lines[idx] = lines[idx].replace('- [ ] ', '- [x] ', 1)
+                    file_edit_count += 1
+                else:
+                    drift_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade: line {ln} in {os.path.basename(fpath)} "
+                        f"no longer matches the recorded item text (line drifted); skipping.",
+                        file=sys.stderr,
+                    )
             else:
                 print(
                     f"[obsidian-brain] cascade: line {ln} in {os.path.basename(fpath)} "
@@ -583,6 +620,10 @@ def batch_cascade_checkoff(
             if key not in seen:
                 seen.add(key)
                 parts.append(f'  - "{item_text}" in {basename}')
+    if drift_skips:
+        # #250 Task 3: surface text-verification skips in the RETURN VALUE,
+        # not only stderr -- a hook's caller may never show stderr.
+        parts.append(_format_text_verification_skips(drift_skips, "item"))
 
     return "\n".join(parts) if parts else "No duplicates found for cascading."
 
@@ -600,14 +641,33 @@ def cascade_group_members(
     Lines that no longer contain a ``- [ ] `` checkbox at apply-time are
     skipped with a stderr warning (file may have changed since grouping).
 
+    Verify-don't-re-resolve (#250): each target is flipped ONLY when the line
+    at its stored index still text-anchors to the member's own stored
+    ``text`` (via ``anchor_text_matches``). A member is never re-searched for
+    elsewhere in the file -- the index is a hint that is confirmed or
+    refused, never re-resolved to a different line. This is deliberately NOT
+    #201 Guard B's "unique text match -> act, 2+ -> refuse" contract: a
+    cascade group IS a set of near-identical lines by construction, so
+    refusing on 2+ matches would refuse exactly the case the cascade exists
+    to serve. Verifying each member against its own index instead preserves
+    multi-sibling cascades while still closing the drift hole (a member line
+    that drifted onto a DIFFERENT still-active checkbox is no longer
+    flipped). Blank/missing stored text is UNVERIFIABLE and is skipped, not
+    flipped, for the same reason.
+
     Returns a compact summary string: ``"Cascaded N member-line(s) across M
-    file(s)."`` or ``"No member lines to cascade."`` for empty input.
+    file(s)."`` or ``"No member lines to cascade."`` for empty input. Any
+    text-verification skips (drifted or unverifiable) are appended as an
+    additional line so a hook caller sees them even without stderr.
     """
     if source_skips is None:
         source_skips = set()
 
-    # Collect all (full_path, line_number) targets, deduplicated
-    targets: dict[tuple[str, int], None] = {}  # ordered dict as ordered set
+    # Collect all (full_path, line_number) -> reference text targets,
+    # deduplicated. When the same key appears twice, keep the FIRST
+    # non-blank text rather than letting a later blank overwrite a usable
+    # anchor (#250).
+    targets: dict[tuple[str, int], str] = {}  # ordered dict as ordered map
     for group in groups or []:
         for m in group.get("members", []) or []:
             fpath = m.get("file", "")
@@ -617,20 +677,25 @@ def cascade_group_members(
             key = (fpath, line_num)
             if key in source_skips:
                 continue
-            targets[key] = None
+            text = m.get("text", "") or ""
+            if key not in targets:
+                targets[key] = text
+            elif not targets[key].strip() and text.strip():
+                targets[key] = text
 
     if not targets:
         return "No member lines to cascade."
 
     # Group by file to minimise rewrites
-    files_to_lines: dict[str, list[int]] = {}
-    for fpath, line_num in targets:
-        files_to_lines.setdefault(fpath, []).append(line_num)
+    files_to_lines: dict[str, list[tuple[int, str]]] = {}
+    for (fpath, line_num), ref_text in targets.items():
+        files_to_lines.setdefault(fpath, []).append((line_num, ref_text))
 
     total_flipped = 0
     files_edited: set[str] = set()
+    drift_skips: list[tuple[str, int]] = []
 
-    for fpath, line_nums in files_to_lines.items():
+    for fpath, line_refs in files_to_lines.items():
         try:
             with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.readlines()
@@ -643,11 +708,31 @@ def cascade_group_members(
             continue
 
         file_flipped = 0
-        for ln in line_nums:
+        for ln, ref_text in line_refs:
             idx = ln - 1  # 0-indexed
             if 0 <= idx < len(lines) and lines[idx].lstrip().startswith("- [ ] "):
-                lines[idx] = lines[idx].replace("- [ ] ", "- [x] ", 1)
-                file_flipped += 1
+                # Checkbox guard passed (unchanged -- this is what prevents
+                # prose corruption, #250's "mode 2"). Verify the line still
+                # IS the member we mean to check off before flipping it.
+                if not ref_text.strip():
+                    drift_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade_group_members: line {ln} in "
+                        f"{os.path.basename(fpath)} has no reference text to "
+                        f"verify against (unverifiable); skipping.",
+                        file=sys.stderr,
+                    )
+                elif anchor_text_matches(lines[idx].rstrip("\n"), ref_text):
+                    lines[idx] = lines[idx].replace("- [ ] ", "- [x] ", 1)
+                    file_flipped += 1
+                else:
+                    drift_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade_group_members: line {ln} in "
+                        f"{os.path.basename(fpath)} no longer matches the "
+                        f"grouped item text (line drifted); skipping.",
+                        file=sys.stderr,
+                    )
             else:
                 print(
                     f"[obsidian-brain] cascade_group_members: line {ln} in "
@@ -685,11 +770,15 @@ def cascade_group_members(
             except OSError:
                 pass
 
-    if total_flipped == 0:
-        return "No member lines to cascade."
-    return (
-        f"Cascaded {total_flipped} member-line(s) across {len(files_edited)} file(s)."
+    base = (
+        "No member lines to cascade." if total_flipped == 0
+        else f"Cascaded {total_flipped} member-line(s) across {len(files_edited)} file(s)."
     )
+    if drift_skips:
+        # #250 Task 3: surface text-verification skips in the RETURN VALUE,
+        # not only stderr -- a hook's caller may never show stderr.
+        return base + "\n" + _format_text_verification_skips(drift_skips, "member-line")
+    return base
 
 
 # ---------------------------------------------------------------------------

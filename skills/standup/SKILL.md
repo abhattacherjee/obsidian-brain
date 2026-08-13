@@ -602,11 +602,13 @@ If the command exits with a non-zero exit code, report the error to the user:
 
 > Cascade checkoff failed for $PROJECT: [first line of stderr]. The standup note is unaffected.
 
-Note: `batch_cascade_checkoff()` may emit warnings to stderr while still succeeding (e.g., a specific line changed). Only treat non-zero exit code as a failure.
+Note: `batch_cascade_checkoff()` may emit warnings to stderr while still succeeding (e.g., a specific line changed). Only treat non-zero exit code as a failure. Since #250, a target line that no longer text-matches the item it was recorded for (drifted onto a different active item, or has no recorded text at all) is skipped rather than flipped — that skip is named in `summary` itself (a trailing `Skipped N item(s) failing text verification: ...` line), not only on stderr, so it is visible even if stderr is not surfaced.
 
 **14c — Report cascade results.** After all cascade calls complete, report:
 
 > Cascaded N checkoff(s) across M vault note(s) for project(s): list.
+
+If `summary` contains a "Skipped ... failing text verification" line for any project, include it in the report so the user knows which items were left unchecked because the recorded line no longer matched.
 
 If `batch_cascade_checkoff` is unavailable (import error), warn the user:
 
