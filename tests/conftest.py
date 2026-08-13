@@ -39,6 +39,11 @@ def _reset_session_resolution_state():
         "_sole_match_not_cwd_warned",
         "_unknown_sid_warned",
         "_transcript_dir_arbitration",
+        # Process-lifetime snapshot index (#70). Keyed by resolved sessions
+        # folder, so cross-test collisions are unlikely — but pytest can hand
+        # the same tmp_path prefix to a re-run and the memo would then answer
+        # from the previous test's file set. Clearing is one dict op.
+        "_snapshot_index_cache",
     ):
         getattr(obsidian_utils, name).clear()
     yield
