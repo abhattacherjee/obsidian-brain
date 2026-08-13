@@ -1373,6 +1373,39 @@ def test_dashboard_report_always_written_on_dry_run(tmp_path):
     content = open(path).read()
     assert "type: claude-check-items-report" in content
     assert "scope: obsidian-brain" in content
+    # #320 F1: skipped defaults to 0 for callers that don't pass it.
+    assert "skipped: 0" in content
+
+
+def test_dashboard_report_threads_skipped_count(tmp_path):
+    """#320 F1: a caller-supplied skipped count renders in BOTH the
+    frontmatter (`skipped: N`) and the prose summary line, next to
+    `cascaded` -- not just the auto-checked count -- so a dashboard reader
+    can see cascade candidates that were refused or lost, not only the
+    ones that succeeded."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+
+    path = write_check_items_dashboard(
+        vault_path=str(vault),
+        scope_name="obsidian-brain",
+        date_str="2026-05-11",
+        window_days=14,
+        raw_count=225,
+        group_count=40,
+        classifications=[],
+        applied=3,
+        cascaded=2,
+        merges=[],
+        semantic_merge_mode="ok",
+        classifier_mode="ok",
+        dry_run=False,
+        skipped=5,
+    )
+    content = open(path).read()
+    assert "skipped: 5" in content
+    assert "3 applied, 2 cascaded, 5 skipped." in content
 
 
 def test_report_filename_scope_suffix(tmp_path):

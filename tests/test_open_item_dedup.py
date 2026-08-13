@@ -22,6 +22,7 @@ from open_item_dedup import (
     verify_before_edit,
     assign_tier,
     partition_for_review,
+    parse_cascade_skipped_total,
 )
 
 
@@ -891,6 +892,166 @@ def test_batch_cascade_checkoff_empty_items_list(tmp_vault):
 
 
 # ---------------------------------------------------------------------------
+# #250: text-anchor batch_cascade_checkoff (verify-don't-re-resolve)
+#
+# batch_cascade_checkoff's targets are line hints that were freshly collected
+# by collect_open_items in the SAME call, so real drift can't occur through
+# the normal call path. These tests simulate drift by monkeypatching
+# collect_open_items (stale hint) or cascade_checkoff (blank text) directly,
+# mirroring the technique test_batch_cascade_checkoff_line_already_changed
+# already uses.
+# ---------------------------------------------------------------------------
+
+def test_batch_cascade_checkoff_wrong_line_drift_not_flipped(tmp_vault, monkeypatch, capsys):
+    """A stale line hint that now points to a DIFFERENT active item is
+    verified against its own stored text and skipped; a genuinely matching
+    sibling in the same file still flips (#250 mode 1)."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = sessions_dir / "2026-04-09-proj-drift.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Something totally different and unrelated\n"
+        "- [ ] Legit sibling item\n",
+        encoding="utf-8",
+    )
+
+    import open_item_dedup as oid_module
+
+    def patched_collect(vault_path, sessions_folder, project, *args, **kwargs):
+        return [
+            (str(note), 7, "Fix hooks/obsidian_utils.py import error"),
+            (str(note), 8, "Legit sibling item"),
+        ]
+
+    monkeypatch.setattr(oid_module, "collect_open_items", patched_collect)
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault), "claude-sessions", "myproject",
+        ["Fix hooks/obsidian_utils.py import error", "Legit sibling item"],
+    )
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Something totally different and unrelated" in content  # untouched
+    assert "- [x] Legit sibling item" in content  # genuinely matching sibling flips
+
+    captured = capsys.readouterr()
+    assert "line drifted" in captured.err
+
+    # Task 3: skip is surfaced in the RETURN VALUE, not only stderr.
+    assert "proj-drift.md:7" in result
+
+
+def test_batch_cascade_checkoff_preserves_sibling_duplicates(tmp_vault, monkeypatch):
+    """Two members in ONE file with identical text both flip.
+
+    Regression guard for the design decision: a naive Guard-B mirror
+    ("exactly one text match -> act, 2+ -> refuse") would refuse this case
+    since both lines legitimately match. Verify-don't-re-resolve checks each
+    target against its OWN stored index, so sibling duplicates both flip."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = sessions_dir / "2026-04-09-proj-sibs.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Merge feature/auth-fix into develop\n"
+        "- [ ] Merge feature/auth-fix into develop\n",
+        encoding="utf-8",
+    )
+
+    import open_item_dedup as oid_module
+
+    def patched_collect(vault_path, sessions_folder, project, *args, **kwargs):
+        return [
+            (str(note), 7, "Merge feature/auth-fix into develop"),
+            (str(note), 8, "Merge feature/auth-fix into develop"),
+        ]
+
+    monkeypatch.setattr(oid_module, "collect_open_items", patched_collect)
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault), "claude-sessions", "myproject",
+        ["Merge feature/auth-fix into develop"],
+    )
+
+    content = note.read_text(encoding="utf-8")
+    assert content.count("- [x] Merge feature/auth-fix into develop") == 2
+    assert "Cascaded 2 high-confidence duplicate(s)" in result
+
+
+def test_batch_cascade_checkoff_drift_onto_text_similar_line_still_flips(tmp_vault, monkeypatch):
+    """Residual honesty test: if the drifted line is ITSELF text-similar
+    enough to anchor (a near-duplicate reword), it still flips. Verify-
+    don't-re-resolve does NOT close this — anchor matching (LCS >= 25
+    normalized chars) can't distinguish a legitimate reword from a
+    coincidental sibling, and refusing on ambiguity would under-flip the
+    common case of a member text that drifted only slightly."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = sessions_dir / "2026-04-09-proj-residual.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Investigate the summarization pipeline configuration for batch recall upgrade process beta\n",
+        encoding="utf-8",
+    )
+
+    import open_item_dedup as oid_module
+
+    def patched_collect(vault_path, sessions_folder, project, *args, **kwargs):
+        return [(
+            str(note), 7,
+            "Investigate the summarization pipeline configuration for batch recall upgrade process alpha",
+        )]
+
+    monkeypatch.setattr(oid_module, "collect_open_items", patched_collect)
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault), "claude-sessions", "myproject",
+        ["Investigate the summarization pipeline configuration for batch recall upgrade process alpha"],
+    )
+
+    content = note.read_text(encoding="utf-8")
+    assert (
+        "- [x] Investigate the summarization pipeline configuration for batch recall upgrade process beta"
+        in content
+    )
+
+
+def test_batch_cascade_checkoff_blank_text_skipped_and_surfaced(tmp_vault, monkeypatch, capsys):
+    """A high-confidence target with blank/missing stored text is
+    UNVERIFIABLE and must be skipped, not flipped. This can't arise through
+    the normal find_duplicates path (a blank item_text can never earn "high"
+    confidence), so cascade_checkoff itself is monkeypatched to force it,
+    unit-testing the flip-site guard directly."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = sessions_dir / "2026-04-09-proj-blanktxt.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Some open item\n",
+        encoding="utf-8",
+    )
+
+    import open_item_dedup as oid_module
+
+    def fake_cascade_checkoff(checked_text, existing, source_file=None, source_line=None):
+        return [(str(note), 7, "", "high")]
+
+    monkeypatch.setattr(oid_module, "cascade_checkoff", fake_cascade_checkoff)
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault), "claude-sessions", "myproject", ["Some open item"],
+    )
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content  # untouched
+
+    captured = capsys.readouterr()
+    assert "unverifiable" in captured.err.lower()
+    assert "proj-blanktxt.md:7" in result
+
+
+# ---------------------------------------------------------------------------
 # R10 tests: verify_before_edit checkbox stripping (F4 fix)
 # ---------------------------------------------------------------------------
 
@@ -1088,14 +1249,440 @@ def test_cascade_group_members_skips_already_checked_line(tmp_path, capsys):
     assert "no longer contains expected checkbox" in captured.err
     # File content unchanged (still [x])
     assert "- [x] Fix issue #42" in note.read_text(encoding="utf-8")
-    # Nothing was flipped, so summary is the empty-result form
-    assert "No member lines to cascade." in summary
+    # #320 F3: a target existed and was refused, so this is NOT the same as
+    # a genuinely empty run -- it must not read as "nothing to cascade".
+    assert "Cascaded 0 member-line(s) — every candidate was refused or failed to save." in summary
+    # #320 F4: the checkbox-gone skip is named in the RETURN VALUE too, not
+    # only stderr.
+    assert "note.md:6" in summary
+    assert "whose checkbox is gone" in summary
 
 
 def test_cascade_group_members_empty_groups_returns_empty_summary():
     """Empty groups list returns the no-cascade summary without raising."""
     result = cascade_group_members([])
     assert "No member lines to cascade." in result
+
+
+# ---------------------------------------------------------------------------
+# #250: text-anchor cascade_group_members (verify-don't-re-resolve)
+# ---------------------------------------------------------------------------
+
+def test_cascade_group_members_wrong_line_drift_not_flipped(tmp_path, capsys):
+    """A member whose stored line now holds a DIFFERENT active item is
+    verified against its own stored text and skipped; a sibling member in
+    the same file whose line still matches is still flipped (#250 mode 1)."""
+    note = tmp_path / "note.md"
+    _make_note(note, [
+        "Something totally different and unrelated",  # line 6 -- drifted
+        "Legit sibling item",                          # line 7 -- still matches
+    ])
+
+    groups = [{
+        "members": [
+            {"file": str(note), "line": 6, "text": "Fix the auth bug in login flow"},
+            {"file": str(note), "line": 7, "text": "Legit sibling item"},
+        ]
+    }]
+    summary = cascade_group_members(groups)
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Something totally different and unrelated" in content  # untouched
+    assert "- [x] Legit sibling item" in content  # genuinely matching sibling flips
+
+    captured = capsys.readouterr()
+    assert "line drifted" in captured.err
+    assert "Cascaded 1 member-line(s)" in summary
+
+
+def test_cascade_group_members_preserves_sibling_duplicates(tmp_path):
+    """Two members in ONE file with identical text both flip.
+
+    Regression guard for the design decision: a naive Guard-B mirror
+    ("exactly one text match -> act, 2+ -> refuse") would refuse this case
+    because both lines legitimately match the stored text. Verify-don't-
+    re-resolve checks each member against its OWN stored index, so sibling
+    duplicates are never conflated and both flip (#250)."""
+    note = tmp_path / "note.md"
+    _make_note(note, [
+        "Merge feature/auth-fix into develop",
+        "Merge feature/auth-fix into develop",
+    ])
+
+    groups = [{
+        "members": [
+            {"file": str(note), "line": 6, "text": "Merge feature/auth-fix into develop"},
+            {"file": str(note), "line": 7, "text": "Merge feature/auth-fix into develop"},
+        ]
+    }]
+    summary = cascade_group_members(groups)
+
+    content = note.read_text(encoding="utf-8")
+    assert content.count("- [x] Merge feature/auth-fix into develop") == 2
+    assert "Cascaded 2 member-line(s) across 1 file(s)." in summary
+
+
+def test_cascade_group_members_drift_onto_text_similar_line_still_flips(tmp_path):
+    """Residual honesty test: if the drifted line is ITSELF text-similar
+    enough to anchor (e.g. a near-duplicate that was reworded), it still
+    flips. This is NOT closed by verify-don't-re-resolve -- anchor matching
+    (LCS >= 25 normalized chars) can't distinguish a legitimate reword from
+    a coincidental sibling, and refusing on ambiguity would under-flip the
+    common case of text that drifted only slightly."""
+    note = tmp_path / "note.md"
+    _make_note(note, [
+        "Investigate the summarization pipeline configuration for batch recall upgrade process beta",
+    ])
+
+    groups = [{
+        "members": [{
+            "file": str(note), "line": 6,
+            "text": "Investigate the summarization pipeline configuration for batch recall upgrade process alpha",
+        }],
+    }]
+    summary = cascade_group_members(groups)
+
+    content = note.read_text(encoding="utf-8")
+    assert (
+        "- [x] Investigate the summarization pipeline configuration for batch recall upgrade process beta"
+        in content
+    )
+    assert "Cascaded 1 member-line(s)" in summary
+
+
+def test_cascade_group_members_blank_text_skipped_and_surfaced(tmp_path, capsys):
+    """A member with blank stored text is UNVERIFIABLE and must be skipped,
+    not flipped -- flipping a target we cannot verify is exactly the
+    vulnerability this change closes (#250). The skip is surfaced in the
+    RETURN VALUE, not only stderr (Task 3)."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Some open item"])
+
+    groups = [{"members": [{"file": str(note), "line": 6, "text": ""}]}]
+    summary = cascade_group_members(groups)
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content  # untouched
+
+    captured = capsys.readouterr()
+    assert "unverifiable" in captured.err.lower()
+    # #320 F3: a target existed (blank text) and was refused, so this reads
+    # as "refused", not as the genuinely-empty-run message.
+    assert "Cascaded 0 member-line(s) — every candidate was refused or failed to save." in summary
+    assert "note.md:6" in summary  # surfaced even though nothing flipped
+
+
+def test_cascade_group_members_missing_text_key_treated_as_blank(tmp_path):
+    """A member dict with no 'text' key at all (not just an empty string) is
+    treated the same as blank -- unverifiable, skipped."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Some open item"])
+
+    groups = [{"members": [{"file": str(note), "line": 6}]}]  # no "text" key
+    summary = cascade_group_members(groups)
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content
+    # #320 F3: a target existed (missing text key -> blank) and was
+    # refused, so this reads as "refused", not as genuinely empty.
+    assert "Cascaded 0 member-line(s) — every candidate was refused or failed to save." in summary
+
+
+def test_cascade_group_members_monotonicity_happy_path(tmp_path):
+    """Old code flipped these lines; new code must flip the SAME lines
+    (monotonicity: the happy path where stored text still matches is
+    untouched by the change)."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Fix issue #99", "Another clean item"])
+
+    groups = [{
+        "members": [
+            {"file": str(note), "line": 6, "text": "Fix issue #99"},
+            {"file": str(note), "line": 7, "text": "Another clean item"},
+        ]
+    }]
+    summary = cascade_group_members(groups)
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [x] Fix issue #99" in content
+    assert "- [x] Another clean item" in content
+    assert "Cascaded 2 member-line(s) across 1 file(s)." in summary
+
+
+def test_cascade_group_members_skip_list_capped_with_more_tail(tmp_path):
+    """A large drift event surfaces a capped list (max 5) + a '+N more'
+    tail, so it can't produce an unbounded summary string."""
+    lines = [f"Original item {i}" for i in range(7)]
+    note = tmp_path / "note.md"
+    _make_note(note, lines)
+
+    groups = [{
+        "members": [
+            {"file": str(note), "line": 6 + i, "text": f"totally different drifted text {i}"}
+            for i in range(7)
+        ]
+    }]
+    summary = cascade_group_members(groups)
+
+    # #320 F3: 7 targets existed and were all refused (drift), so this
+    # reads as "refused", not as genuinely empty.
+    assert "Cascaded 0 member-line(s) — every candidate was refused or failed to save." in summary
+    assert "+2 more" in summary
+
+
+def test_cascade_group_members_skips_surfaced_in_return_value(tmp_path):
+    """Dedicated pin for Task 3: a drifted member is named in the RETURN
+    VALUE string, not only stderr."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Something totally different and unrelated"])
+
+    groups = [{
+        "members": [
+            {"file": str(note), "line": 6, "text": "Fix the auth bug in login flow"},
+        ]
+    }]
+    summary = cascade_group_members(groups)
+
+    assert "note.md:6" in summary
+    assert "text verification" in summary
+
+
+# ---------------------------------------------------------------------------
+# #320 F2 — a failed atomic write must be named, not read as "nothing to do"
+# ---------------------------------------------------------------------------
+
+def test_cascade_group_members_write_failure_surfaced_not_silent(tmp_path, monkeypatch):
+    """A verified flip that fails to reach disk (os.replace OSError) must be
+    named in the summary as a lost write, not collapsed into the
+    empty-input 'No member lines to cascade.' message (#320 F2)."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Fix issue #42"])
+
+    original_replace = os.replace
+
+    def failing_replace(src, dst):
+        if str(dst) == str(note):
+            raise OSError(28, "No space left on device")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+
+    groups = [{"members": [{"file": str(note), "line": 6, "text": "Fix issue #42"}]}]
+    summary = cascade_group_members(groups)
+
+    # Nothing actually landed on disk.
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Fix issue #42" in content
+
+    # The old bug: total_flipped stays 0 because it's only incremented AFTER
+    # a successful write, so this collapsed into the false "nothing to
+    # cascade" message even though a flip WAS computed and lost.
+    assert "No member lines to cascade." not in summary
+    assert "Cascaded 0 member-line(s)" in summary
+    assert "WRITE FAILED" in summary
+    assert "1 verified flip(s) were NOT saved" in summary
+    assert "note.md" in summary
+
+
+def test_batch_cascade_checkoff_write_failure_surfaced_not_silent(tmp_vault, monkeypatch):
+    """Same as above for batch_cascade_checkoff: a lost write must be named,
+    not reported as 'No duplicates found for cascading.' (#320 F2)."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = _create_session_note(
+        sessions_dir, "2026-04-09-proj-wlost.md", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+
+    original_replace = os.replace
+
+    def patched_replace(src, dst):
+        if ".ob-cascade-" in src:
+            raise OSError("cascade write failed")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", patched_replace)
+    result = batch_cascade_checkoff(
+        str(tmp_vault), "claude-sessions", "myproject",
+        ["Fix hooks/obsidian_utils.py import error"],
+    )
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Fix hooks/obsidian_utils.py import error" in content
+    assert "No duplicates found for cascading." not in result
+    assert "WRITE FAILED" in result
+    assert "verified flip(s) were NOT saved" in result
+
+
+# ---------------------------------------------------------------------------
+# #320 F6 — dedup rule coverage: first non-blank text wins over a later blank
+# ---------------------------------------------------------------------------
+
+def test_cascade_group_members_first_nonblank_text_wins_over_later_blank(tmp_path):
+    """A later blank-text entry for the SAME (file, line) key must not
+    clobber an earlier usable anchor (#250's dedup rule, previously
+    untested -- mutating it to plain last-write-wins left the suite green)."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Some open item"])
+    groups = [{"members": [
+        {"file": str(note), "line": 6, "text": "Some open item"},
+        {"file": str(note), "line": 6, "text": ""},          # later blank must not clobber
+    ]}]
+    assert "Cascaded 1 member-line(s)" in cascade_group_members(groups)
+
+
+# ---------------------------------------------------------------------------
+# #320 F7 — non-string stored text must not crash the cascade mid-loop
+# ---------------------------------------------------------------------------
+
+def test_cascade_group_members_non_string_text_does_not_crash(tmp_path):
+    """A member whose stored 'text' is a non-string (int/list/dict) -- e.g.
+    a corrupted merged.json entry -- must not raise AttributeError; it is
+    treated as unverifiable (blank) and skipped, not flipped (#320 F7)."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Some open item"])
+
+    for bad_text in (12345, ["a", "list"], {"k": "v"}):
+        groups = [{"members": [{"file": str(note), "line": 6, "text": bad_text}]}]
+        summary = cascade_group_members(groups)  # must not raise
+        assert isinstance(summary, str)
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content  # never blindly flipped
+
+
+def test_batch_cascade_checkoff_non_string_text_does_not_crash(tmp_vault, monkeypatch):
+    """Same as above for batch_cascade_checkoff's high_targets path -- a
+    non-string item_text (simulated corrupted upstream data) must not
+    crash with AttributeError (#320 F7)."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = sessions_dir / "2026-04-09-proj-nonstr.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Some open item\n",
+        encoding="utf-8",
+    )
+
+    import open_item_dedup as oid_module
+
+    def fake_cascade_checkoff(checked_text, existing, source_file=None, source_line=None):
+        return [(str(note), 7, 12345, "high")]  # non-string text
+
+    monkeypatch.setattr(oid_module, "cascade_checkoff", fake_cascade_checkoff)
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault), "claude-sessions", "myproject", ["Some open item"],
+    )  # must not raise
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content  # untouched
+    assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# #320 R1 (Gemini) — non-int stored 'line' must not crash the cascade
+# mid-loop. The text-sanitization guard above validates 'text'; 'line' was
+# still unhardened, so a str/float line raised TypeError inside the
+# per-file loop AFTER earlier files were already committed via os.replace,
+# leaving a half-applied cascade. isinstance(True, int) is True in Python,
+# so a bool must be excluded explicitly -- otherwise True silently reads as
+# line 1 and flips the wrong line.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad_line", ["10", 1.5, True])
+def test_cascade_group_members_bad_line_type_skipped_sibling_still_flips(tmp_path, capsys, bad_line):
+    """A member whose stored 'line' is a str, a float, or a bool must not
+    raise, and must be skipped rather than flipped. A legitimate sibling
+    member in the SAME group still flips, proving the bad member is
+    skipped, not the whole run aborted (#320 R1 Gemini)."""
+    note = tmp_path / "note.md"
+    _make_note(note, ["Some open item", "Sibling item"])
+
+    groups = [{
+        "members": [
+            {"file": str(note), "line": bad_line, "text": "Some open item"},
+            {"file": str(note), "line": 7, "text": "Sibling item"},
+        ]
+    }]
+    summary = cascade_group_members(groups)  # must not raise
+    assert isinstance(summary, str)
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content  # bad member never touched
+    assert "- [x] Sibling item" in content  # sibling still flips
+
+    captured = capsys.readouterr()
+    assert "malformed line number" in captured.err
+
+
+@pytest.mark.parametrize("bad_line", ["10", 1.5, True])
+def test_batch_cascade_checkoff_bad_line_type_skipped_sibling_still_flips(tmp_vault, monkeypatch, capsys, bad_line):
+    """Same as above for batch_cascade_checkoff's high_targets collection
+    loop (#320 R1 Gemini)."""
+    sessions_dir = tmp_vault / "claude-sessions"
+    note = sessions_dir / "2026-04-09-proj-badline.md"
+    note.write_text(
+        "---\ntype: claude-session\nproject: myproject\n---\n\n"
+        "## Open Questions / Next Steps\n"
+        "- [ ] Some open item\n"
+        "- [ ] Sibling item\n",
+        encoding="utf-8",
+    )
+
+    import open_item_dedup as oid_module
+
+    def fake_cascade_checkoff(checked_text, existing, source_file=None, source_line=None):
+        return [
+            (str(note), bad_line, "Some open item", "high"),
+            (str(note), 8, "Sibling item", "high"),
+        ]
+
+    monkeypatch.setattr(oid_module, "cascade_checkoff", fake_cascade_checkoff)
+
+    result = batch_cascade_checkoff(
+        str(tmp_vault), "claude-sessions", "myproject", ["Some open item"],
+    )  # must not raise
+    assert isinstance(result, str)
+
+    content = note.read_text(encoding="utf-8")
+    assert "- [ ] Some open item" in content  # bad member never touched
+    assert "- [x] Sibling item" in content  # sibling still flips
+
+    captured = capsys.readouterr()
+    assert "malformed line number" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# #320 R1 (Gemini) — parse_cascade_skipped_total: code/doc parity
+# ---------------------------------------------------------------------------
+# SKILL.md's Output format section documents cascade_skipped_total as
+# summing every "Skipped ..."/"WRITE FAILED" line in the cascade summary,
+# but the inline parsing only summed "Skipped" lines -- the WRITE FAILED
+# line's lost-flip count never reached the total. parse_cascade_skipped_total()
+# is now the single source of truth for both skills/check-items/SKILL.md and
+# this test, so the two can no longer drift apart.
+
+def test_parse_cascade_skipped_total_sums_skipped_and_write_failed():
+    """Pin N + M: a summary with both a 'Skipped N ...' line and a
+    'WRITE FAILED for ...; M verified flip(s) were NOT saved: ...' line
+    must sum to N + M, not just N (#320 R1 Gemini)."""
+    summary = (
+        "Cascaded 2 member-line(s) across 1 file(s).\n"
+        "Skipped 3 member-line(s) failing text verification: a.md:5, b.md:9\n"
+        "WRITE FAILED for 1 file(s); 4 verified flip(s) were NOT saved: c.md"
+    )
+    assert parse_cascade_skipped_total(summary) == 3 + 4
+
+
+def test_parse_cascade_skipped_total_write_failed_only():
+    """A summary with only a WRITE FAILED line (no Skipped line) still
+    contributes its lost-flip count."""
+    summary = "WRITE FAILED for 2 file(s); 5 verified flip(s) were NOT saved: a.md, b.md"
+    assert parse_cascade_skipped_total(summary) == 5
+
+
+def test_parse_cascade_skipped_total_no_matching_lines_is_zero():
+    summary = "Cascaded 3 member-line(s) across 1 file(s)."
+    assert parse_cascade_skipped_total(summary) == 0
 
 
 # ---------------------------------------------------------------------------

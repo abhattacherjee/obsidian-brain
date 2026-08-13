@@ -78,6 +78,67 @@ def anchor_text_matches(line_text: str, reference_text: str, min_chars: int = _A
         return a == b and bool(a)
     return _longest_common_substring_len(a, b) >= min_chars
 
+
+def _format_text_verification_skips(
+    skips: "list[tuple[str, int]]",
+    unit: str,
+    reason: str = "failing text verification",
+    cap: int = 5,
+) -> str:
+    """Build a compact 'Skipped N <unit>(s) <reason>: ...' line.
+
+    ``reason`` defaults to the original drift wording so existing callers
+    are unaffected; #320 F4/F5 pass distinct wording for the checkbox-gone
+    and unverifiable(blank-text) skip classes so a reader can tell drift,
+    an already-consumed checkbox, and unreadable stored text apart instead
+    of one undifferentiated "failing text verification" bucket.
+
+    Caps the enumerated ``basename:line`` list at ``cap`` entries with a
+    ``+N more`` tail so a large drift event can't produce an unbounded
+    summary string (#250 Task 3).
+    """
+    shown = skips[:cap]
+    enumerated = ", ".join(f"{os.path.basename(fp)}:{ln}" for fp, ln in shown)
+    extra = len(skips) - len(shown)
+    tail = f", +{extra} more" if extra > 0 else ""
+    return f"Skipped {len(skips)} {unit}(s) {reason}: {enumerated}{tail}"
+
+
+_RE_SKIPPED_COUNT = re.compile(r"^Skipped (\d+)")
+# Matches the exact WRITE FAILED shape built by cascade_group_members /
+# batch_cascade_checkoff:
+#   f"WRITE FAILED for {len(write_failures)} file(s); "
+#   f"{total_lost} verified flip(s) were NOT saved: {names}"
+# Group 1 captures the lost-flip count (M), not the file count (N).
+_RE_WRITE_FAILED_COUNT = re.compile(
+    r"^WRITE FAILED for \d+ file\(s\); (\d+) verified flip\(s\) were NOT saved"
+)
+
+
+def parse_cascade_skipped_total(summary: str) -> int:
+    """Sum every skip/loss count out of a cascade summary string.
+
+    Adds each ``Skipped N ...`` line's N and each ``WRITE FAILED for N
+    file(s); M verified flip(s) were NOT saved: ...`` line's M (the lost
+    verified-flip count). This is the single source of truth for
+    skills/check-items/SKILL.md's ``cascade_skipped_total``, whose doc
+    (Output format section) promises a sum across every ``Skipped ...``/
+    ``WRITE FAILED`` line -- the inline parsing there previously summed
+    only ``Skipped`` lines, silently diverging from that doc (#320 R1
+    Gemini).
+    """
+    total = 0
+    for line in summary.splitlines():
+        sm = _RE_SKIPPED_COUNT.match(line)
+        if sm:
+            total += int(sm.group(1))
+            continue
+        wm = _RE_WRITE_FAILED_COUNT.match(line)
+        if wm:
+            total += int(wm.group(1))
+    return total
+
+
 _STOPWORDS = frozenset({
     'the', 'a', 'an', 'to', 'for', 'in', 'on', 'of', 'and', 'or',
     'but', 'is', 'are', 'was', 'were', 'be', 'not', 'this', 'that',
@@ -499,9 +560,35 @@ def batch_cascade_checkoff(
     for checked_text in checked_texts:
         dupes = cascade_checkoff(checked_text, existing)
         for fpath, line_num, item_text, confidence in dupes:
+            # #320 R1 (Gemini): same line_num hardening as
+            # cascade_group_members above -- line_num is a hint carried
+            # from find_duplicates/existing_items and is not guaranteed to
+            # be a genuine positive int. Reject at the boundary instead of
+            # letting a bad value reach `idx = ln - 1` / `lines[idx]` in the
+            # write loop below, which raises TypeError mid-loop and can
+            # leave a cascade half-applied after earlier files were already
+            # committed via os.replace. isinstance(True, int) is True in
+            # Python, so bool must be excluded explicitly.
+            if not isinstance(line_num, int) or isinstance(line_num, bool) or line_num <= 0:
+                print(
+                    f"[obsidian-brain] batch_cascade_checkoff: candidate in "
+                    f"{os.path.basename(fpath)} has a malformed line number "
+                    f"({line_num!r}, type {type(line_num).__name__}); skipping.",
+                    file=sys.stderr,
+                )
+                continue
             key = (fpath, line_num)
             if confidence == "high":
-                high_targets[key] = item_text
+                # #320 F7: item_text is a hint carried from upstream grouping
+                # data, not guaranteed to be a string (a corrupted cache
+                # entry could hand back an int/list/dict). A non-string
+                # reaches .strip() at the flip site below and raises
+                # AttributeError mid-loop, which can leave a cascade
+                # half-applied after earlier files were already committed
+                # via os.replace. Sanitize at the boundary instead: treat
+                # anything non-string as blank (unverifiable), same as an
+                # empty string.
+                high_targets[key] = item_text if isinstance(item_text, str) else ""
             else:
                 fuzzy_raw.append((key, item_text, os.path.basename(fpath)))
 
@@ -514,16 +601,22 @@ def batch_cascade_checkoff(
     if not high_targets and not fuzzy_suggestions:
         return "No duplicates found for cascading."
 
-    # Edit files for high-confidence targets
-    # Group by file to minimize file rewrites
-    files_to_edit: dict[str, list[int]] = {}
-    for (fpath, line_num), _ in high_targets.items():
-        files_to_edit.setdefault(fpath, []).append(line_num)
+    # Edit files for high-confidence targets. Carry each target's stored item
+    # text through so the flip site can verify it, not just trust the index
+    # (#250 -- verify-don't-re-resolve, mirroring the group-member cascade).
+    # Group by file to minimize file rewrites.
+    files_to_edit: dict[str, list[tuple[int, str]]] = {}
+    for (fpath, line_num), item_text in high_targets.items():
+        files_to_edit.setdefault(fpath, []).append((line_num, item_text))
 
     edited_count = 0
     edited_files: set[str] = set()
+    drift_skips: list[tuple[str, int]] = []
+    unverifiable_skips: list[tuple[str, int]] = []  # #320 F5: blank/missing text, split from drift
+    checkbox_skips: list[tuple[str, int]] = []  # #320 F4: checkbox already gone, was stderr-only
+    write_failures: list[tuple[str, int]] = []  # #320 F2: verified flips lost to a failed os.replace
 
-    for fpath, line_nums in files_to_edit.items():
+    for fpath, line_refs in files_to_edit.items():
         try:
             with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
@@ -532,12 +625,35 @@ def batch_cascade_checkoff(
             continue
 
         file_edit_count = 0
-        for ln in line_nums:
+        for ln, ref_text in line_refs:
             idx = ln - 1  # 0-indexed
             if 0 <= idx < len(lines) and lines[idx].lstrip().startswith('- [ ] '):
-                lines[idx] = lines[idx].replace('- [ ] ', '- [x] ', 1)
-                file_edit_count += 1
+                # Checkbox guard passed (unchanged -- this is what prevents
+                # prose corruption). Verify the line still IS the item we
+                # mean to check off before flipping it: never re-resolve to
+                # a different line, only confirm or refuse this one (#250).
+                if not ref_text.strip():
+                    unverifiable_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade: line {ln} in {os.path.basename(fpath)} "
+                        f"has no reference text to verify against (unverifiable); skipping.",
+                        file=sys.stderr,
+                    )
+                elif anchor_text_matches(lines[idx].rstrip("\n"), ref_text):
+                    lines[idx] = lines[idx].replace('- [ ] ', '- [x] ', 1)
+                    file_edit_count += 1
+                else:
+                    drift_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade: line {ln} in {os.path.basename(fpath)} "
+                        f"no longer matches the recorded item text (line drifted); skipping.",
+                        file=sys.stderr,
+                    )
             else:
+                # #320 F4: this was stderr-only, which made a renumbered line
+                # landing on prose or an already-checked box the most likely
+                # real drift signal AND the one least likely to be seen.
+                checkbox_skips.append((fpath, ln))
                 print(
                     f"[obsidian-brain] cascade: line {ln} in {os.path.basename(fpath)} "
                     f"no longer contains expected checkbox (file may have changed)",
@@ -563,17 +679,30 @@ def batch_cascade_checkoff(
                 edited_count += file_edit_count  # count only after successful write
             except OSError as exc:
                 print(f"[obsidian-brain] cascade: write failed for {os.path.basename(fpath)}: {exc}", file=sys.stderr)
+                # #320 F2: file_edit_count verified flips were computed but
+                # never reached disk. Name the loss instead of letting it
+                # silently collapse into "nothing to cascade".
+                write_failures.append((fpath, file_edit_count))
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
 
-    # Build summary
+    # Build summary. #320 F3: once ANY high-confidence target existed, never
+    # collapse "every one of them was refused or lost" down to the same
+    # "No duplicates found for cascading." wording used for a genuinely
+    # empty run -- that early return above already covers the true empty
+    # case. Keep the success wording byte-identical.
     parts: list[str] = []
     if edited_count:
         parts.append(
             f"Cascaded {edited_count} high-confidence duplicate(s) "
             f"in {len(edited_files)} file(s)."
+        )
+    elif drift_skips or unverifiable_skips or checkbox_skips or write_failures:
+        parts.append(
+            "Cascaded 0 high-confidence duplicate(s) — "
+            "every candidate was refused or failed to save."
         )
     if fuzzy_suggestions:
         parts.append("Fuzzy suggestions (edit manually if same item):")
@@ -583,6 +712,26 @@ def batch_cascade_checkoff(
             if key not in seen:
                 seen.add(key)
                 parts.append(f'  - "{item_text}" in {basename}')
+    if drift_skips:
+        # #250 Task 3: surface text-verification skips in the RETURN VALUE,
+        # not only stderr -- a hook's caller may never show stderr.
+        parts.append(_format_text_verification_skips(drift_skips, "item"))
+    if unverifiable_skips:
+        parts.append(_format_text_verification_skips(
+            unverifiable_skips, "item",
+            reason="with no text to verify against (unverifiable)",
+        ))
+    if checkbox_skips:
+        parts.append(_format_text_verification_skips(
+            checkbox_skips, "item", reason="whose checkbox is gone",
+        ))
+    if write_failures:
+        total_lost = sum(n for _, n in write_failures)
+        names = ", ".join(os.path.basename(fp) for fp, _ in write_failures)
+        parts.append(
+            f"WRITE FAILED for {len(write_failures)} file(s); "
+            f"{total_lost} verified flip(s) were NOT saved: {names}"
+        )
 
     return "\n".join(parts) if parts else "No duplicates found for cascading."
 
@@ -600,37 +749,92 @@ def cascade_group_members(
     Lines that no longer contain a ``- [ ] `` checkbox at apply-time are
     skipped with a stderr warning (file may have changed since grouping).
 
+    Verify-don't-re-resolve (#250): each target is flipped ONLY when the line
+    at its stored index still text-anchors to the member's own stored
+    ``text`` (via ``anchor_text_matches``). A member is never re-searched for
+    elsewhere in the file -- the index is a hint that is confirmed or
+    refused, never re-resolved to a different line. This is deliberately NOT
+    #201 Guard B's "unique text match -> act, 2+ -> refuse" contract: a
+    cascade group IS a set of near-identical lines by construction, so
+    refusing on 2+ matches would refuse exactly the case the cascade exists
+    to serve. Verifying each member against its own index instead preserves
+    multi-sibling cascades while still closing the drift hole (a member line
+    that drifted onto a DIFFERENT still-active checkbox is no longer
+    flipped). Blank/missing stored text is UNVERIFIABLE and is skipped, not
+    flipped, for the same reason.
+
     Returns a compact summary string: ``"Cascaded N member-line(s) across M
-    file(s)."`` or ``"No member lines to cascade."`` for empty input.
+    file(s)."`` or ``"No member lines to cascade."`` for empty input. Any
+    text-verification skips (drifted or unverifiable) are appended as an
+    additional line so a hook caller sees them even without stderr.
     """
     if source_skips is None:
         source_skips = set()
 
-    # Collect all (full_path, line_number) targets, deduplicated
-    targets: dict[tuple[str, int], None] = {}  # ordered dict as ordered set
+    # Collect all (full_path, line_number) -> reference text targets,
+    # deduplicated. When the same key appears twice, keep the FIRST
+    # non-blank text rather than letting a later blank overwrite a usable
+    # anchor (#250).
+    targets: dict[tuple[str, int], str] = {}  # ordered dict as ordered map
     for group in groups or []:
         for m in group.get("members", []) or []:
             fpath = m.get("file", "")
             line_num = m.get("line")
-            if not fpath or line_num is None:
+            if not fpath:
+                continue
+            # #320 R1 (Gemini): line_num is a hint carried from merged.json,
+            # not guaranteed to be a genuine positive int (a corrupted cache
+            # entry could hand back a str/float/bool). `not isinstance(...,
+            # int) or isinstance(..., bool) or line_num <= 0` mirrors the
+            # non-string `text` sanitization above -- reject at the boundary
+            # instead of letting a bad value reach `idx = ln - 1` /
+            # `lines[idx]` below, which raises TypeError mid-loop and can
+            # leave a cascade half-applied after earlier files were already
+            # committed via os.replace. isinstance(True, int) is True in
+            # Python, so bool must be excluded explicitly -- a bool must
+            # NOT be accepted as a line number (True would silently flip
+            # line 0).
+            if not isinstance(line_num, int) or isinstance(line_num, bool) or line_num <= 0:
+                print(
+                    f"[obsidian-brain] cascade_group_members: member in "
+                    f"{os.path.basename(fpath)} has a malformed line number "
+                    f"({line_num!r}, type {type(line_num).__name__}); skipping.",
+                    file=sys.stderr,
+                )
                 continue
             key = (fpath, line_num)
             if key in source_skips:
                 continue
-            targets[key] = None
+            # #320 F7: a member's "text" is a hint carried from merged.json,
+            # not guaranteed to be a string (a corrupted cache entry could
+            # hand back an int/list/dict). A non-string reaches .strip() at
+            # the flip site below and raises AttributeError mid-loop, which
+            # can leave a cascade half-applied after earlier files were
+            # already committed via os.replace. Sanitize at the boundary:
+            # treat anything non-string as blank (unverifiable).
+            text = m.get("text", "")
+            text = text if isinstance(text, str) else ""
+            if key not in targets:
+                targets[key] = text
+            elif not targets[key].strip() and text.strip():
+                targets[key] = text
 
     if not targets:
         return "No member lines to cascade."
 
     # Group by file to minimise rewrites
-    files_to_lines: dict[str, list[int]] = {}
-    for fpath, line_num in targets:
-        files_to_lines.setdefault(fpath, []).append(line_num)
+    files_to_lines: dict[str, list[tuple[int, str]]] = {}
+    for (fpath, line_num), ref_text in targets.items():
+        files_to_lines.setdefault(fpath, []).append((line_num, ref_text))
 
     total_flipped = 0
     files_edited: set[str] = set()
+    drift_skips: list[tuple[str, int]] = []
+    unverifiable_skips: list[tuple[str, int]] = []  # #320 F5: blank/missing text, split from drift
+    checkbox_skips: list[tuple[str, int]] = []  # #320 F4: checkbox already gone, was stderr-only
+    write_failures: list[tuple[str, int]] = []  # #320 F2: verified flips lost to a failed os.replace
 
-    for fpath, line_nums in files_to_lines.items():
+    for fpath, line_refs in files_to_lines.items():
         try:
             with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.readlines()
@@ -643,12 +847,36 @@ def cascade_group_members(
             continue
 
         file_flipped = 0
-        for ln in line_nums:
+        for ln, ref_text in line_refs:
             idx = ln - 1  # 0-indexed
             if 0 <= idx < len(lines) and lines[idx].lstrip().startswith("- [ ] "):
-                lines[idx] = lines[idx].replace("- [ ] ", "- [x] ", 1)
-                file_flipped += 1
+                # Checkbox guard passed (unchanged -- this is what prevents
+                # prose corruption, #250's "mode 2"). Verify the line still
+                # IS the member we mean to check off before flipping it.
+                if not ref_text.strip():
+                    unverifiable_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade_group_members: line {ln} in "
+                        f"{os.path.basename(fpath)} has no reference text to "
+                        f"verify against (unverifiable); skipping.",
+                        file=sys.stderr,
+                    )
+                elif anchor_text_matches(lines[idx].rstrip("\n"), ref_text):
+                    lines[idx] = lines[idx].replace("- [ ] ", "- [x] ", 1)
+                    file_flipped += 1
+                else:
+                    drift_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade_group_members: line {ln} in "
+                        f"{os.path.basename(fpath)} no longer matches the "
+                        f"grouped item text (line drifted); skipping.",
+                        file=sys.stderr,
+                    )
             else:
+                # #320 F4: this was stderr-only, which made a renumbered line
+                # landing on prose or an already-checked box the most likely
+                # real drift signal AND the one least likely to be seen.
+                checkbox_skips.append((fpath, ln))
                 print(
                     f"[obsidian-brain] cascade_group_members: line {ln} in "
                     f"{os.path.basename(fpath)} no longer contains expected "
@@ -680,16 +908,49 @@ def cascade_group_members(
                 f"{os.path.basename(fpath)}: {exc}",
                 file=sys.stderr,
             )
+            # #320 F2: file_flipped verified flips were computed but never
+            # reached disk. Name the loss instead of letting it silently
+            # collapse into "nothing to cascade".
+            write_failures.append((fpath, file_flipped))
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
 
-    if total_flipped == 0:
-        return "No member lines to cascade."
-    return (
-        f"Cascaded {total_flipped} member-line(s) across {len(files_edited)} file(s)."
-    )
+    # #320 F3: once ANY target existed, never collapse "every one of them
+    # was refused or lost" down to the same "No member lines to cascade."
+    # wording used for a genuinely empty run -- that early return above
+    # already covers the true empty case. Keep the success wording
+    # byte-identical.
+    if total_flipped:
+        base = f"Cascaded {total_flipped} member-line(s) across {len(files_edited)} file(s)."
+    elif drift_skips or unverifiable_skips or checkbox_skips or write_failures:
+        base = "Cascaded 0 member-line(s) — every candidate was refused or failed to save."
+    else:
+        base = "No member lines to cascade."
+
+    parts = [base]
+    if drift_skips:
+        # #250 Task 3: surface text-verification skips in the RETURN VALUE,
+        # not only stderr -- a hook's caller may never show stderr.
+        parts.append(_format_text_verification_skips(drift_skips, "member-line"))
+    if unverifiable_skips:
+        parts.append(_format_text_verification_skips(
+            unverifiable_skips, "member-line",
+            reason="with no text to verify against (unverifiable)",
+        ))
+    if checkbox_skips:
+        parts.append(_format_text_verification_skips(
+            checkbox_skips, "member-line", reason="whose checkbox is gone",
+        ))
+    if write_failures:
+        total_lost = sum(n for _, n in write_failures)
+        names = ", ".join(os.path.basename(fp) for fp, _ in write_failures)
+        parts.append(
+            f"WRITE FAILED for {len(write_failures)} file(s); "
+            f"{total_lost} verified flip(s) were NOT saved: {names}"
+        )
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
