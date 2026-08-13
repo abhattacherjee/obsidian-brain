@@ -1862,9 +1862,44 @@ def test_locked_cache_fails_open_when_the_lock_cannot_be_acquired(tmp_path, monk
         cache["runs"]["p"] = {"groups": []}
 
     err = capsys.readouterr().err
-    assert "WARNING" in err and "lock" in err.lower()
+    # Assert locked_cache's OWN message, not merely "a warning mentioning a
+    # lock". _acquire_lock already prints its own warning on this path, so a
+    # generic `"WARNING" in err and "lock" in err.lower()` is satisfied by
+    # that other function's output -- deleting locked_cache's warning
+    # entirely left this test green (vacuity audit, #306).
+    assert "could silently drop this run's cache update" in err
     data = json.loads(fake_cache.read_text())
     assert data["runs"]["p"]["groups"] == []
+
+
+def test_locked_cache_warns_when_contention_times_out(tmp_path, monkeypatch, capsys):
+    """The timeout path is where locked_cache's own warning is the ONLY
+    signal: _acquire_lock prints on an OSError but returns None SILENTLY
+    when it simply runs out of time under contention. Without this test the
+    fail-open warning is only ever exercised on the path where another
+    function happens to be shouting too.
+    """
+    import check_items_cache as cic
+    fake_cache = tmp_path / "check-items-classifications.json"
+    monkeypatch.setattr(cic, "CACHE_PATH", fake_cache)
+    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
+
+    # A rival holds a FRESH lock, so takeover never triggers and the acquire
+    # can only time out.
+    lock_path = fake_cache.with_suffix(".lock")
+    lock_path.write_bytes(b"99999 rival\n")
+
+    with cic.locked_cache(timeout=0.2) as cache:
+        cache["runs"]["p"] = {"groups": []}
+
+    err = capsys.readouterr().err
+    assert "could silently drop this run's cache update" in err, (
+        "a contention timeout must still warn -- _acquire_lock is silent here"
+    )
+    # Fail-open still means the write happens.
+    assert json.loads(fake_cache.read_text())["runs"]["p"]["groups"] == []
+    # The rival's lock is untouched.
+    assert lock_path.read_bytes() == b"99999 rival\n"
 
 
 def test_locked_cache_warning_is_silent_on_the_happy_path(tmp_path, monkeypatch, capsys):
