@@ -1374,3 +1374,128 @@ def test_update_cache_tolerates_non_dict_cached_entry():
     groups = updated["runs"]["obsidian-brain"]["groups"]
     assert [g["canonical_hash"] for g in groups] == ["h1"]
     assert groups[0]["classified_ts"] == t0
+
+
+# ---------------------------------------------------------------------------
+# #305: a surviving entry (no fresh classification this run) must be pinned
+# to the head it was actually verified at, not laundered onto the run-level
+# project_head_at_classify that gets bumped unconditionally.
+# ---------------------------------------------------------------------------
+
+def test_update_cache_does_not_launder_unverified_survivor():
+    """The issue's exact scenario, end to end. A cache entry verified at
+    HEAD1 survives an update_cache run at HEAD2 with no fresh classification
+    for it — it must carry head_at_classify == "HEAD1" afterward, and the
+    next partition() at HEAD2 must route it to needs/head_changed rather than
+    replaying it as known."""
+    from check_items_cache import update_cache, partition
+
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "HEAD1",
+                "groups": [_make_cached_entry("h1")],
+            }
+        },
+    }
+    updated = update_cache(
+        cache=cache, project="obsidian-brain",
+        all_groups=[_make_group("h1")],
+        fresh_classifications=[],
+        head_sha="HEAD2",
+    )
+    survivor = updated["runs"]["obsidian-brain"]["groups"][0]
+    assert survivor["head_at_classify"] == "HEAD1"
+    assert updated["runs"]["obsidian-brain"]["project_head_at_classify"] == "HEAD2"
+
+    known, needs = partition([_make_group("h1")], updated,
+                             project="obsidian-brain", head_sha="HEAD2")
+    assert len(known) == 0
+    assert len(needs) == 1
+    assert needs[0].get("_reason") == "head_changed"
+
+
+def test_update_cache_survivor_keeps_original_head_across_two_bumps():
+    """setdefault semantics: an entry that survives un-reclassified through
+    TWO consecutive update_cache runs (HEAD2 then HEAD3) must keep the head
+    it was ORIGINALLY verified at (HEAD1), not inherit HEAD2 along the way."""
+    from check_items_cache import update_cache
+
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "HEAD1",
+                "groups": [_make_cached_entry("h1")],
+            }
+        },
+    }
+    after_head2 = update_cache(
+        cache=cache, project="obsidian-brain",
+        all_groups=[_make_group("h1")],
+        fresh_classifications=[],
+        head_sha="HEAD2",
+    )
+    assert after_head2["runs"]["obsidian-brain"]["groups"][0]["head_at_classify"] == "HEAD1"
+
+    after_head3 = update_cache(
+        cache=after_head2, project="obsidian-brain",
+        all_groups=[_make_group("h1")],
+        fresh_classifications=[],
+        head_sha="HEAD3",
+    )
+    survivor = after_head3["runs"]["obsidian-brain"]["groups"][0]
+    assert survivor["head_at_classify"] == "HEAD1"
+
+
+def test_partition_replays_freshly_verified_entry_without_per_entry_head():
+    """Positive control: an entry that DID get a fresh record this run must
+    still replay as known on the next partition() at the same head — the
+    per-entry stamp must not leak onto entries update_cache actually
+    verified. Without this test, a mutation that stamps head_at_classify on
+    every entry (not just un-reclassified survivors) would still pass the
+    laundering tests above while destroying the cache's whole purpose."""
+    from check_items_cache import update_cache, partition
+
+    cache = {"schema_version": 1, "runs": {}}
+    updated = update_cache(
+        cache=cache, project="obsidian-brain",
+        all_groups=[_make_group("h1")],
+        fresh_classifications=[_make_fresh("h1", classifier_source="agent")],
+        head_sha="HEAD1",
+    )
+    assert "head_at_classify" not in updated["runs"]["obsidian-brain"]["groups"][0]
+
+    known, needs = partition([_make_group("h1")], updated,
+                             project="obsidian-brain", head_sha="HEAD1")
+    assert len(known) == 1
+    assert len(needs) == 0
+
+
+def test_partition_prefers_per_entry_head_over_run_level():
+    """A per-entry head_at_classify must win over the run-level
+    project_head_at_classify: an entry stamped "OLD" inside a run whose
+    run-level field has since moved to "NEW" is routed to needs/head_changed
+    even though the run-level field matches head_sha."""
+    from check_items_cache import partition
+
+    entry = _make_cached_entry("h1")
+    entry["head_at_classify"] = "OLD"
+    cache = {
+        "schema_version": 1,
+        "runs": {
+            "obsidian-brain": {
+                "last_run_ts": int(time.time()),
+                "project_head_at_classify": "NEW",
+                "groups": [entry],
+            }
+        },
+    }
+    known, needs = partition([_make_group("h1")], cache,
+                             project="obsidian-brain", head_sha="NEW")
+    assert len(known) == 0
+    assert len(needs) == 1
+    assert needs[0].get("_reason") == "head_changed"

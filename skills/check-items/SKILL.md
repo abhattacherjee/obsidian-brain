@@ -279,6 +279,7 @@ flat_groups = cross_project_dedup(coarse_by_proj) if scope["mode"] == "vault" el
 # Cache partition (per project).
 cache = load_cache()
 known, needs = [], []
+heads = {}
 for proj, groups in coarse_by_proj.items():
     repo_path = None
     for _root in get_workspace_roots():
@@ -305,13 +306,14 @@ for proj, groups in coarse_by_proj.items():
         needs.extend(groups)
         continue
     head = head_proc.stdout.strip()
+    heads[proj] = head
     k, n = partition(groups, cache, project=proj, head_sha=head, force=scope["no_cache"])
     known.extend(k)
     needs.extend(n)
 
 out = os.path.join(os.path.dirname(scope_path), "partition.json")
 with open(out, "w") as f:
-    json.dump({"flat_groups": flat_groups, "known": known, "needs": needs}, f, indent=2)
+    json.dump({"flat_groups": flat_groups, "known": known, "needs": needs, "heads": heads}, f, indent=2)
 os.chmod(out, 0o600)
 print(out)
 PYEOF
@@ -823,7 +825,7 @@ rm -f "$_skips_file"
 
 ```bash
 SCOPE_PATH="$scope_path" CLASSIFICATIONS_PATH="$classifications_path" PARTITION_PATH="$part_path" python3 << 'PYEOF'
-import sys, os, glob, json, time, subprocess
+import sys, os, glob, json, time
 import glob, json, os, re, sys
 def _ob_hooks():
     try:
@@ -843,7 +845,6 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
 from check_items_cache import load_cache, save_cache, update_cache, canonical_hash
-from obsidian_utils import get_workspace_roots
 
 scope_path = os.environ["SCOPE_PATH"]
 classifications_path = os.environ["CLASSIFICATIONS_PATH"]
@@ -852,7 +853,7 @@ scope = json.load(open(scope_path))
 data = json.load(open(classifications_path))
 part = json.load(open(partition_path))
 
-# Re-derive project list and HEAD shas for cache update.
+# Re-derive project list for cache update; HEAD shas are reused from Step 3 (#305).
 all_groups = part["flat_groups"]
 
 # Build a lookup from merged.json so we can attach members + mtime to each
@@ -916,27 +917,18 @@ for fc in fresh_classifications:
     fresh_by_proj.setdefault(proj, []).append(fc)
 
 cache = load_cache()
-_workspace_roots = get_workspace_roots()
+# #305: reuse the HEAD captured at Step 3 rather than re-deriving it here. A
+# commit landing between Step 3 and Step 10 would otherwise stamp a mid-run
+# HEAD onto verdicts that were actually derived against the OLD head —
+# laundering them as verified-current when they were never checked against
+# this newer commit.
+heads = part.get("heads", {})
 for proj, proj_groups in groups_by_proj.items():
-    repo_path = None
-    for _root in _workspace_roots:
-        _candidate = os.path.join(_root, proj)
-        if os.path.isdir(os.path.join(_candidate, ".git")):
-            repo_path = _candidate
-            break
-    if not repo_path:
-        print(f"[check-items] no repo found for {proj} in {_workspace_roots}; skipping cache update",
+    head = heads.get(proj)
+    if not head:
+        print(f"[check-items] no head captured at Step 3 for {proj}; skipping cache update",
               file=sys.stderr)
         continue
-    head_proc = subprocess.run(
-        ["git", "-C", repo_path, "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if head_proc.returncode != 0 or not head_proc.stdout.strip():
-        print(f"[check-items] no HEAD for {proj} ({repo_path}); skipping cache update",
-              file=sys.stderr)
-        continue
-    head = head_proc.stdout.strip()
     cache = update_cache(
         cache=cache,
         project=proj,

@@ -428,3 +428,22 @@ def test_every_version_key_snippet_imports_re():
             if "re.findall" in line:
                 assert imported, f"Snippet {name} uses re.findall before importing re"
                 break
+
+
+def test_check_items_skill_captures_head_only_once():
+    """#305: skills/check-items/SKILL.md must call `git rev-parse HEAD`
+    exactly once (Step 3), not twice. Step 10 used to re-derive HEAD with its
+    own `git rev-parse HEAD` call; a commit landing between the two reads
+    would stamp the newer HEAD onto verdicts derived at the older one. Step
+    10 now reuses the head captured at Step 3 via partition.json's "heads"
+    key instead. Anchored on `"HEAD"` specifically so Step 3's unrelated
+    `git rev-parse --show-toplevel` call (line ~129) is not counted."""
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    occurrences = re.findall(r'rev-parse["\']?,?\s*["\']HEAD', content)
+    assert len(occurrences) == 1, (
+        f"expected exactly one `rev-parse ... HEAD` call in {path}, "
+        f"found {len(occurrences)} — Step 10 must reuse Step 3's captured "
+        "head, not re-derive it"
+    )

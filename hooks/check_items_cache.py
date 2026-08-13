@@ -167,7 +167,13 @@ def partition(
             g["_reason"] = "new"
             needs.append(g)
             continue
-        if cached_head != head_sha:
+        # #305: prefer the per-entry stamp when present. An entry only carries one
+        # when update_cache could not confirm it this run, so the fallback is
+        # exactly right for every other entry: those DID have a fresh record, and
+        # the record was produced at the head the run-level field was then bumped
+        # to.
+        entry_head = cached.get("head_at_classify", cached_head)
+        if entry_head != head_sha:
             g["_reason"] = "head_changed"
             needs.append(g)
             continue
@@ -284,6 +290,7 @@ def update_cache(
     cache.setdefault("schema_version", SCHEMA_VERSION)
     cache.setdefault("runs", {})
     run = cache["runs"].setdefault(project, {})
+    prior_run_head = run.get("project_head_at_classify")
     existing_groups = run.get("groups", [])
 
     surviving: list[dict] = []
@@ -305,7 +312,14 @@ def update_cache(
         if h in fresh_by_hash:
             surviving.append(_freeze_classification(fresh_by_hash[h], now, prior=g))
         else:
-            surviving.append(g)
+            # #305: this entry got no fresh classification this run, so it was
+            # never verified against `head_sha`. Pin it to the head it WAS
+            # verified at, so the unconditional run-level bump below cannot
+            # revalidate it. setdefault semantics (not an overwrite): an entry
+            # that already dissented in an earlier run must keep its ORIGINAL
+            # head, not inherit the newer run-level value it was equally never
+            # verified against.
+            surviving.append({**g, "head_at_classify": g.get("head_at_classify", prior_run_head)})
         seen.add(h)
 
     for h, fc in fresh_by_hash.items():
