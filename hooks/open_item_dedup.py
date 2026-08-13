@@ -2180,9 +2180,20 @@ _CROSS_SENTENCE_REASON = (
     "neither governs the other"
 )
 
+# The final clause states the condition that actually routes a text HERE, and
+# it is not "no phrase survived the phrase gate". _compound_phrase_rejection is
+# reached when the pair LOOP produced nothing — no DONE, no cue rejection, no
+# boundary rejection — which is exactly when no surviving phrase sat within
+# `_HEURISTIC_PROXIMITY_CHARS` of a token, since every in-range pair lands in
+# one of those three. Strict phrases elsewhere in the text can and do survive:
+# "Fixed the flaky parser here. <140 chars> the post-release-verification for
+# #101" keeps 'Fixed', and the earlier wording called that text's citation a
+# lie. Of the 4 compound citations on the live 3671-text corpus, 2 are of that
+# shape, so the false clause was printed text, not a constructible edge case.
 _COMPOUND_PHRASE_REASON = (
     "that completion word is part of a hyphenated compound modifier rather "
-    "than a completion claim, so no phrase survived the phrase gate"
+    "than a completion claim, and no phrase that survived the phrase gate "
+    "sat within range of a distinctive token"
 )
 
 # Both reasons above are compared by VALUE, never by identity, at the two
@@ -2226,8 +2237,8 @@ def _heuristic_member_verdict(text):
     A cue rejection outranks a cross-sentence rejection: the cue says WHY the
     item is still open, while the boundary only says the pair proves nothing
     either way. Below both sits the compound-phrase rejection recovered by
-    _compound_phrase_rejection, which says only that the phrase gate had
-    nothing to offer.
+    _compound_phrase_rejection, which says only that the phrase gate left
+    nothing in range.
     """
     tokens = list(_DISTINCTIVE_TOKEN_RE.finditer(text))[:_HEURISTIC_MAX_MATCHES]
     phrases = list(_COMPLETION_PHRASE_RE.finditer(text))[:_HEURISTIC_MAX_MATCHES]
@@ -2381,14 +2392,40 @@ def classify_groups_heuristic(merged_groups, evidence):
         # restating it as a conditional overwrite: ungoverned DONE beats a cue
         # rejection beats a boundary rejection. A cue says WHY the item is
         # open; the boundary only says the pair proves nothing either way; and
-        # the compound rejection, last, only says the phrase gate had nothing
-        # to offer. Choosing first-come across members, as the code used to,
+        # the compound rejection, last, only says the phrase gate left nothing
+        # in range. Choosing first-come across members, as the code used to,
         # made the reported reason depend on member ORDER — the same group with
         # the same two members cited the uninformative boundary reason or the
         # governing cue purely by list position, and that reason is what rides
         # on the citation and, for a DONE group, on the sibling-objection
         # parenthetical.
         rejection = cue_rejection or boundary_rejection or compound_rejection
+        # ... but only an OBJECTION reaches the sibling-dispute path below. The
+        # two consumers ask different questions. The ACTIVE citation asks "this
+        # group was downgraded — why?", and a compound rejection answers that:
+        # it names the phrase the gate removed, which is the whole reason the
+        # downgrade is not silent. DONE-DISPUTED asks "this line is about to be
+        # ticked off on a SIBLING's evidence — did the guard object to it?", and
+        # a compound rejection does not object to anything. It is reached only
+        # when the member had no in-range (token, surviving-phrase) pair at all
+        # — the same evidentiary state as a member with no completion language
+        # whatsoever, which raises no alarm. Firing on one and not the other
+        # split two indistinguishable absences: members ["Fixed in #51", "Bump
+        # the release-notes for #77"] raised DONE-DISPUTED while ["Fixed in
+        # #51", "some prose with no token at all"] did not.
+        #
+        # A boundary rejection DOES belong here, and the line between them is
+        # not arbitrary: it is reached only from inside the proximity check, so
+        # a real token and a phrase that survived the gate were within range of
+        # each other and the guard declined to credit them. That is the guard
+        # refusing a verdict on evidence it examined — and it is the one path
+        # that turns a DONE the pre-#299 code emitted into an ACTIVE, so a
+        # cascade onto such a line is landing on a line this code actively
+        # disputed. A cue rejection is stronger still, naming why it is open.
+        #
+        # Nothing is lost when a compound rejection is dropped here: it exists
+        # to explain a DOWNGRADE, and a DONE group was not downgraded.
+        disputed = cue_rejection or boundary_rejection
 
         if done_match is not None:
             classification = "DONE"
@@ -2403,13 +2440,13 @@ def classify_groups_heuristic(merged_groups, evidence):
                 f"heuristic: token '{_dtok}' "
                 f"near completion phrase '{_dphr}'"
             )
-            if rejection is not None:
+            if disputed is not None:
                 # The group is DONE on this member's evidence, but another
                 # member was judged NOT done. Keep that objection: Step 8
                 # cascades the checkoff to every member line of a DONE group,
                 # so the rejected line gets ticked off on a sibling's evidence
                 # — the human needs to see which line the guard disputed.
-                _rtok, _rphr, _rreason, _rwhere = rejection
+                _rtok, _rphr, _rreason, _rwhere = disputed
                 evidence_citation += (
                     f" (sibling member rejected{_rwhere}: token '{_rtok}' near "
                     f"completion phrase '{_rphr}', but {_rreason})"

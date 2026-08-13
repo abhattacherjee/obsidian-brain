@@ -20,6 +20,8 @@ reported on issue #299, not synthesized vocabulary.
 
 from __future__ import annotations
 
+import re
+
 import open_item_dedup as oid
 
 
@@ -331,7 +333,59 @@ def test_compound_word_is_not_a_completion_phrase():
     assert oid._COMPLETION_PHRASE_RE.search("shipped in the release.") is not None
 
 
-def test_phrase_gate_suppression_is_reported_not_silent(capsys):
+def test_loose_and_strict_phrase_regexes_differ_only_by_the_anchor():
+    """The axiom _compound_phrase_rejection's whole explanation rests on.
+
+    It reports every loose match the strict regex misses as "part of a
+    hyphenated compound modifier". That is sound only because the two regexes
+    are generated from ONE word list and differ ONLY by the trailing compound
+    anchor — so the sole thing that can remove a loose match is a following
+    non-particle hyphen. Everything downstream of that premise is proven and
+    the premise itself was not: adding words to the loose regex alone
+    (`|verified|landed`) passed the entire suite while making "QA #51 verified
+    by the team" ACTIVE with a citation calling 'verified' a hyphenated
+    compound, which is simply false.
+
+    Pinned structurally as well as behaviourally: a probe string can only
+    catch drift in words it happens to contain, while the pattern identity
+    catches ANY word added to or dropped from either side."""
+    # Structural: loose IS the shared word list, and strict is loose + anchor.
+    shared = r"\b(" + oid._COMPLETION_WORDS + r")\b"
+    anchor = (r"(?!-(?!(?:" + oid._COMPLETION_PARTICLES + r")(?![\w-])))")
+    assert oid._LOOSE_COMPLETION_PHRASE_RE.pattern == shared
+    assert oid._COMPLETION_PHRASE_RE.pattern == shared + anchor
+    assert oid._COMPLETION_PHRASE_RE.flags == oid._LOOSE_COMPLETION_PHRASE_RE.flags
+
+    # Behavioural: over a probe carrying every completion word, the loose
+    # regex matches exactly what a regex rebuilt from _COMPLETION_WORDS does.
+    rebuilt = re.compile(shared, re.IGNORECASE)
+    probe = ("done merged shipped closed fixed complete completed resolved "
+             "release released Done MERGED verified landed reopened "
+             "release-notes closed-out post-release-verification undone "
+             "doneness #51 v1.2.0 abc1234")
+    spans = lambda rx: [(m.start(), m.group(0)) for m in rx.finditer(probe)]
+    assert spans(oid._LOOSE_COMPLETION_PHRASE_RE) == spans(rebuilt)
+
+    # ... and where no hyphen is in play the strict regex matches at every
+    # span the loose one does, so the anchor is the ONLY difference between
+    # them. Each loose-only span must be a completion word followed by '-'.
+    loose_only = [m for m in oid._LOOSE_COMPLETION_PHRASE_RE.finditer(probe)
+                  if not any(k.start() == m.start()
+                             for k in oid._COMPLETION_PHRASE_RE.finditer(probe))]
+    assert loose_only, "probe must exercise the anchor"
+    for m in loose_only:
+        assert probe[m.end():m.end() + 1] == "-", (m.group(0), m.start())
+
+    no_hyphen = "done merged shipped closed fixed completed resolved released"
+    strict_spans = [(m.start(), m.group(0))
+                    for m in oid._COMPLETION_PHRASE_RE.finditer(no_hyphen)]
+    loose_spans = [(m.start(), m.group(0))
+                   for m in oid._LOOSE_COMPLETION_PHRASE_RE.finditer(no_hyphen)]
+    assert strict_spans == loose_spans
+    assert len(strict_spans) == len(no_hyphen.split())
+
+
+def test_phrase_gate_suppression_is_reported_not_silent(capsys, monkeypatch):
     """Inverse of the silence this file used to characterize.
 
     _COMPLETION_PHRASE_RE sits UPSTREAM of the pair loop, so a narrowing there
@@ -381,13 +435,58 @@ def test_phrase_gate_suppression_is_reported_not_silent(capsys):
     assert "pending-intent cue" in record["evidence_citation"]
     assert "heuristic-guard" in capsys.readouterr().err
 
-    # The TOKEN gate has no loose counterpart, so its suppression is still
-    # silent. Pinned so that hazard stays visible rather than looking closed.
-    no_token = "The post-release-verification item is still open"
-    assert oid._heuristic_member_verdict(no_token) == (None, None, None)
-    record = _classify([("tok-gate", no_token)])["tok-gate"]
-    assert record["evidence_citation"] is None
-    assert capsys.readouterr().err == ""
+    # The TOKEN gate has no loose counterpart, so its suppression is STILL
+    # silent — the same hazard, on the side this test's subject did not close.
+    # Pinned by actually NARROWING the gate and watching a live verdict vanish
+    # without a trace. The earlier version of this pin asserted silence over a
+    # text carrying no distinctive token at all, which holds under any token
+    # regex — narrower, wider, or deleted — and so characterized "a text with
+    # no token is silent" rather than the hazard named above it. The mutation
+    # it missed is the one applied here: restricting versions to three parts
+    # passes the whole suite while sending "Fixed in v1.2" from DONE to ACTIVE
+    # with no citation and no log line.
+    #
+    # DELETE ME DELIBERATELY if the token gate ever gains a loose counterpart:
+    # this failing would mean the silence CLOSED, which is the good outcome and
+    # has to be an explicit decision rather than a quietly passing assertion.
+    live = "Fixed in v1.2"
+    assert _classify([("tok-wide", live)])["tok-wide"]["classification"] == "DONE"
+    capsys.readouterr()
+    monkeypatch.setattr(oid, "_DISTINCTIVE_TOKEN_RE", re.compile(
+        r"(#\d+|\b[0-9a-f]{7,40}\b|\bv\d+\.\d+\.\d+\b)"))  # 3-part versions only
+    assert oid._DISTINCTIVE_TOKEN_RE.search(live) is None
+    record = _classify([("tok-gate", live)])["tok-gate"]
+    assert record["classification"] == "ACTIVE"    # the verdict MOVED...
+    assert record["evidence_citation"] is None     # ...and explained nothing,
+    assert capsys.readouterr().err == ""           # ...through either channel.
+
+
+def test_compound_reason_states_the_condition_that_reached_it():
+    """A reason a downgrade cites has to be TRUE of the text it explains.
+
+    _compound_phrase_rejection is reached when the pair LOOP produced nothing,
+    and that means no phrase SURVIVING the gate sat within range of a token —
+    not that no phrase survived the gate at all. The reason string used to
+    claim the latter, and the text below falsifies it: 'Fixed' survives the
+    anchor untouched and is merely too far from '#101' to pair with it. One of
+    the two compound citations on the live WIDE corpus has this shape, so the
+    false clause was printed on real data, not only constructible."""
+    text = ("Fixed the flaky parser here. " + "x" * 140
+            + " the post-release-verification for #101")
+    # A strict phrase demonstrably survived the gate...
+    assert [m.group(0) for m in oid._COMPLETION_PHRASE_RE.finditer(text)] == ["Fixed"]
+    # ... it is simply out of range of the only token, which is what actually
+    # routes this text to the compound path.
+    assert (abs(text.index("#101") - text.index("Fixed"))
+            > oid._HEURISTIC_PROXIMITY_CHARS)
+    tok, phr, reason = oid._heuristic_member_verdict(text)
+    assert (tok.group(0), phr.group(0)) == ("#101", "release")
+    assert reason == oid._COMPOUND_PHRASE_REASON
+
+    citation = _classify([("far", text)])["far"]["evidence_citation"]
+    assert "hyphenated compound modifier" in citation
+    assert "no phrase survived the phrase gate" not in citation, citation
+    assert "within range of a distinctive token" in citation
 
 
 def test_cross_sentence_pair_is_reported_not_dropped(capsys):
@@ -886,6 +985,125 @@ def test_rejection_kinds_have_a_total_order_across_members(capsys):
             citation = record["evidence_citation"]
             assert reasons[stronger] in citation, gid
             assert reasons[weaker] not in citation, gid
+
+
+def test_sibling_objection_needs_an_objection_not_an_absence(capsys):
+    """DONE-DISPUTED must fire on a CONTESTED line, not on an absent one.
+
+    Step 8 cascades a DONE group's checkoff to every member (file, line), and
+    the objection exists so a human sees which line is being ticked off over
+    the guard's head. A compound rejection objects to nothing: it is reached
+    only when the member had no in-range (token, surviving-phrase) pair at all
+    — the same evidentiary state as a member carrying no completion language
+    whatsoever. Raising the alarm on one and not the other split two
+    indistinguishable absences and diluted the signal on the lines that really
+    are disputed. It stays on the ACTIVE citation, where it explains a real
+    downgrade; it just no longer speaks for a sibling nobody objected to.
+
+    A BOUNDARY rejection does belong here, and the distinction is checkable
+    rather than a matter of taste: it is only reachable from inside the
+    proximity check, so a real token and a phrase that survived the gate were
+    within range and the guard declined to credit them — the guard refusing a
+    verdict on evidence it examined, and the one path that turns a DONE the
+    pre-#299 code emitted into an ACTIVE.
+
+    Both member orders, since the DONE-first order is the one that used to
+    short-circuit before a sibling was ever scanned."""
+    claim = "Fixed in #51"
+    absent = {
+        # No completion phrase survives the anchor, so no pair is built and
+        # the compound path reports what the gate removed.
+        "compound": "Bump the release-notes for #77",
+        # No token at all: nothing to report through any channel. The control
+        # the compound member must now behave identically to.
+        "no-token": "some prose with no token at all",
+    }
+    contested = {
+        "boundary": "Fixed the parser. See #77.",
+        "cue": "Blocked until #64 is resolved",
+    }
+
+    # Non-tautology: each member really is the kind it stands for.
+    assert (oid._heuristic_member_verdict(absent["compound"])[2]
+            == oid._COMPOUND_PHRASE_REASON)
+    assert oid._heuristic_member_verdict(absent["no-token"]) == (None, None, None)
+    assert (oid._heuristic_member_verdict(contested["boundary"])[2]
+            == oid._CROSS_SENTENCE_REASON)
+    assert "pending-intent cue" in oid._heuristic_member_verdict(contested["cue"])[2]
+
+    citations = {}
+    for kind, sibling in {**absent, **contested}.items():
+        for order, texts in (("sibling-first", [sibling, claim]),
+                             ("done-first", [claim, sibling])):
+            gid = f"{kind}-{order}"
+            record = oid.classify_groups_heuristic(
+                [_multi_member_group(gid, texts)], {})[0]
+            err = capsys.readouterr().err
+            assert record["classification"] == "DONE", gid
+            citation = record["evidence_citation"]
+            citations[gid] = citation
+            if kind in absent:
+                assert "sibling member rejected" not in citation, gid
+                assert "DONE-DISPUTED" not in err, gid
+                assert err == "", gid
+            else:
+                assert "sibling member rejected" in citation, gid
+                assert "DONE-DISPUTED" in err, gid
+
+    # The compound sibling is now indistinguishable from the no-token control,
+    # which is the point: two absences of evidence, one behaviour.
+    for order in ("sibling-first", "done-first"):
+        assert citations[f"compound-{order}"] == citations[f"no-token-{order}"]
+
+    # ... while the compound reason still rides on a genuine downgrade, so
+    # dropping it from the sibling path did not re-open the silent ACTIVE.
+    record = _classify([("solo", absent["compound"])])["solo"]
+    assert record["classification"] == "ACTIVE"
+    assert "hyphenated compound modifier" in record["evidence_citation"]
+    assert "heuristic-guard DONE-REJECTED" in capsys.readouterr().err
+
+
+def test_reason_bucketing_compares_by_value_not_identity(monkeypatch):
+    """`==`, not `is`, at the two bucketing sites — pinned on its own.
+
+    The constants happen to be threaded through the return path unchanged, so
+    `is` works today and a tidy-up back to it passes green. It is a latent
+    inversion: any value-preserving reconstruction of a reason — a JSON
+    round-trip, a `str()` copy, a reason assembled from parts — yields a
+    different object, and `is` would then drop a boundary or compound
+    rejection into the CUE bucket, where first-come wins and the precedence
+    the buckets exist to establish inverts silently.
+
+    The seam below reconstructs the reason exactly that way, so the mutation
+    this kills is `==` -> `is` with nothing else changed."""
+    real = oid._heuristic_member_verdict
+
+    def rebuilt_reason(text):
+        tok, phr, reason = real(text)
+        if reason is not None:
+            reason = "".join(reason)          # equal value, different object
+        return tok, phr, reason
+
+    # The seam must actually be a seam, or the test proves nothing.
+    probe = rebuilt_reason("Blocked until #64 is resolved")[2]
+    assert probe == real("Blocked until #64 is resolved")[2]
+    assert probe is not real("Blocked until #64 is resolved")[2]
+    monkeypatch.setattr(oid, "_heuristic_member_verdict", rebuilt_reason)
+
+    cue = "Blocked until #64 is resolved"
+    weaker = {"boundary": "Fixed the parser. See #51.",
+              "compound": "The post-release-verification item for #101 is open"}
+    for kind, text in weaker.items():
+        for label, order in (("cue-first", [cue, text]),
+                             ("cue-second", [text, cue])):
+            gid = f"cue-over-{kind}-{label}"
+            record = oid.classify_groups_heuristic(
+                [_multi_member_group(gid, order)], {})[0]
+            assert record["classification"] == "ACTIVE", gid
+            citation = record["evidence_citation"]
+            assert "pending-intent cue" in citation, gid
+            assert oid._CROSS_SENTENCE_REASON not in citation, gid
+            assert oid._COMPOUND_PHRASE_REASON not in citation, gid
 
 
 def test_group_with_only_rejected_members_is_still_active():
