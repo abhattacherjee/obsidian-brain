@@ -128,9 +128,11 @@ NO_COOCCURRENCE_CORPUS = [
     ("reg-no-token", "this is done now finally"),
     # Live vault item. 'release' here is a fragment of the hyphenated compound
     # `post-release-verification`, not a completion word, so after the trailing
-    # `(?![-\w])` anchor there is no qualifying pair at all — and therefore
-    # nothing to explain in a citation. Without that anchor the all-pairs sweep
-    # paired it with '#101' and flipped a live ACTIVE item to DONE.
+    # `(?![-\w])` anchor no qualifying pair reaches the pair loop. Without that
+    # anchor the all-pairs sweep paired it with '#101' and flipped a live
+    # ACTIVE item to DONE. Unlike the two cases above it does NOT get a None
+    # citation: the anchor suppressed a phrase that the pre-#299 code used, so
+    # the downgrade has to be explained — see _COMPOUND_REPORTED_CASES.
     ("live-compound-post-release",
      "When next `/release` ships Epic 22 (or queued develop work) to main, "
      "the post-release-verification DoD item will flip and Dependabot alert "
@@ -166,12 +168,25 @@ def test_true_done_corpus_survives():
     assert wrong == {}, f"guard over-rejected: {wrong}"
 
 
+# Cases in NO_COOCCURRENCE_CORPUS whose ACTIVE verdict IS explained, because
+# the phrase gate — not an absence of completion language — is what removed
+# the pair. Everything else in that corpus has no completion word or no token
+# at all, so there is genuinely nothing to report.
+_COMPOUND_REPORTED_CASES = {"live-compound-post-release"}
+
+
 def test_no_cooccurrence_corpus_unchanged():
     by_id = _classify(NO_COOCCURRENCE_CORPUS)
     for cid, _ in NO_COOCCURRENCE_CORPUS:
         assert by_id[cid]["classification"] == "ACTIVE"
-        # No pair was ever a DONE candidate, so there is nothing to explain.
-        assert by_id[cid]["evidence_citation"] is None
+        citation = by_id[cid]["evidence_citation"]
+        if cid in _COMPOUND_REPORTED_CASES:
+            # A phrase the compound anchor swallowed is reported, not silent.
+            assert citation is not None, cid
+            assert "hyphenated compound modifier" in citation, cid
+        else:
+            # No pair was ever a DONE candidate: nothing to explain.
+            assert citation is None, cid
 
 
 def test_confusion_matrix_over_full_corpus():
@@ -316,35 +331,63 @@ def test_compound_word_is_not_a_completion_phrase():
     assert oid._COMPLETION_PHRASE_RE.search("shipped in the release.") is not None
 
 
-def test_phrase_gate_suppression_is_silent_by_construction(capsys):
-    """CHARACTERIZATION of a known hazard, not an endorsement of it.
+def test_phrase_gate_suppression_is_reported_not_silent(capsys):
+    """Inverse of the silence this file used to characterize.
 
-    _COMPLETION_PHRASE_RE and _DISTINCTIVE_TOKEN_RE are the gates UPSTREAM of
-    the pair loop, so when a narrowing there suppresses the only phrase (or the
-    only token) in a text, no pair is built, the #299 reporting machinery never
-    runs, and the record is an ACTIVE with evidence_citation None and no log
-    line — indistinguishable from a text that never mentioned completion at
-    all. That is how the trailing compound anchor swallowed 'This was merged-in
-    with #51' until a cross-model review found it, with no output to notice.
+    _COMPLETION_PHRASE_RE sits UPSTREAM of the pair loop, so a narrowing there
+    that suppressed the only phrase in a text built no pair at all: the #299
+    reporting machinery never ran and the record was an ACTIVE with
+    evidence_citation None and no log line, indistinguishable from a text that
+    never mentioned completion. That is how the trailing compound anchor
+    swallowed 'This was merged-in with #51' until a cross-model review found
+    it, and a live sweep of 3671 open-item texts still found 2 downgrades
+    reaching production through that channel.
 
-    This pins the property so a future narrowing of either regex has to reckon
-    with it. If someone closes the hazard, this test SHOULD go red and be
-    deleted deliberately — it is not asserting that silence is desirable."""
+    _compound_phrase_rejection closes it: the loose (pre-#299) phrase shape
+    recovers whatever the anchor removed and reports it through BOTH channels.
+    The verdict is unchanged — this is a reporting fix, not a behaviour change.
+    """
     # A text whose only completion word is inside a compound modifier.
     text = "The post-release-verification item for #101 is still open"
     assert oid._COMPLETION_PHRASE_RE.search(text) is None
-    assert oid._heuristic_member_verdict(text) == (None, None, None)
+    tok, phr, reason = oid._heuristic_member_verdict(text)
+    assert (tok.group(0), phr.group(0)) == ("#101", "release")
+    assert reason == oid._COMPOUND_PHRASE_REASON
     record = _classify([("gate", text)])["gate"]
-    assert record["classification"] == "ACTIVE"
-    assert record["evidence_citation"] is None      # nothing to explain...
-    assert capsys.readouterr().err == ""            # ...and nothing logged
+    assert record["classification"] == "ACTIVE"     # verdict unchanged...
+    assert "hyphenated compound modifier" in record["evidence_citation"]
+    assert "heuristic-guard DONE-REJECTED" in capsys.readouterr().err
 
-    # Contrast: a rejection INSIDE the pair loop is reported through both
-    # channels. The gap is the placement of the gates, not the guard's intent.
+    # Both live vault texts that reached production silently. Each stays
+    # ACTIVE (the right verdict) and now says why.
+    for cid, live in (
+            ("live-1", "**Pre-tick post-merge tracking flip on PR creation.** "
+                       "Note `(merged-on-PR-close)` in tracking row. PR #859 "
+                       "was avoidable."),
+            ("live-2", "First-time publish: After #73 fix, next real sync "
+                       "publishes `github-release-board-promote` for the first "
+                       "time—confirm this is intended behavior."),
+    ):
+        record = _classify([(cid, live)])[cid]
+        assert record["classification"] == "ACTIVE", cid
+        assert "hyphenated compound modifier" in record["evidence_citation"], cid
+        assert "heuristic-guard DONE-REJECTED" in capsys.readouterr().err, cid
+
+    # A rejection INSIDE the pair loop still reports through both channels,
+    # and outranks the compound reason when both are available.
     record = _classify([("pair", "Blocked until #64 is resolved")])["pair"]
     assert record["classification"] == "ACTIVE"
     assert "DONE rejected" in record["evidence_citation"]
+    assert "pending-intent cue" in record["evidence_citation"]
     assert "heuristic-guard" in capsys.readouterr().err
+
+    # The TOKEN gate has no loose counterpart, so its suppression is still
+    # silent. Pinned so that hazard stays visible rather than looking closed.
+    no_token = "The post-release-verification item is still open"
+    assert oid._heuristic_member_verdict(no_token) == (None, None, None)
+    record = _classify([("tok-gate", no_token)])["tok-gate"]
+    assert record["evidence_citation"] is None
+    assert capsys.readouterr().err == ""
 
 
 def test_cross_sentence_pair_is_reported_not_dropped(capsys):
@@ -418,6 +461,35 @@ def test_abbreviation_dot_is_not_a_sentence_boundary():
         "Waiting on the revs.")
 
 
+def test_sentence_final_etc_is_a_known_residual_of_the_allowlist():
+    """The allowlist does NOT remove the cue-reaches-across failure for `etc.`,
+    and the shortfall is documented on the regex rather than fixed.
+
+    `etc.` is the one allowlisted spelling that is commonly SENTENCE-FINAL, so
+    the lookbehind stops it terminating its own sentence and a tier-1 cue
+    reaches into the next one — the same mechanism as the `A.B.` initials case
+    the allowlist was introduced to remove. Kept deliberately: mid-sentence and
+    sentence-final `etc.` need opposite treatment from one regex, and dropping
+    `etc.` from the allowlist trades this safe-direction error for a false DONE.
+
+    Pinned so the residual is a measured, reported fact rather than a claim in
+    a comment — and so that anyone who does fix it sees this go red."""
+    text = "Waiting on infra, DBs, etc. Fixed #51."
+    # The dot does not end the sentence, so 'Waiting' still governs 'Fixed'.
+    assert oid._sentence_start(text, text.index("#51")) == 0
+    record = _classify([("etc-final", text)])["etc-final"]
+    assert record["classification"] == "ACTIVE"
+    # Safe direction, and NOT silent: the item stays open WITH a reason.
+    assert "pending-intent cue" in record["evidence_citation"]
+
+    # Contrast, and the reason the allowlist is still worth having: the other
+    # three spellings are not normally sentence-final, and an initial — the
+    # case the allowlist was introduced for — still ends its sentence.
+    initials = "Awaiting update from A.B. Fixed #51."
+    assert oid._sentence_start(initials, initials.index("#51")) > 0
+    assert _classify([("ab", initials)])["ab"]["classification"] == "DONE"
+
+
 def test_initials_end_a_sentence_so_a_cue_cannot_reach_across():
     """The allowlist replaced a letter-dot-letter SHAPE, which also matched
     INITIALS and merged two sentences into one. A tier-1 cue in the first half
@@ -470,6 +542,15 @@ def test_verb_particle_survives_the_trailing_compound_anchor():
     assert oid._COMPLETION_PHRASE_RE.search("release-overhaul") is None
     assert oid._COMPLETION_PHRASE_RE.search("closed-out-of-scope") is None
 
+    # `on` is excluded from _COMPLETION_PARTICLES, and THESE are what the
+    # exclusion buys — a branch/date qualifier, not a phrasal verb. The
+    # "Development-Complete-on-board" case asserted above does NOT discriminate
+    # it: that one is blocked either way by the segment-exactness lookahead,
+    # since its `on` is followed by `-board`. Adding `on` to the particle list
+    # passes every other assertion in this file and fails only these two.
+    assert oid._COMPLETION_PHRASE_RE.search("merged-on main") is None
+    assert oid._COMPLETION_PHRASE_RE.search("closed-on friday") is None
+
 
 def test_hyphen_prefixed_cues_fire_while_filenames_still_do_not():
     r"""Fix 5: the leading anchor was killing re-/cross-/double-/self- prefixed
@@ -490,16 +571,46 @@ def test_forward_form_and_conditional_cue_are_anchored_to_prose():
     the anchoring `_PENDING_INTENT_CUE_RE` already had."""
     assert oid._FORWARD_FORM_RE.search("After `go.get.it`, #123 was closed.") is None
     assert oid._FORWARD_FORM_RE.search("it will be closed") is not None
-    # Blocked by the DOT, not by the slash — `/` is deliberately absent from
-    # this regex's classes (see test_slash_joined_conditional_cues_still_fire).
+    # `go.get.it` is blocked by BOTH dot anchors independently, so it pins
+    # neither one on its own and says nothing about `/`. The slash in
+    # _FORWARD_FORM_RE's classes is pinned by
+    # test_forward_form_is_anchored_against_path_segments; the slash's ABSENCE
+    # from _CONDITIONAL_CUE_RE below by test_slash_joined_conditional_cues_still_fire.
     assert oid._CONDITIONAL_CUE_RE.search("see docs/when.md for details") is None
     assert oid._CONDITIONAL_CUE_RE.search("when CI is green") is not None
     # A bare path segment DOES match here, by design: tier 2 cannot reject on a
     # cue alone, and _FORWARD_FORM_RE — which keeps `/` — has to corroborate.
     assert oid._CONDITIONAL_CUE_RE.search("see docs/when/index for details") is not None
-    assert oid._FORWARD_FORM_RE.search("run hooks/get_thing.py now") is None
     by_id = _classify([("dotted", "After `go.get.it`, #123 was closed.")])
     assert by_id["dotted"]["classification"] == "DONE"
+
+
+def test_forward_form_is_anchored_against_path_segments():
+    r"""The `/` in _FORWARD_FORM_RE's two anchor classes, pinned by fixtures
+    that actually discriminate it.
+
+    "run hooks/get_thing.py now" does NOT: `get` there is blocked by the
+    TRAILING anchor on the `_`, so dropping `/` from both classes leaves it
+    passing — the assertion reads as a slash claim but is a dotted/underscore
+    claim, which is also what the sibling test's `go.get.it` fixture proves.
+    Each fixture below has the path segment as the WHOLE final segment, so the
+    slash is the only thing keeping it out."""
+    for probe in ("see docs/be for details", "run hooks/get now",
+                  "land src/be tomorrow"):
+        assert oid._FORWARD_FORM_RE.search(probe) is None, probe
+    # ... while the same words in prose still match.
+    assert oid._FORWARD_FORM_RE.search("it will be closed") is not None
+    assert oid._FORWARD_FORM_RE.search("once we get there") is not None
+
+    # Classifier level: a tier-2 cue is present in each, so a path segment
+    # re-admitted as a forward form corroborates it and falsely downgrades a
+    # genuine completion claim to ACTIVE.
+    for case_id, text in (
+            ("fwd-docs", "Bump the cache once docs/be #51 merged"),
+            ("fwd-hooks", "Rerun once hooks/get #51 merged"),
+            ("fwd-src", "Land it after src/be #51 shipped"),
+    ):
+        assert _classify([(case_id, text)])[case_id]["classification"] == "DONE", case_id
 
 
 def test_slash_joined_conditional_cues_still_fire():
@@ -525,8 +636,10 @@ def test_slash_joined_conditional_cues_still_fire():
 
     # Tier 1 deliberately KEEPS `/`: it rejects on the cue alone, so a path
     # segment reading as a cue must not fire. Asserted so the asymmetry between
-    # the two tiers is visible rather than looking like an oversight.
-    assert "/" in oid._PENDING_INTENT_CUE_RE.pattern[:12]
+    # the two tiers is visible rather than looking like an oversight. Behaviour
+    # only — an assertion on `.pattern` would break under a behaviour-preserving
+    # reorder or a hoist of the anchor into a shared constant (the way
+    # _ABBREV_LOOKBEHINDS already is) while proving nothing this does not.
     assert oid._PENDING_INTENT_CUE_RE.search("see docs/track for #51") is None
 
 
@@ -623,10 +736,15 @@ def test_pairs_beyond_the_match_cap_are_not_seen():
         oid._HEURISTIC_MAX_MATCHES = original
 
 
-def _multi_member_group(gid, texts):
+def _multi_member_group(gid, texts, files=None):
+    members = []
+    for i, t in enumerate(texts):
+        m = {"file": f"{gid}.md", "line": i + 1, "text": t}
+        if files is not None:
+            m.update(files[i])
+        members.append(m)
     return {"group_id": gid, "project": "p", "representative": texts[0],
-            "members": [{"file": "a.md", "line": i + 1, "text": t}
-                        for i, t in enumerate(texts)]}
+            "members": members}
 
 
 def test_sibling_done_keeps_the_rejected_member_s_objection(capsys):
@@ -644,6 +762,9 @@ def test_sibling_done_keeps_the_rejected_member_s_objection(capsys):
     out = {r["group_id"]: r for r in oid.classify_groups_heuristic(
         [_multi_member_group(gid, texts) for gid, texts in orders.items()], {})}
     err = capsys.readouterr().err
+    # Line of the REJECTED member within each group, which is what the cascade
+    # is about to tick off on its sibling's evidence.
+    rejected_line = {"reject-first": 1, "done-first": 2}
 
     for gid, texts in orders.items():
         record = out[gid]
@@ -655,10 +776,16 @@ def test_sibling_done_keeps_the_rejected_member_s_objection(capsys):
         assert "sibling member rejected" in citation, gid
         assert "#64" in citation and "resolved" in citation, gid
         assert "Blocked until" in citation, gid
+        # ... and it names the disputed member's OWN line, not the group
+        # representative's: Step 8 cascades to (file, line), so a reason
+        # without a location leaves the operator with nothing to go look at.
+        where = f" at {gid}.md:{rejected_line[gid]}"
+        assert f"sibling member rejected{where}:" in citation, gid
         # ... and it is logged, naming the group, the ITEM, and the
         # classification the objection rode in on.
         line = next(ln for ln in err.splitlines() if gid in ln)
         assert "DONE-DISPUTED:" in line, gid
+        assert f"sibling member rejected{where} —" in line, gid
         # The line quotes the GROUP's canonical text — the string an operator
         # maps back to the board — not the rejected member's own text, which
         # the rest of the line already names via its token/phrase/cue.
@@ -671,6 +798,28 @@ def test_sibling_done_keeps_the_rejected_member_s_objection(capsys):
     assert "DONE rejected" not in err
     assert err.count("DONE-DISPUTED:") == 2
     assert "DONE-REJECTED:" not in err
+
+
+def test_sibling_objection_omits_an_unknown_member_location(capsys):
+    """Members arrive from merged.json, so file/line can be absent or null.
+    The suffix is dropped rather than printing "at None:None" — but the
+    objection itself still has to survive, since that is the whole point of
+    keeping it."""
+    for label, override in (("no-file", {"file": None}),
+                            ("no-line", {"line": None}),
+                            ("empty-file", {"file": ""})):
+        group = _multi_member_group(
+            label, ["Fixed in #51", "Blocked until #64 is resolved"],
+            files=[{}, override])
+        record = oid.classify_groups_heuristic([group], {})[0]
+        err = capsys.readouterr().err
+        citation = record["evidence_citation"]
+        assert record["classification"] == "DONE", label
+        assert "None" not in citation, label
+        assert "sibling member rejected: token" in citation, label
+        assert "Blocked until" in citation, label
+        assert "None" not in err, label
+        assert "sibling member rejected — token" in err, label
 
 
 def test_guard_log_lines_name_the_item_and_their_kind(capsys):
@@ -698,29 +847,45 @@ def test_guard_log_lines_name_the_item_and_their_kind(capsys):
     assert "[Blocked until #64 is resolved]:" in err
 
 
-def test_cue_rejection_outranks_a_boundary_rejection_across_members(capsys):
-    """Within a member, a cue rejection already outranks a cross-sentence one.
-    ACROSS members the choice was first-come and ignored the kind, so the
-    reported reason depended on member ORDER: the same group with the same two
-    members cited the uninformative boundary reason or the governing cue purely
-    by list position. Order-independence IS the contract, so both orders are
-    pinned."""
+def test_rejection_kinds_have_a_total_order_across_members(capsys):
+    """Within a member the three rejection kinds are already ranked. ACROSS
+    members the choice was first-come and ignored the kind, so the reported
+    reason depended on member ORDER: the same group with the same two members
+    cited the uninformative boundary reason or the governing cue purely by list
+    position. Order-independence IS the contract.
+
+    All three pairwise orders are pinned, not just cue-vs-boundary. The
+    compound rejection is the weakest of the three — it says only that the
+    phrase gate had nothing to offer, where a cue says WHY the item is open —
+    so a group carrying both must report the cue. Ranking it first is the
+    mutation this covers: it is the one that would let the new reporting path
+    from #299 round 4 mask the reason the guard exists to surface."""
+    # One member text per rejection kind.
     boundary = "Fixed the parser. See #51."        # pair straddles a sentence
     cue = "Blocked until #64 is resolved"          # governed by a tier-1 cue
+    compound = "The post-release-verification item for #101 is still open"
 
-    # The two members really are the two rejection kinds, so the test cannot
-    # tautologise if one of them stops rejecting.
-    assert oid._heuristic_member_verdict(boundary)[2] == oid._CROSS_SENTENCE_REASON
-    assert oid._heuristic_member_verdict(cue)[2] != oid._CROSS_SENTENCE_REASON
+    # Each member really is the kind it stands for, so the test cannot
+    # tautologise if one of them stops rejecting or changes kind.
+    kinds = {"cue": cue, "boundary": boundary, "compound": compound}
+    reasons = {k: oid._heuristic_member_verdict(t)[2] for k, t in kinds.items()}
+    assert reasons["boundary"] == oid._CROSS_SENTENCE_REASON
+    assert reasons["compound"] == oid._COMPOUND_PHRASE_REASON
+    assert reasons["cue"] not in (oid._CROSS_SENTENCE_REASON,
+                                  oid._COMPOUND_PHRASE_REASON)
+    assert "pending-intent cue" in reasons["cue"]
 
-    for gid, texts in (("boundary-first", [boundary, cue]),
-                       ("cue-first", [cue, boundary])):
-        record = oid.classify_groups_heuristic(
-            [_multi_member_group(gid, texts)], {})[0]
-        assert record["classification"] == "ACTIVE", gid
-        citation = record["evidence_citation"]
-        assert "pending-intent cue 'Blocked until'" in citation, gid
-        assert oid._CROSS_SENTENCE_REASON not in citation, gid
+    # (stronger, weaker) — asserted in BOTH member orders.
+    for stronger, weaker in (("cue", "boundary"), ("cue", "compound"),
+                             ("boundary", "compound")):
+        for order in ((stronger, weaker), (weaker, stronger)):
+            gid = f"{stronger}-over-{weaker}-{order[0]}first"
+            record = oid.classify_groups_heuristic(
+                [_multi_member_group(gid, [kinds[k] for k in order])], {})[0]
+            assert record["classification"] == "ACTIVE", gid
+            citation = record["evidence_citation"]
+            assert reasons[stronger] in citation, gid
+            assert reasons[weaker] not in citation, gid
 
 
 def test_group_with_only_rejected_members_is_still_active():
