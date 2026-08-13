@@ -1601,8 +1601,17 @@ def test_pinned_survivor_with_corrupt_ts_still_warns(capsys):
 
 def test_unusable_ts_is_reported_once_not_twice(capsys):
     """The two guards that can report a bad stamp are mutually exclusive
-    (each `continue`s), so the warning must fire exactly once. A refactor
-    that let both run would double-report every corrupt entry."""
+    (the head guard `continue`s), so the warning must fire exactly once.
+
+    The fixture is PINNED and head-mismatched on purpose: that is the only
+    configuration where both call sites are reachable in sequence, so the
+    count assertion can actually discriminate. An earlier version used a
+    matching head with no pin, where the head guard never fires at all --
+    "exactly once" was then trivially true and the test could not catch a
+    dropped `continue`. Two mutations are guarded here: hoisting a duplicate
+    warn call above the head guard, and deleting the head branch's
+    `continue` so the entry falls through to the TTL guard and warns twice.
+    """
     from check_items_cache import partition
 
     cache = {
@@ -1610,14 +1619,50 @@ def test_unusable_ts_is_reported_once_not_twice(capsys):
         "runs": {
             "obsidian-brain": {
                 "last_run_ts": int(time.time()),
-                "project_head_at_classify": "HEAD1",
+                "project_head_at_classify": "HEAD2",
                 "groups": [{
                     **_make_cached_entry("h1"),
-                    "classified_ts": time.time() + 90_000,
+                    "head_at_classify": "HEAD1",            # pinned survivor
+                    "classified_ts": time.time() + 90_000,  # future-dated
                 }],
             }
         },
     }
-    # head matches, so this reaches the TTL guard rather than the head guard
-    partition([_make_group("h1")], cache, project="obsidian-brain", head_sha="HEAD1")
+    partition([_make_group("h1")], cache, project="obsidian-brain", head_sha="HEAD2")
     assert capsys.readouterr().err.count("unusable classified_ts") == 1
+
+
+def test_healthy_stamp_never_reports_unusable_ts(capsys):
+    """Negative control for _warn_if_unusable_ts (#305 S5).
+
+    Every other assertion here checks the warning FIRES; none checked that
+    it stays SILENT. Deleting the helper's `not (0 <= age)` predicate
+    outright therefore left the whole suite green -- while a routine run
+    emitted one false "unusable classified_ts" per cached entry (measured:
+    394 on a real 394-entry cache, where a clean tree emits 0). That is the
+    inversion of the failure S5 exists to prevent: instead of a clock-skew
+    signal going silent, it fires constantly and stops meaning anything.
+
+    Both routes to `needs` that can reach the helper are covered, because a
+    guard stuck ON has to be caught on every path it can reach.
+    """
+    from check_items_cache import partition, TTL_DONE
+    now = time.time()
+
+    # head_changed, with a perfectly good stamp
+    cache = {"schema_version": 1, "runs": {"obsidian-brain": {
+        "project_head_at_classify": "HEAD1",
+        "groups": [_make_cached_entry("h1", classified_ts=now - 60)]}}}
+    _k, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                          head_sha="HEAD2", now=now)
+    assert needs[0]["_reason"] == "head_changed"
+    assert "unusable classified_ts" not in capsys.readouterr().err
+
+    # ttl_expired, with a merely-old (not corrupt) stamp
+    cache = {"schema_version": 1, "runs": {"obsidian-brain": {
+        "project_head_at_classify": "HEAD1",
+        "groups": [_make_cached_entry("h1", classified_ts=now - TTL_DONE - 10)]}}}
+    _k, needs = partition([_make_group("h1")], cache, project="obsidian-brain",
+                          head_sha="HEAD1", now=now)
+    assert needs[0]["_reason"] == "ttl_expired"
+    assert "unusable classified_ts" not in capsys.readouterr().err

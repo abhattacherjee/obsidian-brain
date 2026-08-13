@@ -475,7 +475,7 @@ def test_check_items_heads_handoff_key_matches():
     with open(path, encoding="utf-8") as f:
         content = f.read()
 
-    write = re.search(r'json\.dump\(\{[^}]*"([A-Za-z_]\w*)": heads\}', content)
+    write = re.search(r'json\.dump\(\{[^}]*"([A-Za-z_]\w*)":\s*heads\b', content)
     assert write, (
         "Step 3 must serialize the captured per-project HEADs into "
         "partition.json (expected a `\"<key>\": heads` entry in its json.dump)"
