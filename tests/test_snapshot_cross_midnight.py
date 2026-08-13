@@ -412,9 +412,21 @@ def test_unstattable_folder_leaves_no_cache_entry(tmp_path, monkeypatch):
     _snapshot(sessions, SESSION_DATE, "100000", "s-1")
 
     real_stat = os.stat
+    target = os.path.realpath(sessions)
+    tripped = False
 
     def failing_stat(path, *a, **kw):
-        if str(path) == os.path.realpath(sessions):
+        # Only the FIRST os.stat(target) call fails — that's `_snapshot_index`'s
+        # own guard at the top of the function. After that we delegate to the
+        # real os.stat, because `_build_snapshot_index` -> Path.glob() also
+        # stats the folder on Python 3.12 (but makes zero such calls on 3.13 —
+        # verified by measurement). An unconditional raise on every call to
+        # `target` therefore escapes from inside glob() on 3.12 only, coupling
+        # this test to interpreter-internal glob behaviour instead of to the
+        # memo guard it's meant to pin. Don't widen this back to unconditional.
+        nonlocal tripped
+        if not tripped and str(path) == target:
+            tripped = True
             raise OSError("stat refused")
         return real_stat(path, *a, **kw)
 
