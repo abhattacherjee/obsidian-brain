@@ -83,7 +83,7 @@ The active conversation buffer only covers the post-compact half of long session
 2. If present, find the transcript path it cites, of the shape `~/.claude/projects/<project-dir>/<session-id>.jsonl` — the basename minus `.jsonl` IS the prior session id.
 3. If no such boundary is present, pass **no** extra ids — invoke the helper below with zero trailing arguments.
 
-When a prior id is recovered, pass it as a **shell-quoted positional argument** after the `python3 -c '...'` script, one argument per id — never interpolated into the Python source itself (repo security rule). The script reads them from `sys.argv[1:]`, so it works whether zero or several are recovered.
+When a prior id is recovered, pass it as a **shell-quoted positional argument** after the `python3 -c` script below, one argument per id — never interpolated into the Python source itself (repo security rule). The script reads them from `sys.argv[1:]`, so it works whether zero or several are recovered.
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
