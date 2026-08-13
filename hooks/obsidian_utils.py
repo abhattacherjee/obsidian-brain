@@ -13,6 +13,7 @@ Every public function catches its own errors and logs to stderr.
 from __future__ import annotations
 
 import datetime
+import fnmatch
 import hashlib
 import json
 import os
@@ -2310,6 +2311,100 @@ def _describe_note_parse_failure(reason: str | None) -> str:
     return _classify_note_parse_failure(reason)
 
 
+def _parse_note_metadata_uncached(
+    file_path: str,
+) -> tuple[dict | None, str | None, bool]:
+    """Parse a note's frontmatter with NO session-cache round-trip.
+
+    The parsing half of ``read_note_metadata_detailed``, split out so that
+    bulk scanners can read hundreds of notes without paying that function's
+    per-file cache I/O. ``cache_get``/``cache_set`` load and re-dump one
+    JSON file that accumulates a key per note visited in the session, so the
+    per-note cost grows with the session: on the live vault a full pass over
+    the 327 snapshot notes costs ~804 ms through the cached reader versus
+    ~13 ms through this one. Every caller that reads ONE note still goes
+    through the cached wrapper — the cache is a win there and this helper is
+    not a replacement for it.
+
+    Returns ``(meta, reason, cacheable)``. ``cacheable`` is False only for an
+    unreadable file: that failure is about the read, not about the note's
+    content, so a transient error must not pin "no frontmatter" for the rest
+    of the session. It is the flag, not a prefix test on ``reason``, that
+    keeps the wrapper's caching decision from depending on error wording.
+    """
+    lines, read_err, size_caveat = _read_frontmatter_region(file_path)
+    if lines is None:
+        # Unreadable file: return None WITHOUT caching the sentinel — the
+        # failure is about the read, not about the note's content, and a
+        # transient error must not pin "no frontmatter" for the session.
+        return None, read_err, False
+
+    _open_fence, fm_lines, _close_fence, _body_lines, split_err = split_frontmatter(lines)
+    if split_err:
+        # Covers all three malformed shapes: no opening fence, no closing
+        # fence, and an oversized frontmatter block. Each means "this note
+        # has no parsable frontmatter", which is what the sentinel records.
+        #
+        # size_caveat wins ONLY over the bare-exhaustion verdict. A truncated
+        # read makes exactly one of split_frontmatter's three reasons
+        # untrustworthy: the one produced by running off the end of a prefix,
+        # where the real fence may simply sit past the cut. Reporting that as
+        # "no closing '---'" accuses a note that may be fine -- the
+        # wrong-diagnosis failure frontmatter.py's docstring calls out -- so
+        # the caveat ("frontmatter exceeds ... characters") replaces it.
+        #
+        # The other two verdicts are DEFINITIVE regardless of truncation,
+        # because each is derived from a line that was actually read and
+        # inspected: "does not open with a '---' fence" reads lines[0], always
+        # in the first block; the "stopped at a line that is not frontmatter"
+        # variant names the offending line. Overwriting those mislabels a file
+        # that is not a note as an oversized note (which defeats the
+        # no_opening_fence filter in gather_session_evidence for any file over
+        # the char cap) and tells someone whose frontmatter demonstrably dies
+        # at line 3 that "the note may be fine".
+        #
+        # Exact equality, NEVER startswith: `==` here does not depend on the
+        # constant's trailing ')' happening to fall exactly where the
+        # shape-stop variant's text diverges (into "; stopped at ..."). A
+        # hand-truncated or reworded literal could silently start matching
+        # the shape-stop variant too, which is precisely why the literal is
+        # imported from frontmatter.py (and used by the return that produces
+        # it) rather than copied — the two cannot drift apart into a gate
+        # that silently never matches.
+        #
+        # Still the RAW wording either way, so the cached reason re-classifies
+        # correctly on the next hit (see the docstring).
+        if size_caveat and split_err == NO_CLOSING_FENCE_EXHAUSTED_REASON:
+            reason = size_caveat
+        else:
+            reason = split_err
+        return None, reason, True
+
+    meta: dict = {}
+    tags: list[str] = []
+    in_tags = False
+
+    for line in fm_lines:
+        stripped = line.strip()
+        if stripped.startswith('- ') and in_tags:
+            tags.append(stripped[2:].strip())
+            continue
+        in_tags = False
+        if ':' in stripped:
+            key, _, val = stripped.partition(':')
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key == 'tags':
+                in_tags = True
+                continue
+            meta[key] = val
+
+    if tags:
+        meta['tags'] = tags
+
+    return meta, None, True
+
+
 def read_note_metadata_detailed(file_path: str) -> tuple[dict | None, str | None]:
     """Parse YAML frontmatter from a vault note.
 
@@ -2370,76 +2465,12 @@ def read_note_metadata_detailed(file_path: str) -> tuple[dict | None, str | None
             return None, cached.get("__reason__")
         return cached, None
 
-    lines, read_err, size_caveat = _read_frontmatter_region(file_path)
-    if lines is None:
-        # Unreadable file: return None WITHOUT caching the sentinel — the
-        # failure is about the read, not about the note's content, and a
-        # transient error must not pin "no frontmatter" for the session.
-        return None, read_err
-
-    _open_fence, fm_lines, _close_fence, _body_lines, split_err = split_frontmatter(lines)
-    if split_err:
-        # Covers all three malformed shapes: no opening fence, no closing
-        # fence, and an oversized frontmatter block. Each means "this note
-        # has no parsable frontmatter", which is what the sentinel records.
-        #
-        # size_caveat wins ONLY over the bare-exhaustion verdict. A truncated
-        # read makes exactly one of split_frontmatter's three reasons
-        # untrustworthy: the one produced by running off the end of a prefix,
-        # where the real fence may simply sit past the cut. Reporting that as
-        # "no closing '---'" accuses a note that may be fine -- the
-        # wrong-diagnosis failure frontmatter.py's docstring calls out -- so
-        # the caveat ("frontmatter exceeds ... characters") replaces it.
-        #
-        # The other two verdicts are DEFINITIVE regardless of truncation,
-        # because each is derived from a line that was actually read and
-        # inspected: "does not open with a '---' fence" reads lines[0], always
-        # in the first block; the "stopped at a line that is not frontmatter"
-        # variant names the offending line. Overwriting those mislabels a file
-        # that is not a note as an oversized note (which defeats the
-        # no_opening_fence filter in gather_session_evidence for any file over
-        # the char cap) and tells someone whose frontmatter demonstrably dies
-        # at line 3 that "the note may be fine".
-        #
-        # Exact equality, NEVER startswith: `==` here does not depend on the
-        # constant's trailing ')' happening to fall exactly where the
-        # shape-stop variant's text diverges (into "; stopped at ..."). A
-        # hand-truncated or reworded literal could silently start matching
-        # the shape-stop variant too, which is precisely why the literal is
-        # imported from frontmatter.py (and used by the return that produces
-        # it) rather than copied — the two cannot drift apart into a gate
-        # that silently never matches.
-        #
-        # Still the RAW wording either way, so the cached reason re-classifies
-        # correctly on the next hit (see the docstring).
-        if size_caveat and split_err == NO_CLOSING_FENCE_EXHAUSTED_REASON:
-            reason = size_caveat
-        else:
-            reason = split_err
+    meta, reason, cacheable = _parse_note_metadata_uncached(file_path)
+    if meta is None:
+        if not cacheable:
+            return None, reason
         cache_set(sid, cache_key, {"__no_frontmatter__": True, "__reason__": reason})
         return None, reason
-
-    meta: dict = {}
-    tags: list[str] = []
-    in_tags = False
-
-    for line in fm_lines:
-        stripped = line.strip()
-        if stripped.startswith('- ') and in_tags:
-            tags.append(stripped[2:].strip())
-            continue
-        in_tags = False
-        if ':' in stripped:
-            key, _, val = stripped.partition(':')
-            key = key.strip()
-            val = val.strip().strip('"').strip("'")
-            if key == 'tags':
-                in_tags = True
-                continue
-            meta[key] = val
-
-    if tags:
-        meta['tags'] = tags
 
     cache_set(sid, cache_key, meta)
     return meta, None
@@ -2455,8 +2486,98 @@ def read_note_metadata(file_path: str) -> dict | None:
     return read_note_metadata_detailed(file_path)[0]
 
 
+# WHY A MEMO: date-agnostic discovery is the only correct way to find a snapshot
+# written before midnight for a session whose note is dated the next day (#70),
+# but it means reading every snapshot's frontmatter instead of globbing one
+# date prefix. The /recall history table looks snapshots up once per listed
+# session, so an unmemoized date-agnostic lookup turns one scan into N. Measured
+# on the live vault (327 snapshots) for a 10-row table: 37 ms with the old dated
+# glob (and wrong), 1616 ms unmemoized, 14 ms with this memo — the correct
+# answer ends up cheaper than the buggy one it replaces.
+#
+# Keyed by the RESOLVED sessions-folder path: two config spellings of the same
+# folder must share one entry, and two different vaults must never share one.
+#
+# STALENESS: entries live for the life of the process, and are additionally
+# invalidated whenever the sessions folder's own mtime changes — creating,
+# renaming or atomically replacing a note bumps the directory mtime, so a new
+# snapshot self-heals the memo on the next lookup at the cost of one stat().
+# Two residual windows are accepted deliberately:
+#   * a filesystem with coarse (1 s) directory-mtime granularity can hide a
+#     snapshot written in the same tick as the build;
+#   * a snapshot landing between two lookups in the same process is not seen.
+# Both are only reachable from READ paths — /recall, vault-search, vault-ask
+# and summarization — which never write a snapshot themselves and run as fresh
+# short-lived processes. The SessionEnd write path in obsidian_session_log.py
+# deliberately does NOT opt in (it calls find_snapshots_for_session without
+# use_index), because a hook that writes a snapshot and then reads back a
+# memoized list would be a new bug.
+#
+# ``(by_session_id, malformed)`` — the two halves every consumer unpacks.
+# ``malformed`` carries snapshots whose frontmatter would not parse, so the
+# "log malformed to stderr and skip" contract survives the memo.
+_SnapshotIndex = tuple[dict[str, list[tuple[str, str]]], list[tuple[str, str]]]
+_snapshot_index_cache: dict[str, tuple[int, _SnapshotIndex]] = {}
+
+
+def _build_snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
+    """One pass over ``*-snapshot*.md``, grouped by frontmatter session_id.
+
+    Returns ``(by_session_id, malformed)``. Filenames are appended in sorted
+    order, so every per-session list inherits the same lexicographic ordering
+    ``sorted(Path.glob(...))`` gives the uncached path. ``malformed`` holds
+    ``(filename, already-rendered detail)`` pairs — rendered here (never the
+    raw reason, which can embed up to 60 characters of the note's own text)
+    so the caller only decides WHETHER to print, not what.
+    """
+    by_sid: dict[str, list[tuple[str, str]]] = {}
+    malformed: list[tuple[str, str]] = []
+    for p in sorted(sessions_folder_path.glob("*-snapshot*.md")):
+        try:
+            meta, reason, _cacheable = _parse_note_metadata_uncached(str(p))
+            if not meta:
+                # `reason` is None only when the fence pair parsed fine but
+                # held no `key: value` lines — an empty dict, not a defect.
+                if reason:
+                    malformed.append((p.name, _describe_note_parse_failure(reason)))
+                continue
+            by_sid.setdefault(meta.get("session_id", ""), []).append(
+                (p.name, meta.get("project", ""))
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The exception TYPE (plus strerror when there is one), never
+            # str(exc) — str(OSError) embeds the full path argument, which
+            # would leak the absolute vault path into the transcript.
+            detail = getattr(exc, "strerror", None) or type(exc).__name__
+            malformed.append((p.name, detail))
+            continue
+    return by_sid, malformed
+
+
+def _snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
+    """Memoized ``_build_snapshot_index``. See ``_snapshot_index_cache``."""
+    key = os.path.realpath(sessions_folder_path)
+    try:
+        mtime = os.stat(key).st_mtime_ns
+    except OSError:
+        # Unreadable folder: use a sentinel so the entry is always rebuilt
+        # rather than pinning a snapshot of a folder we can no longer stat.
+        mtime = -1
+    cached = _snapshot_index_cache.get(key)
+    if cached is not None and cached[0] == mtime and mtime != -1:
+        return cached[1]
+    index = _build_snapshot_index(sessions_folder_path)
+    _snapshot_index_cache[key] = (mtime, index)
+    return index
+
+
 def find_snapshots_for_session(
-    sessions_folder_path: Path, session_id: str, date: str | None, project: str
+    sessions_folder_path: Path,
+    session_id: str,
+    date: str | None,
+    project: str,
+    *,
+    use_index: bool = False,
 ) -> list[str]:
     """Return chronologically-sorted wikilinks of all snapshots whose
     frontmatter session_id and project match the given session. Empty list
@@ -2476,6 +2597,16 @@ def find_snapshots_for_session(
     and relies entirely on frontmatter session_id+project filtering. Use this
     mode for cross-midnight sessions where snapshots may span multiple
     YYYY-MM-DD prefixes.
+
+    `use_index=True` serves the answer from the process-lifetime memo built by
+    ``_snapshot_index`` instead of re-reading every snapshot's frontmatter, so
+    N lookups in one process cost one scan. Every rule above is preserved
+    exactly — the same filename pattern is re-applied with ``fnmatch``, the
+    same frontmatter session_id+project test runs, malformed snapshots matching
+    the pattern are still logged to stderr and skipped, and the ordering is the
+    same because the memo stores filenames in ``sorted()`` order. It is opt-in
+    because the memo must stay unreachable from write paths that create a
+    snapshot and then read the list back; see ``_snapshot_index_cache``.
     """
     if not sessions_folder_path.is_dir():
         return []
@@ -2485,6 +2616,26 @@ def find_snapshots_for_session(
         glob_pattern = f"*-{slug}-*-snapshot*.md"
     else:
         glob_pattern = f"{date}-{slug}-*-snapshot*.md"
+
+    if use_index:
+        by_sid, malformed = _snapshot_index(sessions_folder_path)
+        # fnmatchcase, not fnmatch: fnmatch() normalises case through
+        # os.path.normcase, which is identity on POSIX but lowercases on
+        # Windows — that would silently widen matching relative to
+        # Path.glob() on the uncached path. The slug and the filenames both
+        # come from slugify()/make_filename() and are already lowercase.
+        for name, detail in malformed:
+            if fnmatch.fnmatchcase(name, glob_pattern):
+                print(f"[obsidian-brain] skipping malformed snapshot {name}: {detail}",
+                      file=sys.stderr)
+        for name, snap_project in by_sid.get(session_id, []):
+            if not fnmatch.fnmatchcase(name, glob_pattern):
+                continue
+            if (snap_project.lower() == project.lower()
+                    or slugify(snap_project) == slug):
+                wikilinks.append(f"[[{Path(name).stem}]]")
+        return wikilinks
+
     for p in sorted(sessions_folder_path.glob(glob_pattern)):
         try:
             meta, reason = read_note_metadata_detailed(str(p))
@@ -2571,8 +2722,19 @@ def _augment_session_input_with_snapshots(
     post-last-compact tail.
 
     Returns the original transcript unchanged if no snapshots exist.
+
+    `date` is accepted for signature compatibility but no longer narrows
+    discovery. It used to be forwarded to find_snapshots_for_session, whose
+    dated glob drops any snapshot written before midnight for a session whose
+    note is dated the next day — the summarizer then saw a truncated arc with
+    no signal that anything was missing (#70). Discovery is date-agnostic and
+    served from the shared snapshot index instead, so passing a wrong date, or
+    the "wrong" one of the two dates a cross-midnight session spans, changes
+    nothing.
     """
-    wikilinks = find_snapshots_for_session(sessions_folder_path, session_id, date, project)
+    wikilinks = find_snapshots_for_session(
+        sessions_folder_path, session_id, None, project, use_index=True,
+    )
     if not wikilinks:
         return transcript
 
@@ -2634,9 +2796,19 @@ def fetch_snapshot_summaries(
 
     Shared helper used by build_context_brief(), the vault-search skill,
     and vault-ask so presentation stays consistent.
+
+    `date` is accepted for signature compatibility — skills/vault-search and
+    skills/vault-ask call this with four positional arguments — but no longer
+    narrows discovery. Forwarding it meant a snapshot written before midnight
+    for a session whose note is dated the next day was silently dropped from
+    the /recall history table and from both skills (#70). Discovery is
+    date-agnostic and served from the shared snapshot index instead, so N
+    sessions in one history table cost one frontmatter scan, not N.
     """
     results: list[dict] = []
-    for link in find_snapshots_for_session(sessions_folder_path, session_id, date, project):
+    for link in find_snapshots_for_session(
+        sessions_folder_path, session_id, None, project, use_index=True,
+    ):
         stem = link.strip("[]")
         path = sessions_folder_path / f"{stem}.md"
         if not path.exists():

@@ -357,53 +357,42 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
     hhmmss = stem_hhmmss_match.group(1)  # e.g. "075610"
     hhmmss_pretty = f"{hhmmss[:2]}:{hhmmss[2:4]}:{hhmmss[4:6]}"  # "07:56:10"
 
-    # Cross-midnight guard: build_context_brief() looks up snapshots via
-    # fetch_snapshot_summaries(note_date), which in turn calls
-    # find_snapshots_for_session() to glob `{date}-{slug}-*-snapshot*.md`.
-    # If Stage 1 (snapshot hook) and Stage 2 (session-log hook) straddle a
-    # calendar day boundary, the two files get different date prefixes and
-    # the snapshot is legitimately excluded from the session's lookup. Keep
-    # the strong assertions for the (overwhelmingly common) same-date case
-    # and avoid a wall-clock flake in the ~100ms-per-year straddle window.
-    snapshot_date_prefix = snapshot_path.stem.split("-snapshot-", 1)[0][:10]
-    session_date_prefix = session_path.stem[:10]
-    if snapshot_date_prefix == session_date_prefix:
-        # Nested snapshot row: exact `↳ HH:MM:SS` match against OUR snapshot's
-        # timestamp. Rendered inside a markdown table cell at
-        # obsidian_utils.py:1881 (`|   | ↳ {hhmmss_pretty} | ...`), so the
-        # glyph sits mid-cell after `|   | ` — no `^` line anchor.
-        assert f"↳ {hhmmss_pretty}" in context_brief_section, (
-            f"expected nested snapshot row `↳ {hhmmss_pretty}` in context brief:\n"
-            f"{context_brief_section[:2000]}"
-        )
+    # Cross-midnight: build_context_brief() looks up snapshots via
+    # fetch_snapshot_summaries(), which discovers date-agnostically from the
+    # shared snapshot index (#70). If Stage 1 (snapshot hook) and Stage 2
+    # (session-log hook) straddle a calendar day boundary the two files get
+    # different date prefixes, and the snapshot must STILL be found — that is
+    # the whole point of the fix, so these assertions are unconditional. They
+    # used to be guarded by `if snapshot_date_prefix == session_date_prefix`,
+    # with a degraded "the file still exists on disk" branch for the straddle
+    # case; that branch encoded the defect and would have gone on passing
+    # after it was fixed. The straddle window is ~100 ms per year, so the
+    # guard also almost never ran — a mutation that reintroduced the dated
+    # glob would not have been caught here either way.
+    assert f"↳ {hhmmss_pretty}" in context_brief_section, (
+        f"expected nested snapshot row `↳ {hhmmss_pretty}` in context brief "
+        f"(snapshot_date={snapshot_path.stem[:10]}, "
+        f"session_date={session_path.stem[:10]}):\n"
+        f"{context_brief_section[:2000]}"
+    )
 
-        assert re.search(
-            r"^snapshot_count:\s*1\b", load_manifest_section, re.MULTILINE
-        ), (
-            f"expected `snapshot_count: 1` in LOAD_MANIFEST:\n{load_manifest_section}"
-        )
+    assert re.search(
+        r"^snapshot_count:\s*1\b", load_manifest_section, re.MULTILINE
+    ), (
+        f"expected `snapshot_count: 1` in LOAD_MANIFEST:\n{load_manifest_section}"
+    )
 
-        # Producer at obsidian_utils.py:2091 emits
-        # `snapshot: [{hhmmss}] ({trigger}) {summary}` in build_context_brief's
-        # LOAD_MANIFEST composition — the full filename stem never appears on
-        # the line, only the HHMMSS tail. Match on that unique substring.
-        assert re.search(
-            rf"^snapshot:\s*\[{hhmmss}\]",
-            load_manifest_section,
-            re.MULTILINE,
-        ), (
-            f"expected `snapshot: [{hhmmss}]` line in LOAD_MANIFEST "
-            f"(stem={snapshot_path.stem}):\n{load_manifest_section}"
-        )
-    else:
-        # Straddled midnight — degraded assertion: just verify the snapshot
-        # still exists on disk (the production code path for cross-midnight
-        # is tracked as follow-up #68/#70 and is out of scope for this test).
-        assert snapshot_path.exists(), (
-            "snapshot note missing after cross-midnight straddle: "
-            f"snapshot_date={snapshot_date_prefix}, "
-            f"session_date={session_date_prefix}"
-        )
+    # Producer emits `snapshot: [{hhmmss}] ({trigger}) {summary}` in
+    # build_context_brief's LOAD_MANIFEST composition — the full filename stem
+    # never appears on the line, only the HHMMSS tail. Match on that substring.
+    assert re.search(
+        rf"^snapshot:\s*\[{hhmmss}\]",
+        load_manifest_section,
+        re.MULTILINE,
+    ), (
+        f"expected `snapshot: [{hhmmss}]` line in LOAD_MANIFEST "
+        f"(stem={snapshot_path.stem}):\n{load_manifest_section}"
+    )
 
     assert most_recent_path == str(session_path), (
         f"expected MOST_RECENT_SESSION_PATH={session_path}, got={most_recent_path}"
