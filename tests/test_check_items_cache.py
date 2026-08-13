@@ -1,5 +1,7 @@
 import os
 import sys
+import textwrap
+import subprocess
 import pytest
 
 HOOKS_DIR = os.path.join(os.path.dirname(__file__), "..", "hooks")
@@ -1886,3 +1888,76 @@ def test_locked_cache_warning_is_silent_on_the_happy_path(tmp_path, monkeypatch,
     data = json.loads(fake_cache.read_text())
     assert data["runs"]["p"]["groups"] == []
     assert "unusable classified_ts" not in capsys.readouterr().err
+
+
+def test_acquire_lock_is_bounded_when_a_stale_lock_cannot_be_removed(tmp_path):
+    """#306 review: _acquire_lock must honour `timeout` on EVERY path.
+
+    Two branches originally `continue`d straight back to the O_EXCL create
+    without checking the deadline: the stat-failed branch, and the
+    stale-takeover branch when unlink() failed. With a stale lock that
+    cannot be removed -- a foreign owner, a read-only volume, a macOS uchg
+    flag, or (as simulated here) a directory sitting at the lock path --
+    the function never returned and pegged a core.
+
+    That is strictly worse than the bug #306 fixes: the race is fail-safe
+    (a lost write just re-classifies next run), whereas an unbounded busy
+    loop wedges /check-items and burns CPU indefinitely.
+
+    Runs in a SUBPROCESS on purpose. Calling _acquire_lock directly would
+    make the regression manifest as a HUNG test rather than a failing one:
+    the assertion after the call is simply never reached, so CI stalls
+    until its job timeout and a spinning thread would keep burning CPU for
+    the remainder of the suite. A killable child turns "spins forever" into
+    a fast, legible failure.
+    """
+    prog = textwrap.dedent(
+        """
+        import os, sys, time
+        sys.path.insert(0, sys.argv[1])
+        from check_items_cache import _acquire_lock
+        from pathlib import Path
+        lock = Path(sys.argv[2])
+        lock.mkdir()                       # O_EXCL fails; unlink() cannot remove it
+        old = time.time() - 10_000
+        os.utime(lock, (old, old))         # older than _LOCK_STALE_SECONDS
+        t0 = time.time()
+        result = _acquire_lock(lock, timeout=0.5)
+        print(f"{result!r}|{time.time() - t0:.2f}")
+        """
+    )
+    hooks = os.path.join(_REPO_ROOT, "hooks") if "_REPO_ROOT" in globals() else \
+        os.path.join(os.path.dirname(__file__), "..", "hooks")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", prog, hooks, str(tmp_path / "cache.lock")],
+            capture_output=True, text=True, timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            "_acquire_lock never returned against a 0.5s timeout — a "
+            "non-returning branch is bypassing the deadline check and "
+            "spinning (unbounded busy loop)"
+        )
+    assert proc.returncode == 0, proc.stderr
+    result, elapsed = proc.stdout.strip().split("|")
+    assert result == "None", "an unremovable lock must fail open, not be claimed"
+    assert float(elapsed) < 5.0, f"_acquire_lock took {elapsed}s against a 0.5s timeout"
+
+
+def test_acquire_lock_returns_promptly_on_an_uncontended_lock(tmp_path):
+    """Negative control for the bound above: the timeout path must not be
+    the ONLY thing keeping acquisition bounded. An uncontended acquire
+    returns immediately and hands back a payload, so a mutation that made
+    _acquire_lock always fall through to the poll loop (or always return
+    None) is caught here rather than silently degrading every run to the
+    unlocked path."""
+    from check_items_cache import _acquire_lock
+
+    started = time.time()
+    payload = _acquire_lock(tmp_path / "cache.lock", timeout=5.0)
+    elapsed = time.time() - started
+
+    assert payload is not None, "an uncontended lock must be acquired, not failed open"
+    assert elapsed < 0.5, f"uncontended acquire took {elapsed:.2f}s"
+    assert (tmp_path / "cache.lock").exists()

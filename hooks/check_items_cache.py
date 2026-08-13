@@ -156,8 +156,11 @@ def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
                 age = time.time() - lock_path.stat().st_mtime
             except OSError:
                 # Lock vanished between the failed create and this stat (the
-                # holder just released it) -- retry the create immediately.
-                continue
+                # holder just released it), or its metadata is unreadable.
+                # Treat it as fresh and fall through to the bounded poll --
+                # never loop straight back to the create, which would spin
+                # without honouring `timeout` if stat kept failing.
+                age = 0.0
             if age > _LOCK_STALE_SECONDS:
                 # Stale lock: a crashed holder must not wedge the cache
                 # permanently unwritable. Takeover is inherently racy --
@@ -172,15 +175,25 @@ def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
                 try:
                     lock_path.unlink()
                 except OSError:
+                    # Cannot remove it: a foreign owner, a read-only volume,
+                    # a macOS uchg flag, or a directory sitting at the lock
+                    # path. Fall through to the bounded poll rather than
+                    # retrying the unlink forever.
                     pass
-                continue
-            if time.time() >= deadline:
-                return None
-            time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
         except OSError as exc:
             print(f"[check-items-cache] WARNING: cache lock acquire failed "
                   f"({exc}); proceeding without the cache lock", file=sys.stderr)
             return None
+        # EVERY path that does not return lands here, so `timeout` governs
+        # unconditionally. Two branches above used to `continue` straight
+        # back to the create, bypassing this check: with a stale lock that
+        # could not be unlinked, _acquire_lock never returned and pegged a
+        # core -- an unbounded busy loop strictly worse than the fail-safe
+        # race #306 set out to fix. Verified by execution before the fix
+        # (timeout=1.0 still spinning at 5s) and after (returns in ~1s).
+        if time.time() >= deadline:
+            return None
+        time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
 
 
 def _release_lock(lock_path: Path, payload: bytes) -> None:
