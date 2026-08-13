@@ -111,7 +111,19 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
 _ID_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,63}$")
-_also_ids = [a for a in sys.argv[1:] if _ID_RE.match(a)]
+_raw_ids = sys.argv[1:]
+_also_ids = [a for a in _raw_ids if _ID_RE.match(a)]
+_rejected = len(_raw_ids) - len(_also_ids)
+if _rejected:
+    # Loud, never silent: a rejected token (e.g. a leftover placeholder that
+    # was not stripped) used to just vanish from _also_ids and degrade to
+    # the empty post-compact bundle #184 exists to eliminate, with no
+    # signal. Exit non-zero so this routes through the existing crash path
+    # below into discovery_errors and the "evidence discovery partially or
+    # fully failed" banner. Never the token itself in the message — this
+    # is fed straight into the model context via the transcript.
+    print(f"rejected {_rejected} invalid also-session-id argument(s)", file=sys.stderr)
+    sys.exit(1)
 from obsidian_utils import load_config, get_session_context, gather_session_evidence
 c = load_config()
 ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
@@ -124,7 +136,7 @@ bundle = gather_session_evidence(
 )
 bundle["_ctx"] = ctx
 print(json.dumps(bundle))
-' "<prior-session-id-if-recovered-else-omit>" >"$_OB_BUNDLE" 2>"$_OB_ERR"
+' >"$_OB_BUNDLE" 2>"$_OB_ERR"
 _OB_RC=$?
 if [ $_OB_RC -ne 0 ]; then
   _OB_ERRMSG="$([ -f "$_OB_ERR" ] && head -c 500 "$_OB_ERR" || echo "")"
@@ -150,19 +162,27 @@ fi
 rm -f "$_OB_BUNDLE" "$_OB_ERR"
 ```
 
-Omit the trailing `"<prior-session-id-if-recovered-else-omit>"` argument entirely when no compact boundary was detected — do not pass a literal placeholder string; pass one shell-quoted argument per recovered id when there is one (or more).
+The canonical block above ships with zero trailing arguments, so the common no-compact-boundary case is correct by copying it verbatim — do not append a literal placeholder string. When a compact boundary IS detected and a prior id recovered, append it as a shell-quoted positional argument after the closing `'`, one argument per recovered id (per the "Detect a compact boundary" step above); the script rejects any argument that is not a bare hex-and-dash id, so a stray or malformed token fails loudly (see the "Helper crash / partial failure" handling below) rather than being silently dropped.
 
-Parse the JSON output. The bundle has these fields: `session_id`, `session_ids`, `snapshots`, `insights`, `decisions`, `error_fixes`, `retros`, `discovery_errors`, and `_ctx` (the cached `get_session_context()` result reused by Step 5).
+Parse the JSON output. The bundle has these fields: `session_id` (the primary id exactly as passed — may be `"unknown"`), `session_ids` (the ordered, de-duplicated ids **actually scanned** — may be non-empty even when `session_id` is `"unknown"`), `snapshots`, `insights`, `decisions`, `error_fixes`, `retros`, `discovery_errors`, and `_ctx` (the cached `get_session_context()` result reused by Step 5).
 
-**Unresolved-session fallback.** If `bundle["_ctx"]["session_id"] == "unknown"` AND `bundle["discovery_errors"] == []`, print:
+**Unresolved-session fallback.** If `bundle["session_ids"] == []` AND `bundle["discovery_errors"] == []`, print:
 
 > Note: this session could not be identified (no Claude Code transcript resolves to the current directory), so session-scoped evidence could not be looked up — falling back to active-conversation-only retro. This is **not** evidence that the vault is empty.
 
-**Empty-bundle fallback.** If the session id IS resolved (`bundle["_ctx"]["session_id"] != "unknown"`), `bundle["discovery_errors"] == []`, and `snapshots`, `insights`, `decisions` and `error_fixes` are all empty, print:
+Gate on `session_ids`, not on the resolver (`bundle["_ctx"]["session_id"]`): resolver failure and preamble-id recovery are independent. The continuation preamble carrying a prior session id lives in the buffer regardless of whether the transcript resolves, so `session_ids` can be non-empty even when `_ctx["session_id"]` is `"unknown"` — that case is the branch immediately below, not this one.
+
+**Recovered-under-prior-id note.** If `bundle["_ctx"]["session_id"] == "unknown"` AND `bundle["session_ids"] != []`, print:
+
+> Note: this session could not be identified, but evidence was recovered under prior session id `<id>` (the last entry in `bundle["session_ids"]`).
+
+Then proceed normally — run the mandatory snapshot pre-pass in Step 3.0 and include `## Evidence Consulted` in Step 4 — exactly as if the session had resolved. Only the unresolved-session fallback above and the empty-bundle fallback below skip the pre-pass; this case does not.
+
+**Empty-bundle fallback.** If the session id IS resolved (`bundle["_ctx"]["session_id"] != "unknown"`), `bundle["discovery_errors"] == []`, and `snapshots`, `insights`, `decisions`, `error_fixes` and `retros` are all empty, print:
 
 > Note: no prior-session evidence found — falling back to active-conversation-only retro.
 
-Keep the two apart. "No evidence found" asserts a fact about the **vault** ("there is nothing"); an unresolved session id is a fact about the **resolver** ("I could not identify this session"), and reporting the second as the first is what let a session-resolution failure read as a genuinely fresh session (#260 I4). The behaviour is identical either way — proceed with Step 3 using only the active conversation buffer, and do not include the `## Evidence Consulted` section in Step 4 in either case.
+Keep the three apart. "No evidence found" asserts a fact about the **vault** ("there is nothing"); an unresolved session id is a fact about the **resolver** ("I could not identify this session"), and reporting the second as the first is what let a session-resolution failure read as a genuinely fresh session (#260 I4). The unresolved-session and empty-bundle fallbacks behave identically from here — proceed with Step 3 using only the active conversation buffer, and do not include the `## Evidence Consulted` section in Step 4 in either case. The recovered-under-prior-id note above is different: evidence exists, so it takes the full evidence-mining path instead.
 
 **Helper crash / partial failure.** If `bundle["discovery_errors"]` is non-empty, do **not** silently fall back to "no prior-session evidence found." Instead emit:
 

@@ -110,7 +110,13 @@ def test_gather_session_evidence_snapshots_sorted_ascending_by_hhmmss(tmp_vault:
 
 
 def test_gather_session_evidence_snapshots_filter_other_project(tmp_vault: Path) -> None:
-    """Snapshots whose frontmatter project differs are excluded."""
+    """Snapshots whose frontmatter project differs are excluded.
+
+    project_slug is pinned to "obsidian-brain" (matching the FILENAME the
+    glob looks for), while the frontmatter `project` stays "other-project" —
+    otherwise the decoy's filename never matches
+    `*-obsidian-brain-*-snapshot*.md`, the file is never opened, and the
+    frontmatter comparison this test claims to exercise never runs."""
     sessions_dir = tmp_vault / "claude-sessions"
     own = _make_snapshot(sessions_dir, sid="SID-A", hhmmss="100000", project="obsidian-brain")
     _make_snapshot(
@@ -118,7 +124,7 @@ def test_gather_session_evidence_snapshots_filter_other_project(tmp_vault: Path)
         sid="SID-A",
         hhmmss="200000",
         project="other-project",
-        project_slug="other-project",
+        project_slug="obsidian-brain",
     )
 
     bundle = obsidian_utils.gather_session_evidence(
@@ -137,7 +143,7 @@ INSIGHT_TEMPLATE = """\
 ---
 type: {note_type}
 source_session: {sid}
-project: obsidian-brain
+project: {project}
 date: 2026-05-03
 ---
 
@@ -155,9 +161,15 @@ def _make_insight(
     sid: str,
     title: str = "Test Title",
     body: str = "Test body content.",
+    project: str = "obsidian-brain",
 ) -> Path:
     path = insights_dir / filename
-    _write(path, INSIGHT_TEMPLATE.format(note_type=note_type, sid=sid, title=title, body=body))
+    _write(
+        path,
+        INSIGHT_TEMPLATE.format(
+            note_type=note_type, sid=sid, title=title, body=body, project=project
+        ),
+    )
     return path
 
 
@@ -880,6 +892,25 @@ def test_gather_session_evidence_also_session_ids_normalization(tmp_vault: Path)
     assert bundle["session_ids"] == ["SID-A", "SID-B"]
 
 
+def test_gather_session_evidence_also_session_ids_bare_string_not_splatted(
+    tmp_vault: Path,
+) -> None:
+    """A bare str passed to also_session_ids must be treated as a single id,
+    not iterated character-by-character. `str` IS a `Sequence[str]`, so
+    `also_session_ids="SID-B"` type-checks clean; without a guard,
+    `(session_id, *also_session_ids)` splats it into six bogus one-character
+    ids."""
+    bundle = obsidian_utils.gather_session_evidence(
+        vault_path=str(tmp_vault),
+        sessions_folder="claude-sessions",
+        insights_folder="claude-insights",
+        session_id="SID-A",
+        project="obsidian-brain",
+        also_session_ids="SID-B",
+    )
+    assert bundle["session_ids"] == ["SID-A", "SID-B"]
+
+
 def test_gather_session_evidence_unknown_primary_with_valid_also_id(
     tmp_vault: Path,
 ) -> None:
@@ -923,7 +954,12 @@ def test_gather_session_evidence_also_session_ids_cross_project_decoy_excluded(
     tmp_vault: Path,
 ) -> None:
     """A decoy snapshot from a different project is excluded even while
-    scanning two session ids."""
+    scanning two session ids.
+
+    project_slug is pinned to "obsidian-brain" so the decoy's FILENAME
+    matches the glob and the file is actually opened and rejected on its
+    frontmatter `project` — a decoy filed under a filename the glob never
+    matches would never reach that comparison at all."""
     sessions_dir = tmp_vault / "claude-sessions"
     own = _make_snapshot(sessions_dir, sid="SID-B", hhmmss="100000", project="obsidian-brain")
     _make_snapshot(
@@ -931,7 +967,7 @@ def test_gather_session_evidence_also_session_ids_cross_project_decoy_excluded(
         sid="SID-B",
         hhmmss="200000",
         project="other-project",
-        project_slug="other-project",
+        project_slug="obsidian-brain",
     )
 
     bundle = obsidian_utils.gather_session_evidence(
@@ -952,6 +988,17 @@ def test_gather_session_evidence_also_session_ids_cross_project_decoy_excluded(
 
 
 def test_gather_session_evidence_no_prior_retros(tmp_vault: Path) -> None:
+    """Distinguish 'no retro collected' from 'nothing collected': an insight
+    for this same session is present and found, but retros stays empty
+    because none exists — an empty vault would leave this assertion vacuous."""
+    insights_dir = tmp_vault / "claude-insights"
+    insight = _make_insight(
+        insights_dir,
+        filename="2026-05-03-finding-aaaa.md",
+        note_type="claude-insight",
+        sid="SID-A",
+    )
+
     bundle = obsidian_utils.gather_session_evidence(
         vault_path=str(tmp_vault),
         sessions_folder="claude-sessions",
@@ -959,6 +1006,7 @@ def test_gather_session_evidence_no_prior_retros(tmp_vault: Path) -> None:
         session_id="SID-A",
         project="obsidian-brain",
     )
+    assert [i["path"] for i in bundle["insights"]] == [str(insight)]
     assert bundle["retros"] == []
 
 
@@ -1004,16 +1052,20 @@ def test_gather_session_evidence_retro_different_session_excluded(tmp_vault: Pat
     assert bundle["retros"] == []
 
 
-def test_gather_session_evidence_retro_different_project_excluded(tmp_vault: Path) -> None:
-    """A retro belonging to a different project has a different source_session
-    (sessions are per-project), so it is excluded the same way any other
-    cross-project note would be."""
+def test_gather_session_evidence_retro_no_project_filter(tmp_vault: Path) -> None:
+    """The insights-folder loop (insights/decisions/error-fixes/retros) has
+    NO project filter of its own — it matches solely on source_session. A
+    retro whose frontmatter `project` differs from the requested project is
+    still returned as long as its source_session id matches; only a
+    mismatched sid excludes it (see
+    test_gather_session_evidence_retro_different_session_excluded above)."""
     insights_dir = tmp_vault / "claude-insights"
-    _make_insight(
+    retro = _make_insight(
         insights_dir,
         filename="2026-05-03-retro-cccc.md",
         note_type="claude-retro",
-        sid="SID-OTHER-PROJECT",
+        sid="SID-A",
+        project="other-project",
     )
 
     bundle = obsidian_utils.gather_session_evidence(
@@ -1024,7 +1076,7 @@ def test_gather_session_evidence_retro_different_project_excluded(tmp_vault: Pat
         project="obsidian-brain",
     )
 
-    assert bundle["retros"] == []
+    assert [r["path"] for r in bundle["retros"]] == [str(retro)]
 
 
 def test_gather_session_evidence_retro_found_via_also_session_ids(tmp_vault: Path) -> None:

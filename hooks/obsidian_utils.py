@@ -2940,6 +2940,10 @@ def gather_session_evidence(
         "retros": [],
         "discovery_errors": [],
     }
+    if isinstance(also_session_ids, str):
+        # str IS a Sequence[str]: without this, a bare string would be splatted
+        # character-by-character into ids and scanned as six bogus sessions.
+        also_session_ids = (also_session_ids,)
     ids: list[str] = []
     for sid in (session_id, *also_session_ids):
         if not sid or sid == "unknown" or sid in ids:
@@ -2964,6 +2968,11 @@ def gather_session_evidence(
         for sid in ids:
             for link in find_snapshots_for_session(sessions_path, sid, None, project):
                 stem = link.strip("[]")
+                # Currently unreachable: find_snapshots_for_session matches an
+                # exact frontmatter session_id, and a file carries exactly
+                # one, so with de-duplicated ids (see `ids` above) no stem
+                # can be yielded twice across the sid loop. Defensive depth,
+                # not live logic.
                 if stem in snap_by_stem:
                     continue
                 snap_path = sessions_path / f"{stem}.md"
