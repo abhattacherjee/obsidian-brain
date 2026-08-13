@@ -1996,3 +1996,60 @@ def test_acquire_lock_returns_promptly_on_an_uncontended_lock(tmp_path):
     assert payload is not None, "an uncontended lock must be acquired, not failed open"
     assert elapsed < 0.5, f"uncontended acquire took {elapsed:.2f}s"
     assert (tmp_path / "cache.lock").exists()
+
+
+def test_lock_age_and_identity_come_from_a_single_read(tmp_path):
+    """#306 cross-model finding G-001: a stale-takeover TOCTOU.
+
+    _acquire_lock measured staleness with stat() and read identity with a
+    separate read_bytes(). Between the two, the stale holder can release and
+    a NEW holder legitimately take the lock -- so the fresh holder's identity
+    got paired with the crashed holder's age, the lock read as stale, and the
+    takeover DELETED a live holder's lock. Two processes then wrote
+    concurrently, which is precisely what #306 exists to prevent. Reproduced
+    deterministically before the fix.
+
+    The fix is that age is derived from the payload's OWN timestamp, so
+    identity and age can never come from different file states. This test
+    pins that invariant directly: a payload whose embedded timestamp is
+    fresh must read as fresh EVEN IF the file's mtime is ancient, which is
+    exactly the mis-pairing the old code produced.
+    """
+    from check_items_cache import _lock_age, _LOCK_STALE_SECONDS
+
+    lock = tmp_path / "cache.lock"
+    fresh_payload = f"4242 {time.time():.3f}\n".encode()
+    lock.write_bytes(fresh_payload)
+    ancient = time.time() - 10_000
+    os.utime(lock, (ancient, ancient))          # mtime lies; payload does not
+
+    age = _lock_age(lock, fresh_payload)
+    assert age < _LOCK_STALE_SECONDS, (
+        f"age {age:.0f}s came from st_mtime, not the payload — identity and "
+        "age can be paired from different file states again"
+    )
+
+    # And the converse: a payload whose own timestamp is old IS stale, even
+    # with a freshly-touched mtime.
+    stale_payload = f"4243 {time.time() - 10_000:.3f}\n".encode()
+    lock.write_bytes(stale_payload)
+    os.utime(lock, None)                        # mtime = now
+    assert _lock_age(lock, stale_payload) > _LOCK_STALE_SECONDS
+
+
+def test_lock_age_falls_back_to_mtime_for_an_unparseable_payload(tmp_path):
+    """A lock file written by an older format, or created by hand, has no
+    parseable timestamp. It must still age out via st_mtime rather than
+    being treated as permanently fresh (which would wedge the cache) or
+    permanently stale (which would make every takeover unsafe)."""
+    from check_items_cache import _lock_age, _LOCK_STALE_SECONDS
+
+    lock = tmp_path / "cache.lock"
+    lock.write_bytes(b"garbage-with-no-timestamp\n")
+    ancient = time.time() - 10_000
+    os.utime(lock, (ancient, ancient))
+    assert _lock_age(lock, b"garbage-with-no-timestamp\n") > _LOCK_STALE_SECONDS
+
+    lock.write_bytes(b"garbage-with-no-timestamp\n")
+    os.utime(lock, None)
+    assert _lock_age(lock, b"garbage-with-no-timestamp\n") < _LOCK_STALE_SECONDS

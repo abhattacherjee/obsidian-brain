@@ -130,6 +130,31 @@ def _try_create_lock(lock_path: Path, payload: bytes) -> None:
         os.close(fd)
 
 
+def _lock_age(lock_path: Path, holder: bytes) -> float:
+    """Age of the lock identified by `holder`, in seconds.
+
+    Read from the payload's OWN timestamp whenever it parses, so that a
+    lock's identity and its age come from a SINGLE read. Deriving age from a
+    separate stat() lets the file be replaced in between: a fresh holder's
+    identity then gets paired with the previous holder's age, the lock reads
+    as stale when it is not, and the takeover deletes a live holder's lock.
+    That mis-pairing was reproduced deterministically -- the single-read
+    invariant is the actual fix, not the re-read confirmation below it.
+
+    Falls back to st_mtime for a payload this version cannot parse (an older
+    format, or a hand-created file), and to 0.0 -- "fresh", so never taken
+    over -- when even that fails.
+    """
+    try:
+        return time.time() - float(holder.split()[1])
+    except (IndexError, ValueError):
+        pass
+    try:
+        return time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
     """Acquire the lock, waiting up to `timeout` seconds under contention.
 
@@ -146,22 +171,24 @@ def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
         return None
 
     payload = _lock_payload()
-    deadline = time.time() + timeout
+    # Monotonic, not wall clock: an NTP correction mid-wait would otherwise
+    # stretch or collapse the timeout arbitrarily. Staleness below MUST stay
+    # on the wall clock, because it compares against st_mtime.
+    deadline = time.monotonic() + timeout
     while True:
         try:
             _try_create_lock(lock_path, payload)
             return payload
         except FileExistsError:
             try:
-                age = time.time() - lock_path.stat().st_mtime
+                holder = lock_path.read_bytes()
             except OSError:
-                # Lock vanished between the failed create and this stat (the
-                # holder just released it), or its metadata is unreadable.
-                # Treat it as fresh and fall through to the bounded poll --
-                # never loop straight back to the create, which would spin
-                # without honouring `timeout` if stat kept failing.
-                age = 0.0
-            if age > _LOCK_STALE_SECONDS:
+                # Lock vanished between the failed create and this read (the
+                # holder just released it), or it is unreadable. Fall through
+                # to the bounded poll -- never loop straight back to the
+                # create, which would spin without honouring `timeout`.
+                holder = None
+            if holder is not None and _lock_age(lock_path, holder) > _LOCK_STALE_SECONDS:
                 # Stale lock: a crashed holder must not wedge the cache
                 # permanently unwritable. Takeover is inherently racy --
                 # multiple waiters can all observe staleness at once and
@@ -173,12 +200,29 @@ def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
                 # "assume ownership and write unprotected while a
                 # legitimate new holder is mid-write".
                 try:
-                    lock_path.unlink()
+                    # Re-read immediately before unlinking and require the
+                    # bytes to be UNCHANGED. Between measuring staleness and
+                    # unlinking, the stale holder can release and a NEW
+                    # holder legitimately take the lock; unlinking then
+                    # deletes a LIVE holder's lock and puts two writers in
+                    # the critical section at once. That is not theoretical
+                    # -- it was reproduced deterministically before this
+                    # check existed.
+                    #
+                    # A residual window remains between this read and the
+                    # unlink. Closing it completely needs rename-based
+                    # claiming, whose failure mode (restoring a lock that a
+                    # third process may already have recreated) is worse
+                    # than the microsecond window it removes. The common
+                    # case -- the lock was replaced while we deliberated --
+                    # is caught here.
+                    if lock_path.read_bytes() == holder:
+                        lock_path.unlink()
                 except OSError:
-                    # Cannot remove it: a foreign owner, a read-only volume,
-                    # a macOS uchg flag, or a directory sitting at the lock
-                    # path. Fall through to the bounded poll rather than
-                    # retrying the unlink forever.
+                    # Cannot read or remove it: a foreign owner, a read-only
+                    # volume, a macOS uchg flag, or a directory sitting at
+                    # the lock path. Fall through to the bounded poll rather
+                    # than retrying forever.
                     pass
         except OSError as exc:
             print(f"[check-items-cache] WARNING: cache lock acquire failed "
@@ -191,7 +235,7 @@ def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
         # core -- an unbounded busy loop strictly worse than the fail-safe
         # race #306 set out to fix. Verified by execution before the fix
         # (timeout=1.0 still spinning at 5s) and after (returns in ~1s).
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             return None
         time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
 
@@ -211,7 +255,20 @@ def _release_lock(lock_path: Path, payload: bytes) -> None:
     except OSError:
         return  # already gone -- nothing to release
     if current != payload:
-        return  # a rival process took this lock over as stale; not ours anymore
+        # Our lock was taken over as stale while we still believed we held
+        # it -- meaning another writer was inside the critical section
+        # concurrently with us. Do NOT unlink (that would delete THEIR
+        # lock), and do not stay silent: this is the one observable trace
+        # that mutual exclusion was actually violated, and swallowing it
+        # would leave a real concurrent-write window with no evidence at
+        # all. Reaching this means the body outran _LOCK_STALE_SECONDS.
+        print(
+            f"[check-items-cache] WARNING: this run's cache lock was taken "
+            f"over by another process while still held ({lock_path}); the "
+            f"cache write may have raced a concurrent writer",
+            file=sys.stderr,
+        )
+        return
     try:
         lock_path.unlink()
     except OSError:
