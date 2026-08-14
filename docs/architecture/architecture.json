@@ -415,7 +415,6 @@
     { "name": "OBSIDIAN_BRAIN_DB", "default": "the vault index DB under ~/.claude", "purpose": "Override the SQLite index path (#192); also used by tests to avoid polluting the live DB." },
     { "name": "OBSIDIAN_BRAIN_VAULT", "default": "(config file)", "purpose": "vault-doctor config override (with _SESSIONS_FOLDER / _INSIGHTS_FOLDER); takes precedence over the config file." },
     { "name": "OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT", "default": "the doctor backup dir under ~/.claude", "purpose": "Scan root for the audit-historic-repairs check (apply always writes under the dispatcher backup root)." },
-    { "name": "OB_SCAN_RESOLVED_INSTALL", "default": "unset", "purpose": "Set to 1 to make the stdin-cap security test also walk the install tree the #278 resolver lands on. Off by default: on a machine whose install resolves a released plugin-cache version, scanning it fails the suite on code that is not in the checkout." },
     { "name": "CHECK_ITEMS_PREFILTER", "default": "on", "purpose": "Set to off to disable the L2 deterministic prefilter and send all items to the LLM classifier." },
     { "name": "CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "default": "300", "purpose": "Inner per-call timeout for the classifier/semantic-merge sub-agents; chunking keeps each call well under it." },
     { "name": "CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE", "default": "25", "purpose": "Max groups per classifier sub-agent call — sized to stay on Haiku and under the timeout." }
@@ -426,7 +425,7 @@
       "Direct filesystem writes only — no MCP server, no REST API, no daemon; the vault works even when Obsidian is closed.",
       "Hooks are pure stdlib, deterministic, and always exit 0; they never import the index (indexing is a skill-side concern).",
       "Everything is recoverable: the SQLite index is derived and fully rebuildable from the markdown vault.",
-      "Defense in depth on writes: path containment, atomic temp+rename, 0600/0700 perms, secret scrubbing, 1 MB stdin caps."
+      "Defense in depth on writes: path containment, atomic temp+rename, 0600/0700 perms, secret scrubbing, 1 MB stdin caps. The stdin-cap AST guard walks all three in-repo Python trees — hooks/, scripts/ and .claude/hooks/ — after #289 retired the opt-in OB_SCAN_RESOLVED_INSTALL walk over the resolved plugin-cache tree (a no-op in both configurations that occur, and upstream-dominated by this repo walk since every cache is populated from a release cut here). The five .claude/hooks/ PreToolUse gates read through a shared _read_hook_input() helper that fails CLOSED on every unusable input: a read error (non-UTF-8 or OSError), overflow past the cap, any parse failure including RecursionError, and a payload that parses but is not an object (or whose tool_input is not an object) all emit permissionDecision: deny at exit 0 — never a non-zero exit, which is a non-blocking error that lets the tool call proceed."
     ],
     "constraints": [
       "Python stdlib only — no pip dependencies (hooks run at session boundaries where install state is unknown).",
