@@ -844,7 +844,7 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
-from check_items_cache import load_cache, save_cache, update_cache, canonical_hash
+from check_items_cache import locked_cache, update_cache, canonical_hash
 
 scope_path = os.environ["SCOPE_PATH"]
 classifications_path = os.environ["CLASSIFICATIONS_PATH"]
@@ -916,31 +916,54 @@ for fc in fresh_classifications:
     proj = fc.pop("_group_project", "unknown")
     fresh_by_proj.setdefault(proj, []).append(fc)
 
-cache = load_cache()
 # #305: reuse the HEAD captured at Step 3 rather than re-deriving it here. A
 # commit landing between Step 3 and Step 10 would otherwise stamp a mid-run
 # HEAD onto verdicts that were actually derived against the OLD head —
 # laundering them as verified-current when they were never checked against
 # this newer commit.
 heads = part.get("heads", {})
-for proj, proj_groups in groups_by_proj.items():
-    head = heads.get(proj)
-    if not head:
-        print(f"[check-items] no head captured at Step 3 for {proj}; skipping cache update",
-              file=sys.stderr)
-        continue
-    cache = update_cache(
-        cache=cache,
-        project=proj,
-        all_groups=proj_groups,
-        fresh_classifications=fresh_by_proj.get(proj, []),
-        head_sha=head,
-    )
+# #306: locked_cache() serializes the whole load-mutate-save cycle behind a
+# lock, so a concurrent run on a different project (same shared
+# cross-project cache file) cannot overwrite this run's update with a stale
+# snapshot. It loads, yields the cache to mutate below, and saves + releases
+# once this block exits.
+#
+# #323 F3: two paths previously skipped the save entirely and left the run
+# looking clean anyway — a body exception, or save_cache() itself raising
+# (a full or read-only disk) — with nothing telling the driving agent to
+# notice. Both are now caught here and reported explicitly rather than
+# left as a bare traceback. #323 F6: `update_cache()` mutates `cache` IN
+# PLACE and its return value is deliberately left unassigned below —
+# locked_cache() saves its OWN `cache` binding, so reassigning that name to
+# update_cache's return value here would be invisible to it the day
+# update_cache() stops returning the same object it was given (see
+# locked_cache()'s docstring).
+try:
+    with locked_cache() as cache:
+        for proj, proj_groups in groups_by_proj.items():
+            head = heads.get(proj)
+            if not head:
+                print(f"[check-items] no head captured at Step 3 for {proj}; skipping cache update",
+                      file=sys.stderr)
+                continue
+            update_cache(
+                cache=cache,
+                project=proj,
+                all_groups=proj_groups,
+                fresh_classifications=fresh_by_proj.get(proj, []),
+                head_sha=head,
+            )
+except Exception as exc:
+    # stdout, not stderr: skills/standup/SKILL.md documents stderr as
+    # ignorable, and this line must actually be noticed.
+    print(f"cache NOT updated: {exc}")
+    sys.exit(1)
 
-save_cache(cache)
 print("cache updated")
 PYEOF
 ```
+
+**#323 F3 — if the block above printed `cache NOT updated: <reason>` and exited non-zero:** STOP here — do not summarise this run as clean, and do not report `Cached: N reused, M fresh` (from Step 7) as if it were the final state. Report the `cache NOT updated: ...` line to the user verbatim. This run's classifications are lost (fail-safe: every group re-derives from scratch next run, at the cost of re-classification tokens, never incorrect output) — but any checkoffs already applied in Step 8 are on disk and unaffected.
 
 ## Output format
 
@@ -952,9 +975,12 @@ PYEOF
   Report: ~/Obsidian/claude-check-items/check-items-obsidian-brain-2026-05-11.md
   Cascaded: 2 sibling notes
   Skipped: 3 sibling(s) refused or lost — see report for basename:line detail
+  Cache: updated
 ```
 
 `Skipped:` (#320 F1) is populated from `cascade_skipped_total` (Step 8) — the count of cascade candidates that were refused (drift, unverifiable stored text, checkbox already gone) or lost (a failed write), summed across every `Skipped ...`/`WRITE FAILED` line in the cascade summary. Omit the line entirely when `cascade_skipped_total` is 0 — don't print `Skipped: 0`.
+
+`Cache:` (#323 F3) reflects Step 10's outcome and is always printed, never omitted: `updated` on success, or `NOT updated — <reason>; verdicts will be re-derived next run` when Step 10 printed `cache NOT updated: <reason>` and exited non-zero.
 
 ## Notes
 

@@ -490,3 +490,120 @@ def test_check_items_heads_handoff_key_matches():
         f"{write.group(1)!r} but Step 10 reads {read.group(1)!r} — every "
         "cache update would be silently skipped"
     )
+
+
+def test_check_items_step10_uses_locked_cache_not_bare_save():
+    """#306: Step 10 must persist cache updates through locked_cache(), the
+    context manager that serializes the whole load-mutate-save cycle behind
+    a lock, not the old unlocked `load_cache()` ... `save_cache(cache)`
+    pair. Skills are advisory prose, not enforced code (memory:
+    feedback_skills_advisory_not_enforcement) — a future edit could
+    silently drop back to the bare calls without anyone noticing; this pins
+    the call shape so that regresses as a failing test instead.
+
+    Extracted from the Step 10 block specifically (bounded by the next
+    `## ` header), not the whole file, so Step 3's own unlocked
+    load_cache() call — deliberately read-only per the #306 spec — cannot
+    false-positive this check.
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+
+    step10_start = content.index("## Step 10")
+    rest = content[step10_start + len("## Step 10"):]
+    next_header = re.search(r"\n## ", rest)
+    step10 = rest[:next_header.start()] if next_header else rest
+
+    assert re.search(r"from check_items_cache import[^\n]*\blocked_cache\b", step10), (
+        "Step 10 must import locked_cache from check_items_cache"
+    )
+    assert re.search(r"\bwith\s+locked_cache\s*\(", step10), (
+        "Step 10 must persist cache updates via `with locked_cache(...)`, "
+        "not a bare load_cache()/save_cache() pair"
+    )
+    assert not re.search(r"(?<!\w)save_cache\s*\(\s*cache\s*\)", step10), (
+        "Step 10 must not call save_cache(cache) directly — locked_cache() "
+        "saves internally as part of its lock-protected cycle"
+    )
+
+
+def _read_step10():
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    step10_start = content.index("## Step 10")
+    rest = content[step10_start + len("## Step 10"):]
+    next_header = re.search(r"\n## ", rest)
+    return content, rest[:next_header.start()] if next_header else rest
+
+
+def test_check_items_step10_reports_failure_on_stdout_and_exits_nonzero():
+    """#323 F3: two paths previously skipped the save entirely (a body
+    exception; save_cache() itself raising on a full/read-only disk) and
+    left the run looking clean anyway — nothing told the driving agent to
+    notice, and the terminal output still showed Step 7's `Cached: N
+    reused, M fresh` as if it were the final state. Step 10 must now catch
+    both, print `cache NOT updated: <reason>` on STDOUT (mirrors the
+    existing `#320 F2` precedent in Step 8: stderr is documented elsewhere
+    in this repo, skills/standup/SKILL.md, as ignorable, so the failure
+    signal must not live there), and exit non-zero."""
+    _, step10 = _read_step10()
+
+    assert re.search(r'except\s+Exception\s+as\s+\w+:', step10), (
+        "Step 10 must wrap the locked_cache block in a try/except so a "
+        "body exception or a save_cache() failure is caught rather than "
+        "left as a bare traceback"
+    )
+    assert re.search(r'print\(f?"cache NOT updated', step10), (
+        "Step 10 must print 'cache NOT updated: <reason>' when the "
+        "locked_cache block fails"
+    )
+    assert re.search(r'print\(f?"cache NOT updated[^\n]*\n\s*sys\.exit\(1\)', step10), (
+        "Step 10 must exit non-zero right after reporting the failure "
+        "(not merely print it and fall through as if nothing happened)"
+    )
+    assert 'print("cache updated")' in step10, (
+        "the pre-existing success message must still be there for the "
+        "happy path"
+    )
+
+
+def test_check_items_step10_does_not_rebind_cache_from_update_cache():
+    """#323 F6: `update_cache()` mutates its `cache` argument IN PLACE and
+    returns that same object — but `locked_cache()` saves its OWN `cache`
+    binding, not whatever a caller inside the `with` block reassigns the
+    name to. `cache = update_cache(...)` is safe today only because the
+    return value happens to be the same object; the day update_cache()
+    returns a copy instead, every run would silently persist the
+    pre-mutation snapshot while still printing 'cache updated'. Step 10
+    must call update_cache(...) unassigned."""
+    _, step10 = _read_step10()
+
+    assert not re.search(r"\bcache\s*=\s*update_cache\s*\(", step10), (
+        "Step 10 must not rebind `cache = update_cache(...)` — "
+        "locked_cache() saves its own binding, not the rebind (#323 F6)"
+    )
+    assert re.search(r"\bupdate_cache\(\s*\n", step10), (
+        "Step 10 must still call update_cache(...) (unassigned) so the "
+        "cache is actually mutated"
+    )
+
+
+def test_check_items_output_format_has_a_cache_line():
+    """#323 F3: the Output format block must surface Step 10's outcome via
+    a `Cache:` line, unconditionally printed — unlike `Skipped:`, which is
+    intentionally omitted when zero, `Cache:` must always appear so a
+    dropped update can never be mistaken for silence meaning success."""
+    content, _ = _read_step10()
+    output_start = content.index("## Output format")
+    output_block = content[output_start:output_start + 2000]
+
+    assert "Cache: updated" in output_block, (
+        "the example Output format block must show the success case, "
+        "`Cache: updated`"
+    )
+    assert "NOT updated" in output_block, (
+        "the Output format section must document the failure wording, "
+        "`NOT updated — <reason>`"
+    )
