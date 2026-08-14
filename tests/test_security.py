@@ -1313,6 +1313,116 @@ class TestScopeGuardCannotBeBypassed:
             f"{hook} let one out-of-scope occurrence descope the whole command"
         )
 
+    # Prefixes containing a `cd` the shell never executes as a directory
+    # change: quoted text, a command substitution, a backtick substitution.
+    INERT_CD_PREFIXES = (
+        'echo "x; cd /tmp" && ',
+        "echo 'x; cd /tmp' && ",
+        "X=$(true; cd /tmp) && ",
+        "X=`true; cd /tmp` && ",
+    )
+
+    @pytest.mark.parametrize("prefix", INERT_CD_PREFIXES)
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_a_cd_that_never_executes_does_not_disarm_the_gate(self, probe, hook, prefix):
+        """A `cd` inside quotes or a substitution is TEXT, not a cwd change.
+
+        The `cd` regex matches raw command text, so it honoured a `cd` inside
+        "..." / '...' / $(...) / `...` — none of which move the shell. The verb
+        then ran HERE while the guard concluded it ran elsewhere, and every one
+        of these four shapes disarmed all five gates. Pre-existing (develop's
+        first-cd-anywhere search allows them too), but the guard's own claim is
+        that descoping is PROVABLE, and a `cd` that never ran proves nothing.
+        """
+        work, env, _ = probe
+        command = prefix + self.VERBS[hook]
+        assert self._decide(work, env, hook, command) == "deny", (
+            f"{hook} was disarmed by a cd the shell would never execute: {prefix!r}"
+        )
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_a_line_continuation_is_whitespace_not_a_separator(self, probe, hook):
+        """`cd /other && \\<newline> <verb>` must still ALLOW.
+
+        A backslash-newline is a line continuation — whitespace — but the bare
+        `\\n` reached the `&&`-only connector rule, failed it, and re-scoped a
+        command that genuinely ran elsewhere. `cd /other/repo && \\` is routine,
+        so this denied real cross-repo work and looked like the other repo's
+        fault. A BARE newline is left alone: that one IS a separator, and a
+        failed `cd` before it runs the verb here.
+        """
+        work, env, elsewhere = probe
+        command = f"cd {elsewhere} && \\\n  " + self.VERBS[hook]
+        assert self._decide(work, env, hook, command) == "allow", (
+            f"{hook} gated a line-wrapped command that ran in {elsewhere}"
+        )
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_an_over_captured_cd_target_leaves_the_command_in_scope(self, probe, hook):
+        """`cd /other;<verb>` — no space after the `;` — must DENY.
+
+        The bare-target group is `\\S+`, so it swallows the separator too and
+        captures `/other;git`. That puts the end of the `cd` match PAST the
+        verb, making the connector slice empty, and the `not connectors` arm of
+        the connector rule is the only thing that keeps this gated — nothing
+        else in this class reaches it. Deny is also the right answer on its own
+        terms: a `;` does not prove the `cd` succeeded.
+        """
+        work, env, elsewhere = probe
+        command = f"cd {elsewhere};" + self.VERBS[hook]
+        assert self._decide(work, env, hook, command) == "deny", (
+            f"{hook} descoped a command whose cd target was mis-captured"
+        )
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_subshell_cd_descopes_only_within_that_subshell(self, probe, hook):
+        """`(cd /other && <verb>)` allows; the same verb after the `)` denies.
+
+        The user's global CLAUDE.md mandates `(cd dir && cmd)` over a bare
+        `cd`, so gating that shape denied a documented-legit way to work in
+        another checkout. A subshell's cwd is real — but only until the `)`.
+        Admitting a leading `(` without checking the subshell is still open
+        would just move the bypass: `(cd /other) && <verb>` runs the verb here.
+        """
+        work, env, elsewhere = probe
+        verb = self.VERBS[hook]
+        assert self._decide(work, env, hook, f"(cd {elsewhere} && {verb})") == "allow", (
+            f"{hook} gated a subshell command that ran in {elsewhere}"
+        )
+        for escaped in (
+            f"(cd {elsewhere} && {verb}) && {verb}",
+            f"(cd {elsewhere} && true) && {verb}",
+            f"X=$(cd {elsewhere} && pwd) && {verb}",
+        ):
+            assert self._decide(work, env, hook, escaped) == "deny", (
+                f"{hook} let a closed subshell descope a verb outside it: {escaped!r}"
+            )
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_a_cd_inside_a_substitution_never_descopes(self, probe, hook):
+        """`X=$(cd /other && <verb>)` must DENY — deliberately over-strict.
+
+        Here the verb really does run in /other: it is inside the same
+        substitution subshell as the `cd`. The guard refuses to reason about
+        that anyway and treats any `cd` inside `$( )` or backticks as no
+        evidence at all, because a substitution's interior is where quoting and
+        nesting are least reliably modelled by a regex-and-scanner pair, and
+        the cost of being wrong in the other direction is a gate that does not
+        fire. Gating an exotic shape costs a false denial; trusting it costs
+        the gate. Without this assertion the whole `$( )` distinction is
+        vacuous — the still-inside-the-subshell check already handles the
+        escaping shape `X=$(cd /other) && <verb>`.
+        """
+        work, env, elsewhere = probe
+        verb = self.VERBS[hook]
+        for command in (
+            f"X=$(cd {elsewhere} && {verb})",
+            f"X=`cd {elsewhere} && {verb}`",
+        ):
+            assert self._decide(work, env, hook, command) == "deny", (
+                f"{hook} descoped on a cd inside a substitution: {command!r}"
+            )
+
     @pytest.mark.parametrize("hook", HOOKS)
     def test_nul_byte_in_cd_target_denies_instead_of_crashing(self, probe, hook):
         """A NUL in the `cd` target raised ValueError out of os.path.realpath.
@@ -1379,29 +1489,50 @@ class TestScopeGuardCannotBeBypassed:
         /harden-repo installs each file standalone into other repos, where no
         shared module exists to import. Duplication is therefore deliberate —
         and drift between the copies is how one gate silently keeps a bug the
-        others were fixed for."""
-        sources = {}
+        others were fixed for.
+
+        The comparison follows the guard's whole call graph rather than just
+        its entry point: `_targets_this_project` delegates the "would the shell
+        actually run this cd" question to `_shell_scan`, and drift in one copy
+        of THAT is exactly as silent. The closure is derived, not listed, so a
+        helper added later is covered without editing this test.
+        """
+        closures = {}
         for hook in self.HOOKS:
             path = Path(".claude/hooks") / f"{hook}.py"
             src = path.read_text(encoding="utf-8")
-            found = [
-                node for node in ast.walk(ast.parse(src))
-                if isinstance(node, ast.FunctionDef)
-                and node.name == "_targets_this_project"
-            ]
-            assert len(found) == 1, (
-                f"{path} defines {len(found)} copies of _targets_this_project"
-            )
-            sources[hook] = ast.get_source_segment(src, found[0])
+            tree = ast.parse(src)
+            defined = {
+                n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)
+            }
+            assert "_targets_this_project" in defined, f"{path} defines no guard"
+
+            closure, pending = {}, ["_targets_this_project"]
+            while pending:
+                name = pending.pop()
+                if name in closure:
+                    continue
+                node = defined[name]
+                closure[name] = ast.get_source_segment(src, node)
+                pending.extend(
+                    call.func.id for call in ast.walk(node)
+                    if isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id in defined
+                )
+            closures[hook] = closure
 
         reference_hook = self.HOOKS[0]
-        reference = sources[reference_hook]
-        for hook, src in sources.items():
-            assert src == reference, (
-                f"{hook}.py's _targets_this_project has drifted from "
-                f"{reference_hook}.py's"
+        reference = closures[reference_hook]
+        for hook, closure in closures.items():
+            assert set(closure) == set(reference), (
+                f"{hook}.py's guard depends on {sorted(set(closure))}, "
+                f"{reference_hook}.py's on {sorted(set(reference))}"
             )
-
+            for name, source in closure.items():
+                assert source == reference[name], (
+                    f"{hook}.py's {name}() has drifted from {reference_hook}.py's"
+                )
 
 class TestScopeGuardFailsClosedWhenScopeIsUnknowable:
     """The guard's fail-safes, exercised on the function itself.
