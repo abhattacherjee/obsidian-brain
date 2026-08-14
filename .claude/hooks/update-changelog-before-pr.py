@@ -204,20 +204,163 @@ def add_context(message):
     sys.exit(0)
 
 
-def _targets_this_project(cmd):
-    """Check if the command targets a repo within this project."""
+def _shell_scan(prefix: str):
+    """Where a shell would textually BE at the end of ``prefix``.
+
+    Returns ``(executes, subshells)``.
+
+    ``executes`` is False when the position is inside `'...'`, `"..."`,
+    backticks or a ``$( )`` substitution, or when ``prefix`` does not parse
+    (unterminated quote, unbalanced ``)``). A ``cd`` at such a position is
+    either plain text or runs in a shell whose cwd nothing outside it ever
+    sees, so honouring it stood every gate down: ``echo "x; cd /tmp" && <verb>``
+    runs the verb right here (#326).
+
+    ``subshells`` is the tuple of start offsets of the plain ``( )`` subshells
+    still open. A ``cd`` inside one applies to the rest of THAT subshell and
+    nothing after it closes, so a caller must check the verb is still inside
+    the same ones — ``(cd /other) && <verb>`` runs the verb here.
+
+    Anything unparseable returns ``(False, ())``: the ``cd`` is dropped, which
+    leaves the command IN scope, the fail-closed direction.
+    """
+    i, n, stack, backtick = 0, len(prefix), [], False
+    while i < n:
+        c = prefix[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            j = prefix.find("'", i + 1)
+            if j < 0:
+                return False, ()
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and prefix[j] != '"':
+                j += 2 if prefix[j] == "\\" else 1
+            if j >= n:
+                return False, ()
+            i = j + 1
+        elif c == "`":
+            backtick = not backtick
+            i += 1
+        elif c == "$" and i + 1 < n and prefix[i + 1] == "(":
+            stack.append(None)  # substitution — its cwd never escapes
+            i += 2
+        elif c == "(":
+            stack.append(i)  # subshell — its cwd applies until it closes
+            i += 1
+        elif c == ")":
+            if not stack:
+                return False, ()
+            stack.pop()
+            i += 1
+        else:
+            i += 1
+    if backtick or any(s is None for s in stack):
+        return False, ()
+    return True, tuple(stack)
+
+
+def _targets_this_project(cmd: str, verb: str) -> bool:
+    """Check if the command targets a repo within this project.
+
+    Hooks run in their own process (cwd = project dir), so the git state the
+    hook inspects is the wrong repo's when Claude does 'cd /other/repo && ...'.
+    Parse the cd targets from the command to determine the effective repo.
+
+    ``verb`` is the regex the caller already matched to decide this command is
+    worth gating. It is used as a PATTERN, not a literal: a caller that
+    interpolates anything into it — a path, a branch name — must wrap that in
+    ``re.escape()``, or the positions computed here silently shift and the
+    scoping decision is made about the wrong offsets.
+
+    Only a ``cd`` that PRECEDES an occurrence of the verb can move it out of
+    this project — a ``cd`` after the verb cannot change where the verb already
+    acted, and honouring one turned every gate in this repo off (#326). Where
+    several ``cd``s precede an occurrence the last one wins, as in the shell:
+    ``cd /a && cd /b && <verb>`` runs in ``/b``.
+
+    A ``cd`` only counts when ``&&`` is the ONLY thing between it and the verb.
+    That is what makes the descoping provable: ``&&`` runs the verb only if the
+    ``cd`` succeeded, whereas ``cd /elsewhere ; <verb>`` runs the verb HERE the
+    moment the ``cd`` fails — and whether it fails is not knowable from the
+    command text. It must also be a ``cd`` the shell would really execute, and
+    one whose subshell the verb is still inside; see ``_shell_scan``.
+
+    Returns True (gate the command) unless EVERY occurrence of the verb is
+    provably somewhere else; a command that touches this project at all must
+    be gated. Every failure to establish scope — no CLAUDE_PROJECT_DIR, an
+    unresolvable path, a verb this function cannot find — also returns True,
+    because False here means the hook exits 0 without a decision, which the
+    PreToolUse contract reads as ALLOW.
+    """
+    # "\<newline>" is a line continuation, i.e. whitespace — not the command
+    # separator a bare newline is. Collapse it before any position is computed,
+    # so a legitimately descoped command that merely wraps lines is not read as
+    # having a non-"&&" connector.
+    cmd = cmd.replace("\\\n", " ")
+
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR", "")
     if not project_dir:
+        return True  # Can't determine scope, be safe
+
+    try:
+        project_dir = os.path.realpath(project_dir)
+    except (ValueError, OSError):
+        return True  # Unresolvable project dir — can't scope, be safe
+
+    try:
+        verb_positions = [m.start() for m in re.finditer(verb, cmd)]
+    except re.error:
+        return True  # Unusable verb pattern — can't scope, be safe
+    if not verb_positions:
+        # The caller matched this verb but this function cannot find it: the
+        # two matchers disagree, so gate rather than guess.
         return True
-    project_dir = os.path.realpath(project_dir)
-    cd_match = re.search(r'(?:^|[;&|]\s*)cd\s+("([^"]+)"|\'([^\']+)\'|(\S+))', cmd)
-    if cd_match:
-        target = cd_match.group(2) or cd_match.group(3) or cd_match.group(4)
-        target = os.path.expanduser(target)
-        target = os.path.expandvars(target)
-        target = os.path.realpath(target)
-        return target.startswith(project_dir)
-    return True
+
+    # Every "cd <target>" the shell would really run, keyed by where it takes
+    # effect and by the subshells it is nested in.
+    cd_matches = []
+    for m in re.finditer(
+        r'(?:^|[;&|(]\s*)(?P<cd>cd)\s+'
+        r'("(?P<dq>[^"]+)"|\'(?P<sq>[^\']+)\'|(?P<bare>\S+))', cmd
+    ):
+        executes, subshells = _shell_scan(cmd[:m.start("cd")])
+        if not executes:
+            continue
+        target = m.group("dq") or m.group("sq") or m.group("bare")
+        cd_matches.append((m.start(), m.end(), target, subshells))
+
+    for position in verb_positions:
+        preceding = [c for c in cd_matches if c[0] < position]
+        if not preceding:
+            # No cd before this occurrence — it runs in the session cwd, which
+            # IS this project.
+            return True
+        _, cd_end, target, subshells = preceding[-1]
+        # Only an unbroken run of "&&" carries the cd's effect to the verb.
+        connectors = re.findall(r'[;&|\n]+', cmd[cd_end:position])
+        if not connectors or any(c.strip() != "&&" for c in connectors):
+            return True
+        if subshells:
+            # The cd ran inside "( )". Its cwd is gone once that closes, so the
+            # verb has to still be inside every subshell the cd was inside.
+            verb_executes, verb_subshells = _shell_scan(cmd[:position])
+            if not verb_executes or verb_subshells[:len(subshells)] != subshells:
+                return True
+        try:
+            target = os.path.expanduser(target)
+            target = os.path.expandvars(target)
+            target = os.path.realpath(target)
+        except (ValueError, OSError):
+            return True  # Unresolvable target — assume it is this project
+        # os.sep matters: without it "/x/proj-evil" reads as inside "/x/proj".
+        if target == project_dir or target.startswith(project_dir + os.sep):
+            return True
+
+    # Every occurrence of the verb provably runs outside this project.
+    return False
 
 
 
@@ -324,7 +467,7 @@ def main():
         sys.exit(0)
 
     # Skip if targeting a different repo
-    if not _targets_this_project(command):
+    if not _targets_this_project(command, r"gh pr create"):
         sys.exit(0)
 
     # Check if changelog has entries under [Unreleased]
