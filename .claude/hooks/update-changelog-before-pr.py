@@ -162,7 +162,7 @@ def _targets_this_project(cmd):
 
 def main():
     try:
-        input_data = json.load(sys.stdin)
+        input_data = json.loads(sys.stdin.read(1_000_000))  # cap: CLAUDE.md stdin-read pattern; a truncated payload fails the JSON parse below
     except (json.JSONDecodeError, ValueError):
         block("Changelog hook received invalid input. Blocking PR as a safety measure.")
 
