@@ -119,16 +119,76 @@ def get_pr_base_branch(command):
     return "develop"  # default base for Git Flow
 
 
+def _warn(message):
+    """Best-effort stderr write, safe when fd 2 is closed.
+
+    Deliberately not ``print(..., file=sys.stderr)``: with fd 2 closed
+    ``sys.stderr`` is ``None`` and ``print(file=None)`` falls back to STDOUT,
+    which is the decision channel — a non-JSON line there is worse than
+    silence.
+    """
+    if sys.stderr is None:
+        return
+    try:
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def block(reason):
-    """Block the PR creation."""
-    output = {
+    """Emit a PreToolUse deny decision and exit 0 — or exit 2 if it cannot.
+
+    Exit 0 with ``permissionDecision: "deny"`` is what BLOCKS, but ONLY if the
+    JSON actually reached stdout. Exit 0 with nothing on stdout is an ALLOW, so
+    an unwritable decision channel silently turns this gate off. Measured with
+    fd 1 closed: all five hooks exited 0 with zero bytes on stdout and zero on
+    stderr — no traceback, no warning, command permitted.
+
+    Two mechanics make that reachable rather than theoretical:
+
+    * ``print()`` is a documented NO-OP when ``sys.stdout`` is ``None``, which
+      is what CPython sets it to when fd 1 is closed. It does not raise.
+    * ``print()`` BUFFERS. Against a pipe whose reader has gone away, the write
+      lands at interpreter shutdown — after ``sys.exit(0)`` has already fixed
+      the exit code — where ``BrokenPipeError`` is reported as "Exception
+      ignored" and changes nothing. Hence the explicit ``flush()`` INSIDE the
+      try: it drags that failure back to a point where it can still be acted
+      on.
+
+    The fallback is exit 2, the one blocking signal that needs no stdout —
+    with ``sys.stdout`` dropped first, or CPython's finalization re-flush fails
+    and overrides the status with 120 (measured), which is non-blocking. The
+    reason goes to stderr via ``sys.stderr.write`` guarded on truthiness, NOT
+    ``print(..., file=sys.stderr)`` — with fd 2 closed ``sys.stderr`` is
+    ``None`` and ``print(file=None)`` falls back to STDOUT, which would put a
+    non-JSON line on the decision channel.
+    """
+    payload = json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": reason
+            "permissionDecisionReason": reason,
         }
-    }
-    print(json.dumps(output))
+    })
+    try:
+        if sys.stdout is None:
+            raise OSError("stdout unavailable")
+        print(payload)
+        sys.stdout.flush()
+    except Exception:
+        _warn(f"BLOCKED: {reason}")
+        # Drop the unwritable streams before exiting. Otherwise CPython retries
+        # the flush during finalization, that failure makes Py_FinalizeEx fail,
+        # and the interpreter OVERRIDES the exit status with 120 — measured.
+        # 120 is non-zero, i.e. non-blocking, i.e. the fail-open this whole
+        # function exists to close. The buffered payload is undeliverable
+        # either way. stderr goes too, and only AFTER _warn() has had its
+        # chance: when both streams are the same dead pipe (`2>&1 |`), dropping
+        # stdout alone still exits 120 — measured.
+        sys.stdout = None
+        sys.stderr = None
+        raise SystemExit(2)
     sys.exit(0)
 
 
@@ -164,23 +224,89 @@ def _targets_this_project(cmd):
 _STDIN_CAP = 1_000_000
 
 
+def _payload_shape_ok(data):
+    """True when the payload matches what every caller below already assumes.
+
+    Not defensive typing for its own sake — each of these was measured failing
+    OPEN on all five hooks. ``tool_input`` as a string gives ``'str' object has
+    no attribute 'get'``; ``command`` as an int gives ``argument of type 'int'
+    is not iterable`` at the first ``in``/``re.search``. Both are tracebacks,
+    both exit non-zero, and a non-zero exit is a NON-blocking error: the gated
+    command runs.
+    """
+    if not isinstance(data, dict):
+        return False
+    if not isinstance(data.get("tool_name", ""), str):
+        return False
+    tool_input = data.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        return False
+    return isinstance(tool_input.get("command", ""), str)
+
+
 def _read_hook_input(what):
     """Read the hook payload, capped, failing CLOSED on anything unusable.
 
     ``read(_STDIN_CAP + 1)`` makes an oversize payload an explicit condition
     rather than a silent truncation that only ever surfaces as a confusing
-    parse error (CLAUDE.md's documented overflow-detection idiom). Both
-    overflow and a parse failure route to ``block()``: a gate that cannot read
-    its input has not established that the command is safe.
+    parse error (note_writer's overflow-detection idiom, extended here to the
+    .claude/hooks/ gates). Everything that can go wrong routes to ``block()``, because a gate
+    that cannot read its input has not established that the command is safe —
+    and every uncaught alternative is fail-OPEN, since an exception exits
+    non-zero and a non-zero exit is a NON-blocking error under the PreToolUse
+    contract.
+
+    Four failure modes, each measured against these scripts:
+
+    * the READ itself, caught as broadly as the parse. Invalid UTF-8 raises
+      ``UnicodeDecodeError`` before ``json.loads`` is ever reached, so the
+      read has to be inside a ``try`` at all — but a narrow
+      ``(UnicodeDecodeError, OSError)`` is not enough either: with fd 0
+      closed, CPython sets ``sys.stdin`` to ``None``, so the failure is an
+      ``AttributeError`` on the attribute access and never reaches ``read()``,
+      and a closed file object raises ``ValueError``, which is not an
+      ``OSError``. Measured: all five hooks exited 1 on ``<&-``.
+    * the PARSE. ``json.JSONDecodeError`` is not all ``json.loads`` raises:
+      ~400 KB of nested ``[`` — comfortably under the cap — raises
+      ``RecursionError``, which is not a ``ValueError``. Hence bare
+      ``except Exception``.
+    * the SHAPE. ``null``, ``[]``, ``5``, ``"5"`` and ``true`` all parse
+      cleanly and then blow up on ``.get()`` in the caller.
+    * the NESTED shape. See ``_payload_shape_ok``.
+
+    The guarantee has a floor, and it is the interpreter, not this function:
+    fail-closed holds from the hook's first statement onward. Hand the process
+    a DIRECTORY as stdin and CPython aborts in ``init_sys_streams`` ("<stdin>
+    is a directory, cannot continue") before any of this code runs — exit 1,
+    which is non-blocking, and nothing in the script can intervene.
     """
-    raw = sys.stdin.read(_STDIN_CAP + 1)
-    if len(raw) > _STDIN_CAP:
-        block(f"{what} received a payload over {_STDIN_CAP} bytes. "
-              "Blocking as a safety measure.")
     try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        block(f"{what} received invalid input. Blocking as a safety measure.")
+        raw = sys.stdin.read(_STDIN_CAP + 1)
+    except Exception:
+        block(f"{what} could not read its input. Blocking as a safety measure.")
+    else:
+        if len(raw) > _STDIN_CAP:
+            block(f"{what} received a payload over {_STDIN_CAP} bytes. "
+                  "Blocking as a safety measure.")
+        else:
+            try:
+                data = json.loads(raw)
+            except Exception:
+                block(f"{what} received invalid input. "
+                      "Blocking as a safety measure.")
+            else:
+                if _payload_shape_ok(data):
+                    return data
+                block(f"{what} received a malformed payload. "
+                      "Blocking as a safety measure.")
+    # Cheap insurance, not a live bug. block() raises SystemExit, a
+    # BaseException, and nothing in this tree catches BaseException or
+    # bare-excepts, so this line is unreachable today (verified). It exists so
+    # that if block() ever returns, callers get a block — exit 2 is the blocking
+    # code — instead of an implicit `return None` they would AttributeError on,
+    # which is the same fail-open class the checks above close.
+    _warn(f"{what}: input handling fell through without a decision. Blocking.")
+    raise SystemExit(2)
 
 
 def main():
