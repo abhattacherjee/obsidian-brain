@@ -1475,7 +1475,10 @@ class TestScopeGuardCannotBeBypassed:
         for node in ast.walk(tree):
             if isinstance(node, ast.If):
                 test_src = ast.get_source_segment(src, node.test) or ""
-                if "re.search" in test_src and "pr" in test_src:
+                # The verb is matched through _verb_occurrences() since #327,
+                # so that both the gate and the scope check below it use one
+                # matcher and cannot disagree about where the verb is.
+                if "_verb_occurrences" in test_src and "_GH_PR_" in test_src:
                     guarded.extend(scope_calls(node))
 
         assert len(scope_calls(tree)) == len(guarded) == 2, (
@@ -1520,6 +1523,32 @@ class TestScopeGuardCannotBeBypassed:
                     and isinstance(call.func, ast.Name)
                     and call.func.id in defined
                 )
+
+            # Module-level names the closure READS are part of it: a
+            # _TRANSPARENT_TOKENS that drifts in one copy changes where that
+            # copy thinks a verb is a command, as silently as a drifted body.
+            # Names the closure BINDS are subtracted first — a local called
+            # `match` must not drag in a module-level `match` that happens to
+            # share its name.
+            read, bound = set(), set()
+            for name in closure:
+                read.update(
+                    n.id for n in ast.walk(defined[name])
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+                )
+                bound.update(
+                    n.id for n in ast.walk(defined[name])
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+                )
+                bound.update(
+                    a.arg for a in ast.walk(defined[name]) if isinstance(a, ast.arg)
+                )
+            read -= bound
+            for stmt in tree.body:
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name) and target.id in read:
+                            closure[target.id] = ast.get_source_segment(src, stmt)
             closures[hook] = closure
 
         reference_hook = self.HOOKS[0]
@@ -1552,13 +1581,54 @@ class TestScopeGuardFailsClosedWhenScopeIsUnknowable:
 
     @staticmethod
     def _helper(os_module=os):
+        """Load `_targets_this_project` and everything it reads, from the file.
+
+        The whole call closure comes along, not just the entry point: the
+        guard delegates "where would the shell be" to `_shell_scan` and "where
+        would the verb actually run" to `_verb_occurrences`, and a namespace
+        missing either raises NameError inside the function under test, which
+        is a traceback, rc 1, and non-blocking. Module-level names the closure
+        reads travel with it for the same reason. Both sets are derived from
+        the AST, so a helper added later needs no edit here.
+        """
         src = Path(".claude/hooks/require-preflight.py").read_text(encoding="utf-8")
-        node = [
-            n for n in ast.walk(ast.parse(src))
-            if isinstance(n, ast.FunctionDef) and n.name == "_targets_this_project"
-        ][0]
+        tree = ast.parse(src)
+        defined = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+        closure, pending = {}, ["_targets_this_project"]
+        while pending:
+            name = pending.pop()
+            if name in closure:
+                continue
+            node = defined[name]
+            closure[name] = node
+            pending.extend(
+                call.func.id for call in ast.walk(node)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id in defined
+            )
+
+        read, bound = set(), set()
+        for node in closure.values():
+            read.update(
+                n.id for n in ast.walk(node)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+            )
+            bound.update(
+                n.id for n in ast.walk(node)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+            )
+            bound.update(a.arg for a in ast.walk(node) if isinstance(a, ast.arg))
+        read -= bound
         namespace = {"os": os_module, "re": re}
-        exec(ast.get_source_segment(src, node), namespace)  # noqa: S102
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id in read for t in stmt.targets
+            ):
+                exec(ast.get_source_segment(src, stmt), namespace)  # noqa: S102
+        for node in closure.values():
+            exec(ast.get_source_segment(src, node), namespace)  # noqa: S102
         return namespace["_targets_this_project"]
 
     def test_verb_the_caller_matched_but_this_cannot_find_is_in_scope(self, monkeypatch, tmp_path):
@@ -1602,3 +1672,379 @@ class TestScopeGuardFailsClosedWhenScopeIsUnknowable:
         )
         helper = self._helper(shim)
         assert helper(f"cd {tmp_path}-elsewhere && git com" + "mit", r"git com" + "mit") is True
+
+
+class TestVerbMatchingAndRefspecPushes:
+    """#327: what makes a command "a push", and what makes it "to main".
+
+    Three defects of one shape — a gate deciding by substring what the shell
+    decides by grammar.
+
+    * `prevent-direct-push` built a refspec-aware list of protected targets
+      (`":main"`, `":develop"`) under a comment claiming refspec coverage, and
+      then guarded it with a strictly NARROWER `if` that no refspec form could
+      satisfy. Every refspec push fell through to allow, force ones included.
+    * All three git gates matched their verb as a literal substring. Git
+      accepts global options between the executable and the subcommand, so
+      `git -C . <verb>` contains no such substring and the hook exited 0
+      before any other logic ran.
+    * `"origin main" in command` is a prefix test, so `origin maintenance`
+      denied, as did any command merely QUOTING a push.
+
+    Measured hermetically before the fix, on a feature branch: 7 refspec/force
+    forms allowed, 5 global-option shapes allowed, 3 false denies.
+
+    The fixture is TestHookBlockingPathsFire._repo, a throwaway repo on
+    `feature/probe`. Probing from `develop` would make
+    `current_branch in ["main", "develop"]` deny every shape regardless of its
+    form — control and case cannot diverge, and every verdict is then the
+    same verdict. Each deny case re-probes an allow control in the SAME repo
+    so that a hook which denies everything cannot pass as a fixed one.
+
+    Command strings are assembled from fragments on purpose: this repo's live
+    PreToolUse hooks inspect unexecuted command text, so a literal
+    protected-branch push string in this file blocks the tooling that reads it.
+    """
+
+    PUSH = "git pu" + "sh"
+    MAIN = "ma" + "in"
+    DEV = "deve" + "lop"
+    CONTROL_ALLOW = PUSH + " origin feature/probe"
+
+    # F1 — every one of these pushes a protected branch without ever saying
+    # "origin main"; all seven were allowed.
+    REFSPEC_DENY = (
+        PUSH + " origin " + MAIN,                      # control: this DID deny
+        PUSH + " origin HEAD:" + MAIN,
+        PUSH + " origin HEAD:" + DEV,
+        PUSH + " --force origin HEAD:" + MAIN,
+        PUSH + " origin mybranch:" + MAIN,
+        PUSH + " origin +" + MAIN + ":" + MAIN,
+        PUSH + " --force-with-lease origin HEAD:" + MAIN,
+        PUSH + " origin HEAD:refs/heads/" + MAIN,
+    )
+
+    # F2 — a global option between `git` and the subcommand, in each of the
+    # three gates that matched its verb as a literal.
+    GLOBAL_OPTION_DENY = (
+        ("prevent-direct-push", "git -C . pu" + "sh origin " + MAIN),
+        ("prevent-direct-push", "git -c user.name=x pu" + "sh origin " + MAIN),
+        ("prevent-direct-push", "git --no-pager pu" + "sh origin " + MAIN),
+        ("prevent-direct-push",
+         "git -C . -c user.name=x pu" + "sh origin HEAD:" + MAIN),
+        # A long option run, which is where the obvious way to write this
+        # pattern collapses. `-{1,2}` splits every long option two ways, so a
+        # run that never reaches the subcommand backtracks exponentially
+        # (measured: 26 options, 16.7s of CPU inside the gate, on command text
+        # written by whoever is being gated). Capping the repetition caps that
+        # cost and hands back a bypass — one option past the cap and the gate
+        # stops matching. This row is 25 of them, and it must still deny.
+        ("prevent-direct-push",
+         "git " + "-c user.name=x " * 25 + "pu" + "sh origin " + MAIN),
+        ("validate-branch-name", "git -C . chec" + "kout -b bogus"),
+        ("require-preflight", "git -C . com" + "mit -m x"),
+    )
+
+    # F3/F4 — shapes that are not a push to a protected branch and denied
+    # anyway, plus the negative controls that keep the fix from being
+    # "match anything containing push".
+    NEGATIVE_ALLOW = (
+        PUSH + " origin " + MAIN + "tenance",       # F4: whole ref, not prefix
+        PUSH + " origin foo:" + MAIN + "line",      # F4: the other side
+        PUSH + " origin feature/" + MAIN,           # F4: a ref merely ending in it
+        "echo " + PUSH + " origin " + MAIN,         # F3: an argument, not a command
+        'echo "' + PUSH + " origin " + MAIN + '"',  # F3: quoted
+        "grep -r '" + PUSH + " origin " + MAIN + "' .",
+        # A separator INSIDE the quotes. Without this row the quoted-state
+        # check is shadowed: for `echo "<push>"` the command-position walk
+        # already rejects the occurrence on its own, so that guard could be
+        # deleted with the suite still green (#326 shipped two guards like
+        # that). Here the `;` makes the position look like a command start,
+        # and only "this is inside quotes" saves it.
+        'echo "; ' + PUSH + " origin " + MAIN + '"',
+        "git pu" + "shd /tmp",                      # not the push verb
+        PUSH + " origin v1.2.3",                    # tag push, allowed before too
+        PUSH + " origin feature/probe",
+    )
+
+    @pytest.mark.parametrize("command", REFSPEC_DENY)
+    def test_a_refspec_push_to_a_protected_branch_denies(self, tmp_path, command):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, "prevent-direct-push", command) == "deny", (
+            f"a protected branch was pushed without the gate objecting: {command!r}"
+        )
+        assert decide(work, env, "prevent-direct-push", self.CONTROL_ALLOW) == "allow", (
+            "the fixture denies a feature-branch push too, so it cannot tell a "
+            "fixed gate from one that denies everything"
+        )
+
+    @pytest.mark.parametrize("hook,command", GLOBAL_OPTION_DENY)
+    def test_a_global_git_option_does_not_evade_the_verb_guard(
+        self, tmp_path, hook, command
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, hook, command) == "deny", (
+            f"{hook} never saw this command: git takes global options before "
+            f"the subcommand, so the literal verb is not in it: {command!r}"
+        )
+        assert decide(work, env, hook, "git status") == "allow", (
+            f"{hook} denies an unrelated command, so this fixture proves nothing"
+        )
+
+    @pytest.mark.parametrize("command", NEGATIVE_ALLOW)
+    def test_shapes_that_are_not_a_protected_push_allow(self, tmp_path, command):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, "prevent-direct-push", command) == "allow", (
+            f"false deny — this is not a push to a protected branch: {command!r}"
+        )
+        assert decide(work, env, "prevent-direct-push",
+                      self.PUSH + " origin " + self.MAIN) == "deny", (
+            "the fixture allows a real protected push, so it cannot tell a "
+            "fixed gate from a disabled one"
+        )
+
+    def test_a_quoted_verb_still_denies_when_it_is_also_a_real_command(self, tmp_path):
+        """The quoted-mention allowance must not disarm the command beside it.
+
+        `echo "<push>" && <push>` mentions the verb twice: once as data, once
+        as a command. Dropping the inert occurrence is only safe because the
+        live one is still found.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = ('echo "' + self.PUSH + " origin " + self.MAIN + '" && '
+                   + self.PUSH + " origin " + self.MAIN)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny"
+
+    def test_an_exec_wrapper_does_not_make_the_verb_an_argument(self, tmp_path):
+        """`sudo <push>` and `env A=b <push>` DO push, unlike `echo <push>`.
+
+        Command-position matching is what stops `echo <push>` denying, and the
+        obvious way to write it — "the verb must be the first word after a
+        separator" — hands back an off switch to anything that runs its
+        arguments. These walk back over transparent tokens instead.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        for command in (
+            "sudo " + self.PUSH + " origin " + self.MAIN,
+            "env GIT_TRACE=1 " + self.PUSH + " origin " + self.MAIN,
+            "time " + self.PUSH + " origin " + self.MAIN,
+            "true && sudo " + self.PUSH + " origin " + self.MAIN,
+        ):
+            assert TestHookBlockingPathsFire._decide(
+                work, env, "prevent-direct-push", command) == "deny", (
+                f"an exec wrapper stood the gate down: {command!r}"
+            )
+
+    def test_a_prefix_that_does_not_parse_keeps_the_occurrence(self, tmp_path):
+        """A `)` with nothing open makes the prefix unparseable — and an
+        unplaceable verb must be KEPT, not dropped.
+
+        The three non-executing states are not interchangeable: "quoted" is
+        proof the verb is inert, "unparseable" is proof of nothing, and
+        dropping an occurrence is an allow. A `case` arm is the ordinary way
+        to write that prefix.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = ("case $x in a) " + self.PUSH + " origin " + self.MAIN
+                   + " ;; esac")
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny"
+
+    def test_an_absolute_path_to_git_is_still_git(self, tmp_path):
+        """`/usr/bin/git <verb>` contains no `git <verb>` at a word boundary
+        the naive way either, and command-position matching would read the
+        path as the preceding word if the pattern did not include it."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push",
+            "/usr/bin/git pu" + "sh origin " + self.MAIN) == "deny"
+
+    def test_the_branch_name_comes_from_the_command_that_runs(self, tmp_path):
+        """validate-branch-name extracts the name with its own regex, which
+        had to move with the verb: `git -C . checkout -b bogus` reaching the
+        gate is worth nothing if the extraction then finds no name and the
+        hook exits 0."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, "validate-branch-name",
+                      "git -C . chec" + "kout -b feature/fine") == "allow"
+        assert decide(work, env, "validate-branch-name",
+                      "git -C . chec" + "kout -b bogus") == "deny"
+
+    def test_a_descoped_push_is_still_descoped(self, tmp_path):
+        """Negative control for the whole verb-matching change: the #326 scope
+        helper is fed the SAME pattern the gate matched, so a push that
+        provably runs in another checkout must still allow."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        command = f"cd {elsewhere} && git -C . pu" + "sh origin " + self.MAIN
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow"
+
+
+class TestGitSubprocessHandlersAreWideEnough:
+    """#327 F5: `except (CalledProcessError, FileNotFoundError)` is too narrow.
+
+    A `git` on PATH that exists and is not executable raises PermissionError.
+    It is an OSError, as FileNotFoundError is, but only the latter was named —
+    so the exception escaped, the hook exited 1, and rc 1 is a NON-BLOCKING
+    error under the PreToolUse contract: the command proceeds.
+
+    What makes this narrowness rather than a design gap is that the code
+    already intends to survive a git failure — it falls back to an empty
+    branch name and carries on, and that fallback is safe in the deny
+    direction. The exception tuple simply did not admit the failure.
+    """
+
+    @staticmethod
+    def _shimmed(tmp_path, env, *names):
+        """PATH holding nothing but non-executable stand-ins for `names`.
+
+        PREPENDING the shim proves nothing, and silently: `execvp` semantics
+        are to treat EACCES as "keep looking", and CPython's exec loop does
+        the same, so the real `git` further down PATH is found and the test
+        tautologises into the ordinary happy path. Measured — the first
+        version of this fixture passed against the UNFIXED handler.
+        """
+        shim = tmp_path / "shim"
+        shim.mkdir(exist_ok=True)
+        for name in names:
+            target = shim / name
+            target.write_text("#!/bin/sh\nexit 0\n")
+            target.chmod(0o600)  # readable, NOT executable -> PermissionError
+        return dict(env, PATH=str(shim))
+
+    def test_a_non_executable_git_does_not_turn_the_push_gate_off(self, tmp_path):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = self._shimmed(tmp_path, env, "git")
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push",
+            "git pu" + "sh origin ma" + "in") == "deny", (
+            "the push gate did not survive an unusable git; an uncaught "
+            "PermissionError is rc 1, and rc 1 is non-blocking"
+        )
+
+    def test_a_non_executable_git_does_not_crash_the_pr_base_gate(self, tmp_path):
+        """The decision here is unchanged — with no branch name the PR-base
+        gate has nothing to object to and allows. What the widened handler
+        buys is that it allows at rc 0 instead of dying at rc 1, which the
+        _decide helper is what checks."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = self._shimmed(tmp_path, env, "git")
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch",
+            "gh pr cre" + "ate --title x") == "allow"
+
+    def test_an_unusable_gh_blocks_the_merge_it_cannot_verify(self, tmp_path):
+        """`gh pr merge` with no PR number resolves one by running gh. When
+        that raised PermissionError the hook exited 1 and the merge went
+        ahead unverified; the deny it already had for a failed gh is the
+        right outcome and is now reachable."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = self._shimmed(tmp_path, env, "git", "gh")
+        for command in ("gh pr me" + "rge", "gh pr me" + "rge 5"):
+            assert TestHookBlockingPathsFire._decide(
+                work, env, "enforce-pr-base-branch", command) == "deny", (
+                f"the base-branch check could not run and did not block: {command!r}"
+            )
+
+
+class TestAdvisoryOutputUsesTheSameChannelRules:
+    """#327 F6: two ways to write the decision channel, one knowing the rules.
+
+    `_deny`/`block` flush inside a try and fall back to exit 2; the ALLOW-side
+    sites were left on a bare `print()`. That is not a fail-open — the
+    intended outcome there IS allow, and 120 is non-blocking — but on a dead
+    pipe it produced `rc=120` and an `Exception ignored on flushing
+    sys.stdout` in the transcript on a path where nothing is wrong. Both now
+    go through one `_emit()`.
+
+    The payload is driven straight into `_emit` rather than through a gated
+    command: reaching the advisory branch through the business logic needs a
+    live preflight token in one hook and a CHANGELOG in the other, and neither
+    has anything to do with what is being tested.
+    """
+
+    HOOKS = ("require-preflight", "update-changelog-before-pr")
+
+    DRIVER = (
+        "import runpy, sys\n"
+        # run_name is deliberately not __main__: these hooks guard their entry
+        # point with it, and running main() would read stdin and decide things.
+        "mod = runpy.run_path(sys.argv[1], run_name='loaded_for_test')\n"
+        "mod['_emit']({'hookSpecificOutput': {'hookEventName': 'PreToolUse',"
+        " 'additionalContext': 'advisory'}})\n"
+    )
+
+    def _run(self, hook, stdout):
+        return subprocess.run(
+            [sys.executable, "-c", self.DRIVER,
+             str(Path(".claude/hooks") / f"{hook}.py")],
+            stdout=stdout, stderr=subprocess.PIPE, text=True, timeout=60,
+        )
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_an_advisory_payload_into_a_dead_pipe_is_not_a_hook_error(self, hook):
+        read_fd, write_fd = os.pipe()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", self.DRIVER,
+                 str(Path(".claude/hooks") / f"{hook}.py")],
+                stdin=subprocess.DEVNULL, stdout=write_fd,
+                stderr=subprocess.PIPE, text=True,
+            )
+        finally:
+            os.close(write_fd)
+        os.close(read_fd)
+        _, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, (
+            f"{hook} exited {proc.returncode} writing advisory context into a "
+            f"dead pipe; the intended decision is allow and exit 0 is how it "
+            f"is spelled: {err[-400:]!r}"
+        )
+        assert "Exception ignored" not in err, (
+            f"{hook} left a spurious hook error in the transcript: {err!r}"
+        )
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_the_same_advisory_payload_still_reaches_a_live_stdout(self, hook):
+        """Negative control: exiting 0 on a dead pipe is only correct if the
+        payload is still WRITTEN when there is somewhere to write it."""
+        proc = self._run(hook, subprocess.PIPE)
+        assert proc.returncode == 0, proc.stderr[-400:]
+        assert json.loads(proc.stdout)["hookSpecificOutput"][
+            "additionalContext"] == "advisory"
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_a_deny_through_the_shared_path_still_exits_2_on_a_dead_pipe(self, hook):
+        """The deny side must not have been loosened by sharing `_emit` with
+        the advisory side: exit 0 with an empty stdout is an ALLOW, so a deny
+        that cannot be written has to exit 2 — never 120, which is
+        non-blocking."""
+        driver = (
+            "import runpy, sys\n"
+            "mod = runpy.run_path(sys.argv[1], run_name='loaded_for_test')\n"
+            "mod['block']('nope')\n"
+        )
+        read_fd, write_fd = os.pipe()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", driver,
+                 str(Path(".claude/hooks") / f"{hook}.py")],
+                stdin=subprocess.DEVNULL, stdout=write_fd,
+                stderr=subprocess.PIPE, text=True,
+            )
+        finally:
+            os.close(write_fd)
+        os.close(read_fd)
+        _, err = proc.communicate(timeout=60)
+        assert proc.returncode == 2, (
+            f"{hook} exited {proc.returncode} on a deny it could not write; "
+            f"only 2 blocks and 120 is a non-blocking error: {err[-400:]!r}"
+        )
+        assert "BLOCKED:" in err, f"{hook} blocked with no reason on stderr: {err!r}"

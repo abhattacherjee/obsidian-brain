@@ -12,26 +12,70 @@ import os
 import sys
 import re
 
+# Git accepts global options BETWEEN the executable and the subcommand, so the
+# literal "git push" this used to test for simply does not occur in
+# `git -C . push origin main` — and the hook exited 0, allowing the push,
+# before any other logic ran (#327). An absolute or relative path to the
+# executable counts too: `/usr/bin/git push …` is a push.
+#
+# ONE leading dash, deliberately, not `-{1,2}`: `-[^\s]+` already matches
+# `--no-pager` (a dash, then `-no-pager`), while spelling it `-{1,2}` gives the
+# engine two ways to split every long option, and the command text here is
+# written by whoever is being gated. Measured on a run of such options with no
+# subcommand to reach: 26 of them cost 16.7s of backtracking, against 0.002s
+# for 5000 of these. Capping the repetition would cap the cost too — and hand
+# back a bypass, since one option past the cap stops the gate matching at all.
+_GIT = r'(?:[^\s;&|()<>]*/)?git\b'
+# An option's value may be quoted, and the quotes may be around only part of
+# it (`-c user.name="a b"`), so a value is a run of quoted spans and bare
+# characters rather than one `[^\s]+` token. The alternatives are disjoint on
+# their first character, so this adds no ambiguity to backtrack through.
+_GIT_OPT_VALUE = (
+    r'(?:"[^"]*"|\'[^\']*\'|[^-\s"\'])'
+    r'(?:"[^"]*"|\'[^\']*\'|[^\s"\'])*'
+)
+_GIT_OPTS = r'(?:\s+-[^\s]+(?:\s+' + _GIT_OPT_VALUE + r')?)*'
+_GIT_CHECKOUT_B_RE = _GIT + _GIT_OPTS + r'\s+checkout\s+-b\b'
+
+
+# Words that stand between a separator and the command that actually runs.
+# `sudo git push …` and `env A=b git push …` really do push, so the verb must
+# stay gated behind them; `echo git push …` must not (#327).
+_TRANSPARENT_TOKENS = frozenset({
+    "!", "then", "else", "do", "elif", "sudo", "env", "command", "nohup",
+    "nice", "time", "xargs", "eval", "stdbuf",
+})
+
 
 def _shell_scan(prefix: str):
     """Where a shell would textually BE at the end of ``prefix``.
 
-    Returns ``(executes, subshells)``.
+    Returns ``(state, subshells)``.
 
-    ``executes`` is False when the position is inside `'...'`, `"..."`,
-    backticks or a ``$( )`` substitution, or when ``prefix`` does not parse
-    (unterminated quote, unbalanced ``)``). A ``cd`` at such a position is
-    either plain text or runs in a shell whose cwd nothing outside it ever
-    sees, so honouring it stood every gate down: ``echo "x; cd /tmp" && <verb>``
-    runs the verb right here (#326).
+    ``state`` is one of:
+
+    * ``"exec"`` — the position is in the command stream. A command written
+      here runs here, and a ``cd`` written here moves this shell.
+    * ``"quoted"`` — inside `'...'` or `"..."`, including a quote this prefix
+      never closes. The text is data: a ``cd`` here is not a ``cd`` and a verb
+      here is not a command.
+    * ``"subst"`` — inside `$( )` or backticks. A command here really does
+      RUN, but in a subshell whose cwd nothing outside it ever sees.
+    * ``"broken"`` — ``prefix`` does not parse (an unbalanced ``)``). Nothing
+      can be concluded from it.
+
+    The states are distinguished, rather than collapsed into one boolean,
+    because the two callers fail closed in OPPOSITE directions (#327):
+    dropping a ``cd`` leaves the command in scope, dropping a VERB stands the
+    gate down. So a ``cd`` counts only in ``"exec"`` — honouring one anywhere
+    else stood every gate down, as ``echo "x; cd /tmp" && <verb>`` runs the
+    verb right here (#326) — while a verb counts everywhere except
+    ``"quoted"``, the one state that proves it is inert.
 
     ``subshells`` is the tuple of start offsets of the plain ``( )`` subshells
     still open. A ``cd`` inside one applies to the rest of THAT subshell and
     nothing after it closes, so a caller must check the verb is still inside
     the same ones — ``(cd /other) && <verb>`` runs the verb here.
-
-    Anything unparseable returns ``(False, ())``: the ``cd`` is dropped, which
-    leaves the command IN scope, the fail-closed direction.
     """
     i, n, stack, backtick = 0, len(prefix), [], False
     while i < n:
@@ -41,14 +85,14 @@ def _shell_scan(prefix: str):
         elif c == "'":
             j = prefix.find("'", i + 1)
             if j < 0:
-                return False, ()
+                return "quoted", ()
             i = j + 1
         elif c == '"':
             j = i + 1
             while j < n and prefix[j] != '"':
                 j += 2 if prefix[j] == "\\" else 1
             if j >= n:
-                return False, ()
+                return "quoted", ()
             i = j + 1
         elif c == "`":
             backtick = not backtick
@@ -61,14 +105,77 @@ def _shell_scan(prefix: str):
             i += 1
         elif c == ")":
             if not stack:
-                return False, ()
+                return "broken", ()
             stack.pop()
             i += 1
         else:
             i += 1
     if backtick or any(s is None for s in stack):
-        return False, ()
-    return True, tuple(stack)
+        return "subst", ()
+    return "exec", tuple(stack)
+
+
+def _at_command_position(prefix: str) -> bool:
+    """True when a word starting at the end of ``prefix`` is a COMMAND.
+
+    ``echo git push origin main`` is not a push, it is an argument — but a
+    gate that matches its verb as text denies it anyway, and that false deny
+    blocked this project's own tooling repeatedly (#327). A verb is a command
+    at the start of the line, or straight after a separator.
+
+    Walking back over TRANSPARENT tokens is what keeps the forms that really
+    do run the verb on the gated side: ``sudo git …``, ``env A=b git …``,
+    ``xargs -n1 git …``, ``time git …``. An option (``-n1``) is transparent
+    too — it belongs to whatever precedes it, and that word decides. So
+    ``echo -n git push …`` walks past ``-n``, reaches ``echo``, and is
+    correctly read as text.
+
+    Known limit, in the fail-open direction: a verb inside a string a shell
+    later executes (``eval "<verb>"``, ``bash -c "<verb>"``) is "quoted" and
+    is dropped. That is deliberate — the alternative is treating every quoted
+    mention of the verb as a command, which is the false-deny this closes.
+    """
+    seps = ";&|(){}\n"
+    while True:
+        head = prefix.rstrip()
+        if not head:
+            return True  # first word of the command line
+        if head[-1] in seps:
+            return True  # straight after a separator
+        cut = max(head.rfind(c) for c in seps)
+        token = head[cut + 1:].rsplit(None, 1)[-1]
+        name, eq, _value = token.partition("=")
+        if not (token in _TRANSPARENT_TOKENS
+                or token.startswith("-")
+                or (eq and name.isidentifier())):
+            return False
+        prefix = head[:len(head) - len(token)]
+
+
+def _verb_occurrences(cmd: str, verb: str):
+    """Offsets in ``cmd`` where the shell would really RUN ``verb``.
+
+    ONE matcher, for both consumers: the top-level guard that decides whether
+    a gate looks at a command at all, and ``_targets_this_project``'s scoping.
+    When those two disagree the scope helper cannot find the occurrence the
+    guard matched, and ``if not verb_positions: return True`` swallows the
+    divergence as "gate it" — fail closed, correct, and silent (#327).
+
+    An occurrence is dropped only when it is provably inert: quoted, or not in
+    command position. Everything else is KEPT, including a prefix that does
+    not parse, because a dropped verb means the hook exits 0 with no decision
+    and the PreToolUse contract reads that as ALLOW.
+    """
+    kept = []
+    for match in re.finditer(verb, cmd):
+        start = match.start()
+        state, _subshells = _shell_scan(cmd[:start])
+        if state == "quoted":
+            continue
+        if not _at_command_position(cmd[:start]):
+            continue
+        kept.append(start)
+    return kept
 
 
 def _targets_this_project(cmd: str, verb: str) -> bool:
@@ -82,7 +189,9 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
     worth gating. It is used as a PATTERN, not a literal: a caller that
     interpolates anything into it — a path, a branch name — must wrap that in
     ``re.escape()``, or the positions computed here silently shift and the
-    scoping decision is made about the wrong offsets.
+    scoping decision is made about the wrong offsets. It must be the SAME
+    pattern the caller matched, and it is applied through the same
+    ``_verb_occurrences()``, so the two cannot disagree about where the verb is.
 
     Only a ``cd`` that PRECEDES an occurrence of the verb can move it out of
     this project — a ``cd`` after the verb cannot change where the verb already
@@ -120,7 +229,7 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         return True  # Unresolvable project dir — can't scope, be safe
 
     try:
-        verb_positions = [m.start() for m in re.finditer(verb, cmd)]
+        verb_positions = _verb_occurrences(cmd, verb)
     except re.error:
         return True  # Unusable verb pattern — can't scope, be safe
     if not verb_positions:
@@ -135,8 +244,8 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         r'(?:^|[;&|(]\s*)(?P<cd>cd)\s+'
         r'("(?P<dq>[^"]+)"|\'(?P<sq>[^\']+)\'|(?P<bare>\S+))', cmd
     ):
-        executes, subshells = _shell_scan(cmd[:m.start("cd")])
-        if not executes:
+        state, subshells = _shell_scan(cmd[:m.start("cd")])
+        if state != "exec":
             continue
         target = m.group("dq") or m.group("sq") or m.group("bare")
         cd_matches.append((m.start(), m.end(), target, subshells))
@@ -155,8 +264,8 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         if subshells:
             # The cd ran inside "( )". Its cwd is gone once that closes, so the
             # verb has to still be inside every subshell the cd was inside.
-            verb_executes, verb_subshells = _shell_scan(cmd[:position])
-            if not verb_executes or verb_subshells[:len(subshells)] != subshells:
+            verb_state, verb_subshells = _shell_scan(cmd[:position])
+            if verb_state != "exec" or verb_subshells[:len(subshells)] != subshells:
                 return True
         try:
             target = os.path.expanduser(target)
@@ -340,15 +449,21 @@ tool_input = input_data.get("tool_input", {})
 command = tool_input.get("command", "")
 
 # Only validate git checkout -b commands
-if tool_name != "Bash" or "git checkout -b" not in command:
+if tool_name != "Bash":
+    sys.exit(0)
+
+occurrences = _verb_occurrences(command, _GIT_CHECKOUT_B_RE)
+if not occurrences:
     sys.exit(0)
 
 # Skip if targeting a different repo
-if not _targets_this_project(command, r"git checkout -b"):
+if not _targets_this_project(command, _GIT_CHECKOUT_B_RE):
     sys.exit(0)
 
-# Extract branch name
-match = re.search(r'git checkout -b\s+([^\s]+)', command)
+# Extract branch name. Searched from the first occurrence the shell would
+# really run, so the name comes from that command and not from an earlier
+# quoted mention of one.
+match = re.search(_GIT_CHECKOUT_B_RE + r'\s+([^\s]+)', command[occurrences[0]:])
 if not match:
     sys.exit(0)
 
