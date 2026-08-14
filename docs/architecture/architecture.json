@@ -425,7 +425,7 @@
       "Direct filesystem writes only — no MCP server, no REST API, no daemon; the vault works even when Obsidian is closed.",
       "Hooks are pure stdlib, deterministic, and always exit 0; they never import the index (indexing is a skill-side concern).",
       "Everything is recoverable: the SQLite index is derived and fully rebuildable from the markdown vault.",
-      "Defense in depth on writes: path containment, atomic temp+rename, 0600/0700 perms, secret scrubbing, 1 MB stdin caps. The stdin-cap AST guard walks all three in-repo Python trees — hooks/, scripts/ and .claude/hooks/ — after #289 retired the opt-in OB_SCAN_RESOLVED_INSTALL walk over the resolved plugin-cache tree (a no-op in both configurations that occur, and upstream-dominated by this repo walk since every cache is populated from a release cut here)."
+      "Defense in depth on writes: path containment, atomic temp+rename, 0600/0700 perms, secret scrubbing, 1 MB stdin caps. The stdin-cap AST guard walks all three in-repo Python trees — hooks/, scripts/ and .claude/hooks/ — after #289 retired the opt-in OB_SCAN_RESOLVED_INSTALL walk over the resolved plugin-cache tree (a no-op in both configurations that occur, and upstream-dominated by this repo walk since every cache is populated from a release cut here). The five .claude/hooks/ PreToolUse gates read through a shared _read_hook_input() helper that fails CLOSED — overflow and parse failure both emit permissionDecision: deny at exit 0, never a non-zero exit (which is a non-blocking error that lets the tool call proceed)."
     ],
     "constraints": [
       "Python stdlib only — no pip dependencies (hooks run at session boundaries where install state is unknown).",

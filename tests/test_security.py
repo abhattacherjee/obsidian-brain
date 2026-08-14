@@ -3,6 +3,8 @@ import ast
 import json
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -615,3 +617,105 @@ class TestPathTraversalFilename:
         evil_dir = tmp_path / ".." / ".." / "evil-dir-test"
         write_vault_note(str(tmp_path), "../../evil-dir-test", "test.md", "payload")
         assert not evil_dir.exists()
+
+
+class TestHookInputFailsClosed:
+    """Every PreToolUse gate DENIES when it cannot read its own input.
+
+    Capping the read (#289) is only half the contract. The other half is what
+    happens when the payload is unusable — malformed, or larger than the cap.
+    Three of these five hooks used to ``sys.exit(1)`` there, which reads as
+    refusal but is not: a non-zero exit is a NON-BLOCKING error in the
+    PreToolUse contract, so Claude Code surfaces it and lets the tool call
+    proceed. A branch-name gate, a protected-branch push gate and a PR-base
+    gate all stepped aside on input they could not parse.
+
+    Blocking is ``exit 0`` carrying ``permissionDecision: "deny"``. This test
+    pins that, behaviourally, against the real scripts — the AST guard in
+    ``TestStdinCap`` can prove a read is bounded but says nothing about where
+    control goes when the bound is hit.
+    """
+
+    HOOKS = (
+        "require-preflight",
+        "enforce-pr-base-branch",
+        "prevent-direct-push",
+        "update-changelog-before-pr",
+        "validate-branch-name",
+    )
+    CAP = 1_000_000
+
+    @staticmethod
+    def _run(hook, payload):
+        return subprocess.run(
+            [sys.executable, str(Path(".claude/hooks") / f"{hook}.py")],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    @staticmethod
+    def _decision(proc):
+        try:
+            return json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"]
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_malformed_payload_denies(self, hook):
+        proc = self._run(hook, '{"tool_name":')
+        assert proc.returncode == 0, (
+            f"{hook} exited {proc.returncode} on malformed input; a non-zero exit "
+            "is a non-blocking error and the tool call PROCEEDS"
+        )
+        assert self._decision(proc) == "deny", (
+            f"{hook} did not deny on malformed input: {proc.stdout!r} {proc.stderr!r}"
+        )
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_oversize_payload_denies(self, hook):
+        """An oversize payload whose truncation is still VALID JSON.
+
+        The fixture shape is the whole point, and the obvious one does not
+        work: padding inside the document means ``read(CAP + 1)`` tears the
+        JSON, the parse fails, and the hook denies via the parse branch — so
+        the test passes with the overflow check deleted and proves nothing
+        about it (measured: deleting the check left this green).
+
+        A complete document followed by whitespace past the cap truncates to
+        something ``json.loads`` accepts. Without an explicit overflow branch
+        the hook would parse a TRUNCATED view of the payload and proceed —
+        the actual fail-open — so this fixture is what makes the check
+        load-bearing rather than cosmetic.
+        """
+        doc = json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": "git status"}}
+        )
+        payload = doc + " " * (self.CAP + 100 - len(doc))
+        assert len(payload) > self.CAP
+        assert json.loads(payload[: self.CAP + 1])["tool_name"] == "Bash", (
+            "fixture no longer truncates to valid JSON; it would exercise the "
+            "parse branch instead of the overflow branch"
+        )
+        proc = self._run(hook, payload)
+        assert proc.returncode == 0, (
+            f"{hook} exited {proc.returncode} on an oversize payload; a non-zero "
+            "exit is a non-blocking error and the tool call PROCEEDS"
+        )
+        assert self._decision(proc) == "deny", (
+            f"{hook} did not deny an oversize payload: {proc.stdout!r} {proc.stderr!r}"
+        )
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_a_readable_benign_payload_is_not_denied(self, hook):
+        """Negative control. Without it, a hook hardcoded to deny everything
+        would satisfy both tests above while breaking every command."""
+        payload = json.dumps(
+            {"tool_name": "Read", "tool_input": {"file_path": "README.md"}}
+        )
+        proc = self._run(hook, payload)
+        assert proc.returncode == 0
+        assert self._decision(proc) != "deny", (
+            f"{hook} denied a benign non-Bash payload: {proc.stdout!r}"
+        )

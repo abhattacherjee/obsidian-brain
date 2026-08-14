@@ -14,11 +14,47 @@ import re
 import sys
 import subprocess
 
-try:
-    input_data = json.loads(sys.stdin.read(1_000_000))  # cap: CLAUDE.md stdin-read pattern; a truncated payload fails the JSON parse below
-except json.JSONDecodeError as e:
-    print(f"Error: Invalid JSON input: {e}", file=sys.stderr)
-    sys.exit(1)
+_STDIN_CAP = 1_000_000
+
+
+def _deny(reason):
+    """Emit a PreToolUse deny decision and exit 0.
+
+    Exit 0 with ``permissionDecision: "deny"`` is what BLOCKS. A non-zero exit
+    is a non-blocking error in the PreToolUse contract — Claude Code surfaces
+    it and lets the tool call proceed — so a security gate must never signal
+    refusal that way.
+    """
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }))
+    sys.exit(0)
+
+
+def _read_hook_input(what):
+    """Read the hook payload, capped, failing CLOSED on anything unusable.
+
+    ``read(_STDIN_CAP + 1)`` makes an oversize payload an explicit condition
+    rather than a silent truncation that only ever surfaces as a confusing
+    parse error (CLAUDE.md's documented overflow-detection idiom). Both
+    overflow and a parse failure deny: a gate that cannot read its input has
+    not established that the command is safe.
+    """
+    raw = sys.stdin.read(_STDIN_CAP + 1)
+    if len(raw) > _STDIN_CAP:
+        _deny(f"{what} received a payload over {_STDIN_CAP} bytes. "
+              "Blocking as a safety measure.")
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        _deny(f"{what} received invalid input. Blocking as a safety measure.")
+
+
+input_data = _read_hook_input("PR-base hook")
 
 tool_name = input_data.get("tool_name", "")
 tool_input = input_data.get("tool_input", {})
@@ -47,15 +83,7 @@ if not _targets_this_project(command):
 
 
 def deny(reason: str):
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason
-        }
-    }
-    print(json.dumps(output))
-    sys.exit(0)
+    _deny(reason)
 
 
 def get_current_branch() -> str:

@@ -75,12 +75,31 @@ def allow() -> None:
     sys.exit(0)
 
 
-def main():
+
+_STDIN_CAP = 1_000_000
+
+
+def _read_hook_input(what):
+    """Read the hook payload, capped, failing CLOSED on anything unusable.
+
+    ``read(_STDIN_CAP + 1)`` makes an oversize payload an explicit condition
+    rather than a silent truncation that only ever surfaces as a confusing
+    parse error (CLAUDE.md's documented overflow-detection idiom). Both
+    overflow and a parse failure route to ``block()``: a gate that cannot read
+    its input has not established that the command is safe.
+    """
+    raw = sys.stdin.read(_STDIN_CAP + 1)
+    if len(raw) > _STDIN_CAP:
+        block(f"{what} received a payload over {_STDIN_CAP} bytes. "
+              "Blocking as a safety measure.")
     try:
-        input_data = json.loads(sys.stdin.read(1_000_000))  # cap: CLAUDE.md stdin-read pattern; a truncated payload fails the JSON parse below
+        return json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        # Security gate must fail closed, not open
-        block("Preflight hook received invalid input. Blocking commit as a safety measure.")
+        block(f"{what} received invalid input. Blocking as a safety measure.")
+
+
+def main():
+    input_data = _read_hook_input("Preflight hook")
 
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
