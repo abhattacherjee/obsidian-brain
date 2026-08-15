@@ -1308,6 +1308,74 @@ def test_parse_scope_all_clears_stale_project(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Task 1 (issue #318) — parse_scope must not silently drop a positional
+# ---------------------------------------------------------------------------
+
+def test_parse_scope_records_unknown_token(monkeypatch):
+    """A positional matching no known project is recorded, not silently dropped."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects", lambda: set())
+    monkeypatch.setattr(check_items_args, "_vault_known_projects", lambda: set())
+    scope = check_items_args.parse_scope(["not-a-project"])
+    assert scope.unknown_tokens == ["not-a-project"]
+    assert scope.mode == "current"
+
+
+def test_parse_scope_no_unknown_tokens_for_valid_input(monkeypatch):
+    """Positive control: recognised flags/keywords must never be flagged as unknown."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects", lambda: set())
+    monkeypatch.setattr(check_items_args, "_vault_known_projects", lambda: set())
+    scope = check_items_args.parse_scope(["all", "30d", "--show-all"])
+    assert scope.unknown_tokens == []
+
+
+def test_parse_scope_accepts_vault_known_project(monkeypatch):
+    """A notes-only project (vault index, no workspace-root directory) still resolves."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects", lambda: set())
+    monkeypatch.setattr(check_items_args, "_vault_known_projects",
+                        lambda: {"notes-only-proj"})
+    scope = check_items_args.parse_scope(["notes-only-proj"])
+    assert scope.mode == "project"
+    assert scope.project == "notes-only-proj"
+    assert scope.unknown_tokens == []
+
+
+def test_parse_scope_vault_lookup_failure_is_not_fatal(monkeypatch):
+    """A broken vault index must degrade, not break argument parsing.
+
+    _known_projects is mocked too (matching test_parse_scope_project_name's
+    idiom above) rather than exercising the real filesystem scan: CI has
+    neither ~/dev/claude_workspace nor ~/projects, so an unmocked
+    get_workspace_roots() would return [] there and this test would fail
+    for reasons unrelated to what it's checking.
+    """
+    import check_items_args
+
+    def _raise():
+        raise RuntimeError("vault index unavailable")
+
+    monkeypatch.setattr(check_items_args, "_known_projects",
+                        lambda: {"obsidian-brain"})
+    monkeypatch.setattr(check_items_args, "_vault_known_projects", _raise)
+    scope = check_items_args.parse_scope(["obsidian-brain"])
+    assert scope.mode == "project"
+    assert scope.project == "obsidian-brain"
+
+
+def test_parse_scope_unknown_token_order_independent(monkeypatch):
+    """An unknown token must not short-circuit parsing of tokens after it."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects", lambda: set())
+    monkeypatch.setattr(check_items_args, "_vault_known_projects", lambda: set())
+    scope = check_items_args.parse_scope(["30d", "bogus", "--dry-run"])
+    assert scope.window_days == 30
+    assert scope.dry_run is True
+    assert scope.unknown_tokens == ["bogus"]
+
+
+# ---------------------------------------------------------------------------
 # verify_before_edit — Stage 6 pre-Edit guard
 # ---------------------------------------------------------------------------
 
