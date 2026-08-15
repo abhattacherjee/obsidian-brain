@@ -153,8 +153,14 @@ _STOPWORDS = frozenset({
 # the model to use for a note_completions hit ("reported done in session
 # YYYY-MM-DD (<title>)"). Shared between CONFIDENCE_TIER_RULES (normal MED
 # matching) and assign_tier's pre-HIGH-loop shape check (F1 below) so the
-# two never drift apart.
-_NOTE_COMPLETION_CITATION_PATTERN = r"\breported done in session \d{4}-\d{2}-\d{2}\b"
+# two never drift apart. F8 (#318 fix round 2 addendum): case-insensitive
+# -- sentence-casing ("Reported done...") is the most natural way a model
+# writes the start of a citation, and a bare case-sensitive match let a
+# single capital letter walk the citation past this fallback into the HIGH
+# loop. A sentence-cased citation should still reach MED through this
+# pattern; the note_evidence_only flag (F7) is the real, wording-independent
+# guard regardless.
+_NOTE_COMPLETION_CITATION_PATTERN = r"(?i)\breported done in session \d{4}-\d{2}-\d{2}\b"
 
 CONFIDENCE_TIER_RULES = {
     "HIGH": {
@@ -447,13 +453,6 @@ def gather_note_completion_evidence(
 
     all_files = sorted(os.listdir(sessions_dir), reverse=True)
 
-    # F3: the evidence pool must cover at least as many notes as the item
-    # scan below (collect_open_items(..., max_sessions)) does -- otherwise a
-    # caller passing max_sessions > _NOTE_EVIDENCE_WINDOW gets items whose
-    # source note falls outside the smaller pool cap, and no pool note could
-    # ever contradict them regardless of what they say.
-    _pool_cap = max(_NOTE_EVIDENCE_WINDOW, max_sessions)
-
     # Single pass, newest-first: apply the SAME project/type filter
     # collect_open_items() uses (first 20 frontmatter lines, quote-stripped,
     # no `type:` field means legacy session) while also picking up `date:`.
@@ -504,20 +503,25 @@ def gather_note_completion_evidence(
         if note_date:
             date_by_path[os.path.abspath(fpath)] = note_date
 
-            # Evidence pool: cap the (expensive) body-read to the newest
-            # _pool_cap matching notes only -- reading every note's body
-            # doesn't scale (mirrors /recall's same cap,
-            # obsidian_utils.py:_OPEN_ITEM_EVIDENCE_WINDOW), but the cap
-            # must not be smaller than max_sessions (F3, see above).
-            if len(evidence_pool) < _pool_cap:
-                content = ''.join(lines)
-                m = _SUMMARY_RE.search(content)
-                if m:
-                    summary_text = m.group(1).strip()
-                    if summary_text:
-                        first_line = summary_text.split('\n')[0].strip()
-                        title = first_line or f"Session: {project}"
-                        evidence_pool.append((note_date, title, summary_text))
+            # F9 (#318 fix round 2 addendum): no separate pool-size cap here.
+            # A prior version gated this append on `len(evidence_pool) <
+            # _pool_cap` (F3's fix), but that check is unreachable-False by
+            # construction: `matched` (incremented once per matching note,
+            # unconditionally, above) can never exceed max_sessions -- the
+            # loop's own `if matched >= max_sessions: break` guarantees it --
+            # and evidence_pool grows by at most one entry per matching note.
+            # So len(evidence_pool) < matched <= max_sessions always, i.e.
+            # the body-read below already runs at most max_sessions times
+            # without any extra gate. A guard that can never turn False is
+            # not a guard; the real bound is the loop's own break condition.
+            content = ''.join(lines)
+            m = _SUMMARY_RE.search(content)
+            if m:
+                summary_text = m.group(1).strip()
+                if summary_text:
+                    first_line = summary_text.split('\n')[0].strip()
+                    title = first_line or f"Session: {project}"
+                    evidence_pool.append((note_date, title, summary_text))
 
         if matched >= max_sessions:
             break

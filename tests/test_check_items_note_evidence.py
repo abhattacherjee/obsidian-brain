@@ -281,6 +281,23 @@ def test_note_completion_citation_without_the_shape_stays_low():
     assert tier == "LOW"
 
 
+def test_sentence_cased_note_completion_citation_still_reaches_med():
+    """F8 (#318 fix round 2 addendum): the citation-shape fallback regex
+    must be case-insensitive. A model writing "Reported done in session..."
+    (capital R, sentence-cased -- the most natural way to start a sentence)
+    used to walk straight past the case-sensitive regex into the HIGH loop.
+    note_evidence_only is left at its default (False) here on purpose: this
+    test is specifically about the fallback layer (F1's regex), not F7's
+    provenance flag."""
+    tier = oid.assign_tier(
+        "Reported done in session 2026-02-01 (fixed the foo exporter #318)",
+        "wire up the foo exporter #318",
+        "DONE",
+        "agent",
+    )
+    assert tier == "MED"
+
+
 def test_datetime_dated_evidence_note_still_reaches_med(tmp_path):
     """F2: a note dated with a full datetime (not just YYYY-MM-DD) must not
     silently drop the resulting citation to LOW. gather_note_completion_evidence
