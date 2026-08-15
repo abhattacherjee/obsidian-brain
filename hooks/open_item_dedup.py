@@ -2039,6 +2039,40 @@ def merge_groups_semantically(coarse_groups):
     return surviving
 
 
+def merge_records_from_groups(groups) -> list:
+    """Derive `## Merged Groups` records from post-merge group dicts.
+
+    `merge_groups_semantically` returns surviving GROUPS (each carrying
+    `absorbed_reasoning`), not merge records -- so the dashboard's Merged
+    Groups section had no correct value to be passed and callers guessed
+    (#318 bug 3: a count was passed, raising TypeError). This adapts one
+    shape to the other.
+
+    Accepts the list form or the `{project: [groups]}` dict form that
+    `merge_groups_semantically(return_dict_shape=True)` returns.
+
+    Groups with no (or empty) `absorbed_reasoning` absorbed nothing and
+    produce no record.
+    """
+    if isinstance(groups, dict):
+        groups = [g for v in groups.values() for g in v]
+
+    records = []
+    for g in groups:
+        absorbed_reasoning = g.get("absorbed_reasoning") or []
+        if not absorbed_reasoning:
+            continue
+        absorbed_ids = [entry.get("absorbed") for entry in absorbed_reasoning]
+        reasons = [entry.get("reasoning", "") for entry in absorbed_reasoning
+                   if entry.get("reasoning")]
+        records.append({
+            "canonical_group_id": g.get("group_id"),
+            "absorbed_group_ids": absorbed_ids,
+            "reasoning": "; ".join(reasons),
+        })
+    return records
+
+
 def _check_items_workdir():
     """Return the 0o700 workdir under ~/.claude/obsidian-brain."""
     p = Path.home() / ".claude" / "obsidian-brain"

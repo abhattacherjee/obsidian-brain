@@ -651,11 +651,15 @@ def test_h2_fts_mentions_nonzero_counts_as_real_evidence():
     assert check_items_cli.note_evidence_only_for(evidence, "git-project") is False
 
 
-def test_h3_present_but_empty_note_completions_is_false():
-    """H3: {"note_completions": []} -- the key is present (the scan ran for
-    this project) but empty (found nothing). Must stay False, same as
-    before the hardening pass: no note evidence means nothing for the cap
-    to protect."""
+def test_present_but_empty_note_completions_is_not_note_evidence_only():
+    """Characterisation pin, not an H3 guard: a prior round proved H3 (the
+    presence-before-emptiness check) carries no behavioural difference for
+    ANY input -- no mutation can turn this test red on that basis. It
+    stays as a pin of current behaviour: {"note_completions": []} -- key
+    present (the scan ran for this project) but empty (found nothing) --
+    must read as False, same as before the hardening pass: no note
+    evidence means nothing for the cap to protect. Do not read this as
+    proof that H3's presence check is exercised."""
     evidence = {"notes-only": {"note_completions": []}}
     assert check_items_cli.note_evidence_only_for(evidence, "notes-only") is False
 

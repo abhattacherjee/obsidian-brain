@@ -1628,6 +1628,226 @@ def test_dashboard_active_truncation_and_path_guard(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# #318 Task 5 — merge_records_from_groups: adapt merge_groups_semantically's
+# surviving-groups shape (absorbed_reasoning) to the dashboard's merge-record
+# shape (canonical_group_id/absorbed_group_ids/reasoning).
+# ---------------------------------------------------------------------------
+
+def test_merge_records_from_groups_reconstructs_records():
+    """A single canonical group with one absorbed entry -> one record."""
+    groups = [
+        {"group_id": "ob-1",
+         "absorbed_reasoning": [{"absorbed": "ob-2", "reasoning": "same fix"}]},
+    ]
+    records = oid.merge_records_from_groups(groups)
+    assert records == [
+        {"canonical_group_id": "ob-1", "absorbed_group_ids": ["ob-2"],
+         "reasoning": "same fix"},
+    ]
+
+
+def test_merge_records_groups_multiple_absorbed_under_one_canonical():
+    """Two absorbed_reasoning entries under one canonical -> ONE record
+    carrying both absorbed ids (in order) and both reasons joined."""
+    groups = [
+        {"group_id": "ob-1", "absorbed_reasoning": [
+            {"absorbed": "ob-2", "reasoning": "same fix"},
+            {"absorbed": "ob-3", "reasoning": "same fix too"},
+        ]},
+    ]
+    records = oid.merge_records_from_groups(groups)
+    assert records == [
+        {"canonical_group_id": "ob-1", "absorbed_group_ids": ["ob-2", "ob-3"],
+         "reasoning": "same fix; same fix too"},
+    ]
+
+
+def test_merge_records_empty_for_unmerged_groups():
+    """POSITIVE CONTROL: groups that never absorbed anything (no key, or an
+    empty absorbed_reasoning list) must produce NO records -- a function
+    that always emits a record for every group would pass the other tests
+    while saying nothing here."""
+    groups = [
+        {"group_id": "ob-1"},
+        {"group_id": "ob-2", "absorbed_reasoning": []},
+    ]
+    assert oid.merge_records_from_groups(groups) == []
+
+
+def test_merge_records_from_groups_accepts_dict_shape():
+    """merge_groups_semantically(return_dict_shape=True) returns
+    {project: [groups]} -- merge_records_from_groups must flatten that
+    before deriving records, same output as the flat-list form."""
+    groups_by_proj = {
+        "proj-a": [
+            {"group_id": "ob-1",
+             "absorbed_reasoning": [{"absorbed": "ob-2", "reasoning": "same fix"}]},
+        ],
+        "proj-b": [{"group_id": "ob-9"}],
+    }
+    records = oid.merge_records_from_groups(groups_by_proj)
+    assert records == [
+        {"canonical_group_id": "ob-1", "absorbed_group_ids": ["ob-2"],
+         "reasoning": "same fix"},
+    ]
+
+
+def test_dashboard_renders_merge_records(tmp_path):
+    """Records shaped by merge_records_from_groups render in the dashboard
+    body's Merged Groups section."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    groups = [
+        {"group_id": "ob-1",
+         "absorbed_reasoning": [{"absorbed": "ob-2", "reasoning": "same fix"}]},
+    ]
+    records = oid.merge_records_from_groups(groups)
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=2, group_count=1, classifications=[],
+        applied=0, cascaded=0, merges=records, semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "ob-1 absorbs [ob-2]" in body
+
+
+def test_dashboard_tolerates_int_merges(tmp_path):
+    """A caller passing a count instead of a list of records (#318 bug 3)
+    must not crash -- and the resulting warning must name the bad input
+    (type + repr), not silently coerce to [] and read as 'no merges this
+    run', which would hide the caller bug."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=3, semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "Merged Groups unavailable" in body
+    # Names the bad input specifically, not just a generic failure sentence.
+    assert "int" in body
+    assert "(3)" in body
+
+
+def test_dashboard_tolerates_none_merges(tmp_path):
+    """merges=None is a legitimate 'nothing to report' -- renders the plain
+    fallback with NO warning line (unlike the int case above)."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=None, semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "_No semantic merges this run._" in body
+    assert "Merged Groups unavailable" not in body
+
+
+# ---------------------------------------------------------------------------
+# #318 Task 5, Step 5.5 — ## Evidence Gaps dashboard section (Preflight R3):
+# the artefact half of the warning Task 3 already put on stderr.
+# ---------------------------------------------------------------------------
+
+def test_dashboard_renders_evidence_gap_section(tmp_path):
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    evidence_gaps = {
+        "projects_scanned": 1, "projects_with_evidence": 0,
+        "projects_without_repo": ["notes-only"], "all_projects_gapped": True,
+    }
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True, evidence_gaps=evidence_gaps,
+    )
+    body = open(path).read()
+    assert "## Evidence Gaps" in body
+    assert "notes-only" in body
+    assert "DONE" in body and "unreachable" in body
+
+
+def test_dashboard_omits_gap_section_when_no_gaps(tmp_path):
+    """POSITIVE CONTROL: an evidence_gaps dict with no actual gaps must NOT
+    render the section -- a section that always renders would pass the
+    test above while saying nothing."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    evidence_gaps = {
+        "projects_scanned": 1, "projects_with_evidence": 1,
+        "projects_without_repo": [], "all_projects_gapped": False,
+    }
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True, evidence_gaps=evidence_gaps,
+    )
+    body = open(path).read()
+    assert "## Evidence Gaps" not in body
+
+
+def test_dashboard_gap_frontmatter_field(tmp_path):
+    """The frontmatter carries evidence_gaps: N (Dataview-queryable), even
+    when N is 0 for a caller who passed a real (gap-free) dict -- distinct
+    from the argument being omitted entirely (see the no-op test below)."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+
+    gapped = {
+        "projects_scanned": 1, "projects_with_evidence": 0,
+        "projects_without_repo": ["notes-only"], "all_projects_gapped": True,
+    }
+    p1 = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True, evidence_gaps=gapped,
+    )
+    assert "evidence_gaps: 1" in open(p1).read()
+
+    no_gaps = {
+        "projects_scanned": 1, "projects_with_evidence": 1,
+        "projects_without_repo": [], "all_projects_gapped": False,
+    }
+    p2 = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="y", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True, evidence_gaps=no_gaps,
+    )
+    assert "evidence_gaps: 0" in open(p2).read()
+
+
+def test_dashboard_without_evidence_gaps_argument_is_unchanged(tmp_path):
+    """Every existing caller omits evidence_gaps entirely -- the default
+    must be a true no-op: no heading, no frontmatter key, no exception."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True,
+    )
+    content = open(path).read()
+    assert "## Evidence Gaps" not in content
+    assert "evidence_gaps:" not in content
+
+
+# ---------------------------------------------------------------------------
 # R2 regression: Finding 3 — path traversal via scope_name
 # ---------------------------------------------------------------------------
 

@@ -848,6 +848,8 @@ rm -f "$_skips_file"
 
 (Implemented in Task 22.) Call `write_check_items_dashboard()` with the scope, classifications, applied count, cascade count, semantic-merge mode, and classifier mode, plus `skipped=cascade_skipped_total` (#320 F1 — the count of cascade candidates that were refused or lost, so the dashboard doesn't collapse to only the auto-checked count). Path: `<vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md` (folder configurable, default `claude-check-items`).
 
+Pass `merges=merge_records_from_groups(<the merged groups from Step 4>)` (import from `open_item_dedup`), never a raw count — `merge_groups_semantically` returns surviving groups carrying `absorbed_reasoning`, not merge records, and `merge_records_from_groups` is the adapter that reconstructs `canonical_group_id`/`absorbed_group_ids`/`reasoning` records from them (#318 bug 3: a count passed directly raised `TypeError`).
+
 ## Step 10 — Persist cache updates
 
 ```bash
