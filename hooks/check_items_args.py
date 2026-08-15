@@ -76,14 +76,7 @@ def parse_scope(argv):
     independent. Unknown tokens are recorded on scope.unknown_tokens rather
     than silently dropped."""
     scope = Scope()
-    try:
-        vault_projects = _vault_known_projects()
-    except Exception:
-        # _vault_known_projects() already degrades internally on its own
-        # failure modes; this guard covers a caller that replaces the whole
-        # function (e.g. a test double) with something that raises instead.
-        vault_projects = set()
-    projects = _known_projects() | vault_projects
+    projects = _known_projects() | _vault_known_projects()
     for tok in argv:
         if tok == "--show-all":
             scope.show_all = True

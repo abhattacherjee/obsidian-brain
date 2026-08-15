@@ -1342,7 +1342,7 @@ def test_parse_scope_accepts_vault_known_project(monkeypatch):
     assert scope.unknown_tokens == []
 
 
-def test_parse_scope_vault_lookup_failure_is_not_fatal(monkeypatch):
+def test_parse_scope_vault_lookup_failure_is_not_fatal(monkeypatch, capsys):
     """A broken vault index must degrade, not break argument parsing.
 
     _known_projects is mocked too (matching test_parse_scope_project_name's
@@ -1350,18 +1350,26 @@ def test_parse_scope_vault_lookup_failure_is_not_fatal(monkeypatch):
     neither ~/dev/claude_workspace nor ~/projects, so an unmocked
     get_workspace_roots() would return [] there and this test would fail
     for reasons unrelated to what it's checking.
+
+    The failure is injected at the DB layer (vault_index._connect), the
+    actual production failure mode, rather than by replacing
+    _vault_known_projects wholesale — that exercises the real internal
+    try/except in _vault_known_projects instead of a call-site guard that
+    only a test double could ever trigger (Fix round 1, Finding C1).
     """
     import check_items_args
+    import vault_index
 
-    def _raise():
+    def _raise(db_path):
         raise RuntimeError("vault index unavailable")
 
     monkeypatch.setattr(check_items_args, "_known_projects",
                         lambda: {"obsidian-brain"})
-    monkeypatch.setattr(check_items_args, "_vault_known_projects", _raise)
+    monkeypatch.setattr(vault_index, "_connect", _raise)
     scope = check_items_args.parse_scope(["obsidian-brain"])
     assert scope.mode == "project"
     assert scope.project == "obsidian-brain"
+    assert "vault project lookup unavailable" in capsys.readouterr().err
 
 
 def test_parse_scope_unknown_token_order_independent(monkeypatch):
