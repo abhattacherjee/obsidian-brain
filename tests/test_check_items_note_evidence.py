@@ -588,6 +588,101 @@ def test_note_evidence_only_for_empty_git_buckets_no_note_evidence_is_false():
     assert check_items_cli.note_evidence_only_for(evidence, "notes-only") is False
 
 
+# ---------------------------------------------------------------------------
+# Hardening pass (H1-H4): the predicate's default was unsafe in four ways,
+# all sharing one theme -- an unfamiliar or degraded input shape should fail
+# SAFE (cap more), not fail open (cap less). Adjudicated as a hardening pass
+# rather than a sixth fix round: every item lives in the same ~10 lines of
+# note_evidence_only_for, the only function standing between a note-derived
+# verdict and an auto-checked item.
+# ---------------------------------------------------------------------------
+
+
+def test_h1_unallowlisted_key_does_not_count_as_git_evidence():
+    """H1: an open-ended "any other key counts as git evidence" test was
+    right for a future GIT-derived source and wrong for a future NON-git
+    one -- and #318 exists to add non-git sources, so the next one is more
+    likely non-git than git. insight_completions is not in
+    _GIT_DERIVED_EVIDENCE_KEYS, so it must not disqualify the cap."""
+    evidence = {
+        "notes-only": {
+            "insight_completions": ["ship it"],
+            "note_completions": [{"text": "wire up the foo exporter #318"}],
+        },
+    }
+    assert check_items_cli.note_evidence_only_for(evidence, "notes-only") is True
+
+
+def test_h1_allowlisted_key_still_counts_as_git_evidence():
+    """POSITIVE CONTROL: a genuine allowlisted key (commits) must still
+    disqualify the cap. Without this, H1's allowlist could be emptied out
+    entirely and nothing here would notice."""
+    evidence = {
+        "git-project": {
+            "commits": ["abc1234"],
+            "note_completions": [{"text": "wire up the foo exporter #318"}],
+        },
+    }
+    assert check_items_cli.note_evidence_only_for(evidence, "git-project") is False
+
+
+def test_h2_fts_mentions_all_zero_counts_as_empty():
+    """H2: fts_mentions is a dict of hit COUNTS, so {"x": 0} is a truthy
+    dict meaning "searched, found nothing" -- a bare `not v` would read
+    that as real evidence and leave the project uncapped."""
+    evidence = {
+        "notes-only": {
+            "fts_mentions": {"wire up the foo exporter": 0},
+            "note_completions": [{"text": "wire up the foo exporter #318"}],
+        },
+    }
+    assert check_items_cli.note_evidence_only_for(evidence, "notes-only") is True
+
+
+def test_h2_fts_mentions_nonzero_counts_as_real_evidence():
+    """POSITIVE CONTROL: a genuine non-zero hit count must still count as
+    git-derived evidence and disqualify the cap."""
+    evidence = {
+        "git-project": {
+            "fts_mentions": {"wire up the foo exporter": 3},
+            "note_completions": [{"text": "wire up the foo exporter #318"}],
+        },
+    }
+    assert check_items_cli.note_evidence_only_for(evidence, "git-project") is False
+
+
+def test_h3_present_but_empty_note_completions_is_false():
+    """H3: {"note_completions": []} -- the key is present (the scan ran for
+    this project) but empty (found nothing). Must stay False, same as
+    before the hardening pass: no note evidence means nothing for the cap
+    to protect."""
+    evidence = {"notes-only": {"note_completions": []}}
+    assert check_items_cli.note_evidence_only_for(evidence, "notes-only") is False
+
+
+def test_h4_unresolvable_project_fails_safe_to_capped():
+    """H4: a group with no project name at all (`g.get("project", "")`
+    defaults to "" when a group carries no "project" field) cannot be
+    looked up in `evidence` no matter what it contains -- we cannot
+    identify which project's evidence would justify HIGH, so the default
+    must be to CAP, not to uncap. Narrower than "the project name is valid
+    but absent from evidence" (test_note_evidence_only_for_project_absent,
+    still False, unaffected -- see the docstring on note_evidence_only_for
+    for why that case is safe to leave uncapped: #297's _cap_at_med already
+    covers it via the synthetic/heuristic path)."""
+    assert check_items_cli.note_evidence_only_for(
+        {"other-project": {"note_completions": [{"text": "x"}]}}, "",
+    ) is True
+    assert check_items_cli.note_evidence_only_for({}, "") is True
+    # Regression guard: a NAMED-but-absent project must NOT be affected by
+    # the H4 change -- it stays False (this is the exact assertion
+    # test_note_evidence_only_for_project_absent already pins; restated
+    # here as the negative control this test's own docstring promises).
+    assert check_items_cli.note_evidence_only_for(
+        {}, "notes-only",
+    ) is False
+
+
 def _cached_record(project):
     """Mirrors SKILL.md Step 6's cache-merge dict shape exactly (post-F12),
     including the note_evidence_only stamp a caller must compute via

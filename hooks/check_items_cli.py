@@ -385,6 +385,40 @@ def _strip_unreleased_section(changelog: str) -> str:
     return pattern.sub("", changelog)
 
 
+# H1 (#318 hardening pass): an ALLOWLIST of git-derived keys, read directly
+# off deep_analysis_pipeline's proj_evidence[...] assignment sites
+# (open_item_dedup.py) rather than trusting a prior draft. An open-ended
+# "any other key counts as git evidence" test (the pre-H1 shape) is right
+# for a future git-derived source and wrong for a future non-git one — and
+# #318 exists precisely to add non-git sources, so the next one is more
+# likely non-git than git. A key outside this set must be classified
+# deliberately; it does NOT default into "this project has real evidence,
+# uncap it".
+_GIT_DERIVED_EVIDENCE_KEYS = frozenset({
+    "commits", "tags", "changed_paths", "releases",
+    "merged_prs", "closed_issues", "changelog_excerpt", "fts_mentions",
+})
+
+
+def _is_empty(v) -> bool:
+    """Empty for a falsy value, and for a dict or list whose entries are
+    all falsy (H2, #318 hardening pass).
+
+    fts_mentions is a dict of hit COUNTS, so `{"x": 0}` is a truthy dict
+    meaning "searched, found nothing" -- a bare `not v` reads that as real
+    evidence. Same shape risk applies to any future evidence bucket built
+    the same way (a mapping or list of zero/empty results), so this is
+    written as a general emptiness check, not an fts_mentions special case.
+    """
+    if not v:
+        return True
+    if isinstance(v, dict):
+        return not any(v.values())
+    if isinstance(v, list):
+        return not any(v)
+    return False
+
+
 def note_evidence_only_for(evidence: dict, project: str) -> bool:
     """True when a project's ONLY real evidence is note_completions.
 
@@ -400,34 +434,57 @@ def note_evidence_only_for(evidence: dict, project: str) -> bool:
     apart: run_classifier's per-project stamp (fresh sub-agent + L2
     synthetic verdicts) and skills/check-items/SKILL.md Step 6's
     cache-merge block (replayed verdicts for known_unchanged groups) — the
-    second of which had NO note_evidence_only key at all until this fix,
-    so a cached DONE citation sharing a literal ref with the item text
-    could reach HIGH and get auto-checked on every re-run after the first.
+    second of which had NO note_evidence_only key at all until F12, so a
+    cached DONE citation sharing a literal ref with the item text could
+    reach HIGH and get auto-checked on every re-run after the first.
 
-    VALUE-aware, not key-presence (F13, #318 fix round 4 addendum):
-    deep_analysis_pipeline's git block sets tags/changed_paths/merged_prs/
-    closed_issues to `[]` on EVERY failure branch (no tags, gh
-    unauthenticated, etc. — the normal state on a fresh machine or in CI),
-    so a repo-backed project with zero usable git evidence still carries
-    those keys. A key-presence test (`set(proj.keys()) <= {...}`) reads
-    that shape as "has git evidence" and leaves it uncapped — a real repo
-    that yielded nothing goes unprotected exactly like a repo-less one
-    should be protected. Checking VALUES, not key presence, treats
-    `{"tags": [], "note_completions": [...]}` the same as
-    `{"note_completions": [...]}` — correctly, since an empty list proves
-    nothing either way.
+    VALUE-aware, not key-presence, for the git-derived buckets (F13, #318
+    fix round 4 addendum): deep_analysis_pipeline's git block sets
+    tags/changed_paths/merged_prs/closed_issues to `[]` on EVERY failure
+    branch (no tags, gh unauthenticated, etc. — the normal state on a
+    fresh machine or in CI), so a repo-backed project with zero usable git
+    evidence still carries those keys. Checking VALUES (via `_is_empty`),
+    not key presence, treats `{"tags": [], "note_completions": [...]}` the
+    same as `{"note_completions": [...]}` — correctly, since an empty list
+    proves nothing either way.
 
-    A bundle with no genuine note_completions evidence at all (regardless
-    of what else it has-or-doesn't) is NOT note-evidence-only — there is no
-    note evidence for the cap to protect, and such a project's groups reach
-    Step 7 through the synthetic/heuristic path anyway, which the
-    pre-existing `_cap_at_med` (#297, `classifier_source not in
-    _HIGH_TRUST_SOURCES`) already handles regardless of this flag.
+    #318 hardening pass, on top of F12/F13:
+    - H1: git evidence is judged against `_GIT_DERIVED_EVIDENCE_KEYS`, an
+      explicit allowlist, not "any key other than note_completions".
+    - H2: `_is_empty` treats a dict/list of all-falsy entries as empty too,
+      not just a falsy container itself (the fts_mentions {"x": 0} case).
+    - H3: the gate on `note_completions` checks PRESENCE before emptiness
+      — distinguishes "this bundle never attempted a note-completion scan
+      for this project" (key absent) from "the scan ran and found
+      nothing" (key present, empty). Both read False today, but they are
+      different situations, and collapsing them into one truthiness check
+      is exactly the kind of normalization that would silently change
+      behaviour if deep_analysis_pipeline is ever edited to assign
+      note_completions unconditionally, the way its git-derived siblings
+      already are.
+    - H4: an unresolvable project (no name to look evidence up by at all —
+      `g.get("project", "")` defaults to `""` when a group carries no
+      `project` field) fails SAFE: cap it, don't uncap it, because we
+      cannot justify HIGH for a citation whose project we cannot even
+      identify. This is narrower than "the project name is valid but
+      produced no evidence" (an ordinary evidence-less project, e.g.
+      project="notes-only" simply absent from `evidence`), which stays
+      False — #297's `_cap_at_med` already caps that case via the
+      synthetic/heuristic path regardless of this flag.
     """
+    if not project:
+        return True
+
     proj = evidence.get(project) or {}
-    if not proj.get("note_completions"):
+    if "note_completions" not in proj:
         return False
-    return all(not v for k, v in proj.items() if k != "note_completions")
+    if _is_empty(proj["note_completions"]):
+        return False
+
+    has_git_evidence = any(
+        not _is_empty(proj.get(k)) for k in _GIT_DERIVED_EVIDENCE_KEYS
+    )
+    return not has_git_evidence
 
 
 def _bridge_project_evidence(evidence: dict, project: str) -> dict:
