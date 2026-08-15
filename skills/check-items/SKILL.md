@@ -28,7 +28,7 @@ Each step below is a bash block; the embedded Python reads its inputs from `$1`,
 ```bash
 ARGUMENTS="${ARGUMENTS:-}"
 scope_path=$(python3 -c "
-import sys, os, glob, json, tempfile
+import sys, os, glob, json, tempfile, difflib
 import glob, json, os, re, sys
 def _ob_hooks():
     try:
@@ -52,9 +52,18 @@ from check_items_args import parse_scope, _known_projects, _vault_known_projects
 argv = sys.argv[1:]
 scope_obj = parse_scope(argv)
 if scope_obj.unknown_tokens:
-    _near = sorted(p for p in (_known_projects() | _vault_known_projects())
+    _all_projects = _known_projects() | _vault_known_projects()
+    _near = sorted(p for p in _all_projects
                    if any(t.lower() in p.lower() or p.lower() in t.lower()
-                          for t in scope_obj.unknown_tokens))[:5]
+                          for t in scope_obj.unknown_tokens))
+    for _t in scope_obj.unknown_tokens:
+        # difflib catches transpositions and single-character typos
+        # ('obsidian-brian' -> 'obsidian-brain'); the substring pass above
+        # only catches prefixes and truncations. Neither alone is enough.
+        for _c in difflib.get_close_matches(_t, sorted(_all_projects), n=3, cutoff=0.6):
+            if _c not in _near:
+                _near.append(_c)
+    _near = _near[:5]
     print('ERROR: unrecognised argument(s): '
           + ', '.join(repr(t) for t in scope_obj.unknown_tokens), file=sys.stderr)
     if _near:
