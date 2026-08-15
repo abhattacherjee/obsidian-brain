@@ -149,6 +149,13 @@ _STOPWORDS = frozenset({
 # Confidence tier rules (spec § Confidence tiers, lines 324-332)
 # ---------------------------------------------------------------------------
 
+# #318: the exact citation shape check_items_cli's CLASSIFIER_PROMPT tells
+# the model to use for a note_completions hit ("reported done in session
+# YYYY-MM-DD (<title>)"). Shared between CONFIDENCE_TIER_RULES (normal MED
+# matching) and assign_tier's pre-HIGH-loop shape check (F1 below) so the
+# two never drift apart.
+_NOTE_COMPLETION_CITATION_PATTERN = r"\breported done in session \d{4}-\d{2}-\d{2}\b"
+
 CONFIDENCE_TIER_RULES = {
     "HIGH": {
         "literal_ref_patterns": [
@@ -163,7 +170,7 @@ CONFIDENCE_TIER_RULES = {
             r"\bshipped\b",
             r"\bcovered by\b",
             r"#\d+",
-            r"\breported done in session \d{4}-\d{2}-\d{2}\b",
+            _NOTE_COMPLETION_CITATION_PATTERN,
         ],
     },
     "LOW": {
@@ -221,6 +228,21 @@ def assign_tier(evidence_citation, item_text, classification=None,
         return "LOW"
     citation = str(evidence_citation)
     text = str(item_text)
+
+    # #318/#297: a note-completion citation ("reported done in session
+    # YYYY-MM-DD (<title>)") is not itself proof of a fix-merge — the
+    # session summary it derives from can trivially co-mention an
+    # issue/PR number, sha, or version that ALSO appears in the item text
+    # (an item can literally read "close #318"). Left to the HIGH
+    # literal-ref loop below, classifier_source="agent" (a high-trust
+    # source) would then read that shared #N as HIGH+DONE and auto-check
+    # it off — the exact harm #297 closed, reopened through this new
+    # evidence source. Test for the note-completion shape FIRST and cap at
+    # MED unconditionally, before the HIGH loop ever runs. Conservative on
+    # purpose: if the only anchor is a session summary, MED is the ceiling
+    # even when a number happens to appear on both sides.
+    if re.search(_NOTE_COMPLETION_CITATION_PATTERN, citation):
+        return "MED"
 
     # #297: a heuristic citation is BUILT FROM a token lifted out of the item
     # text, so "ref appears in both citation and text" is trivially true and
@@ -410,6 +432,13 @@ def gather_note_completion_evidence(
 
     all_files = sorted(os.listdir(sessions_dir), reverse=True)
 
+    # F3: the evidence pool must cover at least as many notes as the item
+    # scan below (collect_open_items(..., max_sessions)) does -- otherwise a
+    # caller passing max_sessions > _NOTE_EVIDENCE_WINDOW gets items whose
+    # source note falls outside the smaller pool cap, and no pool note could
+    # ever contradict them regardless of what they say.
+    _pool_cap = max(_NOTE_EVIDENCE_WINDOW, max_sessions)
+
     # Single pass, newest-first: apply the SAME project/type filter
     # collect_open_items() uses (first 20 frontmatter lines, quote-stripped,
     # no `type:` field means legacy session) while also picking up `date:`.
@@ -461,10 +490,11 @@ def gather_note_completion_evidence(
             date_by_path[os.path.abspath(fpath)] = note_date
 
             # Evidence pool: cap the (expensive) body-read to the newest
-            # _NOTE_EVIDENCE_WINDOW matching notes only -- reading every
-            # note's body doesn't scale (mirrors /recall's same cap,
-            # obsidian_utils.py:_OPEN_ITEM_EVIDENCE_WINDOW).
-            if len(evidence_pool) < _NOTE_EVIDENCE_WINDOW:
+            # _pool_cap matching notes only -- reading every note's body
+            # doesn't scale (mirrors /recall's same cap,
+            # obsidian_utils.py:_OPEN_ITEM_EVIDENCE_WINDOW), but the cap
+            # must not be smaller than max_sessions (F3, see above).
+            if len(evidence_pool) < _pool_cap:
                 content = ''.join(lines)
                 m = _SUMMARY_RE.search(content)
                 if m:
@@ -506,7 +536,14 @@ def gather_note_completion_evidence(
                 if not c.get("has_completion_phrase"):
                     continue
                 if best is None or c["confidence"] > best["confidence"]:
-                    c["contradicted_by"] = ev_date
+                    # F2: store the date-only prefix, not the raw `date:`
+                    # value. A datetime-shaped date (e.g.
+                    # "2026-02-01T09:30:00Z") would otherwise flow into the
+                    # "reported done in session <contradicted_by>" citation
+                    # and break the MED regex's trailing \b (no word
+                    # boundary between the day's last digit and "T"),
+                    # silently dropping the tier to LOW.
+                    c["contradicted_by"] = ev_date[:10]
                     c["contradicted_by_title"] = ev_title
                     best = c
         if best is not None:

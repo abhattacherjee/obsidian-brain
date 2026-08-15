@@ -220,17 +220,124 @@ def test_prefilter_rule_zero_requires_an_actual_match():
 
 def test_note_completion_citation_reaches_med_not_high():
     """Pin MED explicitly: the tier lift is from LOW, and the HIGH-trust cap
-    on _HIGH_TRUST_SOURCES still applies -- it never reaches HIGH."""
+    on _HIGH_TRUST_SOURCES still applies -- it never reaches HIGH.
+
+    Strengthened per fix-round-1 F1: the citation and item text now SHARE a
+    literal #N ref (the exact shape that used to slip past the note-
+    completion check and reach the HIGH literal-ref loop). Without embedding
+    a shared ref, this test could never observe that path at all -- which is
+    why the original CRITICAL defect survived it.
+    """
     tier = oid.assign_tier(
-        "reported done in session 2026-02-01 (Shipped the foo exporter)",
-        "wire up the foo exporter",
+        "reported done in session 2026-02-01 (fixed the foo exporter #318)",
+        "wire up the foo exporter #318",
         "DONE",
         "agent",
     )
     assert tier == "MED"
 
 
+def test_note_completion_citation_with_shared_version_still_caps_at_med():
+    """Same defect, different literal-ref shape (vX.Y.Z instead of #N)."""
+    tier = oid.assign_tier(
+        "reported done in session 2026-02-01 (shipped v3.4.0)",
+        "wire up the foo exporter v3.4.0",
+        "DONE",
+        "agent",
+    )
+    assert tier == "MED"
+
+
+def test_ordinary_high_trust_citation_with_shared_ref_still_reaches_high():
+    """POSITIVE CONTROL for F1: a genuine merged-PR/commit citation (NOT the
+    note-completion shape) that shares a literal #N with the item text must
+    still reach HIGH for a high-trust source. Without this test, capping the
+    note-completion shape at MED could be implemented as capping
+    EVERYTHING at MED, and no test here would notice."""
+    tier = oid.assign_tier(
+        "PR #318 merged as abc1234 on 2026-04-24.",
+        "close issue #318",
+        "DONE",
+        "agent",
+    )
+    assert tier == "HIGH"
+
+
 def test_note_completion_citation_without_the_shape_stays_low():
-    """Guards the new MED regex from being widened into a catch-all."""
-    tier = oid.assign_tier("some prose with no anchor", "wire up the foo exporter")
+    """Guards the new MED regex from being widened into a catch-all.
+
+    Strengthened per fix-round-1 F4: the original fixture ("some prose with
+    no anchor") shared no words with the MED pattern at all, so a regex
+    widened to e.g. `\\breported done\\b` (dropping the date requirement)
+    would still leave this test green. This near-miss carries the phrase's
+    prefix but not its `\\d{4}-\\d{2}-\\d{2}` anchor.
+    """
+    tier = oid.assign_tier(
+        "reported done in session recently", "wire up the foo exporter service",
+    )
     assert tier == "LOW"
+
+
+def test_datetime_dated_evidence_note_still_reaches_med(tmp_path):
+    """F2: a note dated with a full datetime (not just YYYY-MM-DD) must not
+    silently drop the resulting citation to LOW. gather_note_completion_evidence
+    must store the date-ONLY prefix in contradicted_by, and the citation built
+    from it (per the CLASSIFIER_PROMPT shape) must still hit the MED regex."""
+    vault, sessions = _vault(tmp_path)
+    _session(
+        sessions / "2026-01-01-notes-only-aaaa.md", "2026-01-01", "notes-only",
+        open_items=["wire up the foo exporter service"],
+    )
+    _session(
+        sessions / "2026-02-01-notes-only-bbbb.md", "2026-02-01T09:30:00Z", "notes-only",
+        summary="Shipped the foo exporter service end to end.",
+    )
+
+    results = oid.gather_note_completion_evidence(
+        str(vault), "claude-sessions", "notes-only",
+    )
+
+    assert len(results) == 1, results
+    assert results[0]["contradicted_by"] == "2026-02-01", results[0]["contradicted_by"]
+
+    citation = (
+        f"reported done in session {results[0]['contradicted_by']} "
+        f"({results[0]['contradicted_by_title']})"
+    )
+    tier = oid.assign_tier(citation, "wire up the foo exporter service", "DONE", "agent")
+    assert tier == "MED"
+
+
+def test_evidence_pool_covers_a_wider_max_sessions(tmp_path):
+    """F3: the evidence pool must not be capped smaller than max_sessions.
+
+    Layout (newest-first scan order): 15 padding notes (2026-01-20 down to
+    2026-01-06), then the completion note (2026-01-05), then the item's own
+    note (2026-01-01, oldest). The completion note is strictly newer than
+    the item and DOES carry a completion phrase, so it must contradict the
+    item -- but it is the 16th matching note encountered, so a pool
+    hard-capped at 10 (the old _NOTE_EVIDENCE_WINDOW-only cap) would never
+    even read its body, and the item would wrongly stay unflagged.
+    """
+    vault, sessions = _vault(tmp_path)
+    _session(
+        sessions / "2026-01-01-notes-only-aaaa.md", "2026-01-01", "notes-only",
+        open_items=["wire up the foo exporter service"],
+    )
+    _session(
+        sessions / "2026-01-05-notes-only-bbbb.md", "2026-01-05", "notes-only",
+        summary="Shipped the foo exporter service end to end.",
+    )
+    for i in range(15):
+        _session(
+            sessions / f"2026-01-{6 + i:02d}-notes-only-pad{i:02d}.md",
+            f"2026-01-{6 + i:02d}", "notes-only",
+            summary=f"Unrelated padding session {i}.",
+        )
+
+    results = oid.gather_note_completion_evidence(
+        str(vault), "claude-sessions", "notes-only", max_sessions=20,
+    )
+
+    assert len(results) == 1, results
+    assert results[0]["contradicted_by"] == "2026-01-05"

@@ -287,8 +287,12 @@ NEEDS-ACTION, STALE, ACTIVE, or REVIEW. Cite the specific evidence you used.
   explicitly marks the item done.
   A `note_completions` entry is a valid DONE citation for a project with no
   git repo: it means a STRICTLY NEWER session summary reports the item done.
-  Cite it as `reported done in session YYYY-MM-DD (<title>)` so the tier
-  rules recognise the shape. It is never HIGH confidence.
+  Each entry carries a `contradicted_by` date (YYYY-MM-DD) and a
+  `contradicted_by_title` (the newer session's title/first summary line).
+  Build the citation from EXACTLY those two fields:
+  `reported done in session <contradicted_by> (<contradicted_by_title>)`
+  — the tier rules match this literal shape, so any other wording is
+  scored as a plain LOW-confidence citation. It is never HIGH confidence.
 - NEEDS-ACTION — the fix is shipped, but the literal action is an
   external command this tool cannot run (e.g. `gh issue close`, token
   rotation, manual verification). Set `action_required` to a
