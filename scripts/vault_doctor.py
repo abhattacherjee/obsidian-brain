@@ -235,6 +235,26 @@ def _issue_row(i) -> dict:
         row["jsonl_path"] = i.extra["jsonl_path"]
     if "referenced_by" in i.extra:
         row["referenced_by_count"] = len(i.extra.get("referenced_by", []))
+    # memory-index (#308): counts, sizes and the diagnostic detail a consumer
+    # needs to act on a row. skills/vault-doctor/SKILL.md drives that check
+    # through --json, so without these it can only re-parse prose out of
+    # `reason`. Conditional, like the block above: a check that does not set
+    # a key gets a row byte-identical to the prior schema.
+    for key in (
+        "entry_count",
+        "indexed_count",
+        "index_size_bytes",
+        "soft_limit_bytes",
+        "hard_limit_bytes",
+        "index_path",
+        "entry_names",
+        "byte_offset",
+        # read_error, not "error": encoding-corruption already sets an
+        # "error" extra, and whitelisting that name would change its rows.
+        "read_error",
+    ):
+        if key in i.extra:
+            row[key] = i.extra[key]
     return row
 
 
