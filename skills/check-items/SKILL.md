@@ -47,10 +47,21 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
 sys.path.insert(0, _ob_hooks())
-from check_items_args import parse_scope
+from check_items_args import parse_scope, _known_projects, _vault_known_projects
 
 argv = sys.argv[1:]
 scope_obj = parse_scope(argv)
+if scope_obj.unknown_tokens:
+    _near = sorted(p for p in (_known_projects() | _vault_known_projects())
+                   if any(t.lower() in p.lower() or p.lower() in t.lower()
+                          for t in scope_obj.unknown_tokens))[:5]
+    print('ERROR: unrecognised argument(s): '
+          + ', '.join(repr(t) for t in scope_obj.unknown_tokens), file=sys.stderr)
+    if _near:
+        print('Did you mean: ' + ', '.join(_near), file=sys.stderr)
+    print('Valid forms: <project> | all | Nd | --show-all | --dry-run | --no-cache',
+          file=sys.stderr)
+    sys.exit(2)
 scope = {
     'mode': scope_obj.mode,
     'project': scope_obj.project,
@@ -76,6 +87,10 @@ cat "$scope_path"
 Save the printed `scope.json` path in `$scope_path`; pass it to every subsequent step as the first arg.
 
 Note: `window_days` in scope controls how many sessions' files to pass as `basenames` in Step 5. The `collect_open_items` helper itself scans by `max_sessions` count (not calendar days); to apply a window filter, limit the basenames list to files dated within the window before passing to `deep_analysis_pipeline`.
+
+**Unrecognised arguments are fatal (#318).** `parse_scope` records any token that is not a flag, `all`, an `Nd` window, or a known project on `scope.unknown_tokens`, and the block above exits 2 rather than proceeding. A silently-dropped project name does not degrade the run — it makes the run answer about the *current* project while appearing to answer about the one that was named. Known projects are the union of workspace-root directories and every `project` value in the vault index, so a notes-only project with no git repo is recognised.
+
+If the block exits 2, stop and show the user the stderr verbatim; do not fall through to Step 2.
 
 ## Step 2 — Collect open items (Stage 1)
 
