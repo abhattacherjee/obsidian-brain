@@ -418,19 +418,50 @@ if current_branch in ["main", "develop"]:
                 pass
 
 # Check if command or current branch targets protected branches
-# Also detect refspec pushes like "HEAD:main" or "mybranch:develop"
+# Also detect refspec pushes like "HEAD:main" or "mybranch:develop".
+#
+# The refspec arms match the protected name as a WHOLE ref. A plain
+# `":main" in command` substring test also fires on `foo:mainline` and
+# `HEAD:maintenance`, which are ordinary branches — that costs a false deny
+# on legitimate work, and this condition only started deciding anything once
+# the narrowing `if` below was removed.
+# Two arms, because git spells the same destination several ways:
+#   * after a colon, the destination of a refspec, optionally qualified —
+#     `HEAD:main`, `HEAD:heads/main`, `HEAD:refs/heads/main`;
+#   * a QUALIFIED ref standing alone, where source and destination are the
+#     same — `git push origin refs/heads/main`, `+refs/heads/main`. This arm
+#     requires the `heads/` prefix on purpose: a bare `main` here would match
+#     the word anywhere in the command, and `"origin main"` above already
+#     covers the unqualified spelling.
+# The left boundary includes the quote characters: `origin "refs/heads/main"`
+# is one argument to git, but a quote is not whitespace, so a boundary of
+# `[\s+]` alone let the quoted spelling through while the bare one denied.
+# The colon arm needs no such boundary — it anchors on the `:` itself, which
+# is why `'HEAD:main'` already denied.
+_PROTECTED_REF = r'(?:main|develop)(?![A-Za-z0-9._/-])'
+_PROTECTED_REFSPEC_RE = re.compile(
+    r':(?:(?:refs/)?heads/)?' + _PROTECTED_REF
+    + r'''|(?:^|[\s+'"])(?:refs/)?heads/''' + _PROTECTED_REF
+)
+
 targets_protected = (
     "origin main" in command or
     "origin develop" in command or
-    ":main" in command or
-    ":develop" in command or
+    _PROTECTED_REFSPEC_RE.search(command) is not None or
     current_branch in ["main", "develop"]
 )
 
-# Block direct push to main/develop (including force pushes)
+# Block direct push to main/develop (including force pushes).
+#
+# `targets_protected` above is the whole test. It used to be followed by a
+# second `if` that re-checked a STRICTLY NARROWER condition — the current
+# branch, or the literal "origin main"/"origin develop" — which no refspec
+# spelling satisfies. So the `:main` and `:develop` arms were computed, and
+# then discarded: `git push origin HEAD:main`, `+main:main`, `--force` and
+# `--force-with-lease` all fell through to allow, under a comment claiming
+# refspec pushes were detected (#327).
 if targets_protected:
-    if current_branch in ["main", "develop"] or "origin main" in command or "origin develop" in command:
-        reason = f"""❌ Direct push to main/develop is not allowed!
+    reason = f"""❌ Direct push to main/develop is not allowed!
 
 Protected branches:
   - main (production)
@@ -462,7 +493,7 @@ Current branch: {current_branch}
 
 💡 If the superpowers plugin is installed, use /feature, /release, /hotfix, /finish for automated workflows."""
 
-        _deny(reason)
+    _deny(reason)
 
 # Allow the command
 sys.exit(0)

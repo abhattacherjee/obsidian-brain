@@ -1602,3 +1602,110 @@ class TestScopeGuardFailsClosedWhenScopeIsUnknowable:
         )
         helper = self._helper(shim)
         assert helper(f"cd {tmp_path}-elsewhere && git com" + "mit", r"git com" + "mit") is True
+
+
+class TestRefspecPushesToProtectedBranchesAreBlocked:
+    """#327: a refspec push to a protected branch fell through to allow.
+
+    `targets_protected` was built INCLUDING the refspec spellings, under a
+    comment saying so — and the very next `if` re-tested a strictly narrower
+    condition (the current branch, or the literal "origin main"/"origin
+    develop") that no refspec form can satisfy. Every refspec arm was computed
+    and then discarded, so a force-push over `main` was permitted in practice.
+
+    The narrowing `if` is gone, which makes `targets_protected` decide for the
+    first time. That is also why the refspec arms had to stop being substring
+    tests in the same change: `":main" in command` fires on `foo:mainline` and
+    `HEAD:maintenance` too, and those are ordinary branches. Measured before
+    the regex went in, both denied — a false deny that only appeared once the
+    condition started deciding anything.
+
+    Command strings are assembled from fragments for the reason given in
+    TestHookBlockingPathsFire's docstring: this repo's live hooks inspect
+    unexecuted command text, so a literal protected push here blocks the
+    tooling that reads this file.
+    """
+
+    PUSH = "git pu" + "sh"
+    MAIN = "ma" + "in"
+
+    # (label, command, expected). The deny rows are the filed defect; the allow
+    # rows are what stops the fix from being "deny everything".
+    CASES = (
+        ("HEAD refspec", f"{PUSH} origin HEAD:{MAIN}", "deny"),
+        ("HEAD refspec to develop", f"{PUSH} origin HEAD:develop", "deny"),
+        ("branch refspec", f"{PUSH} origin mybranch:{MAIN}", "deny"),
+        ("force refspec", f"{PUSH} origin +{MAIN}:{MAIN}", "deny"),
+        ("--force with refspec", f"{PUSH} --force origin HEAD:{MAIN}", "deny"),
+        ("--force-with-lease", f"{PUSH} --force-with-lease origin HEAD:{MAIN}",
+         "deny"),
+        ("fully qualified ref", f"{PUSH} origin HEAD:refs/heads/{MAIN}", "deny"),
+        # git resolves `heads/main` the same as `refs/heads/main`, and a
+        # qualified ref can stand alone with no colon at all — source and
+        # destination are then the same branch. Both really push it.
+        ("heads/ qualified destination", f"{PUSH} origin HEAD:heads/{MAIN}",
+         "deny"),
+        ("qualified ref, no colon", f"{PUSH} origin refs/heads/{MAIN}", "deny"),
+        ("force, qualified, no colon", f"{PUSH} origin +refs/heads/{MAIN}",
+         "deny"),
+        # A quote is not whitespace, so a left boundary of `[\\s+]` alone let
+        # the quoted spelling through while the bare one denied.
+        ('qualified in double quotes', f'{PUSH} origin "refs/heads/{MAIN}"',
+         "deny"),
+        ("qualified in single quotes",
+         f"{PUSH} origin 'refs/heads/{MAIN}'", "deny"),
+        ("heads/ in double quotes", f'{PUSH} origin "heads/{MAIN}"', "deny"),
+        ("plain protected push", f"{PUSH} origin {MAIN}", "deny"),
+        # Ordinary branches whose names merely BEGIN with a protected name.
+        # These are the rows a substring test gets wrong.
+        ("refspec to a mainline branch", f"{PUSH} origin foo:{MAIN}line",
+         "allow"),
+        ("refspec to a maintenance branch",
+         f"{PUSH} origin HEAD:{MAIN}tenance", "allow"),
+        ("feature refspec", f"{PUSH} origin HEAD:feature/x", "allow"),
+        ("feature branch", f"{PUSH} origin feature/probe", "allow"),
+        ("tag push", f"{PUSH} origin v1.2.3", "allow"),
+        # The qualified-ref arm must not fire on an ordinary qualified ref,
+        # nor on a branch whose name merely begins with a protected one.
+        ("qualified feature ref", f"{PUSH} origin refs/heads/feature/x",
+         "allow"),
+        ("qualified mainline ref", f"{PUSH} origin heads/{MAIN}line", "allow"),
+        ('quoted qualified feature ref',
+         f'{PUSH} origin "refs/heads/feature/x"', "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        CASES,
+        ids=[c[0].replace(" ", "-") for c in CASES],
+    )
+    def test_refspec_decision(self, tmp_path, label, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    def test_the_refspec_arms_are_what_block_these(self, tmp_path):
+        """The negative control.
+
+        Without it, every deny row above would still pass if the gate simply
+        blocked everything — and the allow rows would still pass if the
+        refspec arms were deleted, because `prevent-direct-push` on a FEATURE
+        branch has no other reason to look at `HEAD:main`. Removing the
+        refspec condition must turn the filed rows green-to-red; this asserts
+        the condition is the thing carrying them.
+        """
+        source = Path(".claude/hooks/prevent-direct-push.py").read_text(
+            encoding="utf-8")
+        assert "_PROTECTED_REFSPEC_RE.search(command)" in source, (
+            "the refspec arm of targets_protected is gone; the filed defect "
+            "(#327) is reachable again"
+        )
+        # And it must not have been re-narrowed: the bug was a SECOND, tighter
+        # `if` under the first. Anything that re-tests the current branch or a
+        # literal remote+ref pair after `if targets_protected:` reintroduces it.
+        after = source.split("if targets_protected:", 1)[1]
+        assert "current_branch in [" not in after, (
+            "a second, narrower condition sits under `if targets_protected:` "
+            "again — that is the exact shape of #327"
+        )
