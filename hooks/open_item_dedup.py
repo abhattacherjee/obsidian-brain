@@ -16,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from obsidian_utils import get_workspace_roots
+from obsidian_utils import get_workspace_roots, match_items_against_evidence
 
 # --- Module-level compiled regexes (computed once at import) ---
 
@@ -163,6 +163,7 @@ CONFIDENCE_TIER_RULES = {
             r"\bshipped\b",
             r"\bcovered by\b",
             r"#\d+",
+            r"\breported done in session \d{4}-\d{2}-\d{2}\b",
         ],
     },
     "LOW": {
@@ -378,6 +379,138 @@ def collect_open_items(
 
         if matched >= max_sessions:
             break
+
+    return results
+
+
+_NOTE_EVIDENCE_WINDOW = 10  # mirrors obsidian_utils._OPEN_ITEM_EVIDENCE_WINDOW
+_SUMMARY_RE = re.compile(r"## Summary\n(.+?)(?=\n## |\Z)", re.DOTALL)
+
+
+def gather_note_completion_evidence(
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+    max_sessions: int = 10,
+) -> list[dict]:
+    """Open items that a STRICTLY NEWER session's own summary reports done.
+
+    The one evidence source that needs no git repo (#318). Same signal
+    /recall surfaces as `contradicted_by`, same two guards: the evidence
+    session must be strictly newer than the item's own session, and the
+    match must carry a completion phrase — a mere co-mention of the same
+    branch or file is not completion (BH-001).
+
+    Returns [{"text", "file", "line", "contradicted_by",
+              "contradicted_by_title", "confidence"}].
+    """
+    sessions_dir = os.path.join(vault_path, sessions_folder)
+    if not os.path.isdir(sessions_dir):
+        return []
+
+    all_files = sorted(os.listdir(sessions_dir), reverse=True)
+
+    # Single pass, newest-first: apply the SAME project/type filter
+    # collect_open_items() uses (first 20 frontmatter lines, quote-stripped,
+    # no `type:` field means legacy session) while also picking up `date:`.
+    # Building the evidence pool and the per-note date map here (rather than
+    # re-deriving them from a second scan) guarantees both cover exactly the
+    # same note set collect_open_items() will read below.
+    evidence_pool: list[tuple[str, str, str]] = []  # (date, title, summary_text)
+    date_by_path: dict[str, str] = {}
+    matched = 0
+
+    for fname in all_files:
+        if not fname.endswith('.md'):
+            continue
+
+        fpath = os.path.join(sessions_dir, fname)
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+        except OSError as exc:
+            print(f"[obsidian-brain] note-completion: skipping unreadable note {fname}: {exc}", file=sys.stderr)
+            continue
+        except UnicodeDecodeError as exc:
+            print(f"[obsidian-brain] note-completion: encoding error in {fname}: {exc}", file=sys.stderr)
+            continue
+
+        project_match = False
+        is_session = True  # default for notes with no type field (legacy)
+        type_field_seen = False
+        note_date = ''
+        for line in lines[:20]:
+            stripped = line.strip()
+            if stripped.startswith('project:'):
+                val = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                if val == project:
+                    project_match = True
+            elif stripped.startswith('type:'):
+                type_field_seen = True
+                tval = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                is_session = (tval == 'claude-session')
+            elif stripped.startswith('date:'):
+                note_date = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+        if not project_match or (type_field_seen and not is_session):
+            continue
+
+        matched += 1
+        # An item whose source note has no date: is never flagged --
+        # "strictly newer" is undefined without one. Simply don't record it.
+        if note_date:
+            date_by_path[os.path.abspath(fpath)] = note_date
+
+            # Evidence pool: cap the (expensive) body-read to the newest
+            # _NOTE_EVIDENCE_WINDOW matching notes only -- reading every
+            # note's body doesn't scale (mirrors /recall's same cap,
+            # obsidian_utils.py:_OPEN_ITEM_EVIDENCE_WINDOW).
+            if len(evidence_pool) < _NOTE_EVIDENCE_WINDOW:
+                content = ''.join(lines)
+                m = _SUMMARY_RE.search(content)
+                if m:
+                    summary_text = m.group(1).strip()
+                    if summary_text:
+                        first_line = summary_text.split('\n')[0].strip()
+                        title = first_line or f"Session: {project}"
+                        evidence_pool.append((note_date, title, summary_text))
+
+        if matched >= max_sessions:
+            break
+
+    items = collect_open_items(vault_path, sessions_folder, project, max_sessions)
+    if not items:
+        return []
+
+    results: list[dict] = []
+    for fpath, line_num, item_text in items:
+        item_date = date_by_path.get(os.path.abspath(fpath), '')
+        if not item_date:
+            continue
+        best: dict | None = None
+        for ev_date, ev_title, ev_summary in evidence_pool:
+            # Compare day-prefixes so a `date:` carrying a full datetime
+            # still compares correctly against a date-only value.
+            if ev_date[:10] <= item_date[:10]:
+                continue  # same-date or older session — never contradicts
+            candidates = match_items_against_evidence(
+                ev_summary, [(fpath, line_num, item_text)]
+            )
+            for c in candidates:
+                # BH-001: a co-mentioned branch/file alone is not completion.
+                # Preflight ruling R6: match_items_against_evidence() already
+                # rejects score < 3 before returning, and the completion-
+                # phrase boost below adds +2 AFTER that check — so every
+                # candidate reaching this point with has_completion_phrase
+                # already carries confidence >= 5. Re-checking a confidence
+                # floor here would be unreachable dead code.
+                if not c.get("has_completion_phrase"):
+                    continue
+                if best is None or c["confidence"] > best["confidence"]:
+                    c["contradicted_by"] = ev_date
+                    c["contradicted_by_title"] = ev_title
+                    best = c
+        if best is not None:
+            results.append(best)
 
     return results
 
@@ -1051,7 +1184,7 @@ def deep_analysis_pipeline(
 ) -> str:
     """Single-pass deep analysis: similarity, open items, evidence gathering.
 
-    Returns 'OK:<total_items>:<groups>:<projects_with_evidence>:<projects_without_repo>'.
+    Returns 'OK:<total_items>:<groups>:<projects_with_evidence>:<projects_without_repo_count>'.
     Writes structured JSON to output_path (atomic: tempfile + rename).
 
     15-minute module-level cache keyed on (projects_json, vault_path,
@@ -1375,6 +1508,18 @@ def deep_analysis_pipeline(
                     fts_mentions[item_text[:60]] = len(hits)
             if fts_mentions:
                 proj_evidence["fts_mentions"] = fts_mentions
+
+        # #318: the only evidence source that works without a git repo.
+        try:
+            _note_done = gather_note_completion_evidence(
+                vault_path, sessions_folder, project,
+            )
+        except OSError as exc:
+            print(f"[obsidian-brain] note-completion scan failed for "
+                  f"{project}: {exc}", file=sys.stderr)
+            _note_done = []
+        if _note_done:
+            proj_evidence["note_completions"] = _note_done
 
         if proj_evidence:
             evidence[project] = proj_evidence

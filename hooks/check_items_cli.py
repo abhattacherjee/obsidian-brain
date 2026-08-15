@@ -273,7 +273,7 @@ CLASSIFIER_PROMPT = """You are the classifier sub-agent for /check-items. Read t
 <input-json-path>. It contains:
   - groups: list of merged open-item groups (post Stage 2b).
   - evidence: per-project bundle (commits, merged_prs, closed_issues,
-    releases, changelog_excerpt, fts_mentions).
+    releases, changelog_excerpt, fts_mentions, note_completions).
 
 ## Your job
 
@@ -285,6 +285,10 @@ NEEDS-ACTION, STALE, ACTIVE, or REVIEW. Cite the specific evidence you used.
 - DONE — the action is complete. Cite at least one of: merged PR title,
   commit sha, closed issue body, release note, or an insight note that
   explicitly marks the item done.
+  A `note_completions` entry is a valid DONE citation for a project with no
+  git repo: it means a STRICTLY NEWER session summary reports the item done.
+  Cite it as `reported done in session YYYY-MM-DD (<title>)` so the tier
+  rules recognise the shape. It is never HIGH confidence.
 - NEEDS-ACTION — the fix is shipped, but the literal action is an
   external command this tool cannot run (e.g. `gh issue close`, token
   rotation, manual verification). Set `action_required` to a
@@ -432,6 +436,13 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
             "releases_text": _to_text(proj.get("releases")),
             "changelog_excerpt": _strip_unreleased_section(proj.get("changelog_excerpt") or ""),
             "fts_mentions_text": _to_text(proj.get("fts_mentions")),
+            # #318: note_completions entries (gather_note_completion_evidence)
+            # carry pre-resolved item text, not a bucket to text-join like the
+            # zones above -- has_classifiable_evidence's Rule 0 compares each
+            # entry directly against a group's canonical text.
+            "note_completion_items": [
+                r.get("text", "") for r in (proj.get("note_completions") or [])
+            ],
         }
 
         # #264 Task 2 follow-up: fold the bounded/deduped `tags` and
@@ -447,7 +458,8 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
 
     # Shape B: already _text-suffixed at top level (test fixtures / simplified payloads)
     _TEXT_KEYS = {"commits_text", "merged_prs_text", "closed_issues_text",
-                  "releases_text", "changelog_excerpt", "fts_mentions_text"}
+                  "releases_text", "changelog_excerpt", "fts_mentions_text",
+                  "note_completion_items"}
     if _TEXT_KEYS.intersection(evidence.keys()):
         return evidence
 
@@ -458,7 +470,7 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
     # that contains at least one bare evidence key. In that case, the
     # legitimate answer is "no evidence for this project" — return {} silently.
     # Only WARN when neither shape A nor shape B is recognizable at all.
-    _BARE_KEYS = {"commits", "merged_prs", "closed_issues", "releases",
+    _BARE_KEYS = {"commits", "merged_prs", "closed_issues", "releases", "note_completions",
                   "changelog_excerpt", "fts_mentions"}
     _is_shape_a_payload = any(
         isinstance(v, dict) and _BARE_KEYS.intersection(v.keys())
