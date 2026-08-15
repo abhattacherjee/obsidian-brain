@@ -1051,7 +1051,7 @@ def deep_analysis_pipeline(
 ) -> str:
     """Single-pass deep analysis: similarity, open items, evidence gathering.
 
-    Returns 'OK:<total_items>:<groups>:<projects_with_evidence>'.
+    Returns 'OK:<total_items>:<groups>:<projects_with_evidence>:<projects_without_repo>'.
     Writes structured JSON to output_path (atomic: tempfile + rename).
 
     15-minute module-level cache keyed on (projects_json, vault_path,
@@ -1207,165 +1207,187 @@ def deep_analysis_pipeline(
     project_paths = _resolve_project_paths()
     evidence: dict[str, dict] = {}
     projects_with_evidence = 0
+    projects_without_repo: list[str] = []
 
     for project in projects:
         repo_path = project_paths.get(project)
         if not repo_path:
-            continue
+            # #318: this used to `continue` in silence. EVERY evidence source
+            # below is git-derived, so a repo-less project reaches the
+            # classifier with an empty bundle, caps at tier LOW, and can never
+            # reach DONE+HIGH (the only combination Step 7 preselects). The
+            # run then presents as a normal triage. Name it instead.
+            projects_without_repo.append(project)
+            print(
+                f"[obsidian-brain] {project}: no local git repo — every "
+                f"git-derived evidence source is unavailable, so no item in "
+                f"this project can reach tier HIGH or classification DONE",
+                file=sys.stderr,
+            )
 
         proj_evidence: dict[str, object] = {}
 
-        # git log (last 40 commits)
-        try:
-            proc = subprocess.run(
-                ["git", "log", "--oneline", "-40"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                proj_evidence["commits"] = proc.stdout.strip().split("\n")[:40]
-            else:
-                print(f"[obsidian-brain] git log failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] git log error for {project}: {exc}", file=sys.stderr)
-
-        # git tag --list (#264 Task 2: widen git ground truth). A genuinely-
-        # shipped item may be grounded in a release tag rather than a PR/issue
-        # title (e.g. the reporter's `feature/pull-to-refresh-v2` case, shipped
-        # via tag v2.0.0 with no #N anchor in the checkbox text). Sorted by
-        # creation recency and capped/deduped to keep the evidence blob small.
-        try:
-            proc = subprocess.run(
-                ["git", "tag", "--list", "--sort=-creatordate"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                _seen_tags: set[str] = set()
-                _tags: list[str] = []
-                for _line in proc.stdout.strip().split("\n"):
-                    _line = _line.strip()
-                    if not _line or _line in _seen_tags:
-                        continue
-                    _seen_tags.add(_line)
-                    _tags.append(_line)
-                    if len(_tags) >= _MAX_EVIDENCE_TAGS:
-                        break
-                proj_evidence["tags"] = _tags
-            else:
-                print(f"[obsidian-brain] git tag failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["tags"] = []
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] git tag error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["tags"] = []
-
-        # git log --name-only (#264 Task 2: changed file paths on the default
-        # branch's recent history). Completion may live in changed paths rather
-        # than a PR title (e.g. source/test/doc files landing under a shipped
-        # component's directory). Deduped and hard-capped so the evidence blob
-        # stays bounded regardless of commit size.
-        try:
-            proc = subprocess.run(
-                ["git", "log", "--name-only", "--pretty=format:", "-40"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                _seen_paths: set[str] = set()
-                _paths: list[str] = []
-                for _line in proc.stdout.strip().split("\n"):
-                    _line = _line.strip()
-                    if not _line or _line in _seen_paths:
-                        continue
-                    _seen_paths.add(_line)
-                    _paths.append(_line)
-                    if len(_paths) >= _MAX_EVIDENCE_CHANGED_PATHS:
-                        break
-                proj_evidence["changed_paths"] = _paths
-            else:
-                print(f"[obsidian-brain] git log --name-only failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["changed_paths"] = []
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] git log --name-only error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["changed_paths"] = []
-
-        # gh release list
-        try:
-            proc = subprocess.run(
-                ["gh", "release", "list", "--limit", "5"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                proj_evidence["releases"] = proc.stdout.strip().split("\n")[:5]
-            else:
-                print(f"[obsidian-brain] gh release list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] gh release error for {project}: {exc}", file=sys.stderr)
-
-        # gh pr list --state merged
-        try:
-            proc = subprocess.run(
-                ["gh", "pr", "list", "--state", "merged", "--limit", "20",
-                 "--json", "number,title,mergedAt,url"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                try:
-                    proj_evidence["merged_prs"] = json.loads(proc.stdout)
-                except json.JSONDecodeError as exc:
-                    print(f"[obsidian-brain] gh pr list JSON error for {project}: {exc}", file=sys.stderr)
-                    proj_evidence["merged_prs"] = []
-            else:
-                print(f"[obsidian-brain] gh pr list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["merged_prs"] = []
-        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-            print(f"[obsidian-brain] gh pr list error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["merged_prs"] = []
-
-        # gh issue list --state closed
-        try:
-            proc = subprocess.run(
-                ["gh", "issue", "list", "--state", "closed", "--limit", "20",
-                 "--json", "number,title,closedAt,body,url"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                try:
-                    proj_evidence["closed_issues"] = json.loads(proc.stdout)
-                except json.JSONDecodeError as exc:
-                    print(f"[obsidian-brain] gh issue list JSON error for {project}: {exc}", file=sys.stderr)
-                    proj_evidence["closed_issues"] = []
-            else:
-                print(f"[obsidian-brain] gh issue list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["closed_issues"] = []
-        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-            print(f"[obsidian-brain] gh issue list error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["closed_issues"] = []
-
-        # CHANGELOG.md excerpt
-        changelog_path = os.path.join(repo_path, "CHANGELOG.md")
-        if os.path.isfile(changelog_path):
+        if repo_path:
+            # git log (last 40 commits)
             try:
-                with open(changelog_path, 'r', encoding='utf-8', errors='replace') as f:
-                    proj_evidence["changelog_excerpt"] = f.read(2000)
-            except OSError:
-                pass
-
-        # FTS5 search for each open item scoped to THIS project
-        proj_items = [g["representative"] for g in all_groups if g["project"] == project]
-        fts_mentions: dict[str, int] = {}
-        for item_text in proj_items[:10]:  # cap to avoid excessive queries
-            kws = vault_index.extract_keywords(item_text, limit=3)
-            if kws:
-                # Pass keywords as space-separated (not "OR"-joined — search_vault
-                # handles tokenization internally; literal "OR" would be a search term)
-                hits = vault_index.search_vault(
-                    actual_db, " ".join(kws), project=project, limit=5,
+                proc = subprocess.run(
+                    ["git", "log", "--oneline", "-40"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
                 )
-                fts_mentions[item_text[:60]] = len(hits)
-        if fts_mentions:
-            proj_evidence["fts_mentions"] = fts_mentions
+                if proc.returncode == 0:
+                    proj_evidence["commits"] = proc.stdout.strip().split("\n")[:40]
+                else:
+                    print(f"[obsidian-brain] git log failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] git log error for {project}: {exc}", file=sys.stderr)
+
+            # git tag --list (#264 Task 2: widen git ground truth). A genuinely-
+            # shipped item may be grounded in a release tag rather than a PR/issue
+            # title (e.g. the reporter's `feature/pull-to-refresh-v2` case, shipped
+            # via tag v2.0.0 with no #N anchor in the checkbox text). Sorted by
+            # creation recency and capped/deduped to keep the evidence blob small.
+            try:
+                proc = subprocess.run(
+                    ["git", "tag", "--list", "--sort=-creatordate"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    _seen_tags: set[str] = set()
+                    _tags: list[str] = []
+                    for _line in proc.stdout.strip().split("\n"):
+                        _line = _line.strip()
+                        if not _line or _line in _seen_tags:
+                            continue
+                        _seen_tags.add(_line)
+                        _tags.append(_line)
+                        if len(_tags) >= _MAX_EVIDENCE_TAGS:
+                            break
+                    proj_evidence["tags"] = _tags
+                else:
+                    print(f"[obsidian-brain] git tag failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["tags"] = []
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] git tag error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["tags"] = []
+
+            # git log --name-only (#264 Task 2: changed file paths on the default
+            # branch's recent history). Completion may live in changed paths rather
+            # than a PR title (e.g. source/test/doc files landing under a shipped
+            # component's directory). Deduped and hard-capped so the evidence blob
+            # stays bounded regardless of commit size.
+            try:
+                proc = subprocess.run(
+                    ["git", "log", "--name-only", "--pretty=format:", "-40"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    _seen_paths: set[str] = set()
+                    _paths: list[str] = []
+                    for _line in proc.stdout.strip().split("\n"):
+                        _line = _line.strip()
+                        if not _line or _line in _seen_paths:
+                            continue
+                        _seen_paths.add(_line)
+                        _paths.append(_line)
+                        if len(_paths) >= _MAX_EVIDENCE_CHANGED_PATHS:
+                            break
+                    proj_evidence["changed_paths"] = _paths
+                else:
+                    print(f"[obsidian-brain] git log --name-only failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["changed_paths"] = []
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] git log --name-only error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["changed_paths"] = []
+
+            # gh release list
+            try:
+                proc = subprocess.run(
+                    ["gh", "release", "list", "--limit", "5"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    proj_evidence["releases"] = proc.stdout.strip().split("\n")[:5]
+                else:
+                    print(f"[obsidian-brain] gh release list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] gh release error for {project}: {exc}", file=sys.stderr)
+
+            # gh pr list --state merged
+            try:
+                proc = subprocess.run(
+                    ["gh", "pr", "list", "--state", "merged", "--limit", "20",
+                     "--json", "number,title,mergedAt,url"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    try:
+                        proj_evidence["merged_prs"] = json.loads(proc.stdout)
+                    except json.JSONDecodeError as exc:
+                        print(f"[obsidian-brain] gh pr list JSON error for {project}: {exc}", file=sys.stderr)
+                        proj_evidence["merged_prs"] = []
+                else:
+                    print(f"[obsidian-brain] gh pr list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["merged_prs"] = []
+            except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+                print(f"[obsidian-brain] gh pr list error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["merged_prs"] = []
+
+            # gh issue list --state closed
+            try:
+                proc = subprocess.run(
+                    ["gh", "issue", "list", "--state", "closed", "--limit", "20",
+                     "--json", "number,title,closedAt,body,url"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    try:
+                        proj_evidence["closed_issues"] = json.loads(proc.stdout)
+                    except json.JSONDecodeError as exc:
+                        print(f"[obsidian-brain] gh issue list JSON error for {project}: {exc}", file=sys.stderr)
+                        proj_evidence["closed_issues"] = []
+                else:
+                    print(f"[obsidian-brain] gh issue list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["closed_issues"] = []
+            except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+                print(f"[obsidian-brain] gh issue list error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["closed_issues"] = []
+
+            # CHANGELOG.md excerpt
+            changelog_path = os.path.join(repo_path, "CHANGELOG.md")
+            if os.path.isfile(changelog_path):
+                try:
+                    with open(changelog_path, 'r', encoding='utf-8', errors='replace') as f:
+                        proj_evidence["changelog_excerpt"] = f.read(2000)
+                except OSError:
+                    pass
+
+            # FTS5 search for each open item scoped to THIS project
+            proj_items = [g["representative"] for g in all_groups if g["project"] == project]
+            fts_mentions: dict[str, int] = {}
+            for item_text in proj_items[:10]:  # cap to avoid excessive queries
+                kws = vault_index.extract_keywords(item_text, limit=3)
+                if kws:
+                    # Pass keywords as space-separated (not "OR"-joined — search_vault
+                    # handles tokenization internally; literal "OR" would be a search term)
+                    hits = vault_index.search_vault(
+                        actual_db, " ".join(kws), project=project, limit=5,
+                    )
+                    fts_mentions[item_text[:60]] = len(hits)
+            if fts_mentions:
+                proj_evidence["fts_mentions"] = fts_mentions
 
         if proj_evidence:
             evidence[project] = proj_evidence
             projects_with_evidence += 1
+
+    if projects and not projects_with_evidence:
+        print(
+            f"[obsidian-brain] WARNING: 0 of {len(projects)} project(s) "
+            f"produced any evidence. This run cannot classify anything as "
+            f"DONE; every item will read ACTIVE/REVIEW at tier LOW. This is "
+            f"a precondition failure, not a triage result.",
+            file=sys.stderr,
+        )
 
     # 5. Build output JSON
     output_data = {
@@ -1377,6 +1399,12 @@ def deep_analysis_pipeline(
             "group_count": len(all_groups),
         },
         "evidence": evidence,
+        "evidence_gaps": {
+            "projects_scanned": len(projects),
+            "projects_with_evidence": projects_with_evidence,
+            "projects_without_repo": projects_without_repo,
+            "all_projects_gapped": bool(projects) and projects_with_evidence == 0,
+        },
     }
 
     # Atomic write: tempfile + rename (ensure dir exists first)
@@ -1398,7 +1426,7 @@ def deep_analysis_pipeline(
 
     total = len(all_raw_items)
     groups = len(all_groups)
-    _result = f"OK:{total}:{groups}:{projects_with_evidence}"
+    _result = f"OK:{total}:{groups}:{projects_with_evidence}:{len(projects_without_repo)}"
     # Cache from in-memory output_data rather than re-reading the file on disk.
     # Re-reading could yield an empty string on a race or disk error, which
     # would make later cache hits silently rewrite output_path with empty JSON.
