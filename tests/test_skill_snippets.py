@@ -496,6 +496,97 @@ def test_check_items_heads_handoff_key_matches():
 _PYEOF_HEREDOC_RE = re.compile(r"<< 'PYEOF'\n(.*?)\nPYEOF", re.DOTALL)
 
 
+def _read_step6_heredoc():
+    """Extract the Step 6 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md — the classifier fallback-chain block
+    (agent -> heuristic gap-fill -> cache-merge), distinguished from the
+    other 6 same-delimiter PYEOF blocks (see _read_step7_heredoc's
+    docstring) by the presence of `classify_groups_with_agent`, which is
+    unique to Step 6.
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step6_blocks = [b for b in blocks if "classify_groups_with_agent" in b]
+    assert len(step6_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"classify_groups_with_agent, found {len(step6_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step6_blocks[0]
+
+
+def _dict_has_pair(node, key_value, val_value):
+    """True if an ast.Dict literal has a Constant `key_value: val_value`
+    entry. Zips node.keys/node.values directly (parallel lists, same order,
+    same length by construction) rather than building a plain dict from
+    them first — several of this dict's other entries are Call nodes
+    (`g.get(...)`), not Constants, so a naive `dict(zip(...))` collapse
+    would still work here, but zipping keeps the intent explicit: we are
+    looking for one specific, unambiguous (key, value) pair, not building a
+    general-purpose lookup."""
+    for k, v in zip(node.keys, node.values):
+        if (
+            isinstance(k, ast.Constant) and k.value == key_value
+            and isinstance(v, ast.Constant) and v.value == val_value
+        ):
+            return True
+    return False
+
+
+def _dict_key_names(node):
+    """Constant string keys of an ast.Dict literal (skips any non-Constant
+    key, though this codebase never uses one)."""
+    return {k.value for k in node.keys if isinstance(k, ast.Constant)}
+
+
+def test_check_items_step6_cache_merge_stamps_note_evidence_only():
+    """#318 fix round 4 (F12, CRITICAL): the cache-merge block that replays
+    a cached classification for a `known_unchanged` group must stamp
+    note_evidence_only onto the constructed dict.
+
+    Without it, Step 7's `item.get("note_evidence_only", False)` silently
+    defaults to False on the missing key -- and classifier_source="cache"
+    IS a member of _HIGH_TRUST_SOURCES, so a cached DONE citation sharing a
+    literal #N with the item text reaches HIGH and gets auto-checked, on
+    EVERY re-run of the command after the first (the run that populated the
+    cache). This is worse than the original F1/F7 defect: the first run is
+    safe, the cached replay silently is not.
+
+    Parsed with `ast`, not a substring search: walks for the ast.Dict
+    literal carrying the Constant pair `"classifier_source": "cache"` (the
+    one cache-merge dict in this block -- Step 6's other classifications
+    all flow through classify_groups_with_agent / classify_groups_heuristic,
+    neither of which constructs a literal dict inline here), and asserts
+    "note_evidence_only" is among that dict's keys. A regex for the bare
+    substring "note_evidence_only" would be satisfied by a comment or an
+    unrelated dict elsewhere in the block.
+    """
+    source = _read_step6_heredoc()
+    tree = ast.parse(source)
+
+    cache_dicts = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        and _dict_has_pair(node, "classifier_source", "cache")
+    ]
+    assert len(cache_dicts) == 1, (
+        f"expected exactly one dict literal with "
+        f'"classifier_source": "cache" in Step 6\'s heredoc, found '
+        f"{len(cache_dicts)}"
+    )
+    assert "note_evidence_only" in _dict_key_names(cache_dicts[0]), (
+        "Step 6's cache-merge dict does not stamp note_evidence_only -- "
+        f"found keys {sorted(_dict_key_names(cache_dicts[0]))!r}. Without "
+        "it, every cached (classifier_source=\"cache\", a high-trust "
+        "source) verdict for a note-only project defaults "
+        "note_evidence_only=False at Step 7 and can reach HIGH again "
+        "(#318 F12)."
+    )
+
+
 def _read_step7_heredoc():
     """Extract the Step 7 `python3 << 'PYEOF' ... PYEOF` heredoc body from
     skills/check-items/SKILL.md.

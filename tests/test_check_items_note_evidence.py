@@ -488,3 +488,104 @@ def test_step7_wiring_threads_note_evidence_only_into_assign_tier():
         item["classification"] == "DONE" and item["tier"] == "HIGH"
     )
     assert not is_preselected_high_done
+
+
+# ---------------------------------------------------------------------------
+# Fix round 4 (F12, CRITICAL): a cached classification (skills/check-items/
+# SKILL.md Step 6's "known_unchanged" merge, classifier_source="cache") was
+# hand-constructed with NO note_evidence_only key. "cache" IS in
+# _HIGH_TRUST_SOURCES, and item.get("note_evidence_only", False) silently
+# defaults False on a missing key, so a cached DONE citation sharing a
+# literal #N with the item text reached HIGH and got auto-checked -- on
+# every re-run of the same command after the first, since the first run's
+# fresh classification is what got cached. The fix extracts the shared
+# predicate to check_items_cli.note_evidence_only_for() so both producers
+# (run_classifier's per-project stamp, and SKILL.md Step 6's cache-merge)
+# use the identical logic and cannot drift apart.
+# ---------------------------------------------------------------------------
+
+
+def test_note_evidence_only_for_note_completions_only_bundle():
+    evidence = {"notes-only": {"note_completions": [{"text": "x"}]}}
+    assert check_items_cli.note_evidence_only_for(evidence, "notes-only") is True
+
+
+def test_note_evidence_only_for_bundle_with_git_evidence():
+    evidence = {
+        "git-project": {
+            "commits": ["abc1234 unrelated"],
+            "note_completions": [{"text": "x"}],
+        },
+    }
+    assert check_items_cli.note_evidence_only_for(evidence, "git-project") is False
+
+
+def test_note_evidence_only_for_empty_bundle():
+    assert check_items_cli.note_evidence_only_for({"p": {}}, "p") is False
+
+
+def test_note_evidence_only_for_project_absent():
+    assert check_items_cli.note_evidence_only_for({}, "notes-only") is False
+    assert check_items_cli.note_evidence_only_for(
+        {"other-project": {"note_completions": [{"text": "x"}]}}, "notes-only",
+    ) is False
+
+
+def _cached_record(project):
+    """Mirrors SKILL.md Step 6's cache-merge dict shape exactly (post-F12),
+    including the note_evidence_only stamp a caller must compute via
+    check_items_cli.note_evidence_only_for() the same way Step 6 does."""
+    evidence = {
+        "notes-only": {"note_completions": [{"text": "wire up the foo exporter #318"}]},
+        "git-project": {"commits": ["abc1234 fixed #318"]},
+    }
+    return {
+        "group_id": "ob-0001",
+        "classification": "DONE",
+        "confidence": "LOW",
+        "canonical_text": "wire up the foo exporter #318",
+        "evidence_citation": "PR #318 merged as abc1234 on 2026-04-24.",
+        "action_required": None,
+        "project": project,
+        "classifier_source": "cache",
+        "note_evidence_only": check_items_cli.note_evidence_only_for(evidence, project),
+    }
+
+
+def test_cached_record_for_note_only_project_caps_at_med():
+    """F12 enforcement: a cached record for a note_completions-only project,
+    with a citation carrying a literal #N shared with the item text (which
+    WOULD be HIGH without the flag -- see the positive control below), must
+    read MED once note_evidence_only is threaded through Step 7's
+    assign_tier call the same way a fresh verdict is."""
+    record = _cached_record("notes-only")
+    assert record["note_evidence_only"] is True
+
+    tier = oid.assign_tier(
+        record["evidence_citation"],
+        record["canonical_text"],
+        record["classification"],
+        record["classifier_source"],
+        record["note_evidence_only"],
+    )
+    assert tier == "MED", tier
+
+
+def test_cached_record_for_git_project_still_reaches_high():
+    """POSITIVE CONTROL: the identical cached-record shape, same citation
+    and item text, but for a project that HAS git evidence -- note_evidence_
+    only is False and classifier_source="cache" is high-trust, so the
+    pre-existing behaviour (HIGH, auto-checkable) is unchanged. Without this
+    control, F12's fix could cap every cached record at MED and no test
+    here would notice."""
+    record = _cached_record("git-project")
+    assert record["note_evidence_only"] is False
+
+    tier = oid.assign_tier(
+        record["evidence_citation"],
+        record["canonical_text"],
+        record["classification"],
+        record["classifier_source"],
+        record["note_evidence_only"],
+    )
+    assert tier == "HIGH", tier

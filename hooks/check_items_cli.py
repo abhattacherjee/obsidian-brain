@@ -385,6 +385,33 @@ def _strip_unreleased_section(changelog: str) -> str:
     return pattern.sub("", changelog)
 
 
+def note_evidence_only_for(evidence: dict, project: str) -> bool:
+    """True when a project's evidence bundle has no git-derived bucket at all.
+
+    The enforcing half of #318's MED cap (F7): if the only thing backing a
+    project is note_completions, no verdict for it can legitimately be
+    HIGH, whatever the classifier wrote — assign_tier's note_evidence_only
+    parameter caps at MED unconditionally when this is True, independent of
+    citation wording (the fix-round-2 CRITICAL: a text-shape regex alone is
+    not enforcement against a model's own prose).
+
+    Extracted to module level (F12, #318 fix round 4) so BOTH producers of
+    a classification record use the identical predicate and cannot drift
+    apart: run_classifier's per-project stamp (fresh sub-agent + L2
+    synthetic verdicts) and skills/check-items/SKILL.md Step 6's
+    cache-merge block (replayed verdicts for known_unchanged groups) — the
+    second of which had NO note_evidence_only key at all until this fix,
+    so a cached DONE citation sharing a literal ref with the item text
+    could reach HIGH and get auto-checked on every re-run after the first.
+
+    An absent or empty bundle, or one missing the project entirely, is NOT
+    note-evidence-only — it is simply evidence-less, and has no evidence
+    at all to build a citation from either way.
+    """
+    proj = evidence.get(project) or {}
+    return bool(proj) and set(proj.keys()) <= {"note_completions"}
+
+
 def _bridge_project_evidence(evidence: dict, project: str) -> dict:
     """Convert project evidence to the _text-suffixed flat format expected by
     has_classifiable_evidence().
@@ -839,8 +866,7 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
 
     def _note_evidence_only(project: str) -> bool:
         if project not in _note_only_by_project:
-            proj = evidence.get(project) or {}
-            _note_only_by_project[project] = bool(proj) and set(proj.keys()) <= {"note_completions"}
+            _note_only_by_project[project] = note_evidence_only_for(evidence, project)
         return _note_only_by_project[project]
 
     for g in groups:

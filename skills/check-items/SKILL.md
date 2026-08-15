@@ -528,6 +528,7 @@ sys.path.insert(0, _ob_hooks())
 from open_item_dedup import (
     classify_groups_with_agent, classify_groups_heuristic, get_last_classifier_mode
 )
+from check_items_cli import note_evidence_only_for
 
 scope_path = os.environ["SCOPE_PATH"]
 merged_path = os.environ["MERGED_PATH"]
@@ -573,6 +574,7 @@ for g in all_merged:
             "action_required": g.get("_cached_action_required"),
             "project": g.get("project"),
             "classifier_source": "cache",
+            "note_evidence_only": note_evidence_only_for(evidence, g.get("project", "")),
         })
 
 out = os.path.join(os.path.dirname(scope_path), "classifications.json")
