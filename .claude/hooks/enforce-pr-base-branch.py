@@ -266,6 +266,9 @@ _TRANSPARENT_TOKENS = frozenset({
     "!", "\\", "if", "while", "until", "then", "else", "do", "elif",
     "sudo", "env", "command", "builtin", "exec", "nohup", "nice", "time",
     "timeout", "xargs", "eval", "stdbuf",
+    # Verified on this machine by running each one against `touch`: all three
+    # execute their argument, so a verb behind them is a verb that runs.
+    "caffeinate", "arch", "script",
 })
 # The subset of those that take arguments of their OWN before the command:
 # `timeout 60 <verb>`, `nice -n 10 <verb>`, `xargs -n 1 <verb>`, `sudo -u u
@@ -274,6 +277,9 @@ _TRANSPARENT_TOKENS = frozenset({
 # gate (#327).
 _ARG_TAKING_TOKENS = frozenset({
     "sudo", "env", "nohup", "nice", "timeout", "xargs", "stdbuf",
+    # `script -q /dev/null <verb>` — the typescript FILE is a positional
+    # argument of its own, so without this the walk stops at `/dev/null`.
+    "script",
 })
 # How many words the walk will cross before giving up. Each step rescans the
 # text to its left, so an unbounded walk is O(n) per step over a command line
@@ -300,6 +306,12 @@ _GH_TIMEOUT = 30
 # and the word before it is the command, which the bare-word rule already gets
 # right.
 _REDIRECTION = re.compile(r"\d*(?:>>?|<<?)|&>>?")
+# An assignment PREFIX, in all three spellings bash accepts. `name=value` was
+# recognised by `partition("=")[0].isidentifier()`; `name+=value` and
+# `name[sub]=value` were not, so `A+=1 <verb>` and `A[0]=1 <verb>` read the
+# assignment as an ordinary bare word and the verb as its argument — both ran
+# the verb and both allowed (#327).
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:\[[^]]*\])?\+?=")
 # The characters that end one command and start another. `(`/`{` open a
 # command context, `)`/`}`/`` ` `` close one; either way the next word is a
 # command name.
@@ -332,6 +344,88 @@ def _is_separator(text: str, i: int) -> bool:
         text[i] == "&" and _is_redirection_ampersand(text, i))
 
 
+def _heredoc_delimiter(text: str, i: int):
+    """Read the here-doc introduced at ``i``, where ``text[i:i+2]`` is ``<<``.
+
+    Returns ``(delimiter, strips_tabs, end)``, ``end`` being just past the
+    delimiter word, or None when this is not a here-doc after all.
+
+    A here-doc BODY is data — the shell hands it to a command's stdin, it does
+    not execute it — and modelling that is what closes two holes at once. One
+    apostrophe in a body flipped the scanner into `quoted` and a second flipped
+    it back, and the SKIP_PREFLIGHT hatch was honoured from inside a body
+    (#327). `<<<` is a here-STRING, not a here-doc, and is deliberately not
+    matched here.
+    """
+    j = i + 2
+    strips_tabs = False
+    if j < len(text) and text[j] == "-":
+        strips_tabs = True
+        j += 1
+    while j < len(text) and text[j] in " \t":
+        j += 1
+    if j >= len(text):
+        return None
+    quote = ""
+    if text[j] in "'\"":
+        quote = text[j]
+        j += 1
+    start = j
+    while j < len(text):
+        ch = text[j]
+        if quote:
+            if ch == quote:
+                break
+        elif ch in " \t\n;&|()<>":
+            break
+        j += 1
+    delimiter = text[start:j]
+    if quote:
+        if j >= len(text):
+            return None
+        j += 1
+    if not delimiter:
+        return None
+    return delimiter, strips_tabs, j
+
+
+def _heredoc_body_end(text: str, start: int, delimiter: str,
+                      strips_tabs: bool):
+    """``(offset just past the body, was the terminator line seen)``.
+
+    A body that is never terminated runs to the end of the text, which is what
+    the shell would wait for and what keeps this total. The flag matters
+    because both cases can end at the same offset, and they are different
+    states: a body that ENDED puts the shell back in the command stream, while
+    one still waiting for its terminator does not. Reading them as the same
+    left the offset just past the terminator line marked as body — so a verb
+    written there was dropped, and `cat <<EOF` + a body + `EOF` + the verb
+    allowed. Found by the differential oracle, not by hand (#327).
+    """
+    i = start
+    while i < len(text):
+        end_of_line = text.find("\n", i)
+        line = text[i:] if end_of_line < 0 else text[i:end_of_line]
+        if (line.lstrip("\t") if strips_tabs else line) == delimiter:
+            return (len(text) if end_of_line < 0 else end_of_line + 1), True
+        if end_of_line < 0:
+            return len(text), False
+        i = end_of_line + 1
+    return len(text), False
+
+
+def _is_comment_start(text: str, i: int) -> bool:
+    """Does the ``#`` at ``i`` begin a comment?
+
+    Only at the start of a WORD, which is where bash starts one. Callers check
+    the quoting themselves, because `#` inside `"..."` is an ordinary
+    character — and it was exactly that difference that made an earlier
+    attempt to handle comments in the command-position walk unsafe: the walk
+    cannot see quotes, and this scanner can.
+    """
+    return i == 0 or text[i - 1] in " \t\n;&|()"
+
+
 def _shell_scan(prefix: str):
     """Where a shell would textually BE at the end of ``prefix``.
 
@@ -344,28 +438,50 @@ def _shell_scan(prefix: str):
     * ``"quoted"`` — inside `'...'` or `"..."`, including a quote this prefix
       never closes. The text is data: a ``cd`` here is not a ``cd`` and a verb
       here is not a command.
+    * ``"comment"`` — after an unquoted ``#`` that starts a word, up to the end
+      of that line. Data, and PROVABLY so: the shell discards it.
+    * ``"heredoc"`` — inside a here-doc body. Data as far as this shell is
+      concerned, but a command that READS it (``bash <<EOF``) runs it, so this
+      is deliberately NOT the same state as ``"comment"``.
     * ``"subst"`` — inside `$( )` or backticks. A command here really does
-      RUN, but in a subshell whose cwd nothing outside it ever sees.
+      RUN, but in a subshell whose cwd nothing outside it ever sees. A
+      ``${...}`` parameter expansion is tracked on the same stack, so the
+      ``}`` that closes one is not mistaken for the end of a command.
     * ``"broken"`` — ``prefix`` does not parse (an unbalanced ``)``). Nothing
       can be concluded from it.
 
     The states are distinguished, rather than collapsed into one boolean,
-    because the two callers fail closed in OPPOSITE directions (#327):
-    dropping a ``cd`` leaves the command in scope, dropping a VERB stands the
-    gate down. So a ``cd`` counts only in ``"exec"`` — honouring one anywhere
-    else stood every gate down, as ``echo "x; cd /tmp" && <verb>`` runs the
-    verb right here (#326) — while a verb counts everywhere except
-    ``"quoted"``, the one state that proves it is inert.
+    because the callers fail closed in OPPOSITE directions (#327): dropping a
+    ``cd`` leaves the command in scope, dropping a VERB stands the gate down.
+    So a ``cd`` counts only in ``"exec"`` — honouring one anywhere else stood
+    every gate down, as ``echo "x; cd /tmp" && <verb>`` runs the verb right
+    here (#326) — while a verb counts everywhere except ``"quoted"`` and
+    ``"comment"``, the two states that prove it is inert.
 
     ``subshells`` is the tuple of start offsets of the plain ``( )`` subshells
     still open. A ``cd`` inside one applies to the rest of THAT subshell and
     nothing after it closes, so a caller must check the verb is still inside
     the same ones — ``(cd /other) && <verb>`` runs the verb here.
+
+    This restarts at offset 0 on every call and is the REFERENCE
+    implementation; ``_shell_states`` is the single-pass version every gate
+    consults, and a test compares the two at every offset of a corpus.
     """
-    i, n, stack, backtick = 0, len(prefix), [], False
-    dquote = False
+    i, n = 0, len(prefix)
+    stack, backtick, dquote = [], False, False
+    pending = []
     while i < n:
         c = prefix[i]
+        if pending and c == "\n":
+            i += 1
+            terminated = False
+            for delimiter, strips_tabs in pending:
+                i, terminated = _heredoc_body_end(prefix, i, delimiter,
+                                                  strips_tabs)
+            pending = []
+            if i >= n and not terminated:
+                return "heredoc", ()
+            continue
         if c == "\\":
             i += 2
         elif c == "'" and not dquote:
@@ -376,11 +492,9 @@ def _shell_scan(prefix: str):
         elif c == '"':
             # A TOGGLE, not a jump over the whole span. Jumping meant nothing
             # inside `"..."` ever reached the stack, so `echo "$(<verb>)"` and
-            # `` echo "`<verb>`" `` read as ordinary quoted text, the
-            # occurrence was dropped, and the hook exited 0 with no decision —
-            # an ALLOW on a command substitution that really does run, since
-            # substitution IS performed inside double quotes. Measured against
-            # `develop`, which denied all three (#327).
+            # `` echo "`<verb>`" `` read as ordinary quoted text and the
+            # occurrence was dropped — an ALLOW on a substitution that really
+            # runs, since substitution IS performed inside double quotes.
             dquote = not dquote
             i += 1
         elif c == "`":
@@ -389,14 +503,38 @@ def _shell_scan(prefix: str):
         elif c == "$" and i + 1 < n and prefix[i + 1] == "(":
             stack.append(None)  # substitution — its cwd never escapes
             i += 2
+        elif c == "$" and i + 1 < n and prefix[i + 1] == "{":
+            # A parameter expansion is not a command context, but its `}` must
+            # not read as the end of one: `<push> origin ${FORCE} main` had its
+            # span cut at the brace, and the protected ref was never seen.
+            stack.append("{")
+            i += 2
         elif c == "(" and not dquote:
             stack.append(i)  # subshell — its cwd applies until it closes
             i += 1
         elif c == ")" and not dquote:
-            if not stack:
+            if not stack or stack[-1] == "{":
                 return "broken", ()
             stack.pop()
             i += 1
+        elif c == "}" and not dquote and stack and stack[-1] == "{":
+            stack.pop()
+            i += 1
+        elif (c == "#" and not dquote and not backtick
+              and _is_comment_start(prefix, i)):
+            j = prefix.find("\n", i)
+            if j < 0:
+                return "comment", ()
+            i = j
+        elif (c == "<" and not dquote and prefix[i:i + 2] == "<<"
+              and prefix[i:i + 3] != "<<<"):
+            found = _heredoc_delimiter(prefix, i)
+            if found is None:
+                i += 2
+            else:
+                delimiter, strips_tabs, end = found
+                pending.append((delimiter, strips_tabs))
+                i = end
         else:
             i += 1
     # Order matters. The substitution test comes FIRST so that `echo "$(` is
@@ -417,47 +555,71 @@ def _shell_states(cmd: str):
     pushes: 0.33s at 14 KB, 1.72s at 32 KB, 5.27s at 56 KB — with 1 MB inside
     the stdin cap these hooks accept. A hook the harness kills has written no
     decision, and no decision is an ALLOW under the PreToolUse contract, so
-    the slow path was itself a bypass (#327). A profile put 5.259s of that
-    5.270s inside ``_shell_scan``, which is what this replaces.
+    the slow path was itself a bypass (#327).
 
-    Entry ``k`` is exactly ``_shell_scan(cmd[:k])``, including the states that
-    look surprising on their own: inside an unclosed quote it is ``quoted``,
-    after an unmatched ``)`` it is ``broken`` and stays that way for every
-    longer prefix, and a lone trailing ``$`` is an ordinary character because
-    ``_shell_scan`` only reads ``$(`` when both characters are present.
+    Entry ``k`` is ``_shell_scan(cmd[:k])``, and a test pins that at every
+    offset of a corpus rather than trusting this sentence. The two disagree in
+    exactly one place, which that test excludes and names: offsets strictly
+    INSIDE a here-doc introducer (between ``<<`` and the end of its delimiter
+    word). A truncated prefix makes ``_shell_scan`` fall back to ordinary
+    quote scanning there, while this has the whole word in hand; the vector is
+    the stricter of the two, since ``exec`` keeps a verb where ``quoted``
+    drops it.
 
-    That equality is not a claim in a comment: ``_shell_scan`` is kept as the
-    reference implementation and a test compares the two at every offset of a
-    corpus of quoting, escaping and nesting shapes.
-
-    The stack snapshot is rebuilt only when the stack actually changes, and
-    shared between the offsets in between, so ordinary text costs one tuple.
+    The stack snapshot is rebuilt only when the stack actually CHANGES, and
+    shared between the offsets in between. The key is the stack itself: keying
+    it on the stack's LENGTH returned a stale tuple whenever a pop and a push
+    left the depth unchanged, which ``_shell_states("(`)(`")[5]`` did — the
+    shortest counterexample is five characters long, which is why the corpus
+    is exhaustive to five.
     """
     exec_state = ("exec", ())
-    quoted, brokenstate, substate = ("quoted", ()), ("broken", ()), ("subst", ())
+    quoted, brokenstate = ("quoted", ()), ("broken", ())
+    substate, commentstate = ("subst", ()), ("comment", ())
+    heredocstate = ("heredoc", ())
     states = [exec_state]
     stack, subst_depth = [], 0
-    backtick = escaped = dollar = broken = squote = dquote = False
-    # The `("exec", tuple(stack))` snapshot, rebuilt only when the stack
-    # changes and shared by every offset in between, so ordinary text costs
-    # one tuple rather than one per character.
-    snapshot, snapshot_depth = exec_state, 0
+    backtick = escaped = dollar = broken = squote = dquote = comment = False
+    pending, body_end, body_terminated = [], -1, False
+    snapshot, snapshot_stack = exec_state, ()
 
     def settle():
         # The state of this position, in `_shell_scan`'s own order: a
         # substitution wins over a quote, so `echo "$(` keeps its verb.
-        nonlocal snapshot, snapshot_depth
+        nonlocal snapshot, snapshot_stack
         if backtick or subst_depth:
             return substate
         if dquote:
             return quoted
-        if snapshot_depth != len(stack) or snapshot is exec_state and stack:
-            snapshot, snapshot_depth = ("exec", tuple(stack)), len(stack)
+        current = tuple(stack)
+        if current != snapshot_stack:
+            snapshot, snapshot_stack = ("exec", current), current
         return snapshot
 
-    for index, ch in enumerate(cmd):
+    index = 0
+    while index < len(cmd):
+        ch = cmd[index]
         if broken:
             states.append(brokenstate)
+            index += 1
+            continue
+        if index < body_end:
+            # `body_end` is the offset just PAST the body, so the state AT it
+            # is the command stream again — but only when the body actually
+            # ended. A body still waiting for its terminator runs to the end
+            # of the text and every offset in it is still inside it.
+            states.append(heredocstate
+                          if index + 1 < body_end or not body_terminated
+                          else settle())
+            index += 1
+            continue
+        if comment:
+            if ch == "\n":
+                comment = False
+                states.append(settle())
+            else:
+                states.append(commentstate)
+            index += 1
             continue
         if squote:
             # `'...'` is literal to its closing quote, backslashes included:
@@ -467,41 +629,84 @@ def _shell_states(cmd: str):
                 states.append(settle())
             else:
                 states.append(quoted)
+            index += 1
             continue
         if escaped:
             # "\<anything>" is two characters of nothing, quotes included.
             escaped = False
             dollar = False
-        elif dollar and ch == "(":
+            states.append(settle())
+            index += 1
+            continue
+        if pending and ch == "\n":
+            index += 1
+            body_end, body_terminated = index, False
+            for delimiter, strips_tabs in pending:
+                body_end, body_terminated = _heredoc_body_end(
+                    cmd, body_end, delimiter, strips_tabs)
+            pending = []
+            # The offset just past the newline is already inside the body, and
+            # that is what `_shell_scan` reports for a prefix ending there —
+            # unless the body is empty AND terminated, which puts the shell
+            # straight back in the command stream.
+            states.append(heredocstate
+                          if index < body_end or not body_terminated
+                          else settle())
+            continue
+        if dollar and ch in "({":
             # A substitution runs even inside `"..."`, which is the whole
             # point of the double-quote fix.
-            stack.append(None)  # substitution — its cwd never escapes
-            subst_depth += 1
+            stack.append(None if ch == "(" else "{")
+            if ch == "(":
+                subst_depth += 1
             dollar = False
-        else:
-            dollar = False
-            if ch == "\\":
-                escaped = True
-            elif ch == "'" and not dquote:
-                squote = True
-                states.append(quoted)
+            states.append(settle())
+            index += 1
+            continue
+        dollar = False
+        if ch == "\\":
+            escaped = True
+        elif ch == "'" and not dquote:
+            squote = True
+            states.append(quoted)
+            index += 1
+            continue
+        elif ch == '"':
+            dquote = not dquote
+        elif ch == "`":
+            backtick = not backtick
+        elif ch == "$":
+            dollar = True
+        elif ch == "(" and not dquote:
+            stack.append(index)  # subshell — cwd applies until it closes
+        elif ch == ")" and not dquote:
+            if not stack or stack[-1] == "{":
+                broken = True
+                states.append(brokenstate)
+                index += 1
                 continue
-            elif ch == '"':
-                dquote = not dquote
-            elif ch == "`":
-                backtick = not backtick
-            elif ch == "$":
-                dollar = True
-            elif ch == "(" and not dquote:
-                stack.append(index)  # subshell — cwd applies until it closes
-            elif ch == ")" and not dquote:
-                if not stack:
-                    broken = True
-                    states.append(brokenstate)
-                    continue
-                if stack.pop() is None:
-                    subst_depth -= 1
+            if stack.pop() is None:
+                subst_depth -= 1
+        elif ch == "}" and not dquote and stack and stack[-1] == "{":
+            stack.pop()
+        elif (ch == "#" and not dquote and not backtick
+              and _is_comment_start(cmd, index)):
+            comment = True
+            states.append(commentstate)
+            index += 1
+            continue
+        elif (ch == "<" and not dquote and cmd[index:index + 2] == "<<"
+              and cmd[index:index + 3] != "<<<"):
+            found = _heredoc_delimiter(cmd, index)
+            if found is not None:
+                delimiter, strips_tabs, end = found
+                pending.append((delimiter, strips_tabs))
+                while index < end:
+                    states.append(settle())
+                    index += 1
+                continue
         states.append(settle())
+        index += 1
     return states
 
 
@@ -633,7 +838,6 @@ def _at_command_position(cmd: str, start: int) -> bool:
                 break
             token_start -= 1
         token = cmd[token_start:end]
-        name, eq, _value = token.partition("=")
         redirect = _REDIRECTION.match(token)
         if token in _ARG_TAKING_TOKENS:
             pending_bare = 0  # this is what those bare words belonged to
@@ -642,7 +846,7 @@ def _at_command_position(cmd: str, start: int) -> bool:
             # its right, and that word is not the verb's command.
             if redirect.end() == len(token):
                 pending_bare = max(0, pending_bare - 1)
-        elif token.startswith("-") or (eq and name.isidentifier()):
+        elif token.startswith("-") or _ASSIGNMENT.match(token):
             pass  # an option or an assignment; a bare word may be its value
         elif token in _TRANSPARENT_TOKENS:
             if pending_bare:
@@ -655,34 +859,41 @@ def _at_command_position(cmd: str, start: int) -> bool:
     return True
 
 
-def _argument_span(cmd: str, start: int) -> str:
+def _argument_span(cmd: str, start: int, states=None) -> str:
     """The text of ONE command, from ``start`` to where the shell ends it.
 
     Every allow-side escape hatch in these gates tested a raw substring
     against the WHOLE command, while the deny side had been narrowed to the
     occurrence a shell would really run — and a gate that is narrow where it
     blocks and wide where it stands down is a gate with an off switch (#327).
-    Measured: ``<push> origin main  # see refs/tags/v1`` and ``echo
-    '--tags' && <push> origin main`` both stood the push gate down, and
-    ``<push> --delete origin release/x && <push> origin main`` excused the
-    second push with the first one's flag.
 
-    The span ends at the first thing the shell would treat as ending this
-    command — ``;``, ``&``, ``|``, a newline, a closing ``)``, ``}`` or
-    backtick — or at a ``#`` that starts a comment. The backtick earns its
-    place: without it ``X=`<push> origin main` `` keeps the closing backtick
-    inside the span, and the last WORD of the span is then ``main` `` rather
-    than ``main``, which is not a ref and not a deny. A candidate only counts
-    when the text from the verb to it parses as executable, so a separator
-    inside quotes (``-m "a; b"``) does not cut the span short.
+    A candidate ends the command only when the shell is at the SAME level
+    there as it is at ``start``, which is what the state vector answers. The
+    earlier version asked ``_shell_scan(cmd[start:i])`` per candidate, and
+    that was wrong twice over. It was quadratic — 1.09s at 5 KB, 4.23s at
+    10 KB, 16.97s at 20 KB, all of it under the 32 KB length cap, and a hook
+    the harness kills writes no decision. And it could not tell an OPENING
+    delimiter from a closing one: ``<push> origin `:` main`` ended the span at
+    the first backtick and ``<push> origin ${FORCE} main`` ended it at the
+    brace, so in both the protected ref sat outside the span the gate reads.
+
+    A backtick therefore ends the span only when it CLOSES the substitution
+    the span is inside — which is what ``X=`<push> origin main` `` needs, and
+    what an opening backtick must not do.
     """
+    if states is None:
+        states = _shell_states(cmd)
+    here = states[start]
     i = start
     while i < len(cmd):
-        c = cmd[i]
-        if (c in ";|\n)}`"
-                or (c == "&" and not _is_redirection_ampersand(cmd, i))
-                or (c == "#" and (i == 0 or cmd[i - 1].isspace()))):
-            if _shell_scan(cmd[start:i])[0] == "exec":
+        if states[i] == here:
+            c = cmd[i]
+            if (c in ";|\n)}"
+                    or (c == "&" and not _is_redirection_ampersand(cmd, i))
+                    or (c == "#" and (i == 0 or cmd[i - 1].isspace()))):
+                return cmd[start:i]
+            if (c == "`" and here[0] == "subst"
+                    and states[i + 1][0] != "subst"):
                 return cmd[start:i]
         i += 1
     return cmd[start:]
@@ -707,14 +918,28 @@ def _verb_occurrences(cmd: str, verb: str):
     # verb is inert when the command as a WHOLE parses. `echo don\'t && <verb>`
     # leaves a quote open from the apostrophe onward, so every later position
     # reads as quoted — and dropping the verb there is an ALLOW, on a shape
-    # develop denied. When the whole command does not parse, nothing in it is
-    # provably inert.
+    # develop denied.
+    #
+    # That parity rule closes the ODD case and nothing else, which is how a
+    # comment carrying ONE apostrophe stood all five gates down: `# don\'t` +
+    # newline + the verb + newline + `# it\'s fine` has two, so the command as
+    # a whole parses, the verb reads as quoted, and the occurrence was dropped
+    # (#327). What closes it is the scanner knowing what a comment IS — and
+    # the same is true of a here-doc body, where the trick works just as well.
+    #
+    # The two are not the same verdict, though. A comment is PROVABLY inert:
+    # the shell discards it, so its verb is dropped outright, with no appeal
+    # to whether the rest of the command parses. A here-doc body is data to
+    # THIS shell but a command that reads it (`bash <<EOF`) runs it, so a verb
+    # there is kept and gated.
     states = _shell_states(cmd)
     whole_parses = states[-1][0] != "quoted"
     kept = []
     for match in re.finditer(verb, cmd):
         start = match.start()
         state, _subshells = states[start]
+        if state == "comment":
+            continue
         if state == "quoted" and whole_parses:
             continue
         if not _at_command_position(cmd, start):
@@ -967,6 +1192,10 @@ if (_create_occurrences := _verb_occurrences(command, _GH_PR_CREATE_RE)):
         # create --base main --title x` opened a feature->main PR and allowed,
         # which is precisely what this gate exists to stop (#327). The push
         # gate was fixed to loop; these two were left behind.
+        # Computed ONCE for the whole command and handed to every span: the
+        # helper recomputes it otherwise, which is O(text) per occurrence and
+        # was the third quadratic site in these gates (#327).
+        _create_states = _shell_states(command)
         for _occurrence in _create_occurrences:
             # Check if --base is specified (supports both --base X and --base=X),
             # among the arguments of the create being run — searching the whole
@@ -975,7 +1204,7 @@ if (_create_occurrences := _verb_occurrences(command, _GH_PR_CREATE_RE)):
             # which is exactly what this gate exists to stop: `echo --base develop
             # && gh pr create --title x` was an allow (#327).
             _bases = _base_values_in_span(
-                _argument_span(command, _occurrence))
+                _argument_span(command, _occurrence, _create_states))
             # Two different bases in one create is not a base this gate can
             # check. `gh` would honour the last; refusing is unambiguous, and
             # a flag repeated with the SAME value still passes.
@@ -1017,8 +1246,9 @@ if (_merge_occurrences := _verb_occurrences(command, _GH_PR_MERGE_RE)):
         sys.exit(0)
     # Every merge the command runs, for the same reason the creates above are
     # all judged: one compliant merge must not excuse a later one.
+    _merge_states = _shell_states(command)
     for _occurrence in _merge_occurrences:
-        _span = _argument_span(command, _occurrence)
+        _span = _argument_span(command, _occurrence, _merge_states)
         _numbers = _pr_numbers_in_span(_span)
         if len(set(_numbers)) > 1:
             deny(

@@ -2769,8 +2769,19 @@ class TestBashTruthDifferential:
               "# c\n", "x=1 ", "{ ", ">/dev/null ", "2>&1 ", "1>&2 ", "&>out ",
               "3>&1 ", "if true; then ", "for i in 1; do ",
               "while false; do : ; done; ", "! ", "time ", "sudo ",
-              "nice -n 10 ", "command ", "eval ", "\\", "(", "$(", "`")
-    SUFFIX = ("", ";", " ; }", " ; done", " ; fi", ")", "`")
+              "nice -n 10 ", "command ", "eval ", "\\", "(", "$(", "`",
+              # Phase 2: the families that were found by hand rather than by
+              # this oracle, folded back in so the oracle owns them from here.
+              "# don't\n", "# don't\n# it's\n", '# say "hi"\n',
+              "cat <<EOF\ndon't\nEOF\n", "cat <<'EOF'\ndon't\nEOF\n",
+              "cat <<-EOF\n\tx\n\tEOF\n", "A+=1 ", "A[0]=1 ",
+              "caffeinate ", "arch ", "arch -arm64 ", "script -q /dev/null ",
+              "echo ${HOME} && ", "echo `:` && ")
+    SUFFIX = ("", ";", " ; }", " ; done", " ; fi", ")", "`",
+              # Trailing shapes that used to cut a span short of its own
+              # arguments, or restore quote parity behind the verb.
+              " ${FORCE}", " `:`", " $(true)", "\n# it's fine",
+              " # don't", "\ncat <<EOF\ndon't\nEOF")
     WRAPPERS = ("%s", "`%s`", "$(%s)", "( %s )", "{ %s ; }")
     WRAP_PREFIX = ("", "true; ", "true && ", "echo hi\n", "x=1 ", ">/dev/null ",
                    "2>&1 ")
@@ -3039,6 +3050,26 @@ class TestTheScanIsLinearAndBounded:
         assert elapsed < 3.0, (
             f"{len(command)} characters took {elapsed:.1f}s; the scan is "
             "quadratic again and a slow gate is an open one"
+        )
+
+    def test_many_allowed_occurrences_are_judged_quickly(self, tmp_path):
+        """Every occurrence gets a span when none of them offends.
+
+        The gate stops at the first push it denies, so a command of DENIED
+        pushes computes one span and hides the cost. These all allow, so the
+        loop runs to the end — which is where recomputing the state vector
+        once per span costs O(text) per occurrence (#327).
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        unit = "git pu" + "sh origin feature/probe && "
+        command = (unit * (30 * 1024 // len(unit)))[:30 * 1024].rstrip("& ")
+        started = time.monotonic()
+        decision = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        elapsed = time.monotonic() - started
+        assert decision == "allow"
+        assert elapsed < 3.0, (
+            f"{len(command)} characters of allowed pushes took {elapsed:.1f}s"
         )
 
     @pytest.mark.parametrize("hook,verb", (
@@ -3412,10 +3443,26 @@ class TestTheStateVectorAgreesWithTheScanner:
     and firing.
 
     The corpus is not a handful of nice strings. It is every string of length
-    up to three over the alphabet that matters (quotes, backslash, backtick,
-    `$`, parens, space, newline), plus a seeded random sample of longer ones,
-    plus the shapes earlier defects were found in. Both functions are read out
-    of the real hook file, so this cannot drift from what ships.
+    up to FIVE over the alphabet that matters (quotes, backslash, backtick,
+    `$`, parens, braces, space, newline, `#`, `<`), plus a seeded random
+    sample of longer ones, plus the shapes earlier defects were found in. Both
+    functions are read out of the real hook file, so this cannot drift from
+    what ships.
+
+    Five, not three, because an invariant a test cannot see fail is not an
+    invariant. The stack snapshot was keyed on the stack's LENGTH, so a pop
+    followed by a push returned a stale tuple — and the shortest string that
+    shows it is `` (`)(` ``, which is five characters long (#327). At three
+    the assertion was green against a scanner that was already wrong.
+
+    The two implementations disagree in exactly one place, excluded here and
+    named rather than papered over: offsets strictly INSIDE a here-doc
+    introducer, between `<<` and the end of its delimiter word. A truncated
+    prefix makes the reference fall back to ordinary quote scanning there,
+    while the vector has the whole word in hand. The vector is the STRICTER of
+    the two — `exec` keeps a verb where `quoted` drops it — so the exclusion
+    cannot hide a bypass, and the test asserts the mismatches all fall inside
+    those spans rather than assuming it.
     """
 
     @staticmethod
@@ -3443,9 +3490,60 @@ class TestTheStateVectorAgreesWithTheScanner:
         return namespace
 
     @staticmethod
+    def _truncation_sensitive_spans(namespace, command):
+        """Where the two scanners CANNOT agree, and why.
+
+        Both are correct for the input they are given; they are given
+        different inputs. The reference sees `command[:k]` and the vector sees
+        all of `command`, so wherever the shell's state at k depends on text
+        AFTER k, a truncated prefix answers a different question.
+
+        There are exactly two such places, both inside a here-doc:
+
+        * the INTRODUCER, between `<<` and the end of its delimiter word. Cut
+          the prefix inside `<<'EOF'` and the reference falls back to ordinary
+          quote scanning, because it cannot see the closing quote.
+        * the TERMINATOR line. Cut the prefix at the end of the delimiter word
+          and the reference reads the here-doc as finished; with the newline
+          in hand, the vector knows the line — and the body — runs one
+          character further.
+
+        The vector is the stricter of the two in both (`exec` and `heredoc`
+        keep a verb where `quoted` drops it), so excusing them cannot hide a
+        bypass. Everything else must agree exactly.
+        """
+        spans, i = [], 0
+        while i < len(command) - 1:
+            if command[i:i + 2] == "<<" and command[i:i + 3] != "<<<":
+                found = namespace["_heredoc_delimiter"](command, i)
+                if found:
+                    delimiter, strips_tabs, end = found
+                    spans.append((i + 2, end))
+                    newline = command.find("\n", end)
+                    if newline >= 0:
+                        body_end, terminated = namespace["_heredoc_body_end"](
+                            command, newline + 1, delimiter, strips_tabs)
+                        if terminated:
+                            line_start = command.rfind("\n", 0, body_end - 1)
+                            spans.append((line_start + 1, body_end))
+                    i = end
+                    continue
+            i += 1
+        return spans
+
+    @staticmethod
     def _corpus():
-        alphabet = "'\"`$()\\ a\n)"
+        alphabet = "'\"`$(){}\\ a\n#<"
         corpus = [
+            "# don\'t\ngit push origin main\n# it\'s fine",
+            "cat <<EOF\nSKIP_PREFLIGHT=1\nEOF\ngit commit",
+            "cat <<\'EOF\'\nx\'y\nEOF\ngit push",
+            "cat <<-EOF\n\tbody\n\tEOF\ngit push",
+            "cat <<<here-string git push",
+            "git push origin ${FORCE} main",
+            "git push origin `:` main",
+            "echo a # b\nc", 'echo "# not a comment" c',
+            "(`)(`",
             "", "git push origin main", "echo 'x' && git push",
             '$(git push)', "`git push`", "(git push)", ")", "()", "(()",
             "echo don't && git push", 'echo "unclosed', "echo 'unclosed",
@@ -3456,8 +3554,13 @@ class TestTheStateVectorAgreesWithTheScanner:
         for size in (1, 2, 3):
             for combo in itertools.product(alphabet, repeat=size):
                 corpus.append("".join(combo))
+        # Exhaustive to five over the characters that actually nest, which is
+        # the length the stale-snapshot bug needed to show itself.
+        for size in (4, 5):
+            for combo in itertools.product("'`$(){} a)", repeat=size):
+                corpus.append("".join(combo))
         rng = random.Random(20260814)
-        for _ in range(1500):
+        for _ in range(2500):
             corpus.append("".join(rng.choice(alphabet + "bc;&|")
                                   for _ in range(rng.randint(4, 24))))
         return corpus
@@ -3465,23 +3568,51 @@ class TestTheStateVectorAgreesWithTheScanner:
     def test_every_prefix_state_matches_the_reference_scanner(self):
         namespace = self._hook_namespace()
         scan, states = namespace["_shell_scan"], namespace["_shell_states"]
-        compared, mismatches = 0, []
+        compared, mismatches, excused = 0, [], 0
         for command in self._corpus():
             vector = states(command)
             assert len(vector) == len(command) + 1, (
                 f"the vector is not one entry per prefix: {command!r}"
             )
+            spans = self._truncation_sensitive_spans(namespace, command)
             for k in range(len(command) + 1):
                 compared += 1
                 expected = scan(command[:k])
-                if vector[k] != expected and len(mismatches) < 10:
+                if vector[k] == expected:
+                    continue
+                if any(start < k <= end for start, end in spans):
+                    excused += 1
+                    continue
+                if len(mismatches) < 10:
                     mismatches.append((command, k, vector[k], expected))
-        assert compared > 20_000, (
+        assert compared > 100_000, (
             f"only {compared} offsets compared; the corpus stopped covering"
         )
         assert not mismatches, (
             "the single-pass scan disagrees with the reference scanner:\n  "
             + "\n  ".join(repr(row) for row in mismatches)
+        )
+
+    def test_the_only_excused_mismatches_are_truncation_sensitive(self):
+        """The exclusion above is a fact about the corpus, not an escape.
+
+        If a mismatch ever appears outside a here-doc introducer, the test
+        above fails; this one keeps the excused set from growing silently.
+        """
+        namespace = self._hook_namespace()
+        scan, states = namespace["_shell_scan"], namespace["_shell_states"]
+        excused = 0
+        for command in self._corpus():
+            vector = states(command)
+            spans = self._truncation_sensitive_spans(namespace, command)
+            for k in range(len(command) + 1):
+                if vector[k] != scan(command[:k]):
+                    assert any(start < k <= end for start, end in spans), (
+                        f"an unexcused mismatch: {command!r} @{k}"
+                    )
+                    excused += 1
+        assert excused < 200, (
+            f"{excused} offsets are excused; the divergence is spreading"
         )
 
 
@@ -3918,6 +4049,290 @@ class TestTheLastBaseWins:
         assert decide(work, env, "enforce-pr-base-branch",
                       f"{c} --base develop --title a; {c} --base develop --title b"
                       ) == "allow"
+
+
+class TestCommentsAndHeredocBodiesAreData:
+    """#327 I17: an inert quote on BOTH sides of the verb stood every gate down.
+
+    The scanner modelled neither a `#` comment nor a here-doc body, so an
+    apostrophe written in one opened a quote span and a second one closed it.
+    With parity restored the command as a whole parses, the verb in between
+    reads as `quoted`, and `_verb_occurrences` drops it — exit 0, no decision,
+    which the PreToolUse contract reads as ALLOW:
+
+        # don't
+        <verb>
+        # it's fine
+
+    Verified with a `git`/`gh` shim on PATH that records what it was asked to
+    run: bash executes the verb in every gated row below. The DOUBLE-quote
+    spelling denied even before the fix — one apostrophe is what it takes —
+    and the fix is the scanner knowing what a comment is, not a rule about
+    apostrophes.
+
+    A comment and a here-doc body are not the same verdict. A comment is
+    provably inert, so its verb is dropped outright. A here-doc body is data
+    to THIS shell but `bash <<EOF` runs it, so a verb there is kept and gated
+    — which is why the allow-side row below (the SKIP_PREFLIGHT hatch) is a
+    separate fix from the deny-side rows.
+    """
+
+    PUSH = "git pu" + "sh origin ma" + "in"
+    COMMIT = "git com" + "mit -m x"
+    CHECKOUT = "git check" + "out -b bogus"
+    CREATE = "gh pr " + "cre" + "ate --title x"
+
+    GATED = (
+        ("apostrophes either side", "prevent-direct-push",
+         "# don't\n{v}\n# it's fine"),
+        ("double quotes either side", "prevent-direct-push",
+         '# say "hi"\n{v}\n# and "bye"'),
+        ("one apostrophe before", "prevent-direct-push", "# don't\n{v}"),
+        ("a here-doc body with an apostrophe", "prevent-direct-push",
+         "cat <<EOF\ndon't\nEOF\n{v}"),
+        # A `#` inside a word is not a comment — in bash or here. Read as one,
+        # it swallows the rest of the line and the verb with it.
+        ("a hash inside a word", "prevent-direct-push", "x=a#b {v}"),
+        ("a hash inside an argument", "prevent-direct-push", "echo a#b && {v}"),
+        ("a quoted-delimiter here-doc", "prevent-direct-push",
+         "cat <<'EOF'\ndon't\nEOF\n{v}"),
+        ("a tab-stripped here-doc", "prevent-direct-push",
+         "cat <<-EOF\n\tdon't\n\tEOF\n{v}"),
+    )
+    OTHER_GATES = (
+        ("require-preflight", COMMIT),
+        ("validate-branch-name", CHECKOUT),
+        ("enforce-pr-base-branch", CREATE),
+    )
+    # A verb that really IS in a comment or a body: bash runs neither.
+    TEXT = (
+        ("the verb is the comment", "echo hi # {v}"),
+        ("the verb is on a commented line", "echo hi\n# {v}"),
+        # The discriminating one. After an argument-taking wrapper the walk
+        # reads the `#` as that wrapper's argument and calls the verb a
+        # command, so this row allows ONLY because the scanner knows the verb
+        # is in a comment. `echo hi # <verb>` allows either way and proves
+        # nothing.
+        ("a comment after an arg-taking wrapper", "sudo # {v}"),
+        ("a comment after timeout", "timeout 5 # {v}"),
+    )
+    # A here-doc body is NOT in that list, deliberately. It is data to this
+    # shell, but `bash <<EOF` reads it and runs it, so a verb there stays
+    # gated — the same fail-closed reading these hooks have always had, and
+    # the reason "comment" and "heredoc" are different states rather than one.
+    HEREDOC_STILL_GATED = (
+        ("an unquoted body", "cat <<EOF\n{v}\nEOF"),
+        ("a quoted-delimiter body", "cat <<'EOF'\n{v}\nEOF"),
+        ("a body a shell would really run", "bash <<EOF\n{v}\nEOF"),
+    )
+
+    @pytest.mark.parametrize("label,template", HEREDOC_STILL_GATED)
+    def test_a_verb_in_a_heredoc_body_stays_gated(self, tmp_path, label, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", (
+            f"{label}: `bash <<EOF` runs the body, so it cannot be dropped: "
+            f"{command!r}"
+        )
+
+    @pytest.mark.parametrize("label,hook,template", GATED)
+    def test_an_inert_quote_does_not_hide_the_verb(
+        self, tmp_path, label, hook, template
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, hook, command) == "deny", (
+            f"{label}: a comment stood the gate down: {command!r}"
+        )
+
+    @pytest.mark.parametrize("hook,verb", OTHER_GATES)
+    def test_the_same_shape_on_every_other_gate(self, tmp_path, hook, verb):
+        """One scanner, five copies."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, hook, f"# don't\n{verb}\n# it's fine") == "deny"
+
+    @pytest.mark.parametrize("label,template", TEXT)
+    def test_a_verb_that_really_is_inert_still_allows(
+        self, tmp_path, label, template
+    ):
+        """The control. Modelling comments must not mean denying them: bash
+        runs none of these, and a gate that denied them would be trading one
+        false verdict for another."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow", (
+            f"{label}: {command!r}"
+        )
+
+    def test_the_skip_hatch_is_not_reachable_from_a_heredoc_body(self, tmp_path):
+        """The allow side of the same gap.
+
+        `SKIP_PREFLIGHT=1` written into a here-doc body was honoured as an
+        assignment the shell would make, with no token present — measured
+        ALLOW, and the shim recorded the commit (#327). The body is data, so
+        the hatch requires a position the scanner calls `exec` and a body is
+        not one.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        commit = "git com" + "mit -m x"
+        for body in ("cat <<EOF\nSKIP_PREFLIGHT=1\nEOF\n" + commit,
+                     "cat <<'EOF'\nSKIP_PREFLIGHT=1\nEOF\n" + commit):
+            assert decide(work, env, "require-preflight", body) == "deny", (
+                f"a here-doc body disabled the preflight gate: {body!r}"
+            )
+        # The control: the real hatch, as an assignment the shell would make.
+        assert decide(work, env, "require-preflight",
+                      "SKIP_PREFLIGHT=1 " + commit) == "allow"
+        assert decide(work, env, "require-preflight", commit) == "deny"
+
+
+class TestAssignmentPrefixesInEverySpelling:
+    """#327 I18: bash has three assignment-prefix forms and the walk knew one.
+
+    `token.partition("=")[0].isidentifier()` recognises `A=1` and nothing
+    else, so `A+=1 <verb>` and `A[0]=1 <verb>` read the assignment as an
+    ordinary bare word and the verb as that word's argument. Both run the
+    verb; both allowed.
+    """
+
+    PUSH = "git pu" + "sh origin ma" + "in"
+
+    GATED = ("A=1 {v}", "A+=1 {v}", "A[0]=1 {v}", "A[i+1]+=1 {v}",
+             "PATH=/x A+=1 {v}", "_x=1 {v}")
+    TEXT = ("echo A=1 {v}", "echo A+=1 {v}", "echo A[0]=1 {v}",
+            # Not assignments: no name, or a name that cannot be one. Bare, so
+            # the verdict turns on whether the token is read as an assignment
+            # — with `echo` in front, both readings allow and neither is
+            # tested.
+            "echo =1 {v}", "echo 1A=1 {v}", "1A=1 {v}", "=1 {v}",
+            "a-b=1 {v}")
+
+    @pytest.mark.parametrize("template", GATED)
+    def test_an_assignment_prefix_does_not_hide_the_verb(self, tmp_path, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", command
+
+    @pytest.mark.parametrize("template", TEXT)
+    def test_the_same_text_as_an_argument_still_allows(self, tmp_path, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow", command
+
+
+class TestTheSpanIsNotCutByAnOpeningDelimiter:
+    """#327 I19: the span ended at an OPENING backtick, and at a `${`'s brace.
+
+    `_argument_span` asked `_shell_scan(cmd[start:i])` per candidate, which
+    cannot tell a delimiter that opens from one that closes. So the span
+    stopped before the arguments that decide, and the protected ref was never
+    among the words the gate reads:
+
+        <push> origin ${FORCE} main      span stopped at `${FORCE`
+        <push> origin `:` main           span stopped at the first backtick
+
+    The `$( )` spelling denied throughout, and that asymmetry is the tell.
+
+    The control is the shape the backtick rule exists for: a span that STARTS
+    inside a substitution must still end at the backtick that closes it.
+    """
+
+    PUSH = "git pu" + "sh"
+    MAIN = "ma" + "in"
+    BT = chr(96)
+
+    GATED = (
+        ("${...} between the remote and the ref", "{p} origin ${{FORCE}} {m}"),
+        ("a backtick between them", "{p} origin " + BT + ":" + BT + " {m}"),
+        ("$( ) between them", "{p} origin $(true) {m}"),
+        ("${...} then a refspec", "{p} origin ${{F}} HEAD:{m}"),
+        ("a span that starts inside a substitution",
+         "X=" + BT + "{p} origin {m}" + BT),
+        ("nested braces", "{p} origin ${{A:-${{B}}}} {m}"),
+    )
+
+    @pytest.mark.parametrize("label,template", GATED)
+    def test_the_protected_ref_is_still_in_the_span(self, tmp_path, label, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(p=self.PUSH, m=self.MAIN)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", (
+            f"{label}: the span was cut before the ref: {command!r}"
+        )
+
+    def test_a_separator_still_ends_the_span(self, tmp_path):
+        """The control: widening the span must not swallow the NEXT command.
+
+        If it did, the first push would be judged on the second one's
+        arguments, which is the defect this whole span helper exists to close.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, "prevent-direct-push",
+                      f"{self.PUSH} origin feature/probe && echo {self.MAIN}"
+                      ) == "allow"
+        assert decide(work, env, "prevent-direct-push",
+                      f"{self.PUSH} origin feature/probe; echo {self.MAIN}"
+                      ) == "allow"
+        assert decide(work, env, "prevent-direct-push",
+                      f"{self.PUSH} origin feature/probe ${{X}} # {self.MAIN}"
+                      ) == "allow"
+
+    def test_the_other_gates_read_the_same_span(self, tmp_path):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        create = "gh pr " + "cre" + "ate"
+        checkout = "git check" + "out -b"
+        assert decide(work, env, "enforce-pr-base-branch",
+                      f"{create} --base develop --title x ${{OPTS}} --base {self.MAIN}"
+                      ) == "deny"
+        assert decide(work, env, "validate-branch-name",
+                      f"{checkout} {self.BT}:{self.BT} badname") == "deny"
+        # Controls: the compliant spellings of both.
+        assert decide(work, env, "enforce-pr-base-branch",
+                      f"{create} --base develop --title x ${{OPTS}}") == "allow"
+        assert decide(work, env, "validate-branch-name",
+                      f"{checkout} feature/ok ${{OPTS}}") == "allow"
+
+
+class TestMoreExecWrappers:
+    """#327 I20: three more wrappers that really do run their argument.
+
+    Each was verified on the machine this was written on by running it against
+    `touch` and checking the file appeared: `caffeinate <verb>`,
+    `arch -arm64 <verb>` and `script -q /dev/null <verb>` all execute the verb.
+    `script` takes a positional file of its own, so it belongs in the
+    argument-taking set as well or the walk stops at `/dev/null`.
+    """
+
+    PUSH = "git pu" + "sh origin ma" + "in"
+
+    GATED = ("caffeinate {v}", "caffeinate -i {v}", "arch {v}",
+             "arch -arm64 {v}", "arch -x86_64 {v}",
+             "script -q /dev/null {v}", "script /dev/null {v}")
+    TEXT = ("echo caffeinate {v}", "echo arch -arm64 {v}",
+            "grep -r caffeinate {v}")
+
+    @pytest.mark.parametrize("template", GATED)
+    def test_a_wrapper_does_not_hide_the_verb(self, tmp_path, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", command
+
+    @pytest.mark.parametrize("template", TEXT)
+    def test_the_wrapper_name_as_text_still_allows(self, tmp_path, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow", command
 
 
 class TestAllowSideHatchesAreScopedToTheirCommand:
