@@ -15,6 +15,7 @@ The token is:
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -22,13 +23,36 @@ import time
 
 
 def _get_token_path():
-    """Get project-specific token path using a hash of the project directory."""
-    project_dir = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
-    project_dir = os.path.realpath(project_dir)
+    """The project-specific token path, or None when it cannot be named.
+
+    This runs at IMPORT time, before any function that can decide anything
+    exists. `os.getcwd()` raises FileNotFoundError when the working directory
+    has been deleted out from under the process, and `os.path.realpath` raises
+    ValueError on an embedded NUL — either one was an uncaught traceback at
+    import, i.e. rc 1, which is a NON-blocking error, so the commit proceeded
+    with this gate never having run at all (#327). Returning None hands the
+    decision to `main()`, which blocks.
+
+    `os.getcwd()` is called only when CLAUDE_PROJECT_DIR is absent, and an
+    empty value counts as absent: `os.environ.get(k, default)` returns the
+    empty string when the variable is set to one, and realpath("") is the cwd
+    anyway.
+    """
+    try:
+        project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        project_dir = os.path.realpath(project_dir)
+    except Exception:
+        return None
     project_hash = hashlib.md5(project_dir.encode()).hexdigest()[:8]
     return f"/tmp/.preflight-token-{project_hash}"
 
 TOKEN_FILE = _get_token_path()
+# A token is a small JSON object. Anything larger is not one, and reading it
+# is the exposure: ~400 KB of nested "[" parses into a RecursionError, which
+# was uncaught, and rc 1 is a non-blocking error (#327). The path is a
+# predictable, world-writable /tmp name, so writing that file needs no
+# privilege at all.
+_TOKEN_SIZE_CAP = 64 * 1024
 
 # Git accepts global options BETWEEN the executable and the subcommand, so the
 # literal "git push" this used to test for simply does not occur in
@@ -43,7 +67,24 @@ TOKEN_FILE = _get_token_path()
 # subcommand to reach: 26 of them cost 16.7s of backtracking, against 0.002s
 # for 5000 of these. Capping the repetition would cap the cost too — and hand
 # back a bypass, since one option past the cap stops the gate matching at all.
-_GIT = r'(?:[^\s;&|()<>]*/)?git\b'
+# The path component may only START at a word start, and that negative
+# lookbehind is what keeps this pattern LINEAR. Without it the engine tries
+# `[^\s;&|()<>]*/` at every offset and scans forward to the end of the word
+# looking for a `/` that is not there — quadratic, with ZERO matches needed to
+# trigger it. Measured on `"a" * n`, no match anywhere: 0.029s at 4 KB, 0.45s
+# at 16 KB, 7.20s at 64 KB, 115.7s at 256 KB, against a 1 MB stdin cap. The
+# trigger is mundane — a base64 blob, a data URI, a minified bundle — and a
+# hook the harness kills has written no decision, which the PreToolUse
+# contract reads as ALLOW (#327). With the lookbehind the same sizes are
+# 0.0003s / 0.0005s / 0.0017s / 0.0069s.
+#
+# It removes no match. The leftmost match of the old pattern always began at a
+# word start already: if it matched at p with a non-empty path run, it would
+# have matched at p-1 with a longer one. Verified rather than argued —
+# identical start offsets on 20,022 probes, including `/usr/bin/git`, `./git`,
+# `mygit`, `x/mygit`, `gitd`, `git/x`, `a/b/c/git`, `$HOME/bin/git`, `'git'`,
+# `github` and 20,000 random strings over the alphabet that matters.
+_GIT = r'(?:(?<![^\s;&|()<>])[^\s;&|()<>]*/)?git\b'
 # An option's value may be quoted, and the quotes may be around only part of
 # it (`-c user.name="a b"`), so a value is a run of quoted spans and bare
 # characters rather than one `[^\s]+` token. The alternatives are disjoint on
@@ -84,6 +125,43 @@ _ARG_TAKING_TOKENS = frozenset({
 # not a semantic knob — running out means nothing was established, so the walk
 # gives up on the GATED side.
 _WALK_STEP_LIMIT = 64
+# A leading REDIRECTION is not a command name. `>/dev/null <verb>` and
+# `2>/dev/null <verb>` run the verb, and the walk read the redirection as an
+# unrecognised bare word and stood every gate down (#327). Matched at the
+# START of a token: a `>` inside a word (`foo>out`) is that word's redirection,
+# and the word before it is the command, which the bare-word rule already gets
+# right.
+_REDIRECTION = re.compile(r"\d*(?:>>?|<<?)|&>>?")
+# The characters that end one command and start another. `(`/`{` open a
+# command context, `)`/`}`/`` ` `` close one; either way the next word is a
+# command name.
+_SEPS = ";&|(){}\n`"
+
+
+def _is_redirection_ampersand(text: str, i: int) -> bool:
+    """True when the ``&`` at ``i`` belongs to a redirection operator.
+
+    `>&`, `<&` and `&>` are single operators; the `&` in them separates
+    nothing. Reading it as the separator a bare `&` is split `2>&1 <verb>`
+    into a separator and the file descriptor `1`, which the walk then carried
+    as an outstanding bare word — so the verb read as that word's argument and
+    every gate stood down. The same misreading cut `<push> 2>&1 origin main`
+    short of its own arguments, hiding the protected ref from the one test
+    that looks for it: measured allow here against deny on `develop` (#327).
+
+    `&&` and a lone `&` stay separators. Only ADJACENCY makes an operator, in
+    this as in bash: `echo a & >out <verb>` is a background `&` followed by a
+    separate redirection, and the `&` there does separate.
+    """
+    if i and text[i - 1] in "<>":
+        return True
+    return i + 1 < len(text) and text[i + 1] == ">"
+
+
+def _is_separator(text: str, i: int) -> bool:
+    """Does the character at ``i`` end one command and start another?"""
+    return text[i] in _SEPS and not (
+        text[i] == "&" and _is_redirection_ampersand(text, i))
 
 
 def _shell_scan(prefix: str):
@@ -117,45 +195,160 @@ def _shell_scan(prefix: str):
     the same ones — ``(cd /other) && <verb>`` runs the verb here.
     """
     i, n, stack, backtick = 0, len(prefix), [], False
+    dquote = False
     while i < n:
         c = prefix[i]
         if c == "\\":
             i += 2
-        elif c == "'":
+        elif c == "'" and not dquote:
             j = prefix.find("'", i + 1)
             if j < 0:
                 return "quoted", ()
             i = j + 1
         elif c == '"':
-            j = i + 1
-            while j < n and prefix[j] != '"':
-                j += 2 if prefix[j] == "\\" else 1
-            if j >= n:
-                return "quoted", ()
-            i = j + 1
+            # A TOGGLE, not a jump over the whole span. Jumping meant nothing
+            # inside `"..."` ever reached the stack, so `echo "$(<verb>)"` and
+            # `` echo "`<verb>`" `` read as ordinary quoted text, the
+            # occurrence was dropped, and the hook exited 0 with no decision —
+            # an ALLOW on a command substitution that really does run, since
+            # substitution IS performed inside double quotes. Measured against
+            # `develop`, which denied all three (#327).
+            dquote = not dquote
+            i += 1
         elif c == "`":
             backtick = not backtick
             i += 1
         elif c == "$" and i + 1 < n and prefix[i + 1] == "(":
             stack.append(None)  # substitution — its cwd never escapes
             i += 2
-        elif c == "(":
+        elif c == "(" and not dquote:
             stack.append(i)  # subshell — its cwd applies until it closes
             i += 1
-        elif c == ")":
+        elif c == ")" and not dquote:
             if not stack:
                 return "broken", ()
             stack.pop()
             i += 1
         else:
             i += 1
+    # Order matters. The substitution test comes FIRST so that `echo "$(` is
+    # "subst" and keeps its verb, rather than "quoted", which would drop it.
     if backtick or any(s is None for s in stack):
         return "subst", ()
+    if dquote:
+        return "quoted", ()
     return "exec", tuple(stack)
 
 
-def _at_command_position(prefix: str) -> bool:
-    """True when a word starting at the end of ``prefix`` is a COMMAND.
+
+def _shell_states(cmd: str):
+    """``_shell_scan``'s verdict for EVERY prefix of ``cmd``, in ONE pass.
+
+    ``_shell_scan(cmd[:k])`` restarts at offset 0, so asking it once per match
+    is quadratic in the command text. Measured on a command of repeated
+    pushes: 0.33s at 14 KB, 1.72s at 32 KB, 5.27s at 56 KB — with 1 MB inside
+    the stdin cap these hooks accept. A hook the harness kills has written no
+    decision, and no decision is an ALLOW under the PreToolUse contract, so
+    the slow path was itself a bypass (#327). A profile put 5.259s of that
+    5.270s inside ``_shell_scan``, which is what this replaces.
+
+    Entry ``k`` is exactly ``_shell_scan(cmd[:k])``, including the states that
+    look surprising on their own: inside an unclosed quote it is ``quoted``,
+    after an unmatched ``)`` it is ``broken`` and stays that way for every
+    longer prefix, and a lone trailing ``$`` is an ordinary character because
+    ``_shell_scan`` only reads ``$(`` when both characters are present.
+
+    That equality is not a claim in a comment: ``_shell_scan`` is kept as the
+    reference implementation and a test compares the two at every offset of a
+    corpus of quoting, escaping and nesting shapes.
+
+    The stack snapshot is rebuilt only when the stack actually changes, and
+    shared between the offsets in between, so ordinary text costs one tuple.
+    """
+    exec_state = ("exec", ())
+    quoted, brokenstate, substate = ("quoted", ()), ("broken", ()), ("subst", ())
+    states = [exec_state]
+    stack, subst_depth = [], 0
+    backtick = escaped = dollar = broken = squote = dquote = False
+    # The `("exec", tuple(stack))` snapshot, rebuilt only when the stack
+    # changes and shared by every offset in between, so ordinary text costs
+    # one tuple rather than one per character.
+    snapshot, snapshot_depth = exec_state, 0
+
+    def settle():
+        # The state of this position, in `_shell_scan`'s own order: a
+        # substitution wins over a quote, so `echo "$(` keeps its verb.
+        nonlocal snapshot, snapshot_depth
+        if backtick or subst_depth:
+            return substate
+        if dquote:
+            return quoted
+        if snapshot_depth != len(stack) or snapshot is exec_state and stack:
+            snapshot, snapshot_depth = ("exec", tuple(stack)), len(stack)
+        return snapshot
+
+    for index, ch in enumerate(cmd):
+        if broken:
+            states.append(brokenstate)
+            continue
+        if squote:
+            # `'...'` is literal to its closing quote, backslashes included:
+            # `_shell_scan` reaches it with `find`, not by reading characters.
+            if ch == "'":
+                squote = False
+                states.append(settle())
+            else:
+                states.append(quoted)
+            continue
+        if escaped:
+            # "\<anything>" is two characters of nothing, quotes included.
+            escaped = False
+            dollar = False
+        elif dollar and ch == "(":
+            # A substitution runs even inside `"..."`, which is the whole
+            # point of the double-quote fix.
+            stack.append(None)  # substitution — its cwd never escapes
+            subst_depth += 1
+            dollar = False
+        else:
+            dollar = False
+            if ch == "\\":
+                escaped = True
+            elif ch == "'" and not dquote:
+                squote = True
+                states.append(quoted)
+                continue
+            elif ch == '"':
+                dquote = not dquote
+            elif ch == "`":
+                backtick = not backtick
+            elif ch == "$":
+                dollar = True
+            elif ch == "(" and not dquote:
+                stack.append(index)  # subshell — cwd applies until it closes
+            elif ch == ")" and not dquote:
+                if not stack:
+                    broken = True
+                    states.append(brokenstate)
+                    continue
+                if stack.pop() is None:
+                    subst_depth -= 1
+        states.append(settle())
+    return states
+
+
+def _at_command_position(cmd: str, start: int) -> bool:
+    """True when the word beginning at ``start`` in ``cmd`` is a COMMAND.
+
+    Indices rather than a ``cmd[:start]`` slice, and no step looks further
+    left than the nearest boundary. The walk has always been bounded at
+    ``_WALK_STEP_LIMIT`` WORDS, but each step used to copy the whole text to
+    its left (``rstrip``) and scan all of it (``rfind``) to find a separator
+    that only matters when it touches the token — so a command with no
+    separators in it cost O(text) per step, per occurrence. Measured
+    end-to-end on repeated pushes with no separator: 7.8s at 32 KB and 488s at
+    256 KB, both of them a hang the harness ends with no decision, which the
+    PreToolUse contract reads as ALLOW (#327).
 
     ``echo git push origin main`` is not a push, it is an argument — but a
     gate that matches its verb as text denies it anyway, and that false deny
@@ -190,6 +383,44 @@ def _at_command_position(prefix: str) -> bool:
     that is NOT a wrapper — so the verb is that thing's data, and this returns
     False.
 
+    Three shapes put NO word in front of the verb at all, and each one stood
+    all five gates down until it was handled here — every one measured denying
+    on ``develop`` and allowing before this fix (#327):
+
+    Word boundaries are exactly the characters the strip above uses, and
+    nothing else. Splitting on ``str.isspace()`` instead — which is what
+    ``rsplit(None, 1)`` did — treats a non-breaking space as a boundary, which
+    neither this scanner's strip nor bash's IFS does: bash's IFS is space, tab
+    and newline, so ``a<NBSP>b <verb>`` is the single word ``a<NBSP>b``
+    followed by the verb as its ARGUMENT. One set for both means the token can
+    never come back empty, which is what an earlier cut needed a guard for.
+
+    * a NEWLINE is a separator and it IS in ``seps`` — but ``prefix.rstrip()``
+      removed it before the test below could see it, so ``echo starting`` +
+      newline + the verb walked on to ``starting`` and read a live command as
+      text. Only whitespace that is not itself a separator may be stripped. A
+      two-line Bash command is the ordinary case, which made this the widest
+      hole of the three; it survived every test because a newline with nothing
+      before it denies correctly, and no test put text on the first line.
+    * a BACKTICK is a separator too, and it was missing while ``(`` was
+      present — so ``$(<verb>)`` was gated and `` `<verb>` `` was not.
+    * a leading REDIRECTION is not a name: ``>/dev/null <verb>``,
+      ``2>/dev/null <verb>`` and ``<in <verb>`` all run the verb. The two
+      spellings consume different amounts: an operator with its target
+      attached (``>out``) claims no word of its own, while a bare operator
+      claims exactly the one word to its right — so ``echo a > out <verb>`` is
+      still echo's data, with only ``out`` credited to the ``>``.
+
+    A ``#`` gets NO special case, deliberately. Everything after an unquoted
+    ``#`` on a line is a comment, so a verb there is inert and "allow" is the
+    honest verdict — but a rule that allows on SEEING a ``#`` token is
+    quote-blind, and ``env "A=x # y" <verb>`` really does run the verb (this
+    scanner splits that into the tokens ``y"``, ``#``, ``"A=x``). Left as an
+    ordinary bare word, the verdict comes from the real command word further
+    left, which is the word that decides in the shell too: ``echo x #
+    <verb>`` allows because of ``echo``, and ``sudo # <verb>`` denies. A ``#``
+    on the line BEFORE the verb is settled by the newline, not by this.
+
     The walk gives up after ``_WALK_STEP_LIMIT`` words, on the gated side.
     That bound is about COST, not meaning: each step rescans the text to its
     left, so an unbounded walk is quadratic in a command line an attacker
@@ -208,22 +439,41 @@ def _at_command_position(prefix: str) -> bool:
       means joining shell words before matching, i.e. a real parser rather
       than a scanner, so the gap is documented rather than half-closed.
     """
-    seps = ";&|(){}\n"
     pending_bare = 0
+    end = start
     for _step in range(_WALK_STEP_LIMIT):
-        head = prefix.rstrip()
+        # Every whitespace character EXCEPT the newline, which is a separator
+        # the next lines are about to test for. A bare `.rstrip()` here removed
+        # it first, and that one call opened all five gates to any multi-line
+        # command (#327).
+        while end > 0 and cmd[end - 1] in " \t\r\f\v":
+            end -= 1
         # Reaching the start of the command, or a separator, settles it — but
         # only if nothing is outstanding: bare words that no wrapper ever
         # claimed were arguments to a command, and the verb is one of them.
-        if not head:
+        if end == 0:
             return pending_bare == 0
-        if head[-1] in seps:
+        if _is_separator(cmd, end - 1):
             return pending_bare == 0
-        cut = max(head.rfind(c) for c in seps)
-        token = head[cut + 1:].rsplit(None, 1)[-1]
+        # The token runs back to the nearest boundary, which is whichever of a
+        # separator or a space comes first. Nothing beyond it can change this
+        # step, which is what keeps the step local.
+        token_start = end
+        while token_start > 0:
+            if (cmd[token_start - 1] in " \t\r\f\v"
+                    or _is_separator(cmd, token_start - 1)):
+                break
+            token_start -= 1
+        token = cmd[token_start:end]
         name, eq, _value = token.partition("=")
+        redirect = _REDIRECTION.match(token)
         if token in _ARG_TAKING_TOKENS:
             pending_bare = 0  # this is what those bare words belonged to
+        elif redirect:
+            # `>out <verb>` carries its target; a bare `>` took the one word to
+            # its right, and that word is not the verb's command.
+            if redirect.end() == len(token):
+                pending_bare = max(0, pending_bare - 1)
         elif token.startswith("-") or (eq and name.isidentifier()):
             pass  # an option or an assignment; a bare word may be its value
         elif token in _TRANSPARENT_TOKENS:
@@ -231,7 +481,7 @@ def _at_command_position(prefix: str) -> bool:
                 return False  # `time foo <verb>` runs foo, with the verb as data
         else:
             pending_bare += 1  # maybe a wrapper's argument; maybe `echo`
-        prefix = head[:len(head) - len(token)]
+        end = token_start
     # More words in front of the verb than any real command line has. Nothing
     # is established either way, and an unestablished verb is a gated one.
     return True
@@ -261,7 +511,9 @@ def _argument_span(cmd: str, start: int) -> str:
     i = start
     while i < len(cmd):
         c = cmd[i]
-        if c in ";&|\n)}`" or (c == "#" and (i == 0 or cmd[i - 1].isspace())):
+        if (c in ";|\n)}`"
+                or (c == "&" and not _is_redirection_ampersand(cmd, i))
+                or (c == "#" and (i == 0 or cmd[i - 1].isspace()))):
             if _shell_scan(cmd[start:i])[0] == "exec":
                 return cmd[start:i]
         i += 1
@@ -289,14 +541,15 @@ def _verb_occurrences(cmd: str, verb: str):
     # reads as quoted — and dropping the verb there is an ALLOW, on a shape
     # develop denied. When the whole command does not parse, nothing in it is
     # provably inert.
-    whole_parses = _shell_scan(cmd)[0] != "quoted"
+    states = _shell_states(cmd)
+    whole_parses = states[-1][0] != "quoted"
     kept = []
     for match in re.finditer(verb, cmd):
         start = match.start()
-        state, _subshells = _shell_scan(cmd[:start])
+        state, _subshells = states[start]
         if state == "quoted" and whole_parses:
             continue
-        if not _at_command_position(cmd[:start]):
+        if not _at_command_position(cmd, start):
             continue
         kept.append(start)
     return kept
@@ -363,12 +616,13 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
 
     # Every "cd <target>" the shell would really run, keyed by where it takes
     # effect and by the subshells it is nested in.
+    states = _shell_states(cmd)
     cd_matches = []
     for m in re.finditer(
         r'(?:^|[;&|(]\s*)(?P<cd>cd)\s+'
         r'("(?P<dq>[^"]+)"|\'(?P<sq>[^\']+)\'|(?P<bare>\S+))', cmd
     ):
-        state, subshells = _shell_scan(cmd[:m.start("cd")])
+        state, subshells = states[m.start("cd")]
         if state != "exec":
             continue
         target = m.group("dq") or m.group("sq") or m.group("bare")
@@ -388,7 +642,7 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         if subshells:
             # The cd ran inside "( )". Its cwd is gone once that closes, so the
             # verb has to still be inside every subshell the cd was inside.
-            verb_state, verb_subshells = _shell_scan(cmd[:position])
+            verb_state, verb_subshells = states[position]
             if verb_state != "exec" or verb_subshells[:len(subshells)] != subshells:
                 return True
         try:
@@ -497,6 +751,24 @@ def allow() -> None:
 
 
 _STDIN_CAP = 1_000_000
+# How much command text these gates will analyse. A backstop, not the thing
+# keeping them fast: since the scan became single-pass the worst adversarial
+# shape measured 0.17s at this size, against 7.8s before it, and the guard
+# exists for the tail beyond — 11.3s at 900 KB, which is still inside the
+# 1 MB stdin cap, and a hook the harness kills has written no decision, which
+# the PreToolUse contract reads as ALLOW (#327).
+#
+# It is checked BEFORE the verb is matched, so it also covers the cost of the
+# matching itself. That makes it fail-closed on a long command this gate would
+# otherwise have ignored — a heredoc writing a big file, say. Raising it is
+# one constant, and the measured curve is in the changelog entry.
+_COMMAND_LENGTH_CAP = 32 * 1024
+_TOO_LONG = """⚠️ Command too long for the safety gate to analyse.
+
+This gate blocks rather than judging {size} characters of command text
+(limit {cap}). Shorten the command, or move the long part into a file
+and run that.
+"""
 
 
 def _payload_shape_ok(data):
@@ -601,6 +873,10 @@ def main():
     if tool_name != "Bash":
         allow()
 
+    # A command longer than this gate will analyse is blocked, not waved through.
+    if len(command) > _COMMAND_LENGTH_CAP:
+        block(_TOO_LONG.format(size=len(command), cap=_COMMAND_LENGTH_CAP))
+
     # Check if this is a git commit command
     is_commit = bool(_verb_occurrences(command, _GIT_COMMIT_RE))
     is_amend = "--amend" in command
@@ -624,10 +900,22 @@ def main():
     # that develop allowed. `echo SKIP_PREFLIGHT=1 && <commit>` still denies —
     # `echo` is not a wrapper, so the assignment is its argument, not an
     # assignment at all.
+    _skip_states = _shell_states(command)
     for _skip in re.finditer(r'SKIP_PREFLIGHT=1(?=\s|$)', command):
-        if (_shell_scan(command[:_skip.start()])[0] == "exec"
-                and _at_command_position(command[:_skip.start()])):
+        if (_skip_states[_skip.start()][0] == "exec"
+                and _at_command_position(command, _skip.start())):
             allow()
+
+    # The token path could not be named at import (see _get_token_path).
+    if TOKEN_FILE is None:
+        block("""❌ COMMIT BLOCKED: Cannot locate the preflight token!
+
+The hook could not resolve this project's directory, so it cannot tell
+whether preflight has run. Blocking rather than assuming it has.
+
+Set CLAUDE_PROJECT_DIR, or run from a directory that still exists, then:
+
+    ./scripts/commit-preflight.sh""")
 
     # Check if token file exists
     if not os.path.exists(TOKEN_FILE):
@@ -655,6 +943,8 @@ Then retry your commit.""")
 
     # Read and validate token
     try:
+        if os.path.getsize(TOKEN_FILE) > _TOKEN_SIZE_CAP:
+            raise ValueError("token file is too large to be a token")
         with open(TOKEN_FILE, 'r') as f:
             token_data = json.load(f)
         # A token that PARSES is not yet a token that can be read: `[]`, `5`
@@ -662,15 +952,31 @@ Then retry your commit.""")
         # .get() — a traceback, rc 1, and rc 1 is a NON-blocking error, so the
         # unverified commit proceeded. Same for an `expires` that is not a
         # number, which raises TypeError at the comparison instead (#327).
+        # Defence in depth, and mutation-proved as such: deleting this line
+        # changes no verdict and no reason, because `.get()` on a list or an
+        # int raises AttributeError and the widened handler below blocks on
+        # it identically. It earns its place by naming the failure instead of
+        # relying on the next line to raise.
         if not isinstance(token_data, dict):
             raise ValueError("token is not an object")
-        if isinstance(token_data.get("expires", 0), bool) or not isinstance(
-            token_data.get("expires", 0), (int, float)
-        ):
+        _expires = token_data.get("expires", 0)
+        if isinstance(_expires, bool) or not isinstance(_expires, (int, float)):
             raise ValueError("token expiry is not a number")
-    except (ValueError, OSError):
-        # ValueError covers json.JSONDecodeError and the shape checks above;
-        # OSError covers IOError, which is an alias for it.
+        # `json.loads` accepts NaN and Infinity, and both passed the type test
+        # above: NaN made every comparison False, so the token never expired,
+        # and Infinity never expires by arithmetic. Both measured ALLOW on an
+        # arbitrarily old token (#327). Only a float can be non-finite, and
+        # `math.isfinite` on a huge int raises OverflowError, so the isinstance
+        # test has to come first.
+        if isinstance(_expires, float) and not math.isfinite(_expires):
+            raise ValueError("token expiry is not a finite number")
+    except Exception:
+        # Not (ValueError, OSError): that pair named the failures somebody
+        # thought of, and the ones nobody did — RecursionError from a deeply
+        # nested token, MemoryError from a huge one — are neither, so they
+        # escaped as rc 1 and the unverified commit went through (#327). This
+        # is the same widening the stdin reader already carries. `block()`
+        # raises SystemExit, a BaseException, so it is not swallowed here.
         # Token file corrupted - require new preflight
         try:
             os.remove(TOKEN_FILE)
@@ -688,7 +994,11 @@ Then retry your commit.""")
     expires = token_data.get("expires", 0)
     current_time = int(time.time())
 
-    if current_time > expires:
+    # Written as a NEGATED "still valid" test on purpose: with a non-finite
+    # expiry every comparison is False, so `current_time > expires` reads as
+    # "not expired" and the token lives forever. `not (current_time <=
+    # expires)` sends anything that cannot be compared to the expired branch.
+    if not (current_time <= expires):
         try:
             os.remove(TOKEN_FILE)
         except OSError:

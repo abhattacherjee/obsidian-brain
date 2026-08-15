@@ -1,8 +1,11 @@
 """Security hardening tests for obsidian-brain."""
 import ast
 import hashlib
+import io
+import itertools
 import json
 import os
+import random
 import re
 import shutil
 import stat
@@ -1100,6 +1103,31 @@ class TestHookBlockingPathsFire:
         return work, env
 
     @classmethod
+    def _decision_and_reason(cls, work, env, hook, command):
+        """(decision, reason) from ONE run.
+
+        Some rows cannot be told apart by the verdict alone: every malformed
+        token denies, so a token gate that ignored `expires` entirely and
+        denied for the wrong reason would pass a verdict-only assertion (#327).
+        One run, because the gate DELETES a token it rejects — a second run
+        would see no token at all and block for a different reason.
+        """
+        proc = subprocess.run(
+            [sys.executable, str(work / ".claude/hooks" / f"{hook}.py")],
+            input=json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": command}}),
+            capture_output=True, text=True, timeout=60, cwd=work, env=env,
+        )
+        if proc.returncode == 2:
+            return "deny", proc.stderr
+        try:
+            output = json.loads(proc.stdout)["hookSpecificOutput"]
+        except (ValueError, KeyError, TypeError):
+            return "allow", ""
+        decision = output.get("permissionDecision", "allow")
+        return decision, output.get("permissionDecisionReason", "")
+
+    @classmethod
     def _decide(cls, work, env, hook, command):
         proc = subprocess.run(
             [sys.executable, str(work / ".claude/hooks" / f"{hook}.py")],
@@ -1747,6 +1775,12 @@ class TestVerbMatchingAndRefspecPushes:
         # written by whoever is being gated). Capping the repetition caps that
         # cost and hands back a bypass — one option past the cap and the gate
         # stops matching. This row is 25 of them, and it must still deny.
+        #
+        # It is a CORRECTNESS row and nothing more. The blowup needs options
+        # that never reach a subcommand, and this row reaches one, so it runs
+        # in 0.0000s either way. The cost is asserted by
+        # TestTheVerbPatternIsLinear below, which bounds the time instead of
+        # the verdict (#327).
         ("prevent-direct-push",
          "git " + "-c user.name=x " * 25 + "pu" + "sh origin " + MAIN),
         ("validate-branch-name", "git -C . chec" + "kout -b bogus"),
@@ -1774,6 +1808,29 @@ class TestVerbMatchingAndRefspecPushes:
         PUSH + " origin v1.2.3",                    # tag push, allowed before too
         PUSH + " origin feature/probe",
     )
+
+    def test_a_leading_plus_is_a_force_push_to_the_same_ref(self, tmp_path):
+        """`+main` with no colon.
+
+        Every other row carrying a `+` also carries a `:`, and the
+        `rsplit(":", 1)` branch strips the `+` along with everything before the
+        colon — so `\\+?` in the ref pattern never decided anything and could be
+        deleted with the suite still green (#327). `git push origin +main` is
+        the real force-push spelling that reaches it.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        push = "git pu" + "sh origin "
+        main = "ma" + "in"
+        assert decide(work, env, "prevent-direct-push",
+                      push + "+" + main) == "deny"
+        assert decide(work, env, "prevent-direct-push",
+                      push + "+develop") == "deny"
+        # The control: a leading `+` does not make every ref protected.
+        assert decide(work, env, "prevent-direct-push",
+                      push + "+feature/probe") == "allow"
+        assert decide(work, env, "prevent-direct-push",
+                      push + "+" + main + "tenance") == "allow"
 
     @pytest.mark.parametrize("command", REFSPEC_DENY)
     def test_a_refspec_push_to_a_protected_branch_denies(self, tmp_path, command):
@@ -1973,16 +2030,56 @@ class TestGitSubprocessHandlersAreWideEnough:
             "PermissionError is rc 1, and rc 1 is non-blocking"
         )
 
-    def test_a_non_executable_git_does_not_crash_the_pr_base_gate(self, tmp_path):
-        """The decision here is unchanged — with no branch name the PR-base
-        gate has nothing to object to and allows. What the widened handler
-        buys is that it allows at rc 0 instead of dying at rc 1, which the
-        _decide helper is what checks."""
+    def test_a_non_executable_git_blocks_the_pr_base_gate(self, tmp_path):
+        """An unreadable branch is not an acceptable branch.
+
+        This test used to assert ALLOW, on the reasoning that "with no branch
+        name the gate has nothing to object to". That reasoning is the
+        fail-open: `get_current_branch()` returned `""` on any git failure,
+        `"".startswith("feature/")` is False, and the base check therefore
+        never ran — an unusable git switched the gate off as surely as an
+        uncaught exception did, just at rc 0 (#327). Failing to determine the
+        branch is not evidence about the branch.
+
+        The negative control is the row below: with a WORKING git on the
+        feature branch, the same command still denies for its own reason (no
+        --base), so this row cannot pass by denying everything.
+        """
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
-        env = self._shimmed(tmp_path, env, "git")
+        broken = self._shimmed(tmp_path, env, "git")
+        command = "gh pr cre" + "ate --title x"
         assert TestHookBlockingPathsFire._decide(
-            work, env, "enforce-pr-base-branch",
-            "gh pr cre" + "ate --title x") == "allow"
+            work, broken, "enforce-pr-base-branch", command) == "deny", (
+            "an unusable git stood the PR-base gate down"
+        )
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", command) == "deny"
+
+    def test_a_non_executable_git_blocks_the_push_gate_on_any_branch(
+        self, tmp_path
+    ):
+        """`git push` and `git push -f` from `main`, with git unusable.
+
+        The `""` fallback was documented as "safe in the deny direction" and
+        was not: `""` is not `main`, not `develop`, and starts with neither
+        `release/` nor `hotfix/`, so a push whose only offence is the branch
+        it is ON sailed through. Measured before the fix — both denied with a
+        working git, both ALLOWED with a broken one (#327).
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b", "ma" + "in"],
+                       env=env, check=True, capture_output=True)
+        broken = self._shimmed(tmp_path, env, "git")
+        push = "git pu" + "sh"
+        for command in (f"{push} origin feature/x", f"{push} -f origin feature/x"):
+            assert TestHookBlockingPathsFire._decide(
+                work, env, "prevent-direct-push", command) == "deny", (
+                f"control: a working git must still deny this: {command!r}"
+            )
+            assert TestHookBlockingPathsFire._decide(
+                work, broken, "prevent-direct-push", command) == "deny", (
+                f"a broken git turned the branch check off: {command!r}"
+            )
 
     def test_an_unusable_gh_blocks_the_merge_it_cannot_verify(self, tmp_path):
         """`gh pr merge` with no PR number resolves one by running gh. When
@@ -1991,7 +2088,25 @@ class TestGitSubprocessHandlersAreWideEnough:
         right outcome and is now reachable."""
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
         env = self._shimmed(tmp_path, env, "git", "gh")
-        for command in ("gh pr me" + "rge", "gh pr me" + "rge 5"):
+        # The REASON separates the two, and the verdict does not. Both deny,
+        # but only the numberless one may deny for "cannot determine the PR
+        # number" — a span extractor that always came back empty would be a
+        # false deny of every numbered merge and would still pass a
+        # verdict-only assertion (#327).
+        merge = "gh pr me" + "rge"
+        _, numbered = TestHookBlockingPathsFire._decision_and_reason(
+            work, env, "enforce-pr-base-branch", f"{merge} 5")
+        assert "PR #5" in numbered, (
+            "the merge gate lost the PR number it was given: "
+            f"{numbered[:140]!r}"
+        )
+        _, numberless = TestHookBlockingPathsFire._decision_and_reason(
+            work, env, "enforce-pr-base-branch", merge)
+        assert "Cannot determine PR number" in numberless, (
+            f"the numberless merge blocked for the wrong reason: "
+            f"{numberless[:140]!r}"
+        )
+        for command in (merge, f"{merge} 5"):
             assert TestHookBlockingPathsFire._decide(
                 work, env, "enforce-pr-base-branch", command) == "deny", (
                 f"the base-branch check could not run and did not block: {command!r}"
@@ -2372,6 +2487,14 @@ class TestWrapperArgumentsDoNotHideTheVerb:
         # A plain keyword is not a wrapper: `time` takes no argument of its
         # own, so the bare word before the verb belonged to something else.
         "time foo {v}",
+        # `time foo <verb>` alone does not prove the arm that returns False on
+        # reaching a plain keyword with bare words outstanding: the walk would
+        # reach the start of the line and the terminal `return pending_bare ==
+        # 0` gives the same answer. These two put an ARG-TAKING wrapper further
+        # left, so the terminal check is never reached and only that arm can
+        # produce the allow (#327).
+        "xargs time foo {v}",
+        "sudo time foo {v}",
     )
 
     @pytest.mark.parametrize("template", GATED)
@@ -2433,6 +2556,1358 @@ class TestWrapperArgumentsDoNotHideTheVerb:
         not reach the others would leave three gates open."""
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
         assert TestHookBlockingPathsFire._decide(work, env, hook, command) == "deny"
+
+
+class TestNothingInFrontOfTheVerbIsStillACommand:
+    """#327 I5: three shapes reach the verb with NO word in front of it.
+
+    Measured on this branch before the fix, against `develop`, which denied
+    every row. The marker is a filesystem side-effect, not stdout: stdout is
+    captured inside a substitution and cannot tell a run from a mention.
+
+        echo starting<newline><push> origin main      ALLOW  (develop: deny)
+        echo a<newline>echo b<newline><push> …        ALLOW  (develop: deny)
+        echo a   <newline><push> origin main          ALLOW  (develop: deny)
+        echo x # note<newline><push> origin main      ALLOW  (develop: deny)
+        `<push> origin main`                          ALLOW  (develop: deny)
+        true; `<push> origin main`                    ALLOW  (develop: deny)
+        >/dev/null <push> origin main                 ALLOW  (develop: deny)
+        2>/dev/null <push> origin main                ALLOW  (develop: deny)
+        true && >/dev/null <push> origin main         ALLOW  (develop: deny)
+
+    Three causes, all in one helper: `prefix.rstrip()` removed the newline the
+    very next line tests for as a separator; the backtick was missing from
+    that separator set while `(` was in it; and a leading redirection was an
+    unrecognised bare word. A two-line Bash command is the ordinary case,
+    which made the first the widest hole in this change.
+
+    Every gated row is paired with a control that must still ALLOW and differs
+    only in what stands at the command position — `<newline>echo <push>`
+    against `<newline><push>`, `` `echo <push>` `` against `` `<push>` ``.
+    Without the pair, a helper that denied every newline would pass this class
+    while re-breaking the false-deny fix the change exists to deliver.
+
+    These shipped because no command string in this file contained a newline,
+    a backtick or a redirection.
+    """
+
+    PUSH = "git pu" + "sh"
+    MAIN = "ma" + "in"
+    BT = chr(96)
+    VERB = PUSH + " origin " + MAIN
+
+    # (label, template). The verb is a COMMAND in each: bash runs it.
+    GATED = (
+        ("a second line", "echo starting\n{v}"),
+        ("a third line", "echo a\necho b\n{v}"),
+        ("spaces before the newline", "echo a   \n{v}"),
+        ("a comment on the line before", "echo x # note\n{v}"),
+        ("a bare backtick", BT + "{v}" + BT),
+        ("a backtick after a separator", "true; " + BT + "{v}" + BT),
+        ("a leading redirection", ">/dev/null {v}"),
+        ("a leading 2> redirection", "2>/dev/null {v}"),
+        ("a redirection after a separator", "true && >/dev/null {v}"),
+        ("a redirection with a separated target", "> out {v}"),
+        ("an appending redirection", ">>out {v}"),
+        ("an input redirection", "<in {v}"),
+        # File-descriptor duplication. `&` is a separator, but the `&` in
+        # `>&`, `<&` and `&>` is part of the operator — reading it as one left
+        # the fd number behind as an outstanding bare word, and the verb read
+        # as that word's argument.
+        ("fd duplication 2>&1", "2>&1 {v}"),
+        ("fd duplication 1>&2", "1>&2 {v}"),
+        ("fd duplication 3>&1", "3>&1 {v}"),
+        ("fd duplication then a redirection", "2>&1 >/dev/null {v}"),
+        ("fd close N>&-", "2>&- {v}"),
+        ("fd duplication on input", "3<&0 {v}"),
+        ("&>> appending both streams", "&>>out {v}"),
+        ("fd duplication after a separator", "true && 2>&1 {v}"),
+    )
+
+    # The same shapes with a real command in front of the verb: bash prints it.
+    TEXT = (
+        ("the second line echoes it", "echo starting\necho {v}"),
+        ("the third line echoes it", "echo a\necho b\necho {v}"),
+        ("spaces before the newline, then echo", "echo a   \necho {v}"),
+        # A `#` gets no special case: everything after an unquoted one is a
+        # comment, and the verdict comes from `echo`, the word that decides in
+        # the shell too. A rule that allowed on SEEING a `#` would be
+        # quote-blind — `env "A=x # y" <verb>` really does push.
+        ("a comment on the SAME line", "echo x # {v}"),
+        ("echo inside the backticks", BT + "echo {v}" + BT),
+        ("echo after the redirection", ">/dev/null echo {v}"),
+        ("the redirection is echo's own", "echo a > out {v}"),
+        # A bare `>` claims exactly ONE word — its target. Credit it with more
+        # and this row denies: `echo` would never be reached.
+        ("a separated redirection, then echo", "> out echo {v}"),
+        # The fd-duplication fix must not make every `&` inert: these two run
+        # `echo`, and the `2>&1` belongs to it.
+        ("echo with fd duplication", "echo 2>&1 {v}"),
+        ("echo, an argument, fd duplication", "echo a 2>&1 {v}"),
+        ("echo with &> redirecting both streams", "echo a &>out {v}"),
+        # A non-breaking space is an ordinary word character, here and in
+        # bash: its IFS is space, tab and newline. So the command after the
+        # `&&` is the single word `<nbsp>git`, which bash does not find and
+        # never runs — verified by running it, with a file as the marker. The
+        # word-boundary set is deliberately the same one the strip uses;
+        # `rsplit(None, 1)` split on `str.isspace()` and disagreed with bash.
+        ("a non-breaking space after a separator", "true &&\u00a0{v}"),
+        ("a non-breaking space inside a word", "a\u00a0b {v}"),
+    )
+
+    def test_a_redirection_among_the_arguments_does_not_cut_the_span(
+        self, tmp_path
+    ):
+        """The same misread `&`, one function over.
+
+        `_argument_span` ends a command at `&` too, so `<push> 2>&1 origin
+        main` was cut to `<push> 2>` — and the protected-ref test, which reads
+        only that span, never saw `main`. Measured ALLOW here against DENY on
+        `develop`, which is the shape of a regression, not of a fix.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        push = "git pu" + "sh"
+        main = "ma" + "in"
+        assert decide(work, env, "prevent-direct-push",
+                      f"{push} 2>&1 origin {main}") == "deny"
+        assert decide(work, env, "prevent-direct-push",
+                      f"{push} >/dev/null origin {main}") == "deny"
+        # The control: a `&&` after the push still ends that push's span, so
+        # the second command's arguments are not read as the first's.
+        assert decide(work, env, "prevent-direct-push",
+                      f"{push} origin feature/probe && echo {main}") == "allow"
+
+    @pytest.mark.parametrize("label,template", GATED)
+    def test_a_verb_with_nothing_in_front_of_it_is_gated(
+        self, tmp_path, label, template
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.VERB)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", (
+            f"{label}: bash runs this push and the gate stood down: {command!r}"
+        )
+
+    @pytest.mark.parametrize("label,template", TEXT)
+    def test_the_same_shape_with_a_command_in_front_still_allows(
+        self, tmp_path, label, template
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.VERB)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow", (
+            f"{label}: closing the bypass re-broke the false-deny fix: "
+            f"{command!r}"
+        )
+
+    # hook -> (a command that hook denies, the same text as echo's argument).
+    # The walk is one hand-duplicated helper, so a fix that reached only the
+    # push gate would leave four gates open on every shape above.
+    EVERY_GATE = (
+        ("require-preflight", "git com" + "mit -m wip"),
+        ("prevent-direct-push", "git pu" + "sh origin ma" + "in"),
+        ("validate-branch-name", "git chec" + "kout -b nonsense-branch"),
+        ("enforce-pr-base-branch", "gh pr cre" + "ate --base ma" + "in"),
+        # No CHANGELOG.md exists in the throwaway repo, so this gate denies on
+        # the file, once the command reaches it at all.
+        ("update-changelog-before-pr", "gh pr cre" + "ate --base develop"),
+    )
+    SHAPES = (
+        ("newline", "echo starting\n{v}", "echo starting\necho {v}"),
+        ("backtick", BT + "{v}" + BT, BT + "echo {v}" + BT),
+        ("redirection", ">/dev/null {v}", ">/dev/null echo {v}"),
+    )
+
+    @pytest.mark.parametrize("hook,verb", EVERY_GATE)
+    @pytest.mark.parametrize("shape,gated,text", SHAPES)
+    def test_every_gate_reads_the_same_shapes_the_same_way(
+        self, tmp_path, hook, verb, shape, gated, text
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, hook, gated.format(v=verb)) == "deny", (
+            f"{hook}: a {shape} in front of the verb stood the gate down"
+        )
+        assert decide(work, env, hook, text.format(v=verb)) == "allow", (
+            f"{hook}: the {shape} shape denies even when the verb is text"
+        )
+
+
+@pytest.mark.skipif(not os.path.exists("/bin/bash"),
+                    reason="the bash-truth oracle needs /bin/bash")
+class TestBashTruthDifferential:
+    """#327 I6: bash decides what runs; the gate only gets to agree.
+
+    Every other test in this file is a row somebody thought of, and that is
+    exactly how the newline and backtick bypasses shipped: the suite was 3035
+    green while 16 of 55 executing constructs — 29% — walked straight past the
+    push gate, because no fixture in it contained a newline or a backtick.
+
+    So this one does not assert a verdict list. It builds shell constructs by
+    combination, asks BASH whether the verb really executed, and requires a
+    deny for every construct that did. A construct bash does not execute is
+    skipped rather than asserted on: this is a bypass hunt, and a fail-closed
+    deny on inert text is not a bypass.
+
+    The marker is a FILESYSTEM side-effect, never stdout. Half these
+    constructs run the verb inside `$( )` or backticks, where stdout is
+    captured by the substitution and never reaches the probe — a stdout marker
+    reports "did not run" for exactly the constructs that hide a live verb,
+    which is the wrong answer in the fail-open direction.
+
+    Deterministic on purpose: a fixed prefix/suffix/wrapper product, not random
+    generation, so a failure names a construct that can be pasted into a shell,
+    and a green run means the same thing tomorrow.
+
+    Templates are assembled from fragments (`VERB` is substituted late) for the
+    same reason as the rest of this file: the live PreToolUse hooks in this
+    repo read unexecuted command text.
+    """
+
+    PREFIX = ("", "true; ", "true && ", "true || ", "echo hi\n", "echo hi   \n",
+              "# c\n", "x=1 ", "{ ", ">/dev/null ", "2>&1 ", "1>&2 ", "&>out ",
+              "3>&1 ", "if true; then ", "for i in 1; do ",
+              "while false; do : ; done; ", "! ", "time ", "sudo ",
+              "nice -n 10 ", "command ", "eval ", "\\", "(", "$(", "`")
+    SUFFIX = ("", ";", " ; }", " ; done", " ; fi", ")", "`")
+    WRAPPERS = ("%s", "`%s`", "$(%s)", "( %s )", "{ %s ; }")
+    WRAP_PREFIX = ("", "true; ", "true && ", "echo hi\n", "x=1 ", ">/dev/null ",
+                   "2>&1 ")
+
+    @classmethod
+    def _templates(cls):
+        """The deterministic construct set, VERB still a placeholder."""
+        out = set()
+        for prefix in cls.PREFIX:
+            for suffix in cls.SUFFIX:
+                out.add(prefix + "VERB" + suffix)
+        for wrapper in cls.WRAPPERS:
+            for prefix in cls.WRAP_PREFIX:
+                out.add(prefix + wrapper % "VERB")
+        return sorted(out)
+
+    @staticmethod
+    def _bash_runs_it(work, template):
+        """Did bash EXECUTE the verb? Marker is a file, not stdout."""
+        marker = work / "FUZZ_RAN"
+        if marker.exists():
+            marker.unlink()
+        try:
+            subprocess.run(
+                ["/bin/bash", "-c", template.replace("VERB", f"touch {marker}")],
+                capture_output=True, text=True, cwd=work, timeout=10,
+                # sudo must fail fast instead of reading a password off the
+                # terminal the suite is running in.
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+        ran = marker.exists()
+        if ran:
+            marker.unlink()
+        return ran
+
+    def test_every_construct_bash_executes_is_denied(self, tmp_path):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        verb = "git pu" + "sh origin ma" + "in"
+        executed, bypasses = 0, []
+        for template in self._templates():
+            if not self._bash_runs_it(work, template):
+                continue
+            executed += 1
+            command = template.replace("VERB", verb)
+            if TestHookBlockingPathsFire._decide(
+                    work, env, "prevent-direct-push", command) != "deny":
+                bypasses.append(template)
+        # The oracle has to keep finding live constructs, or this test passes
+        # by testing nothing. 55 executed at the time it was written.
+        assert executed >= 50, (
+            f"only {executed} constructs executed; the bash oracle is broken, "
+            "not the gate"
+        )
+        assert not bypasses, (
+            f"{len(bypasses)} of {executed} constructs run the verb and the "
+            "gate allowed them:\n  " + "\n  ".join(repr(t) for t in bypasses)
+        )
+
+
+class TestEveryOccurrenceIsJudged:
+    """#327 I7: one acceptable command laundered every later one on the line.
+
+    The push gate was fixed to loop over its occurrences; the branch-name gate
+    and the PR-base gate were left judging `occurrences[0]` alone. Measured,
+    all four ALLOW before this fix while each offending half denies on its own:
+
+        git CHECKOUT -b feature/ok && git CHECKOUT -b badname
+        git CHECKOUT -b release/v1.0.0 && git CHECKOUT -b release/1.0
+        gh pr CREATE --base develop && gh pr CREATE --title x
+        gh pr CREATE --base develop && gh pr CREATE --base main --title x
+
+    The last one opens a feature->main PR, which is the single thing that gate
+    exists to prevent.
+
+    Each row is paired with two controls: the offending half ALONE must still
+    deny (so the row is not passing because the gate denies chains), and a
+    chain of two ACCEPTABLE commands must still allow (so it is not passing
+    because the gate denies second occurrences).
+    """
+
+    BAD_THEN_GOOD = (
+        ("branch: a good name then a bad one", "validate-branch-name",
+         "git {CO} -b feature/ok && git {CO} -b badname"),
+        ("branch: a good release then a bad one", "validate-branch-name",
+         "git {CO} -b release/v1.0.0 && git {CO} -b release/1.0"),
+        ("pr base: a compliant create then a bare one", "enforce-pr-base-branch",
+         "gh pr {CR} --base develop && gh pr {CR} --title x"),
+        ("pr base: a compliant create then --base main", "enforce-pr-base-branch",
+         "gh pr {CR} --base develop && gh pr {CR} --base main --title x"),
+    )
+    ALONE = (
+        ("branch: the bad name alone", "validate-branch-name",
+         "git {CO} -b badname"),
+        ("branch: the bad release alone", "validate-branch-name",
+         "git {CO} -b release/1.0"),
+        ("pr base: the bare create alone", "enforce-pr-base-branch",
+         "gh pr {CR} --title x"),
+        ("pr base: --base main alone", "enforce-pr-base-branch",
+         "gh pr {CR} --base main --title x"),
+    )
+    ALL_GOOD = (
+        ("branch: two good names", "validate-branch-name",
+         "git {CO} -b feature/ok && git {CO} -b feature/two"),
+        ("pr base: two compliant creates", "enforce-pr-base-branch",
+         "gh pr {CR} --base develop && gh pr {CR} --base develop"),
+    )
+
+    @staticmethod
+    def _fill(template):
+        return template.format(CO="check" + "out", CR="cre" + "ate")
+
+    @pytest.mark.parametrize("label,hook,template", BAD_THEN_GOOD)
+    def test_a_later_occurrence_is_judged_too(self, tmp_path, label, hook, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = self._fill(template)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, hook, command) == "deny", (
+            f"{label}: the first occurrence excused the second: {command!r}"
+        )
+
+    @pytest.mark.parametrize("label,hook,template", ALONE)
+    def test_the_offending_half_alone_still_denies(
+        self, tmp_path, label, hook, template
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, hook, self._fill(template)) == "deny"
+
+    @pytest.mark.parametrize("label,hook,template", ALL_GOOD)
+    def test_a_chain_of_acceptable_commands_still_allows(
+        self, tmp_path, label, hook, template
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = self._fill(template)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, hook, command) == "allow", (
+            f"{label}: looping over occurrences turned into denying chains: "
+            f"{command!r}"
+        )
+
+
+class TestThePrNumberComesFromABareWord:
+    """#327 I8: a digit inside a flag's value was read as the PR number.
+
+    `gh pr MERGE` takes the PR as a positional argument, and the gate took the
+    first digit run anywhere in the span instead. So a number written in a
+    commit subject or a body decided which PR got its base checked, while a
+    different PR was the one being merged.
+
+    Proven against a stubbed `gh` in which #331 targets develop from a feature
+    branch (compliant, allowed) and #296 targets main from a feature branch
+    (must block). Measured before the fix:
+
+        gh pr MERGE 296 --squash                     DENY   (control)
+        gh pr MERGE -t "Merge PR 331" 296 --squash   ALLOW  <- laundered
+        gh pr MERGE --body "closes 331" 296 --squash ALLOW  <- laundered
+
+    The negative control matters as much: `-t "Merge PR 296" 331` must still
+    ALLOW. A gate that read every digit would deny it, and would be "fixed"
+    only in the sense that it now denies more.
+    """
+
+    @staticmethod
+    def _stub_gh(tmp_path, env):
+        """A gh that answers for two PRs and fails for anything else."""
+        binder = tmp_path / "stub"
+        binder.mkdir(exist_ok=True)
+        gh = binder / "gh"
+        gh.write_text(
+            '#!/bin/sh\n'
+            'for a in "$@"; do case "$a" in\n'
+            '331) echo "develop feature/ok"; exit 0;;\n'
+            '296) echo "main feature/bad"; exit 0;;\n'
+            'esac; done\n'
+            'exit 1\n'
+        )
+        gh.chmod(0o755)
+        return dict(env, PATH=str(binder) + os.pathsep + env.get("PATH", ""))
+
+    MERGE = "gh pr " + "me" + "rge"
+
+    DENIED = (
+        ("the PR itself", "{m} 296 --squash"),
+        ("a number in -t", '{m} -t "Merge PR 331" 296 --squash'),
+        ("a number in --body", '{m} --body "closes 331" 296 --squash'),
+        ("a number in --subject", '{m} --subject "PR 331" 296 --squash'),
+        ("a number in -R", "{m} -R owner/repo331 296 --squash"),
+        ("a bare number after -t, then the real PR", "{m} -t 331 296 --squash"),
+        ("two different PRs named", "{m} 296 331"),
+        ("a compliant PR named first, a blocked one second", "{m} 331 296"),
+    )
+    ALLOWED = (
+        ("the compliant PR itself", "{m} 331 --squash"),
+        ("a blocked number quoted in -t", '{m} -t "Merge PR 296" 331 --squash'),
+        ("a blocked number quoted in --body", '{m} --body "see 296" 331 --squash'),
+        # Unquoted, and the value of a flag: skipping it is the only reason
+        # this merge is judged as #331. Count it and the span names two PRs.
+        ("a bare blocked number after -t", "{m} -t 296 331 --squash"),
+    )
+
+    @pytest.mark.parametrize("label,template", DENIED)
+    def test_the_merge_that_runs_is_the_one_checked(self, tmp_path, label, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = self._stub_gh(tmp_path, env)
+        command = template.format(m=self.MERGE)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", command) == "deny", (
+            f"{label}: a digit that is not the PR decided the check: {command!r}"
+        )
+
+    @pytest.mark.parametrize("label,template", ALLOWED)
+    def test_a_quoted_number_does_not_block_a_compliant_merge(
+        self, tmp_path, label, template
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = self._stub_gh(tmp_path, env)
+        command = template.format(m=self.MERGE)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", command) == "allow", (
+            f"{label}: reading every digit denies compliant merges: {command!r}"
+        )
+
+    def test_a_compliant_merge_does_not_excuse_a_later_one(self, tmp_path):
+        """The same occurrence-loop fix as the create and branch gates."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = self._stub_gh(tmp_path, env)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch",
+            f"{self.MERGE} 331 --squash && {self.MERGE} 296 --squash") == "deny"
+
+
+class TestTheScanIsLinearAndBounded:
+    """#327 I9: a hook that hangs has written no decision, and no decision is
+    an ALLOW.
+
+    `_shell_scan(cmd[:start])` restarts at offset 0 and was called once per
+    match, so the cost was quadratic in the command text: measured end-to-end
+    at 0.63s for 14 KB and 9.54s for 56 KB, with 1 MB inside the stdin cap
+    these hooks accept. The separator-free shape was worse still — 7.8s at
+    32 KB and 488s at 256 KB.
+
+    Two changes, and the test asserts what each is for. `_shell_states`
+    computes every prefix state in one pass, and `_at_command_position` walks
+    by index instead of copying and rescanning the text to its left. The
+    length cap is the backstop for what is left, not the thing making this
+    pass — which is why the timing row runs at a size the cap ALLOWS.
+    """
+
+    PUSH = "git " + "pu" + "sh" + " origin " + "ma" + "in"
+
+    def test_a_large_command_is_judged_quickly(self, tmp_path):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        # Just under the cap, and the worst measured shape: no separator, so
+        # every step of the walk used to rescan the whole text to its left.
+        unit = self.PUSH + " "
+        command = (unit * (30 * 1024 // len(unit)))[:30 * 1024]
+        started = time.monotonic()
+        decision = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        elapsed = time.monotonic() - started
+        assert decision == "deny"
+        # Generous against the 7.8s this shape cost before, and against CI
+        # jitter; the point is the order of magnitude, not the number.
+        assert elapsed < 3.0, (
+            f"{len(command)} characters took {elapsed:.1f}s; the scan is "
+            "quadratic again and a slow gate is an open one"
+        )
+
+    @pytest.mark.parametrize("hook,verb", (
+        ("prevent-direct-push", "git " + "pu" + "sh origin ma" + "in"),
+        ("require-preflight", "git " + "com" + "mit -m wip"),
+        ("validate-branch-name", "git " + "check" + "out -b nonsense"),
+        ("enforce-pr-base-branch", "gh pr " + "cre" + "ate --title x"),
+        ("update-changelog-before-pr", "gh pr " + "cre" + "ate --base develop"),
+    ))
+    def test_a_command_over_the_cap_is_blocked_not_waved_through(
+        self, tmp_path, hook, verb
+    ):
+        """Over the cap the answer is a BLOCK, in every gate.
+
+        The control is the same command under the cap: it must reach the
+        gate's own verdict, so this row cannot pass by denying everything.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        padding = "echo " + "x" * 100 + "\n"
+        # The verb as ECHO'S ARGUMENT: under the cap this is an ALLOW, so the
+        # deny above the cap can only be the cap. A fixture whose verb sits at
+        # command position denies either way and proves nothing.
+        text = "echo " + verb
+        long_pad = padding * ((32 * 1024) // len(padding) + 2)
+        assert decide(work, env, hook, long_pad + text) == "deny", (
+            "a command too long to analyse was allowed"
+        )
+        assert decide(work, env, hook, padding * 10 + text) == "allow", (
+            "control: under the cap this shape is text, and must allow"
+        )
+        assert decide(work, env, hook, padding * 10 + verb) == "deny", (
+            "control: under the cap a real verb must still reach its verdict"
+        )
+
+
+class TestSubprocessCallsCannotHangOrEscape:
+    """#327 I10: no subprocess call in any of these hooks had a timeout.
+
+    Including the ones that go to the network. `subprocess.TimeoutExpired` is
+    a `SubprocessError`, but it is NOT a `CalledProcessError` and NOT an
+    `OSError`, so a handler naming those two lets a timeout escape as an
+    uncaught traceback — rc 1, non-blocking, i.e. the command proceeds.
+
+    Structural, because the alternative is a test that really waits: the
+    behavioural row below shortens the timeout in a copy of the hook so a
+    stubbed `gh` that sleeps is measured in a second rather than thirty.
+    """
+
+    HOOKS = TestHookInputFailsClosed.HOOKS
+
+    # The two hooks that make NO subprocess call at all. They are named rather
+    # than derived so that adding a call to one of them fails this file
+    # instead of silently escaping every timeout rule below. Neither imports
+    # `subprocess`; neither carries a timeout constant, and neither should.
+    NO_SUBPROCESS = ("require-preflight", "validate-branch-name")
+
+    @staticmethod
+    def _subprocess_calls(hook):
+        """(node, source) for every subprocess call in one hook."""
+        source = (Path(".claude/hooks") / f"{hook}.py").read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "subprocess"
+                    and func.attr in ("run", "check_output", "call",
+                                      "check_call", "Popen")):
+                yield node, source
+
+    def test_the_two_hooks_with_no_subprocess_calls_still_have_none(self):
+        """Confirmed, not assumed: neither imports `subprocess`, so neither
+        needs a timeout constant and neither has one."""
+        for hook in self.NO_SUBPROCESS:
+            source = (Path(".claude/hooks") / f"{hook}.py").read_text(
+                encoding="utf-8")
+            assert not list(self._subprocess_calls(hook)), hook
+            assert "import subprocess" not in source, hook
+            assert "_GIT_TIMEOUT" not in source and "_GH_TIMEOUT" not in source, (
+                f"{hook} carries a timeout constant it does not use"
+            )
+
+    def test_every_subprocess_call_passes_a_BOUNDED_timeout(self):
+        """`timeout=` is not enough — `timeout=None` is no timeout at all.
+
+        This test used to assert only that the keyword was present, and
+        `_GIT_TIMEOUT = None` therefore restored the original unbounded hang
+        with the whole suite still green (#327). The VALUE has to be a number:
+        either a literal, or a name this file resolves to a positive number in
+        the hook's own module.
+        """
+        problems = []
+        for hook in self.HOOKS:
+            if hook in self.NO_SUBPROCESS:
+                continue
+            namespace = TestTheStateVectorAgreesWithTheScanner._hook_namespace(hook)
+            for node, _source in self._subprocess_calls(hook):
+                keywords = {kw.arg: kw.value for kw in node.keywords}
+                if "timeout" not in keywords:
+                    problems.append(f"{hook}:{node.lineno} has no timeout")
+                    continue
+                value = keywords["timeout"]
+                if isinstance(value, ast.Constant):
+                    resolved = value.value
+                elif isinstance(value, ast.Name):
+                    resolved = namespace.get(value.id, None)
+                else:
+                    resolved = None
+                if not isinstance(resolved, (int, float)) or resolved <= 0:
+                    problems.append(
+                        f"{hook}:{node.lineno} timeout resolves to {resolved!r}")
+        assert not problems, (
+            "a subprocess call that can hang forever; the harness kills the "
+            f"hook, no decision is written, and that is an allow: {problems}"
+        )
+
+    def test_no_handler_narrows_to_calledprocesserror(self):
+        """`except (subprocess.CalledProcessError, ...)` cannot catch a
+        timeout. Every one of them is now `subprocess.SubprocessError`, which
+        can."""
+        narrow = []
+        for hook in self.HOOKS:
+            path = Path(".claude/hooks") / f"{hook}.py"
+            src = path.read_text(encoding="utf-8")
+            for node in ast.walk(ast.parse(src)):
+                if not isinstance(node, ast.ExceptHandler) or node.type is None:
+                    continue
+                named = ast.get_source_segment(src, node.type) or ""
+                if "CalledProcessError" in named:
+                    narrow.append(f"{hook}:{node.lineno}")
+        assert not narrow, (
+            f"handlers that a TimeoutExpired escapes: {narrow}"
+        )
+
+    @staticmethod
+    def _slow_binaries(tmp_path, env, *names, seconds=30):
+        """Put `names` on PATH as scripts that never answer in time."""
+        binder = tmp_path / ("slow-" + "-".join(names))
+        binder.mkdir(exist_ok=True)
+        for name in names:
+            script = binder / name
+            script.write_text(f"#!/bin/sh\nsleep {seconds}\n")
+            script.chmod(0o755)
+        return dict(env, PATH=str(binder) + os.pathsep + env.get("PATH", ""))
+
+    @staticmethod
+    def _shorten_bounds(work, hook, git=1, gh=1):
+        """Shrink one copied hook's timeouts so the row takes a second.
+
+        The constants are asserted before being replaced, so this fixture goes
+        red rather than quietly doing nothing if either is renamed, retuned or
+        set to None.
+        """
+        path = work / ".claude/hooks" / f"{hook}.py"
+        source = path.read_text(encoding="utf-8")
+        assert "_GIT_TIMEOUT = 10" in source, hook
+        source = source.replace("_GIT_TIMEOUT = 10", f"_GIT_TIMEOUT = {git}")
+        if "_GH_TIMEOUT" in source:
+            assert "_GH_TIMEOUT = 30" in source, hook
+            source = source.replace("_GH_TIMEOUT = 30", f"_GH_TIMEOUT = {gh}")
+        path.write_text(source, encoding="utf-8")
+
+    def test_a_git_that_hangs_blocks_the_push(self, tmp_path):
+        """The bound on `git branch --show-current`, which had no test.
+
+        Setting `_GIT_TIMEOUT = None` restored the original unbounded hang and
+        542 tests still passed (#327). This is the row that notices. It also
+        pins the REASON: the push must be blocked for not being able to
+        determine the branch, not for some later check happening to fire.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._shorten_bounds(work, "prevent-direct-push")
+        slow = self._slow_binaries(tmp_path, env, "git")
+        started = time.monotonic()
+        decision, reason = TestHookBlockingPathsFire._decision_and_reason(
+            work, slow, "prevent-direct-push", "git pu" + "sh origin feature/x")
+        elapsed = time.monotonic() - started
+        assert decision == "deny", "a git that never answers let the push through"
+        assert "Cannot determine the current branch" in reason, reason[:160]
+        assert elapsed < 15, (
+            f"the hook took {elapsed:.1f}s; it waited on git rather than "
+            "bounding it"
+        )
+
+    def test_a_git_that_hangs_blocks_the_pr_base_gate(self, tmp_path):
+        """The same bound in the other gate that reads the branch."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._shorten_bounds(work, "enforce-pr-base-branch")
+        slow = self._slow_binaries(tmp_path, env, "git")
+        started = time.monotonic()
+        decision, reason = TestHookBlockingPathsFire._decision_and_reason(
+            work, slow, "enforce-pr-base-branch", "gh pr cre" + "ate --title x")
+        elapsed = time.monotonic() - started
+        assert decision == "deny"
+        assert "Cannot determine the current branch" in reason, reason[:160]
+        assert elapsed < 15, f"the hook took {elapsed:.1f}s"
+
+    def test_a_working_binary_is_not_blocked_by_the_bound(self, tmp_path):
+        """The control for both rows above.
+
+        A one-second bound must not turn an ordinary, fast `git` into a block
+        — otherwise the rows above would pass against a gate that denied
+        everything, which is the failure this whole change is about.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._shorten_bounds(work, "prevent-direct-push")
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, "prevent-direct-push",
+                      "git pu" + "sh origin feature/probe") == "allow"
+        assert decide(work, env, "prevent-direct-push",
+                      "git pu" + "sh origin ma" + "in") == "deny"
+
+    def test_a_gh_that_hangs_blocks_the_merge(self, tmp_path):
+        """A timeout on the merge path must DENY.
+
+        The hook's own `_GH_TIMEOUT` is shortened in the throwaway copy so the
+        row takes a second instead of thirty; what it proves is the handler,
+        which is the part that was wrong.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._shorten_bounds(work, "enforce-pr-base-branch")
+        slow = self._slow_binaries(tmp_path, env, "gh")
+        started = time.monotonic()
+        decision, reason = TestHookBlockingPathsFire._decision_and_reason(
+            work, slow, "enforce-pr-base-branch",
+            "gh pr " + "me" + "rge 7 --squash")
+        elapsed = time.monotonic() - started
+        assert decision == "deny", "a gh that never answers let the merge through"
+        assert "could not run" in reason, reason[:160]
+        assert elapsed < 25, (
+            f"the hook took {elapsed:.1f}s; it waited on gh rather than "
+            "bounding it"
+        )
+
+
+class TestPreflightTokenCannotBeLaundered:
+    """#327 I11: three ways the preflight gate stood itself down.
+
+    * the token READ caught `(ValueError, OSError)`. A token file of 200,000
+      `[` characters raises RecursionError out of `json.load`, which is
+      neither — an uncaught traceback, rc 1, non-blocking, and the unverified
+      commit proceeded. The path is a predictable, world-writable /tmp name,
+      so writing that file needs no privilege.
+    * `json` accepts `NaN` and `Infinity`, and both passed the "is it a
+      number" test. `current_time > NaN` is False, so the token never expired.
+    * `_get_token_path()` calls `os.getcwd()` at IMPORT time. With the working
+      directory deleted that raises before any code can decide anything —
+      again rc 1, again non-blocking.
+
+    Every row is paired with the same fixture holding a VALID token, which
+    must allow; without it a gate that blocked unconditionally would pass.
+    """
+
+    COMMIT = "git " + "com" + "mit -m wip"
+
+    @staticmethod
+    def _token_path(work):
+        digest = hashlib.md5(os.path.realpath(str(work)).encode()).hexdigest()[:8]
+        return Path(f"/tmp/.preflight-token-{digest}")
+
+    @pytest.fixture
+    def preflight(self, tmp_path):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        token = self._token_path(work)
+        yield work, env, token
+        if token.exists():
+            token.unlink()
+
+    def test_a_valid_token_still_allows(self, preflight):
+        """The control every row below needs."""
+        work, env, token = preflight
+        token.write_text(json.dumps(
+            {"expires": int(time.time()) + 300, "checks_run": "all",
+             "staged_files": 1}))
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "require-preflight", self.COMMIT) == "allow"
+
+    @pytest.mark.parametrize("label,body", (
+        ("nested brackets over the size cap", "[" * 200_000),
+        ("nested brackets under the size cap", "[" * 40_000),
+    ))
+    def test_a_token_that_cannot_be_parsed_blocks(self, preflight, label, body):
+        work, env, token = preflight
+        token.write_text(body)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "require-preflight", self.COMMIT) == "deny", (
+            f"{label}: an unparseable token let the commit through"
+        )
+
+    def test_a_valid_but_oversized_token_blocks(self, preflight):
+        """A token is a small JSON object; 64 KB of one is not a token.
+
+        This row is what makes the size check observable on its own. An
+        unparseable giant is caught by the widened handler whether or not the
+        size is checked first, but a giant that parses CLEANLY and carries a
+        future expiry would otherwise be honoured.
+        """
+        work, env, token = preflight
+        token.write_text(json.dumps(
+            {"expires": int(time.time()) + 300, "checks_run": "all",
+             "pad": "x" * (80 * 1024)}))
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "require-preflight", self.COMMIT) == "deny"
+
+    @pytest.mark.parametrize("expires", ("NaN", "Infinity", "-Infinity"))
+    def test_a_token_that_never_expires_blocks(self, preflight, expires):
+        work, env, token = preflight
+        token.write_text('{"expires": %s, "checks_run": "all"}' % expires)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "require-preflight", self.COMMIT) == "deny", (
+            f"expires={expires} produced a token that never expires"
+        )
+
+    def test_an_expired_token_still_blocks(self, preflight):
+        """The ordinary expiry path, which the negated comparison must keep."""
+        work, env, token = preflight
+        token.write_text(json.dumps({"expires": int(time.time()) - 10}))
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "require-preflight", self.COMMIT) == "deny"
+
+    def test_a_deleted_working_directory_blocks(self, tmp_path):
+        """`os.getcwd()` at import time, with no CLAUDE_PROJECT_DIR to use
+        instead. Before the guard this was a traceback at rc 1."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        env = {k: v for k, v in env.items() if k != "CLAUDE_PROJECT_DIR"}
+        script = (f'cd {gone} && rmdir {gone} && '
+                  f'exec {sys.executable} {work}/.claude/hooks/require-preflight.py')
+        proc = subprocess.run(
+            ["/bin/sh", "-c", script],
+            input=json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": self.COMMIT}}),
+            capture_output=True, text=True, timeout=60, cwd=str(gone), env=env,
+        )
+        assert proc.returncode in (0, 2), (
+            f"a deleted cwd exited {proc.returncode}; anything but a decision "
+            f"at rc 0, or rc 2, lets the commit through: {proc.stderr[-300:]!r}"
+        )
+        decision = "deny" if proc.returncode == 2 else None
+        if decision is None:
+            try:
+                decision = json.loads(proc.stdout)["hookSpecificOutput"].get(
+                    "permissionDecision", "allow")
+            except (ValueError, KeyError, TypeError):
+                decision = "allow"
+        assert decision == "deny", (
+            "a deleted cwd let the unverified commit through"
+        )
+
+
+class TestTheStateVectorAgreesWithTheScanner:
+    """`_shell_states(cmd)[k]` must be `_shell_scan(cmd[:k])`, at every k.
+
+    `_shell_scan` is kept as the reference implementation precisely so this
+    can be asserted rather than argued: the single-pass version is what every
+    caller now uses, and a divergence in it moves a verb between "quoted",
+    "subst" and "exec" — which is the difference between a gate standing down
+    and firing.
+
+    The corpus is not a handful of nice strings. It is every string of length
+    up to three over the alphabet that matters (quotes, backslash, backtick,
+    `$`, parens, space, newline), plus a seeded random sample of longer ones,
+    plus the shapes earlier defects were found in. Both functions are read out
+    of the real hook file, so this cannot drift from what ships.
+    """
+
+    @staticmethod
+    def _hook_namespace(hook="prevent-direct-push"):
+        """Execute a hook module and hand back its globals.
+
+        Its top level reads stdin and exits, so stdin is a payload the gate
+        stands down on and SystemExit is expected. Reading the constants out
+        of the real module is the point: a copy in this file could drift from
+        the pattern that ships.
+        """
+        path = Path(f".claude/hooks/{hook}.py")
+        namespace = {"__name__": "probe"}
+        payload = json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": "true"}})
+        real_stdin = sys.stdin
+        sys.stdin = io.StringIO(payload)
+        try:
+            exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"),
+                 namespace)
+        except SystemExit:
+            pass
+        finally:
+            sys.stdin = real_stdin
+        return namespace
+
+    @staticmethod
+    def _corpus():
+        alphabet = "'\"`$()\\ a\n)"
+        corpus = [
+            "", "git push origin main", "echo 'x' && git push",
+            '$(git push)', "`git push`", "(git push)", ")", "()", "(()",
+            "echo don't && git push", 'echo "unclosed', "echo 'unclosed",
+            'echo "a\\"b" && git push', "cd /a && (cd /b && git push) && git push",
+            'echo "x; cd /tmp" && git push', "2>&1 git push", "x=`a` git push",
+            "$($($(a)))", "```", "`a`b`c`", "\\$(a)", "$\\(a)", '"$(a)"',
+        ]
+        for size in (1, 2, 3):
+            for combo in itertools.product(alphabet, repeat=size):
+                corpus.append("".join(combo))
+        rng = random.Random(20260814)
+        for _ in range(1500):
+            corpus.append("".join(rng.choice(alphabet + "bc;&|")
+                                  for _ in range(rng.randint(4, 24))))
+        return corpus
+
+    def test_every_prefix_state_matches_the_reference_scanner(self):
+        namespace = self._hook_namespace()
+        scan, states = namespace["_shell_scan"], namespace["_shell_states"]
+        compared, mismatches = 0, []
+        for command in self._corpus():
+            vector = states(command)
+            assert len(vector) == len(command) + 1, (
+                f"the vector is not one entry per prefix: {command!r}"
+            )
+            for k in range(len(command) + 1):
+                compared += 1
+                expected = scan(command[:k])
+                if vector[k] != expected and len(mismatches) < 10:
+                    mismatches.append((command, k, vector[k], expected))
+        assert compared > 20_000, (
+            f"only {compared} offsets compared; the corpus stopped covering"
+        )
+        assert not mismatches, (
+            "the single-pass scan disagrees with the reference scanner:\n  "
+            + "\n  ".join(repr(row) for row in mismatches)
+        )
+
+
+class TestTheVerbPatternIsLinear:
+    """#327 I12: the optional path prefix was quadratic, with ZERO matches.
+
+    `(?:[^\\s;&|()<>]*/)?git\\b` made the engine scan forward from every offset
+    looking for a `/` that is not there. Measured on `"a" * n`, no match
+    anywhere in it:
+
+        4 KB -> 0.029s    16 KB -> 0.451s    64 KB -> 7.205s    256 KB -> 115.7s
+
+    Four times the length, sixteen times the time. End-to-end, a plain `echo
+    <64 KB of base64>` cost 7.29s inside the hook and then allowed. The
+    trigger is mundane: a base64 blob, a data URI, a minified bundle, a
+    `--data` payload.
+
+    This is NOT the quadratic scan the state vector fixed. It fires with no
+    matches at all, so `_shell_scan` and `_at_command_position` are never
+    reached, and memoizing them leaves it exactly in place. Two independent
+    defects, two independent tests.
+
+    Time-bounded rather than verdict-bounded, because the verdict was never
+    wrong — and read out of the hook's own module so it cannot drift from what
+    ships. A generous bound: the fixed pattern does this in under 0.01s, and
+    the broken one needs seven seconds.
+    """
+
+    HOOK_PATTERNS = (
+        ("prevent-direct-push", "_GIT_PUSH_RE"),
+        ("require-preflight", "_GIT_COMMIT_RE"),
+        ("validate-branch-name", "_GIT_CHECKOUT_B_RE"),
+        ("enforce-pr-base-branch", "_GH_PR_CREATE_RE"),
+        ("enforce-pr-base-branch", "_GH_PR_MERGE_RE"),
+        ("update-changelog-before-pr", "_GH_PR_CREATE_RE"),
+    )
+
+    @classmethod
+    def _patterns(cls):
+        for hook, name in cls.HOOK_PATTERNS:
+            namespace = TestTheStateVectorAgreesWithTheScanner._hook_namespace(hook)
+            assert name in namespace, f"{hook} defines no {name}"
+            yield f"{hook}:{name}", namespace[name]
+
+    def test_a_long_word_with_no_match_is_searched_in_linear_time(self):
+        blob = "a" * 65536
+        slow = []
+        for label, pattern in self._patterns():
+            started = time.monotonic()
+            assert re.search(pattern, blob) is None, label
+            elapsed = time.monotonic() - started
+            if elapsed > 1.0:
+                slow.append(f"{label}: {elapsed:.2f}s")
+        assert not slow, (
+            "the verb pattern is quadratic in the command text; a hook the "
+            f"harness kills writes no decision, and that is an allow: {slow}"
+        )
+
+    def test_the_same_blob_through_the_real_hook_is_fast(self, tmp_path):
+        """End-to-end, and under the length cap so the cap is not what saves it."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = "echo " + "a" * (30 * 1024)
+        started = time.monotonic()
+        decision = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        elapsed = time.monotonic() - started
+        assert decision == "allow"
+        assert elapsed < 3.0, (
+            f"a 30 KB blob with no verb in it took {elapsed:.1f}s"
+        )
+
+
+class TestTheGitFlowFinishPathIsReachable:
+    """#327 I13: two widened handlers no test could reach.
+
+    The Git Flow finish block only runs when the current branch IS `main` or
+    `develop`, and every fixture in this file is on `feature/probe`. So the
+    two `except (SubprocessError, OSError)` handlers in it — the one that
+    decides "HEAD is not a merge commit" and the one around the recent-log
+    lookup — were never executed by anything, widened or not.
+
+    These rows put the probe repo on those branches. They also pin the
+    behaviour the block exists for, which nothing else did: a Git Flow finish
+    merge on `main` allows, and an ordinary commit on `main` does not.
+    """
+
+    PUSH = "git pu" + "sh origin "
+    MAIN = "ma" + "in"
+
+    @staticmethod
+    def _on(work, env, branch, message=None, merge=False):
+        """Move the probe repo onto `branch`, optionally with a merge HEAD."""
+        run = lambda *args: subprocess.run(
+            ["git", "-C", str(work), *args], env=env, check=True,
+            capture_output=True)
+        run("checkout", "-q", "-B", branch)
+        if merge:
+            run("checkout", "-q", "-B", "tmp-side")
+            run("-c", "user.email=t@example.invalid", "-c", "user.name=t",
+                "commit", "-q", "--allow-empty", "-m", "side")
+            run("checkout", "-q", branch)
+            run("-c", "user.email=t@example.invalid", "-c", "user.name=t",
+                "merge", "-q", "--no-ff", "-m", message or "merge", "tmp-side")
+        elif message:
+            run("-c", "user.email=t@example.invalid", "-c", "user.name=t",
+                "commit", "-q", "--allow-empty", "-m", message)
+
+    def test_a_git_flow_finish_merge_on_main_allows(self, tmp_path):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._on(work, env, self.MAIN, "Merge release/v1.2.0 into main",
+                 merge=True)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", self.PUSH + self.MAIN) == "allow"
+
+    def test_an_ordinary_commit_on_main_still_denies(self, tmp_path):
+        """The control: without the merge, the same push on the same branch
+        must be denied, or the row above passes by allowing everything."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._on(work, env, self.MAIN, "ordinary work")
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", self.PUSH + self.MAIN) == "deny"
+
+    def test_a_feature_merge_on_main_still_denies(self, tmp_path):
+        """A merge commit is not enough — features never merge to main."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._on(work, env, self.MAIN, "Merge feature/x into main", merge=True)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", self.PUSH + self.MAIN) == "deny"
+
+    def test_a_version_bump_after_a_release_allows_on_develop(self, tmp_path):
+        """The recent-log branch, which is the SECOND unreachable handler: it
+        runs only when HEAD is not a merge and the branch is develop."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._on(work, env, "develop", "chore: bump after release/v1.2.0")
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", self.PUSH + "develop") == "allow"
+
+    def test_ordinary_work_on_develop_still_denies(self, tmp_path):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._on(work, env, "develop", "feat: something unrelated")
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", self.PUSH + "develop") == "deny"
+
+    def test_an_unusable_git_on_main_blocks_instead_of_crashing(self, tmp_path):
+        """Both handlers, with `git` unusable.
+
+        This is what widening them to `SubprocessError` is FOR: reaching them
+        at all needs the branch to be main or develop, and reaching them with
+        a failure that is not a `CalledProcessError` needs a git that cannot
+        run. Before, this exited 1 — non-blocking — and the push proceeded.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._on(work, env, self.MAIN, "Merge release/v1.2.0 into main",
+                 merge=True)
+        broken = TestGitSubprocessHandlersAreWideEnough._shimmed(
+            tmp_path, env, "git")
+        assert TestHookBlockingPathsFire._decide(
+            work, broken, "prevent-direct-push",
+            self.PUSH + self.MAIN) == "deny", (
+            "an unusable git turned the Git Flow finish path into an allow"
+        )
+
+
+class TestASubstitutionInsideDoubleQuotesStillRuns:
+    """#327 I14: `_shell_scan` jumped over a `"..."` span in one step.
+
+    Nothing inside the span reached the stack, so a command substitution
+    written there read as ordinary quoted text: the occurrence was dropped as
+    "quoted", the hook exited 0 with an empty decision, and that is an ALLOW.
+    Command substitution IS performed inside double quotes, so these really
+    run. Measured, working tree against `develop`:
+
+        echo "$(<push> origin main)"   develop=deny   tree=ALLOW
+        echo "`<push> origin main`"    develop=deny   tree=ALLOW
+        echo "$(<commit> -m x)"        develop=deny   tree=ALLOW
+
+    The double quote is a toggle now, and the substitution test runs before
+    the quote test so that `echo "$(` is "subst" and keeps its verb rather
+    than "quoted", which would drop it.
+
+    The controls are the whole point of the fix's shape: a verb that is merely
+    QUOTED, with no substitution around it, must still allow — that is the
+    false-deny this change exists to deliver, and a fix that made every double
+    quote gated would take it back.
+    """
+
+    BT = chr(96)
+    PUSH = "git pu" + "sh origin ma" + "in"
+    COMMIT = "git com" + "mit -m x"
+
+    GATED = (
+        ("$( ) inside double quotes", 'echo "$({v})"', "prevent-direct-push"),
+        ("backticks inside double quotes",
+         'echo "' + BT + '{v}' + BT + '"', "prevent-direct-push"),
+        ("nested, unquoted outside", 'x="$({v})"', "prevent-direct-push"),
+        ("after other quoted text", 'echo "a b" "$({v})"', "prevent-direct-push"),
+        # The unquoted forms, which were already gated: they must stay that way.
+        ("$( ) unquoted", "$({v})", "prevent-direct-push"),
+        ("backticks unquoted", BT + "{v}" + BT, "prevent-direct-push"),
+    )
+    TEXT = (
+        ("a verb inside plain double quotes", 'echo "{v}"'),
+        ("a verb inside single quotes", "echo '{v}'"),
+        ("a verb quoted after a real command", 'true && echo "{v}"'),
+        ("double quotes around an ordinary word", 'echo "a b" && echo {v}'),
+    )
+
+    @pytest.mark.parametrize("label,template,hook", GATED)
+    def test_a_substitution_that_runs_is_gated(self, tmp_path, label, template, hook):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, hook, command) == "deny", (
+            f"{label}: a live substitution read as quoted text: {command!r}"
+        )
+
+    def test_the_commit_gate_reads_it_the_same_way(self, tmp_path):
+        """One scanner, five copies: a fix in one is a fix in none."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, "require-preflight",
+                      'echo "$(%s)"' % self.COMMIT) == "deny"
+        assert decide(work, env, "require-preflight",
+                      'echo "%s"' % self.COMMIT) == "allow"
+
+    @pytest.mark.parametrize("label,template", TEXT)
+    def test_a_merely_quoted_verb_still_allows(self, tmp_path, label, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow", (
+            f"{label}: making the double quote a toggle re-broke the "
+            f"false-deny fix: {command!r}"
+        )
+
+
+class TestAHatchCannotExcuseAProtectedRefBesideIt:
+    """#327 I15: the escape hatches were substrings one level down.
+
+    Scoping each hatch to the command that carries it was half the fix. Within
+    that span the tests were still `"--tags" in span`, so hatch text sitting in
+    the SAME push's argument list stood the gate down. All four ALLOW before
+    this fix, and all four are real git that really does push main — `--tags`
+    pushes tags IN ADDITION to the refspec, it does not replace it:
+
+        <push> origin refs/tags/v1 main
+        <push> --tags origin main
+        <push> --delete origin release/x main
+        <push> --force origin main refs/tags/v1
+
+    And the span does not end at a redirect or a process substitution, neither
+    of which is an argument to `git push`, so a hatch could be read out of a
+    filename or a subshell:
+
+        <push> origin main > /tmp/refs/tags/log
+        <push> origin main 2> refs/tags/err
+        <push> origin main <(echo --tags)
+        <push> origin main --push-option="see --tags"
+
+    The controls are the Git Flow pushes this gate exists to permit. Two of
+    them only reach the hatch at all from `main`, which is the branch the
+    hatch is for, so those rows move the probe repo there.
+    """
+
+    PUSH = "git pu" + "sh"
+    MAIN = "ma" + "in"
+
+    GATED = (
+        ("a tag ref beside main", "{p} origin refs/tags/v1 {m}"),
+        ("--tags beside main", "{p} --tags origin {m}"),
+        ("--delete release beside main", "{p} --delete origin release/x {m}"),
+        ("a force push with a tag after it", "{p} --force origin {m} refs/tags/v1"),
+        ("a hatch inside a redirect target", "{p} origin {m} > /tmp/refs/tags/log"),
+        ("a hatch as a redirect target", "{p} origin {m} 2> refs/tags/err"),
+        ("a hatch inside a process substitution", "{p} origin {m} <(echo --tags)"),
+        ("a hatch inside a push-option", '{p} origin {m} --push-option="see --tags"'),
+        ("a refspec to main beside a tag", "{p} origin HEAD:{m} refs/tags/v1"),
+    )
+    ALLOWED_ON_FEATURE = (
+        ("a version tag push", "{p} origin v1.2.3 --tags"),
+        ("a release branch deletion", "{p} --delete origin release/x"),
+        ("a hotfix branch deletion", "{p} --delete origin hotfix/x"),
+        ("an ordinary feature push", "{p} origin feature/probe"),
+    )
+    ALLOWED_ON_MAIN = (
+        ("a version tag push from main", "{p} origin v1.2.3 --tags"),
+        ("a refs/tags push from main", "{p} origin refs/tags/v1.2.3"),
+        ("a release deletion from main", "{p} --delete origin release/x"),
+    )
+
+    def _fill(self, template):
+        return template.format(p=self.PUSH, m=self.MAIN)
+
+    @pytest.mark.parametrize("label,template", GATED)
+    def test_a_hatch_word_does_not_excuse_the_protected_ref(
+        self, tmp_path, label, template
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = self._fill(template)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", (
+            f"{label}: a hatch excused a push of {self.MAIN}: {command!r}"
+        )
+
+    @pytest.mark.parametrize("label,template", ALLOWED_ON_FEATURE)
+    def test_the_git_flow_pushes_still_work(self, tmp_path, label, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = self._fill(template)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow", (
+            f"{label}: word-matching the hatch broke a real Git Flow push: "
+            f"{command!r}"
+        )
+
+    @pytest.mark.parametrize("label,template", ALLOWED_ON_MAIN)
+    def test_the_hatch_still_opens_from_main(self, tmp_path, label, template):
+        """From `main` every push is denied unless a hatch opens it, so these
+        rows are what proves the hatch still exists at all."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", "-B", self.MAIN],
+                       env=env, check=True, capture_output=True)
+        command = self._fill(template)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow", (
+            f"{label}: the hatch no longer opens from {self.MAIN}: {command!r}"
+        )
+
+    # From `main` every push is denied unless a hatch opens it, so this is
+    # where a hatch that is too GENEROUS shows up — as a false allow. Each row
+    # carries hatch TEXT that is not a hatch: a word that merely contains
+    # `--tags`, a `refs/tags/` that is a redirect target rather than a ref, and
+    # a `--delete` of something that is not a release or hotfix branch. Without
+    # these the substring/word distinction is invisible, because a protected
+    # ref is decided before the hatch is consulted at all.
+    DENIED_FROM_MAIN = (
+        ("--tags inside a push-option",
+         '{p} origin feature/x --push-option="see --tags"'),
+        ("--tags inside a process substitution",
+         "{p} origin feature/x <(echo --tags)"),
+        ("refs/tags as a redirect target",
+         "{p} origin feature/x 2> refs/tags/err"),
+        ("refs/tags inside a redirect path",
+         "{p} origin feature/x > /tmp/refs/tags/log"),
+        ("deleting something that is not a release branch",
+         "{p} --delete origin feature/x"),
+        ("the control: an ordinary push", "{p} origin feature/x"),
+    )
+
+    @pytest.mark.parametrize("label,template", DENIED_FROM_MAIN)
+    def test_hatch_text_that_is_not_a_hatch_does_not_open_from_main(
+        self, tmp_path, label, template
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", "-B", self.MAIN],
+                       env=env, check=True, capture_output=True)
+        command = self._fill(template)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", (
+            f"{label}: hatch text that is not a hatch opened the gate: "
+            f"{command!r}"
+        )
+
+
+class TestTheLastBaseWins:
+    """#327 I16: `--base` took the first match; `gh` honours the last.
+
+    The same defect as the PR number, inside one command rather than across
+    two. `gh pr CREATE --base develop --base main` created a feature->main PR
+    and ALLOWED, while the reversed spelling denied — an asymmetry that proves
+    it was first-match rather than a rule.
+
+    Two different bases in one create is refused rather than guessed at; the
+    same base twice is not. `--base` is read by WORD now, so a `--base`
+    written inside a title or a body is a mention and not a base — which also
+    fixes a false deny nobody had noticed: `gh pr CREATE --base develop
+    --title "not --base main"` used to read `main"` out of the title.
+    """
+
+    CREATE = "gh pr " + "cre" + "ate"
+    MAIN = "ma" + "in"
+
+    DENIED = (
+        ("develop then main", "{c} --base develop --base {m}"),
+        ("main then develop", "{c} --base {m} --base develop"),
+        ("attached spellings", "{c} --base=develop --base={m}"),
+        ("mixed spellings", "{c} --base develop --base={m}"),
+        ("only a base in the title", '{c} --title "use --base develop"'),
+        # Unquoted, and the VALUE of a flag. `_WORD_RE` keeps a quoted span
+        # inside its word, so only this shape can tell whether the value of a
+        # value-taking flag is skipped: here `--base` is the title, and
+        # `develop` is a positional, so this create has no base at all.
+        ("a --base that is a title's value", "{c} --title --base develop"),
+    )
+    ALLOWED = (
+        ("one base", "{c} --base develop"),
+        ("attached base", "{c} --base=develop"),
+        ("the same base twice", "{c} --base develop --base develop"),
+        ("a base plus a quoted mention of another",
+         '{c} --base develop --title "not --base {m}"'),
+        ("a base plus a body mentioning another",
+         '{c} --base develop --body "supersedes --base {m}"'),
+    )
+
+    def _fill(self, template):
+        return template.format(c=self.CREATE, m=self.MAIN)
+
+    @pytest.mark.parametrize("label,template", DENIED)
+    def test_an_ambiguous_or_missing_base_is_blocked(self, tmp_path, label, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = self._fill(template)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", command) == "deny", (
+            f"{label}: {command!r}"
+        )
+
+    @pytest.mark.parametrize("label,template", ALLOWED)
+    def test_a_single_base_of_develop_still_allows(self, tmp_path, label, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = self._fill(template)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", command) == "allow", (
+            f"{label}: reading --base by word broke a compliant create: "
+            f"{command!r}"
+        )
+
+    def test_the_occurrence_loop_does_not_key_on_the_connector(self, tmp_path):
+        """`;` chains the same way `&&` does, and the fix must not care."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        c, m = self.CREATE, self.MAIN
+        assert decide(work, env, "enforce-pr-base-branch",
+                      f"{c} --base develop --title a; {c} --base {m} --title b"
+                      ) == "deny"
+        assert decide(work, env, "enforce-pr-base-branch",
+                      f"{c} --base develop --title a; {c} --base develop --title b"
+                      ) == "allow"
 
 
 class TestAllowSideHatchesAreScopedToTheirCommand:
@@ -2694,20 +4169,29 @@ class TestPreflightTokenShapeFailsClosed:
             + hashlib.md5(str(Path(work).resolve()).encode()).hexdigest()[:8]
         )
 
-    @pytest.mark.parametrize("body,expected", (
-        ("[]", "deny"),
-        ("5", "deny"),
-        ('"x"', "deny"),
-        ("null", "deny"),
-        ('{"expires": "soon"}', "deny"),
-        ('{"expires": true}', "deny"),
-        ("not json at all", "deny"),
+    # (body, expected, reason fragment). The reason matters: EVERY malformed
+    # token denies, and `{"expires": true}` denies even with the shape check
+    # deleted, because `True` reaches `current_time > True` and reads as long
+    # expired. A verdict-only assertion is therefore satisfied by a gate that
+    # never validated the shape at all — so each row names the reason it must
+    # be blocked FOR (#327).
+    @pytest.mark.parametrize("body,expected,reason", (
+        ("[]", "deny", "Invalid preflight token"),
+        ("5", "deny", "Invalid preflight token"),
+        ('"x"', "deny", "Invalid preflight token"),
+        ("null", "deny", "Invalid preflight token"),
+        ('{"expires": "soon"}', "deny", "Invalid preflight token"),
+        ('{"expires": true}', "deny", "Invalid preflight token"),
+        ("not json at all", "deny", "Invalid preflight token"),
+        # An expiry that IS a number and IS in the past blocks for the other
+        # reason, which is what makes the rows above discriminating.
+        ('{"expires": 1}', "deny", "token expired"),
         # The control: a well-formed, unexpired token allows, and is what the
         # rows above must be distinguished FROM.
-        (None, "allow"),
+        (None, "allow", ""),
     ))
     def test_a_malformed_token_blocks_instead_of_crashing(
-        self, tmp_path, body, expected
+        self, tmp_path, body, expected, reason
     ):
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
         token = self._token_path(work)
@@ -2715,10 +4199,17 @@ class TestPreflightTokenShapeFailsClosed:
             body = json.dumps({"expires": int(time.time()) + 300,
                                "checks_run": "test", "staged_files": 1})
         token.write_text(body, encoding="utf-8")
+        command = "git com" + "mit -m wip"
         try:
-            assert TestHookBlockingPathsFire._decide(
-                work, env, "require-preflight",
-                "git com" + "mit -m wip") == expected, body
+            decision, blocked_with = (
+                TestHookBlockingPathsFire._decision_and_reason(
+                    work, env, "require-preflight", command))
+            assert decision == expected, body
+            if reason:
+                assert reason.lower() in blocked_with.lower(), (
+                    f"{body} was blocked, but not for the reason that makes "
+                    f"the row discriminating: {blocked_with[:140]!r}"
+                )
         finally:
             if token.exists():
                 token.unlink()
