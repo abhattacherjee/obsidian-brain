@@ -291,8 +291,11 @@ NEEDS-ACTION, STALE, ACTIVE, or REVIEW. Cite the specific evidence you used.
   `contradicted_by_title` (the newer session's title/first summary line).
   Build the citation from EXACTLY those two fields:
   `reported done in session <contradicted_by> (<contradicted_by_title>)`
-  — the tier rules match this literal shape, so any other wording is
-  scored as a plain LOW-confidence citation. It is never HIGH confidence.
+  — this is the ONLY shape the tier rules recognise as a MED-tier
+  note-completion citation; anything else reads as a plain citation with
+  no special handling. (The guarantee that this source never reaches HIGH
+  is enforced in code from the evidence bundle's own shape, not from your
+  wording — do not rely on phrasing to keep it capped.)
 - NEEDS-ACTION — the fix is shipped, but the literal action is an
   external command this tool cannot run (e.g. `gh issue close`, token
   rotation, manual verification). Set `action_required` to a
@@ -819,6 +822,31 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
         merged_by_id[s["group_id"]] = s
     for s in synthetic:
         merged_by_id[s["group_id"]] = s
+
+    # -------------------------------------------------------------------
+    # F7 (#318 fix round 2, CRITICAL): stamp note_evidence_only per project
+    # onto every record -- sub-agent AND synthetic alike. This is DATA WE
+    # CONTROL (the evidence bundle's own keys), not text a model composes,
+    # so it can't be bypassed by off-template wording the way fix round 1's
+    # citation-shape regex could. If a project's evidence bundle contains
+    # ONLY note_completions (no git-derived bucket at all), no citation for
+    # any item in it can legitimately be HIGH -- Step 7 threads this flag
+    # into assign_tier(), which caps at MED unconditionally when it's set,
+    # regardless of what the classifier actually wrote. Computed once per
+    # project via a project -> bool memo, not once per group.
+    # -------------------------------------------------------------------
+    _note_only_by_project: dict[str, bool] = {}
+
+    def _note_evidence_only(project: str) -> bool:
+        if project not in _note_only_by_project:
+            proj = evidence.get(project) or {}
+            _note_only_by_project[project] = bool(proj) and set(proj.keys()) <= {"note_completions"}
+        return _note_only_by_project[project]
+
+    for g in groups:
+        gid = g.get("group_id")
+        if gid in merged_by_id:
+            merged_by_id[gid]["note_evidence_only"] = _note_evidence_only(g.get("project", ""))
 
     ordered = [merged_by_id[g["group_id"]] for g in groups if g["group_id"] in merged_by_id]
 

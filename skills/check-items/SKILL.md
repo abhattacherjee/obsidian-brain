@@ -619,7 +619,8 @@ for item in data["classifications"]:
     item["tier"] = assign_tier(item.get("evidence_citation"),
                                item.get("canonical_text"),
                                item.get("classification"),
-                               item.get("classifier_source"))
+                               item.get("classifier_source"),
+                               item.get("note_evidence_only", False))
 
 buckets = partition_for_review(data["classifications"], show_all=scope["show_all"])
 

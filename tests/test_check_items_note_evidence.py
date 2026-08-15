@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import json as _json
 import os
+import time as _time
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import check_items_cli
 import check_items_prefilter
@@ -341,3 +344,130 @@ def test_evidence_pool_covers_a_wider_max_sessions(tmp_path):
 
     assert len(results) == 1, results
     assert results[0]["contradicted_by"] == "2026-01-05"
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2 (F7, CRITICAL): the fix-round-1 citation-shape regex is text
+# pattern matching against a string the classifier composes freely -- a
+# reviewer found five off-template phrasings (one differs from the exact
+# template by a single word) that all skip the regex and reach the HIGH
+# literal-ref loop. These are the reviewer's own observed bypasses, used
+# verbatim. The real fix is `note_evidence_only`: DATA check_items_cli
+# derives from the evidence bundle's own shape (which no model wording can
+# influence), threaded into assign_tier as an unconditional MED cap.
+# ---------------------------------------------------------------------------
+
+_OFF_TEMPLATE_BYPASS_CITATIONS = [
+    "session 2026-02-01 reports #318 done",
+    "newer session note (2026-02-01) says #318 shipped",
+    "reported done in session note 2026-02-01 (Shipped #318)",
+    "reported complete in session 2026-02-01 (Shipped #318)",
+    "per the 2026-02-01 session summary, #318 is done",
+]
+
+
+@pytest.mark.parametrize("citation", _OFF_TEMPLATE_BYPASS_CITATIONS)
+def test_note_evidence_only_caps_every_off_template_bypass_at_med(citation):
+    """F7 enforcement: none of the five observed bypasses reach HIGH when
+    note_evidence_only=True, regardless of the exact wording the classifier
+    used or whether it happens to share #318 with the item text."""
+    tier = oid.assign_tier(
+        citation, "wire up the foo exporter #318", "DONE", "agent",
+        note_evidence_only=True,
+    )
+    assert tier == "MED", (citation, tier)
+
+
+@pytest.mark.parametrize("citation", _OFF_TEMPLATE_BYPASS_CITATIONS)
+def test_off_template_citation_still_reaches_high_with_git_evidence(citation):
+    """POSITIVE CONTROL: for a project that DOES have git evidence
+    (note_evidence_only=False), the pre-existing behaviour is unchanged --
+    a citation sharing a literal #N with the item text still reaches HIGH
+    for a high-trust source. Without this control, F7's fix could cap
+    EVERY citation at MED and no test here would notice."""
+    tier = oid.assign_tier(
+        citation, "wire up the foo exporter #318", "DONE", "agent",
+        note_evidence_only=False,
+    )
+    assert tier == "HIGH", (citation, tier)
+
+
+def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path):
+    """F7 bundle-level test, via check_items_cli.run_classifier(): a project
+    whose evidence bundle is note_completions-ONLY (no git-derived bucket)
+    is stamped note_evidence_only=True on its output record; a project
+    whose bundle ALSO carries a git-derived bucket (commits) is stamped
+    False, even though it too carries note_completions. Both groups have no
+    classifiable evidence for their own canonical text, so both take the L2
+    synthetic path -- exercising the "stamp synthetic records too" half of
+    the fix without needing to mock a claude -p subprocess dispatch."""
+    stdin_payload = {
+        "groups": [
+            {
+                "group_id": "ob-0001",
+                "project": "notes-only",
+                "representative": "clean up temp files",
+                "instances": [{"mtime": _time.time()}],
+            },
+            {
+                "group_id": "ob-0002",
+                "project": "git-project",
+                "representative": "rotate the deploy key",
+                "instances": [{"mtime": _time.time()}],
+            },
+        ],
+        "evidence": {
+            "notes-only": {
+                "note_completions": [
+                    {"text": "wire up the foo exporter service"},
+                ],
+            },
+            "git-project": {
+                "commits": ["abc1234 unrelated commit"],
+                "note_completions": [
+                    {"text": "wire up the foo exporter service"},
+                ],
+            },
+        },
+    }
+    output_path = str(tmp_path / "classout.json")
+
+    rc = check_items_cli.run_classifier(_json.dumps(stdin_payload), output_path)
+    assert rc == 0, rc
+
+    with open(output_path, encoding="utf-8") as f:
+        records = _json.load(f)
+    by_id = {r["group_id"]: r for r in records}
+
+    assert by_id["ob-0001"]["note_evidence_only"] is True, by_id["ob-0001"]
+    assert by_id["ob-0002"]["note_evidence_only"] is False, by_id["ob-0002"]
+
+
+def test_step7_wiring_threads_note_evidence_only_into_assign_tier():
+    """Step 7 wiring test: a record carrying note_evidence_only=True with an
+    off-template #N citation must NOT land in the HIGH+DONE preselected
+    bucket. Reproduces SKILL.md Step 7's assign_tier call shape directly
+    (item.get("note_evidence_only", False) as the 5th positional arg) rather
+    than re-parsing the markdown, since the call is a plain Python snippet
+    with no importable entry point of its own."""
+    item = {
+        "evidence_citation": "session 2026-02-01 reports #318 done",
+        "canonical_text": "wire up the foo exporter #318",
+        "classification": "DONE",
+        "classifier_source": "agent",
+        "note_evidence_only": True,
+    }
+    tier = oid.assign_tier(
+        item.get("evidence_citation"),
+        item.get("canonical_text"),
+        item.get("classification"),
+        item.get("classifier_source"),
+        item.get("note_evidence_only", False),
+    )
+    item["tier"] = tier
+
+    assert tier == "MED", tier
+    is_preselected_high_done = (
+        item["classification"] == "DONE" and item["tier"] == "HIGH"
+    )
+    assert not is_preselected_high_done

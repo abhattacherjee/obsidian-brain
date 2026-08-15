@@ -204,7 +204,7 @@ def _outer_subagent_timeout() -> int:
 
 
 def assign_tier(evidence_citation, item_text, classification=None,
-                classifier_source=None):
+                classifier_source=None, note_evidence_only=False):
     """Deterministically assign HIGH | MED | LOW from evidence citation shape.
 
     HIGH requires a literal ref (sha, #N, vX.Y) appearing in BOTH the citation
@@ -222,6 +222,11 @@ def assign_tier(evidence_citation, item_text, classification=None,
     with existing callers, appended rather than inserted — all 23 pre-#297
     call sites pass 1-3 positional args). See the #297 comment below the cap.
 
+    `note_evidence_only` is optional and defaults to False (appended last,
+    same backward-compat rule). See #318 fix round 2 (F7) below: this is
+    THE enforcing guard for a note-completion citation, not the citation-
+    shape regex check that follows it.
+
     Spec § Confidence tiers (lines 324-332).
     """
     if not evidence_citation or not item_text:
@@ -229,18 +234,28 @@ def assign_tier(evidence_citation, item_text, classification=None,
     citation = str(evidence_citation)
     text = str(item_text)
 
-    # #318/#297: a note-completion citation ("reported done in session
-    # YYYY-MM-DD (<title>)") is not itself proof of a fix-merge — the
-    # session summary it derives from can trivially co-mention an
-    # issue/PR number, sha, or version that ALSO appears in the item text
-    # (an item can literally read "close #318"). Left to the HIGH
-    # literal-ref loop below, classifier_source="agent" (a high-trust
-    # source) would then read that shared #N as HIGH+DONE and auto-check
-    # it off — the exact harm #297 closed, reopened through this new
-    # evidence source. Test for the note-completion shape FIRST and cap at
-    # MED unconditionally, before the HIGH loop ever runs. Conservative on
-    # purpose: if the only anchor is a session summary, MED is the ceiling
-    # even when a number happens to appear on both sides.
+    # #318 fix round 2 (F7, CRITICAL): the citation-shape check below (added
+    # in fix round 1) is TEXT PATTERN MATCHING against a string the
+    # classifier model composes freely. A reviewer found five one-word-off
+    # phrasings ("session note 2026-02-01" / "reported complete in session"
+    # / no template at all, just "#318 is done") that all skip the regex and
+    # fall through to the HIGH literal-ref loop -- persuading a model to
+    # reproduce a literal string is not enforcement. `note_evidence_only` is
+    # DATA WE CONTROL: check_items_cli stamps it from the evidence bundle's
+    # own keys (whether the project's evidence is note_completions-only, no
+    # git-derived bucket at all), so it cannot be defeated by wording. If
+    # true, no citation for this item can legitimately be HIGH regardless of
+    # what the model wrote — cap at MED unconditionally, before anything
+    # else runs.
+    if note_evidence_only:
+        return "MED"
+
+    # #318/#297 fix round 1: fallback second line of defence for a project
+    # that ALSO has git evidence (so note_evidence_only is False) but whose
+    # citation still happens to match the exact template
+    # check_items_cli.CLASSIFIER_PROMPT asks for. Kept, but no longer the
+    # only guard — see F7 above for why text-shape matching alone doesn't
+    # enforce anything.
     if re.search(_NOTE_COMPLETION_CITATION_PATTERN, citation):
         return "MED"
 
