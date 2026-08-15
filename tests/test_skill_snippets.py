@@ -1,5 +1,6 @@
 """Validate python3 -c '...' snippets in all SKILL.md files compile without SyntaxError."""
 
+import ast
 import glob
 import os
 import re
@@ -489,6 +490,92 @@ def test_check_items_heads_handoff_key_matches():
         f"partition.json heads-key mismatch: Step 3 writes "
         f"{write.group(1)!r} but Step 10 reads {read.group(1)!r} — every "
         "cache update would be silently skipped"
+    )
+
+
+_PYEOF_HEREDOC_RE = re.compile(r"<< 'PYEOF'\n(.*?)\nPYEOF", re.DOTALL)
+
+
+def _read_step7_heredoc():
+    """Extract the Step 7 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md.
+
+    Steps 3-10 ALL use `python3 << 'PYEOF' ... PYEOF` (7 occurrences, same
+    delimiter every time — unlike note_writer's per-invocation `<eof4>`
+    convention) — a naive first-match regex grabs Step 3's block, not
+    Step 7's. Scanned for the one block that actually contains
+    `assign_tier(`, which is unique to Step 7. `python3 -c '...'` snippets
+    elsewhere are already covered by _extract_python_snippets() above via
+    _SQ_SNIPPET_RE / _DQ_SNIPPET_RE (neither pattern matches a heredoc, so
+    no PYEOF block was ever visible to any existing snippet test). Reads
+    the real file on disk, not a fixture, so this test guards the actual
+    call site rather than a stand-in for it (#318 fix round 3, F11).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step7_blocks = [b for b in blocks if "assign_tier(" in b]
+    assert len(step7_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing assign_tier(, "
+        f"found {len(step7_blocks)} (of {len(blocks)} total heredoc blocks)"
+    )
+    return step7_blocks[0]
+
+
+def test_check_items_step7_threads_note_evidence_only_into_assign_tier():
+    """#318 fix round 3 (F11): Step 7's assign_tier(...) call must pass
+    note_evidence_only through, or every note-only project's citation
+    silently reverts to the pre-F7 HIGH-reachable bypass — announced
+    nowhere, since an omitted argument just falls back to
+    note_evidence_only's own default (False).
+
+    tests/test_check_items_note_evidence.py's
+    test_step7_wiring_threads_note_evidence_only_into_assign_tier pins the
+    *semantics* of that call shape (drop the 5th arg -> HIGH instead of
+    MED) but only against a Python-level reproduction of it — it cannot
+    catch a regression in the real markdown, because nothing executes
+    SKILL.md. This test closes that gap by parsing the ACTUAL Step 7
+    heredoc off disk.
+
+    Uses `ast`, not a substring/regex search for "note_evidence_only": a
+    regex would be satisfied by a comment or a string literal that never
+    reaches the call, which is exactly the kind of false-green a future
+    "helpful" edit could introduce. Walking the parsed AST for the
+    `assign_tier(...)` Call node and inspecting its actual arguments (via
+    `ast.unparse`, stdlib since Python 3.9 — no CI-version risk per
+    test_no_python_3_13_only_apis's floor) can only pass if the argument is
+    genuinely there.
+    """
+    source = _read_step7_heredoc()
+    tree = ast.parse(source)
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "assign_tier"
+    ]
+    assert len(calls) == 1, (
+        f"expected exactly one assign_tier(...) call in Step 7's heredoc, "
+        f"found {len(calls)}"
+    )
+    call = calls[0]
+
+    arg_sources = [ast.unparse(a) for a in call.args]
+    kw_names = {kw.arg for kw in call.keywords if kw.arg}
+
+    threaded_as_keyword = "note_evidence_only" in kw_names
+    threaded_as_5th_positional = (
+        len(arg_sources) >= 5 and "note_evidence_only" in arg_sources[4]
+    )
+    assert threaded_as_keyword or threaded_as_5th_positional, (
+        "Step 7's assign_tier(...) call does not pass note_evidence_only "
+        f"through — found {len(arg_sources)} positional arg(s) "
+        f"{arg_sources!r} and keyword(s) {sorted(kw_names)!r}. Without it, "
+        "every note-only project's citation defaults to "
+        "note_evidence_only=False and can reach HIGH again (#318 F7)."
     )
 
 
