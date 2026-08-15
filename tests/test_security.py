@@ -1640,6 +1640,14 @@ class TestRefspecPushesToProtectedBranchesAreBlocked:
         ("--force-with-lease", f"{PUSH} --force-with-lease origin HEAD:{MAIN}",
          "deny"),
         ("fully qualified ref", f"{PUSH} origin HEAD:refs/heads/{MAIN}", "deny"),
+        # git resolves `heads/main` the same as `refs/heads/main`, and a
+        # qualified ref can stand alone with no colon at all — source and
+        # destination are then the same branch. Both really push it.
+        ("heads/ qualified destination", f"{PUSH} origin HEAD:heads/{MAIN}",
+         "deny"),
+        ("qualified ref, no colon", f"{PUSH} origin refs/heads/{MAIN}", "deny"),
+        ("force, qualified, no colon", f"{PUSH} origin +refs/heads/{MAIN}",
+         "deny"),
         ("plain protected push", f"{PUSH} origin {MAIN}", "deny"),
         # Ordinary branches whose names merely BEGIN with a protected name.
         # These are the rows a substring test gets wrong.
@@ -1650,6 +1658,11 @@ class TestRefspecPushesToProtectedBranchesAreBlocked:
         ("feature refspec", f"{PUSH} origin HEAD:feature/x", "allow"),
         ("feature branch", f"{PUSH} origin feature/probe", "allow"),
         ("tag push", f"{PUSH} origin v1.2.3", "allow"),
+        # The qualified-ref arm must not fire on an ordinary qualified ref,
+        # nor on a branch whose name merely begins with a protected one.
+        ("qualified feature ref", f"{PUSH} origin refs/heads/feature/x",
+         "allow"),
+        ("qualified mainline ref", f"{PUSH} origin heads/{MAIN}line", "allow"),
     )
 
     @pytest.mark.parametrize(

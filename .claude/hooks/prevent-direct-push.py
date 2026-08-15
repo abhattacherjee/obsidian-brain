@@ -425,7 +425,19 @@ if current_branch in ["main", "develop"]:
 # `HEAD:maintenance`, which are ordinary branches — that costs a false deny
 # on legitimate work, and this condition only started deciding anything once
 # the narrowing `if` below was removed.
-_PROTECTED_REFSPEC_RE = re.compile(r':(?:refs/heads/)?(?:main|develop)(?![A-Za-z0-9._/-])')
+# Two arms, because git spells the same destination several ways:
+#   * after a colon, the destination of a refspec, optionally qualified —
+#     `HEAD:main`, `HEAD:heads/main`, `HEAD:refs/heads/main`;
+#   * a QUALIFIED ref standing alone, where source and destination are the
+#     same — `git push origin refs/heads/main`, `+refs/heads/main`. This arm
+#     requires the `heads/` prefix on purpose: a bare `main` here would match
+#     the word anywhere in the command, and `"origin main"` above already
+#     covers the unqualified spelling.
+_PROTECTED_REF = r'(?:main|develop)(?![A-Za-z0-9._/-])'
+_PROTECTED_REFSPEC_RE = re.compile(
+    r':(?:(?:refs/)?heads/)?' + _PROTECTED_REF
+    + r'|(?:^|[\s+])(?:refs/)?heads/' + _PROTECTED_REF
+)
 
 targets_protected = (
     "origin main" in command or
