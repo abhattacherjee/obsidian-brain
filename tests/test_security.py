@@ -1,5 +1,6 @@
 """Security hardening tests for obsidian-brain."""
 import ast
+import hashlib
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -1508,9 +1510,15 @@ class TestScopeGuardCannotBeBypassed:
             defined = {
                 n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)
             }
-            assert "_targets_this_project" in defined, f"{path} defines no guard"
+            for root in ("_targets_this_project", "_argument_span"):
+                assert root in defined, f"{path} defines no {root}()"
 
-            closure, pending = {}, ["_targets_this_project"]
+            # Two roots, not one: `_argument_span` is hand-duplicated into all
+            # five hooks like the rest of this block, but nothing in
+            # `_targets_this_project`'s call graph reaches it, so a copy that
+            # drifted would change which text one gate reads as a command's
+            # arguments — and no test would notice.
+            closure, pending = {}, ["_targets_this_project", "_argument_span"]
             while pending:
                 name = pending.pop()
                 if name in closure:
@@ -1839,6 +1847,22 @@ class TestVerbMatchingAndRefspecPushes:
                 f"an exec wrapper stood the gate down: {command!r}"
             )
 
+    def test_a_verb_inside_a_substitution_is_kept(self, tmp_path):
+        """`$( )` is the one non-"exec" state whose occurrences are KEPT: the
+        command inside really runs, in a subshell whose cwd never escapes.
+        Nothing named that arm, so folding it in with the dropped states —
+        which is the natural way to write the check — would have gone
+        unnoticed. The `echo`'d row is the control that keeps this from
+        passing on a gate that denies everything.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        push = self.PUSH + " origin " + self.MAIN
+        assert decide(work, env, "prevent-direct-push", "$(" + push + ")") == "deny"
+        assert decide(work, env, "prevent-direct-push",
+                      "X=`" + push + "`") == "deny"
+        assert decide(work, env, "prevent-direct-push", "echo " + push) == "allow"
+
     def test_a_prefix_that_does_not_parse_keeps_the_occurrence(self, tmp_path):
         """A `)` with nothing open makes the prefix unparseable — and an
         unplaceable verb must be KEPT, not dropped.
@@ -1853,6 +1877,26 @@ class TestVerbMatchingAndRefspecPushes:
                    + " ;; esac")
         assert TestHookBlockingPathsFire._decide(
             work, env, "prevent-direct-push", command) == "deny"
+
+    def test_a_cd_after_an_unparseable_prefix_does_not_descope(self, tmp_path):
+        """The other half of the "broken" state, on the `cd` side.
+
+        `_shell_scan` returning "exec" for a prefix it could not parse would
+        make the `cd` in `echo ) && cd /elsewhere && <push>` count, and a
+        counted `cd` descopes the verb — an ALLOW. The unmatched `)` means a
+        shell runs none of it, so gating costs nothing and trusting it costs
+        the gate. The row below it is the same command WITHOUT the `)`, which
+        must still allow, or this asserts only that everything denies.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        push = self.PUSH + " origin " + self.MAIN
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, "prevent-direct-push",
+                      f"echo ) && cd {elsewhere} && {push}") == "deny"
+        assert decide(work, env, "prevent-direct-push",
+                      f"cd {elsewhere} && {push}") == "allow"
 
     def test_an_absolute_path_to_git_is_still_git(self, tmp_path):
         """`/usr/bin/git <verb>` contains no `git <verb>` at a word boundary
@@ -2048,3 +2092,633 @@ class TestAdvisoryOutputUsesTheSameChannelRules:
             f"only 2 blocks and 120 is a non-blocking error: {err[-400:]!r}"
         )
         assert "BLOCKED:" in err, f"{hook} blocked with no reason on stderr: {err!r}"
+
+
+class TestFormsDevelopDeniedDoNotRegress:
+    """Shapes `develop` denied, which the first cut of this change ALLOWED.
+
+    Matching the verb by substring made `develop` accidentally right about a
+    whole family of commands: it did not care what stood in front of the verb,
+    so `if <verb>; then …`, `exec <verb>`, `\\<verb>` and a line-continued
+    `git \\`+newline+`push` all denied. Deciding by grammar is only an
+    improvement if it keeps them — a command-position walk that stops at the
+    first word it does not recognise turns each one into an ALLOW, and an
+    allow is what this gate exists to prevent. Measured develop -> first cut,
+    all seven deny -> allow.
+
+    So every row here is a REGRESSION test in the strict sense: the reference
+    verdict is develop's, not this change's. Each is paired in the same test
+    with the `echo`'d form, which must still ALLOW — otherwise "deny
+    everything" would pass as a fix.
+
+    Fragments again: the live hooks inspect unexecuted command text.
+    """
+
+    PUSH = "git pu" + "sh"
+    MAIN = "ma" + "in"
+    DEV = "deve" + "lop"
+    CHECKOUT = "git chec" + "kout -b"
+    COMMIT = "git com" + "mit"
+    GH_CREATE = "gh pr cre" + "ate"
+
+    # C1 — a keyword or wrapper that OPENS a command. The walk-back has to
+    # cross it; stopping there reads a real command as text.
+    OPENERS = (
+        ("prevent-direct-push", "if {v} origin " + MAIN + "; then echo ok; fi"),
+        ("prevent-direct-push", "while {v} origin " + MAIN + "; do :; done"),
+        ("prevent-direct-push", "until {v} origin " + MAIN + "; do :; done"),
+        ("prevent-direct-push", "exec {v} origin " + MAIN),
+        ("prevent-direct-push", "command {v} origin " + MAIN),
+        ("prevent-direct-push", "! {v} origin " + MAIN),
+        # A bare backslash: the ordinary way to bypass an alias or a shell
+        # function of the same name. The verb pattern matches at offset 1.
+        ("prevent-direct-push", "\\{v} origin " + MAIN),
+        ("require-preflight", "if {v} -m wip; then :; fi"),
+        ("require-preflight", "exec {v} -m wip"),
+        ("require-preflight", "\\{v} -m wip"),
+        ("validate-branch-name", "if {v} nonsense; then :; fi"),
+        ("validate-branch-name", "while {v} nonsense; do :; done"),
+        ("validate-branch-name", "\\{v} nonsense"),
+        ("update-changelog-before-pr", "if {v} --base develop; then :; fi"),
+        ("update-changelog-before-pr", "exec {v} --base develop"),
+        ("enforce-pr-base-branch", "if {v} --base " + MAIN + "; then :; fi"),
+        ("enforce-pr-base-branch", "\\{v} --base " + MAIN),
+    )
+
+    # C2 — "\<newline>" is a line continuation, i.e. whitespace. `\s+` does
+    # not span the backslash, so the verb guard never matched and exited 0
+    # before the helper that already knew this was ever called.
+    CONTINUATIONS = (
+        ("prevent-direct-push", "git \\\n push origin " + MAIN),
+        ("prevent-direct-push", "git -C \\\n . pu" + "sh origin " + MAIN),
+        ("prevent-direct-push", "git pu" + "sh origin \\\n" + MAIN),
+        ("require-preflight", "git \\\n com" + "mit -m wip"),
+        ("validate-branch-name", "git \\\n chec" + "kout -b nonsense"),
+        ("update-changelog-before-pr", "gh pr \\\n cre" + "ate --base develop"),
+        ("enforce-pr-base-branch", "gh pr \\\n cre" + "ate --title x"),
+    )
+
+    # C3 — the same defect this change fixes for git, in the gh siblings.
+    # `gh --repo o/r pr list` parses and returns 0 against the real binary.
+    GH_GLOBAL_OPTIONS = (
+        ("enforce-pr-base-branch", "gh --repo o/r pr cre" + "ate --base " + MAIN),
+        ("enforce-pr-base-branch", "gh -R o/r pr cre" + "ate --base " + MAIN),
+        ("enforce-pr-base-branch",
+         'gh --repo "o/r x" pr cre' + "ate --base " + MAIN),
+        ("enforce-pr-base-branch", "/opt/homebrew/bin/gh pr cre" + "ate --base " + MAIN),
+        ("update-changelog-before-pr", "gh --repo o/r pr cre" + "ate --base develop"),
+    )
+
+    # The verb each gate's business logic denies in the fixture repo, and the
+    # `echo`'d control that must still allow.
+    VERBS = {
+        "prevent-direct-push": PUSH,
+        "require-preflight": COMMIT,
+        "validate-branch-name": CHECKOUT,
+        "update-changelog-before-pr": GH_CREATE,
+        "enforce-pr-base-branch": GH_CREATE,
+    }
+
+    @classmethod
+    def _fill(cls, hook, template):
+        return template.replace("{v}", cls.VERBS[hook])
+
+    @pytest.mark.parametrize("hook,template", OPENERS)
+    def test_a_command_opener_does_not_stand_the_gate_down(
+        self, tmp_path, hook, template
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        command = self._fill(hook, template)
+        assert decide(work, env, hook, command) == "deny", (
+            f"{hook} read a real command as text because of the word in front "
+            f"of the verb; develop denied this: {command!r}"
+        )
+        echoed = "echo " + self._fill(hook, "{v}")
+        assert decide(work, env, hook, echoed) == "allow", (
+            f"{hook} now denies an echo'd mention, so the row above proves "
+            f"nothing but a gate that denies everything: {echoed!r}"
+        )
+
+    @pytest.mark.parametrize("hook,command", CONTINUATIONS)
+    def test_a_line_continuation_does_not_hide_the_verb(
+        self, tmp_path, hook, command
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, hook, command) == "deny", (
+            f"{hook} lost the verb across a line continuation: {command!r}"
+        )
+        echoed = "echo " + self._fill(hook, "{v}")
+        assert decide(work, env, hook, echoed) == "allow", (
+            f"{hook} denies an echo'd mention; this fixture cannot discriminate"
+        )
+
+    @pytest.mark.parametrize("hook,command", GH_GLOBAL_OPTIONS)
+    def test_a_global_gh_option_does_not_evade_the_pr_gates(
+        self, tmp_path, hook, command
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, hook, command) == "deny", (
+            f"{hook} never saw this command: gh takes global options before "
+            f"its subcommand, exactly as git does: {command!r}"
+        )
+        assert decide(work, env, hook, "gh --repo o/r pr sta" + "tus") == "allow", (
+            f"{hook} denies an unrelated gh command, so this proves nothing"
+        )
+
+    def test_a_global_gh_option_does_not_evade_the_merge_gate(self, tmp_path):
+        """`gh pr merge` needs the same widening, and its verdict must not
+        depend on the network: with `gh` unusable the gate's own "cannot
+        verify" deny is what proves the verb was matched at all — an unmatched
+        verb exits 0, which is an allow."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = TestGitSubprocessHandlersAreWideEnough._shimmed(
+            tmp_path, env, "git", "gh")
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, "enforce-pr-base-branch",
+                      "gh --repo o/r pr me" + "rge 5") == "deny"
+        assert decide(work, env, "enforce-pr-base-branch",
+                      "echo gh pr me" + "rge 5") == "allow"
+
+    # Quoting is an EVASION AXIS, not one bad row: a matcher that reads the
+    # ref by position in the text loses it behind any quote, so every refspec
+    # form is swept with both quote styles. The controls under them are what
+    # keep the sweep from becoming "deny anything quoted".
+    QUOTED_REFS = (
+        "git pu" + "sh origin '" + MAIN + "'",
+        'git pu' + 'sh origin "' + MAIN + '"',
+        "git pu" + "sh origin '" + DEV + "'",
+        "git pu" + "sh --force origin 'HEAD:" + MAIN + "'",
+        'git pu' + 'sh --force origin "HEAD:' + MAIN + '"',
+        "git pu" + "sh origin '+" + MAIN + ":" + MAIN + "'",
+        'git pu' + 'sh --force-with-lease origin "HEAD:' + MAIN + '"',
+        "git pu" + "sh origin 'refs/heads/" + MAIN + "'",
+        "git pu" + "sh origin 'mybranch:" + DEV + "'",
+        "git pu" + "sh upstream '" + MAIN + "'",
+    )
+
+    QUOTED_ALLOWED = (
+        "git pu" + "sh origin '" + MAIN + "tenance'",
+        'git pu' + 'sh origin "foo:' + MAIN + 'line"',
+        "git pu" + "sh origin 'feature/" + MAIN + "'",
+        'git pu' + 'sh origin feature/probe -o "deploy to ' + MAIN + '"',
+    )
+
+    @pytest.mark.parametrize("command", QUOTED_ALLOWED)
+    def test_quoting_does_not_make_an_ordinary_ref_protected(
+        self, tmp_path, command
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow", command
+
+    @pytest.mark.parametrize("command", QUOTED_REFS)
+    def test_a_quoted_ref_is_the_same_ref(self, tmp_path, command):
+        """This file already models quoted option values; the ref comparison
+        being quote-blind was an inconsistency inside one file."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        assert decide(work, env, "prevent-direct-push", command) == "deny", command
+        assert decide(work, env, "prevent-direct-push",
+                      "git pu" + "sh origin '" + self.MAIN + "tenance'") == "allow", (
+            "tolerating the opening quote must not re-break whole-ref matching"
+        )
+
+    def test_a_command_that_does_not_parse_keeps_its_verb(self, tmp_path):
+        """An apostrophe opens a quote that never closes, and every position
+        after it scans as "quoted" — so dropping quoted occurrences turned
+        `echo don't && <push>` into an ALLOW, on a shape develop denied.
+
+        "Quoted" is only evidence of inertness when the command as a WHOLE
+        parses. The three rows separate that: the middle one is the same
+        command with the apostrophe removed (it always denied), and the last
+        is a genuinely quoted mention inside a command that parses, which must
+        still allow.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        push = self.PUSH + " origin " + self.MAIN
+        assert decide(work, env, "prevent-direct-push",
+                      "echo don't && " + push) == "deny"
+        assert decide(work, env, "prevent-direct-push",
+                      "echo dont && " + push) == "deny"
+        assert decide(work, env, "prevent-direct-push",
+                      "echo '" + push + "'") == "allow"
+
+    def test_the_option_value_grammar_is_identical_in_all_five_hooks(self):
+        """`_OPT_VALUE` is hand-duplicated like the scope guard, and it is not
+        reachable from `_targets_this_project`, so the drift test that covers
+        that closure does not cover this. A copy that drifts changes which
+        commands one gate can see, silently."""
+        sources = {}
+        for hook in TestHookInputFailsClosed.HOOKS:
+            src = (Path(".claude/hooks") / f"{hook}.py").read_text(encoding="utf-8")
+            tree = ast.parse(src)
+            found = [
+                ast.get_source_segment(src, node) for node in tree.body
+                if isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "_OPT_VALUE"
+                        for t in node.targets)
+            ]
+            assert len(found) == 1, f"{hook}.py defines _OPT_VALUE {len(found)}x"
+            sources[hook] = found[0]
+        reference = sources[TestHookInputFailsClosed.HOOKS[0]]
+        for hook, text in sources.items():
+            assert text == reference, f"{hook}.py's _OPT_VALUE has drifted"
+
+
+class TestWrapperArgumentsDoNotHideTheVerb:
+    """#327 I2: a wrapper's own argument is a bare word, and so is `echo`.
+
+    The command-position walk crosses transparent tokens, and an option
+    (`-n1`) is transparent. A SEPARATED value is not an option — it is a bare
+    word — so the walk stopped at `60` in `timeout 60 <verb>` and read a real
+    command as text. Measured, develop -> before this fix: `timeout 60`,
+    `nice -n 10` and `xargs -n 1` all deny -> ALLOW, while their joined-flag
+    spellings (`xargs -n1`) denied, which is the tell that the flag was never
+    the point.
+
+    The fix cannot be "cross bare words too": `echo <verb>` is that shape
+    exactly, and crossing it re-breaks the false-deny this change exists to
+    close. Bare words are carried and only settled once a wrapper claims them,
+    which is what the paired rows below assert — same walk, opposite verdicts.
+    """
+
+    PUSH = "git pu" + "sh"
+    MAIN = "ma" + "in"
+
+    GATED = (
+        "timeout 60 {v}",
+        "timeout -k 5 60 {v}",
+        "nice -n 10 {v}",
+        "nice -n10 {v}",
+        "xargs -n 1 {v}",
+        "xargs -n1 {v}",
+        "sudo -u someone {v}",
+        "env -i {v}",
+        "nohup {v}",
+    )
+
+    TEXT = (
+        "echo {v}",
+        "echo -n {v}",
+        "grep -r foo {v}",
+        "printf %s {v}",
+        # Bare words nothing claims: the walk reaches the start of the line
+        # still carrying them, which settles it as text.
+        "echo one two three four {v}",
+        # A plain keyword is not a wrapper: `time` takes no argument of its
+        # own, so the bare word before the verb belonged to something else.
+        "time foo {v}",
+    )
+
+    @pytest.mark.parametrize("template", GATED)
+    def test_a_wrapper_with_arguments_still_reaches_the_gate(self, tmp_path, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH + " origin " + self.MAIN)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", (
+            f"a wrapper's own argument hid a real push: {command!r}"
+        )
+
+    @pytest.mark.parametrize("template", TEXT)
+    def test_the_verb_as_another_command_s_argument_still_allows(
+        self, tmp_path, template
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(v=self.PUSH + " origin " + self.MAIN)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow", (
+            f"carrying bare words re-broke the false-deny fix: {command!r}"
+        )
+
+    def test_the_walk_gives_up_on_the_gated_side(self, tmp_path):
+        """The walk is bounded, and the bound fails CLOSED.
+
+        Each step rescans the text to its left, so an unbounded walk is
+        quadratic in a command line written by whoever is being gated. The
+        bound is a cost control, not a meaning: running out establishes
+        nothing, and an unestablished verb is a gated one.
+
+        The first cut bounded the number of BARE WORDS carried instead, and a
+        mutation proved that unfalsifiable — the terminal check already
+        rejects `echo one two three four <verb>`, so raising the carry limit
+        changed no verdict any test could see. The rows below are what a real
+        bound looks like: past it the verdict flips, under it nothing changes,
+        and a wrapper further left than four words is now credited (the last
+        row), which the carry limit had been quietly refusing.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        push = self.PUSH + " origin " + self.MAIN
+        assert decide(work, env, "prevent-direct-push",
+                      "echo " + "w " * 70 + push) == "deny"
+        assert decide(work, env, "prevent-direct-push",
+                      "echo " + "w " * 10 + push) == "allow"
+        assert decide(work, env, "prevent-direct-push",
+                      "xargs a b c d e " + push) == "deny"
+
+    @pytest.mark.parametrize("hook,command", (
+        ("require-preflight", "timeout 5 git com" + "mit -m wip"),
+        ("validate-branch-name", "timeout 5 git chec" + "kout -b nonsense"),
+        ("update-changelog-before-pr", "timeout 5 gh pr cre" + "ate --base develop"),
+        ("enforce-pr-base-branch", "timeout 60 gh pr cre" + "ate --base ma" + "in"),
+    ))
+    def test_the_other_gates_cross_a_wrapper_argument_too(
+        self, tmp_path, hook, command
+    ):
+        """The walk is one hand-duplicated helper; a fix in one copy that did
+        not reach the others would leave three gates open."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        assert TestHookBlockingPathsFire._decide(work, env, hook, command) == "deny"
+
+
+class TestAllowSideHatchesAreScopedToTheirCommand:
+    """#327 I3/I4/S2: the gates were narrow where they blocked and wide where
+    they stood down.
+
+    Every deny-side test in this change asks what a shell would RUN. Every
+    allow-side escape hatch still asked whether some characters appear
+    anywhere in the command text — so each hatch was an off switch for the
+    whole line, reachable by writing about it. Measured on develop and on the
+    first cuts of this change:
+
+        <push> origin main  # see refs/tags/v1                     ALLOW
+        echo 'refs/tags/x' && <push> origin main                   ALLOW
+        echo '--tags' && <push> origin main                        ALLOW
+        <push> --delete origin release/x && <push> origin main     ALLOW
+        <push> origin main && <push> origin v1.2.3                 ALLOW
+        <commit> -m "document SKIP_PREFLIGHT=1 escape hatch"       ALLOW
+        grep -r 'SKIP_PREFLIGHT=1' . && <commit> -m wip            ALLOW
+        echo --base develop && gh pr create --title x              ALLOW
+
+    The commit-message row is the one that needs no adversary: documenting the
+    escape hatch in a commit message silently skips preflight.
+
+    Each hatch is now read from the occurrence's own argument span, and each
+    row below is paired with the LEGITIMATE use of the same hatch, which must
+    still allow — a hatch that never applies is not a fix.
+    """
+
+    PUSH = "git pu" + "sh"
+    MAIN = "ma" + "in"
+    COMMIT = "git com" + "mit"
+
+    HATCH_MUST_NOT_APPLY = (
+        "{p} origin " + MAIN + "  # see refs/tags/v1",
+        "echo 'refs/tags/x' && {p} origin " + MAIN,
+        "echo '--tags' && {p} origin " + MAIN,
+        "{p} --delete origin release/x && {p} origin " + MAIN,
+        "{p} origin " + MAIN + " && {p} origin v1.2.3",
+        "{p} origin v1.2.3 && {p} origin " + MAIN,
+    )
+
+    HATCH_STILL_APPLIES = (
+        "{p} origin v1.2.3",
+        "{p} --tags",
+        "{p} origin refs/tags/v1.2.3",
+        "{p} --delete origin release/v1.2.3",
+        "{p} origin feature/probe",
+    )
+
+    @pytest.mark.parametrize("template", HATCH_MUST_NOT_APPLY)
+    def test_a_hatch_does_not_excuse_a_different_push(self, tmp_path, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(p=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", (
+            f"a protected push was excused by text belonging to another "
+            f"command: {command!r}"
+        )
+
+    @pytest.mark.parametrize("template", HATCH_STILL_APPLIES)
+    def test_the_hatch_still_opens_for_its_own_push(self, tmp_path, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(p=self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "allow", (
+            f"Git Flow's own operations must still pass: {command!r}"
+        )
+
+    SKIP_MUST_NOT_APPLY = (
+        '{c} -m "document SKIP_PREFLIGHT=1 escape hatch"',
+        "grep -r 'SKIP_PREFLIGHT=1' . && {c} -m wip",
+        'echo "; SKIP_PREFLIGHT=1 " && {c} -m wip',
+    )
+
+    @pytest.mark.parametrize("template", SKIP_MUST_NOT_APPLY)
+    def test_writing_about_the_skip_flag_does_not_set_it(self, tmp_path, template):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = template.format(c=self.COMMIT)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "require-preflight", command) == "deny", (
+            f"preflight was skipped by text that sets nothing: {command!r}"
+        )
+
+    SKIP_REALLY_SET = (
+        "SKIP_PREFLIGHT=1 {c} -m wip",
+        "true && SKIP_PREFLIGHT=1 {c} -m wip",
+        # `env VAR=value command` is an ordinary spelling of an assignment, and
+        # develop allowed it. The first cut of this gate anchored the hatch to
+        # a separator, which denied it — a false deny introduced by this
+        # change, and the reason the hatch is now judged by the same
+        # command-position walk as the verb rather than by its own regex.
+        "env SKIP_PREFLIGHT=1 {c} -m wip",
+        "sudo SKIP_PREFLIGHT=1 {c} -m wip",
+    )
+
+    @pytest.mark.parametrize("template", SKIP_REALLY_SET)
+    def test_the_skip_flag_still_works_when_it_is_really_set(
+        self, tmp_path, template
+    ):
+        """The emergency hatch is deliberate and must survive: an assignment
+        the shell would really make, at a command position."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "require-preflight",
+            template.format(c=self.COMMIT)) == "allow", template
+
+    def test_the_skip_flag_is_a_whole_assignment(self, tmp_path):
+        """`SKIP_PREFLIGHT=12` is a different value, and `echo SKIP_...` is an
+        argument to echo. Neither sets anything, and both must still block —
+        the boundary the token check draws, and the walk the `env` row above
+        needs, are not the same check."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        for command in ("SKIP_PREFLIGHT=12 " + self.COMMIT + " -m wip",
+                        "echo SKIP_PREFLIGHT=1 && " + self.COMMIT + " -m wip"):
+            assert decide(work, env, "require-preflight", command) == "deny", command
+
+    def test_an_earlier_base_does_not_satisfy_a_later_create(self, tmp_path):
+        """`--base` was searched across the whole command, so any earlier
+        mention satisfied a create that had none of its own — and GitHub
+        defaults those to main, which is the thing this gate exists to stop."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        create = "gh pr cre" + "ate --title x"
+        assert decide(work, env, "enforce-pr-base-branch",
+                      "echo --base develop && " + create) == "deny"
+        assert decide(work, env, "enforce-pr-base-branch",
+                      "gh pr cre" + "ate --base develop") == "allow"
+
+    def test_the_pr_number_comes_from_the_merge_being_run(self, tmp_path):
+        """A digit grabbed from anywhere after the verb, so
+        `gh pr merge --squash && echo 123` verified PR #123 and merged
+        whichever PR the branch points at.
+
+        Both readings deny here (gh is unusable), so the decision cannot tell
+        them apart — the REASON can, and it is what names the PR the gate
+        thought it was checking.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = TestGitSubprocessHandlersAreWideEnough._shimmed(
+            tmp_path, env, "git", "gh")
+        proc = subprocess.run(
+            [sys.executable, str(work / ".claude/hooks/enforce-pr-base-branch.py")],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {
+                "command": "gh pr me" + "rge --squash && echo 123"}}),
+            capture_output=True, text=True, timeout=60, cwd=work, env=env,
+        )
+        assert proc.returncode == 0, proc.stderr[-300:]
+        reason = json.loads(proc.stdout)["hookSpecificOutput"][
+            "permissionDecisionReason"]
+        assert "123" not in reason, (
+            f"the gate read a digit from another command as the PR number: "
+            f"{reason!r}"
+        )
+        assert "Cannot determine PR number" in reason, reason
+
+
+class TestProtectedRefIsProtectedOnAnyRemote:
+    """#327 S1: the rule keyed off the remote NAME, so only `origin` counted.
+
+    `git push upstream main` and `git push git@github.com:o/r.git main` push
+    main exactly as hard, and both allowed on develop and on the first cut of
+    this change. Once a push verb is established, a WORD among its arguments
+    that IS `main`/`develop` is a ref — the remote it goes to does not change
+    what is being overwritten.
+
+    This is the one place the change widens what denies rather than narrowing
+    it, so the controls matter more than usual: an ordinary branch push to a
+    non-`origin` remote, a branch merely CONTAINING the word, and the word
+    inside a quoted sentence must all still allow.
+    """
+
+    PUSH = "git pu" + "sh"
+    MAIN = "ma" + "in"
+
+    @pytest.mark.parametrize("command,expected", (
+        ("{p} upstream " + MAIN, "deny"),
+        ("{p} fork develop", "deny"),
+        ("{p} git@github.com:o/r.git " + MAIN, "deny"),
+        ("{p} https://host/o/r.git HEAD:" + MAIN, "deny"),
+        ("{p} upstream refs/heads/" + MAIN, "deny"),
+        ("{p} upstream " + MAIN + "^{}", "deny"),
+        ("{p} upstream " + MAIN + "~1", "deny"),
+        # Controls: ordinary work to any remote must still pass.
+        ("{p} upstream feature/probe", "allow"),
+        ("{p} upstream " + MAIN + "tenance", "allow"),
+        ("{p} upstream develop-x", "allow"),
+        ("{p} upstream feature/" + MAIN, "allow"),
+        # The word inside a quoted SENTENCE is not a ref. This is what the
+        # whole-word comparison buys over a substring search, and the row
+        # above it (`origin 'main'`, in the quoted-ref test) is what it must
+        # not cost.
+        ('{p} upstream feature/probe -o "deploy to ' + MAIN + '"', "allow"),
+    ))
+    def test_protected_ref_on_any_remote(self, tmp_path, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        # .replace, not .format: one of the refs below is `main^{}`, and a peel
+        # suffix is a format placeholder as far as str.format is concerned.
+        command = command.replace("{p}", self.PUSH)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == expected, command
+
+
+class TestEveryBranchCreatingFormIsGated:
+    """#327 S4: `checkout -b` is one of three spellings.
+
+    `git checkout -B <name>` creates (or resets) a branch and `git switch -c
+    <name>` creates one, and a gate that knows only `checkout -b` lets a
+    non-conforming name in by either. Both allowed on develop too.
+    """
+
+    @pytest.mark.parametrize("command,expected", (
+        ("git chec" + "kout -b nonsense", "deny"),
+        ("git chec" + "kout -B nonsense", "deny"),
+        ("git swi" + "tch -c nonsense", "deny"),
+        ("git swi" + "tch -C nonsense", "deny"),
+        ("git swi" + "tch --create nonsense", "deny"),
+        ("git swi" + "tch --force-create nonsense", "deny"),
+        ("git -C . swi" + "tch -c nonsense", "deny"),
+        ("git -C . swi" + "tch --force-create nonsense", "deny"),
+        ("git chec" + "kout -B feature/ok", "allow"),
+        ("git swi" + "tch -c feature/ok", "allow"),
+        ("git swi" + "tch -C feature/ok", "allow"),
+        ("git swi" + "tch --create feature/ok", "allow"),
+        ("git swi" + "tch --force-create feature/ok", "allow"),
+        # Switching to a branch that exists creates nothing, and a gate that
+        # denied it would block ordinary work.
+        ("git swi" + "tch existing-branch", "allow"),
+        ("git chec" + "kout existing-branch", "allow"),
+        ("git swi" + "tch --detach HEAD~1", "allow"),
+        ("echo git swi" + "tch -c nonsense", "allow"),
+    ))
+    def test_branch_creation_decision(self, tmp_path, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "validate-branch-name", command) == expected, command
+
+
+class TestPreflightTokenShapeFailsClosed:
+    """#327 S6: a token that PARSES is not yet a token that can be read.
+
+    `json.load` returning `[]`, `5` or `"x"` is not a JSONDecodeError, so the
+    handler did not catch it — and `token_data.get(...)` then raised
+    AttributeError. An `expires` that is a string raises TypeError at the
+    comparison instead. Both are tracebacks, both exit 1, and rc 1 is a
+    NON-BLOCKING error under the PreToolUse contract: the unverified commit
+    proceeds. Same fail-open class this change closes elsewhere.
+
+    The valid-token row is the control: a gate that rejected every token would
+    pass every row above while making the preflight mechanism unusable.
+    """
+
+    @staticmethod
+    def _token_path(work):
+        """The hook's own formula, not a copy of its output."""
+        return Path("/tmp") / (
+            ".preflight-token-"
+            + hashlib.md5(str(Path(work).resolve()).encode()).hexdigest()[:8]
+        )
+
+    @pytest.mark.parametrize("body,expected", (
+        ("[]", "deny"),
+        ("5", "deny"),
+        ('"x"', "deny"),
+        ("null", "deny"),
+        ('{"expires": "soon"}', "deny"),
+        ('{"expires": true}', "deny"),
+        ("not json at all", "deny"),
+        # The control: a well-formed, unexpired token allows, and is what the
+        # rows above must be distinguished FROM.
+        (None, "allow"),
+    ))
+    def test_a_malformed_token_blocks_instead_of_crashing(
+        self, tmp_path, body, expected
+    ):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        token = self._token_path(work)
+        if body is None:
+            body = json.dumps({"expires": int(time.time()) + 300,
+                               "checks_run": "test", "staged_files": 1})
+        token.write_text(body, encoding="utf-8")
+        try:
+            assert TestHookBlockingPathsFire._decide(
+                work, env, "require-preflight",
+                "git com" + "mit -m wip") == expected, body
+        finally:
+            if token.exists():
+                token.unlink()

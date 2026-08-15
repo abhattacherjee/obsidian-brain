@@ -33,20 +33,34 @@ _GIT = r'(?:[^\s;&|()<>]*/)?git\b'
 # it (`-c user.name="a b"`), so a value is a run of quoted spans and bare
 # characters rather than one `[^\s]+` token. The alternatives are disjoint on
 # their first character, so this adds no ambiguity to backtrack through.
-_GIT_OPT_VALUE = (
+# Named without a tool prefix because `gh` takes global options in exactly the
+# same shape (`gh --repo o/r pr create`), and the two gh gates carry a
+# byte-identical copy of this definition (#327).
+_OPT_VALUE = (
     r'(?:"[^"]*"|\'[^\']*\'|[^-\s"\'])'
     r'(?:"[^"]*"|\'[^\']*\'|[^\s"\'])*'
 )
-_GIT_OPTS = r'(?:\s+-[^\s]+(?:\s+' + _GIT_OPT_VALUE + r')?)*'
+_GIT_OPTS = r'(?:\s+-[^\s]+(?:\s+' + _OPT_VALUE + r')?)*'
 _GIT_PUSH_RE = _GIT + _GIT_OPTS + r'\s+push\b'
 
-# A whole ref, not a prefix: `origin maintenance` and `foo:mainline` are
-# ordinary branches, and both used to DENY (#327). `refs/heads/main` is the
-# same ref written long, and `+main:main` is a force refspec.
-_PROTECTED_REMOTE_RE = re.compile(
-    r'\borigin\s+\+?(?:refs/heads/)?(?:main|develop)(?![\w./-])')
-_PROTECTED_REFSPEC_RE = re.compile(
-    r':(?:refs/heads/)?(?:main|develop)(?![\w./-])')
+# One shell word of a command. Quoted spans are part of the word they sit in,
+# so `-c user.name="a b"` and `'HEAD:main'` are each ONE word — which is what
+# makes "is this word a ref?" answerable at all.
+_WORD_RE = re.compile(r'(?:"[^"]*"|\'[^\']*\'|[^\s"\'])+')
+
+# A protected ref, matched WHOLE against one word. Not anchored to `origin`:
+# `git push upstream main` and `git push git@github.com:o/r.git main` push
+# main just as hard, and both were allowed by a rule that keyed off the remote
+# NAME (#327). Once a push verb is established, a word among its arguments
+# that IS `main`/`develop` is a ref, wherever it sits.
+#
+# Matching a whole word is also what keeps the ordinary branches out, in both
+# directions and without lookarounds: `maintenance`, `develop-x` and
+# `feature/main` are simply different words. `refs/heads/main` is the same ref
+# written long, `+` is a force refspec, and the `^~@` tail covers the peel and
+# reflog suffixes (`main^{}`, `main~1`, `main@{u}`) that name it too.
+_PROTECTED_REF_RE = re.compile(
+    r'\+?(?:refs/heads/)?(?:main|develop)(?:[\^~@].*)?')
 
 
 def _warn(message):
@@ -211,24 +225,45 @@ input_data = _read_hook_input("Push hook")
 
 tool_name = input_data.get("tool_name", "")
 tool_input = input_data.get("tool_input", {})
-command = tool_input.get("command", "")
+# "\<newline>" is a line continuation — whitespace, not a separator — and it
+# is collapsed HERE, at the one point the command is read, rather than inside
+# the scope helper alone. The verb guard runs BEFORE that helper: matching the
+# raw text, `\s+` never spans the backslash, so `git \` + newline + `push`
+# exited 0 at the guard and the helper that knows about continuations was
+# never called (#327). The helper keeps its own collapse; it is idempotent.
+command = tool_input.get("command", "").replace("\\\n", " ")
 
 # Only validate Bash commands. The push verb itself is matched further down,
 # once the helpers that know where a shell would really run it exist.
 if tool_name != "Bash":
     sys.exit(0)
 
-# --- Project-scope guard ---
-# Skip this hook if the command targets a repo outside this project.
-# Hooks run in their own process (cwd = project dir), so git commands in
-# the hook inspect the wrong repo when Claude does "cd /other/repo && git push".
+
 # Words that stand between a separator and the command that actually runs.
-# `sudo git push …` and `env A=b git push …` really do push, so the verb must
-# stay gated behind them; `echo git push …` must not (#327).
+# `if git push …; then`, `exec git push …`, `sudo git push …` and `\git push …`
+# all really do push, so the verb must stay gated behind them; `echo git push
+# …` must not (#327). Block OPENERS matter as much as the `then`/`do` that
+# follow them — measured, every gate allowed `if <verb>; then :; fi` while
+# denying the bare verb.
 _TRANSPARENT_TOKENS = frozenset({
-    "!", "then", "else", "do", "elif", "sudo", "env", "command", "nohup",
-    "nice", "time", "xargs", "eval", "stdbuf",
+    "!", "\\", "if", "while", "until", "then", "else", "do", "elif",
+    "sudo", "env", "command", "builtin", "exec", "nohup", "nice", "time",
+    "timeout", "xargs", "eval", "stdbuf",
 })
+# The subset of those that take arguments of their OWN before the command:
+# `timeout 60 <verb>`, `nice -n 10 <verb>`, `xargs -n 1 <verb>`, `sudo -u u
+# <verb>`. A separated value is a bare word, so without this list the walk
+# stops at `60` and reads a real command as text — measured allowing on every
+# gate (#327).
+_ARG_TAKING_TOKENS = frozenset({
+    "sudo", "env", "nohup", "nice", "timeout", "xargs", "stdbuf",
+})
+# How many words the walk will cross before giving up. Each step rescans the
+# text to its left, so an unbounded walk is O(n) per step over a command line
+# written by whoever is being gated; this is what keeps that bounded. It is
+# not a semantic knob — running out means nothing was established, so the walk
+# gives up on the GATED side.
+_WALK_STEP_LIMIT = 64
 
 
 def _shell_scan(prefix: str):
@@ -308,32 +343,109 @@ def _at_command_position(prefix: str) -> bool:
     at the start of the line, or straight after a separator.
 
     Walking back over TRANSPARENT tokens is what keeps the forms that really
-    do run the verb on the gated side: ``sudo git …``, ``env A=b git …``,
-    ``xargs -n1 git …``, ``time git …``. An option (``-n1``) is transparent
-    too — it belongs to whatever precedes it, and that word decides. So
-    ``echo -n git push …`` walks past ``-n``, reaches ``echo``, and is
-    correctly read as text.
+    do run the verb on the gated side. Three groups, and every one of them was
+    measured denying on ``develop`` and allowing here before it was added:
 
-    Known limit, in the fail-open direction: a verb inside a string a shell
-    later executes (``eval "<verb>"``, ``bash -c "<verb>"``) is "quoted" and
-    is dropped. That is deliberate — the alternative is treating every quoted
-    mention of the verb as a command, which is the false-deny this closes.
+    * block openers and shell keywords — ``if <verb>; then …``,
+      ``while``/``until``, ``then``/``else``/``do``/``elif``, ``!``;
+    * exec wrappers — ``sudo``, ``env``, ``command``, ``builtin``, ``exec``,
+      ``nohup``, ``nice``, ``time``, ``timeout``, ``xargs``, ``eval``,
+      ``stdbuf``, and ``VAR=value`` assignments;
+    * a bare backslash — ``\\git push …`` is the ordinary way to bypass an
+      alias or a function of the same name, and the verb pattern matches at
+      offset 1, leaving the escape as its own token here.
+
+    An OPTION (``-n1``) is transparent too: it belongs to whatever precedes
+    it, and that word decides. So ``echo -n git push …`` walks past ``-n``,
+    reaches ``echo``, and is correctly read as text — and ``xargs -n1 git …``
+    walks the same ``-n1``, reaches ``xargs``, and is gated.
+
+    A BARE word is the hard case, because it is what a wrapper's separated
+    argument looks like (``timeout 60 git push …``, ``nice -n 10 git push …``)
+    AND what a command taking the verb as data looks like (``echo git push
+    …``). The two are told apart by what is further left: bare words are
+    carried, and count as absorbed only once an ``_ARG_TAKING_TOKENS`` wrapper
+    is reached. Hit the start of the command, a separator, or a plain keyword
+    with bare words still outstanding and they were arguments to something
+    that is NOT a wrapper — so the verb is that thing's data, and this returns
+    False.
+
+    The walk gives up after ``_WALK_STEP_LIMIT`` words, on the gated side.
+    That bound is about COST, not meaning: each step rescans the text to its
+    left, so an unbounded walk is quadratic in a command line an attacker
+    writes. A carry limit was tried first and proved unfalsifiable — the
+    terminal check already rejects ``echo one two three four <verb>``, so
+    raising the limit changed no verdict a test could see.
+
+    Two known limits, both in the fail-open direction:
+
+    * A verb inside a string a shell later executes (``eval "<verb>"``,
+      ``bash -c "<verb>"``) is "quoted" and is dropped. That is deliberate —
+      the alternative is treating every quoted mention of the verb as a
+      command, which is the false deny this exists to close.
+    * A QUOTED executable is not matched at all: ``"git" push …`` and
+      ``g"i"t push …`` allow, here and on develop alike. Recognising them
+      means joining shell words before matching, i.e. a real parser rather
+      than a scanner, so the gap is documented rather than half-closed.
     """
     seps = ";&|(){}\n"
-    while True:
+    pending_bare = 0
+    for _step in range(_WALK_STEP_LIMIT):
         head = prefix.rstrip()
+        # Reaching the start of the command, or a separator, settles it — but
+        # only if nothing is outstanding: bare words that no wrapper ever
+        # claimed were arguments to a command, and the verb is one of them.
         if not head:
-            return True  # first word of the command line
+            return pending_bare == 0
         if head[-1] in seps:
-            return True  # straight after a separator
+            return pending_bare == 0
         cut = max(head.rfind(c) for c in seps)
         token = head[cut + 1:].rsplit(None, 1)[-1]
         name, eq, _value = token.partition("=")
-        if not (token in _TRANSPARENT_TOKENS
-                or token.startswith("-")
-                or (eq and name.isidentifier())):
-            return False
+        if token in _ARG_TAKING_TOKENS:
+            pending_bare = 0  # this is what those bare words belonged to
+        elif token.startswith("-") or (eq and name.isidentifier()):
+            pass  # an option or an assignment; a bare word may be its value
+        elif token in _TRANSPARENT_TOKENS:
+            if pending_bare:
+                return False  # `time foo <verb>` runs foo, with the verb as data
+        else:
+            pending_bare += 1  # maybe a wrapper's argument; maybe `echo`
         prefix = head[:len(head) - len(token)]
+    # More words in front of the verb than any real command line has. Nothing
+    # is established either way, and an unestablished verb is a gated one.
+    return True
+
+
+def _argument_span(cmd: str, start: int) -> str:
+    """The text of ONE command, from ``start`` to where the shell ends it.
+
+    Every allow-side escape hatch in these gates tested a raw substring
+    against the WHOLE command, while the deny side had been narrowed to the
+    occurrence a shell would really run — and a gate that is narrow where it
+    blocks and wide where it stands down is a gate with an off switch (#327).
+    Measured: ``<push> origin main  # see refs/tags/v1`` and ``echo
+    '--tags' && <push> origin main`` both stood the push gate down, and
+    ``<push> --delete origin release/x && <push> origin main`` excused the
+    second push with the first one's flag.
+
+    The span ends at the first thing the shell would treat as ending this
+    command — ``;``, ``&``, ``|``, a newline, a closing ``)``, ``}`` or
+    backtick — or at a ``#`` that starts a comment. The backtick earns its
+    place: without it ``X=`<push> origin main` `` keeps the closing backtick
+    inside the span, and the last WORD of the span is then ``main` `` rather
+    than ``main``, which is not a ref and not a deny. A candidate only counts
+    when the text from the verb to it parses as executable, so a separator
+    inside quotes (``-m "a; b"``) does not cut the span short.
+    """
+    i = start
+    while i < len(cmd):
+        c = cmd[i]
+        if c in ";&|\n)}`" or (c == "#" and (i == 0 or cmd[i - 1].isspace())):
+            if _shell_scan(cmd[start:i])[0] == "exec":
+                return cmd[start:i]
+        i += 1
+    return cmd[start:]
 
 
 def _verb_occurrences(cmd: str, verb: str):
@@ -345,16 +457,24 @@ def _verb_occurrences(cmd: str, verb: str):
     guard matched, and ``if not verb_positions: return True`` swallows the
     divergence as "gate it" — fail closed, correct, and silent (#327).
 
-    An occurrence is dropped only when it is provably inert: quoted, or not in
-    command position. Everything else is KEPT, including a prefix that does
-    not parse, because a dropped verb means the hook exits 0 with no decision
-    and the PreToolUse contract reads that as ALLOW.
+    An occurrence is dropped only when it is provably inert: quoted inside a
+    command that otherwise parses, or not in command position. Everything else
+    is KEPT — including a prefix that does not parse, and every position in a
+    command that does not parse — because a dropped verb means the hook exits
+    0 with no decision, and the PreToolUse contract reads that as ALLOW.
     """
+    # "Quoted" is a verdict about a PREFIX, and it is only evidence that the
+    # verb is inert when the command as a WHOLE parses. `echo don\'t && <verb>`
+    # leaves a quote open from the apostrophe onward, so every later position
+    # reads as quoted — and dropping the verb there is an ALLOW, on a shape
+    # develop denied. When the whole command does not parse, nothing in it is
+    # provably inert.
+    whole_parses = _shell_scan(cmd)[0] != "quoted"
     kept = []
     for match in re.finditer(verb, cmd):
         start = match.start()
         state, _subshells = _shell_scan(cmd[:start])
-        if state == "quoted":
+        if state == "quoted" and whole_parses:
             continue
         if not _at_command_position(cmd[:start]):
             continue
@@ -465,22 +585,57 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
     return False
 
 # Only validate git push commands
-if not _verb_occurrences(command, _GIT_PUSH_RE):
+occurrences = _verb_occurrences(command, _GIT_PUSH_RE)
+if not occurrences:
     sys.exit(0)
 
 if not _targets_this_project(command, _GIT_PUSH_RE):
     sys.exit(0)
 
-# Allow tag pushes (refs/tags/*, --tags, or explicit version tags like v1.2.3)
-if "refs/tags/" in command or "--tags" in command:
-    sys.exit(0)
-# Allow pushing an explicit version tag (e.g., "git push origin v1.2.3")
-if re.search(_GIT_PUSH_RE + r'\s+\S+\s+v\d+\.\d+\.\d+', command):
-    sys.exit(0)
+def _is_git_flow_push(span: str) -> bool:
+    """Pushes this gate deliberately permits, judged on ONE push's arguments.
 
-# Allow branch deletion (--delete) for release/hotfix cleanup
-if "--delete" in command and ("release/" in command or "hotfix/" in command):
-    sys.exit(0)
+    These same three tests used to run against the WHOLE command, which made
+    each of them an off switch for every push on the line: `<push> origin main
+    # see refs/tags/v1` allowed, `echo '--tags' && <push> origin main`
+    allowed, and `<push> --delete origin release/x && <push> origin main`
+    excusing the second push with the first one's flag (#327). A span ends at
+    the separator or comment that ends that command, so a hatch now excuses
+    only the push that carries it.
+    """
+    # Tags are not branches: refs/tags/*, --tags, or an explicit version tag.
+    if "refs/tags/" in span or "--tags" in span:
+        return True
+    if re.search(_GIT_PUSH_RE + r'\s+\S+\s+v\d+\.\d+\.\d+', span):
+        return True
+    # Branch deletion for release/hotfix cleanup.
+    if "--delete" in span and ("release/" in span or "hotfix/" in span):
+        return True
+    return False
+
+
+def _pushes_a_protected_ref(span: str) -> bool:
+    """A protected ref among this push's arguments.
+
+    Word by word, rather than by position in the text. A position test cannot
+    tell `origin 'main'` — a quoted ARGUMENT, and a real push to main — from
+    the `main` inside `-o "deploy to main"`, which is one word of a sentence.
+    Whole words separate them: the first IS the ref, the second is not a word
+    at all.
+
+    Quotes are dropped before the comparison because a shell drops them: the
+    word `'main'` and the word `main` name the same branch. A refspec is
+    tried by its destination as well as whole, since `HEAD:main` and
+    `+main:main` push main under a name that is not `main`.
+    """
+    for word in _WORD_RE.findall(span):
+        word = word.replace('"', "").replace("'", "")
+        if _PROTECTED_REF_RE.fullmatch(word):
+            return True
+        if ":" in word and _PROTECTED_REF_RE.fullmatch(word.rsplit(":", 1)[-1]):
+            return True
+    return False
+
 
 # Get current branch
 try:
@@ -544,21 +699,22 @@ if current_branch in ["main", "develop"]:
             except (subprocess.CalledProcessError, OSError):
                 pass
 
-# Check if command or current branch targets protected branches.
+# Judge each push the command runs, on its own arguments.
+#
 # Refspec pushes — "HEAD:main", "mybranch:develop", "+main:main",
 # "HEAD:refs/heads/main" — are pushes to a protected branch that never say
-# "origin main". They were already listed here, and then a second `if`
-# re-tested a STRICTLY NARROWER condition that no refspec form could satisfy,
+# "origin main". They were listed in the condition below and then a second
+# `if` re-tested a STRICTLY NARROWER one that no refspec form could satisfy,
 # so every one of them fell through to allow (#327). There is one condition
-# now, and it is this one.
-targets_protected = (
-    _PROTECTED_REMOTE_RE.search(command) is not None or
-    _PROTECTED_REFSPEC_RE.search(command) is not None or
-    current_branch in ["main", "develop"]
-)
-
-# Block direct push to main/develop (including force pushes)
-if targets_protected:
+# now, and it is per occurrence: a command that runs several pushes is judged
+# once for each, so no push can be excused by another push's flags.
+for _occurrence in occurrences:
+    _span = _argument_span(command, _occurrence)
+    if _is_git_flow_push(_span):
+        continue
+    if not (_pushes_a_protected_ref(_span)
+            or current_branch in ["main", "develop"]):
+        continue
     reason = f"""❌ Direct push to main/develop is not allowed!
 
 Protected branches:

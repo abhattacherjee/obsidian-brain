@@ -30,21 +30,49 @@ _GIT = r'(?:[^\s;&|()<>]*/)?git\b'
 # it (`-c user.name="a b"`), so a value is a run of quoted spans and bare
 # characters rather than one `[^\s]+` token. The alternatives are disjoint on
 # their first character, so this adds no ambiguity to backtrack through.
-_GIT_OPT_VALUE = (
+# Named without a tool prefix because `gh` takes global options in exactly the
+# same shape (`gh --repo o/r pr create`), and the two gh gates carry a
+# byte-identical copy of this definition (#327).
+_OPT_VALUE = (
     r'(?:"[^"]*"|\'[^\']*\'|[^-\s"\'])'
     r'(?:"[^"]*"|\'[^\']*\'|[^\s"\'])*'
 )
-_GIT_OPTS = r'(?:\s+-[^\s]+(?:\s+' + _GIT_OPT_VALUE + r')?)*'
-_GIT_CHECKOUT_B_RE = _GIT + _GIT_OPTS + r'\s+checkout\s+-b\b'
+_GIT_OPTS = r'(?:\s+-[^\s]+(?:\s+' + _OPT_VALUE + r')?)*'
+# Every form that CREATES a branch, not just the one spelling of it.
+# `git checkout -B` resets-if-exists, `git switch -c` creates, `-C`
+# force-creates, and both switch flags have long forms — six spellings of one
+# operation, of which the gate knew one, so a non-conforming name walked in by
+# any of the other five (#327).
+_GIT_CHECKOUT_B_RE = (
+    _GIT + _GIT_OPTS +
+    r'\s+(?:checkout\s+-[bB]|switch\s+(?:-[cC]|--create|--force-create))\b')
 
 
 # Words that stand between a separator and the command that actually runs.
-# `sudo git push …` and `env A=b git push …` really do push, so the verb must
-# stay gated behind them; `echo git push …` must not (#327).
+# `if git push …; then`, `exec git push …`, `sudo git push …` and `\git push …`
+# all really do push, so the verb must stay gated behind them; `echo git push
+# …` must not (#327). Block OPENERS matter as much as the `then`/`do` that
+# follow them — measured, every gate allowed `if <verb>; then :; fi` while
+# denying the bare verb.
 _TRANSPARENT_TOKENS = frozenset({
-    "!", "then", "else", "do", "elif", "sudo", "env", "command", "nohup",
-    "nice", "time", "xargs", "eval", "stdbuf",
+    "!", "\\", "if", "while", "until", "then", "else", "do", "elif",
+    "sudo", "env", "command", "builtin", "exec", "nohup", "nice", "time",
+    "timeout", "xargs", "eval", "stdbuf",
 })
+# The subset of those that take arguments of their OWN before the command:
+# `timeout 60 <verb>`, `nice -n 10 <verb>`, `xargs -n 1 <verb>`, `sudo -u u
+# <verb>`. A separated value is a bare word, so without this list the walk
+# stops at `60` and reads a real command as text — measured allowing on every
+# gate (#327).
+_ARG_TAKING_TOKENS = frozenset({
+    "sudo", "env", "nohup", "nice", "timeout", "xargs", "stdbuf",
+})
+# How many words the walk will cross before giving up. Each step rescans the
+# text to its left, so an unbounded walk is O(n) per step over a command line
+# written by whoever is being gated; this is what keeps that bounded. It is
+# not a semantic knob — running out means nothing was established, so the walk
+# gives up on the GATED side.
+_WALK_STEP_LIMIT = 64
 
 
 def _shell_scan(prefix: str):
@@ -124,32 +152,109 @@ def _at_command_position(prefix: str) -> bool:
     at the start of the line, or straight after a separator.
 
     Walking back over TRANSPARENT tokens is what keeps the forms that really
-    do run the verb on the gated side: ``sudo git …``, ``env A=b git …``,
-    ``xargs -n1 git …``, ``time git …``. An option (``-n1``) is transparent
-    too — it belongs to whatever precedes it, and that word decides. So
-    ``echo -n git push …`` walks past ``-n``, reaches ``echo``, and is
-    correctly read as text.
+    do run the verb on the gated side. Three groups, and every one of them was
+    measured denying on ``develop`` and allowing here before it was added:
 
-    Known limit, in the fail-open direction: a verb inside a string a shell
-    later executes (``eval "<verb>"``, ``bash -c "<verb>"``) is "quoted" and
-    is dropped. That is deliberate — the alternative is treating every quoted
-    mention of the verb as a command, which is the false-deny this closes.
+    * block openers and shell keywords — ``if <verb>; then …``,
+      ``while``/``until``, ``then``/``else``/``do``/``elif``, ``!``;
+    * exec wrappers — ``sudo``, ``env``, ``command``, ``builtin``, ``exec``,
+      ``nohup``, ``nice``, ``time``, ``timeout``, ``xargs``, ``eval``,
+      ``stdbuf``, and ``VAR=value`` assignments;
+    * a bare backslash — ``\\git push …`` is the ordinary way to bypass an
+      alias or a function of the same name, and the verb pattern matches at
+      offset 1, leaving the escape as its own token here.
+
+    An OPTION (``-n1``) is transparent too: it belongs to whatever precedes
+    it, and that word decides. So ``echo -n git push …`` walks past ``-n``,
+    reaches ``echo``, and is correctly read as text — and ``xargs -n1 git …``
+    walks the same ``-n1``, reaches ``xargs``, and is gated.
+
+    A BARE word is the hard case, because it is what a wrapper's separated
+    argument looks like (``timeout 60 git push …``, ``nice -n 10 git push …``)
+    AND what a command taking the verb as data looks like (``echo git push
+    …``). The two are told apart by what is further left: bare words are
+    carried, and count as absorbed only once an ``_ARG_TAKING_TOKENS`` wrapper
+    is reached. Hit the start of the command, a separator, or a plain keyword
+    with bare words still outstanding and they were arguments to something
+    that is NOT a wrapper — so the verb is that thing's data, and this returns
+    False.
+
+    The walk gives up after ``_WALK_STEP_LIMIT`` words, on the gated side.
+    That bound is about COST, not meaning: each step rescans the text to its
+    left, so an unbounded walk is quadratic in a command line an attacker
+    writes. A carry limit was tried first and proved unfalsifiable — the
+    terminal check already rejects ``echo one two three four <verb>``, so
+    raising the limit changed no verdict a test could see.
+
+    Two known limits, both in the fail-open direction:
+
+    * A verb inside a string a shell later executes (``eval "<verb>"``,
+      ``bash -c "<verb>"``) is "quoted" and is dropped. That is deliberate —
+      the alternative is treating every quoted mention of the verb as a
+      command, which is the false deny this exists to close.
+    * A QUOTED executable is not matched at all: ``"git" push …`` and
+      ``g"i"t push …`` allow, here and on develop alike. Recognising them
+      means joining shell words before matching, i.e. a real parser rather
+      than a scanner, so the gap is documented rather than half-closed.
     """
     seps = ";&|(){}\n"
-    while True:
+    pending_bare = 0
+    for _step in range(_WALK_STEP_LIMIT):
         head = prefix.rstrip()
+        # Reaching the start of the command, or a separator, settles it — but
+        # only if nothing is outstanding: bare words that no wrapper ever
+        # claimed were arguments to a command, and the verb is one of them.
         if not head:
-            return True  # first word of the command line
+            return pending_bare == 0
         if head[-1] in seps:
-            return True  # straight after a separator
+            return pending_bare == 0
         cut = max(head.rfind(c) for c in seps)
         token = head[cut + 1:].rsplit(None, 1)[-1]
         name, eq, _value = token.partition("=")
-        if not (token in _TRANSPARENT_TOKENS
-                or token.startswith("-")
-                or (eq and name.isidentifier())):
-            return False
+        if token in _ARG_TAKING_TOKENS:
+            pending_bare = 0  # this is what those bare words belonged to
+        elif token.startswith("-") or (eq and name.isidentifier()):
+            pass  # an option or an assignment; a bare word may be its value
+        elif token in _TRANSPARENT_TOKENS:
+            if pending_bare:
+                return False  # `time foo <verb>` runs foo, with the verb as data
+        else:
+            pending_bare += 1  # maybe a wrapper's argument; maybe `echo`
         prefix = head[:len(head) - len(token)]
+    # More words in front of the verb than any real command line has. Nothing
+    # is established either way, and an unestablished verb is a gated one.
+    return True
+
+
+def _argument_span(cmd: str, start: int) -> str:
+    """The text of ONE command, from ``start`` to where the shell ends it.
+
+    Every allow-side escape hatch in these gates tested a raw substring
+    against the WHOLE command, while the deny side had been narrowed to the
+    occurrence a shell would really run — and a gate that is narrow where it
+    blocks and wide where it stands down is a gate with an off switch (#327).
+    Measured: ``<push> origin main  # see refs/tags/v1`` and ``echo
+    '--tags' && <push> origin main`` both stood the push gate down, and
+    ``<push> --delete origin release/x && <push> origin main`` excused the
+    second push with the first one's flag.
+
+    The span ends at the first thing the shell would treat as ending this
+    command — ``;``, ``&``, ``|``, a newline, a closing ``)``, ``}`` or
+    backtick — or at a ``#`` that starts a comment. The backtick earns its
+    place: without it ``X=`<push> origin main` `` keeps the closing backtick
+    inside the span, and the last WORD of the span is then ``main` `` rather
+    than ``main``, which is not a ref and not a deny. A candidate only counts
+    when the text from the verb to it parses as executable, so a separator
+    inside quotes (``-m "a; b"``) does not cut the span short.
+    """
+    i = start
+    while i < len(cmd):
+        c = cmd[i]
+        if c in ";&|\n)}`" or (c == "#" and (i == 0 or cmd[i - 1].isspace())):
+            if _shell_scan(cmd[start:i])[0] == "exec":
+                return cmd[start:i]
+        i += 1
+    return cmd[start:]
 
 
 def _verb_occurrences(cmd: str, verb: str):
@@ -161,16 +266,24 @@ def _verb_occurrences(cmd: str, verb: str):
     guard matched, and ``if not verb_positions: return True`` swallows the
     divergence as "gate it" — fail closed, correct, and silent (#327).
 
-    An occurrence is dropped only when it is provably inert: quoted, or not in
-    command position. Everything else is KEPT, including a prefix that does
-    not parse, because a dropped verb means the hook exits 0 with no decision
-    and the PreToolUse contract reads that as ALLOW.
+    An occurrence is dropped only when it is provably inert: quoted inside a
+    command that otherwise parses, or not in command position. Everything else
+    is KEPT — including a prefix that does not parse, and every position in a
+    command that does not parse — because a dropped verb means the hook exits
+    0 with no decision, and the PreToolUse contract reads that as ALLOW.
     """
+    # "Quoted" is a verdict about a PREFIX, and it is only evidence that the
+    # verb is inert when the command as a WHOLE parses. `echo don\'t && <verb>`
+    # leaves a quote open from the apostrophe onward, so every later position
+    # reads as quoted — and dropping the verb there is an ALLOW, on a shape
+    # develop denied. When the whole command does not parse, nothing in it is
+    # provably inert.
+    whole_parses = _shell_scan(cmd)[0] != "quoted"
     kept = []
     for match in re.finditer(verb, cmd):
         start = match.start()
         state, _subshells = _shell_scan(cmd[:start])
-        if state == "quoted":
+        if state == "quoted" and whole_parses:
             continue
         if not _at_command_position(cmd[:start]):
             continue
@@ -446,7 +559,13 @@ input_data = _read_hook_input("Branch-name hook")
 
 tool_name = input_data.get("tool_name", "")
 tool_input = input_data.get("tool_input", {})
-command = tool_input.get("command", "")
+# "\<newline>" is a line continuation — whitespace, not a separator — and it
+# is collapsed HERE, at the one point the command is read, rather than inside
+# the scope helper alone. The verb guard runs BEFORE that helper: matching the
+# raw text, `\s+` never spans the backslash, so `git \` + newline + `push`
+# exited 0 at the guard and the helper that knows about continuations was
+# never called (#327). The helper keeps its own collapse; it is idempotent.
+command = tool_input.get("command", "").replace("\\\n", " ")
 
 # Only validate git checkout -b commands
 if tool_name != "Bash":
