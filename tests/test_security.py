@@ -1648,6 +1648,13 @@ class TestRefspecPushesToProtectedBranchesAreBlocked:
         ("qualified ref, no colon", f"{PUSH} origin refs/heads/{MAIN}", "deny"),
         ("force, qualified, no colon", f"{PUSH} origin +refs/heads/{MAIN}",
          "deny"),
+        # A quote is not whitespace, so a left boundary of `[\\s+]` alone let
+        # the quoted spelling through while the bare one denied.
+        ('qualified in double quotes', f'{PUSH} origin "refs/heads/{MAIN}"',
+         "deny"),
+        ("qualified in single quotes",
+         f"{PUSH} origin 'refs/heads/{MAIN}'", "deny"),
+        ("heads/ in double quotes", f'{PUSH} origin "heads/{MAIN}"', "deny"),
         ("plain protected push", f"{PUSH} origin {MAIN}", "deny"),
         # Ordinary branches whose names merely BEGIN with a protected name.
         # These are the rows a substring test gets wrong.
@@ -1663,6 +1670,8 @@ class TestRefspecPushesToProtectedBranchesAreBlocked:
         ("qualified feature ref", f"{PUSH} origin refs/heads/feature/x",
          "allow"),
         ("qualified mainline ref", f"{PUSH} origin heads/{MAIN}line", "allow"),
+        ('quoted qualified feature ref',
+         f'{PUSH} origin "refs/heads/feature/x"', "allow"),
     )
 
     @pytest.mark.parametrize(

@@ -433,10 +433,15 @@ if current_branch in ["main", "develop"]:
 #     requires the `heads/` prefix on purpose: a bare `main` here would match
 #     the word anywhere in the command, and `"origin main"` above already
 #     covers the unqualified spelling.
+# The left boundary includes the quote characters: `origin "refs/heads/main"`
+# is one argument to git, but a quote is not whitespace, so a boundary of
+# `[\s+]` alone let the quoted spelling through while the bare one denied.
+# The colon arm needs no such boundary — it anchors on the `:` itself, which
+# is why `'HEAD:main'` already denied.
 _PROTECTED_REF = r'(?:main|develop)(?![A-Za-z0-9._/-])'
 _PROTECTED_REFSPEC_RE = re.compile(
     r':(?:(?:refs/)?heads/)?' + _PROTECTED_REF
-    + r'|(?:^|[\s+])(?:refs/)?heads/' + _PROTECTED_REF
+    + r'''|(?:^|[\s+'"])(?:refs/)?heads/''' + _PROTECTED_REF
 )
 
 targets_protected = (
