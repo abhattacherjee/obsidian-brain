@@ -669,18 +669,39 @@ class TestPartialStoreFailure:
 
 class TestRegexCost:
 
-    def test_link_targets_stays_fast_on_a_large_entry(self):
-        """The unbounded runs this replaced were quadratic.
+    def test_link_targets_stays_fast_on_a_long_word_run(self):
+        """80 KB of one unbroken word: 0.044 s bounded, 8.26 s unbounded.
 
-        Measured through _link_targets before the bound: 10 KB 0.13 s,
-        20 KB 0.52 s, 40 KB 2.1 s, 80 KB 8.4 s — 4x per doubling. The
-        bounded regexes do this input in ~0.00 s, so the 2 s ceiling has
-        roughly 36x headroom and cannot flake; it only trips if an
-        unbounded run comes back.
+        Measured on this machine against _BARE_MD_RE alone. 2 s leaves ~45x
+        headroom over the bounded figure, so it cannot flake, and it trips
+        the moment the {0,200} bound goes away.
         """
         start = time.perf_counter()
         mi._link_targets("a" * 80_000)
         assert time.perf_counter() - start < 2.0
+
+    def test_link_targets_stays_fast_on_a_dotted_run(self):
+        """The adversarial input for the bound: 0.031 s bounded, 5.87 s not.
+
+        The word-run fixture above is the weaker of the two — a dot every
+        other character gives the engine 40,000 viable start positions
+        instead of one, so this is the fixture that really exercises
+        {0,200}. Both are kept: they fail on different mistakes.
+        """
+        start = time.perf_counter()
+        mi._link_targets("a." * 40_000)
+        assert time.perf_counter() - start < 2.0
+
+    def test_a_mention_in_underscore_emphasis_still_counts(self, env):
+        """_note.md_ is italic markdown, not a different filename.
+
+        A lookbehind excluding a preceding underscore would reject this
+        start position and invent an orphan for a note that is mentioned.
+        """
+        store = _store(env)
+        (store / "note.md").write_text("x\n")
+        (store / "MEMORY.md").write_text("superseded by _note.md_\n")
+        assert _scan() == []
 
     def test_link_targets_stays_fast_on_a_run_of_open_link_brackets(self):
         """Same guard for _MD_LINK_RE, which was quadratic too.
@@ -1066,8 +1087,11 @@ class TestUnreadableProjectDir:
 
     @_ROOT_SKIP
     def test_an_unreadable_project_dir_is_counted_not_skipped(self, env):
-        """Probed with os.stat: on Python 3.13, Path.is_dir() raises
-        PermissionError here and crashes the whole check."""
+        """The probe is wrapped in try/except; that is the guard.
+
+        With the project dir at 0o000 on Python 3.13.3, os.stat, is_dir,
+        exists and iterdir all raise PermissionError. The pre-fix code
+        called is_dir() with no try at all, so the check crashed."""
         _seed_store(env, "-Users-me-dev-good")
         bad = _store(env, "-Users-me-dev-bad")
         (bad / "a.md").write_text("x\n")
@@ -1251,3 +1275,180 @@ class TestEntryReadCatchIsSymmetric:
         classes = _classes(_scan())
         assert classes["entry-unreadable"] == ["a.md"]
         assert classes["orphan-unreachable"] == ["orphan.md"]
+
+
+# ---------------------------------------------------------------------------
+# 29. A --project value that matches no store (P1)
+# ---------------------------------------------------------------------------
+
+class TestProjectFilterMatchesNothing:
+
+    def _run(self, env, *args: str) -> subprocess.CompletedProcess:
+        cmd = [
+            sys.executable, str(_SCRIPT),
+            "--vault", str(env["vault"]),
+            "--sessions-folder", "claude-sessions",
+            "--insights-folder", "claude-insights",
+            "--check", "memory-index", "--json",
+            *args,
+        ]
+        return subprocess.run(
+            cmd, capture_output=True, text=True,
+            env={**os.environ, "HOME": str(env["tmp_path"])},
+        )
+
+    def test_a_typo_in_the_filter_is_a_row_not_a_clean_report(self, env):
+        """A typo used to scan nothing and report clean at exit 0."""
+        _seed_store(env, "-Users-me-dev-demo")
+        issues = _scan(project="dmeo")
+        assert _classes(issues) == {"project-filter-matched-nothing": ["projects"]}
+        row = issues[0]
+        assert "dmeo" in row.reason
+        assert row.extra["stores_scanned"] == 0
+        assert row.extra["stores_filtered_out"] == 1
+
+    def test_the_row_reaches_the_cli_at_exit_1_with_its_counts(self, env):
+        _seed_store(env, "-Users-me-dev-demo")
+        _seed_store(env, "-Users-me-dev-other")
+        r = self._run(env, "--project", "nosuchproject")
+        assert r.returncode == 1, r.stderr
+        payload = json.loads(r.stdout)
+        assert payload["total_issues"] == 1
+        row = payload["issues"][0]
+        assert row["signal_class"] == "project-filter-matched-nothing"
+        assert row["stores_scanned"] == 0
+        assert row["stores_filtered_out"] == 2
+
+    def test_a_filter_that_matches_produces_no_such_row(self, env):
+        """Negative control: the row must not fire whenever a filter is used."""
+        _seed_store(env, "-Users-me-dev-demo")
+        _seed_store(env, "-Users-me-dev-other")
+        assert "project-filter-matched-nothing" not in _classes(_scan(project="demo"))
+
+    def test_no_filter_and_no_stores_is_still_silent(self, env):
+        """Negative control: an empty machine is clean, not a filter miss."""
+        assert _scan() == []
+
+
+# ---------------------------------------------------------------------------
+# 30. CommonMark link forms naming a direct child (P3)
+# ---------------------------------------------------------------------------
+
+class TestCommonMarkLinkForms:
+
+    def _store_with(self, env, index_line: str) -> None:
+        store = _store(env)
+        (store / "here.md").write_text("x\n")
+        (store / "MEMORY.md").write_text(
+            f"- [Here](here.md) — x\n{index_line}\n"
+        )
+
+    @pytest.mark.parametrize("index_line", [
+        "- [X](gone.md) — bare",
+        "- [X](./gone.md) — dot-slash",
+        '- [X](gone.md "Title") — titled',
+        "- [X](gone.md 'Title') — single-quoted title",
+        "- [X](<gone.md>) — angle brackets",
+    ])
+    def test_every_direct_child_form_is_dangling(self, env, index_line):
+        """A missed dangling pointer reads as clean, which is the danger."""
+        self._store_with(env, index_line)
+        assert _classes(_scan()) == {"index-dangling": ["gone.md"]}
+
+    @pytest.mark.parametrize("index_line", [
+        "- [X](<../gone.md>) — angle-bracketed parent",
+        "- [X](../gone.md) — parent",
+        "- [X](sub/gone.md) — subdirectory",
+        "- [X](https://example.com/r/blob/main/gone.md) — url",
+    ])
+    def test_non_child_forms_are_still_not_dangling(self, env, index_line):
+        """Negative control: widening the forms must not reopen the hole."""
+        self._store_with(env, index_line)
+        assert _scan() == []
+
+    def test_a_dot_slash_pointer_at_a_real_entry_is_clean(self, env):
+        store = _store(env)
+        (store / "here.md").write_text("x\n")
+        (store / "MEMORY.md").write_text("- [Here](./here.md) — x\n")
+        assert _scan() == []
+
+
+# ---------------------------------------------------------------------------
+# 31. Case folding covers all three link kinds (P4)
+# ---------------------------------------------------------------------------
+
+class TestCaseFoldingAcrossLinkKinds:
+
+    def test_a_wikilink_differing_only_in_case_reaches_the_entry(self, env):
+        """[[Their-Name]] is the documented way one memory links another."""
+        store = _store(env)
+        (store / "feedback_foo.md").write_text("x\n")
+        (store / "MEMORY.md").write_text("- [[Feedback_Foo]] — x\n")
+        assert _scan() == []
+
+    def test_a_bare_mention_differing_only_in_case_reaches_the_entry(self, env):
+        store = _store(env)
+        (store / "feedback_bar.md").write_text("x\n")
+        (store / "MEMORY.md").write_text("see Feedback_Bar.md for detail\n")
+        assert _scan() == []
+
+    def test_an_entry_to_entry_wikilink_folds_case_too(self, env):
+        """The edge that matters most: entries link each other by wikilink."""
+        store = _store(env)
+        (store / "hub.md").write_text("see [[Leaf_Name]]\n")
+        (store / "leaf_name.md").write_text("x\n")
+        (store / "MEMORY.md").write_text("- [Hub](hub.md) — x\n")
+        assert _scan() == []
+
+    def test_a_genuinely_different_name_is_still_an_orphan(self, env):
+        """Negative control: folding case must not make everything reachable."""
+        store = _store(env)
+        (store / "hub.md").write_text("see [[Different_Name]]\n")
+        (store / "leaf_name.md").write_text("x\n")
+        (store / "MEMORY.md").write_text("- [Hub](hub.md) — x\n")
+        assert _classes(_scan()) == {"orphan-isolated": ["leaf_name.md"]}
+
+    def test_the_markdown_link_case_mismatch_row_still_fires(self, env):
+        """P4 must not swallow the index-case-mismatch warning."""
+        store = _store(env)
+        (store / "mynote.md").write_text("x\n")
+        (store / "MEMORY.md").write_text("- [C](MyNote.md) — x\n")
+        assert _classes(_scan()) == {"index-case-mismatch": ["MyNote.md"]}
+
+
+# ---------------------------------------------------------------------------
+# 32. An unreadable entry is one row, not two (P6)
+# ---------------------------------------------------------------------------
+
+class TestUnreadableEntryIsOneRow:
+
+    @_ROOT_SKIP
+    def test_unreadable_and_unindexed_gets_only_the_unreadable_row(self, env):
+        store = _store(env)
+        (store / "anchor.md").write_text("x\n")
+        (store / "secret.md").write_text("x\n")
+        (store / "MEMORY.md").write_text("- [Anchor](anchor.md) — x\n")
+        (store / "secret.md").chmod(0o000)
+        try:
+            classes = _classes(_scan())
+        finally:
+            (store / "secret.md").chmod(0o600)
+        assert classes == {"entry-unreadable": ["secret.md"]}
+
+    @_ROOT_SKIP
+    def test_unreadable_and_indexed_does_not_become_dangling(self, env):
+        """The shape the obvious fix breaks.
+
+        Dropping the entry from entry_names would make the index pointer at
+        it read as dangling — a missing-file row for a file that exists.
+        """
+        store = _store(env)
+        (store / "secret.md").write_text("x\n")
+        (store / "MEMORY.md").write_text("- [Secret](secret.md) — x\n")
+        (store / "secret.md").chmod(0o000)
+        try:
+            classes = _classes(_scan())
+        finally:
+            (store / "secret.md").chmod(0o600)
+        assert classes == {"entry-unreadable": ["secret.md"]}
+        assert "index-dangling" not in classes

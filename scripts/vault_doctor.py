@@ -249,6 +249,8 @@ def _issue_row(i) -> dict:
         "index_path",
         "entry_names",
         "byte_offset",
+        "stores_scanned",
+        "stores_filtered_out",
         # read_error, not "error": encoding-corruption already sets an
         # "error" extra, and whitelisting that name would change its rows.
         "read_error",

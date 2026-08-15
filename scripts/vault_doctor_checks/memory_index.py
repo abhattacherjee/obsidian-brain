@@ -97,22 +97,33 @@ INDEX_SIZE_HARD_LIMIT_BYTES = 24_000
 INDEX_NAME = "MEMORY.md"
 
 # Every run below is bounded. An unbounded run backtracks from every start
-# position, which is quadratic in the file size: the earlier unbounded
-# _BARE_MD_RE measured 0.53 s at 20 KB, 8.4 s at 80 KB and 56 s at 200 KB.
-# This is hardening, not a bug anyone is hitting — the longest [\w.-] run
-# across the author's 1,112 real memory files is 79 characters. 300 and 200
-# are far above any real memory filename or link target.
-# ``](name.md)`` / ``](./dir/name.md)`` — an explicit pointer at a local file.
-_MD_LINK_RE = re.compile(r"\]\(\s*([^)\s]{1,300}\.md)\s*\)")
+# position, which is quadratic in the file size: dropping the {0,200} bound
+# takes _BARE_MD_RE from 0.044 s to 8.26 s on 80 KB of "a", and from 0.031 s
+# to 5.87 s on 80 KB of "a." (measured here). This is hardening, not a bug
+# anyone is hitting — the longest [\w.-] run across the author's 1,112 real
+# memory files is 79 characters. 300 and 200 are far above any real memory
+# filename or link target.
+
+# An explicit pointer at a local file, in the CommonMark forms that name one:
+# ``](name.md)``, ``](./name.md)``, ``](name.md "Title")``, ``](<name.md>)``.
+# The optional title and angle brackets are not decoration — without them a
+# pointer at a missing file produces no dangling row at all, which reads as
+# clean.
+_MD_LINK_RE = re.compile(
+    r"\]\(\s*<?([^)<>\s]{1,300}\.md)>?"
+    r"""(?:\s+(?:"[^"]{0,300}"|'[^']{0,300}'|\([^)]{0,300}\)))?\s*\)"""
+)
 # ``[[name]]``, ``[[name|alias]]``, ``[[name#heading]]``.
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]|#]{1,300})(?:[|#][^\[\]]{0,300})?\]\]")
 # A bare filename anywhere in the prose. Deliberately unanchored: every hit is
 # intersected with the store's real filenames before it counts, so a false
-# match costs nothing while a missed one would invent an orphan. The
-# lookbehind only skips start positions that could not begin a filename; it
-# does not anchor the match to a word boundary, so a name inside a path
-# (``docs/archive/note.md``) still counts.
-_BARE_MD_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9][\w.-]{0,200}\.md")
+# match costs nothing while a missed one would invent an orphan. A name inside
+# a path (``docs/archive/note.md``) counts, and so does one wrapped in
+# underscore emphasis (``_note.md_``). The {0,200} bound is what keeps this
+# linear; there is deliberately no lookbehind, because one would reject the
+# ``_note.md_`` start position and invent an orphan for a note that really is
+# mentioned.
+_BARE_MD_RE = re.compile(r"[A-Za-z0-9][\w.-]{0,200}\.md")
 
 
 class MemoryStoreUnreadable(Exception):
@@ -145,16 +156,26 @@ def _link_targets(text: str) -> set[str]:
 def _md_child_link_targets(text: str) -> set[str]:
     """Markdown-link targets naming a direct child of the store (dangling only).
 
-    A target containing a slash is about something else — an external URL
-    (``https://…/README.md``), a file above the store (``../outside.md``) or
-    one in a subdirectory (``sub/deep.md``). Taking its basename would invent
-    a dangling row at a path the index never claimed; the ``reference``
-    memory type is defined as pointers to external resources, so index lines
-    holding URLs are expected. Recursion into subdirectories is deliberately
-    not added: the store is flat by convention, one MEMORY.md beside its
-    entries.
+    A leading ``./`` is stripped first: ``](./name.md)`` names a direct child
+    exactly as ``](name.md)`` does, and dropping it left a real dangling
+    pointer unreported.
+
+    After that strip, a target still containing a slash is about something
+    else — an external URL (``https://…/README.md``), a file above the store
+    (``../outside.md``) or one in a subdirectory (``sub/deep.md``). Taking its
+    basename would invent a dangling row at a path the index never claimed;
+    the ``reference`` memory type is defined as pointers to external
+    resources, so index lines holding URLs are expected. Recursion into
+    subdirectories is deliberately not added: the store is flat by
+    convention, one MEMORY.md beside its entries.
     """
-    return {m for m in _MD_LINK_RE.findall(text) if "/" not in m and "\\" not in m}
+    out: set[str] = set()
+    for m in _MD_LINK_RE.findall(text):
+        target = m[2:] if m.startswith("./") else m
+        if "/" in target or "\\" in target:
+            continue
+        out.add(target)
+    return out
 
 
 def _project_matches(dir_name: str, project: str) -> bool:
@@ -253,6 +274,11 @@ def _scan_store(store: Path, project: str) -> list[Issue]:
     # in full, which makes every orphan verdict in this store provisional.
     outbound: dict[str, set[str]] = {}
     degraded: list[str] = []
+    # Entries that got an entry-unreadable row. They stay in entry_names so
+    # an index pointer at them is not mistaken for a dangling one, but they
+    # get no orphan row on top: one broken file is one finding, and "add a
+    # pointer line" is not actionable while the file cannot be read.
+    unreadable_names: set[str] = set()
     readable_entries: list[Path] = []
     for entry in entries:
         try:
@@ -268,6 +294,7 @@ def _scan_store(store: Path, project: str) -> list[Issue]:
             # rather than crashing the whole check.
             readable_entries.append(entry)
             degraded.append(entry.name)
+            unreadable_names.add(entry.name)
             outbound[entry.name] = set()
             issues.append(_issue(
                 entry,
@@ -310,22 +337,36 @@ def _scan_store(store: Path, project: str) -> list[Issue]:
     by_lower: dict[str, list[str]] = {}
     for name in entry_names:
         by_lower.setdefault(name.lower(), []).append(name)
+    for variants in by_lower.values():
+        variants.sort()
+
+    def resolve(target: str) -> str | None:
+        """The entry this target names, exact first, then case-folded.
+
+        Case folding applies to all three link kinds, not just markdown
+        links: ``[[Their-Name]]`` is the documented way one memory links
+        another, so that is exactly where a case-only difference lives, and
+        on the case-insensitive filesystem this runs on it resolves. Calling
+        such an entry isolated states something false — there IS a pointer.
+        """
+        if target in entry_names:
+            return target
+        variants = by_lower.get(target.lower())
+        return variants[0] if variants else None
     dangling: list[str] = []
     case_mismatched: list[tuple[str, list[str]]] = []
-    case_matched: set[str] = set()
     for target in sorted(_md_child_link_targets(index_text)):
         if target == INDEX_NAME or target in entry_names:
             continue
         same_name_other_case = sorted(by_lower.get(target.lower(), []))
         if same_name_other_case:
             case_mismatched.append((target, same_name_other_case))
-            case_matched.update(same_name_other_case)
         else:
             dangling.append(target)
 
     # Transitive reachability: BFS from MEMORY.md through memory-file links.
     index_targets = _link_targets(index_text)
-    directly_indexed = {n for n in index_targets if n in entry_names}
+    directly_indexed = {r for r in map(resolve, index_targets) if r}
     # An index with text in it that names no file at all is never healthy.
     # It gets one summary row on top of the per-entry rows, not instead of
     # them: the index read above is strict, so anything reaching here
@@ -336,10 +377,7 @@ def _scan_store(store: Path, project: str) -> list[Issue]:
     # gets no summary row.
     index_names_nothing = bool(entries) and bool(index_text.strip()) and not index_targets
     reachable: set[str] = set()
-    # Case-matched entries seed the walk too: the pointer resolves on the
-    # machine that wrote it, so the entry is reachable there. The
-    # case-mismatch row is what warns about the other machine.
-    frontier = deque(sorted(directly_indexed | case_matched))
+    frontier = deque(sorted(directly_indexed))
     while frontier:
         # popleft(), not pop(): FIFO is what makes this breadth-first, which
         # is what the docs say. The reachable set is the same either way.
@@ -348,16 +386,18 @@ def _scan_store(store: Path, project: str) -> list[Issue]:
             continue
         reachable.add(name)
         for target in outbound.get(name, ()):
-            if target in entry_names and target not in reachable:
-                frontier.append(target)
+            resolved = resolve(target)
+            if resolved and resolved not in reachable:
+                frontier.append(resolved)
 
     # Inbound-from-anywhere, used only to separate "fully isolated" from
     # "linked, but only from something the index cannot reach".
     inbound: set[str] = set()
     for name, targets in outbound.items():
         for target in targets:
-            if target in entry_names and target != name:
-                inbound.add(target)
+            resolved = resolve(target)
+            if resolved and resolved != name:
+                inbound.add(resolved)
 
     if index_names_nothing:
         issues.append(_issue(
@@ -374,7 +414,7 @@ def _scan_store(store: Path, project: str) -> list[Issue]:
         ))
 
     for entry in entries:
-        if entry.name in reachable:
+        if entry.name in reachable or entry.name in unreadable_names:
             continue
         isolated = entry.name not in inbound
         if isolated and not degraded:
@@ -503,10 +543,13 @@ def scan(
     for proj_dir in sorted(projects_root.iterdir()):
         store = proj_dir / "memory"
         try:
-            # os.stat inside a try, not Path.is_dir(). With an unreadable
-            # project directory is_dir() raises PermissionError straight out
-            # of scan() on Python 3.13 (verified here), so the whole check
-            # crashes instead of reporting.
+            # The try/except is the guard here, not the choice of os.stat.
+            # With the project dir at 0o000 on Python 3.13.3, os.stat,
+            # Path.is_dir, Path.exists and Path.iterdir all raise
+            # PermissionError (verified); the pre-fix code called is_dir()
+            # with no try at all, so the whole check died. os.stat is just
+            # the most direct way to ask, and swapping it back for is_dir()
+            # inside this try would be equally safe.
             is_dir = stat.S_ISDIR(os.stat(store).st_mode)
         except (FileNotFoundError, NotADirectoryError):
             # No store here. This is the ordinary case for most project dirs.
@@ -546,6 +589,30 @@ def scan(
                 "store-unreadable",
                 {"read_error": str(exc)},
             ))
+
+    if filtering and n_stores == 0:
+        # A filter that matches nothing is not a clean result — the user
+        # asked about something that is not there. Without this row the run
+        # is exit 0 with an empty report, which reads as "no drift" for a
+        # store that was never looked at. A row rather than JSON metadata,
+        # so it shows up in every output format.
+        issues.append(_issue(
+            projects_root,
+            project.strip(),
+            f"--project {project} matched 0 of "
+            f"{n_skipped_by_project} memory store(s)",
+            f"check the filter against the directory names under "
+            f"{projects_root}",
+            f"--project {project!r} matched none of the "
+            f"{n_skipped_by_project} memory store(s) found, so nothing was "
+            f"scanned — an empty report here means the filter missed, not "
+            f"that the stores are clean",
+            "project-filter-matched-nothing",
+            {
+                "stores_scanned": n_stores,
+                "stores_filtered_out": n_skipped_by_project,
+            },
+        ))
 
     if n_stores and n_unreadable == n_stores:
         # Nothing at all could be read. There is no partial report to
