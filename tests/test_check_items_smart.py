@@ -2599,3 +2599,101 @@ def test_check_items_report_empty_string_folder_uses_default(tmp_path, monkeypat
         )
     finally:
         _reset_load_config_cache()
+
+
+# ---------------------------------------------------------------------------
+# #318 Task 7 — plugin install version-skew probe (preflight ruling R5:
+# enumerate installs and report divergence; a skill cannot introspect which
+# copy of itself Claude Code loaded, so CLAUDE_PLUGIN_ROOT-gated comparison
+# was replaced with this). Every test drives injected paths only -- never
+# this machine's real ~/.claude/plugins -- so the suite stays hermetic.
+# ---------------------------------------------------------------------------
+
+def _write_plugin_manifest(root, version, nested=".claude-plugin"):
+    """Write a minimal plugin.json manifest under `root`, at `root/nested/
+    plugin.json` (nested="." for the bare `root/plugin.json` rung)."""
+    d = root / nested if nested != "." else root
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "plugin.json").write_text(json.dumps({"name": "obsidian-brain", "version": version}))
+
+
+def test_divergent_installs_are_reported(tmp_path):
+    """Two installs at different versions -> a string naming both and
+    marking which one is resolved."""
+    import obsidian_utils
+
+    old = tmp_path / "cache-3.4.1"
+    new = tmp_path / "cache-3.5.1"
+    _write_plugin_manifest(old, "3.4.1")
+    _write_plugin_manifest(new, "3.5.1")
+
+    msg = obsidian_utils.describe_plugin_install_divergence(
+        install_paths=[str(old), str(new)], resolved_path=str(new)
+    )
+    assert msg is not None
+    assert "3.4.1" in msg
+    assert "3.5.1" in msg
+    assert "resolved" in msg.lower()
+
+
+def test_matching_installs_return_none(tmp_path):
+    """POSITIVE CONTROL: two installs at the SAME version -> None. Without
+    this, a probe hardcoded to always warn would still pass the divergence
+    test above."""
+    import obsidian_utils
+
+    a = tmp_path / "install-a"
+    b = tmp_path / "install-b"
+    _write_plugin_manifest(a, "3.5.1")
+    _write_plugin_manifest(b, "3.5.1")
+
+    msg = obsidian_utils.describe_plugin_install_divergence(
+        install_paths=[str(a), str(b)], resolved_path=str(a)
+    )
+    assert msg is None
+
+
+def test_single_install_returns_none(tmp_path):
+    """A single install cannot diverge from anything."""
+    import obsidian_utils
+
+    only = tmp_path / "install-only"
+    _write_plugin_manifest(only, "3.5.1")
+
+    msg = obsidian_utils.describe_plugin_install_divergence(
+        install_paths=[str(only)], resolved_path=str(only)
+    )
+    assert msg is None
+
+
+def test_unreadable_manifest_is_skipped_not_fatal(tmp_path):
+    """One valid install plus one with no manifest at all -> None (one
+    readable version means no divergence) and must not raise."""
+    import obsidian_utils
+
+    valid = tmp_path / "install-valid"
+    _write_plugin_manifest(valid, "3.5.1")
+    no_manifest = tmp_path / "install-no-manifest"
+    no_manifest.mkdir()
+
+    msg = obsidian_utils.describe_plugin_install_divergence(
+        install_paths=[str(valid), str(no_manifest)], resolved_path=str(valid)
+    )
+    assert msg is None
+
+
+def test_manifest_found_via_parent_rung(tmp_path):
+    """This repo keeps its manifest at `.claude-plugin/plugin.json` with
+    hooks one level down -- _read_plugin_version(hooks_dir) must climb to
+    the parent to find it (Ruling R4, retained), or the resolved install
+    reads as unknown and every divergence check above is inert against
+    the real repo layout even though tests 1-4 all still pass."""
+    import obsidian_utils
+
+    root = tmp_path / "repo-root"
+    _write_plugin_manifest(root, "3.5.1")
+    hooks_dir = root / "hooks"
+    hooks_dir.mkdir(parents=True)
+
+    version = obsidian_utils._read_plugin_version(str(hooks_dir))
+    assert version == "3.5.1"

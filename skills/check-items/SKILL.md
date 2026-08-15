@@ -48,6 +48,7 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
 sys.path.insert(0, _ob_hooks())
 from check_items_args import parse_scope, _known_projects, _vault_known_projects
+from obsidian_utils import describe_plugin_install_divergence
 
 argv = sys.argv[1:]
 scope_obj = parse_scope(argv)
@@ -86,6 +87,19 @@ scope_path = os.path.join(workdir, 'scope.json')
 with open(scope_path, 'w') as f:
     json.dump(scope, f)
 os.chmod(scope_path, 0o600)
+
+# #318 Task 7: warn (never fail) when installed obsidian-brain copies
+# disagree on version -- a diagnostic must never break the command it
+# diagnoses, so any failure here is swallowed. Printed to stderr, never
+# stdout: this whole block's stdout is captured as \$scope_path below, and
+# a second stdout line would corrupt that capture.
+try:
+    _skew = describe_plugin_install_divergence()
+    if _skew:
+        print('WARNING: ' + _skew, file=sys.stderr)
+except Exception:
+    pass
+
 print(scope_path)
 " $ARGUMENTS)
 
@@ -519,6 +533,8 @@ gaps_path=$(echo "$_step5_out" | sed -n '2p')
 echo "evidence_path=$evidence_path"
 echo "gaps_path=$gaps_path"
 ```
+
+`deep_analysis_pipeline` gathers per-project evidence for every project in `merged_by_proj`. For a project with a resolved local git repo, evidence is git-derived: commits, merged PRs, closed issues, releases, FTS-indexed vault mentions, and tags/changed paths folded in from recent commits. For a project with no local repo, `gather_note_completion_evidence()` (#318) is the only evidence source: it flags an item when a strictly newer session's own `## Summary` reports it done (mirroring `/recall`'s `contradicted_by` signal), gated on the same completion-phrase guard the heuristic classifier uses so a bare co-mention can never fabricate DONE evidence. Both write into the same per-project bucket (`note_completions` alongside the git-derived keys) — Step 6's classifier and Step 7's `assign_tier` treat a project whose ONLY real evidence is `note_completions` as capped at tier MED regardless of citation wording, via `note_evidence_only_for()` (`hooks/check_items_cli.py`), never HIGH.
 
 ## Step 6 — Classify (Stage 4) with fallback chain
 

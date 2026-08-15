@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime
 import fnmatch
+import glob
 import hashlib
 import json
 import os
@@ -6835,3 +6836,150 @@ def upgrade_batch(
             file=sys.stderr,
         )
     return results
+
+
+# ---------------------------------------------------------------------------
+# Plugin install version-skew probe (#318 Task 7, preflight ruling R5)
+# ---------------------------------------------------------------------------
+#
+# Root cause: a SKILL.md is loaded by Claude Code from whichever install it
+# registered, while every heredoc's inline _ob_hooks() helper resolves the
+# hooks/ it imports independently (preferring the marketplace directory-
+# source install, #278, else falling back to the highest-version cache
+# entry). The two paths are resolved by different mechanisms and can
+# legitimately diverge -- the reporter's exact scenario had SKILL.md loaded
+# from a 3.4.1 cache while hooks resolved from 3.5.0, every step ran, and
+# nothing warned.
+#
+# Ruling R5: the original design gated this probe on CLAUDE_PLUGIN_ROOT,
+# verified NOT set in a skill's Bash block (Claude Code interpolates it into
+# hooks.json command strings, not skill shells) -- that guard would never
+# fire. A skill also cannot introspect which copy of its own SKILL.md was
+# loaded. So the probe changes shape: enumerate the installs present on
+# disk and warn when their versions disagree, naming the one the hooks
+# resolved to, rather than comparing "this skill" against "these hooks".
+
+
+def _default_plugin_install_paths() -> list[str]:
+    """Every obsidian-brain install this machine can find: the marketplace
+    directory-source checkout (if registered), plus every version
+    directory under ``~/.claude/plugins/cache/*/obsidian-brain/*/``.
+
+    Mirrors the discovery every SKILL.md heredoc's inline ``_ob_hooks()``
+    helper already does to resolve a single "best" hooks dir -- but returns
+    every install found, not just the winner, so a caller can compare
+    versions across the full set. Never touches the real filesystem when a
+    caller passes ``install_paths`` explicitly to
+    :func:`describe_plugin_install_divergence`.
+    """
+    paths: list[str] = []
+    try:
+        marketplaces_path = os.path.expanduser("~/.claude/plugins/known_marketplaces.json")
+        with open(marketplaces_path, encoding="utf-8") as f:
+            marketplaces = json.load(f)
+        for entry in marketplaces.values():
+            source = entry.get("source") if isinstance(entry, dict) else None
+            if not (isinstance(source, dict) and source.get("source") == "directory"):
+                continue
+            install_loc = entry.get("installLocation") if isinstance(entry, dict) else None
+            if not (isinstance(install_loc, str) and os.path.isabs(install_loc)):
+                continue
+            if os.path.isfile(os.path.join(install_loc, "hooks", "obsidian_utils.py")):
+                paths.append(install_loc)
+    except Exception:  # noqa: BLE001 — a diagnostic must never raise
+        pass
+
+    for hooks_dir in glob.glob(os.path.expanduser(
+        "~/.claude/plugins/cache/*/obsidian-brain/*/hooks"
+    )):
+        plugin_root = os.path.dirname(hooks_dir)
+        version_dirname = os.path.basename(plugin_root)
+        if re.fullmatch(r"[0-9]+([.][0-9]+)*", version_dirname):
+            paths.append(plugin_root)
+
+    return paths
+
+
+def _read_plugin_version(path: str | None) -> str | None:
+    """Version from the plugin manifest for `path`, or None.
+
+    Checked in order: `<path>/.claude-plugin/plugin.json`, `<path>/plugin.json`,
+    then the same two on the parent. This repo keeps its manifest at
+    `.claude-plugin/plugin.json` while the hooks live in `hooks/`, so the
+    parent rungs are what make a hooks-directory input resolve at all
+    (#318, preflight ruling R4).
+    """
+    if not path:
+        return None
+    normalized = os.path.normpath(path)
+    candidates = [
+        os.path.join(path, ".claude-plugin", "plugin.json"),
+        os.path.join(path, "plugin.json"),
+    ]
+    parent = os.path.dirname(normalized)
+    if parent and parent != normalized:
+        candidates.append(os.path.join(parent, ".claude-plugin", "plugin.json"))
+        candidates.append(os.path.join(parent, "plugin.json"))
+
+    for candidate in candidates:
+        try:
+            with open(candidate, encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, ValueError):
+            # ValueError covers json.JSONDecodeError; a missing/unreadable/
+            # malformed manifest at one rung is not fatal -- try the next.
+            continue
+        version = manifest.get("version") if isinstance(manifest, dict) else None
+        if isinstance(version, str) and version:
+            return version
+    return None
+
+
+def describe_plugin_install_divergence(
+    install_paths: list[str] | None = None,
+    resolved_path: str | None = None,
+) -> str | None:
+    """Warn when several obsidian-brain installs with different versions exist.
+
+    Claude Code loads a skill's SKILL.md from whichever install it registered
+    and the hooks resolve independently via `_ob_hooks()`, so the prose and
+    the code can legitimately come from different versions with nothing
+    checking (#318 bug 3: SKILL.md from 3.4.1 against hooks from 3.5.0, every
+    step ran, nothing warned). A skill cannot see which copy of itself was
+    loaded, so this reports the divergence and names the executing version
+    instead.
+
+    `install_paths` defaults to the marketplace directory-source install plus
+    every `~/.claude/plugins/cache/*/obsidian-brain/*/`; `resolved_path`
+    defaults to the hooks directory this module lives in. Both are injectable
+    so the tests never read the real plugin tree.
+
+    Returns None when fewer than two versions are readable or they all agree.
+    """
+    if install_paths is None:
+        install_paths = _default_plugin_install_paths()
+    if resolved_path is None:
+        resolved_path = os.path.dirname(os.path.abspath(__file__))
+
+    versions: dict[str, str] = {}
+    for p in install_paths:
+        v = _read_plugin_version(p)
+        if v is not None:
+            versions[p] = v
+
+    # Divergence is judged among the readable installs themselves -- 0 or 1
+    # readable version can't disagree with anything, and an unreadable
+    # manifest at one install must never manufacture a false alarm.
+    if len(set(versions.values())) < 2:
+        return None
+
+    resolved_version = _read_plugin_version(resolved_path)
+    listing = "; ".join(
+        f"{v} at {p}" + (" (resolved)" if v == resolved_version else "")
+        for p, v in versions.items()
+    )
+    return (
+        f"obsidian-brain: installs disagree on version -- {listing}. "
+        f"Executing version: {resolved_version or 'unknown'} (from {resolved_path}). "
+        "Run `/plugin marketplace update` or remove the stale cache directory."
+    )
