@@ -3318,9 +3318,19 @@ class TestPreflightTokenCannotBeLaundered:
         assert TestHookBlockingPathsFire._decide(
             work, env, "require-preflight", self.COMMIT) == "allow"
 
+    # The ids are explicit because pytest builds a node id from the parameter
+    # VALUES, and exports that node id to every subprocess as
+    # PYTEST_CURRENT_TEST. A 200,000-character body therefore becomes a
+    # 200 KB environment variable, and execve's limit covers the environment
+    # as well as the arguments: Linux caps a single entry at 128 KB and
+    # rejected the git call inside the fixture with E2BIG, while macOS's
+    # larger limit tolerated it. Green locally, red in CI, and nothing to do
+    # with what the test asserts.
     @pytest.mark.parametrize("label,body", (
-        ("nested brackets over the size cap", "[" * 200_000),
-        ("nested brackets under the size cap", "[" * 40_000),
+        pytest.param("nested brackets over the size cap", "[" * 200_000,
+                     id="nested-brackets-over-the-size-cap"),
+        pytest.param("nested brackets under the size cap", "[" * 40_000,
+                     id="nested-brackets-under-the-size-cap"),
     ))
     def test_a_token_that_cannot_be_parsed_blocks(self, preflight, label, body):
         work, env, token = preflight
