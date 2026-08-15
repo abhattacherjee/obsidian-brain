@@ -418,19 +418,33 @@ if current_branch in ["main", "develop"]:
                 pass
 
 # Check if command or current branch targets protected branches
-# Also detect refspec pushes like "HEAD:main" or "mybranch:develop"
+# Also detect refspec pushes like "HEAD:main" or "mybranch:develop".
+#
+# The refspec arms match the protected name as a WHOLE ref. A plain
+# `":main" in command` substring test also fires on `foo:mainline` and
+# `HEAD:maintenance`, which are ordinary branches — that costs a false deny
+# on legitimate work, and this condition only started deciding anything once
+# the narrowing `if` below was removed.
+_PROTECTED_REFSPEC_RE = re.compile(r':(?:refs/heads/)?(?:main|develop)(?![A-Za-z0-9._/-])')
+
 targets_protected = (
     "origin main" in command or
     "origin develop" in command or
-    ":main" in command or
-    ":develop" in command or
+    _PROTECTED_REFSPEC_RE.search(command) is not None or
     current_branch in ["main", "develop"]
 )
 
-# Block direct push to main/develop (including force pushes)
+# Block direct push to main/develop (including force pushes).
+#
+# `targets_protected` above is the whole test. It used to be followed by a
+# second `if` that re-checked a STRICTLY NARROWER condition — the current
+# branch, or the literal "origin main"/"origin develop" — which no refspec
+# spelling satisfies. So the `:main` and `:develop` arms were computed, and
+# then discarded: `git push origin HEAD:main`, `+main:main`, `--force` and
+# `--force-with-lease` all fell through to allow, under a comment claiming
+# refspec pushes were detected (#327).
 if targets_protected:
-    if current_branch in ["main", "develop"] or "origin main" in command or "origin develop" in command:
-        reason = f"""❌ Direct push to main/develop is not allowed!
+    reason = f"""❌ Direct push to main/develop is not allowed!
 
 Protected branches:
   - main (production)
@@ -462,7 +476,7 @@ Current branch: {current_branch}
 
 💡 If the superpowers plugin is installed, use /feature, /release, /hotfix, /finish for automated workflows."""
 
-        _deny(reason)
+    _deny(reason)
 
 # Allow the command
 sys.exit(0)
