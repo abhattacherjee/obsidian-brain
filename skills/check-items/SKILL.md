@@ -786,6 +786,36 @@ if skips_file and os.path.exists(skips_file):
         print(f"[check-items] WARNING: source_skips load failed ({exc}); cascade summary may be inaccurate", file=sys.stderr)
         source_skips = set()
 
+# #318 Task 6: stamp applied=True on each buckets record whose own occurrence
+# is a member of source_skips -- i.e. was actually Read-Verified-Edited by
+# the primary-flip loop above (steps 1-4), not merely classified. Covers
+# every classification (DONE, NEEDS-ACTION, REVIEW), not just DONE -- a
+# user-opted-in REVIEW checkoff is just as much "actually flipped" as a
+# preselected DONE one. Step 9's dashboard (check_items_report._body)
+# renders `- [x]` from THIS field, not from classification, so a DONE item
+# the user deselected (never reached source_skips) must stay unchecked.
+for b in buckets["review"]:
+    gid = b.get("group_id")
+    merged_group = groups_by_id.get(gid) if gid else None
+    if not merged_group:
+        continue
+    for m in merged_group.get("members", []) or []:
+        basename = m.get("file", "")
+        line_num = m.get("line")
+        if not basename or line_num is None:
+            continue
+        full_path = os.path.join(sessions_dir, basename)
+        if (full_path, line_num) in source_skips:
+            b["applied"] = True
+            break
+
+# Persist the applied stamps: Step 9 reads buckets_path fresh for its
+# classifications argument, so the in-memory mutation above is invisible
+# downstream unless written back here.
+with open(buckets_path, "w") as f:
+    json.dump(buckets, f, indent=2)
+os.chmod(buckets_path, 0o600)
+
 # Build groups_to_cascade: DONE items from buckets["review"] that have members
 # in merged.json. Resolve member basenames to full paths.
 groups_to_cascade = []
@@ -858,13 +888,15 @@ PYEOF
 rm -f "$_skips_file"
 ```
 
-**Note on primary-flip loop tracking:** After each successful Edit in steps 1–4, append the flipped item's full file path and line number as `[path, line]` to a Python list, then write that list as JSON to `$_skips_file` before running the cascade block. This prevents the cascade from double-flipping lines the SKILL already handled. `batch_cascade_checkoff` is retained for ad-hoc text-search use outside this SKILL flow.
+**Note on primary-flip loop tracking:** After each successful Edit in steps 1–4, append the flipped item's full file path and line number as `[path, line]` to a Python list, then write that list as JSON to `$_skips_file` before running the cascade block. This prevents the cascade from double-flipping lines the SKILL already handled. `batch_cascade_checkoff` is retained for ad-hoc text-search use outside this SKILL flow. `source_skips` has a second consumer now (#318 Task 6): the cascade block above also uses it to stamp `applied=True` on each buckets record it corresponds to, and rewrites `buckets_path` with that stamp before Step 9 runs.
 
 **Reading `cascade_total` and `cascade_skipped_total`:** carry both forward to Step 9's `write_check_items_dashboard()` call (`cascaded=cascade_total`, `skipped=cascade_skipped_total`) and to the terminal Output format's `Cascaded:` and `Skipped:` lines. If the python block above exited non-zero, its `WRITE FAILED` line is the reason — report it to the user verbatim rather than proceeding as if the cascade fully succeeded.
 
 ## Step 9 — Write dashboard report (Stage 8) — ALWAYS
 
 (Implemented in Task 22.) Call `write_check_items_dashboard()` with the scope, classifications, applied count, cascade count, semantic-merge mode, and classifier mode, plus `skipped=cascade_skipped_total` (#320 F1 — the count of cascade candidates that were refused or lost, so the dashboard doesn't collapse to only the auto-checked count). Path: `<vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md` (folder configurable, default `claude-check-items`).
+
+`classifications` must be `buckets["review"]` reloaded fresh from `buckets_path` (`json.load(open(buckets_path))`) — the same file Step 8's cascade block just rewrote with `applied` stamps — not a copy captured earlier in the run. The dashboard renders each item's checkbox from `c.get("applied")`, not from `c.get("classification")` (#318 Task 6): a DONE item the user deselected, and never reached the primary-flip loop, must render `- [ ]`, and a REVIEW/NEEDS-ACTION item the user opted in and flipped must render `- [x]`. Passing a stale, pre-Step-8 copy of `buckets["review"]` would silently revert every checkbox to reading from classification again.
 
 Pass `merges=merge_records_from_groups(<the merged groups from Step 4>)` (import from `open_item_dedup`), never a raw count — `merge_groups_semantically` returns surviving groups carrying `absorbed_reasoning`, not merge records, and `merge_records_from_groups` is the adapter that reconstructs `canonical_group_id`/`absorbed_group_ids`/`reasoning` records from them (#318 bug 3: a count passed directly raised `TypeError`).
 

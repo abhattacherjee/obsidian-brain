@@ -99,27 +99,52 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     )
     parts.append("")
 
-    parts.append(f"## Done ({applied} applied of {len(by_kind['DONE'])} classified)")
+    # #318 Task 6: a record renders `- [x]` when c.get("applied") is truthy,
+    # by FACT not by classification -- in every checkbox section below. A
+    # DONE verdict the user deselected (never reached Step 8's primary-flip
+    # loop) must render unchecked; a REVIEW/NEEDS-ACTION item the user
+    # opted into checkoff and Step 8 actually flipped must render checked.
+    # The vault has always been correct here; only this report used to lie
+    # by rendering DONE as always-checked and everything else as
+    # always-unchecked regardless of what was actually applied.
+    done_applied = sum(1 for c in by_kind["DONE"] if c.get("applied"))
+
+    parts.append(f"## Done ({done_applied} applied of {len(by_kind['DONE'])} classified)")
     for c in by_kind["DONE"]:
-        parts.append(f"- [x] {c.get('canonical_text', '')}")
+        mark = "x" if c.get("applied") else " "
+        parts.append(f"- [{mark}] {c.get('canonical_text', '')}")
         parts.append(f"  - Evidence: {c.get('evidence_citation') or 'n/a'}")
+    # `applied` is the run's total (unchanged meaning); done_applied only
+    # counts DONE. The difference is flips applied OUTSIDE Done -- name it
+    # here so it doesn't vanish from the arithmetic now that the heading
+    # above no longer over-counts every applied flip as if it were DONE.
+    if applied - done_applied > 0:
+        _extra = applied - done_applied
+        _plural = "" if _extra == 1 else "s"
+        parts.append(f"_{_extra} additional flip{_plural} applied outside DONE "
+                     f"(see Needs-Action/Review sections below)._")
     parts.append("")
 
     parts.append(f"## Needs-Action ({len(by_kind['NEEDS-ACTION'])} surfaced, not applied)")
     for c in by_kind["NEEDS-ACTION"]:
-        parts.append(f"- [ ] {c.get('canonical_text', '')}")
+        mark = "x" if c.get("applied") else " "
+        parts.append(f"- [{mark}] {c.get('canonical_text', '')}")
         parts.append(f"  - Evidence: {c.get('evidence_citation') or 'n/a'}")
         if c.get("action_required"):
             parts.append(f"  - Action: `{c['action_required']}`")
     parts.append("")
 
     # REVIEW: names a shipped-looking component/branch/feature but has no
-    # citable anchor — surfaced for human judgement, never auto-checked
-    # (#264 Task 1). Always rendered here regardless of --show-all; unlike
-    # ACTIVE its evidence_citation is never scrubbed upstream.
+    # citable anchor — surfaced for human judgement, never AUTO-checked by
+    # classification alone (#264 Task 1). It CAN render checked when the
+    # user explicitly opted it into checkoff and Step 8 actually flipped it
+    # (#318 Task 6, c.get("applied")) -- always rendered here regardless of
+    # --show-all; unlike ACTIVE its evidence_citation is never scrubbed
+    # upstream.
     parts.append(f"## Review ({len(by_kind['REVIEW'])} needs a human look, not applied)")
     for c in by_kind["REVIEW"]:
-        parts.append(f"- [ ] {c.get('canonical_text', '')}")
+        mark = "x" if c.get("applied") else " "
+        parts.append(f"- [{mark}] {c.get('canonical_text', '')}")
         parts.append(f"  - Weak signal: {c.get('evidence_citation') or 'n/a'}")
     parts.append("")
 

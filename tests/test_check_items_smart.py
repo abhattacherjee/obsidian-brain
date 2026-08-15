@@ -1574,8 +1574,111 @@ def test_dashboard_body_includes_review_section(tmp_path):
     content = open(path).read()
     assert "pull-to-refresh-v2" in content
     assert "review: 1" in content
-    # REVIEW must never be auto-checked — it always renders as an open box.
+    # Unapplied items render unchecked regardless of classification (#318
+    # Task 6) -- this fixture carries no "applied" key, so it renders open.
     assert "- [ ] Return to feature/pull-to-refresh-v2" in content
+
+
+# ---------------------------------------------------------------------------
+# #318 Task 6 — applied items render as applied, by fact not by class.
+# ---------------------------------------------------------------------------
+
+def test_applied_review_item_renders_checked(tmp_path):
+    """A REVIEW classification the user opted into checkoff (applied: True,
+    stamped by Step 8's primary-flip loop) must render `- [x]`, even though
+    REVIEW is never auto-checked by classification alone."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "REVIEW",
+         "canonical_text": "Ship the thing", "evidence_citation": None,
+         "applied": True},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=1, group_count=1,
+        classifications=classifications,
+        applied=1, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "- [x] Ship the thing" in body
+
+
+def test_unapplied_done_item_renders_unchecked(tmp_path):
+    """POSITIVE CONTROL: a DONE classification with no `applied` key must
+    render `- [ ]`, not `- [x]` -- this is what stops the by-fact fix from
+    marking everything checked (DONE no longer means auto-checked)."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "DONE",
+         "canonical_text": "Deselected done item", "evidence_citation": "PR #1"},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=1, group_count=1,
+        classifications=classifications,
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "- [ ] Deselected done item" in body
+    assert "- [x] Deselected done item" not in body
+
+
+def test_done_heading_counts_only_applied_done_items(tmp_path):
+    """The ## Done heading must count applied DONE items, not the run's
+    total applied count -- an applied REVIEW flip must not inflate it."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "DONE",
+         "canonical_text": "Applied done item", "evidence_citation": "PR #1",
+         "applied": True},
+        {"group_id": "g2", "classification": "REVIEW",
+         "canonical_text": "Applied review item", "evidence_citation": None,
+         "applied": True},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=2, group_count=2,
+        classifications=classifications,
+        applied=2, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "## Done (1 applied of 1 classified)" in body
+
+
+def test_applied_elsewhere_line_names_non_done_flips(tmp_path):
+    """The applied REVIEW flip from the fixture above must not vanish from
+    the arithmetic once the ## Done heading stops over-counting -- a summary
+    line must name it."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "DONE",
+         "canonical_text": "Applied done item", "evidence_citation": "PR #1",
+         "applied": True},
+        {"group_id": "g2", "classification": "REVIEW",
+         "canonical_text": "Applied review item", "evidence_citation": None,
+         "applied": True},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=2, group_count=2,
+        classifications=classifications,
+        applied=2, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "1" in body
+    assert "applied outside DONE" in body
 
 
 def test_dashboard_idempotent_overwrite(tmp_path):

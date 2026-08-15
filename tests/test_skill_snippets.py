@@ -739,6 +739,82 @@ def test_check_items_step7_threads_note_evidence_only_into_assign_tier():
     )
 
 
+def _read_step8_heredoc():
+    """Extract the Step 8 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md -- the cascade block, distinguished from the
+    other 6 same-delimiter PYEOF blocks by the presence of
+    `cascade_group_members(`, which is unique to Step 8 (the `from
+    open_item_dedup import cascade_group_members` line contains the bare
+    name without a paren; the actual call site is the discriminator).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step8_blocks = [b for b in blocks if "cascade_group_members(" in b]
+    assert len(step8_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"cascade_group_members(, found {len(step8_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step8_blocks[0]
+
+
+def test_check_items_step8_stamps_applied_on_flipped_records():
+    """#318 Task 6: Step 8's cascade block must stamp `applied=True` onto
+    each buckets record whose occurrence was actually Read-Verified-Edited
+    by the primary-flip loop (tracked in `source_skips`), and persist that
+    stamp back to `buckets_path` -- before Step 9 reads it.
+
+    Without this, check_items_report._body's by-fact rendering (#318 Task
+    6, `c.get("applied")`) has nothing to key off of in a real run: every
+    classification record loaded from buckets_path would carry no
+    `applied` key at all, so the dashboard's checkboxes would silently
+    revert to always-unchecked (or, for DONE before this task's fix,
+    always-checked) -- correct code shipping dead, exactly like the
+    ## Evidence Gaps section before Fix round 1 (F14).
+
+    Parsed with `ast`, not a substring search: walks for an Assign node
+    whose target is a Subscript matching `<name>["applied"]` with value
+    `True` -- a regex for the bare string "applied" would also match the
+    unrelated `applied` count/heading logic living in check_items_report.py
+    (a different file, not even loaded here) or a comment in this block.
+    """
+    source = _read_step8_heredoc()
+    tree = ast.parse(source)
+
+    def _is_applied_true_assign(node):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            return False
+        target = node.targets[0]
+        return (
+            isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Name)
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value == "applied"
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+        )
+
+    stamps = [node for node in ast.walk(tree) if _is_applied_true_assign(node)]
+    assert stamps, (
+        'Step 8\'s cascade block does not contain an `<name>["applied"] = '
+        "True` assignment -- the dashboard's applied-by-fact rendering "
+        "(#318 Task 6) can never receive real data from a live "
+        "/check-items run."
+    )
+
+    # The stamp must also be persisted to buckets_path, or the mutation is
+    # invisible to the fresh `json.load(open(buckets_path))` Step 9 does.
+    assert "buckets_path" in source and 'json.dump(buckets' in source, (
+        "Step 8's cascade block stamps applied but never writes buckets "
+        "back to buckets_path -- the in-memory mutation is lost when this "
+        "subprocess exits, since Step 9 runs as a separate python3 "
+        "invocation that re-reads buckets_path from disk."
+    )
+
+
 def test_check_items_step10_uses_locked_cache_not_bare_save():
     """#306: Step 10 must persist cache updates through locked_cache(), the
     context manager that serializes the whole load-mutate-save cycle behind
