@@ -386,7 +386,7 @@ def _strip_unreleased_section(changelog: str) -> str:
 
 
 def note_evidence_only_for(evidence: dict, project: str) -> bool:
-    """True when a project's evidence bundle has no git-derived bucket at all.
+    """True when a project's ONLY real evidence is note_completions.
 
     The enforcing half of #318's MED cap (F7): if the only thing backing a
     project is note_completions, no verdict for it can legitimately be
@@ -404,12 +404,30 @@ def note_evidence_only_for(evidence: dict, project: str) -> bool:
     so a cached DONE citation sharing a literal ref with the item text
     could reach HIGH and get auto-checked on every re-run after the first.
 
-    An absent or empty bundle, or one missing the project entirely, is NOT
-    note-evidence-only — it is simply evidence-less, and has no evidence
-    at all to build a citation from either way.
+    VALUE-aware, not key-presence (F13, #318 fix round 4 addendum):
+    deep_analysis_pipeline's git block sets tags/changed_paths/merged_prs/
+    closed_issues to `[]` on EVERY failure branch (no tags, gh
+    unauthenticated, etc. — the normal state on a fresh machine or in CI),
+    so a repo-backed project with zero usable git evidence still carries
+    those keys. A key-presence test (`set(proj.keys()) <= {...}`) reads
+    that shape as "has git evidence" and leaves it uncapped — a real repo
+    that yielded nothing goes unprotected exactly like a repo-less one
+    should be protected. Checking VALUES, not key presence, treats
+    `{"tags": [], "note_completions": [...]}` the same as
+    `{"note_completions": [...]}` — correctly, since an empty list proves
+    nothing either way.
+
+    A bundle with no genuine note_completions evidence at all (regardless
+    of what else it has-or-doesn't) is NOT note-evidence-only — there is no
+    note evidence for the cap to protect, and such a project's groups reach
+    Step 7 through the synthetic/heuristic path anyway, which the
+    pre-existing `_cap_at_med` (#297, `classifier_source not in
+    _HIGH_TRUST_SOURCES`) already handles regardless of this flag.
     """
     proj = evidence.get(project) or {}
-    return bool(proj) and set(proj.keys()) <= {"note_completions"}
+    if not proj.get("note_completions"):
+        return False
+    return all(not v for k, v in proj.items() if k != "note_completions")
 
 
 def _bridge_project_evidence(evidence: dict, project: str) -> dict:

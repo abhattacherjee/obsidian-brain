@@ -531,6 +531,63 @@ def test_note_evidence_only_for_project_absent():
     ) is False
 
 
+# ---------------------------------------------------------------------------
+# Fix round 4 addendum (F13, CRITICAL): note_evidence_only_for() must be
+# VALUE-aware, not key-presence. deep_analysis_pipeline's git block sets
+# tags/changed_paths/merged_prs/closed_issues to `[]` on EVERY failure
+# branch (no tags, gh unauthenticated/offline -- the normal state on a
+# fresh machine or in CI), so a repo-backed project with zero usable git
+# evidence still carries those keys with empty-list values. The original
+# key-presence form (`set(proj.keys()) <= {"note_completions"}`) read that
+# shape as "has git evidence" (any key beyond note_completions disqualifies
+# it) and left it uncapped -- reachable without anything exotic: a repo
+# with no tags and no merged PRs, gh offline.
+# ---------------------------------------------------------------------------
+
+
+def test_note_evidence_only_for_all_empty_git_buckets_is_true():
+    """The exact shape a repo produces when every git/gh call fails or
+    returns nothing: real note evidence, but every git-derived bucket
+    present with an empty value. Must be True -- this is precisely the case
+    the key-presence form got wrong (it read the empty tags/merged_prs/etc.
+    keys as "has git evidence" and left the project uncapped)."""
+    evidence = {
+        "notes-only": {
+            "tags": [],
+            "changed_paths": [],
+            "merged_prs": [],
+            "closed_issues": [],
+            "note_completions": [{"text": "wire up the foo exporter #318"}],
+        },
+    }
+    assert check_items_cli.note_evidence_only_for(evidence, "notes-only") is True
+
+
+def test_note_evidence_only_for_real_commits_is_false():
+    """POSITIVE CONTROL: a project with genuine (non-empty) git evidence
+    alongside note_completions must stay uncapped. Without this, F13's fix
+    could treat every bundle as note-evidence-only and nothing here would
+    notice."""
+    evidence = {
+        "git-project": {
+            "commits": ["abc1234 fix"],
+            "note_completions": [{"text": "wire up the foo exporter #318"}],
+        },
+    }
+    assert check_items_cli.note_evidence_only_for(evidence, "git-project") is False
+
+
+def test_note_evidence_only_for_empty_git_buckets_no_note_evidence_is_false():
+    """A project with only empty git buckets and NO note_completions at all
+    is not note-evidence-only -- there is no note evidence for the cap to
+    protect. Such a project has NO real evidence of any kind, so its groups
+    reach Step 7 through the synthetic/heuristic path, which the
+    pre-existing _cap_at_med (#297: classifier_source not in
+    _HIGH_TRUST_SOURCES) already caps regardless of this flag."""
+    evidence = {"notes-only": {"tags": [], "commits": []}}
+    assert check_items_cli.note_evidence_only_for(evidence, "notes-only") is False
+
+
 def _cached_record(project):
     """Mirrors SKILL.md Step 6's cache-merge dict shape exactly (post-F12),
     including the note_evidence_only stamp a caller must compute via
