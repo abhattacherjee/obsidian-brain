@@ -587,6 +587,75 @@ def test_check_items_step6_cache_merge_stamps_note_evidence_only():
     )
 
 
+def _read_step5_heredoc():
+    """Extract the Step 5 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md -- the evidence-gathering block, distinguished
+    from the other 6 same-delimiter PYEOF blocks by the presence of
+    `deep_analysis_pipeline(`, which is unique to Step 5 (Step 5's `from
+    open_item_dedup import deep_analysis_pipeline` line contains the bare
+    name without a paren, but the call site `status = deep_analysis_pipeline(`
+    is the actual invocation and appears nowhere else).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step5_blocks = [b for b in blocks if "deep_analysis_pipeline(" in b]
+    assert len(step5_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"deep_analysis_pipeline(, found {len(step5_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step5_blocks[0]
+
+
+def _is_dict_get_call(node, dict_name, key_value):
+    """True if `node` is a Call matching `<dict_name>.get(<key_value>, ...)`."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == dict_name
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == key_value
+    )
+
+
+def test_check_items_step5_extracts_evidence_gaps_from_pipeline_output():
+    """#318 Fix round 1 (F14): Step 5 reads `pipeline_data` (deep_analysis_
+    pipeline's output_path JSON) and previously extracted only
+    `pipeline_data.get("evidence", {})`, dropping `evidence_gaps` on the
+    floor. deep_analysis_pipeline already writes evidence_gaps into that
+    same JSON (#318 Task 3) -- it is the ONLY record of which projects had
+    no local git repo. Step 9's dashboard can only ever render the
+    ## Evidence Gaps section (Task 5 Step 5.5) if this extraction exists;
+    without it the section and its tests are correct but dead code in a
+    real /check-items run.
+
+    Parsed with `ast`, not a substring search: walks for a Call node
+    matching `pipeline_data.get("evidence_gaps", ...)` specifically (not
+    just any occurrence of the string "evidence_gaps", which would also
+    match a comment or the write_check_items_dashboard() call this same
+    block does NOT make).
+    """
+    source = _read_step5_heredoc()
+    tree = ast.parse(source)
+
+    gap_extractions = [
+        node for node in ast.walk(tree)
+        if _is_dict_get_call(node, "pipeline_data", "evidence_gaps")
+    ]
+    assert gap_extractions, (
+        "Step 5's heredoc does not extract "
+        'pipeline_data.get("evidence_gaps", ...) -- the dashboard\'s '
+        "## Evidence Gaps section can never receive real data from a "
+        "live /check-items run (#318 F14)."
+    )
+
+
 def _read_step7_heredoc():
     """Extract the Step 7 `python3 << 'PYEOF' ... PYEOF` heredoc body from
     skills/check-items/SKILL.md.

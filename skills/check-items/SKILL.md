@@ -411,7 +411,7 @@ echo "merged_path=$merged_path"
 ## Step 5 — Gather evidence (Stage 3)
 
 ```bash
-evidence_path=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" python3 << 'PYEOF'
+_step5_out=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" python3 << 'PYEOF'
 import sys, os, glob, json, datetime
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -484,22 +484,40 @@ if not status.startswith("OK"):
     print(f"WARNING: deep_analysis_pipeline returned: {status}", file=sys.stderr)
 
 # Read the written evidence from output_path for downstream use.
+# evidence_gaps (#318 Task 5 F14) is extracted alongside evidence here, not
+# dropped: it is deep_analysis_pipeline's ONLY record of which projects had
+# no git repo to draw evidence from, and it must reach Step 9's dashboard
+# artefact -- the stderr warning deep_analysis_pipeline already prints is
+# not something the user keeps.
 try:
     pipeline_data = json.load(open(output_path))
     evidence = pipeline_data.get("evidence", {})
+    evidence_gaps = pipeline_data.get("evidence_gaps", {})
 except (OSError, json.JSONDecodeError) as e:
     print(f"WARNING: could not read pipeline output: {e}", file=sys.stderr)
     evidence = {}
+    evidence_gaps = {}
 
 out = os.path.join(os.path.dirname(scope_path), "evidence.json")
 with open(out, "w") as f:
     json.dump(evidence, f, default=str, indent=2)
 os.chmod(out, 0o600)
+
+gaps_out = os.path.join(os.path.dirname(scope_path), "gaps.json")
+with open(gaps_out, "w") as f:
+    json.dump(evidence_gaps, f, default=str, indent=2)
+os.chmod(gaps_out, 0o600)
+
 print(out)
+print(gaps_out)
 PYEOF
 )
 
+evidence_path=$(echo "$_step5_out" | sed -n '1p')
+gaps_path=$(echo "$_step5_out" | sed -n '2p')
+
 echo "evidence_path=$evidence_path"
+echo "gaps_path=$gaps_path"
 ```
 
 ## Step 6 — Classify (Stage 4) with fallback chain
@@ -849,6 +867,8 @@ rm -f "$_skips_file"
 (Implemented in Task 22.) Call `write_check_items_dashboard()` with the scope, classifications, applied count, cascade count, semantic-merge mode, and classifier mode, plus `skipped=cascade_skipped_total` (#320 F1 — the count of cascade candidates that were refused or lost, so the dashboard doesn't collapse to only the auto-checked count). Path: `<vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md` (folder configurable, default `claude-check-items`).
 
 Pass `merges=merge_records_from_groups(<the merged groups from Step 4>)` (import from `open_item_dedup`), never a raw count — `merge_groups_semantically` returns surviving groups carrying `absorbed_reasoning`, not merge records, and `merge_records_from_groups` is the adapter that reconstructs `canonical_group_id`/`absorbed_group_ids`/`reasoning` records from them (#318 bug 3: a count passed directly raised `TypeError`).
+
+Also pass `evidence_gaps=<the dict loaded from Step 5's `gaps_path`>` (`json.load(open(gaps_path))`). Without it, `write_check_items_dashboard()`'s `## Evidence Gaps` section and `evidence_gaps` frontmatter field never render — the section defaults to a no-op when the argument is omitted — and a repo-less project's report reads exactly like a normal triage, which is the failure #318 exists to fix. Step 5 already writes this dict to disk for you; do not recompute it from `evidence.json`, whose shape is project-keyed and does not carry `projects_without_repo`/`all_projects_gapped`.
 
 ## Step 10 — Persist cache updates
 
