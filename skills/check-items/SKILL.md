@@ -1019,20 +1019,36 @@ applied = sum(1 for c in classifications if c.get("applied"))
 
 try:
     evidence_gaps = json.load(open(gaps_path))
-except (OSError, json.JSONDecodeError):
-    evidence_gaps = {}
+except (OSError, json.JSONDecodeError) as exc:
+    # N2: None, not {} -- write_check_items_dashboard() treats None as the
+    # argument being OMITTED (a true no-op: no section, no frontmatter
+    # key). {} is a real, evaluated-and-clean result and would stamp
+    # `evidence_gaps: 0`, asserting coverage that never actually happened
+    # because this file could not be read at all.
+    print(f"WARNING: could not read {gaps_path}: {exc} -- evidence_gaps "
+          f"omitted from this report", file=sys.stderr)
+    evidence_gaps = None
 
 # cascade_summary.json is written by Step 8's cascade block, AFTER computing
 # cascaded/skipped but before its own WRITE FAILED check, so it exists even
 # on a failed cascade run. It does NOT exist when Step 8 was skipped
 # entirely (dry_run or the user typed "none") -- 0/0 is correct there, since
-# nothing was cascaded.
+# nothing was cascaded. N3: it can ALSO be missing when Step 8 ran, flipped
+# some primary items, then died before reaching this write (an uncaught
+# exception, or the earlier "cannot load merged.json" FATAL) -- 0/0 is
+# silently WRONG in that case, so it's still the fallback (a report must
+# still get written) but the quiet-and-wrong case is now named on stderr
+# instead of reading identically to "nothing happened, nothing to cascade".
 cascade_summary_path = os.path.join(os.path.dirname(scope_path), "cascade_summary.json")
 try:
     cascade_summary = json.load(open(cascade_summary_path))
     cascaded = cascade_summary.get("cascaded", 0)
     skipped = cascade_summary.get("skipped", 0)
-except (OSError, json.JSONDecodeError):
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"WARNING: could not read {cascade_summary_path}: {exc} -- "
+          f"cascaded/skipped default to 0, which is WRONG if Step 8 ran "
+          f"and died before writing this file (correct only if Step 8 was "
+          f"skipped entirely)", file=sys.stderr)
     cascaded, skipped = 0, 0
 
 report_path = write_check_items_dashboard(
@@ -1060,6 +1076,8 @@ echo "report_path=$report_path"
 ```
 
 `report_path` is the dashboard note's full path — surface it to the user in the terminal Output format's `Report:` line.
+
+N5: this block has no top-level `try` around its core inputs (`raw_path`/`part_path`/`merged_path`/`classifications_path`/`buckets_path`) — the right fail-loud default for a step marked ALWAYS, since a dashboard built on a missing or corrupt upstream artefact would be worse than none at all. If this block exits non-zero, `$report_path` is unset and no dashboard was written this run — stop and show the user the traceback verbatim rather than reporting the run as complete.
 
 ## Step 10 — Persist cache updates
 

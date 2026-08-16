@@ -927,6 +927,59 @@ def test_check_items_step9_passes_merges_and_evidence_gaps():
         f"'## Evidence Gaps' silently never renders (#318 F14)."
     )
 
+    # N6: the other two of I1's three "must be mechanical" items were
+    # unguarded -- pinned only by the keyword-argument check above binding
+    # `classifications=classifications` and `cascaded=cascaded`, neither of
+    # which proves those NAMES were themselves derived from a fresh
+    # buckets_path read / cascade_summary_path read, as opposed to (say) a
+    # stale variable left over from an earlier, unrelated block.
+    def _is_json_load_open_call(node, arg_name):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "load"
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "json"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Name) and node.args[0].func.id == "open"
+            and node.args[0].args
+            and isinstance(node.args[0].args[0], ast.Name)
+            and node.args[0].args[0].id == arg_name
+        )
+
+    buckets_reads = [n for n in ast.walk(tree) if _is_json_load_open_call(n, "buckets_path")]
+    assert buckets_reads, (
+        "Step 9's heredoc does not contain json.load(open(buckets_path)) -- "
+        "classifications must be reloaded fresh from buckets_path (#318 "
+        "Task 6), not a stale copy, or every checkbox silently reverts to "
+        "reading from classification instead of Step 8's applied stamps."
+    )
+
+    classifications_from_buckets = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "classifications"
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "get"
+        and isinstance(node.value.func.value, ast.Name) and node.value.func.value.id == "buckets"
+    ]
+    assert classifications_from_buckets, (
+        "Step 9's heredoc does not assign classifications = buckets.get(...) "
+        "-- json.load(open(buckets_path)) being present doesn't prove "
+        "`classifications` itself comes from it, only that SOMETHING reads "
+        "the file."
+    )
+
+    cascade_summary_reads = [
+        n for n in ast.walk(tree) if _is_json_load_open_call(n, "cascade_summary_path")
+    ]
+    assert cascade_summary_reads, (
+        "Step 9's heredoc does not contain "
+        "json.load(open(cascade_summary_path)) -- cascaded/skipped would "
+        "silently default to 0/0 on every run, not just when Step 8 was "
+        "genuinely skipped (#318 I1/N3)."
+    )
+
 
 def test_check_items_step10_uses_locked_cache_not_bare_save():
     """#306: Step 10 must persist cache updates through locked_cache(), the

@@ -1672,12 +1672,7 @@ def test_done_heading_counts_only_applied_done_items(tmp_path):
 def test_applied_elsewhere_line_names_non_done_flips(tmp_path):
     """The applied REVIEW flip from the fixture above must not vanish from
     the arithmetic once the ## Done heading stops over-counting -- a summary
-    line must name it.
-
-    #318 I2 AGREEING-CASE control: applied=2 matches the stamped total
-    (1 DONE + 1 REVIEW, both c.get('applied') truthy), so no mismatch note
-    should render -- see test_applied_mismatch_note_names_both_counts for
-    the disagreeing case."""
+    line must name it."""
     from check_items_report import write_check_items_dashboard
     vault = tmp_path / "vault"
     (vault / "claude-dashboards").mkdir(parents=True)
@@ -1699,7 +1694,6 @@ def test_applied_elsewhere_line_names_non_done_flips(tmp_path):
     body = open(path).read()
     assert "1" in body
     assert "applied outside DONE" in body
-    assert "this run reported" not in body
 
 
 def test_applied_outside_done_derived_from_stamps_not_subtraction(tmp_path):
@@ -1733,31 +1727,6 @@ def test_applied_outside_done_derived_from_stamps_not_subtraction(tmp_path):
     body = open(path).read()
     assert "1 additional flip applied outside DONE" in body
     assert "4 additional flip" not in body
-
-
-def test_applied_mismatch_note_names_both_counts(tmp_path):
-    """#318 I2 DISAGREEING case: `applied` (the run total) and the
-    fact-derived stamped total can legitimately diverge -- e.g. a
-    cascade-only sibling flip Step 8 never stamped onto any record. That
-    must be said explicitly (naming both numbers), not papered over."""
-    from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
-    (vault / "claude-dashboards").mkdir(parents=True)
-    classifications = [
-        {"group_id": "g1", "classification": "DONE",
-         "canonical_text": "Applied done item", "evidence_citation": "PR #1",
-         "applied": True},
-    ]
-    path = write_check_items_dashboard(
-        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
-        window_days=14, raw_count=1, group_count=1,
-        classifications=classifications,
-        applied=3, cascaded=0, merges=[], semantic_merge_mode="ok",
-        classifier_mode="ok", dry_run=True
-    )
-    body = open(path).read()
-    assert "this run reported 3 applied" in body
-    assert "only 1 record" in body
 
 
 def test_dashboard_idempotent_overwrite(tmp_path):

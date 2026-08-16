@@ -113,16 +113,23 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     # subtracting the caller's `applied` run-total from done_applied. The
     # subtraction form let the report print "N additional flips applied
     # outside DONE" while nothing outside DONE actually rendered checked
-    # (an unstamped applied total), or vice versa. `applied` (the run
-    # total) and this fact-derived stamped_total are independent inputs
-    # that CAN legitimately disagree -- e.g. a cascade-only flip that never
-    # reached a per-record stamp (see Task 6 report's known limitation) --
-    # and a disagreement is a real diagnostic, not something to paper over.
+    # (an unstamped applied total), or vice versa.
+    #
+    # N1: an earlier version of this also compared `applied` against
+    # `done_applied + stamped_outside_done` and warned on a mismatch.
+    # Removed: Step 9 derives `applied` as
+    # `sum(1 for c in classifications if c.get("applied"))` over the SAME
+    # `classifications` list `by_kind` partitions here, which makes that
+    # comparison tautologically equal on every real call -- 300 randomised
+    # classification lists through Step 9's own derivation never rendered
+    # it once. `applied` staying a distinct argument (rather than being
+    # recomputed here) is deliberate -- it documents that a future caller
+    # COULD pass an independently-tracked total -- but inventing one here
+    # to keep a warning alive would manufacture an input, not guard one.
     stamped_outside_done = sum(
         1 for kind, items in by_kind.items() if kind != "DONE"
         for c in items if c.get("applied")
     )
-    stamped_total = done_applied + stamped_outside_done
 
     parts.append(f"## Done ({done_applied} applied of {len(by_kind['DONE'])} classified)")
     for c in by_kind["DONE"]:
@@ -133,12 +140,6 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
         _plural = "" if stamped_outside_done == 1 else "s"
         parts.append(f"_{stamped_outside_done} additional flip{_plural} applied outside DONE "
                      f"(see Needs-Action/Review sections below)._")
-    if applied != stamped_total:
-        parts.append(
-            f"_Note: this run reported {applied} applied, but only "
-            f"{stamped_total} record(s) in this report are stamped applied "
-            f"— Step 8 may not have stamped everything it flipped._"
-        )
     parts.append("")
 
     # M4: "surfaced" / "needs a human look" no longer claim "not applied" --
