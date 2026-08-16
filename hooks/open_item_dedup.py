@@ -16,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from obsidian_utils import get_workspace_roots
+from obsidian_utils import get_workspace_roots, match_items_against_evidence
 
 # --- Module-level compiled regexes (computed once at import) ---
 
@@ -149,6 +149,19 @@ _STOPWORDS = frozenset({
 # Confidence tier rules (spec § Confidence tiers, lines 324-332)
 # ---------------------------------------------------------------------------
 
+# #318: the exact citation shape check_items_cli's CLASSIFIER_PROMPT tells
+# the model to use for a note_completions hit ("reported done in session
+# YYYY-MM-DD (<title>)"). Shared between CONFIDENCE_TIER_RULES (normal MED
+# matching) and assign_tier's pre-HIGH-loop shape check (F1 below) so the
+# two never drift apart. F8 (#318 fix round 2 addendum): case-insensitive
+# -- sentence-casing ("Reported done...") is the most natural way a model
+# writes the start of a citation, and a bare case-sensitive match let a
+# single capital letter walk the citation past this fallback into the HIGH
+# loop. A sentence-cased citation should still reach MED through this
+# pattern; the note_evidence_only flag (F7) is the real, wording-independent
+# guard regardless.
+_NOTE_COMPLETION_CITATION_PATTERN = r"(?i)\breported done in session \d{4}-\d{2}-\d{2}\b"
+
 CONFIDENCE_TIER_RULES = {
     "HIGH": {
         "literal_ref_patterns": [
@@ -163,6 +176,7 @@ CONFIDENCE_TIER_RULES = {
             r"\bshipped\b",
             r"\bcovered by\b",
             r"#\d+",
+            _NOTE_COMPLETION_CITATION_PATTERN,
         ],
     },
     "LOW": {
@@ -196,7 +210,7 @@ def _outer_subagent_timeout() -> int:
 
 
 def assign_tier(evidence_citation, item_text, classification=None,
-                classifier_source=None):
+                classifier_source=None, note_evidence_only=False):
     """Deterministically assign HIGH | MED | LOW from evidence citation shape.
 
     HIGH requires a literal ref (sha, #N, vX.Y) appearing in BOTH the citation
@@ -214,12 +228,42 @@ def assign_tier(evidence_citation, item_text, classification=None,
     with existing callers, appended rather than inserted — all 23 pre-#297
     call sites pass 1-3 positional args). See the #297 comment below the cap.
 
+    `note_evidence_only` is optional and defaults to False (appended last,
+    same backward-compat rule). See #318 fix round 2 (F7) below: this is
+    THE enforcing guard for a note-completion citation, not the citation-
+    shape regex check that follows it.
+
     Spec § Confidence tiers (lines 324-332).
     """
     if not evidence_citation or not item_text:
         return "LOW"
     citation = str(evidence_citation)
     text = str(item_text)
+
+    # #318 fix round 2 (F7, CRITICAL): the citation-shape check below (added
+    # in fix round 1) is TEXT PATTERN MATCHING against a string the
+    # classifier model composes freely. A reviewer found five one-word-off
+    # phrasings ("session note 2026-02-01" / "reported complete in session"
+    # / no template at all, just "#318 is done") that all skip the regex and
+    # fall through to the HIGH literal-ref loop -- persuading a model to
+    # reproduce a literal string is not enforcement. `note_evidence_only` is
+    # DATA WE CONTROL: check_items_cli stamps it from the evidence bundle's
+    # own keys (whether the project's evidence is note_completions-only, no
+    # git-derived bucket at all), so it cannot be defeated by wording. If
+    # true, no citation for this item can legitimately be HIGH regardless of
+    # what the model wrote — cap at MED unconditionally, before anything
+    # else runs.
+    if note_evidence_only:
+        return "MED"
+
+    # #318/#297 fix round 1: fallback second line of defence for a project
+    # that ALSO has git evidence (so note_evidence_only is False) but whose
+    # citation still happens to match the exact template
+    # check_items_cli.CLASSIFIER_PROMPT asks for. Kept, but no longer the
+    # only guard — see F7 above for why text-shape matching alone doesn't
+    # enforce anything.
+    if re.search(_NOTE_COMPLETION_CITATION_PATTERN, citation):
+        return "MED"
 
     # #297: a heuristic citation is BUILT FROM a token lifted out of the item
     # text, so "ref appears in both citation and text" is trivially true and
@@ -378,6 +422,151 @@ def collect_open_items(
 
         if matched >= max_sessions:
             break
+
+    return results
+
+
+_NOTE_EVIDENCE_WINDOW = 10  # mirrors obsidian_utils._OPEN_ITEM_EVIDENCE_WINDOW
+_SUMMARY_RE = re.compile(r"## Summary\n(.+?)(?=\n## |\Z)", re.DOTALL)
+
+
+def gather_note_completion_evidence(
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+    max_sessions: int = 10,
+) -> list[dict]:
+    """Open items that a STRICTLY NEWER session's own summary reports done.
+
+    The one evidence source that needs no git repo (#318). Same signal
+    /recall surfaces as `contradicted_by`, same two guards: the evidence
+    session must be strictly newer than the item's own session, and the
+    match must carry a completion phrase — a mere co-mention of the same
+    branch or file is not completion (BH-001).
+
+    Returns [{"text", "file", "line", "contradicted_by",
+              "contradicted_by_title", "confidence"}].
+    """
+    sessions_dir = os.path.join(vault_path, sessions_folder)
+    if not os.path.isdir(sessions_dir):
+        return []
+
+    all_files = sorted(os.listdir(sessions_dir), reverse=True)
+
+    # Single pass, newest-first: apply the SAME project/type filter
+    # collect_open_items() uses (first 20 frontmatter lines, quote-stripped,
+    # no `type:` field means legacy session) while also picking up `date:`.
+    # Building the evidence pool and the per-note date map here (rather than
+    # re-deriving them from a second scan) guarantees both cover exactly the
+    # same note set collect_open_items() will read below.
+    evidence_pool: list[tuple[str, str, str]] = []  # (date, title, summary_text)
+    date_by_path: dict[str, str] = {}
+    matched = 0
+
+    for fname in all_files:
+        if not fname.endswith('.md'):
+            continue
+
+        fpath = os.path.join(sessions_dir, fname)
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+        except OSError as exc:
+            print(f"[obsidian-brain] note-completion: skipping unreadable note {fname}: {exc}", file=sys.stderr)
+            continue
+        except UnicodeDecodeError as exc:
+            print(f"[obsidian-brain] note-completion: encoding error in {fname}: {exc}", file=sys.stderr)
+            continue
+
+        project_match = False
+        is_session = True  # default for notes with no type field (legacy)
+        type_field_seen = False
+        note_date = ''
+        for line in lines[:20]:
+            stripped = line.strip()
+            if stripped.startswith('project:'):
+                val = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                if val == project:
+                    project_match = True
+            elif stripped.startswith('type:'):
+                type_field_seen = True
+                tval = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                is_session = (tval == 'claude-session')
+            elif stripped.startswith('date:'):
+                note_date = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+        if not project_match or (type_field_seen and not is_session):
+            continue
+
+        matched += 1
+        # An item whose source note has no date: is never flagged --
+        # "strictly newer" is undefined without one. Simply don't record it.
+        if note_date:
+            date_by_path[os.path.abspath(fpath)] = note_date
+
+            # F9 (#318 fix round 2 addendum): no separate pool-size cap here.
+            # A prior version gated this append on `len(evidence_pool) <
+            # _pool_cap` (F3's fix), but that check is unreachable-False by
+            # construction: `matched` (incremented once per matching note,
+            # unconditionally, above) can never exceed max_sessions -- the
+            # loop's own `if matched >= max_sessions: break` guarantees it --
+            # and evidence_pool grows by at most one entry per matching note.
+            # So len(evidence_pool) < matched <= max_sessions always, i.e.
+            # the body-read below already runs at most max_sessions times
+            # without any extra gate. A guard that can never turn False is
+            # not a guard; the real bound is the loop's own break condition.
+            content = ''.join(lines)
+            m = _SUMMARY_RE.search(content)
+            if m:
+                summary_text = m.group(1).strip()
+                if summary_text:
+                    first_line = summary_text.split('\n')[0].strip()
+                    title = first_line or f"Session: {project}"
+                    evidence_pool.append((note_date, title, summary_text))
+
+        if matched >= max_sessions:
+            break
+
+    items = collect_open_items(vault_path, sessions_folder, project, max_sessions)
+    if not items:
+        return []
+
+    results: list[dict] = []
+    for fpath, line_num, item_text in items:
+        item_date = date_by_path.get(os.path.abspath(fpath), '')
+        if not item_date:
+            continue
+        best: dict | None = None
+        for ev_date, ev_title, ev_summary in evidence_pool:
+            # Compare day-prefixes so a `date:` carrying a full datetime
+            # still compares correctly against a date-only value.
+            if ev_date[:10] <= item_date[:10]:
+                continue  # same-date or older session — never contradicts
+            candidates = match_items_against_evidence(
+                ev_summary, [(fpath, line_num, item_text)]
+            )
+            for c in candidates:
+                # BH-001: a co-mentioned branch/file alone is not completion.
+                # Preflight ruling R6: match_items_against_evidence() already
+                # rejects score < 3 before returning, and the completion-
+                # phrase boost below adds +2 AFTER that check — so every
+                # candidate reaching this point with has_completion_phrase
+                # already carries confidence >= 5. Re-checking a confidence
+                # floor here would be unreachable dead code.
+                if not c.get("has_completion_phrase"):
+                    continue
+                if best is None or c["confidence"] > best["confidence"]:
+                    # F2: store the date-only prefix, not the raw `date:`
+                    # value. A datetime-shaped date (e.g.
+                    # "2026-02-01T09:30:00Z") would otherwise flow into the
+                    # "reported done in session <contradicted_by>" citation
+                    # and break the MED regex's trailing \b (no word
+                    # boundary between the day's last digit and "T"),
+                    # silently dropping the tier to LOW.
+                    c["contradicted_by"] = ev_date[:10]
+                    c["contradicted_by_title"] = ev_title
+                    best = c
+        if best is not None:
+            results.append(best)
 
     return results
 
@@ -1051,7 +1240,7 @@ def deep_analysis_pipeline(
 ) -> str:
     """Single-pass deep analysis: similarity, open items, evidence gathering.
 
-    Returns 'OK:<total_items>:<groups>:<projects_with_evidence>'.
+    Returns 'OK:<total_items>:<groups>:<projects_with_evidence>:<projects_without_repo_count>'.
     Writes structured JSON to output_path (atomic: tempfile + rename).
 
     15-minute module-level cache keyed on (projects_json, vault_path,
@@ -1207,165 +1396,214 @@ def deep_analysis_pipeline(
     project_paths = _resolve_project_paths()
     evidence: dict[str, dict] = {}
     projects_with_evidence = 0
+    projects_without_repo: list[str] = []
 
     for project in projects:
         repo_path = project_paths.get(project)
         if not repo_path:
-            continue
+            # #318: this used to `continue` in silence. EVERY evidence source
+            # below is git-derived, so a repo-less project reaches the
+            # classifier with an empty bundle, caps at tier LOW, and can never
+            # reach DONE+HIGH (the only combination Step 7 preselects). The
+            # run then presents as a normal triage. Name it instead.
+            projects_without_repo.append(project)
+            print(
+                f"[obsidian-brain] {project}: no local git repo — every "
+                f"git-derived evidence source is unavailable, so no item in "
+                f"this project can reach tier HIGH or classification DONE",
+                file=sys.stderr,
+            )
 
         proj_evidence: dict[str, object] = {}
 
-        # git log (last 40 commits)
-        try:
-            proc = subprocess.run(
-                ["git", "log", "--oneline", "-40"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                proj_evidence["commits"] = proc.stdout.strip().split("\n")[:40]
-            else:
-                print(f"[obsidian-brain] git log failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] git log error for {project}: {exc}", file=sys.stderr)
-
-        # git tag --list (#264 Task 2: widen git ground truth). A genuinely-
-        # shipped item may be grounded in a release tag rather than a PR/issue
-        # title (e.g. the reporter's `feature/pull-to-refresh-v2` case, shipped
-        # via tag v2.0.0 with no #N anchor in the checkbox text). Sorted by
-        # creation recency and capped/deduped to keep the evidence blob small.
-        try:
-            proc = subprocess.run(
-                ["git", "tag", "--list", "--sort=-creatordate"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                _seen_tags: set[str] = set()
-                _tags: list[str] = []
-                for _line in proc.stdout.strip().split("\n"):
-                    _line = _line.strip()
-                    if not _line or _line in _seen_tags:
-                        continue
-                    _seen_tags.add(_line)
-                    _tags.append(_line)
-                    if len(_tags) >= _MAX_EVIDENCE_TAGS:
-                        break
-                proj_evidence["tags"] = _tags
-            else:
-                print(f"[obsidian-brain] git tag failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["tags"] = []
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] git tag error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["tags"] = []
-
-        # git log --name-only (#264 Task 2: changed file paths on the default
-        # branch's recent history). Completion may live in changed paths rather
-        # than a PR title (e.g. source/test/doc files landing under a shipped
-        # component's directory). Deduped and hard-capped so the evidence blob
-        # stays bounded regardless of commit size.
-        try:
-            proc = subprocess.run(
-                ["git", "log", "--name-only", "--pretty=format:", "-40"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                _seen_paths: set[str] = set()
-                _paths: list[str] = []
-                for _line in proc.stdout.strip().split("\n"):
-                    _line = _line.strip()
-                    if not _line or _line in _seen_paths:
-                        continue
-                    _seen_paths.add(_line)
-                    _paths.append(_line)
-                    if len(_paths) >= _MAX_EVIDENCE_CHANGED_PATHS:
-                        break
-                proj_evidence["changed_paths"] = _paths
-            else:
-                print(f"[obsidian-brain] git log --name-only failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["changed_paths"] = []
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] git log --name-only error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["changed_paths"] = []
-
-        # gh release list
-        try:
-            proc = subprocess.run(
-                ["gh", "release", "list", "--limit", "5"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                proj_evidence["releases"] = proc.stdout.strip().split("\n")[:5]
-            else:
-                print(f"[obsidian-brain] gh release list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] gh release error for {project}: {exc}", file=sys.stderr)
-
-        # gh pr list --state merged
-        try:
-            proc = subprocess.run(
-                ["gh", "pr", "list", "--state", "merged", "--limit", "20",
-                 "--json", "number,title,mergedAt,url"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                try:
-                    proj_evidence["merged_prs"] = json.loads(proc.stdout)
-                except json.JSONDecodeError as exc:
-                    print(f"[obsidian-brain] gh pr list JSON error for {project}: {exc}", file=sys.stderr)
-                    proj_evidence["merged_prs"] = []
-            else:
-                print(f"[obsidian-brain] gh pr list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["merged_prs"] = []
-        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-            print(f"[obsidian-brain] gh pr list error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["merged_prs"] = []
-
-        # gh issue list --state closed
-        try:
-            proc = subprocess.run(
-                ["gh", "issue", "list", "--state", "closed", "--limit", "20",
-                 "--json", "number,title,closedAt,body,url"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                try:
-                    proj_evidence["closed_issues"] = json.loads(proc.stdout)
-                except json.JSONDecodeError as exc:
-                    print(f"[obsidian-brain] gh issue list JSON error for {project}: {exc}", file=sys.stderr)
-                    proj_evidence["closed_issues"] = []
-            else:
-                print(f"[obsidian-brain] gh issue list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["closed_issues"] = []
-        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-            print(f"[obsidian-brain] gh issue list error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["closed_issues"] = []
-
-        # CHANGELOG.md excerpt
-        changelog_path = os.path.join(repo_path, "CHANGELOG.md")
-        if os.path.isfile(changelog_path):
+        if repo_path:
+            # git log (last 40 commits)
             try:
-                with open(changelog_path, 'r', encoding='utf-8', errors='replace') as f:
-                    proj_evidence["changelog_excerpt"] = f.read(2000)
-            except OSError:
-                pass
-
-        # FTS5 search for each open item scoped to THIS project
-        proj_items = [g["representative"] for g in all_groups if g["project"] == project]
-        fts_mentions: dict[str, int] = {}
-        for item_text in proj_items[:10]:  # cap to avoid excessive queries
-            kws = vault_index.extract_keywords(item_text, limit=3)
-            if kws:
-                # Pass keywords as space-separated (not "OR"-joined — search_vault
-                # handles tokenization internally; literal "OR" would be a search term)
-                hits = vault_index.search_vault(
-                    actual_db, " ".join(kws), project=project, limit=5,
+                proc = subprocess.run(
+                    ["git", "log", "--oneline", "-40"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
                 )
-                fts_mentions[item_text[:60]] = len(hits)
-        if fts_mentions:
-            proj_evidence["fts_mentions"] = fts_mentions
+                if proc.returncode == 0:
+                    proj_evidence["commits"] = proc.stdout.strip().split("\n")[:40]
+                else:
+                    print(f"[obsidian-brain] git log failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] git log error for {project}: {exc}", file=sys.stderr)
+
+            # git tag --list (#264 Task 2: widen git ground truth). A genuinely-
+            # shipped item may be grounded in a release tag rather than a PR/issue
+            # title (e.g. the reporter's `feature/pull-to-refresh-v2` case, shipped
+            # via tag v2.0.0 with no #N anchor in the checkbox text). Sorted by
+            # creation recency and capped/deduped to keep the evidence blob small.
+            try:
+                proc = subprocess.run(
+                    ["git", "tag", "--list", "--sort=-creatordate"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    _seen_tags: set[str] = set()
+                    _tags: list[str] = []
+                    for _line in proc.stdout.strip().split("\n"):
+                        _line = _line.strip()
+                        if not _line or _line in _seen_tags:
+                            continue
+                        _seen_tags.add(_line)
+                        _tags.append(_line)
+                        if len(_tags) >= _MAX_EVIDENCE_TAGS:
+                            break
+                    proj_evidence["tags"] = _tags
+                else:
+                    print(f"[obsidian-brain] git tag failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["tags"] = []
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] git tag error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["tags"] = []
+
+            # git log --name-only (#264 Task 2: changed file paths on the default
+            # branch's recent history). Completion may live in changed paths rather
+            # than a PR title (e.g. source/test/doc files landing under a shipped
+            # component's directory). Deduped and hard-capped so the evidence blob
+            # stays bounded regardless of commit size.
+            try:
+                proc = subprocess.run(
+                    ["git", "log", "--name-only", "--pretty=format:", "-40"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    _seen_paths: set[str] = set()
+                    _paths: list[str] = []
+                    for _line in proc.stdout.strip().split("\n"):
+                        _line = _line.strip()
+                        if not _line or _line in _seen_paths:
+                            continue
+                        _seen_paths.add(_line)
+                        _paths.append(_line)
+                        if len(_paths) >= _MAX_EVIDENCE_CHANGED_PATHS:
+                            break
+                    proj_evidence["changed_paths"] = _paths
+                else:
+                    print(f"[obsidian-brain] git log --name-only failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["changed_paths"] = []
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] git log --name-only error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["changed_paths"] = []
+
+            # gh release list
+            try:
+                proc = subprocess.run(
+                    ["gh", "release", "list", "--limit", "5"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    proj_evidence["releases"] = proc.stdout.strip().split("\n")[:5]
+                else:
+                    print(f"[obsidian-brain] gh release list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] gh release error for {project}: {exc}", file=sys.stderr)
+
+            # gh pr list --state merged
+            try:
+                proc = subprocess.run(
+                    ["gh", "pr", "list", "--state", "merged", "--limit", "20",
+                     "--json", "number,title,mergedAt,url"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    try:
+                        proj_evidence["merged_prs"] = json.loads(proc.stdout)
+                    except json.JSONDecodeError as exc:
+                        print(f"[obsidian-brain] gh pr list JSON error for {project}: {exc}", file=sys.stderr)
+                        proj_evidence["merged_prs"] = []
+                else:
+                    print(f"[obsidian-brain] gh pr list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["merged_prs"] = []
+            except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+                print(f"[obsidian-brain] gh pr list error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["merged_prs"] = []
+
+            # gh issue list --state closed
+            try:
+                proc = subprocess.run(
+                    ["gh", "issue", "list", "--state", "closed", "--limit", "20",
+                     "--json", "number,title,closedAt,body,url"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    try:
+                        proj_evidence["closed_issues"] = json.loads(proc.stdout)
+                    except json.JSONDecodeError as exc:
+                        print(f"[obsidian-brain] gh issue list JSON error for {project}: {exc}", file=sys.stderr)
+                        proj_evidence["closed_issues"] = []
+                else:
+                    print(f"[obsidian-brain] gh issue list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["closed_issues"] = []
+            except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+                print(f"[obsidian-brain] gh issue list error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["closed_issues"] = []
+
+            # CHANGELOG.md excerpt
+            changelog_path = os.path.join(repo_path, "CHANGELOG.md")
+            if os.path.isfile(changelog_path):
+                try:
+                    with open(changelog_path, 'r', encoding='utf-8', errors='replace') as f:
+                        proj_evidence["changelog_excerpt"] = f.read(2000)
+                except OSError:
+                    pass
+
+            # FTS5 search for each open item scoped to THIS project
+            proj_items = [g["representative"] for g in all_groups if g["project"] == project]
+            fts_mentions: dict[str, int] = {}
+            for item_text in proj_items[:10]:  # cap to avoid excessive queries
+                kws = vault_index.extract_keywords(item_text, limit=3)
+                if kws:
+                    # Pass keywords as space-separated (not "OR"-joined — search_vault
+                    # handles tokenization internally; literal "OR" would be a search term)
+                    hits = vault_index.search_vault(
+                        actual_db, " ".join(kws), project=project, limit=5,
+                    )
+                    fts_mentions[item_text[:60]] = len(hits)
+            if fts_mentions:
+                proj_evidence["fts_mentions"] = fts_mentions
+
+        else:
+            # #318 I3 ruling: note-completion evidence is gathered ONLY when
+            # there is no repo, not unconditionally for every project. This
+            # used to run outside the `if repo_path:` block above, so a
+            # repo-backed project's bundle carried note_completions
+            # ALONGSIDE git-derived keys -- note_evidence_only_for() (the MED
+            # cap) is a per-PROJECT flag, not per-verdict, so any git key
+            # being present at all (even an empty one) flips it False and a
+            # paraphrased note citation sharing a literal ref with the item
+            # text could reach HIGH and get auto-checked. Scoping this to
+            # repo-less projects makes the safety property unconditional: a
+            # note-derived verdict can never reach HIGH, full stop. This
+            # trades away the note-completion signal on repo-backed
+            # projects entirely (live dogfood found 6 of 7 real hits there)
+            # -- restoring it needs per-verdict provenance, not a per-project
+            # flag, and is a follow-up issue, not this branch.
+            try:
+                _note_done = gather_note_completion_evidence(
+                    vault_path, sessions_folder, project,
+                )
+            except OSError as exc:
+                print(f"[obsidian-brain] note-completion scan failed for "
+                      f"{project}: {exc}", file=sys.stderr)
+                _note_done = []
+            if _note_done:
+                proj_evidence["note_completions"] = _note_done
 
         if proj_evidence:
             evidence[project] = proj_evidence
             projects_with_evidence += 1
+
+    if projects and not projects_with_evidence:
+        print(
+            f"[obsidian-brain] WARNING: 0 of {len(projects)} project(s) "
+            f"produced any evidence. This run cannot classify anything as "
+            f"DONE; every item will read ACTIVE/REVIEW at tier LOW. This is "
+            f"a precondition failure, not a triage result.",
+            file=sys.stderr,
+        )
 
     # 5. Build output JSON
     output_data = {
@@ -1377,6 +1615,12 @@ def deep_analysis_pipeline(
             "group_count": len(all_groups),
         },
         "evidence": evidence,
+        "evidence_gaps": {
+            "projects_scanned": len(projects),
+            "projects_with_evidence": projects_with_evidence,
+            "projects_without_repo": projects_without_repo,
+            "all_projects_gapped": bool(projects) and projects_with_evidence == 0,
+        },
     }
 
     # Atomic write: tempfile + rename (ensure dir exists first)
@@ -1398,7 +1642,7 @@ def deep_analysis_pipeline(
 
     total = len(all_raw_items)
     groups = len(all_groups)
-    _result = f"OK:{total}:{groups}:{projects_with_evidence}"
+    _result = f"OK:{total}:{groups}:{projects_with_evidence}:{len(projects_without_repo)}"
     # Cache from in-memory output_data rather than re-reading the file on disk.
     # Re-reading could yield an empty string on a race or disk error, which
     # would make later cache hits silently rewrite output_path with empty JSON.
@@ -1808,6 +2052,40 @@ def merge_groups_semantically(coarse_groups):
             out.setdefault(g.get("project"), []).append(g)
         return out
     return surviving
+
+
+def merge_records_from_groups(groups) -> list:
+    """Derive `## Merged Groups` records from post-merge group dicts.
+
+    `merge_groups_semantically` returns surviving GROUPS (each carrying
+    `absorbed_reasoning`), not merge records -- so the dashboard's Merged
+    Groups section had no correct value to be passed and callers guessed
+    (#318 bug 3: a count was passed, raising TypeError). This adapts one
+    shape to the other.
+
+    Accepts the list form or the `{project: [groups]}` dict form that
+    `merge_groups_semantically(return_dict_shape=True)` returns.
+
+    Groups with no (or empty) `absorbed_reasoning` absorbed nothing and
+    produce no record.
+    """
+    if isinstance(groups, dict):
+        groups = [g for v in groups.values() for g in v]
+
+    records = []
+    for g in groups:
+        absorbed_reasoning = g.get("absorbed_reasoning") or []
+        if not absorbed_reasoning:
+            continue
+        absorbed_ids = [entry.get("absorbed") for entry in absorbed_reasoning]
+        reasons = [entry.get("reasoning", "") for entry in absorbed_reasoning
+                   if entry.get("reasoning")]
+        records.append({
+            "canonical_group_id": g.get("group_id"),
+            "absorbed_group_ids": absorbed_ids,
+            "reasoning": "; ".join(reasons),
+        })
+    return records
 
 
 def _check_items_workdir():

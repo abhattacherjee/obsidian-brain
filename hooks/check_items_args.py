@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 
 from obsidian_utils import get_workspace_roots
 
@@ -21,6 +22,12 @@ class Scope:
     show_all: bool = False
     dry_run: bool = False
     no_cache: bool = False
+    unknown_tokens: list[str] = field(default_factory=list)
+    # M2: the union of workspace-root and vault-index project names this
+    # parse computed, exposed so a caller building a "Did you mean"
+    # suggestion (SKILL.md Step 1) can reuse it instead of re-querying the
+    # vault index and re-walking every workspace root a second time.
+    known_projects: set[str] = field(default_factory=set)
 
 
 _WINDOW_RE = re.compile(r"^(\d+)d$")
@@ -39,11 +46,43 @@ def _known_projects():
     return projects
 
 
+def _vault_known_projects() -> set[str]:
+    """Project names that have session notes in the vault index.
+
+    A notes-only project (#318: `abhishek-work-vault`) has no directory
+    under any workspace root, so `_known_projects()` alone cannot recognise
+    it and `parse_scope` would drop its name. The vault index already
+    records one `project` per note, which is the authoritative list of
+    projects /check-items can actually triage.
+
+    Any failure (no index yet, unreadable DB, schema drift) returns an empty
+    set — the workspace-root list still works, so a lookup failure must
+    degrade rather than break argument parsing.
+    """
+    try:
+        import vault_index
+        conn = vault_index._connect(vault_index._default_db_path())
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT project FROM notes "
+                "WHERE project IS NOT NULL AND project != ''"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {str(r[0]) for r in rows if r and r[0]}
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        print(f"[check-items] vault project lookup unavailable: {exc}",
+              file=sys.stderr)
+        return set()
+
+
 def parse_scope(argv):
     """Parse argv tokens into a Scope. Flags and positionals are order-
-    independent. Unknown tokens are ignored."""
+    independent. Unknown tokens are recorded on scope.unknown_tokens rather
+    than silently dropped."""
     scope = Scope()
-    projects = _known_projects()
+    projects = _known_projects() | _vault_known_projects()
+    scope.known_projects = projects
     for tok in argv:
         if tok == "--show-all":
             scope.show_all = True
@@ -66,4 +105,5 @@ def parse_scope(argv):
             scope.mode = "project"
             scope.project = tok
             continue
+        scope.unknown_tokens.append(tok)
     return scope

@@ -1308,6 +1308,97 @@ def test_parse_scope_all_clears_stale_project(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Task 1 (issue #318) — parse_scope must not silently drop a positional
+# ---------------------------------------------------------------------------
+
+def test_parse_scope_records_unknown_token(monkeypatch):
+    """A positional matching no known project is recorded, not silently dropped."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects", lambda: set())
+    monkeypatch.setattr(check_items_args, "_vault_known_projects", lambda: set())
+    scope = check_items_args.parse_scope(["not-a-project"])
+    assert scope.unknown_tokens == ["not-a-project"]
+    assert scope.mode == "current"
+
+
+def test_parse_scope_no_unknown_tokens_for_valid_input(monkeypatch):
+    """Positive control: recognised flags/keywords must never be flagged as unknown."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects", lambda: set())
+    monkeypatch.setattr(check_items_args, "_vault_known_projects", lambda: set())
+    scope = check_items_args.parse_scope(["all", "30d", "--show-all"])
+    assert scope.unknown_tokens == []
+
+
+def test_parse_scope_accepts_vault_known_project(monkeypatch):
+    """A notes-only project (vault index, no workspace-root directory) still resolves."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects", lambda: set())
+    monkeypatch.setattr(check_items_args, "_vault_known_projects",
+                        lambda: {"notes-only-proj"})
+    scope = check_items_args.parse_scope(["notes-only-proj"])
+    assert scope.mode == "project"
+    assert scope.project == "notes-only-proj"
+    assert scope.unknown_tokens == []
+
+
+def test_parse_scope_vault_lookup_failure_is_not_fatal(monkeypatch, capsys):
+    """A broken vault index must degrade, not break argument parsing.
+
+    _known_projects is mocked too (matching test_parse_scope_project_name's
+    idiom above) rather than exercising the real filesystem scan: CI has
+    neither ~/dev/claude_workspace nor ~/projects, so an unmocked
+    get_workspace_roots() would return [] there and this test would fail
+    for reasons unrelated to what it's checking.
+
+    The failure is injected at the DB layer (vault_index._connect), the
+    actual production failure mode, rather than by replacing
+    _vault_known_projects wholesale — that exercises the real internal
+    try/except in _vault_known_projects instead of a call-site guard that
+    only a test double could ever trigger (Fix round 1, Finding C1).
+    """
+    import check_items_args
+    import vault_index
+
+    def _raise(db_path):
+        raise RuntimeError("vault index unavailable")
+
+    monkeypatch.setattr(check_items_args, "_known_projects",
+                        lambda: {"obsidian-brain"})
+    monkeypatch.setattr(vault_index, "_connect", _raise)
+    scope = check_items_args.parse_scope(["obsidian-brain"])
+    assert scope.mode == "project"
+    assert scope.project == "obsidian-brain"
+    assert "vault project lookup unavailable" in capsys.readouterr().err
+
+
+def test_parse_scope_unknown_token_order_independent(monkeypatch):
+    """An unknown token must not short-circuit parsing of tokens after it."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects", lambda: set())
+    monkeypatch.setattr(check_items_args, "_vault_known_projects", lambda: set())
+    scope = check_items_args.parse_scope(["30d", "bogus", "--dry-run"])
+    assert scope.window_days == 30
+    assert scope.dry_run is True
+    assert scope.unknown_tokens == ["bogus"]
+
+
+def test_parse_scope_exposes_known_projects_for_reuse(monkeypatch):
+    """M2: parse_scope must expose the project set it already computed
+    (scope.known_projects) so a caller building a 'Did you mean'
+    suggestion doesn't have to re-query the vault index and re-walk every
+    workspace root a second time -- see skills/check-items/SKILL.md Step 1,
+    which used to do exactly that."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects",
+                        lambda: {"obsidian-brain", "cc-token-router"})
+    monkeypatch.setattr(check_items_args, "_vault_known_projects",
+                        lambda: {"notes-only-proj"})
+    scope = check_items_args.parse_scope(["30d"])
+    assert scope.known_projects == {"obsidian-brain", "cc-token-router", "notes-only-proj"}
+
+
+# ---------------------------------------------------------------------------
 # verify_before_edit — Stage 6 pre-Edit guard
 # ---------------------------------------------------------------------------
 
@@ -1498,8 +1589,144 @@ def test_dashboard_body_includes_review_section(tmp_path):
     content = open(path).read()
     assert "pull-to-refresh-v2" in content
     assert "review: 1" in content
-    # REVIEW must never be auto-checked — it always renders as an open box.
+    # Unapplied items render unchecked regardless of classification (#318
+    # Task 6) -- this fixture carries no "applied" key, so it renders open.
     assert "- [ ] Return to feature/pull-to-refresh-v2" in content
+
+
+# ---------------------------------------------------------------------------
+# #318 Task 6 — applied items render as applied, by fact not by class.
+# ---------------------------------------------------------------------------
+
+def test_applied_review_item_renders_checked(tmp_path):
+    """A REVIEW classification the user opted into checkoff (applied: True,
+    stamped by Step 8's primary-flip loop) must render `- [x]`, even though
+    REVIEW is never auto-checked by classification alone."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "REVIEW",
+         "canonical_text": "Ship the thing", "evidence_citation": None,
+         "applied": True},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=1, group_count=1,
+        classifications=classifications,
+        applied=1, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "- [x] Ship the thing" in body
+
+
+def test_unapplied_done_item_renders_unchecked(tmp_path):
+    """POSITIVE CONTROL: a DONE classification with no `applied` key must
+    render `- [ ]`, not `- [x]` -- this is what stops the by-fact fix from
+    marking everything checked (DONE no longer means auto-checked)."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "DONE",
+         "canonical_text": "Deselected done item", "evidence_citation": "PR #1"},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=1, group_count=1,
+        classifications=classifications,
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "- [ ] Deselected done item" in body
+    assert "- [x] Deselected done item" not in body
+
+
+def test_done_heading_counts_only_applied_done_items(tmp_path):
+    """The ## Done heading must count applied DONE items, not the run's
+    total applied count -- an applied REVIEW flip must not inflate it."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "DONE",
+         "canonical_text": "Applied done item", "evidence_citation": "PR #1",
+         "applied": True},
+        {"group_id": "g2", "classification": "REVIEW",
+         "canonical_text": "Applied review item", "evidence_citation": None,
+         "applied": True},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=2, group_count=2,
+        classifications=classifications,
+        applied=2, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "## Done (1 applied of 1 classified)" in body
+
+
+def test_applied_elsewhere_line_names_non_done_flips(tmp_path):
+    """The applied REVIEW flip from the fixture above must not vanish from
+    the arithmetic once the ## Done heading stops over-counting -- a summary
+    line must name it."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "DONE",
+         "canonical_text": "Applied done item", "evidence_citation": "PR #1",
+         "applied": True},
+        {"group_id": "g2", "classification": "REVIEW",
+         "canonical_text": "Applied review item", "evidence_citation": None,
+         "applied": True},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=2, group_count=2,
+        classifications=classifications,
+        applied=2, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "1" in body
+    assert "applied outside DONE" in body
+
+
+def test_applied_outside_done_derived_from_stamps_not_subtraction(tmp_path):
+    """#318 I2: the "additional flips applied outside DONE" count must come
+    from counting stamped records outside DONE, not from `applied -
+    done_applied`. Fixture: applied (run total) is inflated to 5 with only
+    one REVIEW record actually stamped applied=True outside DONE -- the
+    old subtraction form would have printed "4 additional flips applied
+    outside DONE" (5 - 1) though only ONE record anywhere outside DONE
+    renders checked. The correct, fact-derived count is 1."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "DONE",
+         "canonical_text": "Applied done item", "evidence_citation": "PR #1",
+         "applied": True},
+        {"group_id": "g2", "classification": "REVIEW",
+         "canonical_text": "Applied review item", "evidence_citation": None,
+         "applied": True},
+        {"group_id": "g3", "classification": "NEEDS-ACTION",
+         "canonical_text": "Unapplied needs-action item", "evidence_citation": None},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=3, group_count=3,
+        classifications=classifications,
+        applied=5, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "1 additional flip applied outside DONE" in body
+    assert "4 additional flip" not in body
 
 
 def test_dashboard_idempotent_overwrite(tmp_path):
@@ -1549,6 +1776,249 @@ def test_dashboard_active_truncation_and_path_guard(tmp_path):
     src = open(cr.__file__).read()
     assert "is_relative_to" in src
     assert "refusing to write outside" in src
+
+
+# ---------------------------------------------------------------------------
+# #318 Task 5 — merge_records_from_groups: adapt merge_groups_semantically's
+# surviving-groups shape (absorbed_reasoning) to the dashboard's merge-record
+# shape (canonical_group_id/absorbed_group_ids/reasoning).
+# ---------------------------------------------------------------------------
+
+def test_merge_records_from_groups_reconstructs_records():
+    """A single canonical group with one absorbed entry -> one record."""
+    groups = [
+        {"group_id": "ob-1",
+         "absorbed_reasoning": [{"absorbed": "ob-2", "reasoning": "same fix"}]},
+    ]
+    records = oid.merge_records_from_groups(groups)
+    assert records == [
+        {"canonical_group_id": "ob-1", "absorbed_group_ids": ["ob-2"],
+         "reasoning": "same fix"},
+    ]
+
+
+def test_merge_records_groups_multiple_absorbed_under_one_canonical():
+    """Two absorbed_reasoning entries under one canonical -> ONE record
+    carrying both absorbed ids (in order) and both reasons joined."""
+    groups = [
+        {"group_id": "ob-1", "absorbed_reasoning": [
+            {"absorbed": "ob-2", "reasoning": "same fix"},
+            {"absorbed": "ob-3", "reasoning": "same fix too"},
+        ]},
+    ]
+    records = oid.merge_records_from_groups(groups)
+    assert records == [
+        {"canonical_group_id": "ob-1", "absorbed_group_ids": ["ob-2", "ob-3"],
+         "reasoning": "same fix; same fix too"},
+    ]
+
+
+def test_merge_records_empty_for_unmerged_groups():
+    """POSITIVE CONTROL: groups that never absorbed anything (no key, or an
+    empty absorbed_reasoning list) must produce NO records -- a function
+    that always emits a record for every group would pass the other tests
+    while saying nothing here."""
+    groups = [
+        {"group_id": "ob-1"},
+        {"group_id": "ob-2", "absorbed_reasoning": []},
+    ]
+    assert oid.merge_records_from_groups(groups) == []
+
+
+def test_merge_records_from_groups_accepts_dict_shape():
+    """merge_groups_semantically(return_dict_shape=True) returns
+    {project: [groups]} -- merge_records_from_groups must flatten that
+    before deriving records, same output as the flat-list form."""
+    groups_by_proj = {
+        "proj-a": [
+            {"group_id": "ob-1",
+             "absorbed_reasoning": [{"absorbed": "ob-2", "reasoning": "same fix"}]},
+        ],
+        "proj-b": [{"group_id": "ob-9"}],
+    }
+    records = oid.merge_records_from_groups(groups_by_proj)
+    assert records == [
+        {"canonical_group_id": "ob-1", "absorbed_group_ids": ["ob-2"],
+         "reasoning": "same fix"},
+    ]
+
+
+def test_dashboard_renders_merge_records(tmp_path):
+    """Records shaped by merge_records_from_groups render in the dashboard
+    body's Merged Groups section."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    groups = [
+        {"group_id": "ob-1",
+         "absorbed_reasoning": [{"absorbed": "ob-2", "reasoning": "same fix"}]},
+    ]
+    records = oid.merge_records_from_groups(groups)
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=2, group_count=1, classifications=[],
+        applied=0, cascaded=0, merges=records, semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "ob-1 absorbs [ob-2]" in body
+
+
+def test_dashboard_tolerates_int_merges(tmp_path):
+    """A caller passing a count instead of a list of records (#318 bug 3)
+    must not crash -- and the resulting warning must name the bad input
+    (type + repr), not silently coerce to [] and read as 'no merges this
+    run', which would hide the caller bug."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=3, semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "Merged Groups unavailable" in body
+    # Names the bad input specifically, not just a generic failure sentence.
+    assert "int" in body
+    assert "(3)" in body
+
+
+def test_dashboard_tolerates_huge_merges_repr_truncated(tmp_path):
+    """#318 M7: a bad `merges` value's repr is unbounded -- a caller could
+    pass a giant string or a deeply nested structure, not just a bare int.
+    The warning must cap the repr length and say so, rather than writing
+    an unbounded blob into a kept artefact."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    huge_bad_value = "x" * 5000
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=huge_bad_value, semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "Merged Groups unavailable" in body
+    assert "(truncated)" in body
+    assert "x" * 5000 not in body
+    # The full 5000-char blob must not have leaked into the kept artefact.
+    assert len(body) < 5000
+
+
+def test_dashboard_tolerates_none_merges(tmp_path):
+    """merges=None is a legitimate 'nothing to report' -- renders the plain
+    fallback with NO warning line (unlike the int case above)."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=None, semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "_No semantic merges this run._" in body
+    assert "Merged Groups unavailable" not in body
+
+
+# ---------------------------------------------------------------------------
+# #318 Task 5, Step 5.5 — ## Evidence Gaps dashboard section (Preflight R3):
+# the artefact half of the warning Task 3 already put on stderr.
+# ---------------------------------------------------------------------------
+
+def test_dashboard_renders_evidence_gap_section(tmp_path):
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    evidence_gaps = {
+        "projects_scanned": 1, "projects_with_evidence": 0,
+        "projects_without_repo": ["notes-only"], "all_projects_gapped": True,
+    }
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True, evidence_gaps=evidence_gaps,
+    )
+    body = open(path).read()
+    assert "## Evidence Gaps" in body
+    assert "notes-only" in body
+    assert "DONE" in body and "unreachable" in body
+
+
+def test_dashboard_omits_gap_section_when_no_gaps(tmp_path):
+    """POSITIVE CONTROL: an evidence_gaps dict with no actual gaps must NOT
+    render the section -- a section that always renders would pass the
+    test above while saying nothing."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    evidence_gaps = {
+        "projects_scanned": 1, "projects_with_evidence": 1,
+        "projects_without_repo": [], "all_projects_gapped": False,
+    }
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True, evidence_gaps=evidence_gaps,
+    )
+    body = open(path).read()
+    assert "## Evidence Gaps" not in body
+
+
+def test_dashboard_gap_frontmatter_field(tmp_path):
+    """The frontmatter carries evidence_gaps: N (Dataview-queryable), even
+    when N is 0 for a caller who passed a real (gap-free) dict -- distinct
+    from the argument being omitted entirely (see the no-op test below)."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+
+    gapped = {
+        "projects_scanned": 1, "projects_with_evidence": 0,
+        "projects_without_repo": ["notes-only"], "all_projects_gapped": True,
+    }
+    p1 = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True, evidence_gaps=gapped,
+    )
+    assert "evidence_gaps: 1" in open(p1).read()
+
+    no_gaps = {
+        "projects_scanned": 1, "projects_with_evidence": 1,
+        "projects_without_repo": [], "all_projects_gapped": False,
+    }
+    p2 = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="y", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True, evidence_gaps=no_gaps,
+    )
+    assert "evidence_gaps: 0" in open(p2).read()
+
+
+def test_dashboard_without_evidence_gaps_argument_is_unchanged(tmp_path):
+    """Every existing caller omits evidence_gaps entirely -- the default
+    must be a true no-op: no heading, no frontmatter key, no exception."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True,
+    )
+    content = open(path).read()
+    assert "## Evidence Gaps" not in content
+    assert "evidence_gaps:" not in content
 
 
 # ---------------------------------------------------------------------------
@@ -2200,3 +2670,135 @@ def test_check_items_report_empty_string_folder_uses_default(tmp_path, monkeypat
         )
     finally:
         _reset_load_config_cache()
+
+
+# ---------------------------------------------------------------------------
+# #318 Task 7 — plugin install version-skew probe (preflight ruling R5:
+# enumerate installs and report divergence; a skill cannot introspect which
+# copy of itself Claude Code loaded, so CLAUDE_PLUGIN_ROOT-gated comparison
+# was replaced with this). Every test drives injected paths only -- never
+# this machine's real ~/.claude/plugins -- so the suite stays hermetic.
+# ---------------------------------------------------------------------------
+
+def _write_plugin_manifest(root, version, nested=".claude-plugin"):
+    """Write a minimal plugin.json manifest under `root`, at `root/nested/
+    plugin.json` (nested="." for the bare `root/plugin.json` rung)."""
+    d = root / nested if nested != "." else root
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "plugin.json").write_text(json.dumps({"name": "obsidian-brain", "version": version}))
+
+
+def test_divergent_installs_are_reported(tmp_path):
+    """Two installs at different versions -> a string naming both and
+    marking which one is resolved."""
+    import obsidian_utils
+
+    old = tmp_path / "cache-3.4.1"
+    new = tmp_path / "cache-3.5.1"
+    _write_plugin_manifest(old, "3.4.1")
+    _write_plugin_manifest(new, "3.5.1")
+
+    msg = obsidian_utils.describe_plugin_install_divergence(
+        install_paths=[str(old), str(new)], resolved_path=str(new)
+    )
+    assert msg is not None
+    assert "3.4.1" in msg
+    assert "3.5.1" in msg
+    assert "resolved" in msg.lower()
+
+
+def test_resolved_marker_picks_the_resolved_path_not_every_matching_version(tmp_path):
+    """M1: two installs can share the SAME version as the executing one
+    (e.g. a directory-source checkout and a cache entry both at the
+    current release) while only one of them is the install actually
+    imported. Marking by version equality tags every same-version entry
+    "(resolved)"; marking by path must tag only the real one.
+
+    `resolved_path` here is a hooks/ subdirectory NESTED under one of the
+    plugin roots in install_paths -- the shape describe_plugin_install_divergence
+    sees by default in a real run (resolved_path is a hooks dir; install_paths
+    entries are plugin roots one level up) -- so this also proves the
+    containment check, not just exact string equality."""
+    import obsidian_utils
+
+    resolved_root = tmp_path / "install-resolved"
+    other_same_version = tmp_path / "install-same-version-not-resolved"
+    stale = tmp_path / "install-stale"
+    _write_plugin_manifest(resolved_root, "3.5.1")
+    _write_plugin_manifest(other_same_version, "3.5.1")
+    _write_plugin_manifest(stale, "3.4.1")
+
+    resolved_hooks_dir = resolved_root / "hooks"
+    resolved_hooks_dir.mkdir(parents=True, exist_ok=True)
+
+    msg = obsidian_utils.describe_plugin_install_divergence(
+        install_paths=[str(resolved_root), str(other_same_version), str(stale)],
+        resolved_path=str(resolved_hooks_dir),
+    )
+    assert msg is not None
+    assert f"3.5.1 at {resolved_root} (resolved)" in msg
+    assert f"3.5.1 at {other_same_version}" in msg
+    assert f"3.5.1 at {other_same_version} (resolved)" not in msg
+
+
+def test_matching_installs_return_none(tmp_path):
+    """POSITIVE CONTROL: two installs at the SAME version -> None. Without
+    this, a probe hardcoded to always warn would still pass the divergence
+    test above."""
+    import obsidian_utils
+
+    a = tmp_path / "install-a"
+    b = tmp_path / "install-b"
+    _write_plugin_manifest(a, "3.5.1")
+    _write_plugin_manifest(b, "3.5.1")
+
+    msg = obsidian_utils.describe_plugin_install_divergence(
+        install_paths=[str(a), str(b)], resolved_path=str(a)
+    )
+    assert msg is None
+
+
+def test_single_install_returns_none(tmp_path):
+    """A single install cannot diverge from anything."""
+    import obsidian_utils
+
+    only = tmp_path / "install-only"
+    _write_plugin_manifest(only, "3.5.1")
+
+    msg = obsidian_utils.describe_plugin_install_divergence(
+        install_paths=[str(only)], resolved_path=str(only)
+    )
+    assert msg is None
+
+
+def test_unreadable_manifest_is_skipped_not_fatal(tmp_path):
+    """One valid install plus one with no manifest at all -> None (one
+    readable version means no divergence) and must not raise."""
+    import obsidian_utils
+
+    valid = tmp_path / "install-valid"
+    _write_plugin_manifest(valid, "3.5.1")
+    no_manifest = tmp_path / "install-no-manifest"
+    no_manifest.mkdir()
+
+    msg = obsidian_utils.describe_plugin_install_divergence(
+        install_paths=[str(valid), str(no_manifest)], resolved_path=str(valid)
+    )
+    assert msg is None
+
+
+def test_manifest_found_via_parent_rung(tmp_path):
+    """This repo keeps its manifest at `.claude-plugin/plugin.json` with
+    hooks one level down -- _read_plugin_version(hooks_dir) must climb to
+    the parent to find it (Ruling R4, retained), or the resolved install
+    reads as unknown and every divergence check above is inert against
+    the real repo layout even though tests 1-4 all still pass."""
+    import obsidian_utils
+
+    root = tmp_path / "repo-root"
+    _write_plugin_manifest(root, "3.5.1")
+    hooks_dir = root / "hooks"
+    hooks_dir.mkdir(parents=True)
+
+    version = obsidian_utils._read_plugin_version(str(hooks_dir))
+    assert version == "3.5.1"

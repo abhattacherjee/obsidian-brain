@@ -31,7 +31,8 @@ def _safe_filename_component(s: str) -> str:
 
 def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
                  classifications, applied, cascaded,
-                 semantic_merge_mode, classifier_mode, skipped=0):
+                 semantic_merge_mode, classifier_mode, skipped=0,
+                 evidence_gaps=None):
     counts = {"done": 0, "needs_action": 0, "stale": 0, "active": 0, "review": 0}
     for c in classifications:
         kind = c.get("classification", "")
@@ -44,6 +45,14 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
     # could inject extra YAML fields.
     safe_scope = _safe_filename_component(scope_name)
     safe_date = _safe_filename_component(date_str)
+    # evidence_gaps is None for every caller that doesn't pass it (a true
+    # no-op) vs. a dict (even one with no actual gaps) for a caller that
+    # does -- so the frontmatter key itself, not just its value, signals
+    # whether this run evaluated evidence-gap coverage at all.
+    gap_line = ""
+    if evidence_gaps is not None:
+        gap_count = len(evidence_gaps.get("projects_without_repo") or [])
+        gap_line = f"evidence_gaps: {gap_count}\n"
     return (
         "---\n"
         "type: claude-check-items-report\n"
@@ -63,6 +72,7 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
         f"applied: {applied}\n"
         f"cascaded: {cascaded}\n"
         f"skipped: {skipped}\n"
+        f"{gap_line}"
         "tags:\n"
         "  - claude/check-items\n"
         f"  - claude/project/{safe_scope}\n"
@@ -71,7 +81,8 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
 
 
 def _body(scope_name, date_str, window_days, raw_count, group_count,
-          classifications, applied, cascaded, merges, skipped=0):
+          classifications, applied, cascaded, merges, skipped=0,
+          evidence_gaps=None):
     by_kind = {"DONE": [], "NEEDS-ACTION": [], "STALE": [], "ACTIVE": [], "REVIEW": []}
     for c in classifications:
         by_kind.setdefault(c.get("classification", "ACTIVE"), []).append(c)
@@ -88,27 +99,72 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     )
     parts.append("")
 
-    parts.append(f"## Done ({applied} applied of {len(by_kind['DONE'])} classified)")
+    # #318 Task 6: a record renders `- [x]` when c.get("applied") is truthy,
+    # by FACT not by classification -- in every checkbox section below. A
+    # DONE verdict the user deselected (never reached Step 8's primary-flip
+    # loop) must render unchecked; a REVIEW/NEEDS-ACTION item the user
+    # opted into checkoff and Step 8 actually flipped must render checked.
+    # The vault has always been correct here; only this report used to lie
+    # by rendering DONE as always-checked and everything else as
+    # always-unchecked regardless of what was actually applied.
+    done_applied = sum(1 for c in by_kind["DONE"] if c.get("applied"))
+    # #318 I2: derive the "outside DONE" count the SAME way done_applied is
+    # derived -- from the per-record `applied` stamps themselves, never by
+    # subtracting the caller's `applied` run-total from done_applied. The
+    # subtraction form let the report print "N additional flips applied
+    # outside DONE" while nothing outside DONE actually rendered checked
+    # (an unstamped applied total), or vice versa.
+    #
+    # N1: an earlier version of this also compared `applied` against
+    # `done_applied + stamped_outside_done` and warned on a mismatch.
+    # Removed: Step 9 derives `applied` as
+    # `sum(1 for c in classifications if c.get("applied"))` over the SAME
+    # `classifications` list `by_kind` partitions here, which makes that
+    # comparison tautologically equal on every real call -- 300 randomised
+    # classification lists through Step 9's own derivation never rendered
+    # it once. `applied` staying a distinct argument (rather than being
+    # recomputed here) is deliberate -- it documents that a future caller
+    # COULD pass an independently-tracked total -- but inventing one here
+    # to keep a warning alive would manufacture an input, not guard one.
+    stamped_outside_done = sum(
+        1 for kind, items in by_kind.items() if kind != "DONE"
+        for c in items if c.get("applied")
+    )
+
+    parts.append(f"## Done ({done_applied} applied of {len(by_kind['DONE'])} classified)")
     for c in by_kind["DONE"]:
-        parts.append(f"- [x] {c.get('canonical_text', '')}")
+        mark = "x" if c.get("applied") else " "
+        parts.append(f"- [{mark}] {c.get('canonical_text', '')}")
         parts.append(f"  - Evidence: {c.get('evidence_citation') or 'n/a'}")
+    if stamped_outside_done > 0:
+        _plural = "" if stamped_outside_done == 1 else "s"
+        parts.append(f"_{stamped_outside_done} additional flip{_plural} applied outside DONE "
+                     f"(see Needs-Action/Review sections below)._")
     parts.append("")
 
-    parts.append(f"## Needs-Action ({len(by_kind['NEEDS-ACTION'])} surfaced, not applied)")
+    # M4: "surfaced" / "needs a human look" no longer claim "not applied" --
+    # a NEEDS-ACTION or REVIEW row CAN render `- [x]` (#318 Task 6), so a
+    # heading asserting the opposite would contradict its own rows.
+    parts.append(f"## Needs-Action ({len(by_kind['NEEDS-ACTION'])} surfaced)")
     for c in by_kind["NEEDS-ACTION"]:
-        parts.append(f"- [ ] {c.get('canonical_text', '')}")
+        mark = "x" if c.get("applied") else " "
+        parts.append(f"- [{mark}] {c.get('canonical_text', '')}")
         parts.append(f"  - Evidence: {c.get('evidence_citation') or 'n/a'}")
         if c.get("action_required"):
             parts.append(f"  - Action: `{c['action_required']}`")
     parts.append("")
 
     # REVIEW: names a shipped-looking component/branch/feature but has no
-    # citable anchor — surfaced for human judgement, never auto-checked
-    # (#264 Task 1). Always rendered here regardless of --show-all; unlike
-    # ACTIVE its evidence_citation is never scrubbed upstream.
-    parts.append(f"## Review ({len(by_kind['REVIEW'])} needs a human look, not applied)")
+    # citable anchor — surfaced for human judgement, never AUTO-checked by
+    # classification alone (#264 Task 1). It CAN render checked when the
+    # user explicitly opted it into checkoff and Step 8 actually flipped it
+    # (#318 Task 6, c.get("applied")) -- always rendered here regardless of
+    # --show-all; unlike ACTIVE its evidence_citation is never scrubbed
+    # upstream.
+    parts.append(f"## Review ({len(by_kind['REVIEW'])} needs a human look)")
     for c in by_kind["REVIEW"]:
-        parts.append(f"- [ ] {c.get('canonical_text', '')}")
+        mark = "x" if c.get("applied") else " "
+        parts.append(f"- [{mark}] {c.get('canonical_text', '')}")
         parts.append(f"  - Weak signal: {c.get('evidence_citation') or 'n/a'}")
     parts.append("")
 
@@ -125,6 +181,33 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     parts.append("")
 
     parts.append("## Merged Groups")
+    # merges must be a list of merge records (see
+    # open_item_dedup.merge_records_from_groups()). A caller that passes
+    # anything else -- e.g. a bare count (#318 bug 3) -- must not crash the
+    # whole dashboard write, and the mistake must be visible in the
+    # artefact rather than silently coerced to "no merges this run".
+    merge_warning = None
+    if merges is None:
+        merges = []
+    elif not isinstance(merges, (list, tuple)):
+        # M7: the repr of an arbitrary bad-input value is unbounded -- cap
+        # it before it lands in a kept artefact (a caller could pass a
+        # multi-MB string or a deeply nested structure, not just a bare int).
+        _MAX_MERGES_REPR = 200
+        _merges_repr = repr(merges)
+        if len(_merges_repr) > _MAX_MERGES_REPR:
+            _merges_repr = _merges_repr[:_MAX_MERGES_REPR] + "... (truncated)"
+        merge_warning = (
+            f"could not render merges: expected a list of merge records, got "
+            f"{type(merges).__name__} ({_merges_repr}) — see open_item_dedup."
+            f"merge_records_from_groups()"
+        )
+        merges = []
+    else:
+        merges = [m for m in merges if isinstance(m, dict)]
+
+    if merge_warning:
+        parts.append(f"**Merged Groups unavailable** — {merge_warning}")
     if not merges:
         parts.append("_No semantic merges this run._")
     else:
@@ -133,6 +216,23 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
             absorbed = ", ".join(m.get("absorbed_group_ids", []))
             parts.append(f"- {cid} absorbs [{absorbed}] — {m.get('reasoning', '')}")
     parts.append("")
+
+    # #318 Task 5 Step 5.5 (Preflight R3): the artefact half of the
+    # git-evidence-gap warning Task 3 already puts on stderr. Rendered only
+    # when there's an actual gap to report -- an unconditional section
+    # would say nothing (see test_dashboard_omits_gap_section_when_no_gaps).
+    if evidence_gaps and evidence_gaps.get("projects_without_repo"):
+        parts.append("## Evidence Gaps")
+        if evidence_gaps.get("all_projects_gapped"):
+            parts.append(
+                "This run could not classify anything as DONE for ANY "
+                "project — a precondition failure (no git evidence "
+                "available for any scanned project), not a triage result."
+            )
+        for proj in evidence_gaps["projects_without_repo"]:
+            parts.append(f"- {proj}: DONE was unreachable (no git repo "
+                         f"evidence available for this project).")
+        parts.append("")
 
     return "\n".join(parts)
 
@@ -153,6 +253,7 @@ def write_check_items_dashboard(
     classifier_mode,
     dry_run,
     skipped=0,
+    evidence_gaps=None,
 ):
     """
     Write the check-items dashboard report and return the path.
@@ -161,6 +262,13 @@ def write_check_items_dashboard(
     ``skipped`` (#320 F1) is the count of cascade candidates that were
     refused or lost (drifted, unverifiable, checkbox-gone, or a failed
     write) — optional with a 0 default so existing callers are unaffected.
+
+    ``evidence_gaps`` (#318 Task 5 Step 5.5) is an optional dict with
+    ``projects_scanned``, ``projects_with_evidence``,
+    ``projects_without_repo`` (list of project names), and
+    ``all_projects_gapped`` (bool). None (the default) is a true no-op —
+    every existing caller omits it, so it must render nothing and add no
+    frontmatter key.
     """
     # Folder name comes from user config. Reject empty / absolute / parent-
     # escape values explicitly, and anchor the containment check on
@@ -197,9 +305,11 @@ def write_check_items_dashboard(
     # markdown headings with newlines/colons.
     content = (_frontmatter(safe_scope, date_str, window_days, raw_count, group_count,
                             classifications, applied, cascaded,
-                            semantic_merge_mode, classifier_mode, skipped=skipped)
+                            semantic_merge_mode, classifier_mode, skipped=skipped,
+                            evidence_gaps=evidence_gaps)
                + _body(safe_scope, date_str, window_days, raw_count, group_count,
-                       classifications, applied, cascaded, merges, skipped=skipped))
+                       classifications, applied, cascaded, merges, skipped=skipped,
+                       evidence_gaps=evidence_gaps))
 
     tmp = tempfile.NamedTemporaryFile(
         mode="w", delete=False, dir=str(target_dir),

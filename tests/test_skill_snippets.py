@@ -1,5 +1,6 @@
 """Validate python3 -c '...' snippets in all SKILL.md files compile without SyntaxError."""
 
+import ast
 import glob
 import os
 import re
@@ -489,6 +490,494 @@ def test_check_items_heads_handoff_key_matches():
         f"partition.json heads-key mismatch: Step 3 writes "
         f"{write.group(1)!r} but Step 10 reads {read.group(1)!r} — every "
         "cache update would be silently skipped"
+    )
+
+
+_PYEOF_HEREDOC_RE = re.compile(r"<< 'PYEOF'\n(.*?)\nPYEOF", re.DOTALL)
+
+
+def _read_step6_heredoc():
+    """Extract the Step 6 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md — the classifier fallback-chain block
+    (agent -> heuristic gap-fill -> cache-merge), distinguished from the
+    other 6 same-delimiter PYEOF blocks (see _read_step7_heredoc's
+    docstring) by the presence of `classify_groups_with_agent`, which is
+    unique to Step 6.
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step6_blocks = [b for b in blocks if "classify_groups_with_agent" in b]
+    assert len(step6_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"classify_groups_with_agent, found {len(step6_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step6_blocks[0]
+
+
+def _dict_has_pair(node, key_value, val_value):
+    """True if an ast.Dict literal has a Constant `key_value: val_value`
+    entry. Zips node.keys/node.values directly (parallel lists, same order,
+    same length by construction) rather than building a plain dict from
+    them first — several of this dict's other entries are Call nodes
+    (`g.get(...)`), not Constants, so a naive `dict(zip(...))` collapse
+    would still work here, but zipping keeps the intent explicit: we are
+    looking for one specific, unambiguous (key, value) pair, not building a
+    general-purpose lookup."""
+    for k, v in zip(node.keys, node.values):
+        if (
+            isinstance(k, ast.Constant) and k.value == key_value
+            and isinstance(v, ast.Constant) and v.value == val_value
+        ):
+            return True
+    return False
+
+
+def _dict_key_names(node):
+    """Constant string keys of an ast.Dict literal (skips any non-Constant
+    key, though this codebase never uses one)."""
+    return {k.value for k in node.keys if isinstance(k, ast.Constant)}
+
+
+def test_check_items_step6_cache_merge_stamps_note_evidence_only():
+    """#318 fix round 4 (F12, CRITICAL): the cache-merge block that replays
+    a cached classification for a `known_unchanged` group must stamp
+    note_evidence_only onto the constructed dict.
+
+    Without it, Step 7's `item.get("note_evidence_only", False)` silently
+    defaults to False on the missing key -- and classifier_source="cache"
+    IS a member of _HIGH_TRUST_SOURCES, so a cached DONE citation sharing a
+    literal #N with the item text reaches HIGH and gets auto-checked, on
+    EVERY re-run of the command after the first (the run that populated the
+    cache). This is worse than the original F1/F7 defect: the first run is
+    safe, the cached replay silently is not.
+
+    Parsed with `ast`, not a substring search: walks for the ast.Dict
+    literal carrying the Constant pair `"classifier_source": "cache"` (the
+    one cache-merge dict in this block -- Step 6's other classifications
+    all flow through classify_groups_with_agent / classify_groups_heuristic,
+    neither of which constructs a literal dict inline here), and asserts
+    "note_evidence_only" is among that dict's keys. A regex for the bare
+    substring "note_evidence_only" would be satisfied by a comment or an
+    unrelated dict elsewhere in the block.
+    """
+    source = _read_step6_heredoc()
+    tree = ast.parse(source)
+
+    cache_dicts = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        and _dict_has_pair(node, "classifier_source", "cache")
+    ]
+    assert len(cache_dicts) == 1, (
+        f"expected exactly one dict literal with "
+        f'"classifier_source": "cache" in Step 6\'s heredoc, found '
+        f"{len(cache_dicts)}"
+    )
+    assert "note_evidence_only" in _dict_key_names(cache_dicts[0]), (
+        "Step 6's cache-merge dict does not stamp note_evidence_only -- "
+        f"found keys {sorted(_dict_key_names(cache_dicts[0]))!r}. Without "
+        "it, every cached (classifier_source=\"cache\", a high-trust "
+        "source) verdict for a note-only project defaults "
+        "note_evidence_only=False at Step 7 and can reach HIGH again "
+        "(#318 F12)."
+    )
+
+
+def _read_step5_heredoc():
+    """Extract the Step 5 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md -- the evidence-gathering block, distinguished
+    from the other 6 same-delimiter PYEOF blocks by the presence of
+    `deep_analysis_pipeline(`, which is unique to Step 5 (Step 5's `from
+    open_item_dedup import deep_analysis_pipeline` line contains the bare
+    name without a paren, but the call site `status = deep_analysis_pipeline(`
+    is the actual invocation and appears nowhere else).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step5_blocks = [b for b in blocks if "deep_analysis_pipeline(" in b]
+    assert len(step5_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"deep_analysis_pipeline(, found {len(step5_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step5_blocks[0]
+
+
+def _is_dict_get_call(node, dict_name, key_value):
+    """True if `node` is a Call matching `<dict_name>.get(<key_value>, ...)`."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == dict_name
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == key_value
+    )
+
+
+def test_check_items_step5_extracts_evidence_gaps_from_pipeline_output():
+    """#318 Fix round 1 (F14): Step 5 reads `pipeline_data` (deep_analysis_
+    pipeline's output_path JSON) and previously extracted only
+    `pipeline_data.get("evidence", {})`, dropping `evidence_gaps` on the
+    floor. deep_analysis_pipeline already writes evidence_gaps into that
+    same JSON (#318 Task 3) -- it is the ONLY record of which projects had
+    no local git repo. Step 9's dashboard can only ever render the
+    ## Evidence Gaps section (Task 5 Step 5.5) if this extraction exists;
+    without it the section and its tests are correct but dead code in a
+    real /check-items run.
+
+    Parsed with `ast`, not a substring search: walks for a Call node
+    matching `pipeline_data.get("evidence_gaps", ...)` specifically (not
+    just any occurrence of the string "evidence_gaps", which would also
+    match a comment or the write_check_items_dashboard() call this same
+    block does NOT make).
+    """
+    source = _read_step5_heredoc()
+    tree = ast.parse(source)
+
+    gap_extractions = [
+        node for node in ast.walk(tree)
+        if _is_dict_get_call(node, "pipeline_data", "evidence_gaps")
+    ]
+    assert gap_extractions, (
+        "Step 5's heredoc does not extract "
+        'pipeline_data.get("evidence_gaps", ...) -- the dashboard\'s '
+        "## Evidence Gaps section can never receive real data from a "
+        "live /check-items run (#318 F14)."
+    )
+
+
+def _read_step7_heredoc():
+    """Extract the Step 7 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md.
+
+    Steps 3-10 ALL use `python3 << 'PYEOF' ... PYEOF` (7 occurrences, same
+    delimiter every time — unlike note_writer's per-invocation `<eof4>`
+    convention) — a naive first-match regex grabs Step 3's block, not
+    Step 7's. Scanned for the one block that actually contains
+    `assign_tier(`, which is unique to Step 7. `python3 -c '...'` snippets
+    elsewhere are already covered by _extract_python_snippets() above via
+    _SQ_SNIPPET_RE / _DQ_SNIPPET_RE (neither pattern matches a heredoc, so
+    no PYEOF block was ever visible to any existing snippet test). Reads
+    the real file on disk, not a fixture, so this test guards the actual
+    call site rather than a stand-in for it (#318 fix round 3, F11).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step7_blocks = [b for b in blocks if "assign_tier(" in b]
+    assert len(step7_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing assign_tier(, "
+        f"found {len(step7_blocks)} (of {len(blocks)} total heredoc blocks)"
+    )
+    return step7_blocks[0]
+
+
+def test_check_items_step7_threads_note_evidence_only_into_assign_tier():
+    """#318 fix round 3 (F11): Step 7's assign_tier(...) call must pass
+    note_evidence_only through, or every note-only project's citation
+    silently reverts to the pre-F7 HIGH-reachable bypass — announced
+    nowhere, since an omitted argument just falls back to
+    note_evidence_only's own default (False).
+
+    tests/test_check_items_note_evidence.py's
+    test_step7_wiring_threads_note_evidence_only_into_assign_tier pins the
+    *semantics* of that call shape (drop the 5th arg -> HIGH instead of
+    MED) but only against a Python-level reproduction of it — it cannot
+    catch a regression in the real markdown, because nothing executes
+    SKILL.md. This test closes that gap by parsing the ACTUAL Step 7
+    heredoc off disk.
+
+    Uses `ast`, not a substring/regex search for "note_evidence_only": a
+    regex would be satisfied by a comment or a string literal that never
+    reaches the call, which is exactly the kind of false-green a future
+    "helpful" edit could introduce. Walking the parsed AST for the
+    `assign_tier(...)` Call node and inspecting its actual arguments (via
+    `ast.unparse`, stdlib since Python 3.9 — no CI-version risk per
+    test_no_python_3_13_only_apis's floor) can only pass if the argument is
+    genuinely there.
+    """
+    source = _read_step7_heredoc()
+    tree = ast.parse(source)
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "assign_tier"
+    ]
+    assert len(calls) == 1, (
+        f"expected exactly one assign_tier(...) call in Step 7's heredoc, "
+        f"found {len(calls)}"
+    )
+    call = calls[0]
+
+    arg_sources = [ast.unparse(a) for a in call.args]
+    kw_names = {kw.arg for kw in call.keywords if kw.arg}
+
+    threaded_as_keyword = "note_evidence_only" in kw_names
+    threaded_as_5th_positional = (
+        len(arg_sources) >= 5 and "note_evidence_only" in arg_sources[4]
+    )
+    assert threaded_as_keyword or threaded_as_5th_positional, (
+        "Step 7's assign_tier(...) call does not pass note_evidence_only "
+        f"through — found {len(arg_sources)} positional arg(s) "
+        f"{arg_sources!r} and keyword(s) {sorted(kw_names)!r}. Without it, "
+        "every note-only project's citation defaults to "
+        "note_evidence_only=False and can reach HIGH again (#318 F7)."
+    )
+
+
+def _read_step8_heredoc():
+    """Extract the Step 8 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md -- the cascade block, distinguished from the
+    other 6 same-delimiter PYEOF blocks by the presence of
+    `cascade_group_members(`, which is unique to Step 8 (the `from
+    open_item_dedup import cascade_group_members` line contains the bare
+    name without a paren; the actual call site is the discriminator).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step8_blocks = [b for b in blocks if "cascade_group_members(" in b]
+    assert len(step8_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"cascade_group_members(, found {len(step8_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step8_blocks[0]
+
+
+def test_check_items_step8_stamps_applied_on_flipped_records():
+    """#318 Task 6: Step 8's cascade block must stamp `applied=True` onto
+    each buckets record whose occurrence was actually Read-Verified-Edited
+    by the primary-flip loop (tracked in `source_skips`), and persist that
+    stamp back to `buckets_path` -- before Step 9 reads it.
+
+    Without this, check_items_report._body's by-fact rendering (#318 Task
+    6, `c.get("applied")`) has nothing to key off of in a real run: every
+    classification record loaded from buckets_path would carry no
+    `applied` key at all, so the dashboard's checkboxes would silently
+    revert to always-unchecked (or, for DONE before this task's fix,
+    always-checked) -- correct code shipping dead, exactly like the
+    ## Evidence Gaps section before Fix round 1 (F14).
+
+    Parsed with `ast`, not a substring search: walks for an Assign node
+    whose target is a Subscript matching `<name>["applied"]` with value
+    `True` -- a regex for the bare string "applied" would also match the
+    unrelated `applied` count/heading logic living in check_items_report.py
+    (a different file, not even loaded here) or a comment in this block.
+    """
+    source = _read_step8_heredoc()
+    tree = ast.parse(source)
+
+    def _is_applied_true_assign(node):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            return False
+        target = node.targets[0]
+        return (
+            isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Name)
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value == "applied"
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+        )
+
+    stamps = [node for node in ast.walk(tree) if _is_applied_true_assign(node)]
+    assert stamps, (
+        'Step 8\'s cascade block does not contain an `<name>["applied"] = '
+        "True` assignment -- the dashboard's applied-by-fact rendering "
+        "(#318 Task 6) can never receive real data from a live "
+        "/check-items run."
+    )
+
+    # The stamp must also be persisted to buckets_path, or the mutation is
+    # invisible to the fresh `json.load(open(buckets_path))` Step 9 does.
+    # #318 M3: the write is now routed through _atomic_write_json(path, data)
+    # (temp+rename, not a plain open("w")) -- checked via ast for a Call to
+    # that name with buckets_path/buckets as its two arguments, not a
+    # substring search for "json.dump(buckets", which no longer appears
+    # literally in this block (the json.dump call now lives inside the
+    # helper's generic (path, data) parameters).
+    persist_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_atomic_write_json"
+        and len(node.args) == 2
+        and isinstance(node.args[0], ast.Name) and node.args[0].id == "buckets_path"
+        and isinstance(node.args[1], ast.Name) and node.args[1].id == "buckets"
+    ]
+    assert persist_calls, (
+        "Step 8's cascade block stamps applied but never writes buckets "
+        "back to buckets_path via _atomic_write_json(buckets_path, buckets) "
+        "-- the in-memory mutation is lost when this subprocess exits, "
+        "since Step 9 runs as a separate python3 invocation that re-reads "
+        "buckets_path from disk."
+    )
+
+
+def test_check_items_step8_atomic_write_helper_uses_temp_and_replace():
+    """#318 M3: the buckets_path REWRITE (and the new cascade_summary.json
+    write) must go through temp-file-then-rename, not a plain `open(path,
+    "w")` -- the repo's atomic-write convention (write_vault_note(),
+    check_items_cache.save_cache()). A plain in-place write left the
+    previous test's `_atomic_write_json(buckets_path, buckets)` call site
+    guard satisfied by a helper that still truncates the file directly, so
+    this checks the helper's OWN body for `tempfile.mkstemp` and
+    `os.replace`, not just that something named `_atomic_write_json` gets
+    called."""
+    source = _read_step8_heredoc()
+    tree = ast.parse(source)
+
+    funcs = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_atomic_write_json"
+    ]
+    assert len(funcs) == 1, (
+        f"expected exactly one _atomic_write_json def in Step 8's heredoc, "
+        f"found {len(funcs)}"
+    )
+    body_src = ast.unparse(funcs[0])
+    assert "tempfile.mkstemp" in body_src, (
+        "_atomic_write_json does not use tempfile.mkstemp -- it is not "
+        "writing to a temp file first."
+    )
+    assert "os.replace" in body_src, (
+        "_atomic_write_json does not use os.replace -- a temp file with no "
+        "rename into place is not an atomic write, just a stray temp file."
+    )
+
+
+def _read_step9_heredoc():
+    """Extract the Step 9 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md -- the dashboard-write block, distinguished
+    from the other 7 same-delimiter PYEOF blocks by the presence of
+    `write_check_items_dashboard(` (the actual call, with its opening
+    paren -- the bare `write_check_items_dashboard()` mention in this
+    step's own prose, outside any heredoc, is never part of the extracted
+    block strings in the first place, so it can't cause a false match here).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step9_blocks = [b for b in blocks if "write_check_items_dashboard(" in b]
+    assert len(step9_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"write_check_items_dashboard(, found {len(step9_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step9_blocks[0]
+
+
+def test_check_items_step9_passes_merges_and_evidence_gaps():
+    """#318 I1: Step 9 was prose-only ("call write_check_items_dashboard()
+    with the scope, classifications, ...") with no executable block behind
+    it -- the same shape as F14 (## Evidence Gaps): code that is written,
+    tested, and unreachable unless a model happens to follow the prose.
+    `merge_records_from_groups` had ZERO production callers outside that
+    prose. Step 9 now has a real heredoc; this guards that its
+    write_check_items_dashboard(...) call actually passes `merges=` and
+    `evidence_gaps=` as keyword arguments, not just that the function is
+    called at all.
+
+    Parsed with `ast`: walks for the Call node whose func is the Name
+    `write_check_items_dashboard`, then inspects its keyword arguments by
+    name -- a regex for the bare strings "merges" / "evidence_gaps" would
+    also match their assignment above the call (`merges = ...`,
+    `evidence_gaps = ...`) or a comment, neither of which proves they
+    reached the call itself.
+    """
+    source = _read_step9_heredoc()
+    tree = ast.parse(source)
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "write_check_items_dashboard"
+    ]
+    assert len(calls) == 1, (
+        f"expected exactly one write_check_items_dashboard(...) call in "
+        f"Step 9's heredoc, found {len(calls)}"
+    )
+    kw_names = {kw.arg for kw in calls[0].keywords if kw.arg}
+    missing = {"merges", "evidence_gaps"} - kw_names
+    assert not missing, (
+        f"Step 9's write_check_items_dashboard(...) call is missing "
+        f"keyword argument(s) {sorted(missing)} -- found keywords "
+        f"{sorted(kw_names)!r}. Without merges=, '## Merged Groups' has "
+        f"nothing correct to render (#318 bug 3); without evidence_gaps=, "
+        f"'## Evidence Gaps' silently never renders (#318 F14)."
+    )
+
+    # N6: the other two of I1's three "must be mechanical" items were
+    # unguarded -- pinned only by the keyword-argument check above binding
+    # `classifications=classifications` and `cascaded=cascaded`, neither of
+    # which proves those NAMES were themselves derived from a fresh
+    # buckets_path read / cascade_summary_path read, as opposed to (say) a
+    # stale variable left over from an earlier, unrelated block.
+    def _is_json_load_open_call(node, arg_name):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "load"
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "json"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Name) and node.args[0].func.id == "open"
+            and node.args[0].args
+            and isinstance(node.args[0].args[0], ast.Name)
+            and node.args[0].args[0].id == arg_name
+        )
+
+    buckets_reads = [n for n in ast.walk(tree) if _is_json_load_open_call(n, "buckets_path")]
+    assert buckets_reads, (
+        "Step 9's heredoc does not contain json.load(open(buckets_path)) -- "
+        "classifications must be reloaded fresh from buckets_path (#318 "
+        "Task 6), not a stale copy, or every checkbox silently reverts to "
+        "reading from classification instead of Step 8's applied stamps."
+    )
+
+    classifications_from_buckets = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "classifications"
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "get"
+        and isinstance(node.value.func.value, ast.Name) and node.value.func.value.id == "buckets"
+    ]
+    assert classifications_from_buckets, (
+        "Step 9's heredoc does not assign classifications = buckets.get(...) "
+        "-- json.load(open(buckets_path)) being present doesn't prove "
+        "`classifications` itself comes from it, only that SOMETHING reads "
+        "the file."
+    )
+
+    cascade_summary_reads = [
+        n for n in ast.walk(tree) if _is_json_load_open_call(n, "cascade_summary_path")
+    ]
+    assert cascade_summary_reads, (
+        "Step 9's heredoc does not contain "
+        "json.load(open(cascade_summary_path)) -- cascaded/skipped would "
+        "silently default to 0/0 on every run, not just when Step 8 was "
+        "genuinely skipped (#318 I1/N3)."
     )
 
 
