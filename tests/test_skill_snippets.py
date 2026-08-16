@@ -807,11 +807,124 @@ def test_check_items_step8_stamps_applied_on_flipped_records():
 
     # The stamp must also be persisted to buckets_path, or the mutation is
     # invisible to the fresh `json.load(open(buckets_path))` Step 9 does.
-    assert "buckets_path" in source and 'json.dump(buckets' in source, (
+    # #318 M3: the write is now routed through _atomic_write_json(path, data)
+    # (temp+rename, not a plain open("w")) -- checked via ast for a Call to
+    # that name with buckets_path/buckets as its two arguments, not a
+    # substring search for "json.dump(buckets", which no longer appears
+    # literally in this block (the json.dump call now lives inside the
+    # helper's generic (path, data) parameters).
+    persist_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_atomic_write_json"
+        and len(node.args) == 2
+        and isinstance(node.args[0], ast.Name) and node.args[0].id == "buckets_path"
+        and isinstance(node.args[1], ast.Name) and node.args[1].id == "buckets"
+    ]
+    assert persist_calls, (
         "Step 8's cascade block stamps applied but never writes buckets "
-        "back to buckets_path -- the in-memory mutation is lost when this "
-        "subprocess exits, since Step 9 runs as a separate python3 "
-        "invocation that re-reads buckets_path from disk."
+        "back to buckets_path via _atomic_write_json(buckets_path, buckets) "
+        "-- the in-memory mutation is lost when this subprocess exits, "
+        "since Step 9 runs as a separate python3 invocation that re-reads "
+        "buckets_path from disk."
+    )
+
+
+def test_check_items_step8_atomic_write_helper_uses_temp_and_replace():
+    """#318 M3: the buckets_path REWRITE (and the new cascade_summary.json
+    write) must go through temp-file-then-rename, not a plain `open(path,
+    "w")` -- the repo's atomic-write convention (write_vault_note(),
+    check_items_cache.save_cache()). A plain in-place write left the
+    previous test's `_atomic_write_json(buckets_path, buckets)` call site
+    guard satisfied by a helper that still truncates the file directly, so
+    this checks the helper's OWN body for `tempfile.mkstemp` and
+    `os.replace`, not just that something named `_atomic_write_json` gets
+    called."""
+    source = _read_step8_heredoc()
+    tree = ast.parse(source)
+
+    funcs = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_atomic_write_json"
+    ]
+    assert len(funcs) == 1, (
+        f"expected exactly one _atomic_write_json def in Step 8's heredoc, "
+        f"found {len(funcs)}"
+    )
+    body_src = ast.unparse(funcs[0])
+    assert "tempfile.mkstemp" in body_src, (
+        "_atomic_write_json does not use tempfile.mkstemp -- it is not "
+        "writing to a temp file first."
+    )
+    assert "os.replace" in body_src, (
+        "_atomic_write_json does not use os.replace -- a temp file with no "
+        "rename into place is not an atomic write, just a stray temp file."
+    )
+
+
+def _read_step9_heredoc():
+    """Extract the Step 9 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md -- the dashboard-write block, distinguished
+    from the other 7 same-delimiter PYEOF blocks by the presence of
+    `write_check_items_dashboard(` (the actual call, with its opening
+    paren -- the bare `write_check_items_dashboard()` mention in this
+    step's own prose, outside any heredoc, is never part of the extracted
+    block strings in the first place, so it can't cause a false match here).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step9_blocks = [b for b in blocks if "write_check_items_dashboard(" in b]
+    assert len(step9_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"write_check_items_dashboard(, found {len(step9_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step9_blocks[0]
+
+
+def test_check_items_step9_passes_merges_and_evidence_gaps():
+    """#318 I1: Step 9 was prose-only ("call write_check_items_dashboard()
+    with the scope, classifications, ...") with no executable block behind
+    it -- the same shape as F14 (## Evidence Gaps): code that is written,
+    tested, and unreachable unless a model happens to follow the prose.
+    `merge_records_from_groups` had ZERO production callers outside that
+    prose. Step 9 now has a real heredoc; this guards that its
+    write_check_items_dashboard(...) call actually passes `merges=` and
+    `evidence_gaps=` as keyword arguments, not just that the function is
+    called at all.
+
+    Parsed with `ast`: walks for the Call node whose func is the Name
+    `write_check_items_dashboard`, then inspects its keyword arguments by
+    name -- a regex for the bare strings "merges" / "evidence_gaps" would
+    also match their assignment above the call (`merges = ...`,
+    `evidence_gaps = ...`) or a comment, neither of which proves they
+    reached the call itself.
+    """
+    source = _read_step9_heredoc()
+    tree = ast.parse(source)
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "write_check_items_dashboard"
+    ]
+    assert len(calls) == 1, (
+        f"expected exactly one write_check_items_dashboard(...) call in "
+        f"Step 9's heredoc, found {len(calls)}"
+    )
+    kw_names = {kw.arg for kw in calls[0].keywords if kw.arg}
+    missing = {"merges", "evidence_gaps"} - kw_names
+    assert not missing, (
+        f"Step 9's write_check_items_dashboard(...) call is missing "
+        f"keyword argument(s) {sorted(missing)} -- found keywords "
+        f"{sorted(kw_names)!r}. Without merges=, '## Merged Groups' has "
+        f"nothing correct to render (#318 bug 3); without evidence_gaps=, "
+        f"'## Evidence Gaps' silently never renders (#318 F14)."
     )
 
 

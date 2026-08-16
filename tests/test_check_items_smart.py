@@ -1383,6 +1383,21 @@ def test_parse_scope_unknown_token_order_independent(monkeypatch):
     assert scope.unknown_tokens == ["bogus"]
 
 
+def test_parse_scope_exposes_known_projects_for_reuse(monkeypatch):
+    """M2: parse_scope must expose the project set it already computed
+    (scope.known_projects) so a caller building a 'Did you mean'
+    suggestion doesn't have to re-query the vault index and re-walk every
+    workspace root a second time -- see skills/check-items/SKILL.md Step 1,
+    which used to do exactly that."""
+    import check_items_args
+    monkeypatch.setattr(check_items_args, "_known_projects",
+                        lambda: {"obsidian-brain", "cc-token-router"})
+    monkeypatch.setattr(check_items_args, "_vault_known_projects",
+                        lambda: {"notes-only-proj"})
+    scope = check_items_args.parse_scope(["30d"])
+    assert scope.known_projects == {"obsidian-brain", "cc-token-router", "notes-only-proj"}
+
+
 # ---------------------------------------------------------------------------
 # verify_before_edit — Stage 6 pre-Edit guard
 # ---------------------------------------------------------------------------
@@ -1657,7 +1672,12 @@ def test_done_heading_counts_only_applied_done_items(tmp_path):
 def test_applied_elsewhere_line_names_non_done_flips(tmp_path):
     """The applied REVIEW flip from the fixture above must not vanish from
     the arithmetic once the ## Done heading stops over-counting -- a summary
-    line must name it."""
+    line must name it.
+
+    #318 I2 AGREEING-CASE control: applied=2 matches the stamped total
+    (1 DONE + 1 REVIEW, both c.get('applied') truthy), so no mismatch note
+    should render -- see test_applied_mismatch_note_names_both_counts for
+    the disagreeing case."""
     from check_items_report import write_check_items_dashboard
     vault = tmp_path / "vault"
     (vault / "claude-dashboards").mkdir(parents=True)
@@ -1679,6 +1699,65 @@ def test_applied_elsewhere_line_names_non_done_flips(tmp_path):
     body = open(path).read()
     assert "1" in body
     assert "applied outside DONE" in body
+    assert "this run reported" not in body
+
+
+def test_applied_outside_done_derived_from_stamps_not_subtraction(tmp_path):
+    """#318 I2: the "additional flips applied outside DONE" count must come
+    from counting stamped records outside DONE, not from `applied -
+    done_applied`. Fixture: applied (run total) is inflated to 5 with only
+    one REVIEW record actually stamped applied=True outside DONE -- the
+    old subtraction form would have printed "4 additional flips applied
+    outside DONE" (5 - 1) though only ONE record anywhere outside DONE
+    renders checked. The correct, fact-derived count is 1."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "DONE",
+         "canonical_text": "Applied done item", "evidence_citation": "PR #1",
+         "applied": True},
+        {"group_id": "g2", "classification": "REVIEW",
+         "canonical_text": "Applied review item", "evidence_citation": None,
+         "applied": True},
+        {"group_id": "g3", "classification": "NEEDS-ACTION",
+         "canonical_text": "Unapplied needs-action item", "evidence_citation": None},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=3, group_count=3,
+        classifications=classifications,
+        applied=5, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "1 additional flip applied outside DONE" in body
+    assert "4 additional flip" not in body
+
+
+def test_applied_mismatch_note_names_both_counts(tmp_path):
+    """#318 I2 DISAGREEING case: `applied` (the run total) and the
+    fact-derived stamped total can legitimately diverge -- e.g. a
+    cascade-only sibling flip Step 8 never stamped onto any record. That
+    must be said explicitly (naming both numbers), not papered over."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    classifications = [
+        {"group_id": "g1", "classification": "DONE",
+         "canonical_text": "Applied done item", "evidence_citation": "PR #1",
+         "applied": True},
+    ]
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=1, group_count=1,
+        classifications=classifications,
+        applied=3, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "this run reported 3 applied" in body
+    assert "only 1 record" in body
 
 
 def test_dashboard_idempotent_overwrite(tmp_path):
@@ -1835,6 +1914,29 @@ def test_dashboard_tolerates_int_merges(tmp_path):
     # Names the bad input specifically, not just a generic failure sentence.
     assert "int" in body
     assert "(3)" in body
+
+
+def test_dashboard_tolerates_huge_merges_repr_truncated(tmp_path):
+    """#318 M7: a bad `merges` value's repr is unbounded -- a caller could
+    pass a giant string or a deeply nested structure, not just a bare int.
+    The warning must cap the repr length and say so, rather than writing
+    an unbounded blob into a kept artefact."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    huge_bad_value = "x" * 5000
+    path = write_check_items_dashboard(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=0, cascaded=0, merges=huge_bad_value, semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=True
+    )
+    body = open(path).read()
+    assert "Merged Groups unavailable" in body
+    assert "(truncated)" in body
+    assert "x" * 5000 not in body
+    # The full 5000-char blob must not have leaked into the kept artefact.
+    assert len(body) < 5000
 
 
 def test_dashboard_tolerates_none_merges(tmp_path):
@@ -2634,6 +2736,40 @@ def test_divergent_installs_are_reported(tmp_path):
     assert "3.4.1" in msg
     assert "3.5.1" in msg
     assert "resolved" in msg.lower()
+
+
+def test_resolved_marker_picks_the_resolved_path_not_every_matching_version(tmp_path):
+    """M1: two installs can share the SAME version as the executing one
+    (e.g. a directory-source checkout and a cache entry both at the
+    current release) while only one of them is the install actually
+    imported. Marking by version equality tags every same-version entry
+    "(resolved)"; marking by path must tag only the real one.
+
+    `resolved_path` here is a hooks/ subdirectory NESTED under one of the
+    plugin roots in install_paths -- the shape describe_plugin_install_divergence
+    sees by default in a real run (resolved_path is a hooks dir; install_paths
+    entries are plugin roots one level up) -- so this also proves the
+    containment check, not just exact string equality."""
+    import obsidian_utils
+
+    resolved_root = tmp_path / "install-resolved"
+    other_same_version = tmp_path / "install-same-version-not-resolved"
+    stale = tmp_path / "install-stale"
+    _write_plugin_manifest(resolved_root, "3.5.1")
+    _write_plugin_manifest(other_same_version, "3.5.1")
+    _write_plugin_manifest(stale, "3.4.1")
+
+    resolved_hooks_dir = resolved_root / "hooks"
+    resolved_hooks_dir.mkdir(parents=True, exist_ok=True)
+
+    msg = obsidian_utils.describe_plugin_install_divergence(
+        install_paths=[str(resolved_root), str(other_same_version), str(stale)],
+        resolved_path=str(resolved_hooks_dir),
+    )
+    assert msg is not None
+    assert f"3.5.1 at {resolved_root} (resolved)" in msg
+    assert f"3.5.1 at {other_same_version}" in msg
+    assert f"3.5.1 at {other_same_version} (resolved)" not in msg
 
 
 def test_matching_installs_return_none(tmp_path):

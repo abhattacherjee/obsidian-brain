@@ -1565,17 +1565,32 @@ def deep_analysis_pipeline(
             if fts_mentions:
                 proj_evidence["fts_mentions"] = fts_mentions
 
-        # #318: the only evidence source that works without a git repo.
-        try:
-            _note_done = gather_note_completion_evidence(
-                vault_path, sessions_folder, project,
-            )
-        except OSError as exc:
-            print(f"[obsidian-brain] note-completion scan failed for "
-                  f"{project}: {exc}", file=sys.stderr)
-            _note_done = []
-        if _note_done:
-            proj_evidence["note_completions"] = _note_done
+        else:
+            # #318 I3 ruling: note-completion evidence is gathered ONLY when
+            # there is no repo, not unconditionally for every project. This
+            # used to run outside the `if repo_path:` block above, so a
+            # repo-backed project's bundle carried note_completions
+            # ALONGSIDE git-derived keys -- note_evidence_only_for() (the MED
+            # cap) is a per-PROJECT flag, not per-verdict, so any git key
+            # being present at all (even an empty one) flips it False and a
+            # paraphrased note citation sharing a literal ref with the item
+            # text could reach HIGH and get auto-checked. Scoping this to
+            # repo-less projects makes the safety property unconditional: a
+            # note-derived verdict can never reach HIGH, full stop. This
+            # trades away the note-completion signal on repo-backed
+            # projects entirely (live dogfood found 6 of 7 real hits there)
+            # -- restoring it needs per-verdict provenance, not a per-project
+            # flag, and is a follow-up issue, not this branch.
+            try:
+                _note_done = gather_note_completion_evidence(
+                    vault_path, sessions_folder, project,
+                )
+            except OSError as exc:
+                print(f"[obsidian-brain] note-completion scan failed for "
+                      f"{project}: {exc}", file=sys.stderr)
+                _note_done = []
+            if _note_done:
+                proj_evidence["note_completions"] = _note_done
 
         if proj_evidence:
             evidence[project] = proj_evidence

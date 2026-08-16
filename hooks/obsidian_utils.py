@@ -6974,8 +6974,25 @@ def describe_plugin_install_divergence(
         return None
 
     resolved_version = _read_plugin_version(resolved_path)
+    # M1: mark by resolved PATH, not version equality -- two installs can
+    # legitimately share the executing version (e.g. a directory-source
+    # checkout and a cache entry both at the same release), and marking
+    # every one of them "(resolved)" is misleading about which install the
+    # hooks actually loaded from. `resolved_path` defaults to a hooks/
+    # subdirectory (see the docstring), while `install_paths` entries are
+    # plugin ROOTS one level up -- exact string equality would therefore
+    # never match in the common default-path case. A containment check
+    # (p is resolved_path itself, or a directory it lives under) handles
+    # both shapes: a plugin-root entry whose hooks/ subdirectory is what
+    # actually got imported, and an install_paths entry that already IS
+    # the exact resolved path.
+    def _is_resolved(p):
+        p = os.path.normpath(p)
+        rp = os.path.normpath(resolved_path)
+        return rp == p or rp.startswith(p + os.sep)
+
     listing = "; ".join(
-        f"{v} at {p}" + (" (resolved)" if v == resolved_version else "")
+        f"{v} at {p}" + (" (resolved)" if _is_resolved(p) else "")
         for p, v in versions.items()
     )
     return (

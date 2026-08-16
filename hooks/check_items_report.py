@@ -108,24 +108,43 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     # by rendering DONE as always-checked and everything else as
     # always-unchecked regardless of what was actually applied.
     done_applied = sum(1 for c in by_kind["DONE"] if c.get("applied"))
+    # #318 I2: derive the "outside DONE" count the SAME way done_applied is
+    # derived -- from the per-record `applied` stamps themselves, never by
+    # subtracting the caller's `applied` run-total from done_applied. The
+    # subtraction form let the report print "N additional flips applied
+    # outside DONE" while nothing outside DONE actually rendered checked
+    # (an unstamped applied total), or vice versa. `applied` (the run
+    # total) and this fact-derived stamped_total are independent inputs
+    # that CAN legitimately disagree -- e.g. a cascade-only flip that never
+    # reached a per-record stamp (see Task 6 report's known limitation) --
+    # and a disagreement is a real diagnostic, not something to paper over.
+    stamped_outside_done = sum(
+        1 for kind, items in by_kind.items() if kind != "DONE"
+        for c in items if c.get("applied")
+    )
+    stamped_total = done_applied + stamped_outside_done
 
     parts.append(f"## Done ({done_applied} applied of {len(by_kind['DONE'])} classified)")
     for c in by_kind["DONE"]:
         mark = "x" if c.get("applied") else " "
         parts.append(f"- [{mark}] {c.get('canonical_text', '')}")
         parts.append(f"  - Evidence: {c.get('evidence_citation') or 'n/a'}")
-    # `applied` is the run's total (unchanged meaning); done_applied only
-    # counts DONE. The difference is flips applied OUTSIDE Done -- name it
-    # here so it doesn't vanish from the arithmetic now that the heading
-    # above no longer over-counts every applied flip as if it were DONE.
-    if applied - done_applied > 0:
-        _extra = applied - done_applied
-        _plural = "" if _extra == 1 else "s"
-        parts.append(f"_{_extra} additional flip{_plural} applied outside DONE "
+    if stamped_outside_done > 0:
+        _plural = "" if stamped_outside_done == 1 else "s"
+        parts.append(f"_{stamped_outside_done} additional flip{_plural} applied outside DONE "
                      f"(see Needs-Action/Review sections below)._")
+    if applied != stamped_total:
+        parts.append(
+            f"_Note: this run reported {applied} applied, but only "
+            f"{stamped_total} record(s) in this report are stamped applied "
+            f"— Step 8 may not have stamped everything it flipped._"
+        )
     parts.append("")
 
-    parts.append(f"## Needs-Action ({len(by_kind['NEEDS-ACTION'])} surfaced, not applied)")
+    # M4: "surfaced" / "needs a human look" no longer claim "not applied" --
+    # a NEEDS-ACTION or REVIEW row CAN render `- [x]` (#318 Task 6), so a
+    # heading asserting the opposite would contradict its own rows.
+    parts.append(f"## Needs-Action ({len(by_kind['NEEDS-ACTION'])} surfaced)")
     for c in by_kind["NEEDS-ACTION"]:
         mark = "x" if c.get("applied") else " "
         parts.append(f"- [{mark}] {c.get('canonical_text', '')}")
@@ -141,7 +160,7 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     # (#318 Task 6, c.get("applied")) -- always rendered here regardless of
     # --show-all; unlike ACTIVE its evidence_citation is never scrubbed
     # upstream.
-    parts.append(f"## Review ({len(by_kind['REVIEW'])} needs a human look, not applied)")
+    parts.append(f"## Review ({len(by_kind['REVIEW'])} needs a human look)")
     for c in by_kind["REVIEW"]:
         mark = "x" if c.get("applied") else " "
         parts.append(f"- [{mark}] {c.get('canonical_text', '')}")
@@ -170,9 +189,16 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
     if merges is None:
         merges = []
     elif not isinstance(merges, (list, tuple)):
+        # M7: the repr of an arbitrary bad-input value is unbounded -- cap
+        # it before it lands in a kept artefact (a caller could pass a
+        # multi-MB string or a deeply nested structure, not just a bare int).
+        _MAX_MERGES_REPR = 200
+        _merges_repr = repr(merges)
+        if len(_merges_repr) > _MAX_MERGES_REPR:
+            _merges_repr = _merges_repr[:_MAX_MERGES_REPR] + "... (truncated)"
         merge_warning = (
             f"could not render merges: expected a list of merge records, got "
-            f"{type(merges).__name__} ({merges!r}) — see open_item_dedup."
+            f"{type(merges).__name__} ({_merges_repr}) — see open_item_dedup."
             f"merge_records_from_groups()"
         )
         merges = []

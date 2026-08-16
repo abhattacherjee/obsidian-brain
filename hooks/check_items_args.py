@@ -23,6 +23,11 @@ class Scope:
     dry_run: bool = False
     no_cache: bool = False
     unknown_tokens: list[str] = field(default_factory=list)
+    # M2: the union of workspace-root and vault-index project names this
+    # parse computed, exposed so a caller building a "Did you mean"
+    # suggestion (SKILL.md Step 1) can reuse it instead of re-querying the
+    # vault index and re-walking every workspace root a second time.
+    known_projects: set[str] = field(default_factory=set)
 
 
 _WINDOW_RE = re.compile(r"^(\d+)d$")
@@ -77,6 +82,7 @@ def parse_scope(argv):
     than silently dropped."""
     scope = Scope()
     projects = _known_projects() | _vault_known_projects()
+    scope.known_projects = projects
     for tok in argv:
         if tok == "--show-all":
             scope.show_all = True

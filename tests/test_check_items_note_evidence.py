@@ -395,18 +395,77 @@ def test_note_evidence_only_caps_every_off_template_bypass_at_med(citation):
     assert tier == "MED", (citation, tier)
 
 
-@pytest.mark.parametrize("citation", _OFF_TEMPLATE_BYPASS_CITATIONS)
-def test_off_template_citation_still_reaches_high_with_git_evidence(citation):
-    """POSITIVE CONTROL: for a project that DOES have git evidence
-    (note_evidence_only=False), the pre-existing behaviour is unchanged --
-    a citation sharing a literal #N with the item text still reaches HIGH
-    for a high-trust source. Without this control, F7's fix could cap
-    EVERY citation at MED and no test here would notice."""
-    tier = oid.assign_tier(
-        citation, "wire up the foo exporter #318", "DONE", "agent",
-        note_evidence_only=False,
+def test_repo_backed_project_never_gets_note_completions(tmp_path):
+    """#318 I3 ruling, REPLACES test_off_template_citation_still_reaches_high_with_git_evidence
+    (deliberately removed -- it pinned the exact behaviour this closes).
+
+    gather_note_completion_evidence() used to run unconditionally for
+    EVERY project inside deep_analysis_pipeline's evidence loop, outside
+    the `if repo_path:` block. note_evidence_only_for() (the MED cap) is a
+    per-PROJECT flag derived from the evidence bundle's shape, not
+    per-verdict -- so a repo-backed project's bundle carrying
+    note_completions ALONGSIDE any git-derived key (even an empty one,
+    which deep_analysis_pipeline sets on every git-command failure branch)
+    still read as "has git evidence", note_evidence_only_for() returned
+    False, and a note-derived citation sharing a literal #N with the item
+    text could reach HIGH and get auto-checked -- the exact bypass the old
+    (now-removed) test pinned as "the pre-existing behaviour, unchanged".
+
+    gather_note_completion_evidence() now runs ONLY in the `else:` branch
+    of `if repo_path:`, so a repo-backed project's bundle can never carry
+    note_completions at all -- the safety property is now unconditional
+    rather than dependent on which git commands happened to fail. The
+    fixture DELIBERATELY includes a real note-completion candidate (a
+    strictly-newer session reporting the item done) so this proves the
+    absence is caused by repo_path being truthy, not by no candidate
+    existing (see test_pipeline_attaches_note_completions_for_repo_less_project
+    below for the repo-less positive control, unaffected by this change).
+    """
+    vault, sessions = _vault(tmp_path)
+    insights_dir = vault / "insights"
+    insights_dir.mkdir()
+    _session(
+        sessions / "2026-01-01-git-proj-aaaa.md", "2026-01-01", "git-proj",
+        open_items=["wire up the foo exporter service #318"],
     )
-    assert tier == "HIGH", (citation, tier)
+    _session(
+        sessions / "2026-02-01-git-proj-bbbb.md", "2026-02-01", "git-proj",
+        summary="Shipped the foo exporter service end to end (#318).",
+    )
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    output_path = str(tmp_path / "pipeline-out.json")
+
+    fake_vi = MagicMock()
+    fake_vi.ensure_index.return_value = str(tmp_path / "vault.db")
+    fake_vi.extract_keywords.return_value = []
+    fake_vi.search_vault.return_value = []
+
+    with patch("subprocess.run", side_effect=lambda *a, **k: _fake_completed("")), \
+         patch.dict("sys.modules", {"vault_index": fake_vi}), \
+         patch.object(oid, "_resolve_project_paths", return_value={"git-proj": str(repo_dir)}):
+
+        result = oid.deep_analysis_pipeline(
+            basenames=[],
+            projects_json=_json.dumps(["git-proj"]),
+            output_path=output_path,
+            vault_path=str(vault),
+            sessions_folder="claude-sessions",
+            insights_folder="insights",
+            db_path=str(tmp_path / "test-vault.db"),
+        )
+
+    with open(output_path, encoding="utf-8") as f:
+        data = _json.load(f)
+
+    assert result.startswith("OK:"), result
+    assert "note_completions" not in data["evidence"].get("git-proj", {}), (
+        f"repo-backed project must never carry note_completions in its "
+        f"bundle: {data['evidence']}"
+    )
+    assert data["evidence_gaps"]["projects_without_repo"] == []
 
 
 def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path):
