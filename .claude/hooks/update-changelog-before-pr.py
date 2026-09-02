@@ -575,17 +575,47 @@ def _read_hook_input(what):
 #  * a QUOTED OPTION TOKEN (`"-c"`, `'-c'`). Every alternative above
 #    assumed the option starts with a literal, unquoted `-`; git does not
 #    require that. `_OPT` adds two more shapes for "the option token
-#    itself" -- a fully double- or single-quoted run -- alongside the
-#    original `-`-prefixed one. Accepting more shapes here can only ever
-#    ADD a gate (an `_OPT` alternative that fails to match just means
-#    fewer iterations of `_GLOBAL_OPTS`, never a match somewhere it
-#    shouldn't be), so this is deliberately permissive like everything
-#    else in this pattern.
+#    itself" -- a double- or single-quoted run whose FIRST character is
+#    the `-` -- alongside the original `-`-prefixed one.
+#
+#    The `-` has to be INSIDE the quotes. Accepting ANY fully-quoted word
+#    as an option token (`"[^"]*"`, which is what round 4 of #351 shipped)
+#    made a quoted word eligible both as an option token AND as the
+#    PREVIOUS option's separate value, inside the same `(?:...)*` repeat.
+#    Every adjacent pair of quoted words could then be parsed two ways, so
+#    a run of n of them cost 2^n. Measured end-to-end through this hook:
+#    `git ` + `"a" ` x34 (141 chars) took 1.8s, and x40 (165 chars) took
+#    33s -- on input that need not even be a git command, since the hook
+#    reads TEXT and the run only has to follow the literal `git `/`gh `.
+#    Requiring the `-` makes the two roles disjoint again (a value like
+#    `'k=v w'` can no longer be an `_OPT`): the same run at 2000 words
+#    costs 0.05ms, and both quoted-option spellings above still match.
+#
+#    That is only HALF of it, though. A word like
+#    `"-c"` is a legal `_OPT` AND, being fully quoted, was still a legal
+#    SEPARATE VALUE for the option before it -- so a run of `"-c" "-c"
+#    ...` kept the same 2^n (measured on `_OPT`-with-the-dash alone:
+#    2.5ms at 20 words, ~2.6x per word after that). The separate-value
+#    group below therefore refuses a quoted run whose first character is
+#    a `-`: `"(?:[^-"][^"]*)?"` matches `""` and `"x..."` but never
+#    `"-..."`. That costs no permissiveness, because a word this group
+#    declines is picked up as the NEXT `_OPT` on the following iteration
+#    -- `git -c "-x" push` still matches -- and it makes "option token"
+#    and "separate value" disjoint at the WORD level, which is what
+#    removes the choice the engine was backtracking over. Measured
+#    linear to 50 000 repeats on every shape.
+#
+#    "More shapes can only ADD a gate" is true of the VERDICT and false of
+#    the COST -- the trap round 4 fell into. Every alternative added here
+#    must be DISJOINT from the others (the rule the CRIT-3 fix above
+#    established) and must be TIMED; `TestPatternDecisionTimeIsBounded`
+#    now asserts that over generated shapes instead of leaving it to
+#    whoever remembers to measure.
 _Q = r'''(?:"[^"]*"|'[^']*'|"(?![^"]*")|'(?![^']*')|\\.|[^\s"'\\])'''
-_OPT = r'''(?:-''' + _Q + r'''*|"[^"]*"|'[^']*')'''
+_OPT = r'''(?:-''' + _Q + r'''*|"-[^"]*"|'-[^']*')'''
 _GLOBAL_OPTS = (
-    r'(?:' + _OPT + r'(?:\s+(?:(?:"[^"]*"|'
-    r"'[^']*'|\"(?![^\"]*\")|'(?![^']*')|\\.|[^-\s\"'\\])"
+    r'(?:' + _OPT + r'(?:\s+(?:(?:"(?:[^-"][^"]*)?"|'
+    r"'(?:[^-'][^']*)?'|\"(?![^\"]*\")|'(?![^']*')|\\.|[^-\s\"'\\])"
     + _Q + r'*))?\s+)*'
 )
 

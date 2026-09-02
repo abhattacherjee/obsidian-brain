@@ -1549,6 +1549,77 @@ def _backslash_escape(value: str) -> str:
     return "".join(("\\" + c) if c not in safe else c for c in value)
 
 
+def _option_token_quotings(token):
+    """Every quoting of `token` a POSIX shell reads back as exactly `token`.
+
+    Derived from the token by rule -- wrap it, wrap its tail, wrap its
+    first character, escape every character -- rather than typed out one
+    spelling at a time, which is the same discipline `_double_quote_escape`
+    and `_backslash_escape` apply to option VALUES.
+
+    The axis exists because varying the value alone turned out to be blind
+    to the half of #351 CRIT-6 that round 4 then broke. Reverting CRIT-6's
+    escaped-space half turned 5 generated rows red; reverting its
+    quoted-option-token half left all 105 green, because every generated
+    spelling was `-c a.b=<styled>` -- the value varied, the option token
+    was always a bare `-c`.
+    """
+    return {
+        "bare": token,
+        "fully-double-quoted": '"' + token + '"',
+        "fully-single-quoted": "'" + token + "'",
+        "tail-double-quoted": token[0] + '"' + token[1:] + '"',
+        "tail-single-quoted": token[0] + "'" + token[1:] + "'",
+        "leading-dash-double-quoted": '"' + token[0] + '"' + token[1:],
+        "leading-dash-single-quoted": "'" + token[0] + "'" + token[1:],
+        "every-character-escaped": "".join("\\" + c for c in token),
+    }
+
+
+_OPTION_TOKEN_QUOTINGS = _option_token_quotings("-c")
+
+# Spellings `_GLOBAL_OPTS` does not match today, so the gate stands down on
+# a command git accepts. Measured `allow` where the plain form is `deny`,
+# on all five hooks, at `74cf1b1` (before this branch), at `b428ff3` and
+# here -- pre-existing, unchanged by #351, NOT a regression.
+#
+# They are listed as strict xfails rather than left out: an omitted row is
+# a gap nobody can see, and `strict=True` means the day one of them starts
+# passing this test FAILS until the entry is deleted, so the ledger cannot
+# rot. The obvious fix -- letting `_OPT` start with a quote followed by the
+# dash -- was measured during round 5 at 221ms for 2000 tokens and rising
+# quadratically, i.e. it trades a fail-open for a slow-loris on every Bash
+# call, so it was not taken. See `TestPatternDecisionTimeIsBounded`.
+_OPTION_TOKEN_KNOWN_GAPS = frozenset({
+    "leading-dash-double-quoted",
+    "leading-dash-single-quoted",
+    "every-character-escaped",
+})
+
+# Two values, so the axis is not silently coupled to one value shape.
+_OPTION_TOKEN_VALUES = {
+    "bare": "a.b=v",
+    "shlex-quoted-space": "a.b=" + shlex.quote("x y"),
+}
+
+_OPTION_TOKEN_PARAMS = [
+    pytest.param(
+        quoting, value_name,
+        marks=(
+            [pytest.mark.xfail(
+                strict=True,
+                reason=f"known pre-existing gap: `_GLOBAL_OPTS` does not "
+                       f"match a {quoting} option token (same at 74cf1b1)",
+            )]
+            if quoting in _OPTION_TOKEN_KNOWN_GAPS else []
+        ),
+        id=f"{quoting}-{value_name}",
+    )
+    for quoting in sorted(_OPTION_TOKEN_QUOTINGS)
+    for value_name in sorted(_OPTION_TOKEN_VALUES)
+]
+
+
 class TestGeneratedGlobalOptionValuesMatchThePlainVerdict:
     """IMP-3's "stop hand-picking spellings" fix. Rounds 1-4 each found a
     fail-open the hand-picked `OPTION_SPELLINGS` list above had not thought
@@ -1604,6 +1675,31 @@ class TestGeneratedGlobalOptionValuesMatchThePlainVerdict:
         got = TestHookBlockingPathsFire._decide(work, env, hook, candidate)
         assert got == control, (
             f"{hook}: {candidate!r} ({style_name}/{value_name}) verdict "
+            f"{got!r} != plain-form {plain!r} verdict {control!r}"
+        )
+
+    @pytest.mark.parametrize("quoting,value_name", _OPTION_TOKEN_PARAMS)
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_generated_option_token_matches_plain_verdict(
+        self, tmp_path, hook, quoting, value_name
+    ):
+        """The same property over the OPTION TOKEN rather than its value.
+
+        `-c`, `"-c"`, `'-c'`, `-"c"`, `-'c'` are one option to any POSIX
+        shell, so all five must reach the same verdict as the plain form.
+        Three further quotings are strict xfails -- see
+        `_OPTION_TOKEN_KNOWN_GAPS`.
+        """
+        exe, verb = self.HOOK_VERBS[hook]
+        token = _OPTION_TOKEN_QUOTINGS[quoting]
+        spelling = f"{token} {_OPTION_TOKEN_VALUES[value_name]} "
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        plain = exe + verb
+        control = TestHookBlockingPathsFire._decide(work, env, hook, plain)
+        candidate = exe + spelling + verb
+        got = TestHookBlockingPathsFire._decide(work, env, hook, candidate)
+        assert got == control, (
+            f"{hook}: {candidate!r} ({quoting}/{value_name}) verdict "
             f"{got!r} != plain-form {plain!r} verdict {control!r}"
         )
 
@@ -1666,6 +1762,18 @@ class TestDecisionTimeIsBounded:
             "git " + ("-c a=b " * 500) + "pu" + "sh origin ma" + "in",
         "a ~900KB single argument, near the 1MB stdin cap":
             "git pu" + "sh origin " + ("x" * 900_000),
+        # #351 round 4 shipped an `_OPT` under which a run of fully-quoted
+        # words was 2^n: 141 chars took 1.8s and 165 chars took 33s through
+        # this very hook. No row above is a run of fully-quoted words, so
+        # nothing here went red. These two are, in both of the spellings
+        # that blew up -- a word that is NOT an option token, and one that
+        # IS. Each carries the run after BOTH executables, because every
+        # other row in this dict says `git ` and is therefore a no-op for
+        # the two `gh` gates.
+        "2000 fully-quoted words after each executable":
+            "git " + ('"a" ' * 2000) + "x gh " + ('"a" ' * 2000) + "x",
+        "2000 quoted OPTION words after each executable":
+            "git " + ('"-c" ' * 2000) + "x gh " + ('"-c" ' * 2000) + "x",
     }
 
     @pytest.mark.parametrize("label", sorted(ADVERSARIAL_INPUTS))
@@ -1700,6 +1808,333 @@ class TestDecisionTimeIsBounded:
             f"{self.BUDGET_MS}ms budget -- possible catastrophic "
             f"backtracking or other superlinear blowup"
         )
+
+
+def _hook_regex_constants(hook):
+    """Every regex constant a hook builds, folded out of its source.
+
+    The hooks are SCRIPTS -- importing one reads stdin and exits -- so the
+    patterns cannot simply be imported. They are, however, plain
+    string-concatenation expressions over `r'...'` literals and constants
+    defined above them, so this folds the three AST node types that takes
+    (a string constant, a name defined earlier in the same file, and `+`)
+    by hand. Deliberately NOT `eval`: a file that audits source should not
+    execute it, and a hand fold fails loudly on anything it does not model
+    instead of quietly running it.
+    """
+    src = (Path(".claude/hooks") / f"{hook}.py").read_text(encoding="utf-8")
+    ns = {}
+
+    def fold(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return ns[node.id]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return fold(node.left) + fold(node.right)
+        raise TypeError(type(node).__name__)
+
+    for node in ast.parse(src).body:
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            continue
+        name = node.targets[0].id
+        if not (name in ("_Q", "_OPT", "_GLOBAL_OPTS")
+                or name.endswith("_VERB")):
+            continue
+        try:
+            ns[name] = fold(node.value)
+        except (TypeError, KeyError):
+            continue
+    return ns
+
+
+# Times ONE `re.search` and prints the milliseconds. Run as a subprocess so
+# a catastrophic backtrack is killed by a timeout instead of wedging pytest
+# (Python's `re` does not check for signals while matching, so an in-process
+# alarm cannot interrupt it). Pattern and text arrive as JSON on stdin --
+# never interpolated into this source, never passed as shell arguments.
+_PATTERN_TIMER_SRC = (
+    "import json, re, sys, time\n"
+    "req = json.load(sys.stdin)\n"
+    "rx = re.compile(req['pattern'])\n"
+    "start = time.perf_counter()\n"
+    "rx.search(req['text'])\n"
+    "print((time.perf_counter() - start) * 1000)\n"
+)
+
+
+_PATTERN_REPEATS = 5000
+
+# Repeated between the executable and a trailing non-verb word, so the
+# engine must EXHAUST the pattern rather than succeed early -- the worst
+# case, and the one a real fail-open command also hits. Module-level
+# because a class-body comprehension cannot see other class attributes.
+_PATTERN_TOKENS = {
+    "a fully-quoted word": '"a" ',
+    "a fully-quoted word holding a space": '"a b" ',
+    "a single-quoted word": "'a' ",
+    "a quoted OPTION word": '"-c" ',
+    "a single-quoted OPTION word": "'-c' ",
+    "a quoted option and a quoted value": '"-c" "k=v w" ',
+    "a quoted option and a bare value": '"-c" k=v ',
+    "a quoted option and a quoted dash-value": '"-c" "-x" ',
+    "a bare option and a quoted dash-value": '-c "-x" ',
+    "a backslash-escaped space in a value": "-c a.b=x\\ y ",
+    "a bare backslash escape": "\\x",
+    "an unbalanced double quote": '"',
+    "an unbalanced single quote": "'",
+}
+
+_PATTERN_LABELS = sorted(
+    [f"{name} x {_PATTERN_REPEATS}" for name in _PATTERN_TOKENS]
+    + ["a ~900KB single argument"]
+)
+
+
+class TestPatternDecisionTimeIsBounded:
+    """A timing budget on the PATTERNS themselves, not just end-to-end.
+
+    `TestDecisionTimeIsBounded` measures whole hooks, which is the number
+    that matters to a user but a coarse instrument: every row there pays
+    ~25ms of interpreter startup, and its four original inputs happened to
+    miss the shape that broke round 4. This class times a single
+    `re.search` per row against SHAPES GENERATED from a token template, so
+    the next spelling is covered by construction rather than by whoever
+    thinks of it.
+
+    Why this is a standing assertion rather than a habit: every single
+    regex change in `_Q`/`_OPT`/`_GLOBAL_OPTS` so far has been one
+    measurement away from a 30-second hook. Round 2 widened `_Q`'s
+    catch-all and made a quote both a run-opener and an ordinary character
+    (CRIT-3, 932ms at 34 quotes). Round 4 added a fully-quoted word as an
+    option token, which made it eligible as the PREVIOUS option's value
+    too (BLOCKING-1, 33s at 165 chars). Round 5's first attempt at the fix
+    required the `-` inside the quotes, which stops `"a" "a" ...` but not
+    `"-c" "-c" ...` -- still 2^n, still only visible by timing it. Each was
+    a verdict-preserving change, so no correctness test in this file could
+    have caught any of them.
+
+    The rule those three share, written into the pattern's own comment: in
+    a `(?:...)*` repeat, any two alternatives that can both match the same
+    text hand the engine a choice it will backtrack over. Adding an
+    alternative can only ever ADD a gate to the VERDICT; it can multiply
+    the COST.
+    """
+
+    # 200ms for one `re.search`. The worst honest measurement on this
+    # machine across every shape below, at ten times the repeat count used
+    # here, is ~27ms (a 600KB run of backslash-escaped values); at the
+    # 5000 repeats used here nothing exceeds ~3ms. 200ms is therefore
+    # ~60x headroom over the measured worst case while still catching a
+    # merely QUADRATIC regression (a candidate measured during round 5 hit
+    # 221ms at 2000 repeats), let alone an exponential one, which cannot
+    # finish at all at these sizes and dies on the subprocess cap instead.
+    BUDGET_MS = 200
+    SUBPROCESS_TIMEOUT_S = 5
+
+    REPEATS = _PATTERN_REPEATS
+    REPEATED_TOKENS = _PATTERN_TOKENS
+
+    HOOK_VERBS = TestGlobalOptionSpellingsMatchThePlainVerdict.HOOK_VERBS
+
+    @classmethod
+    def _texts(cls, exe, verb):
+        texts = {
+            f"{name} x {cls.REPEATS}": exe + token * cls.REPEATS + " x"
+            for name, token in cls.REPEATED_TOKENS.items()
+        }
+        texts["a ~900KB single argument"] = (
+            exe + verb + " " + "x" * 900_000)
+        return texts
+
+    @pytest.mark.parametrize("label", _PATTERN_LABELS)
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_pattern_search_within_budget(self, hook, label):
+        exe, verb = self.HOOK_VERBS[hook]
+        constants = _hook_regex_constants(hook)
+        verbs = {k: v for k, v in constants.items() if k.endswith("_VERB")}
+        assert verbs, (
+            f"{hook}.py defines no `*_VERB` constant this test could fold "
+            f"-- a rename would otherwise make every row here vacuous"
+        )
+        text = self._texts(exe, verb)[label]
+        for name, pattern in sorted(verbs.items()):
+            start = time.perf_counter()
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-c", _PATTERN_TIMER_SRC],
+                    input=json.dumps({"pattern": pattern, "text": text}),
+                    capture_output=True, text=True,
+                    timeout=self.SUBPROCESS_TIMEOUT_S,
+                )
+            except subprocess.TimeoutExpired:
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                pytest.fail(
+                    f"{hook}.{name} did not finish one re.search on "
+                    f"{label!r} within {elapsed_ms:.0f}ms (killed at the "
+                    f"{self.SUBPROCESS_TIMEOUT_S}s cap), against a "
+                    f"{self.BUDGET_MS}ms budget -- catastrophic "
+                    f"backtracking: two alternatives in a repeat can both "
+                    f"match the same text"
+                )
+            assert proc.returncode == 0, (
+                f"{hook}.{name} timer exited {proc.returncode} on "
+                f"{label!r}: {proc.stderr[-400:]!r}"
+            )
+            match_ms = float(proc.stdout.strip())
+            assert match_ms < self.BUDGET_MS, (
+                f"{hook}.{name} took {match_ms:.1f}ms for one re.search on "
+                f"{label!r}, over the {self.BUDGET_MS}ms budget"
+            )
+
+
+class TestUnparseableTextResolvesTowardGating:
+    """Every consumer of `_shell_scan` must say which way "cannot tell"
+    resolves, and it has to be whichever way ADDS gating FOR THAT CONSUMER.
+
+    `_shell_scan` reports "this position is inside an open quote" and "this
+    text does not parse at all" as the same `False`, and it cannot tell
+    them apart, because it reads a PREFIX and a prefix that ends mid-quote
+    looks exactly like one that never closes. Its two consumers need
+    opposite things from that `False`:
+
+    * `_targets_this_project` DROPS a `cd`/`-C` it cannot vouch for. A
+      dropped `cd` leaves the command in scope, so the gate still applies.
+    * `_push_invocations` must SPLIT on a separator it cannot vouch for. An
+      extra segment with no verb is skipped; a MERGED one runs past the ref
+      and hands the deletion gate a token like `main;`.
+
+    Round 4 of #351 gave the second consumer the first one's answer --
+    reused `_shell_scan` and merged on doubt -- and three command shapes
+    that `develop` denies started to ALLOW a delete of a protected branch.
+    Measured, all four `_shell_scan` blind spots, on `prevent-direct-push`:
+    deny at `74cf1b1`, allow at `b428ff3`.
+
+    The fixtures below are all valid bash (`bash -n` rc 0) whose PREFIX a
+    real shell parses fine and `_shell_scan` cannot: an apostrophe in a `#`
+    comment, an unbalanced quote in one, a `case` pattern's bare `)`, and a
+    heredoc body. Each test asserts the GATING verdict, and pairs it with a
+    control proving the row is not trivially gated.
+    """
+
+    # label -> (prefix, suffix). The suffix closes the construct the prefix
+    # opens, so every fixture is a command bash would actually accept.
+    BAILS = {
+        "an apostrophe in a `#` comment": ("git status # don't\n", ""),
+        "an unbalanced quote in a `#` comment": ('git status # a "b\n', ""),
+        "a `case` pattern's bare `)`": ("case a in a) ", " ;; esac"),
+        "a heredoc body with an apostrophe":
+            ("cat <<'EOF'\ndon't\nEOF\n", ""),
+    }
+
+    HOOK_VERBS = TestGlobalOptionSpellingsMatchThePlainVerdict.HOOK_VERBS
+
+    # A `cd` to a directory outside the project stands every gate down --
+    # that is `_targets_this_project`'s whole job (#326).
+    ELSEWHERE = "cd /nonexistent-elsewhere && "
+
+    @pytest.mark.parametrize("bail", sorted(BAILS))
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_unvouched_cd_is_dropped_and_the_gate_still_applies(
+        self, tmp_path, hook, bail
+    ):
+        exe, verb = self.HOOK_VERBS[hook]
+        prefix, suffix = self.BAILS[bail]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+
+        # Controls, so a `deny` below is not just "this hook denies
+        # everything": the bare command is gated, and the SAME `cd` stands
+        # it down when the text ahead of it does parse.
+        assert decide(work, env, hook, exe + verb) == "deny"
+        assert decide(work, env, hook, self.ELSEWHERE + exe + verb) == "allow"
+
+        candidate = prefix + self.ELSEWHERE + exe + verb + suffix
+        assert decide(work, env, hook, candidate) == "deny", (
+            f"{hook}: {candidate!r} honoured a `cd` that {bail} makes "
+            f"unverifiable -- dropping it is the gating direction"
+        )
+
+    # `_push_invocations` is `prevent-direct-push`-only, and so is this.
+    DELETE = "git pu" + "sh origin --delete "
+
+    # What follows the ref. A shell needs no space around a separator, and
+    # the GLUED spellings are the ones only the split can catch: `_bare_ref`
+    # strips a TRAILING run of separator characters, so it rescues `main;`
+    # from `main; echo hi` but nothing recovers `main` from `main&&echo`.
+    # The spaced spelling is kept so both layers stay covered.
+    TAILS = ("; echo hi", ";echo hi", "&&echo hi", "|cat")
+
+    @pytest.mark.parametrize("tail", TAILS)
+    @pytest.mark.parametrize("bail", sorted(BAILS))
+    def test_unvouched_separator_still_splits_the_segment(
+        self, tmp_path, bail, tail
+    ):
+        prefix, suffix = self.BAILS[bail]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        hook = "prevent-direct-push"
+
+        protected = prefix + self.DELETE + "ma" + "in" + tail + suffix
+        assert decide(work, env, hook, protected) == "deny", (
+            f"{protected!r} deleted a protected branch: {bail} stopped the "
+            f"separator from splitting, so the ref token kept it attached "
+            f"and the #333 deletion gate never recognised it"
+        )
+
+        # The control: splitting must not have become "deny everything".
+        # A release-cleanup delete on the same shape still stands down.
+        release = prefix + self.DELETE + "release/1.0.0" + tail + suffix
+        assert decide(work, env, hook, release) == "allow", (
+            f"{release!r} was denied -- the release-cleanup stand-down has "
+            f"to survive the split, or this test proves nothing"
+        )
+
+    @staticmethod
+    def _bare_ref():
+        """`_bare_ref` loaded from the shipped source, not a copy of it.
+
+        Same technique as `TestScopeGuardFailsClosedWhenScopeIsUnknowable`.
+        """
+        src = Path(".claude/hooks/prevent-direct-push.py").read_text(
+            encoding="utf-8")
+        node = [
+            n for n in ast.walk(ast.parse(src))
+            if isinstance(n, ast.FunctionDef) and n.name == "_bare_ref"
+        ][0]
+        namespace = {}
+        exec(ast.get_source_segment(src, node), namespace)  # noqa: S102
+        return namespace["_bare_ref"]
+
+    # (token, the ref git would actually act on)
+    GLUED_REF_TOKENS = (
+        ("ma" + "in", "ma" + "in"),
+        ("ma" + "in;", "ma" + "in"),
+        ("ma" + "in&", "ma" + "in"),
+        ("ma" + "in|", "ma" + "in"),
+        ("ma" + "in;;", "ma" + "in"),
+        ('"refs/heads/ma' + 'in"', "ma" + "in"),
+        ("+refs/heads/ma" + "in;", "ma" + "in"),
+        # NOT stripped: a separator INSIDE the name is part of the ref git
+        # receives, and no branch is named `main;x`, so this must stay
+        # unprotected or a legitimate command starts being denied.
+        ("ma" + "in;x", "ma" + "in;x"),
+    )
+
+    @pytest.mark.parametrize("token,expected", GLUED_REF_TOKENS)
+    def test_bare_ref_strips_a_glued_trailing_separator(self, token, expected):
+        """The second layer, pinned on its own.
+
+        The segment split above is the primary fix, and it makes this
+        stripping redundant TODAY -- which is exactly why it needs its own
+        test: a defence-in-depth layer that no test exercises is deleted by
+        the next person who notices nothing goes red without it. It is here
+        because a `;`/`&`/`|` glued to a ref is how round 4 of #351 let a
+        delete of a protected branch through, and this is the last place
+        that can still be caught.
+        """
+        assert self._bare_ref()(token) == expected
 
 
 class TestScopeGuardCannotBeBypassed:

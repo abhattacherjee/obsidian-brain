@@ -237,17 +237,47 @@ def _read_hook_input(what):
 #  * a QUOTED OPTION TOKEN (`"-c"`, `'-c'`). Every alternative above
 #    assumed the option starts with a literal, unquoted `-`; git does not
 #    require that. `_OPT` adds two more shapes for "the option token
-#    itself" -- a fully double- or single-quoted run -- alongside the
-#    original `-`-prefixed one. Accepting more shapes here can only ever
-#    ADD a gate (an `_OPT` alternative that fails to match just means
-#    fewer iterations of `_GLOBAL_OPTS`, never a match somewhere it
-#    shouldn't be), so this is deliberately permissive like everything
-#    else in this pattern.
+#    itself" -- a double- or single-quoted run whose FIRST character is
+#    the `-` -- alongside the original `-`-prefixed one.
+#
+#    The `-` has to be INSIDE the quotes. Accepting ANY fully-quoted word
+#    as an option token (`"[^"]*"`, which is what round 4 of #351 shipped)
+#    made a quoted word eligible both as an option token AND as the
+#    PREVIOUS option's separate value, inside the same `(?:...)*` repeat.
+#    Every adjacent pair of quoted words could then be parsed two ways, so
+#    a run of n of them cost 2^n. Measured end-to-end through this hook:
+#    `git ` + `"a" ` x34 (141 chars) took 1.8s, and x40 (165 chars) took
+#    33s -- on input that need not even be a git command, since the hook
+#    reads TEXT and the run only has to follow the literal `git `/`gh `.
+#    Requiring the `-` makes the two roles disjoint again (a value like
+#    `'k=v w'` can no longer be an `_OPT`): the same run at 2000 words
+#    costs 0.05ms, and both quoted-option spellings above still match.
+#
+#    That is only HALF of it, though. A word like
+#    `"-c"` is a legal `_OPT` AND, being fully quoted, was still a legal
+#    SEPARATE VALUE for the option before it -- so a run of `"-c" "-c"
+#    ...` kept the same 2^n (measured on `_OPT`-with-the-dash alone:
+#    2.5ms at 20 words, ~2.6x per word after that). The separate-value
+#    group below therefore refuses a quoted run whose first character is
+#    a `-`: `"(?:[^-"][^"]*)?"` matches `""` and `"x..."` but never
+#    `"-..."`. That costs no permissiveness, because a word this group
+#    declines is picked up as the NEXT `_OPT` on the following iteration
+#    -- `git -c "-x" push` still matches -- and it makes "option token"
+#    and "separate value" disjoint at the WORD level, which is what
+#    removes the choice the engine was backtracking over. Measured
+#    linear to 50 000 repeats on every shape.
+#
+#    "More shapes can only ADD a gate" is true of the VERDICT and false of
+#    the COST -- the trap round 4 fell into. Every alternative added here
+#    must be DISJOINT from the others (the rule the CRIT-3 fix above
+#    established) and must be TIMED; `TestPatternDecisionTimeIsBounded`
+#    now asserts that over generated shapes instead of leaving it to
+#    whoever remembers to measure.
 _Q = r'''(?:"[^"]*"|'[^']*'|"(?![^"]*")|'(?![^']*')|\\.|[^\s"'\\])'''
-_OPT = r'''(?:-''' + _Q + r'''*|"[^"]*"|'[^']*')'''
+_OPT = r'''(?:-''' + _Q + r'''*|"-[^"]*"|'-[^']*')'''
 _GLOBAL_OPTS = (
-    r'(?:' + _OPT + r'(?:\s+(?:(?:"[^"]*"|'
-    r"'[^']*'|\"(?![^\"]*\")|'(?![^']*')|\\.|[^-\s\"'\\])"
+    r'(?:' + _OPT + r'(?:\s+(?:(?:"(?:[^-"][^"]*)?"|'
+    r"'(?:[^-'][^']*)?'|\"(?![^\"]*\")|'(?![^']*')|\\.|[^-\s\"'\\])"
     + _Q + r'*))?\s+)*'
 )
 
@@ -555,13 +585,63 @@ def _bare_ref(token: str) -> str:
     happen FIRST, before `lstrip("+:")`, so a quoted qualified ref like
     `"refs/heads/main"` loses the quote before the `refs/heads/` prefix is
     tested, not after.
+
+    A TRAILING shell separator is stripped for the same reason, as defence
+    in depth behind the segment split in `_push_invocations`. If any path
+    ever fails to split a `;`/`&`/`|` away from the ref that precedes it,
+    the token arrives as `main;` -- which is not `main`, so
+    `_PROTECTED_REF_RE.fullmatch` misses it and the deletion gate lets the
+    delete through. That is exactly how round 4 of #351 regressed. Only the
+    trailing run is stripped, so a ref literally named `main;x` still reads
+    as `main;x` (git accepts it, it is not protected, and it must stay
+    allowed).
     """
     token = token.strip("\"'")
+    token = token.rstrip(";&|")
     token = token.lstrip("+:")
     for prefix in ("refs/heads/", "heads/"):
         if token.startswith(prefix):
             return token[len(prefix):]
     return token
+
+
+def _quoted_spans(cmd: str):
+    """Offset pairs `(open, close)` of every CLOSED quoted run in ``cmd``.
+
+    ``None`` when a quote opens and never closes -- i.e. when the text does
+    not parse and nothing in it can be vouched for.
+
+    This exists because `_shell_scan` answers a DIFFERENT question, and the
+    difference is a bug class. It scans a PREFIX, so "the position sits
+    inside an open quote" and "the text does not parse" are the same code
+    path there and come back as the same `False`. `_push_invocations` needs
+    them separated: see the direction-of-doubt paragraph in its docstring.
+    Looking at the WHOLE command rather than a prefix is what separates
+    them -- `-c a.b="c;d"` has a quote that closes, `# don't` has one that
+    never does.
+    """
+    spans, i, n = [], 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                return None
+            spans.append((i, j))
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and cmd[j] != '"':
+                j += 2 if cmd[j] == "\\" else 1
+            if j >= n:
+                return None
+            spans.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    return spans
 
 
 def _push_invocations(cmd: str):
@@ -597,28 +677,53 @@ def _push_invocations(cmd: str):
     normalised by ``_bare_ref`` — including the quotes, which is why skipping
     ``shlex`` cannot hide a protected ref.
 
-    The separator scan is QUOTE-AWARE, using ``_shell_scan`` the same way
-    ``_targets_this_project`` does for ``cd``: a ``;``/``&``/``|``/newline is
-    only a real split point when ``_shell_scan`` reports the shell would
-    really be executing there, i.e. not sitting inside an open quote,
-    backtick run, or ``$( )`` substitution. A plain ``re.split`` is
-    text-blind, so `git -c a.b="c;d" push origin --delete main` split on the
-    quoted `;` into two fragments — `git -c a.b="c` and `d" push origin
-    --delete main` — NEITHER of which contains a complete `git ... push`
-    match. `_push_invocations` returned no invocation at all for a real
-    `git push`, so `_protected_delete_refs` never saw the `main` ref and the
-    deletion gate missed it entirely (#351 CRIT-5). Splitting only at
-    real separators keeps `-c a.b="c;d"` as one token inside the SAME
-    invocation, so the verb match — and the ref tokens after it — survive
-    intact.
+    The separator scan is QUOTE-AWARE. A plain ``re.split`` is text-blind,
+    so `git -c a.b="c;d" push origin --delete main` split on the quoted `;`
+    into two fragments — `git -c a.b="c` and `d" push origin --delete main`
+    — NEITHER of which contains a complete `git ... push` match.
+    `_push_invocations` returned no invocation at all for a real `git push`,
+    so `_protected_delete_refs` never saw the `main` ref and the deletion
+    gate missed it entirely (#351 CRIT-5). Suppressing that split keeps
+    `-c a.b="c;d"` as one token inside the SAME invocation, so the verb
+    match — and the ref tokens after it — survive intact.
+
+    DIRECTION OF DOUBT. Every consumer of a shell-text scan has to state
+    which way "cannot tell" resolves, and the answer is whichever way ADDS
+    gating FOR THAT CONSUMER — it is not a property of the scan.
+    `_targets_this_project` DROPS a `cd`/`-C` it cannot vouch for, because
+    dropping it leaves the command IN scope. This function is the mirror
+    image: SPLITTING is what adds gating here, because an extra segment
+    with no push verb is simply skipped, whereas a MERGED one runs `tail`
+    on past the ref and hands the deletion gate a token like `main;`, which
+    it does not recognise as `main`.
+
+    Round 4 of #351 got this backwards by reusing `_shell_scan`, which
+    reports "inside an open quote" and "this text does not parse" as the
+    same `False`, and suppressed the split on both. Its four documented
+    blind spots — a `#` comment, an unbalanced quote inside one, a
+    `case ... )` pattern, a heredoc body — then MERGED the whole command,
+    and `git status # don't`⏎`git push origin --delete main; echo hi`
+    (valid bash, denied on `develop`) started to ALLOW. So the default here
+    is the old text-blind behaviour — split at EVERY separator — and a
+    split is suppressed ONLY where `_quoted_spans` positively vouches that
+    the separator sits inside a quoted run that closes. Over-splitting is
+    safe; merging is not. `_bare_ref` strips a trailing separator as a
+    second layer, so a token some future path does merge still resolves.
     """
     cmd = cmd.replace("\\\n", " ")
     invocations = []
+    # `_quoted_spans` walks the whole command, and the stdin cap allows a
+    # ~1MB one. Skip that walk when there is no quote character to find:
+    # with no quoted run, no separator can sit inside one, so the `[]` it
+    # would return and the `None` this leaves behind mean the same thing to
+    # the loop below — split at every separator.
+    spans = _quoted_spans(cmd) if ('"' in cmd or "'" in cmd) else None
     parts, last = [], 0
     for m in re.finditer(r'[;&|\n]+', cmd):
-        if _shell_scan(cmd[:m.start()])[0]:
-            parts.append(cmd[last:m.start()])
-            last = m.end()
+        if spans is not None and any(a < m.start() < b for a, b in spans):
+            continue  # provably inside a closed quoted run — not a separator
+        parts.append(cmd[last:m.start()])
+        last = m.end()
     parts.append(cmd[last:])
     for part in parts:
         m = re.search(_PUSH_VERB, part)
