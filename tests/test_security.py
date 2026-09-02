@@ -1787,6 +1787,9 @@ _GROWTH_MIN_WORK_MS = 3.0
 _GROWTH_MAX_RATIO = 3.0
 
 
+# Memo for the size-matched baselines, keyed by (hook, size in KB).
+_SIZE_MATCHED_BASELINES = {}
+
 _MATRIX_LABELS = sorted(
     f"{unit} @ {kb}KB"
     for unit in _MATRIX_UNITS
@@ -1831,9 +1834,11 @@ class TestDecisionTimeIsBounded:
     every other test in this class only checks the VERDICT, never how long
     it took to arrive at one.
 
-    Budget: a floor of 500ms, raised to 12x this machine's own measured
-    baseline when that is larger -- see CEILING_BASELINE_MULTIPLE. The floor
-    was chosen from measurements on this machine (a 2026-era
+    Budget: see SIZE_MATCHED_MULTIPLE and STALL_CEILING_MS -- the generated
+    matrix is judged against an equally large benign command, and the
+    hand-picked rows against a loose stall backstop. The 500ms figure below
+    survives only as a floor, and was chosen from measurements on this
+    machine (a 2026-era
     Mac): an honest `git status` costs ~22-29ms per hook here --
     interpreter/subprocess startup dominates that number, not the regex
     work -- and the heaviest NON-pathological input measured (a ~900KB
@@ -1854,38 +1859,61 @@ class TestDecisionTimeIsBounded:
 
     BUDGET_MS = 500
 
-    # The ceiling is MACHINE-RELATIVE, because an absolute millisecond number
-    # measures the runner as much as the code. CI proved it: the
-    # `balanced quote run @ 900KB` row measured 548.4 ms on a shared GitHub
-    # runner against ~96 ms locally and failed a flat 500 ms budget, while the
-    # growth-ratio assertion below it passed -- a ratio cancels machine speed
-    # and an absolute number cannot.
+    # Two nets with different jobs, because one number cannot do both.
     #
-    # Raising 500 to 2000 was the other option and is the wrong one: it picks a
-    # number for today's runner, drifts again on tomorrow's, and widens the
-    # window in which a genuine slowdown looks acceptable on every machine.
+    # CI killed the obvious model twice. A flat 500 ms failed on a shared
+    # runner. Scaling it by 12x a TINY-COMMAND baseline failed too, and the
+    # second failure is the instructive one: the runner's baseline was
+    # 39.4 ms against 39.4 ms here -- identical -- while the 900 KB cell took
+    # 551.6 ms against 235.8 ms. The runner starts an interpreter at the same
+    # speed and moves 900 KB far more slowly.
     #
-    # `max(BUDGET_MS, MULTIPLE * baseline)` keeps both halves. The floor is
-    # what "a human notices a stall" means on a fast machine, where 12x a 25 ms
-    # baseline is only 300 ms and nobody would notice. The multiple is what it
-    # means on a slow or contended one, where the same honest work legitimately
-    # costs proportionally more.
+    # The baseline and the cell were in different REGIMES. A tiny command is
+    # dominated by interpreter start-up and a couple of git calls, which is
+    # nearly machine-independent; a 900 KB command is dominated by memory and
+    # I/O throughput, which is exactly where a shared runner is worst. A ratio
+    # between two regimes measures the difference between the regimes, not the
+    # code, so K measured here could never transfer.
     #
-    # 12 comes from measurement, not taste. The honest worst shape across all
-    # five hooks and all 27 generated cells is 6.06x its hook's baseline
-    # (`prevent-direct-push`, `balanced quote run @ 900KB`: 242.3 ms against a
-    # 40.0 ms baseline); the other four hooks peak at 1.54x-2.63x. 12 is ~2x
-    # headroom over the worst honest case. Read the other way: once the
-    # multiple dominates, this catches a ~2x regression on the worst shape;
-    # while the floor dominates it catches a ~3.3x one. Anything smaller is
-    # the growth-ratio assertion's job, and that is the primary net -- this is
-    # a backstop for pathological ABSOLUTE cost.
-    CEILING_BASELINE_MULTIPLE = 12
+    # The generated matrix therefore compares each cell against the BENIGN
+    # CELL OF THE SAME SIZE -- `no structure @ <same size>`, the same bytes
+    # through the same hook with the adversarial property removed. The
+    # assertion becomes "this shape costs no more than K x an equally large
+    # ordinary command", which is a statement about the code. Measured, that
+    # ratio is both tighter and stabler than the cross-regime one:
+    #
+    #                          worst ratio   worst ratio
+    #                                 idle   under 12 burners on 12 cores
+    #   vs a tiny command             6.06   --      (CI showed 14x)
+    #   vs the same-size benign cell  2.89   2.38-2.57
+    #
+    # Under load the size-matched baseline rose from 81.5 ms to 121-133 ms and
+    # the cell from 235.8 ms to 313-317 ms -- together, which is the property
+    # the tiny baseline did not have. Four of the five hooks sit at ~1.0x.
+    #
+    # K = 10 is ~3.5x headroom over the worst measured 2.89. It catches a
+    # constant-factor regression of ~3.5x or more in the span/separator
+    # machinery -- the failure mode the growth-ratio assertion CANNOT see,
+    # since a constant factor scales every size equally. Anything subtler is
+    # that assertion's job, and it is the primary detector: it is
+    # machine-independent by construction and stayed green through both CI
+    # failures.
+    SIZE_MATCHED_MULTIPLE = 10
 
-    # Best-of-2 for the baseline, taken per row rather than once per session:
-    # `min` discards a scheduling spike, and re-measuring per row keeps the
-    # denominator honest when load varies through a long run.
-    CEILING_BASELINE_REPS = 2
+    # A floor, so a cheap cell whose baseline is a few milliseconds cannot
+    # produce a ceiling small enough to flake on scheduling noise.
+    CEILING_FLOOR_MS = 500
+
+    # The hand-picked ADVERSARIAL_INPUTS have no same-size benign partner --
+    # they are arbitrary remembered shapes, not points on a size axis -- so
+    # they keep a plain absolute bound, DEMOTED to what it can honestly claim:
+    # a catastrophic-stall backstop, not a tuned budget. 2 s is "a human has
+    # noticed and is wondering if it hung", not "this machine's fastest".
+    # Regressions on these shapes are caught by the growth assertion and by
+    # the size-matched matrix; this only catches a hang.
+    STALL_CEILING_MS = 2000
+
+    BASELINE_REPS = 2
 
     # A per-row subprocess timeout just above the budget, not the shared
     # 60s harness default. Round 3's implementation used the harness's
@@ -1900,55 +1928,35 @@ class TestDecisionTimeIsBounded:
     SUBPROCESS_TIMEOUT_S = 2
 
     @classmethod
-    def _ceiling_ms(cls, baseline_ms):
-        """The absolute ceiling for a machine whose baseline is `baseline_ms`.
+    def _size_matched_baseline_ms(cls, work, env, hook, kb):
+        """Cost of the BENIGN cell of the same size, through the same hook.
 
-        See `CEILING_BASELINE_MULTIPLE` for where the 12 comes from.
+        Memoised per (hook, size): it is a property of the machine and the
+        input size, not of the adversarial shape being judged, and measuring
+        it per row would add hundreds of 900 KB runs to the suite.
         """
-        return max(cls.BUDGET_MS, cls.CEILING_BASELINE_MULTIPLE * baseline_ms)
-
-    @classmethod
-    def _baseline_ms(cls, work, env, hook):
-        """Cost of getting in and out of `hook` at all, on this machine now."""
+        key = (hook, kb)
+        if key in _SIZE_MATCHED_BASELINES:
+            return _SIZE_MATCHED_BASELINES[key]
+        command = _matrix_command(f"no structure @ {kb}KB")
         best = None
-        for _ in range(cls.CEILING_BASELINE_REPS):
+        for _ in range(cls.BASELINE_REPS):
             start = time.perf_counter()
             proc = subprocess.run(
                 [sys.executable, str(work / ".claude/hooks" / f"{hook}.py")],
                 input=json.dumps({"tool_name": "Bash",
-                                  "tool_input": {"command":
-                                                 "git pu" + "sh origin feature/probe"}}),
+                                  "tool_input": {"command": command}}),
                 capture_output=True, text=True,
                 timeout=cls.SUBPROCESS_TIMEOUT_S, cwd=work, env=env,
             )
             assert proc.returncode == 0, (
-                f"{hook} baseline exited {proc.returncode}: "
+                f"{hook} size-matched baseline exited {proc.returncode}: "
                 f"{proc.stderr[-400:]!r}"
             )
             elapsed = (time.perf_counter() - start) * 1000
             best = elapsed if best is None else min(best, elapsed)
+        _SIZE_MATCHED_BASELINES[key] = best
         return best
-
-    def test_the_ceiling_scales_with_the_machine(self):
-        """The formula's own properties, over synthetic baselines.
-
-        A slow machine cannot be produced on demand, so the two directions
-        that matter are asserted directly: the ceiling never shrinks below
-        the floor (a suspiciously fast baseline cannot make it fire on
-        everything), and it never grows past the multiple (it cannot become
-        a ceiling that fires on nothing). The end-to-end proof that a real
-        regression still trips it is in the round-7 report: the pre-fix
-        quadratic hook reddens these rows at both a 40 ms and a
-        load-inflated baseline.
-        """
-        for baseline in (5.0, 25.0, 40.0, 90.0, 250.0, 1000.0):
-            ceiling = self._ceiling_ms(baseline)
-            assert ceiling >= self.BUDGET_MS
-            assert ceiling <= max(self.BUDGET_MS,
-                                  self.CEILING_BASELINE_MULTIPLE * baseline)
-            # The honest worst shape, 6.06x its hook's baseline, must pass on
-            # every machine -- otherwise this is just a flake generator.
-            assert ceiling > 6.06 * baseline
 
     # label -> command. Chosen to stress the three shapes rounds 1-3 each
     # found a fail-open or a blowup in: unbalanced quotes (CRIT-3), a long
@@ -1993,8 +2001,7 @@ class TestDecisionTimeIsBounded:
     @pytest.mark.parametrize("hook", TestHookInputFailsClosed.HOOKS)
     def test_decision_within_budget(self, tmp_path, hook, label):
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
-        baseline = self._baseline_ms(work, env, hook)
-        ceiling = self._ceiling_ms(baseline)
+        ceiling = self.STALL_CEILING_MS
         command = self.ADVERSARIAL_INPUTS[label]
         start = time.perf_counter()
         try:
@@ -2020,10 +2027,9 @@ class TestDecisionTimeIsBounded:
         )
         assert elapsed_ms < ceiling, (
             f"{hook} took {elapsed_ms:.1f}ms on {label!r}, over the "
-            f"{ceiling:.0f}ms ceiling (max of the {self.BUDGET_MS}ms floor "
-            f"and {self.CEILING_BASELINE_MULTIPLE}x this machine's "
-            f"{baseline:.1f}ms baseline) -- possible catastrophic "
-            f"backtracking or other superlinear blowup"
+            f"{ceiling:.0f}ms catastrophic-stall backstop -- this bound only "
+            f"catches a hang; a smaller regression is the growth assertion's "
+            f"job"
         )
 
     @pytest.mark.parametrize("label", _MATRIX_LABELS)
@@ -2041,8 +2047,10 @@ class TestDecisionTimeIsBounded:
         `quoted separators`, and cells here are seven times larger again.
         """
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
-        baseline = self._baseline_ms(work, env, hook)
-        ceiling = self._ceiling_ms(baseline)
+        kb = int(label.rpartition(" @ ")[2].removesuffix("KB"))
+        baseline = self._size_matched_baseline_ms(work, env, hook, kb)
+        ceiling = max(self.CEILING_FLOOR_MS,
+                      self.SIZE_MATCHED_MULTIPLE * baseline)
         command = _matrix_command(label)
         start = time.perf_counter()
         try:
@@ -2058,9 +2066,10 @@ class TestDecisionTimeIsBounded:
             pytest.fail(
                 f"{hook} took over {elapsed_ms:.0f}ms on the generated shape "
                 f"{label!r}, well past the {ceiling:.0f}ms ceiling "
-                f"(subprocess killed at the {self.SUBPROCESS_TIMEOUT_S}s "
-                f"safety cap) -- a superlinear blowup over separator or "
-                f"quote density"
+                f"({self.SIZE_MATCHED_MULTIPLE}x the {baseline:.1f}ms cost of "
+                f"an equally large benign command; subprocess killed at the "
+                f"{self.SUBPROCESS_TIMEOUT_S}s safety cap) -- a superlinear "
+                f"blowup over separator or quote density"
             )
         elapsed_ms = (time.perf_counter() - start) * 1000
         assert proc.returncode == 0, (
@@ -2069,10 +2078,12 @@ class TestDecisionTimeIsBounded:
         )
         assert elapsed_ms < ceiling, (
             f"{hook} took {elapsed_ms:.1f}ms on the generated shape "
-            f"{label!r}, over the {ceiling:.0f}ms ceiling (max of the "
-            f"{self.BUDGET_MS}ms floor and "
-            f"{self.CEILING_BASELINE_MULTIPLE}x this machine's "
-            f"{baseline:.1f}ms baseline)"
+            f"{label!r}, against a {baseline:.1f}ms baseline for an equally "
+            f"large BENIGN command through the same hook -- "
+            f"{elapsed_ms / baseline:.2f}x, over the "
+            f"{self.SIZE_MATCHED_MULTIPLE}x bound (ceiling {ceiling:.0f}ms). "
+            f"Both numbers are the same size on the same machine, so this is "
+            f"the code, not the runner."
         )
 
     # ---- the RELATIVE assertion --------------------------------------------
