@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -1708,4 +1709,272 @@ class TestRefspecPushesToProtectedBranchesAreBlocked:
         assert "current_branch in [" not in after, (
             "a second, narrower condition sits under `if targets_protected:` "
             "again — that is the exact shape of #327"
+        )
+
+
+class TestProtectedBranchDeletionIsBlocked:
+    """#333: the `--delete` allowlist stood the gate down on a substring.
+
+    The allowlist was two unanchored `in` tests::
+
+        if "--delete" in command and ("release/" in command or "hotfix/" in command):
+
+    Neither half is tied to an argument, so a protected ref riding ALONGSIDE a
+    release ref was permitted: `--delete origin release/x main` deleted `main`.
+    A deletion is worse than a push to the same branch — a push can be
+    reverted, a deleted ref is gone.
+
+    Falling through to `targets_protected` does not catch it either, which is
+    why this needed a deny of its own rather than just a tighter allowlist:
+    `"origin main"` is not a substring of `--delete origin release/x main`, the
+    refspec arms need a `:` or a `heads/` spelling, and on a feature branch
+    `current_branch` is clean. Measured before the fix: allow.
+
+    The allow rows are the other half of the claim. Deleting a `release/` or
+    `hotfix/` ref is the case the allowlist exists for, and deleting a
+    `feature/` ref is what `git-branch-cleanup` actually runs — it never
+    reached the allowlist at all, and must still be permitted.
+
+    Command strings are assembled from fragments for the reason given in
+    TestHookBlockingPathsFire's docstring: this repo's live hooks inspect
+    unexecuted command text, so a literal protected push here blocks the
+    tooling that reads this file.
+    """
+
+    PUSH = "git pu" + "sh"
+    MAIN = "ma" + "in"
+
+    # (label, command, expected). The deny rows are the filed defect; the allow
+    # rows are what stops the fix from being "deny every deletion".
+    CASES = (
+        ("protected ref beside a release ref",
+         f"{PUSH} --delete origin release/x {MAIN}", "deny"),
+        ("protected ref beside a hotfix ref",
+         f"{PUSH} --delete origin hotfix/x develop", "deny"),
+        ("short flag", f"{PUSH} -d origin release/x {MAIN}", "deny"),
+        # git's parse-options bundles short flags, so `-fd` is `--force
+        # --delete`. A test for `-d` alone does not cover it.
+        ("bundled short flag", f"{PUSH} -fd origin release/x {MAIN}", "deny"),
+        ("flag after the remote",
+         f"{PUSH} origin --delete release/x {MAIN}", "deny"),
+        # Control: this one already denied, via the "origin main" substring.
+        ("plain protected deletion", f"{PUSH} --delete origin {MAIN}", "deny"),
+        # The qualified spellings of the same destination.
+        ("qualified protected ref",
+         f"{PUSH} --delete origin release/x refs/heads/{MAIN}", "deny"),
+        ("heads/ qualified protected ref",
+         f"{PUSH} --delete origin release/x heads/{MAIN}", "deny"),
+        ("quoted qualified protected ref",
+         f'{PUSH} --delete origin release/x "refs/heads/{MAIN}"', "deny"),
+        ("protected ref before the release ref",
+         f"{PUSH} --delete origin {MAIN} release/x", "deny"),
+        # This row is what proves the stand-down asks about EVERY ref rather
+        # than any one of them. `HEAD:main` is a ref token the deny below does
+        # not recognise (it is a refspec, not a bare ref), so under an "any
+        # release ref" stand-down the command is allowed outright and the
+        # refspec arms never run. Under "every ref", it falls through to them
+        # and `:main` denies.
+        ("refspec spelling beside a release ref",
+         f"{PUSH} --delete origin release/x HEAD:{MAIN}", "deny"),
+        # A second push in the same command is a separate invocation and has to
+        # be analysed as one.
+        ("protected deletion in a later segment",
+         f"{PUSH} --delete origin release/x && {PUSH} --delete origin {MAIN}",
+         "deny"),
+        # ---- negative controls: the fix must not be "deny every deletion" ----
+        ("the intended release cleanup",
+         f"{PUSH} --delete origin release/x", "allow"),
+        ("the intended hotfix cleanup",
+         f"{PUSH} --delete origin hotfix/x", "allow"),
+        ("several release refs",
+         f"{PUSH} --delete origin release/x hotfix/y", "allow"),
+        ("qualified release ref",
+         f"{PUSH} --delete origin refs/heads/release/x", "allow"),
+        # A branch whose name merely BEGINS with a protected name is ordinary.
+        ("a mainline branch beside a release ref",
+         f"{PUSH} --delete origin release/x {MAIN}line", "allow"),
+        ("a maintenance branch beside a release ref",
+         f"{PUSH} --delete origin release/x {MAIN}tenance", "allow"),
+        # What git-branch-cleanup actually runs.
+        ("feature branch cleanup",
+         f"{PUSH} origin --delete feature/x", "allow"),
+        ("feature branch cleanup, flag first",
+         f"{PUSH} --delete origin feature/x", "allow"),
+        # #333 follow-up (fix 1): a backslash-newline is a line continuation,
+        # i.e. whitespace, not the segment separator a bare newline is. Before
+        # the fix, splitting on it dropped the protected ref into a segment
+        # with no push verb, so it was never inspected and the delete was
+        # allowed.
+        ("protected ref after a line continuation",
+         f"{PUSH} --delete origin release/x \\\n    {MAIN}", "deny"),
+        # #333 follow-up (fix 2): an unbalanced quote sends `_push_invocations`
+        # down the whitespace-split fallback, which does not strip quotes.
+        # Before the fix the resulting token kept its leading `"`, `_bare_ref`
+        # did not recognise it as protected, and the delete was allowed.
+        ("protected ref behind an unbalanced quote",
+         f'{PUSH} --delete origin release/x "{MAIN}', "deny"),
+        # Negative control for fix 2: a normally single-quoted release ref
+        # must still stand down — the quote strip must not turn into "deny
+        # every quoted token".
+        ("singly-quoted release ref still stands down",
+         f"{PUSH} --delete origin 'release/x'", "allow"),
+        # `_push_invocations` skips `shlex` for an argument string past
+        # `_SHLEX_MAX` (it is quadratic in a single token's length). That
+        # shortcut must not become a way to hide a ref: the whitespace split
+        # keeps the quotes on, and `_bare_ref` is what takes them off again.
+        ("quoted protected ref past the shlex bound",
+         f"{PUSH} --delete origin release/x " + "b" * 100_001 + f' "{MAIN}"',
+         "deny"),
+        # The same shape under the bound, which DOES go through shlex — so the
+        # row above is testing the shortcut rather than just the ref matcher.
+        ("quoted protected ref under the shlex bound",
+         f"{PUSH} --delete origin release/x " + "b" * 10 + f' "{MAIN}"',
+         "deny"),
+        # A flag whose value is a SEPARATE token consumes that token, so it is
+        # neither the remote nor a ref. Skipping it must not open a hole: the
+        # protected ref after it still denies.
+        ("value flag before a mixed deletion",
+         f"{PUSH} -o ci.skip --delete origin release/x {MAIN}", "deny"),
+        ("long value flag before a mixed deletion",
+         f"{PUSH} --push-option ci.skip --delete origin release/x {MAIN}",
+         "deny"),
+        # The `=`-joined spelling is one token starting with `-`, so it is
+        # already a flag and consumes nothing.
+        ("=-joined value flag before a mixed deletion",
+         f"{PUSH} --push-option=ci.skip --delete origin release/x {MAIN}",
+         "deny"),
+        # Verified against real git: `--repo` consumes `origin`, which leaves
+        # the single positional as the REPOSITORY and no refspec at all, so
+        # git refuses with "--delete doesn't make sense without any refs" and
+        # the remote is unchanged. Nothing is deleted, so allow is the verdict
+        # that matches git. This row is also the control proving the skip is
+        # real: without it, `origin` would be the remote and `main` a ref.
+        ("value flag leaves no refspec at all",
+         f"{PUSH} --repo origin --delete {MAIN}", "allow"),
+        # A `-`-prefixed token is never eaten as a value, so an over-broad
+        # entry cannot swallow a real option and hide the ref behind it.
+        ("value flag followed by another flag",
+         f"{PUSH} -o --force origin --delete {MAIN}", "deny"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        CASES,
+        ids=[c[0].replace(" ", "-") for c in CASES],
+    )
+    def test_delete_decision(self, tmp_path, label, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # The stand-down is only OBSERVABLE from a protected branch. On a feature
+    # branch, "stood down" and "fell through" both end in allow — the hook has
+    # no other reason to refuse — so every row above would pass against a
+    # stand-down that never fires. From `develop` the two outcomes separate:
+    # standing down exits 0 immediately, and anything that falls through hits
+    # `current_branch in ["main", "develop"]` and denies. These rows are what
+    # keep the allowlist from being quietly deleted.
+    DEVELOP_CASES = (
+        # The case the allowlist exists for.
+        ("release cleanup from develop",
+         f"{PUSH} --delete origin release/x", "allow"),
+        ("hotfix cleanup from develop",
+         f"{PUSH} --delete origin hotfix/x", "allow"),
+        # Needs the qualified spellings to be stripped before the release/
+        # prefix is tested.
+        ("qualified release ref from develop",
+         f"{PUSH} --delete origin refs/heads/release/x", "allow"),
+        ("heads/ qualified release ref from develop",
+         f"{PUSH} --delete origin heads/release/x", "allow"),
+        # Needs the quotes stripped: a whitespace split leaves `"release/x"`,
+        # which does not start with `release/`.
+        ("quoted release ref from develop",
+         f'{PUSH} --delete origin "release/x"', "allow"),
+        # Needs each push to be analysed on its own arguments: read as one
+        # string, the second invocation's `git`, `push` and `origin` become
+        # ref tokens of the first and none of them is a release ref.
+        ("two release cleanups in one command",
+         f"{PUSH} --delete origin release/x && {PUSH} --delete origin hotfix/y",
+         "allow"),
+        # The false deny this fix removes. `-o` takes a separate value, so
+        # before the fix `ci.skip` was read as the remote and `origin` as a
+        # ref; `origin` is not a release ref, the stand-down was withheld, and
+        # a legitimate release cleanup run from develop was DENIED.
+        ("release cleanup behind a value flag",
+         f"{PUSH} -o ci.skip --delete origin release/x", "allow"),
+        ("release cleanup behind a long value flag",
+         f"{PUSH} --push-option ci.skip --delete origin release/x", "allow"),
+        # ---- controls: develop must not become an allow-everything branch --
+        ("a protected push from develop", f"{PUSH} origin develop", "deny"),
+        ("a protected deletion from develop",
+         f"{PUSH} --delete origin release/x {MAIN}", "deny"),
+        # Pre-existing behaviour, unchanged by #333 and pinned so a later
+        # change has to be deliberate: the allowlist only ever covered
+        # release/hotfix refs, so deleting a feature branch while standing on
+        # develop was refused before this change and still is.
+        ("feature cleanup from develop is still refused",
+         f"{PUSH} --delete origin feature/x", "deny"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        DEVELOP_CASES,
+        ids=[c[0].replace(" ", "-") for c in DEVELOP_CASES],
+    )
+    def test_delete_decision_from_develop(self, tmp_path, label, command,
+                                          expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b",
+                        "develop"], env=env, check=True, capture_output=True)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    def test_a_large_command_does_not_stall_the_gate(self, tmp_path):
+        """`shlex` is quadratic in the length of a single argument.
+
+        This hook runs before EVERY Bash tool call, and the payload cap
+        upstream is 1 MB. Handing `shlex` a ~900 KB argument took 5.6s, against
+        0.03s for the same command on `develop` — measured, a ~185x regression
+        introduced by the delete gate itself. `_push_invocations` now skips
+        `shlex` past `_SHLEX_MAX`, which brought it back to 0.04s.
+
+        The bound is generous on purpose: it sits far below the 5.6s the
+        unfixed path took, and far above the ~0.04s the fixed one does, so it
+        catches the regression without going flaky on a loaded CI runner. The
+        verdict is asserted alongside the timing — a fast ALLOW would be the
+        worst possible way to pass this test.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = (f"{self.PUSH} --delete origin release/x "
+                   + "b" * 900_000 + f" {self.MAIN}")
+        started = time.monotonic()
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        elapsed = time.monotonic() - started
+        assert got == "deny", f"a 900 KB command must still deny, got {got}"
+        assert elapsed < 3.0, (
+            f"the gate took {elapsed:.2f}s on a 900 KB command; the quadratic "
+            f"shlex path is back (it measured 5.6s, the fixed path 0.04s)"
+        )
+
+    def test_the_delete_analysis_is_what_carries_these(self, tmp_path):
+        """The negative control on the guard itself.
+
+        Without it the deny rows would still pass against a hook that blocked
+        everything, and the allow rows would still pass against the ORIGINAL
+        substring allowlist for every row that does not mix a protected ref
+        with a release one. This asserts the substring form is gone and the
+        ref-token analysis is the thing deciding.
+        """
+        source = Path(".claude/hooks/prevent-direct-push.py").read_text(
+            encoding="utf-8")
+        assert '"--delete" in command and' not in source, (
+            "the unanchored substring allowlist is back; #333 is reachable "
+            "again"
+        )
+        assert "_protected_delete_refs(command)" in source, (
+            "the ref-token delete analysis is gone; nothing else in this hook "
+            "denies `--delete origin release/x main`"
         )

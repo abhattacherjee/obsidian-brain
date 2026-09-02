@@ -10,6 +10,7 @@ Installed by /harden-repo into target repo's .claude/hooks/
 import json
 import os
 import re
+import shlex
 import sys
 import subprocess
 
@@ -356,8 +357,212 @@ if "refs/tags/" in command or "--tags" in command:
 if re.search(r'git push\s+\S+\s+v\d+\.\d+\.\d+', command):
     sys.exit(0)
 
+# --- Branch deletion (--delete / -d) ---
+#
+# This gate was two unanchored substring tests — `"--delete" in command` and
+# `"release/" in command or "hotfix/" in command` — so a protected ref riding
+# ALONGSIDE a release ref stood the whole hook down: `--delete origin
+# release/x main` deleted `main` (#333).
+#
+# Tightening the allowlist alone would not have fixed it, which is why there
+# is a deny here as well. Nothing downstream catches that command: "origin
+# main" is not a substring of it, the refspec arms below need a `:` or a
+# `heads/` spelling, and on a feature branch `current_branch` is clean.
+# Measured before this change: allow. A deletion is also worse than a push to
+# the same branch — a bad push can be reverted, a deleted ref is gone.
+#
+# Both halves are decided on REF TOKENS instead. `_PROTECTED_REF` is the
+# whole-ref matcher from #332, reused so that `mainline` and `maintenance`
+# stay the ordinary branches they are.
+_PROTECTED_REF = r'(?:main|develop)(?![A-Za-z0-9._/-])'
+_PROTECTED_REF_RE = re.compile(_PROTECTED_REF)
+
+# Longest argument string still handed to `shlex` — see `_push_invocations`.
+# No real ref name approaches this; it exists only to bound a quadratic path.
+_SHLEX_MAX = 100_000
+
+# `git push` flags whose value is a SEPARATE token — see `_ref_tokens`. Only
+# these five: `--force-with-lease`, `--signed` and `--recurse-submodules` take
+# their value `=`-joined only, and a bare `--force-with-lease` takes none, so
+# treating any of them as separate-value would consume a real ref token.
+_VALUE_FLAGS = frozenset({
+    "-o", "--push-option", "--repo", "--exec", "--receive-pack",
+})
+
+
+def _bare_ref(token: str) -> str:
+    """A ref token with the decorations git accepts stripped off.
+
+    `main`, `heads/main`, `refs/heads/main` and `+refs/heads/main` are one
+    destination; a leading `:` is the old-style delete spelling.
+
+    Also strips a leading/trailing quote character, because it can arrive
+    already attached: when `shlex.split` raises on an unbalanced quote,
+    `_push_invocations` falls back to a plain whitespace split, which does
+    not strip quoting the way `shlex` does. Measured: a command ending in an
+    unbalanced `"` immediately followed by `main` produced the token `"main`
+    from that fallback, which this function did not recognise as `main` —
+    the deletion gate missed it and allowed the delete. The strip has to
+    happen FIRST, before `lstrip("+:")`, so a quoted qualified ref like
+    `"refs/heads/main"` loses the quote before the `refs/heads/` prefix is
+    tested, not after.
+    """
+    token = token.strip("\"'")
+    token = token.lstrip("+:")
+    for prefix in ("refs/heads/", "heads/"):
+        if token.startswith(prefix):
+            return token[len(prefix):]
+    return token
+
+
+def _push_invocations(cmd: str):
+    r"""One list of argument tokens per `git push` in ``cmd``.
+
+    Split on shell separators first, so each push in a compound command is
+    judged on its OWN arguments rather than on the whole string — which is the
+    mistake the substring allowlist made. ``shlex`` is what strips the quotes,
+    so `"refs/heads/main"` is the same token as `refs/heads/main`; a segment
+    it cannot parse falls back to a whitespace split, which does NOT strip
+    quotes and can mis-split — see ``_bare_ref``, which strips a stray quote
+    character off a token from that path so both consumers below still
+    recognise it. Extra ref tokens are still safe either way: a spurious one
+    can only add a deny or withhold the stand-down, never grant one. What is
+    not safe is a MALFORMED one that a downstream check fails to recognise as
+    protected, which is why the quote is stripped rather than left for the
+    caller to trip over.
+
+    "\<newline>" is a line continuation, i.e. whitespace, not the command
+    separator a bare newline is — same reasoning as `_targets_this_project`,
+    which collapses it for the same reason. Collapse it here too, before the
+    `re.split`: otherwise a delete command wrapped across a line with a
+    trailing backslash splits into two segments, the second (holding the
+    protected ref) has no push verb, and the ref is silently dropped instead
+    of being read as part of the same invocation.
+
+    ``shlex`` is only reached when there is quoting for it to strip, and only
+    below ``_SHLEX_MAX``. It accumulates a token one character at a time, so
+    it is quadratic in the length of a SINGLE argument: a ~900 KB one took
+    5.6s against 0.03s for the same command before this gate existed
+    (measured), and the payload cap upstream is 1 MB. Both shortcuts land on
+    the same whitespace split the ``ValueError`` path uses, and its tokens are
+    normalised by ``_bare_ref`` — including the quotes, which is why skipping
+    ``shlex`` cannot hide a protected ref.
+    """
+    cmd = cmd.replace("\\\n", " ")
+    invocations = []
+    for part in re.split(r'[;&|\n]+', cmd):
+        m = re.search(r'\bgit\s+push\b', part)
+        if not m:
+            continue
+        tail = part[m.end():]
+        if len(tail) > _SHLEX_MAX or ('"' not in tail and "'" not in tail):
+            invocations.append(tail.split())
+            continue
+        try:
+            invocations.append(shlex.split(tail))
+        except ValueError:
+            invocations.append(tail.split())
+    return invocations
+
+
+def _is_delete(tokens) -> bool:
+    """True when these arguments delete a ref.
+
+    `-d` is bundleable: git's parse-options reads `-fd` as `--force --delete`,
+    so a test for the exact token `-d` misses it. Any single-dash token
+    containing a `d` counts — no other single-dash `git push` flag carries
+    one, and over-reading here only ever adds a deny.
+    """
+    return any(
+        t == "--delete"
+        or (len(t) > 1 and t[0] == "-" and t[1] != "-" and "d" in t)
+        for t in tokens
+    )
+
+
+def _ref_tokens(tokens):
+    """The refs an invocation acts on: every non-flag token after the remote.
+
+    A flag taking a SEPARATE value consumes the token after it, so that token
+    is neither the remote nor a ref. Without this, `-o ci.skip --delete origin
+    release/x` read `ci.skip` as the remote and `origin` as a ref, no ref was
+    a `release/` one, the stand-down was withheld, and a legitimate release
+    cleanup run from `develop` was DENIED — measured during the #333 review.
+
+    Only an UNPREFIXED token is consumed as a value. A `-`-prefixed one is
+    left to be read as a flag, so an over-broad entry in `_VALUE_FLAGS`
+    cannot swallow a real option — and any token this declines to consume can
+    only reappear as an extra ref, which is the fail-closed direction. The
+    `=`-joined spellings (`--repo=origin`) need no entry at all: they are a
+    single token that starts with `-`, so they already read as flags.
+    """
+    non_flags = []
+    skip_next = False
+    for t in tokens:
+        if skip_next:
+            skip_next = False
+            if not t.startswith("-"):
+                continue  # consumed as the preceding flag's value
+        if t in _VALUE_FLAGS:
+            skip_next = True
+        if not t.startswith("-"):
+            non_flags.append(t)
+    return non_flags[1:]
+
+
+def _protected_delete_refs(cmd: str):
+    """Every protected ref ``cmd`` would delete, across all of its pushes."""
+    found = []
+    for tokens in _push_invocations(cmd):
+        if not _is_delete(tokens):
+            continue
+        found.extend(
+            t for t in _ref_tokens(tokens)
+            if _PROTECTED_REF_RE.fullmatch(_bare_ref(t))
+        )
+    return found
+
+
+def _is_release_cleanup_only(cmd: str) -> bool:
+    """True when EVERY push here deletes nothing but release/hotfix refs.
+
+    "Every", not "any": one release ref on the line no longer buys a
+    stand-down for whatever else is on it.
+    """
+    invocations = _push_invocations(cmd)
+    if not invocations:
+        return False
+    for tokens in invocations:
+        refs = _ref_tokens(tokens)
+        if not _is_delete(tokens) or not refs:
+            return False
+        if not all(
+            _bare_ref(r).startswith(("release/", "hotfix/")) for r in refs
+        ):
+            return False
+    return True
+
+
+_deleted_protected = _protected_delete_refs(command)
+if _deleted_protected:
+    _deny("""❌ Deleting a protected branch is not allowed!
+
+Refused ref(s): {refs}
+
+Protected branches:
+  - main (production)
+  - develop (integration)
+
+There is no revert for this. A bad push to a protected branch can be undone;
+a deleted ref is gone.
+
+To clean up a release or hotfix branch, name only those refs:
+
+  git push origin --delete release/<version>""".format(
+        refs=", ".join(_deleted_protected)))
+
 # Allow branch deletion (--delete) for release/hotfix cleanup
-if "--delete" in command and ("release/" in command or "hotfix/" in command):
+if _is_release_cleanup_only(command):
     sys.exit(0)
 
 # Get current branch
@@ -438,7 +643,7 @@ if current_branch in ["main", "develop"]:
 # `[\s+]` alone let the quoted spelling through while the bare one denied.
 # The colon arm needs no such boundary — it anchors on the `:` itself, which
 # is why `'HEAD:main'` already denied.
-_PROTECTED_REF = r'(?:main|develop)(?![A-Za-z0-9._/-])'
+# _PROTECTED_REF is defined with the deletion gate above, which needs it first.
 _PROTECTED_REFSPEC_RE = re.compile(
     r':(?:(?:refs/)?heads/)?' + _PROTECTED_REF
     + r'''|(?:^|[\s+'"])(?:refs/)?heads/''' + _PROTECTED_REF
