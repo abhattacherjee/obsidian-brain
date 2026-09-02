@@ -862,19 +862,28 @@ def _ref_tokens(tokens):
     return non_flags[1:]
 
 
-# `git push origin v3.5.0` is what scripts/git-flow-finish.sh really runs
-# (phase 3, from `main`, right after tagging), and the bare `vX.Y.Z` spelling
-# is what the old version-tag regex allowed. Every tag in this repo's history
-# is that shape. Anchored with `fullmatch` on a single ref TOKEN rather than
-# `search`ed over the whole command, which is what let the old test stand the
-# hook down on `origin v1.2.3 --delete main`.
+# A bare `vX.Y.Z` tag push is what scripts/git-flow-finish.sh really runs
+# (phase 3, from `main`, right after tagging), and it is what the old
+# version-tag regex allowed. Every tag in this repo's history is that shape.
+# Anchored with `fullmatch` on a single ref TOKEN rather than `search`ed over
+# the whole command, which is what let the old test stand the hook down while
+# a protected branch was being deleted on the same line.
+#
+# The optional suffix accepts a semver prerelease or build-metadata tag
+# (`v4.0.0-rc1`, `v1.2.3+build.5`). Matching only the bare triple would have
+# denied an ordinary prerelease cut from `main`, and a false deny on the
+# release flow is how a gate ends up switched off. It opens nothing: a ref
+# matching this is by construction neither `main` nor `develop` (both fail at
+# the leading `v`), and a branch that happens to be named `v1.2.3-foo` was
+# always pushable anyway.
 #
 # Timed before shipping, per the rule in `TestPatternDecisionTimeIsBounded`:
-# worst measured `fullmatch` over five adversarial 300-900 KB shapes (one
-# long digit run, many dots, a trailing non-digit) is 1.7ms. Linear — the
-# three groups are pinned by the two literal dots, so there is nothing for
-# the engine to backtrack over.
-_VERSION_TAG = r'v\d+\.\d+\.\d+'
+# worst measured `fullmatch` over nine adversarial 600-900 KB shapes is
+# 6.6ms, on a suffix that runs to the end but for a trailing space. Linear —
+# the three numeric groups are pinned by the two literal dots, and the suffix
+# alternative can only start on a `-`/`+`, which `\d` cannot match, so the
+# two are disjoint and there is nothing for the engine to backtrack over.
+_VERSION_TAG = r'v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?'
 _VERSION_TAG_RE = re.compile(_VERSION_TAG)
 
 
@@ -960,6 +969,39 @@ def _protected_delete_refs(cmd: str):
     for tokens in _push_invocations(cmd):
         if not _is_delete(tokens):
             continue
+        found.extend(
+            t for t in _ref_tokens(tokens)
+            if _PROTECTED_REF_RE.fullmatch(_bare_ref(t))
+        )
+    return found
+
+
+def _protected_push_refs(cmd: str):
+    """Every protected ref ``cmd`` would PUSH, across all of its pushes.
+
+    `_protected_delete_refs` without the delete filter, and it exists for the
+    same reason: `targets_protected` below tested the literal substring
+    `"origin main"`, which only fires when the protected ref sits IMMEDIATELY
+    after the remote. One word further along and it was missed —
+    `origin foo <protected>` measured ALLOW from a feature branch at
+    74cf1b1, with no tag or allowlist involved anywhere (#351). Same
+    substring-versus-ref-token class #333 fixed for deletions.
+
+    Deletions are not excluded. One that names a protected ref has already
+    been refused by the deletion gate far above, so including them here can
+    only ever restate a verdict that is settled.
+
+    Going through `_ref_tokens` is load-bearing, not tidiness: it is what
+    stops a flag's SEPARATE value being read as a ref. Re-deriving the tokens
+    here is how #333's review found a legitimate release cleanup being
+    DENIED, and `--repo origin --delete <protected>` — which git refuses
+    outright, changing nothing on the remote — would start denying too.
+
+    `_PROTECTED_REF_RE.fullmatch(_bare_ref(t))` is what keeps `mainline`,
+    `maintenance` and `develop-x` the ordinary branches they are.
+    """
+    found = []
+    for tokens in _push_invocations(cmd):
         found.extend(
             t for t in _ref_tokens(tokens)
             if _PROTECTED_REF_RE.fullmatch(_bare_ref(t))
@@ -1131,10 +1173,18 @@ _PROTECTED_REFSPEC_RE = re.compile(
     + r'''|(?:^|[\s+'"])(?:refs/)?heads/''' + _PROTECTED_REF
 )
 
+# The ref-token arm. The two substring arms above only fire when a protected
+# ref sits IMMEDIATELY after the remote; this one reads the actual refs, so a
+# protected ref anywhere in the argument list is caught. See
+# `_protected_push_refs`. It sits here, below the Git Flow allowances, so a
+# release finish pushing `main` from `main` still exits above it.
+_pushed_protected = _protected_push_refs(command)
+
 targets_protected = (
     "origin main" in command or
     "origin develop" in command or
     _PROTECTED_REFSPEC_RE.search(command) is not None or
+    bool(_pushed_protected) or
     current_branch in ["main", "develop"]
 )
 
@@ -1148,7 +1198,13 @@ targets_protected = (
 # `--force-with-lease` all fell through to allow, under a comment claiming
 # refspec pushes were detected (#327).
 if targets_protected:
-    reason = f"""❌ Direct push to main/develop is not allowed!
+    # Name the refs when it was a ref that decided it. Without this the
+    # message talks about the CURRENT branch, which on a feature branch is
+    # not what was refused, and the user is left guessing which argument
+    # tripped the gate.
+    refused = ("\n\nRefused ref(s): " + ", ".join(_pushed_protected)
+               if _pushed_protected else "")
+    reason = f"""❌ Direct push to main/develop is not allowed!{refused}
 
 Protected branches:
   - main (production)

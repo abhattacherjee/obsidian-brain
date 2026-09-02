@@ -3108,6 +3108,11 @@ class TestAllowlistsCannotShadowTheDenyGates:
          f"{PUSH} origin refs/tags/v1 --delete {MAIN}", "deny"),
         ("a bare version tag shadows the deletion gate",
          f"{PUSH} origin v1.2.3 --delete {MAIN}", "deny"),
+        # The widened suffix must not reopen the shadow it sits next to.
+        ("a prerelease tag shadows the deletion gate",
+         f"{PUSH} origin v1.2.3-rc1 --delete {MAIN}", "deny"),
+        ("a build-metadata tag shadows the deletion gate",
+         f"{PUSH} origin v1.2.3+build.5 --delete {MAIN}", "deny"),
         ("--tags shadows a develop deletion",
          f"{PUSH} --tags origin --delete develop", "deny"),
         # ---- the filed defect: an allowlist shadowing a protected PUSH ----
@@ -3117,18 +3122,65 @@ class TestAllowlistsCannotShadowTheDenyGates:
          f"{PUSH} --tags origin refs/heads/{MAIN}", "deny"),
         ("--tags beside a protected refspec",
          f"{PUSH} --tags origin HEAD:{MAIN}", "deny"),
-        # A DIFFERENT guard's pre-existing hole, pinned here so it is visible
-        # rather than silent. The tag allowance correctly declines this (`main`
-        # is not a tag ref), but nothing below catches it either:
-        # `targets_protected` tests the literal substring `"origin main"`, and
-        # here the ref token sits one word further along. It is not a tag
-        # problem — `git push origin foo main` has the identical verdict with
-        # no tag anywhere — and it is not a regression: all three spellings
-        # measured ALLOW at 74cf1b1 and still do. Fixing it means giving
-        # `targets_protected` the ref-token treatment `_protected_delete_refs`
-        # already has, which is a change to gate 6 rather than to an allowlist.
-        ("a protected ref one word past the remote (gate 6's hole)",
-         f"{PUSH} origin v1.2.3 {MAIN}", "allow"),
+        # ---- a protected ref that is not ADJACENT to the remote ----
+        # `targets_protected` tested the literal substring `"origin main"`, so
+        # a protected ref one word further along was missed entirely: measured
+        # ALLOW at 74cf1b1 from a feature branch, with no tag involved in the
+        # `foo` spelling at all. Same substring-vs-ref-token class #333 fixed
+        # for deletes, now fixed for pushes by `_protected_push_refs`, which
+        # reuses `_ref_tokens` + `_bare_ref` + `_PROTECTED_REF_RE`.
+        ("a protected ref one word past the remote",
+         f"{PUSH} origin foo {MAIN}", "deny"),
+        ("a protected ref past a feature ref",
+         f"{PUSH} origin feature/x {MAIN}", "deny"),
+        ("develop one word past the remote",
+         f"{PUSH} origin foo develop", "deny"),
+        ("a protected ref past a tag ref",
+         f"{PUSH} origin v1.2.3 {MAIN}", "deny"),
+        # Carried by the pre-existing refspec arm, not by the new one — kept
+        # as a control that the two agree rather than as proof of either.
+        ("a qualified protected ref past another ref",
+         f"{PUSH} origin foo refs/heads/{MAIN}", "deny"),
+        # Negative controls for the SAME arm: a branch whose name merely begins
+        # with a protected one is ordinary. `_PROTECTED_REF_RE.fullmatch` on
+        # `_bare_ref(t)` is what buys this; a substring test would deny all of
+        # them.
+        ("a mainline branch past another ref",
+         f"{PUSH} origin foo {MAIN}line", "allow"),
+        ("a maintenance branch past another ref",
+         f"{PUSH} origin foo {MAIN}tenance", "allow"),
+        ("a develop-x branch past another ref",
+         f"{PUSH} origin foo develop-x", "allow"),
+        ("a qualified mainline branch past another ref",
+         f"{PUSH} origin foo heads/{MAIN}line", "allow"),
+        # A branch whose LEAF is spelt like a protected one. This is the row
+        # that separates a whole-ref `fullmatch` from a `search`: the
+        # `mainline`/`maintenance` rows above do not, because
+        # `_PROTECTED_REF`'s trailing negative lookahead refuses those under
+        # either matcher. Here the lookahead is satisfied (the name ends the
+        # token) and only the whole-ref anchoring keeps an ordinary branch
+        # pushable.
+        ("a branch whose leaf is spelt like a protected one",
+         f"{PUSH} origin feature/{MAIN}", "allow"),
+        ("a qualified branch whose leaf is spelt like a protected one",
+         f"{PUSH} origin refs/heads/feature/{MAIN}", "allow"),
+        ("a branch whose leaf is spelt like develop",
+         f"{PUSH} origin foo team/develop", "allow"),
+        # The value-flag handling in `_ref_tokens` exists so a flag's VALUE is
+        # never read as a ref. Going through `_ref_tokens` rather than
+        # re-deriving tokens is what keeps these right — re-deriving them is
+        # how #333's review found a legitimate release cleanup being DENIED.
+        ("a value flag whose value is not a ref",
+         f"{PUSH} -o ci.skip origin feature/x", "allow"),
+        ("a long value flag whose value is not a ref",
+         f"{PUSH} --push-option ci.skip origin feature/x", "allow"),
+        # The sharpest form of the same claim: a push option whose VALUE is
+        # spelt exactly like a protected branch. git sends it to the remote's
+        # hook as an opaque string and pushes `feature/x`; nothing touches the
+        # protected branch, so this must allow. It denies the moment
+        # `_protected_push_refs` stops going through `_ref_tokens`.
+        ("a value flag whose value is spelt like a protected branch",
+         f"{PUSH} -o {MAIN} origin feature/x", "allow"),
         # ---- --mirror / --prune, which need no --delete to destroy refs ----
         ("mirror push", f"{PUSH} --mirror origin", "deny"),
         ("prune push",
@@ -3213,6 +3265,16 @@ class TestAllowlistsCannotShadowTheDenyGates:
         # how the verb is spelled.
         ("a tag push behind a global option, from main",
          f"{GPUSH} origin v1.2.3", "allow"),
+        # A prerelease or build-metadata suffix is an ordinary thing to cut,
+        # and a false deny on the release flow is how a gate gets switched
+        # off. The suffix opens nothing: a ref matching this pattern is by
+        # construction neither `main` nor `develop`, and a branch that happens
+        # to be named `v1.2.3-foo` was always pushable anyway.
+        ("a prerelease tag from main", f"{PUSH} origin v4.0.0-rc1", "allow"),
+        ("a build-metadata tag from main",
+         f"{PUSH} origin v1.2.3+build.5", "allow"),
+        ("a prerelease tag behind a global option, from main",
+         f"{GPUSH} origin v2.0.0-beta.1", "allow"),
         # ---- controls: main must not become an allow-everything branch ----
         ("--tags beside a protected branch, from main",
          f"{PUSH} --tags origin {MAIN}", "deny"),
@@ -3255,6 +3317,49 @@ class TestAllowlistsCannotShadowTheDenyGates:
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
         subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b",
                         self.MAIN], env=env, check=True, capture_output=True)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # A release/hotfix branch exits at gate 5 (`is_release_or_hotfix_finish`)
+    # before gate 6 runs at all, so gate 6 cannot stand in for the deletion
+    # gate here. That makes this the ONLY place the quote strip in
+    # `_is_delete` is observable: everywhere else the ref-token arm of
+    # `targets_protected` reaches the same verdict by another route, and
+    # removing the strip turned no row red until these went in. The branch the
+    # release flow actually runs from is a `release/*` one, so this is the
+    # live path, not a contrived one.
+    RELEASE_CASES = (
+        ("a quoted delete flag, from a release branch",
+         f'{PUSH} "--delete" origin "{MAIN}', "deny"),
+        ("a single-quoted delete flag, from a release branch",
+         f"{PUSH} '--delete' origin \"{MAIN}", "deny"),
+        ("a quoted short delete flag, from a release branch",
+         f'{PUSH} "-d" origin "{MAIN}', "deny"),
+        # Control: the bare spelling already denied at 74cf1b1, so the three
+        # rows above are testing the QUOTING rather than the deletion gate.
+        ("a bare protected deletion, from a release branch",
+         f"{PUSH} --delete origin {MAIN}", "deny"),
+        # Control: a release branch must stay able to clean up its own refs.
+        ("the intended cleanup, from a release branch",
+         f"{PUSH} --delete origin release/x", "allow"),
+        # Control: gate 5 really does stand this branch down, which is what
+        # makes the rows above meaningful rather than incidental.
+        ("a release branch may push main during a finish",
+         f"{PUSH} origin {MAIN}", "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        RELEASE_CASES,
+        ids=[c[0].replace(" ", "-") for c in RELEASE_CASES],
+    )
+    def test_allowlist_decision_from_release_branch(self, tmp_path, label,
+                                                    command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b",
+                        "release/1.0.0"], env=env, check=True,
+                       capture_output=True)
         got = TestHookBlockingPathsFire._decide(
             work, env, "prevent-direct-push", command)
         assert got == expected, f"{label}: expected {expected}, got {got}"
@@ -3316,6 +3421,33 @@ class TestAllowlistsCannotShadowTheDenyGates:
             "the tag allowance runs AFTER the current-branch check — the "
             "release flow's `git push origin v3.5.0` from main now denies "
             "(scripts/git-flow-finish.sh phase 3)"
+        )
+
+    def test_the_non_adjacent_arm_is_what_blocks_those(self):
+        """The negative control on the new `targets_protected` arm.
+
+        Without it the deny rows above would still pass against a hook that
+        blocked everything, and the `mainline`/`maintenance` allow rows would
+        still pass if the arm were deleted, because a feature branch has no
+        other reason to refuse them. Two claims: the arm exists, and it
+        decides on a WHOLE ref rather than a substring.
+        """
+        source = Path(".claude/hooks/prevent-direct-push.py").read_text(
+            encoding="utf-8")
+        assert "_protected_push_refs(command)" in source, (
+            "the non-adjacent protected-push arm is gone; `origin foo "
+            "<protected>` is allowed from a feature branch again"
+        )
+        body = source.split("def _protected_push_refs", 1)[1].split(
+            "\ndef ", 1)[0]
+        assert "_ref_tokens(tokens)" in body, (
+            "_protected_push_refs no longer goes through `_ref_tokens`, so a "
+            "value flag's value can be read as a ref — that is the false deny "
+            "#333's review found"
+        )
+        assert "_PROTECTED_REF_RE.fullmatch(_bare_ref(t))" in body, (
+            "_protected_push_refs no longer matches a WHOLE ref; `mainline` "
+            "and `maintenance` are ordinary branches and must stay allowed"
         )
 
     def test_the_tag_allowance_asks_about_every_ref(self):
