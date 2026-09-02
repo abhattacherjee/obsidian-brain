@@ -617,8 +617,24 @@ def _quoted_spans(cmd: str):
     path there and come back as the same `False`. `_push_invocations` needs
     them separated: see the direction-of-doubt paragraph in its docstring.
     Looking at the WHOLE command rather than a prefix is what separates
-    them -- `-c a.b="c;d"` has a quote that closes, `# don't` has one that
-    never does.
+    them -- `-c a.b="c;d"` has a quote that closes.
+
+    A span that CONTAINS A NEWLINE is dropped, and the reason is that the
+    "a lone quote never closes, so we return None" half of the paragraph
+    above was wrong whenever the command holds TWO of them. A `'` in a `#`
+    comment or a heredoc body is not a quote to the shell at all, but this
+    scanner cannot see comments or heredocs; it pairs that `'` with the
+    next one it finds, on a LATER LINE, and vouches for everything in
+    between -- including real separators. `echo hi # don't`⏎`git push origin
+    --delete main&&echo x # it's` then merged into one segment, the ref
+    token came out as `main&&echo`, and `_bare_ref`'s trailing-separator
+    strip cannot reach a separator with text after it: a delete of a
+    protected branch that `develop` denies was ALLOWED (#351).
+
+    Dropping the span costs nothing real, because a genuine quoted shell
+    word does not span lines, and the whole bypass class needs a newline:
+    `#` runs to end of line, and a heredoc cannot exist without one. What
+    is left is the fail-closed direction -- an unvouched separator splits.
     """
     spans, i, n = [], 0, len(cmd)
     while i < n:
@@ -641,7 +657,7 @@ def _quoted_spans(cmd: str):
             i = j + 1
         else:
             i += 1
-    return spans
+    return [(a, b) for a, b in spans if "\n" not in cmd[a:b]]
 
 
 def _push_invocations(cmd: str):

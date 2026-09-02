@@ -2091,6 +2091,81 @@ class TestUnparseableTextResolvesTowardGating:
             f"to survive the split, or this test proves nothing"
         )
 
+    # A lone quote in a `#` comment or a heredoc body is not a quote to the
+    # shell, but `_quoted_spans` cannot see comments or heredocs. Given TWO
+    # of them it pairs the first with the second, on a LATER LINE, and
+    # vouches for every separator in between -- so the command merged into
+    # one segment. The merge alone is harmless; the fail-open needs the
+    # separator GLUED to the ref, which makes the token `main&&echo`, past
+    # the reach of `_bare_ref`'s trailing-separator strip. Measured `deny`
+    # at `74cf1b1`, `allow` at `950609c`. Both quote characters, all three
+    # separators, and a heredoc as well as a `#` comment.
+    #
+    # (prefix, tail) around the `<delete> <ref>` in the middle.
+    NEWLINE_SPANNING_QUOTES = {
+        "an apostrophe in a `#` comment, then another, glued `&&`":
+            ("echo hi # don't\n", "&&echo x # it's"),
+        "an apostrophe in a `#` comment, then another, glued `;`":
+            ("echo hi # don't\n", ";echo x # it's"),
+        "an apostrophe in a `#` comment, then another, glued `|`":
+            ("echo hi # don't\n", "|cat # it's"),
+        "an apostrophe in a heredoc body, then another, glued `&&`":
+            ("cat <<'EOF'\ndon't\nEOF\n", "&&echo x # it's"),
+        'a double quote in a `#` comment, then another, glued `&&`':
+            ('echo hi # don"t\n', '&&echo x # it"s'),
+    }
+
+    @pytest.mark.parametrize("shape", sorted(NEWLINE_SPANNING_QUOTES))
+    def test_a_span_across_a_newline_does_not_vouch_for_a_separator(
+        self, tmp_path, shape
+    ):
+        prefix, tail = self.NEWLINE_SPANNING_QUOTES[shape]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        hook = "prevent-direct-push"
+
+        protected = prefix + self.DELETE + "ma" + "in" + tail
+        assert decide(work, env, hook, protected) == "deny", (
+            f"{protected!r} deleted a protected branch: {shape} let "
+            f"`_quoted_spans` pair two quotes ACROSS a newline and vouch "
+            f"for the separator between them, so the segment never split "
+            f"and the ref token kept the separator glued to it"
+        )
+
+        # Same shape, release ref: the stand-down must still stand down, or
+        # this is just "deny everything after a quote".
+        release = prefix + self.DELETE + "release/1.0.0" + tail
+        assert decide(work, env, hook, release) == "allow", (
+            f"{release!r} was denied -- the release-cleanup stand-down has "
+            f"to survive the span filter"
+        )
+
+    # Isolate the cause: each of these differs from a row above in exactly
+    # one respect, and each denies at `74cf1b1` AND at `950609c`, so none
+    # of them can be what the rows above are really testing.
+    NEWLINE_SPAN_CONTROLS = {
+        # the separator is space-separated, so `main` is a clean token and
+        # `_bare_ref` never sees the separator at all
+        "the separator spaced away from the ref":
+            ("echo hi # don't\n", " && echo x # it's"),
+        # no second quote, so nothing pairs and no span is built
+        "no bracketing quotes at all":
+            ("echo hi # dont\n", "&&echo x # its"),
+        # no bail, no quotes: the ordinary shape
+        "neither a bail nor a quote": ("", "&&echo x"),
+    }
+
+    @pytest.mark.parametrize("shape", sorted(NEWLINE_SPAN_CONTROLS))
+    def test_newline_span_controls_are_unaffected(self, tmp_path, shape):
+        prefix, tail = self.NEWLINE_SPAN_CONTROLS[shape]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = prefix + self.DELETE + "ma" + "in" + tail
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", (
+            f"{command!r} ({shape}) must deny at every revision -- it is a "
+            f"control, not a fixture for the span filter"
+        )
+
     @staticmethod
     def _bare_ref():
         """`_bare_ref` loaded from the shipped source, not a copy of it.
