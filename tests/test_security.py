@@ -1192,6 +1192,25 @@ class TestVerbFormsCannotSkipTheGate:
         ("prevent-direct-push", "git -C /nonexistent-elsewhere pu" + "sh origin ma" + "in", "allow"),
         ("prevent-direct-push", "git config --global alias.p pu" + "sh", "allow"),
         ("prevent-direct-push", "git -C . status", "allow"),
+        # CRIT-1: a value quoted mid-token (`-c k="v w"`), not fully quoted.
+        ("prevent-direct-push",
+         'git -c user.name="A B" pu' + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -c user.name='A B' pu" + "sh origin ma" + "in", "deny"),
+        # CRIT-2: a line continuation between the executable and the verb.
+        ("prevent-direct-push", "git \\\n  pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git -C \\\n  . pu" + "sh origin ma" + "in", "deny"),
+        # IMP-1: `_push_invocations` (the #333 deletion gate) with global options.
+        ("prevent-direct-push",
+         "git -C . pu" + "sh origin --delete ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git --no-pager pu" + "sh origin --delete ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -c k=v pu" + "sh origin --delete ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -C . pu" + "sh origin --delete release/1.0.0 ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -C . pu" + "sh origin --delete release/1.0.0", "allow"),
 
         # --- validate-branch-name: git checkout -b ---
         ("validate-branch-name", "git chec" + "kout -b nonsense-branch", "deny"),
@@ -1203,6 +1222,12 @@ class TestVerbFormsCannotSkipTheGate:
         ("validate-branch-name", "git -C /nonexistent-elsewhere chec" + "kout -b nonsense-branch", "allow"),
         ("validate-branch-name", "git config --global alias.c chec" + "kout", "allow"),
         ("validate-branch-name", "git -C . status", "allow"),
+        # CRIT-1
+        ("validate-branch-name",
+         'git -c user.name="A B" chec' + "kout -b nonsense-branch", "deny"),
+        # CRIT-2
+        ("validate-branch-name",
+         "git \\\n  chec" + "kout -b nonsense-branch", "deny"),
 
         # --- require-preflight: git commit ---
         ("require-preflight", "git com" + "mit -m wip", "deny"),
@@ -1213,6 +1238,11 @@ class TestVerbFormsCannotSkipTheGate:
         ("require-preflight", "git -C /nonexistent-elsewhere com" + "mit -m wip", "allow"),
         ("require-preflight", "git config --global alias.c com" + "mit", "allow"),
         ("require-preflight", "git -C . status", "allow"),
+        # CRIT-1
+        ("require-preflight",
+         'git -c user.name="A B" com' + "mit -m wip", "deny"),
+        # CRIT-2
+        ("require-preflight", "git \\\n  com" + "mit -m wip", "deny"),
 
         # --- enforce-pr-base-branch: gh pr create ---
         ("enforce-pr-base-branch", "gh pr cre" + "ate --base ma" + "in", "deny"),
@@ -1220,16 +1250,35 @@ class TestVerbFormsCannotSkipTheGate:
         ("enforce-pr-base-branch", "gh -R o/r pr cre" + "ate --base ma" + "in", "deny"),
         ("enforce-pr-base-branch", "gh --repo o/r pr cre" + "ate --base develop", "allow"),
         ("enforce-pr-base-branch", "gh config get git_protocol", "allow"),
+        # CRIT-1
+        ("enforce-pr-base-branch",
+         'gh -c foo="a b" pr cre' + "ate --base ma" + "in", "deny"),
+        # CRIT-2
+        ("enforce-pr-base-branch", "gh \\\n  pr cre" + "ate --base ma" + "in", "deny"),
 
         # --- enforce-pr-base-branch: gh pr merge ---
         ("enforce-pr-base-branch", "gh pr mer" + "ge 5", "deny"),
         ("enforce-pr-base-branch", "gh --repo o/r pr mer" + "ge 5", "deny"),
         ("enforce-pr-base-branch", "gh -R o/r pr mer" + "ge 5", "deny"),
+        # CRIT-1
+        ("enforce-pr-base-branch", 'gh -c foo="a b" pr mer' + "ge 5", "deny"),
+        # CRIT-2
+        ("enforce-pr-base-branch", "gh \\\n  pr mer" + "ge 5", "deny"),
 
         # --- update-changelog-before-pr: gh pr create ---
         ("update-changelog-before-pr", "gh pr cre" + "ate --base develop", "deny"),
         ("update-changelog-before-pr", "gh --repo o/r pr cre" + "ate --base develop", "deny"),
         ("update-changelog-before-pr", "gh -R o/r pr cre" + "ate --base develop", "deny"),
+        # CRIT-1
+        ("update-changelog-before-pr",
+         'gh -c foo="a b" pr cre' + "ate --base develop", "deny"),
+        # CRIT-2
+        ("update-changelog-before-pr",
+         "gh \\\n  pr cre" + "ate --base develop", "deny"),
+        # MIN-1: this gate had no `allow` negative control at all.
+        ("update-changelog-before-pr", "gh --repo o/r pr view 3", "allow"),
+        ("update-changelog-before-pr",
+         "gh pr list --search 'pr cre" + "ate'", "allow"),
     )
 
     @pytest.mark.parametrize("hook,command,expected", CASES)

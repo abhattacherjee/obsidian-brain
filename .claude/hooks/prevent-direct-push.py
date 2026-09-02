@@ -189,7 +189,16 @@ def _read_hook_input(what):
 #
 # Over-matching here can only ever ADD a gate, never remove one, so the
 # pattern is deliberately permissive.
-_GLOBAL_OPTS = r'''(?:-\S+(?:\s+(?:"[^"]*"|'[^']*'|[^-\s]\S*))?\s+)*'''
+# A shell WORD is a run of non-space chars in which a quoted run may itself
+# contain spaces, so `-c user.name="A B"` is ONE argument. Matching only a
+# fully-quoted value (`-C "/a b"`) left the commoner half-quoted spelling
+# (`-c k="v w"`) stranded mid-argument: the option-value alternatives ended
+# at the first bare space, the required trailing `\s+` then landed on the
+# quote-terminated remainder, which is neither a `-`-prefixed option nor the
+# verb, and the match failed closed into an ALLOW (#351 CRIT-1).
+_Q = r'''(?:"[^"]*"|'[^']*'|[^\s"'])'''
+_GLOBAL_OPTS = (r'(?:-' + _Q + r'*(?:\s+(?:(?:"[^"]*"|'
+                r"'[^']*'|[^-\s\"'])" + _Q + r'*))?\s+)*')
 
 _PUSH_VERB = r'\bgit\s+' + _GLOBAL_OPTS + r'push\b'
 
@@ -198,6 +207,16 @@ input_data = _read_hook_input("Push hook")
 tool_name = input_data.get("tool_name", "")
 tool_input = input_data.get("tool_input", {})
 command = tool_input.get("command", "")
+# A "\<newline>" is a line continuation -- whitespace, not a separator --
+# so `git \<NL> push` is `git push`. Normalise ONCE here, before the
+# entry test below and every other raw-text check on `command`
+# ("--tags" in command, the --base regex): the entry test exiting 0 with
+# empty stdout is an ALLOW, and it read un-collapsed text before
+# `_targets_this_project` or `_push_invocations` ever got a chance to
+# collapse it themselves -- both run too late to save the entry test
+# (#351 CRIT-2). Their own internal collapses stay; they are idempotent
+# and are also exercised directly by tests.
+command = command.replace("\\\n", " ")
 
 # Only validate git push commands
 if tool_name != "Bash" or re.search(_PUSH_VERB, command) is None:

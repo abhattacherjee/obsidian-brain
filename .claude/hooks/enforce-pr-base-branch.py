@@ -28,7 +28,16 @@ import subprocess
 #
 # Over-matching here can only ever ADD a gate, never remove one, so the
 # pattern is deliberately permissive.
-_GLOBAL_OPTS = r'''(?:-\S+(?:\s+(?:"[^"]*"|'[^']*'|[^-\s]\S*))?\s+)*'''
+# A shell WORD is a run of non-space chars in which a quoted run may itself
+# contain spaces, so `-c user.name="A B"` is ONE argument. Matching only a
+# fully-quoted value (`-C "/a b"`) left the commoner half-quoted spelling
+# (`-c k="v w"`) stranded mid-argument: the option-value alternatives ended
+# at the first bare space, the required trailing `\s+` then landed on the
+# quote-terminated remainder, which is neither a `-`-prefixed option nor the
+# verb, and the match failed closed into an ALLOW (#351 CRIT-1).
+_Q = r'''(?:"[^"]*"|'[^']*'|[^\s"'])'''
+_GLOBAL_OPTS = (r'(?:-' + _Q + r'*(?:\s+(?:(?:"[^"]*"|'
+                r"'[^']*'|[^-\s\"'])" + _Q + r'*))?\s+)*')
 
 _PR_CREATE_VERB = r'\bgh\s+' + _GLOBAL_OPTS + r'pr\s+create\b'
 _PR_MERGE_VERB = r'\bgh\s+' + _GLOBAL_OPTS + r'pr\s+merge\b'
@@ -205,6 +214,14 @@ input_data = _read_hook_input("PR-base hook")
 tool_name = input_data.get("tool_name", "")
 tool_input = input_data.get("tool_input", {})
 command = tool_input.get("command", "")
+# A "\<newline>" is a line continuation -- whitespace, not a separator --
+# so `gh \<NL> pr create` is `gh pr create`. Normalise ONCE here, before
+# both entry tests below and the --base regex they feed: an entry test
+# exiting 0 with empty stdout is an ALLOW, and it read un-collapsed text
+# before `_targets_this_project` ever got a chance to collapse it itself --
+# that runs too late to save the entry test (#351 CRIT-2). Its own internal
+# collapse stays; it is idempotent and is also exercised directly by tests.
+command = command.replace("\\\n", " ")
 
 if tool_name != "Bash":
     sys.exit(0)

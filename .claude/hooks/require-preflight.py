@@ -391,7 +391,16 @@ def _read_hook_input(what):
 #
 # Over-matching here can only ever ADD a gate, never remove one, so the
 # pattern is deliberately permissive.
-_GLOBAL_OPTS = r'''(?:-\S+(?:\s+(?:"[^"]*"|'[^']*'|[^-\s]\S*))?\s+)*'''
+# A shell WORD is a run of non-space chars in which a quoted run may itself
+# contain spaces, so `-c user.name="A B"` is ONE argument. Matching only a
+# fully-quoted value (`-C "/a b"`) left the commoner half-quoted spelling
+# (`-c k="v w"`) stranded mid-argument: the option-value alternatives ended
+# at the first bare space, the required trailing `\s+` then landed on the
+# quote-terminated remainder, which is neither a `-`-prefixed option nor the
+# verb, and the match failed closed into an ALLOW (#351 CRIT-1).
+_Q = r'''(?:"[^"]*"|'[^']*'|[^\s"'])'''
+_GLOBAL_OPTS = (r'(?:-' + _Q + r'*(?:\s+(?:(?:"[^"]*"|'
+                r"'[^']*'|[^-\s\"'])" + _Q + r'*))?\s+)*')
 
 _COMMIT_VERB = r'\bgit\s+' + _GLOBAL_OPTS + r'commit\b'
 
@@ -402,6 +411,16 @@ def main():
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
     command = tool_input.get("command", "")
+    # A "\<newline>" is a line continuation -- whitespace, not a
+    # separator -- so `git \<NL> commit` is `git commit`. Normalise ONCE
+    # here, before the entry test below and the other raw-text checks on
+    # `command` ("--amend" in command, "SKIP_PREFLIGHT=1" in command): the
+    # entry test exiting 0 with empty stdout is an ALLOW, and it read
+    # un-collapsed text before `_targets_this_project` ever got a
+    # chance to collapse it itself -- that runs too late to save the
+    # entry test (#351 CRIT-2). Its own internal collapse stays; it is
+    # idempotent and is also exercised directly by tests.
+    command = command.replace("\\\n", " ")
 
     # Only validate git commit commands
     if tool_name != "Bash":
