@@ -196,9 +196,20 @@ def _read_hook_input(what):
 # at the first bare space, the required trailing `\s+` then landed on the
 # quote-terminated remainder, which is neither a `-`-prefixed option nor the
 # verb, and the match failed closed into an ALLOW (#351 CRIT-1).
-_Q = r'''(?:"[^"]*"|'[^']*'|[^\s"'])'''
+#
+# A quote char that never finds its matching close (`user.name=O'Brien`, a
+# real git idiom and rc 0 on the real binary) made the two alternatives
+# below FAIL outright rather than degrade: excluding quote chars from the
+# catch-all left `_Q*`/the value continuation unable to advance past a lone
+# `'`, which stopped the option/value token short and stranded the required
+# trailing `\s+` on a non-space character -- another route to the same
+# ALLOW (#351 NEW-1). The fix direction only ever ADDS a gate: a balanced
+# quoted run is still preferred (tried first in the alternation, so a space
+# inside `"A B"` still bridges), and only an UNBALANCED quote falls through
+# to matching as an ordinary character, same as the old permissive `\S+`.
+_Q = r'''(?:"[^"]*"|'[^']*'|[^\s])'''
 _GLOBAL_OPTS = (r'(?:-' + _Q + r'*(?:\s+(?:(?:"[^"]*"|'
-                r"'[^']*'|[^-\s\"'])" + _Q + r'*))?\s+)*')
+                r"'[^']*'|[^-\s])" + _Q + r'*))?\s+)*')
 
 _PUSH_VERB = r'\bgit\s+' + _GLOBAL_OPTS + r'push\b'
 
@@ -365,15 +376,26 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         c_dirs = re.findall(
             r'''(?:^|\s)-C\s+(?:"([^"]*)"|'([^']*)'|(\S+))''', m.group(0))
         if len(c_dirs) == 1:
-            target = next(t for t in c_dirs[0] if t)
-            try:
-                target = os.path.realpath(
-                    os.path.expandvars(os.path.expanduser(target)))
-            except (ValueError, OSError):
-                return True
-            if not (target == project_dir
-                    or target.startswith(project_dir + os.sep)):
-                continue  # this occurrence provably acts on another checkout
+            # `-C ""` is documented git behaviour ("if <path> is present but
+            # empty, the current working directory is left unchanged") and is
+            # rc 0 on git 2.50.1 -- all three capture groups are then the
+            # empty string, and the old `next(t for t in c_dirs[0] if t)`
+            # raised StopIteration with no target to fall back to. An
+            # uncaught exception exits non-zero, which is a NON-blocking
+            # error under the PreToolUse contract -- the crash itself was the
+            # fail-open (#351 NEW-2). An empty/unresolved `-C` value is
+            # ambiguous, not provably out of scope, so it falls through to
+            # the `cd` logic below exactly like `len(c_dirs) != 1` -- gated.
+            target = next((t for t in c_dirs[0] if t), None)
+            if target is not None:
+                try:
+                    target = os.path.realpath(
+                        os.path.expandvars(os.path.expanduser(target)))
+                except (ValueError, OSError):
+                    return True
+                if not (target == project_dir
+                        or target.startswith(project_dir + os.sep)):
+                    continue  # this occurrence provably acts on another checkout
 
         preceding = [c for c in cd_matches if c[0] < position]
         if not preceding:

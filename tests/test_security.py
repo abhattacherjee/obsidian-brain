@@ -1211,6 +1211,22 @@ class TestVerbFormsCannotSkipTheGate:
          "git -C . pu" + "sh origin --delete release/1.0.0 ma" + "in", "deny"),
         ("prevent-direct-push",
          "git -C . pu" + "sh origin --delete release/1.0.0", "allow"),
+        # NEW-1: an UNBALANCED quote inside a global option (a real git
+        # idiom, `-c user.name=O'Brien`) must degrade to matching as an
+        # ordinary character, not fail the whole match.
+        ("prevent-direct-push",
+         "git -c user.name=O'Brien pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         'git -c a.b="cd pu' + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -c a.b=O'B pu" + "sh origin --delete ma" + "in", "deny"),
+        # NEW-2: `-C ""` / `-C ''` (documented git behaviour: cwd unchanged)
+        # must not crash the hook -- an empty/unresolved -C target is
+        # ambiguous, not provably out of scope, so it falls through gated.
+        ("prevent-direct-push",
+         'git -C "" pu' + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -C '' pu" + "sh origin ma" + "in", "deny"),
 
         # --- validate-branch-name: git checkout -b ---
         ("validate-branch-name", "git chec" + "kout -b nonsense-branch", "deny"),
@@ -1228,6 +1244,14 @@ class TestVerbFormsCannotSkipTheGate:
         # CRIT-2
         ("validate-branch-name",
          "git \\\n  chec" + "kout -b nonsense-branch", "deny"),
+        # NEW-1
+        ("validate-branch-name",
+         "git -c user.name=O'Brien chec" + "kout -b nonsense-branch", "deny"),
+        # NEW-2
+        ("validate-branch-name",
+         'git -C "" chec' + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name",
+         "git -C '' chec" + "kout -b nonsense-branch", "deny"),
 
         # --- require-preflight: git commit ---
         ("require-preflight", "git com" + "mit -m wip", "deny"),
@@ -1243,6 +1267,12 @@ class TestVerbFormsCannotSkipTheGate:
          'git -c user.name="A B" com' + "mit -m wip", "deny"),
         # CRIT-2
         ("require-preflight", "git \\\n  com" + "mit -m wip", "deny"),
+        # NEW-1
+        ("require-preflight",
+         "git -c user.name=O'Brien com" + "mit -m wip", "deny"),
+        # NEW-2
+        ("require-preflight", 'git -C "" com' + "mit -m wip", "deny"),
+        ("require-preflight", "git -C '' com" + "mit -m wip", "deny"),
 
         # --- enforce-pr-base-branch: gh pr create ---
         ("enforce-pr-base-branch", "gh pr cre" + "ate --base ma" + "in", "deny"),
@@ -1255,6 +1285,9 @@ class TestVerbFormsCannotSkipTheGate:
          'gh -c foo="a b" pr cre' + "ate --base ma" + "in", "deny"),
         # CRIT-2
         ("enforce-pr-base-branch", "gh \\\n  pr cre" + "ate --base ma" + "in", "deny"),
+        # NEW-1
+        ("enforce-pr-base-branch",
+         "gh -c foo=O'Brien pr cre" + "ate --base ma" + "in", "deny"),
 
         # --- enforce-pr-base-branch: gh pr merge ---
         ("enforce-pr-base-branch", "gh pr mer" + "ge 5", "deny"),
@@ -1264,6 +1297,8 @@ class TestVerbFormsCannotSkipTheGate:
         ("enforce-pr-base-branch", 'gh -c foo="a b" pr mer' + "ge 5", "deny"),
         # CRIT-2
         ("enforce-pr-base-branch", "gh \\\n  pr mer" + "ge 5", "deny"),
+        # NEW-1
+        ("enforce-pr-base-branch", "gh -c foo=O'Brien pr mer" + "ge 5", "deny"),
 
         # --- update-changelog-before-pr: gh pr create ---
         ("update-changelog-before-pr", "gh pr cre" + "ate --base develop", "deny"),
@@ -1279,6 +1314,9 @@ class TestVerbFormsCannotSkipTheGate:
         ("update-changelog-before-pr", "gh --repo o/r pr view 3", "allow"),
         ("update-changelog-before-pr",
          "gh pr list --search 'pr cre" + "ate'", "allow"),
+        # NEW-1
+        ("update-changelog-before-pr",
+         "gh -c foo=O'Brien pr cre" + "ate --base develop", "deny"),
     )
 
     @pytest.mark.parametrize("hook,command,expected", CASES)
@@ -1311,6 +1349,76 @@ class TestVerbFormsCannotSkipTheGate:
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
         command = f'git -C "{work}/a b" ' + verb
         assert TestHookBlockingPathsFire._decide(work, env, hook, command) == "deny"
+
+
+class TestGlobalOptionSpellingsMatchThePlainVerdict:
+    """The durable regression net for the whole `_GLOBAL_OPTS`/`_Q` class
+    (#351), not just the specific cases CRIT-1/CRIT-2/NEW-1/NEW-2 happened to
+    probe. Round 1 fixed a fail-open on a half-quoted value; round 2 found
+    TWO MORE fail-opens the fix itself introduced (an unbalanced quote, an
+    empty `-C` value) — the pattern of "case 22 next round" is exactly what
+    a hand-picked example list cannot close.
+
+    Instead of asserting a hardcoded `allow`/`deny` per spelling, this
+    generates a bounded matrix of global-option spellings and asserts each
+    one's verdict equals the PLAIN form's verdict (no global options at all)
+    for the same verb. The plain form is the control; a spelling that moves
+    the verdict away from it is a bug by construction, in EITHER direction —
+    a new fail-open, or a spelling that over-matches into a false deny.
+
+    Kept to a small, deliberately chosen set rather than a fuzzer, so it
+    stays in the seconds range: separate and `=`-joined values; bare,
+    single-quoted, double-quoted, half-quoted, unbalanced-quoted and
+    empty-quoted values; a value containing a space, a `-`, or an `=`; a
+    single option and two stacked; a tab separator; and a `\\<newline>`
+    continuation right after the global options.
+    """
+
+    # Text to splice between the executable and the verb, e.g.
+    # "git " + SPELLING + "push origin main". Every one of these must be a
+    # NO-OP on the verdict relative to the plain form with no global options.
+    OPTION_SPELLINGS = (
+        "-C . ",
+        "-c user.name=x ",
+        '-c user.name="A B" ',
+        "-c user.name='A B' ",
+        "-c user.name=O'Brien ",          # unbalanced quote (NEW-1)
+        '-c a.b="only-opens ',             # unbalanced quote, opens & never closes
+        "--no-pager ",
+        '-C "" ',                          # empty double-quoted value (NEW-2)
+        "-C '' ",                          # empty single-quoted value (NEW-2)
+        "-c k=v=w ",                       # value containing '='
+        "-c k=a-b ",                       # value containing '-'
+        "--repo=o/r ",                     # '='-joined long option
+        "-C .\t",                          # tab as the trailing separator
+        "-C\t. ",                          # tab between flag and value
+        "-C . -c user.name=x ",            # two stacked options
+        "-c user.name=x -C . ",            # two stacked options, reversed
+        "-C . \\\n",                       # line continuation after the options
+    )
+
+    # hook -> (executable prefix, bare verb text with its own arguments).
+    HOOK_VERBS = {
+        "prevent-direct-push": ("git ", "pu" + "sh origin ma" + "in"),
+        "validate-branch-name": ("git ", "chec" + "kout -b nonsense-branch"),
+        "require-preflight": ("git ", "com" + "mit -m wip"),
+        "enforce-pr-base-branch": ("gh ", "pr cre" + "ate --base ma" + "in"),
+        "update-changelog-before-pr": ("gh ", "pr cre" + "ate --base develop"),
+    }
+
+    @pytest.mark.parametrize("spelling", OPTION_SPELLINGS)
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_spelling_matches_plain_verdict(self, tmp_path, hook, spelling):
+        exe, verb = self.HOOK_VERBS[hook]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        plain = exe + verb
+        control = TestHookBlockingPathsFire._decide(work, env, hook, plain)
+        candidate = exe + spelling + verb
+        got = TestHookBlockingPathsFire._decide(work, env, hook, candidate)
+        assert got == control, (
+            f"{hook}: {candidate!r} verdict {got!r} != plain-form {plain!r} "
+            f"verdict {control!r}"
+        )
 
 
 class TestScopeGuardCannotBeBypassed:
