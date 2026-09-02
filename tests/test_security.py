@@ -1742,6 +1742,35 @@ _MATRIX_UNITS = {
 # becomes unmistakable; 900 KB sits just under the hooks' 1 MB stdin cap.
 _MATRIX_SIZES_KB = (4, 64, 900)
 
+# Sizes for the GROWTH assertion below. Doubling twice, in the band where the
+# work dominates the fixed ~42 ms of interpreter start-up and git calls but
+# the input is still small: a quadratic term is unmistakable here long before
+# it is large enough to breach any absolute budget.
+_GROWTH_SIZES_KB = (32, 64, 128)
+
+# Best-of-N per cell. `min` picks the least-contended run, which is what makes
+# a wall-clock measurement mean something on a machine running several agents
+# at once -- the condition under which this suite has actually been observed
+# to slow from 4:00 to 6:09.
+_GROWTH_REPS = 3
+
+# Below this, a cell's work time is measurement noise rather than signal, and
+# a ratio computed from it is meaningless. Measured: on the fixed code the
+# smallest cells sit at 0.5-3 ms and produce ratios anywhere from 1.1 to 2.2
+# purely from jitter; on the PRE-fix code two shapes with sub-millisecond work
+# produced 4.60 and 4.06, which would have been false alarms rather than the
+# real quadratic sitting beside them. Cells under the floor are covered by the
+# absolute ceiling in `test_generated_shape_within_budget` instead.
+_GROWTH_MIN_WORK_MS = 3.0
+
+# Linear work doubles when the input doubles, so an honest ratio sits near
+# 2.0; quadratic work quadruples. Measured across all nine shapes on the fixed
+# code, worst ratio 2.24. 3.0 sits between the two regimes with ~34% headroom
+# over the measured worst case, and the quadratic it exists to catch does not
+# arrive at 3.1 -- the three affected shapes do not finish at all at 128 KB.
+_GROWTH_MAX_RATIO = 3.0
+
+
 _MATRIX_LABELS = sorted(
     f"{unit} @ {kb}KB"
     for unit in _MATRIX_UNITS
@@ -1934,6 +1963,94 @@ class TestDecisionTimeIsBounded:
             f"{hook} took {elapsed_ms:.1f}ms on the generated shape "
             f"{label!r}, over the {self.BUDGET_MS}ms budget"
         )
+
+    # ---- the RELATIVE assertion --------------------------------------------
+    # Everything above is an absolute millisecond budget, and an absolute
+    # budget has two problems that this method exists to answer.
+    #
+    # It measures the MACHINE as much as the code. This suite has been
+    # observed taking 4:00 idle and 6:09 with several agents running, and a
+    # loaded machine is exactly when a hook feels slow to a human -- so the
+    # budget has to be set loose enough to survive load, which blunts it.
+    # Measuring an honest baseline command in the SAME run and subtracting it
+    # cancels most of that: interpreter start-up, git calls and scheduler
+    # contention move the baseline and the sample together.
+    #
+    # And it only fires once the input is already big enough to blow it. The
+    # quadratic term this class failed to catch was visible as a RATIO at
+    # 4 KB -- 70 ms against a flat 127 ms baseline -- long before it was
+    # visible as a budget breach at 64 KB. A net that watches the shape of
+    # the curve catches such a defect a hundred times smaller than one
+    # watching the total.
+    #
+    # Only `prevent-direct-push` is swept: it is the one hook with the
+    # `_push_invocations` span/separator machinery where the growth risk
+    # lives. The other four are covered by the absolute matrix above.
+    @pytest.mark.parametrize("unit", sorted(_MATRIX_UNITS))
+    def test_work_grows_no_faster_than_the_input(self, tmp_path, unit):
+        """Doubling the input must not much more than double the work.
+
+        Measured on the fixed code, worst ratio across all nine shapes: 2.24
+        (linear work doubles, so ~2.0 is the honest figure). Against the
+        pre-fix hook the three shapes that carry both many quoted spans and
+        many separators do not finish at 128 KB at all, and the rest stay
+        under 2.5 -- so this separates the regimes rather than merely
+        ranking them.
+        """
+        work_dir, env = TestHookBlockingPathsFire._repo(tmp_path)
+
+        def measure(command):
+            best = None
+            for _ in range(_GROWTH_REPS):
+                start = time.perf_counter()
+                try:
+                    proc = subprocess.run(
+                        [sys.executable,
+                         str(work_dir / ".claude/hooks/prevent-direct-push.py")],
+                        input=json.dumps({"tool_name": "Bash",
+                                          "tool_input": {"command": command}}),
+                        capture_output=True, text=True,
+                        timeout=self.SUBPROCESS_TIMEOUT_S, cwd=work_dir,
+                        env=env,
+                    )
+                except subprocess.TimeoutExpired:
+                    return None
+                assert proc.returncode == 0, (
+                    f"prevent-direct-push exited {proc.returncode}: "
+                    f"{proc.stderr[-400:]!r}"
+                )
+                elapsed = (time.perf_counter() - start) * 1000
+                best = elapsed if best is None else min(best, elapsed)
+            return best
+
+        # The fixed cost of getting in and out of the hook at all, measured
+        # here rather than assumed, so load moves it with the samples.
+        baseline = measure("git pu" + "sh origin feature/probe")
+        assert baseline is not None, "the baseline command itself timed out"
+
+        works = []
+        for kb in _GROWTH_SIZES_KB:
+            elapsed = measure(_matrix_command(f"{unit} @ {kb}KB"))
+            if elapsed is None:
+                pytest.fail(
+                    f"prevent-direct-push did not finish {unit!r} at {kb}KB "
+                    f"within {self.SUBPROCESS_TIMEOUT_S}s -- superlinear "
+                    f"growth over separator or quote density (the fixed code "
+                    f"costs single-digit milliseconds of work here)"
+                )
+            works.append((kb, max(elapsed - baseline, 0.0)))
+
+        for (kb_a, work_a), (kb_b, work_b) in zip(works, works[1:]):
+            if work_a < _GROWTH_MIN_WORK_MS:
+                continue  # noise, not signal -- see _GROWTH_MIN_WORK_MS
+            ratio = work_b / work_a
+            assert ratio < _GROWTH_MAX_RATIO, (
+                f"prevent-direct-push work grew {ratio:.2f}x for {unit!r} "
+                f"when the input doubled from {kb_a}KB to {kb_b}KB "
+                f"({work_a:.1f}ms -> {work_b:.1f}ms over a {baseline:.1f}ms "
+                f"baseline), past the {_GROWTH_MAX_RATIO}x bound. Linear "
+                f"work doubles; quadratic work quadruples."
+            )
 
 
 def _hook_regex_constants(hook):
