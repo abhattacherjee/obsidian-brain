@@ -3166,6 +3166,14 @@ class TestAllowlistsCannotShadowTheDenyGates:
          f"{PUSH} origin refs/heads/feature/{MAIN}", "allow"),
         ("a branch whose leaf is spelt like develop",
          f"{PUSH} origin foo team/develop", "allow"),
+        # A legitimate MULTI-REF push. Every other negative control for this
+        # arm carries a protected-looking name; this one carries none, so it
+        # is the row that catches an arm which simply refuses more than one
+        # ref rather than reading them. git pushes all three.
+        ("several feature refs in one push",
+         f"{PUSH} origin feature/a feature/b", "allow"),
+        ("several feature refs, one of them qualified",
+         f"{PUSH} origin feature/a refs/heads/feature/b feature/c", "allow"),
         # The value-flag handling in `_ref_tokens` exists so a flag's VALUE is
         # never read as a ref. Going through `_ref_tokens` rather than
         # re-deriving tokens is what keeps these right — re-deriving them is
