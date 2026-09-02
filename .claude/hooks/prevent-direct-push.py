@@ -381,6 +381,14 @@ _PROTECTED_REF_RE = re.compile(_PROTECTED_REF)
 # No real ref name approaches this; it exists only to bound a quadratic path.
 _SHLEX_MAX = 100_000
 
+# `git push` flags whose value is a SEPARATE token — see `_ref_tokens`. Only
+# these five: `--force-with-lease`, `--signed` and `--recurse-submodules` take
+# their value `=`-joined only, and a bare `--force-with-lease` takes none, so
+# treating any of them as separate-value would consume a real ref token.
+_VALUE_FLAGS = frozenset({
+    "-o", "--push-option", "--repo", "--exec", "--receive-pack",
+})
+
 
 def _bare_ref(token: str) -> str:
     """A ref token with the decorations git accepts stripped off.
@@ -475,11 +483,30 @@ def _is_delete(tokens) -> bool:
 def _ref_tokens(tokens):
     """The refs an invocation acts on: every non-flag token after the remote.
 
-    A flag taking a SEPARATE value (`-o ci.skip`) shifts this by one and pulls
-    an extra token in as a ref. Deliberate, same direction as above: an extra
-    ref can only add a deny or withhold the stand-down.
+    A flag taking a SEPARATE value consumes the token after it, so that token
+    is neither the remote nor a ref. Without this, `-o ci.skip --delete origin
+    release/x` read `ci.skip` as the remote and `origin` as a ref, no ref was
+    a `release/` one, the stand-down was withheld, and a legitimate release
+    cleanup run from `develop` was DENIED — measured during the #333 review.
+
+    Only an UNPREFIXED token is consumed as a value. A `-`-prefixed one is
+    left to be read as a flag, so an over-broad entry in `_VALUE_FLAGS`
+    cannot swallow a real option — and any token this declines to consume can
+    only reappear as an extra ref, which is the fail-closed direction. The
+    `=`-joined spellings (`--repo=origin`) need no entry at all: they are a
+    single token that starts with `-`, so they already read as flags.
     """
-    non_flags = [t for t in tokens if not t.startswith("-")]
+    non_flags = []
+    skip_next = False
+    for t in tokens:
+        if skip_next:
+            skip_next = False
+            if not t.startswith("-"):
+                continue  # consumed as the preceding flag's value
+        if t in _VALUE_FLAGS:
+            skip_next = True
+        if not t.startswith("-"):
+            non_flags.append(t)
     return non_flags[1:]
 
 

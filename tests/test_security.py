@@ -1830,6 +1830,31 @@ class TestProtectedBranchDeletionIsBlocked:
         ("quoted protected ref under the shlex bound",
          f"{PUSH} --delete origin release/x " + "b" * 10 + f' "{MAIN}"',
          "deny"),
+        # A flag whose value is a SEPARATE token consumes that token, so it is
+        # neither the remote nor a ref. Skipping it must not open a hole: the
+        # protected ref after it still denies.
+        ("value flag before a mixed deletion",
+         f"{PUSH} -o ci.skip --delete origin release/x {MAIN}", "deny"),
+        ("long value flag before a mixed deletion",
+         f"{PUSH} --push-option ci.skip --delete origin release/x {MAIN}",
+         "deny"),
+        # The `=`-joined spelling is one token starting with `-`, so it is
+        # already a flag and consumes nothing.
+        ("=-joined value flag before a mixed deletion",
+         f"{PUSH} --push-option=ci.skip --delete origin release/x {MAIN}",
+         "deny"),
+        # Verified against real git: `--repo` consumes `origin`, which leaves
+        # the single positional as the REPOSITORY and no refspec at all, so
+        # git refuses with "--delete doesn't make sense without any refs" and
+        # the remote is unchanged. Nothing is deleted, so allow is the verdict
+        # that matches git. This row is also the control proving the skip is
+        # real: without it, `origin` would be the remote and `main` a ref.
+        ("value flag leaves no refspec at all",
+         f"{PUSH} --repo origin --delete {MAIN}", "allow"),
+        # A `-`-prefixed token is never eaten as a value, so an over-broad
+        # entry cannot swallow a real option and hide the ref behind it.
+        ("value flag followed by another flag",
+         f"{PUSH} -o --force origin --delete {MAIN}", "deny"),
     )
 
     @pytest.mark.parametrize(
@@ -1872,6 +1897,14 @@ class TestProtectedBranchDeletionIsBlocked:
         ("two release cleanups in one command",
          f"{PUSH} --delete origin release/x && {PUSH} --delete origin hotfix/y",
          "allow"),
+        # The false deny this fix removes. `-o` takes a separate value, so
+        # before the fix `ci.skip` was read as the remote and `origin` as a
+        # ref; `origin` is not a release ref, the stand-down was withheld, and
+        # a legitimate release cleanup run from develop was DENIED.
+        ("release cleanup behind a value flag",
+         f"{PUSH} -o ci.skip --delete origin release/x", "allow"),
+        ("release cleanup behind a long value flag",
+         f"{PUSH} --push-option ci.skip --delete origin release/x", "allow"),
         # ---- controls: develop must not become an allow-everything branch --
         ("a protected push from develop", f"{PUSH} origin develop", "deny"),
         ("a protected deletion from develop",
