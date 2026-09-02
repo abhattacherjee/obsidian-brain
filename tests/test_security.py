@@ -1774,6 +1774,18 @@ class TestDecisionTimeIsBounded:
             "git " + ('"a" ' * 2000) + "x gh " + ('"a" ' * 2000) + "x",
         "2000 quoted OPTION words after each executable":
             "git " + ('"-c" ' * 2000) + "x gh " + ('"-c" ' * 2000) + "x",
+        # The #351 tag allowlist runs `_is_tag_ref` -- and with it
+        # `_VERSION_TAG_RE.fullmatch` -- once per ref TOKEN, so a command
+        # with thousands of them is the shape that would expose a
+        # superlinear cost there. No row above has more than a handful of
+        # ref tokens.
+        "5000 version-tag ref tokens":
+            "git pu" + "sh --tags origin " + ("v1.2.3 " * 5000),
+        # The same count in the shape that makes every one of them FAIL the
+        # tag test, so the allowance is refused on the last token rather
+        # than short-circuiting on the first.
+        "5000 near-miss tag ref tokens":
+            "git pu" + "sh origin " + ("v1.2.3x " * 5000),
     }
 
     @pytest.mark.parametrize("label", sorted(ADVERSARIAL_INPUTS))
@@ -1839,7 +1851,7 @@ def _hook_regex_constants(hook):
                 and isinstance(node.targets[0], ast.Name)):
             continue
         name = node.targets[0].id
-        if not (name in ("_Q", "_OPT", "_GLOBAL_OPTS")
+        if not (name in ("_Q", "_OPT", "_GLOBAL_OPTS", "_VERSION_TAG")
                 or name.endswith("_VERB")):
             continue
         try:
@@ -1953,13 +1965,20 @@ class TestPatternDecisionTimeIsBounded:
     def test_pattern_search_within_budget(self, hook, label):
         exe, verb = self.HOOK_VERBS[hook]
         constants = _hook_regex_constants(hook)
-        verbs = {k: v for k, v in constants.items() if k.endswith("_VERB")}
-        assert verbs, (
+        # Every pattern the hook applies to command text, not just the entry
+        # verb. `prevent-direct-push` also carries `_VERSION_TAG`, added with
+        # the #351 tag allowlist; a new pattern that is never timed is
+        # exactly how rounds 2, 4 and 5 each shipped a 30-second hook.
+        patterns = {
+            k: v for k, v in constants.items()
+            if k.endswith("_VERB") or k == "_VERSION_TAG"
+        }
+        assert any(k.endswith("_VERB") for k in patterns), (
             f"{hook}.py defines no `*_VERB` constant this test could fold "
             f"-- a rename would otherwise make every row here vacuous"
         )
         text = self._texts(exe, verb)[label]
-        for name, pattern in sorted(verbs.items()):
+        for name, pattern in sorted(patterns.items()):
             start = time.perf_counter()
             try:
                 proc = subprocess.run(
@@ -3030,4 +3049,286 @@ class TestProtectedBranchDeletionIsBlocked:
         assert "_protected_delete_refs(command)" in source, (
             "the ref-token delete analysis is gone; nothing else in this hook "
             "denies `--delete origin release/x main`"
+        )
+
+
+class TestAllowlistsCannotShadowTheDenyGates:
+    """#351: the tag allowlist ran ABOVE the deletion gate and stood the whole
+    hook down on an unanchored substring.
+
+    Three tests decided it, all on the raw command text and all before any
+    deny gate had run::
+
+        if "refs/tags/" in command or "--tags" in command:
+            sys.exit(0)
+        if re.search(r'git push\\s+\\S+\\s+v\\d+\\.\\d+\\.\\d+', command):
+            sys.exit(0)
+
+    None is tied to an argument, so ONE tag-shaped thing anywhere on the line
+    bought a stand-down for everything else on it. Measured at `1b0d3e5`, all
+    ALLOW from a feature branch:
+
+    * `--tags origin --delete main` deleted `main`;
+    * `origin refs/tags/v1 --delete main` and `origin v1.2.3 --delete main`
+      did the same in the other two spellings;
+    * `--tags origin main` pushed `main`.
+
+    Two more got through with no allowlist involved at all, because
+    `--mirror` and `--prune` delete remote refs with NO `--delete` flag: the
+    deletion gate's `_is_delete()` is false, no ref token is ever examined,
+    and nothing else in the hook looks at either flag. `--mirror origin`
+    measured ALLOW and removes every remote ref absent locally, `main`
+    included.
+
+    The fix is gate ORDER plus ref-token anchoring: both denies run first,
+    and the tag allowance now asks whether EVERY push on the line pushes
+    nothing but tags — the same correction #333 made to the release-cleanup
+    allowlist. The allowance still has to run BEFORE the current-branch
+    check, because the release flow really does run `git push origin v3.5.0`
+    from `main` (scripts/git-flow-finish.sh, phase 3).
+
+    Command strings are assembled from fragments for the reason given in
+    TestHookBlockingPathsFire's docstring: this repo's live hooks inspect
+    unexecuted command text, so a literal protected push here blocks the
+    tooling that reads this file.
+    """
+
+    PUSH = "git pu" + "sh"
+    GPUSH = "git -C . pu" + "sh"
+    MAIN = "ma" + "in"
+
+    # (label, command, expected) from a FEATURE branch. This is where the
+    # deny rows discriminate: on a feature branch the hook has no other
+    # reason to refuse, so anything that reaches the end allows.
+    CASES = (
+        # ---- the filed defect: an allowlist shadowing the deletion gate ----
+        ("--tags shadows the deletion gate",
+         f"{PUSH} --tags origin --delete {MAIN}", "deny"),
+        ("refs/tags/ shadows the deletion gate",
+         f"{PUSH} origin refs/tags/v1 --delete {MAIN}", "deny"),
+        ("a bare version tag shadows the deletion gate",
+         f"{PUSH} origin v1.2.3 --delete {MAIN}", "deny"),
+        ("--tags shadows a develop deletion",
+         f"{PUSH} --tags origin --delete develop", "deny"),
+        # ---- the filed defect: an allowlist shadowing a protected PUSH ----
+        ("--tags beside a protected branch",
+         f"{PUSH} --tags origin {MAIN}", "deny"),
+        ("--tags beside a qualified protected ref",
+         f"{PUSH} --tags origin refs/heads/{MAIN}", "deny"),
+        ("--tags beside a protected refspec",
+         f"{PUSH} --tags origin HEAD:{MAIN}", "deny"),
+        # A DIFFERENT guard's pre-existing hole, pinned here so it is visible
+        # rather than silent. The tag allowance correctly declines this (`main`
+        # is not a tag ref), but nothing below catches it either:
+        # `targets_protected` tests the literal substring `"origin main"`, and
+        # here the ref token sits one word further along. It is not a tag
+        # problem — `git push origin foo main` has the identical verdict with
+        # no tag anywhere — and it is not a regression: all three spellings
+        # measured ALLOW at 74cf1b1 and still do. Fixing it means giving
+        # `targets_protected` the ref-token treatment `_protected_delete_refs`
+        # already has, which is a change to gate 6 rather than to an allowlist.
+        ("a protected ref one word past the remote (gate 6's hole)",
+         f"{PUSH} origin v1.2.3 {MAIN}", "allow"),
+        # ---- --mirror / --prune, which need no --delete to destroy refs ----
+        ("mirror push", f"{PUSH} --mirror origin", "deny"),
+        ("prune push",
+         f"{PUSH} --prune origin +refs/heads/*:refs/heads/*", "deny"),
+        ("mirror push the tag allowlist would have shadowed",
+         f"{PUSH} --mirror --tags origin", "deny"),
+        ("mirror push behind a global option",
+         f"{GPUSH} --mirror origin", "deny"),
+        # git's parse-options accepts an unambiguous ABBREVIATION of a long
+        # option. Verified on git 2.50.1 against a real bare remote: `--mi`,
+        # `--mir` and `--mirror` all pushed `refs/heads/main` plus every tag.
+        # An exact-token denylist is therefore bypassable by typing less.
+        ("abbreviated mirror push", f"{PUSH} --mi origin", "deny"),
+        ("half-abbreviated mirror push", f"{PUSH} --mir origin", "deny"),
+        ("abbreviated prune push",
+         f"{PUSH} --pru origin +refs/heads/*:refs/heads/*", "deny"),
+        # ---- the QUOTED spelling of a flag, on both deny gates ----
+        # `_push_invocations` falls back to a whitespace split when
+        # `shlex.split` raises on an unbalanced quote, and that split does not
+        # strip quoting. `_bare_ref` has taken the quotes off REF tokens since
+        # #333; the FLAG tokens kept theirs, so a quoted flag did not start
+        # with `-` and every flag test skipped it. Measured at 74cf1b1: all
+        # three of these ALLOW, and the `--delete` one deletes a protected
+        # branch. Both helpers now strip the quote first.
+        ("a quoted mirror flag behind an unbalanced quote",
+         f'{PUSH} "--mirror" origin "', "deny"),
+        ("a single-quoted mirror flag behind an unbalanced quote",
+         f"{PUSH} '--mirror' origin \"", "deny"),
+        # This one goes through `shlex`, which strips the quotes itself, so it
+        # is the control proving the row above tests the FALLBACK path rather
+        # than just the flag matcher.
+        ("a quoted mirror flag that shlex can parse",
+         f'{PUSH} "--mirror" origin', "deny"),
+        # The same bypass on the #333 deletion gate. Kept here rather than in
+        # TestProtectedBranchDeletionIsBlocked because the quoting class is
+        # what this change fixed; the gate itself is unchanged.
+        ("a quoted delete flag beside a protected ref",
+         f'{PUSH} "--delete" origin "{MAIN}', "deny"),
+        # ---- negative controls: the fix must not be "deny every tag push" --
+        ("the release flow's tag push", f"{PUSH} origin v1.2.3", "allow"),
+        ("all tags", f"{PUSH} --tags origin", "allow"),
+        ("a qualified tag ref", f"{PUSH} origin refs/tags/v1.2.3", "allow"),
+        ("a tag push behind a global option", f"{GPUSH} origin v1.2.3",
+         "allow"),
+        ("a feature branch push", f"{PUSH} origin feature/probe", "allow"),
+        ("the #333 release cleanup",
+         f"{PUSH} origin --delete release/1.0.0", "allow"),
+        ("what git-branch-cleanup runs",
+         f"{PUSH} origin --delete feature/x", "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        CASES,
+        ids=[c[0].replace(" ", "-") for c in CASES],
+    )
+    def test_allowlist_decision(self, tmp_path, label, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # The allowance is only OBSERVABLE from a protected branch, for the reason
+    # spelled out on TestProtectedBranchDeletionIsBlocked.DEVELOP_CASES: on a
+    # feature branch "stood down" and "fell through" both end in allow. From
+    # `main` they separate, and `main` is also where the release flow really
+    # pushes its tag from (scripts/git-flow-finish.sh creates the tag on main,
+    # then runs `git push origin "$VERSION"`).
+    MAIN_CASES = (
+        # The case the allowance exists for. Every tag in this repo's history
+        # is the bare `vX.Y.Z` spelling.
+        ("the release flow's tag push from main",
+         f"{PUSH} origin v3.5.0", "allow"),
+        ("all tags from main", f"{PUSH} --tags origin", "allow"),
+        ("a qualified tag ref from main",
+         f"{PUSH} origin refs/tags/v1.2.3", "allow"),
+        ("several tags from main",
+         f"{PUSH} origin v1.2.3 refs/tags/v1.2.4", "allow"),
+        # The old version-tag test was a literal `git push` regex, so a tag
+        # push carrying a global option FALSELY DENIED from main — measured
+        # at `1b0d3e5`. The replacement reads ref tokens, so it does not care
+        # how the verb is spelled.
+        ("a tag push behind a global option, from main",
+         f"{GPUSH} origin v1.2.3", "allow"),
+        # ---- controls: main must not become an allow-everything branch ----
+        ("--tags beside a protected branch, from main",
+         f"{PUSH} --tags origin {MAIN}", "deny"),
+        ("--tags shadowing a deletion, from main",
+         f"{PUSH} --tags origin --delete {MAIN}", "deny"),
+        ("a plain protected push from main", f"{PUSH} origin {MAIN}", "deny"),
+        # The row that separates `all` from `any`. Both agree whenever there
+        # is exactly ONE ref token, so every other deny row here survives the
+        # `any` mutation: `--tags origin main` has one ref, `main`, which is
+        # not a tag either way. Only a MIX tells them apart — and it has to be
+        # judged from `main`, because on a feature branch a stand-down and a
+        # fall-through both end in allow.
+        ("a tag ref beside a protected branch ref, from main",
+         f"{PUSH} origin refs/tags/v1 {MAIN}", "deny"),
+        ("a tag ref beside an ordinary branch ref, from main",
+         f"{PUSH} origin v1.2.3 feature/x", "deny"),
+        ("a mirror push from main", f"{PUSH} --mirror origin", "deny"),
+        # `--follow-tags` is NOT a tags-only push and must not be treated as
+        # one. Verified on git 2.50.1 against a real bare remote with
+        # push.default=current: `git push --follow-tags origin` put
+        # `refs/heads/main` on the remote alongside the tag, where
+        # `git push --tags origin` pushed the tag ALONE. Standing the hook
+        # down on a bare `--follow-tags` would therefore have opened a fresh
+        # route to pushing `main` — the very thing this class closes.
+        ("--follow-tags is a branch push, from main",
+         f"{PUSH} --follow-tags origin", "deny"),
+        # With an explicit tag refspec it adds only reachable tags, so it is
+        # a genuine tags-only push and must still be allowed.
+        ("--follow-tags with an explicit tag ref, from main",
+         f"{PUSH} --follow-tags origin v1.2.3", "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        MAIN_CASES,
+        ids=[c[0].replace(" ", "-") for c in MAIN_CASES],
+    )
+    def test_allowlist_decision_from_main(self, tmp_path, label, command,
+                                          expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b",
+                        self.MAIN], env=env, check=True, capture_output=True)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    def test_the_gate_order_is_what_carries_these(self):
+        """The negative control on ORDER, which no verdict row can express.
+
+        Every deny row above would still pass against a hook that blocked
+        everything, and — more to the point — the whole defect was an
+        allowlist sitting in the wrong PLACE rather than a missing check.
+
+        This assertion is not redundant with the verdict rows, and the
+        mutation says so: moving `_is_tag_push_only` back above the deletion
+        gate turns NO verdict row red, because the function refuses on
+        `_is_delete()` and `_all_ref_flags()` by itself before it ever looks
+        at a ref. The two are belt and braces — the position and the internal
+        checks each close #351 alone — and this is the only test that can
+        catch the position half going. (Deleting the mirror/prune deny, by
+        contrast, turns seven verdict rows red; changing `all` to `any` turns
+        the mixed-ref rows red.)
+        """
+        source = Path(".claude/hooks/prevent-direct-push.py").read_text(
+            encoding="utf-8")
+
+        # The three substring tests that were the defect. Matched in their
+        # CODE shape, not as bare prose: the replacement's own docstring
+        # quotes each of them to say what it replaced, the way
+        # `test_the_delete_analysis_is_what_carries_these` matches
+        # `'"--delete" in command and'` rather than `'"--delete"'`.
+        assert 'if "refs/tags/" in command' not in source, (
+            "the unanchored refs/tags/ substring allowlist is back; #351 is "
+            "reachable again"
+        )
+        assert 'or "--tags" in command:' not in source, (
+            "the unanchored --tags substring allowlist is back; #351 is "
+            "reachable again"
+        )
+        assert ("git pu" + "sh" + r"\s+\S+\s+v") not in source, (
+            "the unanchored version-tag regex is back; it also spelt the "
+            "verb literally, so a global-option tag push falsely denied"
+        )
+
+        delete_deny = source.index(
+            "_deleted_protected = _protected_delete_refs(command)")
+        mirror_deny = source.index("_all_ref_pushes = [")
+        tag_allow = source.index("if _is_tag_push_only(command):")
+        branch_check = source.index('["main", "develop"]')
+
+        assert delete_deny < tag_allow, (
+            "the tag allowance runs BEFORE the protected-deletion deny again "
+            "— that is exactly #351: one tag ref on the line stands the whole "
+            "hook down while `main` is being deleted"
+        )
+        assert mirror_deny < tag_allow, (
+            "the tag allowance runs BEFORE the mirror/prune deny again — "
+            "`--mirror --tags origin` is allowed as a tag push"
+        )
+        assert tag_allow < branch_check, (
+            "the tag allowance runs AFTER the current-branch check — the "
+            "release flow's `git push origin v3.5.0` from main now denies "
+            "(scripts/git-flow-finish.sh phase 3)"
+        )
+
+    def test_the_tag_allowance_asks_about_every_ref(self):
+        """`all`, not `any` — the #333 correction, applied here.
+
+        Without it `--tags origin main` is a tag push with a branch riding
+        along, which is the shape of every deny row above.
+        """
+        source = Path(".claude/hooks/prevent-direct-push.py").read_text(
+            encoding="utf-8")
+        body = source.split("def _is_tag_push_only", 1)[1].split(
+            "\n_deleted_protected", 1)[0]
+        assert "if not all(_is_tag_ref(r) for r in refs):" in body, (
+            "_is_tag_push_only no longer asks about EVERY ref token; one tag "
+            "on the line buys a stand-down for whatever else is on it"
         )

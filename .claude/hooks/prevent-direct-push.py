@@ -290,8 +290,9 @@ tool_input = input_data.get("tool_input", {})
 command = tool_input.get("command", "")
 # A "\<newline>" is a line continuation -- whitespace, not a separator --
 # so `git \<NL> push` is `git push`. Normalise ONCE here, before the
-# entry test below and every other raw-text check on `command`
-# ("--tags" in command, the --base regex): the entry test exiting 0 with
+# entry test below and every other raw-text check on `command` (the
+# `targets_protected` substring arms; the --base regex in the sibling
+# gates): the entry test exiting 0 with
 # empty stdout is an ALLOW, and it read un-collapsed text before
 # `_targets_this_project` or `_push_invocations` ever got a chance to
 # collapse it themselves -- both run too late to save the entry test
@@ -529,12 +530,10 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
 if not _targets_this_project(command, _PUSH_VERB):
     sys.exit(0)
 
-# Allow tag pushes (refs/tags/*, --tags, or explicit version tags like v1.2.3)
-if "refs/tags/" in command or "--tags" in command:
-    sys.exit(0)
-# Allow pushing an explicit version tag (e.g., "git push origin v1.2.3")
-if re.search(r'git push\s+\S+\s+v\d+\.\d+\.\d+', command):
-    sys.exit(0)
+# The tag allowlist USED TO SIT HERE, above every deny gate, as three
+# unanchored substring tests on the raw command text. It now lives below
+# them and reads ref tokens — see `_is_tag_push_only` and the gate order at
+# the bottom of this file.
 
 # --- Branch deletion (--delete / -d) ---
 #
@@ -763,12 +762,74 @@ def _is_delete(tokens) -> bool:
     so a test for the exact token `-d` misses it. Any single-dash token
     containing a `d` counts — no other single-dash `git push` flag carries
     one, and over-reading here only ever adds a deny.
+
+    Quote characters come off first, for the reason `_bare_ref` takes them
+    off a REF token: when `shlex.split` raises on an unbalanced quote,
+    `_push_invocations` falls back to a whitespace split, which does NOT
+    strip quoting. Measured at 74cf1b1 and still ALLOW until this strip went
+    in: a `--delete` written in double quotes, alongside a protected ref
+    behind an unbalanced quote, produced the token `"--delete"` — neither
+    equal to `--delete` nor `-`-prefixed — so the deletion gate saw no
+    delete at all and a deletion of main was permitted. This is
+    the FLAG side of the bypass `_bare_ref` already closes on the ref side.
     """
     return any(
         t == "--delete"
         or (len(t) > 1 and t[0] == "-" and t[1] != "-" and "d" in t)
-        for t in tokens
+        for t in (t.strip("\"'") for t in tokens)
     )
+
+
+# `--mirror` and `--prune` delete remote refs with no `--delete` flag, so
+# `_is_delete()` is false and no ref token is ever examined: measured ALLOW
+# at 1b0d3e5 for `git push --mirror origin`, which removes every remote ref
+# absent locally — `main` included (#351 item 2). Verified against a real
+# bare remote on git 2.50.1: `--mirror origin` put `refs/heads/main` and
+# every tag on the remote in one step.
+#
+# The hook cannot know WHICH refs either would remove without querying the
+# remote, so in a repo with protected branches the only fail-closed option is
+# to refuse both outright. Recorded as the decision #351 asked for. Neither
+# flag appears anywhere in `scripts/`, `.github/`, `.claude/` or `skills/`
+# (grepped), so no current workflow relies on it. A mirror configured through
+# `remote.<name>.mirror` rather than the flag is NOT detected — out of reach
+# of command text alone, and noted here so the limit is on the record.
+#
+# Matched by PREFIX, not by exact token, because git's parse-options accepts
+# any UNAMBIGUOUS abbreviation of a long option. Measured on git 2.50.1
+# against a real bare remote: `--mi`, `--mir` and `--mirror` all mirrored
+# identically, so a `frozenset({"--mirror", "--prune"})` would have been
+# bypassable by typing less. Over-matching is safe here in a way it is not
+# on the allow side: a prefix this accepts that git would reject as
+# ambiguous (`--pr`, shared with `--progress`) only ever costs a deny on a
+# command git refuses anyway.
+_ALL_REF_FLAG_NAMES = ("mirror", "prune")
+
+
+def _all_ref_flags(tokens):
+    """Every ``--mirror``/``--prune`` in one invocation's arguments.
+
+    Returns the tokens as written, so the deny message can name what it
+    refused rather than the flag it decided they meant.
+    """
+    found = []
+    for t in tokens:
+        # Quotes come off BEFORE the `--` test, not after. The whitespace
+        # split `_push_invocations` falls back to on an unbalanced quote
+        # leaves them attached, so a `--mirror` written in double quotes does
+        # not start with `--` and was skipped entirely — measured ALLOW while
+        # the bare spelling denied. Same bypass `_bare_ref` closes on the ref
+        # side and `_is_delete` on the flag side.
+        bare = t.strip("\"'")
+        if not bare.startswith("--"):
+            continue
+        # `--` on its own is the end-of-options marker, and an `=`-joined
+        # value belongs to the option rather than to its name. An empty name
+        # would prefix-match everything, hence the guard.
+        name = bare[2:].split("=", 1)[0]
+        if name and any(f.startswith(name) for f in _ALL_REF_FLAG_NAMES):
+            found.append(t)
+    return found
 
 
 def _ref_tokens(tokens):
@@ -799,6 +860,98 @@ def _ref_tokens(tokens):
         if not t.startswith("-"):
             non_flags.append(t)
     return non_flags[1:]
+
+
+# `git push origin v3.5.0` is what scripts/git-flow-finish.sh really runs
+# (phase 3, from `main`, right after tagging), and the bare `vX.Y.Z` spelling
+# is what the old version-tag regex allowed. Every tag in this repo's history
+# is that shape. Anchored with `fullmatch` on a single ref TOKEN rather than
+# `search`ed over the whole command, which is what let the old test stand the
+# hook down on `origin v1.2.3 --delete main`.
+#
+# Timed before shipping, per the rule in `TestPatternDecisionTimeIsBounded`:
+# worst measured `fullmatch` over five adversarial 300-900 KB shapes (one
+# long digit run, many dots, a trailing non-digit) is 1.7ms. Linear — the
+# three groups are pinned by the two literal dots, so there is nothing for
+# the engine to backtrack over.
+_VERSION_TAG = r'v\d+\.\d+\.\d+'
+_VERSION_TAG_RE = re.compile(_VERSION_TAG)
+
+
+def _is_tag_ref(token: str) -> bool:
+    """True when a ref token names a TAG, not a branch.
+
+    The destination is what matters, so a refspec is read after its last
+    ``:`` — `main:refs/tags/x` pushes a tag, `x:main` pushes a branch.
+
+    A token still carrying a shell separator is refused outright. `_bare_ref`
+    strips a TRAILING one because declining to recognise `main;` as `main`
+    would miss a deny; here the direction of doubt is the opposite way round
+    — this function grants a STAND-DOWN, so a token this cannot fully account
+    for must not be read as a tag. The cost is nil: a ref genuinely named
+    with a `;` is not protected, so it still allows on its own merits.
+    """
+    token = token.strip("\"'").lstrip("+")
+    if any(c in token for c in ";&|\n"):
+        return False
+    if ":" in token:
+        token = token.rsplit(":", 1)[1]
+    if token.startswith(("refs/tags/", "tags/")):
+        return True
+    return _VERSION_TAG_RE.fullmatch(token) is not None
+
+
+def _is_tag_push_only(cmd: str) -> bool:
+    """True when EVERY push here pushes nothing but tags.
+
+    This replaces three unanchored substring tests — `"refs/tags/"`,
+    `"--tags"` and a `git push \\S+ vN.N.N` regex, each tested against the
+    raw command text — that ran BEFORE the deletion gate and stood the whole
+    hook down on a match anywhere in the command. Measured ALLOW at 1b0d3e5:
+    `git push --tags origin --delete main` deleted `main`; so did the
+    `refs/tags/` and `vN.N.N` spellings alongside a `--delete main`, and
+    `git push --tags origin main` pushed `main` (#351).
+
+    "Every", not "any": one tag ref on the line no longer buys a stand-down
+    for whatever else is on it — the same correction #333 made to the
+    release-cleanup allowlist.
+
+    DIRECTION OF DOUBT. This function hands out a stand-down, so anything it
+    cannot fully account for returns False. That is only a DENY the user can
+    work around by naming the refs; returning True on a half-parsed command
+    is a ref that is gone. Hence: no invocations at all is False (the caller
+    matched a push verb this did not, and two matchers disagreeing is not
+    evidence of safety), an unrecognised flag spelling is False, and — unlike
+    the deny side above — abbreviations are NOT honoured, so `git push --tag
+    origin` falls through and denies from a protected branch rather than
+    standing the hook down on a spelling this did not verify.
+    """
+    invocations = _push_invocations(cmd)
+    if not invocations:
+        return False
+    for tokens in invocations:
+        if _is_delete(tokens) or _all_ref_flags(tokens):
+            return False
+        refs = _ref_tokens(tokens)
+        if not refs:
+            # `git push --tags origin` pushes tags and NOTHING else —
+            # verified against a real bare remote on git 2.50.1: the remote
+            # ended with `refs/tags/v0.0.1` alone, no branch.
+            #
+            # `--follow-tags` is deliberately absent. The same experiment
+            # with `push.default=current` left `refs/heads/main` on the
+            # remote alongside the tag, because with no refspec it takes the
+            # default-branch path and merely ADDS reachable annotated tags.
+            # Treating it as tags-only would have opened a fresh route to
+            # pushing `main` — the defect this gate exists to close. With an
+            # explicit tag refspec it adds only tags, and that case is
+            # handled by the ref-token branch below.
+            if "--tags" not in tokens:
+                return False
+            continue
+        if not all(_is_tag_ref(r) for r in refs):
+            return False
+    return True
 
 
 def _protected_delete_refs(cmd: str):
@@ -851,6 +1004,44 @@ To clean up a release or hotfix branch, name only those refs:
 
   git push origin --delete release/<version>""".format(
         refs=", ".join(_deleted_protected)))
+
+# --- Gate order below this point is the #351 fix, and it is load-bearing ---
+#
+#   1. protected-ref deletion            deny   (above)
+#   2. --mirror / --prune                deny   (here)
+#   3. tag-only push                     allow
+#   4. release/hotfix cleanup delete     allow
+#   5. current-branch and Git Flow       allow
+#   6. targets_protected                 deny
+#
+# 1 and 2 MUST precede 3, or `--tags origin --delete main` and
+# `--mirror --tags origin` are allowed again — that is the exact defect.
+# 3 MUST precede 5 and 6, or the release flow's `git push origin v3.5.0`
+# from `main` starts denying.
+_all_ref_pushes = [
+    f for tokens in _push_invocations(command) for f in _all_ref_flags(tokens)
+]
+if _all_ref_pushes:
+    _deny("""❌ Mirror and prune pushes are not allowed in this repo!
+
+Refused flag(s): {flags}
+
+Both delete remote refs that have no local counterpart — including main and
+develop — and neither carries --delete, so nothing below this point ever sees
+a ref to check. This hook cannot know which refs the remote would lose
+without querying it, so it refuses both outright.
+
+There is no revert for this. Push the refs you mean, by name:
+
+  git push origin <branch>
+  git push origin --delete release/<version>""".format(
+        flags=", ".join(sorted(set(_all_ref_pushes)))))
+
+# Tag pushes are fine — but only when the push is tags and NOTHING else, and
+# only after the two deny gates above have had their say. See
+# _is_tag_push_only.
+if _is_tag_push_only(command):
+    sys.exit(0)
 
 # Allow branch deletion (--delete) for release/hotfix cleanup
 if _is_release_cleanup_only(command):
