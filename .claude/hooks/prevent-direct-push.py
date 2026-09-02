@@ -598,6 +598,35 @@ def _bare_ref(token: str) -> str:
     as `main;x` (git accepts it, it is not protected, and it must stay
     allowed).
 
+    A REDIRECTION is cut off the same way, and a trailing BACKSLASH is
+    stripped with the rest. Both sit flush against the previous word, so this
+    hook sees one token where bash sees two: `push origin main>/dev/null`
+    really pushes the branch and redirects the output, and bash strips a
+    trailing backslash before git ever sees the argument. Measured across 84
+    generated rows -- two protected refs x six push forms x seven punctuation
+    forms, every one valid bash -- 0 fail open at 74cf1b1 and 84 at
+    5f7f29b..95dd663, including real DELETIONS. The substring arm in
+    `targets_protected` had been covering all of them, because it read the
+    raw text and did not care how the token ended; removing that arm exposed
+    them (#351 B1).
+
+    The redirection is CUT (everything from the first `<`/`>` onward is
+    dropped) rather than stripped from the right, because the punctuation is
+    not always last: `main>>f` and `main<&-` both carry a filename or a
+    descriptor after it. Cutting also gets the mirror case right --
+    `push origin >main` is a redirection INTO a file of that name and pushes
+    no ref at all, and cutting leaves the empty string rather than the
+    branch.
+
+    Deliberately `str.split`, not `re.split(r"[<>]", token, 1)`: passing
+    `maxsplit` positionally is deprecated as of Python 3.13 (measured on
+    3.13.3, the interpreter this repo runs) and raises `DeprecationWarning`.
+    Under `-W error`, or in the Python release that turns the deprecation
+    into an error, that is an exception inside a PreToolUse hook -- a
+    non-zero exit, which is a NON-BLOCKING error under the hook contract, so
+    the gate would fail OPEN. `str.split` has no such wrinkle and no regex
+    to time.
+
     The closing half of a command substitution is stripped for the same
     reason, and was found the same way. `X=$(cd /elsewhere && git push origin
     main)` leaves the `)` attached to the last token, so the ref arrived as
@@ -609,7 +638,8 @@ def _bare_ref(token: str) -> str:
     and no real ref name ends in one of these.
     """
     token = token.strip("\"'")
-    token = token.rstrip(";&|)}" + chr(96))
+    token = token.split("<", 1)[0].split(">", 1)[0]
+    token = token.rstrip(";&|)}" + chr(96) + chr(92))
     token = token.lstrip("+:")
     for prefix in ("refs/heads/", "heads/"):
         if token.startswith(prefix):

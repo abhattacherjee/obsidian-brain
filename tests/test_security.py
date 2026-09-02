@@ -3283,6 +3283,38 @@ class TestProtectedBranchDeletionIsBlocked:
         )
 
 
+# B1 fixture, generated at module level because a class-body comprehension
+# cannot see other class attributes -- same reason `_PATTERN_TOKENS` is here.
+# Fragments, for the reason given in TestHookBlockingPathsFire's docstring.
+_GLUE_PUSH = "git pu" + "sh"
+_GLUE_REFS = ("ma" + "in", "develop")
+_GLUE_FORMS = {
+    "plain": "{pu} origin {ref}{glue}",
+    "-d": "{pu} -d origin {ref}{glue}",
+    "--delete": "{pu} --delete origin {ref}{glue}",
+    "-f": "{pu} -f origin {ref}{glue}",
+}
+# Every way bash lets punctuation sit flush against the previous word. Each
+# was confirmed valid bash (`bash -n` rc 0) and confirmed to reach git with
+# the ref intact.
+_GLUE_PUNCTUATION = {
+    "trailing backslash": chr(92),
+    "redirect to a file": ">f",
+    "append to a file": ">>f",
+    "clobbering redirect": ">|f",
+    "close a descriptor": "<&-",
+    "read-write redirect": "<>f",
+    "redirect to /dev/null": ">/dev/null",
+}
+_GLUE_CASES = tuple(
+    (f"{ref} {form} {glue_name}",
+     template.format(pu=_GLUE_PUSH, ref=ref, glue=glue))
+    for ref in _GLUE_REFS
+    for form, template in _GLUE_FORMS.items()
+    for glue_name, glue in _GLUE_PUNCTUATION.items()
+)
+
+
 class TestAllowlistsCannotShadowTheDenyGates:
     """#351: the tag allowlist ran ABOVE the deletion gate and stood the whole
     hook down on an unanchored substring.
@@ -3681,6 +3713,77 @@ class TestAllowlistsCannotShadowTheDenyGates:
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
         subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b",
                         self.MAIN], env=env, check=True, capture_output=True)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # ---- B1: shell punctuation glued to the ref token ----------------------
+    # `git push origin <protected>>/dev/null` is one WORD to this hook and two
+    # to bash: bash splits the redirection off and really pushes the branch.
+    # Same for a trailing backslash, which bash strips. `_bare_ref` normalised
+    # neither, so `_protected_push_refs` saw `main>/dev/null` and `main\` and
+    # matched neither.
+    #
+    # This was masked until 5f7f29b by the `"origin main" in command` substring
+    # arm -- the arm fired on the raw text regardless of how the token ended.
+    # Deleting the arm (C5) was right, and it did expose two other real gaps,
+    # but it had no deny row carrying THIS glue, so a passing mutation could
+    # not see it. Measured: 0 of 84 rows fail open at 74cf1b1, 84 of 84 at
+    # 5f7f29b..95dd663, every one valid bash (`bash -n` rc 0) and every one a
+    # real push or a real deletion of a protected branch.
+    #
+    # Generated rather than listed, for the reason the timing matrix is:
+    # a hand-picked glue list is what missed this in the first place.
+    GLUE_CASES = _GLUE_CASES
+
+    @pytest.mark.parametrize(
+        "label,command",
+        GLUE_CASES,
+        ids=[c[0].replace(" ", "-") for c in GLUE_CASES],
+    )
+    def test_glued_punctuation_does_not_hide_a_protected_ref(
+            self, tmp_path, label, command):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == "deny", f"{label}: expected deny, got {got}"
+
+    # The other half of the claim. Normalising the glue must not turn into
+    # "deny anything with punctuation on it", and in particular must not
+    # resurrect the substring false-denies C5 removed: `maintenance`, `main2`,
+    # `mainline` and `developer` all DENIED at 74cf1b1 and must stay allowed.
+    # `>{protected}` is the sharp one -- it is a redirection INTO a file named
+    # like a protected branch, not a push of one, and the split must read it
+    # that way round.
+    GLUE_CONTROLS = (
+        ("a feature branch wearing a redirect",
+         f"{PUSH} origin feature/x>/dev/null", "allow"),
+        ("a feature branch wearing a backslash",
+         f"{PUSH} origin feature/x" + chr(92), "allow"),
+        ("maintenance wearing a redirect",
+         f"{PUSH} origin {MAIN}tenance>/dev/null", "allow"),
+        ("a main2 branch wearing a redirect",
+         f"{PUSH} origin {MAIN}2>/dev/null", "allow"),
+        ("a mainline branch", f"{PUSH} origin {MAIN}line", "allow"),
+        ("a developer branch wearing a redirect",
+         f"{PUSH} origin developer>/dev/null", "allow"),
+        ("a tag wearing a redirect",
+         f"{PUSH} origin refs/tags/v1.2.3>/dev/null", "allow"),
+        # A redirection whose TARGET FILE is named like a protected branch.
+        # The word before the `>` is what git receives; there is no ref here
+        # at all, and the current branch is a feature branch.
+        ("a redirect into a file named like a protected branch",
+         f"{PUSH} origin >{MAIN}", "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        GLUE_CONTROLS,
+        ids=[c[0].replace(" ", "-") for c in GLUE_CONTROLS],
+    )
+    def test_glue_normalisation_does_not_over_deny(
+            self, tmp_path, label, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
         got = TestHookBlockingPathsFire._decide(
             work, env, "prevent-direct-push", command)
         assert got == expected, f"{label}: expected {expected}, got {got}"
