@@ -377,13 +377,29 @@ if re.search(r'git push\s+\S+\s+v\d+\.\d+\.\d+', command):
 _PROTECTED_REF = r'(?:main|develop)(?![A-Za-z0-9._/-])'
 _PROTECTED_REF_RE = re.compile(_PROTECTED_REF)
 
+# Longest argument string still handed to `shlex` — see `_push_invocations`.
+# No real ref name approaches this; it exists only to bound a quadratic path.
+_SHLEX_MAX = 100_000
+
 
 def _bare_ref(token: str) -> str:
     """A ref token with the decorations git accepts stripped off.
 
     `main`, `heads/main`, `refs/heads/main` and `+refs/heads/main` are one
     destination; a leading `:` is the old-style delete spelling.
+
+    Also strips a leading/trailing quote character, because it can arrive
+    already attached: when `shlex.split` raises on an unbalanced quote,
+    `_push_invocations` falls back to a plain whitespace split, which does
+    not strip quoting the way `shlex` does. Measured: a command ending in an
+    unbalanced `"` immediately followed by `main` produced the token `"main`
+    from that fallback, which this function did not recognise as `main` —
+    the deletion gate missed it and allowed the delete. The strip has to
+    happen FIRST, before `lstrip("+:")`, so a quoted qualified ref like
+    `"refs/heads/main"` loses the quote before the `refs/heads/` prefix is
+    tested, not after.
     """
+    token = token.strip("\"'")
     token = token.lstrip("+:")
     for prefix in ("refs/heads/", "heads/"):
         if token.startswith(prefix):
@@ -392,23 +408,48 @@ def _bare_ref(token: str) -> str:
 
 
 def _push_invocations(cmd: str):
-    """One list of argument tokens per `git push` in ``cmd``.
+    r"""One list of argument tokens per `git push` in ``cmd``.
 
     Split on shell separators first, so each push in a compound command is
     judged on its OWN arguments rather than on the whole string — which is the
     mistake the substring allowlist made. ``shlex`` is what strips the quotes,
     so `"refs/heads/main"` is the same token as `refs/heads/main`; a segment
-    it cannot parse falls back to a whitespace split, which can only yield
-    MORE ref tokens than the truth, never fewer. That direction is the safe
-    one: a spurious extra ref can add a deny or withhold the stand-down, never
-    grant one.
+    it cannot parse falls back to a whitespace split, which does NOT strip
+    quotes and can mis-split — see ``_bare_ref``, which strips a stray quote
+    character off a token from that path so both consumers below still
+    recognise it. Extra ref tokens are still safe either way: a spurious one
+    can only add a deny or withhold the stand-down, never grant one. What is
+    not safe is a MALFORMED one that a downstream check fails to recognise as
+    protected, which is why the quote is stripped rather than left for the
+    caller to trip over.
+
+    "\<newline>" is a line continuation, i.e. whitespace, not the command
+    separator a bare newline is — same reasoning as `_targets_this_project`,
+    which collapses it for the same reason. Collapse it here too, before the
+    `re.split`: otherwise a delete command wrapped across a line with a
+    trailing backslash splits into two segments, the second (holding the
+    protected ref) has no push verb, and the ref is silently dropped instead
+    of being read as part of the same invocation.
+
+    ``shlex`` is only reached when there is quoting for it to strip, and only
+    below ``_SHLEX_MAX``. It accumulates a token one character at a time, so
+    it is quadratic in the length of a SINGLE argument: a ~900 KB one took
+    5.6s against 0.03s for the same command before this gate existed
+    (measured), and the payload cap upstream is 1 MB. Both shortcuts land on
+    the same whitespace split the ``ValueError`` path uses, and its tokens are
+    normalised by ``_bare_ref`` — including the quotes, which is why skipping
+    ``shlex`` cannot hide a protected ref.
     """
+    cmd = cmd.replace("\\\n", " ")
     invocations = []
     for part in re.split(r'[;&|\n]+', cmd):
         m = re.search(r'\bgit\s+push\b', part)
         if not m:
             continue
         tail = part[m.end():]
+        if len(tail) > _SHLEX_MAX or ('"' not in tail and "'" not in tail):
+            invocations.append(tail.split())
+            continue
         try:
             invocations.append(shlex.split(tail))
         except ValueError:

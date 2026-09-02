@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -1799,6 +1800,36 @@ class TestProtectedBranchDeletionIsBlocked:
          f"{PUSH} origin --delete feature/x", "allow"),
         ("feature branch cleanup, flag first",
          f"{PUSH} --delete origin feature/x", "allow"),
+        # #333 follow-up (fix 1): a backslash-newline is a line continuation,
+        # i.e. whitespace, not the segment separator a bare newline is. Before
+        # the fix, splitting on it dropped the protected ref into a segment
+        # with no push verb, so it was never inspected and the delete was
+        # allowed.
+        ("protected ref after a line continuation",
+         f"{PUSH} --delete origin release/x \\\n    {MAIN}", "deny"),
+        # #333 follow-up (fix 2): an unbalanced quote sends `_push_invocations`
+        # down the whitespace-split fallback, which does not strip quotes.
+        # Before the fix the resulting token kept its leading `"`, `_bare_ref`
+        # did not recognise it as protected, and the delete was allowed.
+        ("protected ref behind an unbalanced quote",
+         f'{PUSH} --delete origin release/x "{MAIN}', "deny"),
+        # Negative control for fix 2: a normally single-quoted release ref
+        # must still stand down — the quote strip must not turn into "deny
+        # every quoted token".
+        ("singly-quoted release ref still stands down",
+         f"{PUSH} --delete origin 'release/x'", "allow"),
+        # `_push_invocations` skips `shlex` for an argument string past
+        # `_SHLEX_MAX` (it is quadratic in a single token's length). That
+        # shortcut must not become a way to hide a ref: the whitespace split
+        # keeps the quotes on, and `_bare_ref` is what takes them off again.
+        ("quoted protected ref past the shlex bound",
+         f"{PUSH} --delete origin release/x " + "b" * 100_001 + f' "{MAIN}"',
+         "deny"),
+        # The same shape under the bound, which DOES go through shlex — so the
+        # row above is testing the shortcut rather than just the ref matcher.
+        ("quoted protected ref under the shlex bound",
+         f"{PUSH} --delete origin release/x " + "b" * 10 + f' "{MAIN}"',
+         "deny"),
     )
 
     @pytest.mark.parametrize(
@@ -1866,6 +1897,34 @@ class TestProtectedBranchDeletionIsBlocked:
         got = TestHookBlockingPathsFire._decide(
             work, env, "prevent-direct-push", command)
         assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    def test_a_large_command_does_not_stall_the_gate(self, tmp_path):
+        """`shlex` is quadratic in the length of a single argument.
+
+        This hook runs before EVERY Bash tool call, and the payload cap
+        upstream is 1 MB. Handing `shlex` a ~900 KB argument took 5.6s, against
+        0.03s for the same command on `develop` — measured, a ~185x regression
+        introduced by the delete gate itself. `_push_invocations` now skips
+        `shlex` past `_SHLEX_MAX`, which brought it back to 0.04s.
+
+        The bound is generous on purpose: it sits far below the 5.6s the
+        unfixed path took, and far above the ~0.04s the fixed one does, so it
+        catches the regression without going flaky on a loaded CI runner. The
+        verdict is asserted alongside the timing — a fast ALLOW would be the
+        worst possible way to pass this test.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = (f"{self.PUSH} --delete origin release/x "
+                   + "b" * 900_000 + f" {self.MAIN}")
+        started = time.monotonic()
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        elapsed = time.monotonic() - started
+        assert got == "deny", f"a 900 KB command must still deny, got {got}"
+        assert elapsed < 3.0, (
+            f"the gate took {elapsed:.2f}s on a 900 KB command; the quadratic "
+            f"shlex path is back (it measured 5.6s, the fixed path 0.04s)"
+        )
 
     def test_the_delete_analysis_is_what_carries_these(self, tmp_path):
         """The negative control on the guard itself.
