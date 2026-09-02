@@ -163,6 +163,18 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         # `-C` the scan cannot vouch for is not provably real, so it is
         # dropped here and the occurrence falls through to the `cd` logic
         # below, exactly like `len(c_dirs) != 1` -- gated.
+        #
+        # Inheriting `_shell_scan` also inherits its blind spots: a `#`
+        # comment on a PRECEDING line, an unbalanced quote inside such a
+        # comment, a `case ... )` pattern, and a heredoc body are all valid
+        # bash that `_shell_scan` cannot model, so a legitimately cross-repo
+        # `-C` after one of these now falls through to the `cd` logic and
+        # gets denied instead of descoped. All four are fail-CLOSED -- the
+        # cost lands only on cross-repo `-C` work, an in-project `-C` after
+        # the same constructs still denies correctly -- and are the accepted
+        # cost of "a `-C` the scan cannot vouch for is not provably real"
+        # (documented, not fixed: modelling comments/heredocs would be a
+        # redesign of the #326 `_shell_scan` machinery, not this task).
         c_dirs = [
             cd for cd in re.finditer(
                 r'''(?<![^\s])-C\s+(?:"([^"]*)"|'([^']*)'|(\S+))''',
@@ -428,10 +440,33 @@ def _read_hook_input(what):
 # literal character ONLY when no closing `"` exists ahead of it, so a given
 # quote character is never simultaneously eligible for the balanced-run
 # alternative AND the catch-all -- nothing left to backtrack between.
-_Q = r'''(?:"[^"]*"|'[^']*'|"(?![^"]*")|'(?![^']*')|[^\s"'])'''
+#
+# Two more spellings the catch-all still missed, both reaching the real
+# binary at rc 0 (#351 CRIT-6):
+#
+#  * a BACKSLASH-ESCAPED space (`user.name=A\ B`, no quotes at all). The
+#    catch-all excluded whitespace, so `_Q*` stopped dead at the space,
+#    the value truncated to `user.name=A\`, and the mandatory trailing
+#    `\s+` swallowed just that one space -- stranding `B` where `push`
+#    needed to be next. Fixed with a new `\\.` alternative that matches a
+#    backslash plus the character it escapes as ONE atomic unit -- bare
+#    backslash is now EXCLUDED from the catch-all (`[^\s"'\\]`) so a given
+#    backslash can only ever be consumed by `\\.`, never by both, keeping
+#    every alternative disjoint the same way the CRIT-3 fix requires.
+#  * a QUOTED OPTION TOKEN (`"-c"`, `'-c'`). Every alternative above
+#    assumed the option starts with a literal, unquoted `-`; git does not
+#    require that. `_OPT` adds two more shapes for "the option token
+#    itself" -- a fully double- or single-quoted run -- alongside the
+#    original `-`-prefixed one. Accepting more shapes here can only ever
+#    ADD a gate (an `_OPT` alternative that fails to match just means
+#    fewer iterations of `_GLOBAL_OPTS`, never a match somewhere it
+#    shouldn't be), so this is deliberately permissive like everything
+#    else in this pattern.
+_Q = r'''(?:"[^"]*"|'[^']*'|"(?![^"]*")|'(?![^']*')|\\.|[^\s"'\\])'''
+_OPT = r'''(?:-''' + _Q + r'''*|"[^"]*"|'[^']*')'''
 _GLOBAL_OPTS = (
-    r'(?:-' + _Q + r'*(?:\s+(?:(?:"[^"]*"|'
-    r"'[^']*'|\"(?![^\"]*\")|'(?![^']*')|[^-\s\"'])"
+    r'(?:' + _OPT + r'(?:\s+(?:(?:"[^"]*"|'
+    r"'[^']*'|\"(?![^\"]*\")|'(?![^']*')|\\.|[^-\s\"'\\])"
     + _Q + r'*))?\s+)*'
 )
 

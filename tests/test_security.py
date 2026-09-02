@@ -3,6 +3,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1244,6 +1245,19 @@ class TestVerbFormsCannotSkipTheGate:
         ("prevent-direct-push",
          'git -c a.b="x && cd /nonexistent-elsewhere" pu'
          + "sh origin ma" + "in", "deny"),
+        # CRIT-5: a quoted `;` (or `&`/`|`) inside a global-option value
+        # defeats a text-blind segment split -- see `_push_invocations`.
+        ("prevent-direct-push",
+         'git -c a.b="c;d" pu' + "sh origin --delete ma" + "in", "deny"),
+        # CRIT-6: two more global-option spellings that reach real git.
+        ("prevent-direct-push",
+         "git -c user.name=A\\ B pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         'git "-c" k=v pu' + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git '-c' 'k=v w' pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -c a.b=c=d\\ e pu" + "sh origin ma" + "in", "deny"),
 
         # --- validate-branch-name: git checkout -b ---
         ("validate-branch-name", "git chec" + "kout -b nonsense-branch", "deny"),
@@ -1273,6 +1287,11 @@ class TestVerbFormsCannotSkipTheGate:
         ("validate-branch-name",
          'git -c a.b="x -C /nonexistent-elsewhere" chec'
          + "kout -b nonsense-branch", "deny"),
+        # CRIT-6
+        ("validate-branch-name",
+         "git -c user.name=A\\ B chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name",
+         'git "-c" k=v chec' + "kout -b nonsense-branch", "deny"),
 
         # --- require-preflight: git commit ---
         ("require-preflight", "git com" + "mit -m wip", "deny"),
@@ -1297,6 +1316,10 @@ class TestVerbFormsCannotSkipTheGate:
         # CRIT-4
         ("require-preflight",
          'git -c a.b="x -C /nonexistent-elsewhere" com' + "mit -m wip", "deny"),
+        # CRIT-6
+        ("require-preflight",
+         "git -c user.name=A\\ B com" + "mit -m wip", "deny"),
+        ("require-preflight", "git '-c' 'k=v w' com" + "mit -m wip", "deny"),
 
         # --- enforce-pr-base-branch: gh pr create ---
         ("enforce-pr-base-branch", "gh pr cre" + "ate --base ma" + "in", "deny"),
@@ -1312,6 +1335,9 @@ class TestVerbFormsCannotSkipTheGate:
         # NEW-1
         ("enforce-pr-base-branch",
          "gh -c foo=O'Brien pr cre" + "ate --base ma" + "in", "deny"),
+        # CRIT-6
+        ("enforce-pr-base-branch",
+         'gh "-c" foo=x pr cre' + "ate --base ma" + "in", "deny"),
 
         # --- enforce-pr-base-branch: gh pr merge ---
         ("enforce-pr-base-branch", "gh pr mer" + "ge 5", "deny"),
@@ -1341,6 +1367,9 @@ class TestVerbFormsCannotSkipTheGate:
         # NEW-1
         ("update-changelog-before-pr",
          "gh -c foo=O'Brien pr cre" + "ate --base develop", "deny"),
+        # CRIT-6
+        ("update-changelog-before-pr",
+         "gh -c foo=x\\ y pr cre" + "ate --base develop", "deny"),
     )
 
     @pytest.mark.parametrize("hook,command,expected", CASES)
@@ -1378,13 +1407,15 @@ class TestVerbFormsCannotSkipTheGate:
 class TestGlobalOptionSpellingsMatchThePlainVerdict:
     """The durable regression net for the whole `_GLOBAL_OPTS`/`_Q` class
     (#351), not just the specific cases CRIT-1/CRIT-2/NEW-1/NEW-2/CRIT-3/
-    CRIT-4 happened to probe. Round 1 fixed a fail-open on a half-quoted
-    value; round 2 found TWO MORE fail-opens the fix itself introduced (an
-    unbalanced quote, an empty `-C` value); round 3 found a ReDoS the round-2
-    fix introduced AND a decoy-`-C`-inside-a-quoted-value bypass that had
-    been live since round 0 and untouched by every round in between — the
-    pattern of "case N+1 next round" is exactly what a hand-picked example
-    list cannot close.
+    CRIT-4/CRIT-5/CRIT-6 happened to probe. Every one of rounds 1-4 found a
+    fail-open or a blowup this file's own hand-picked example list had not
+    thought of yet — the pattern of "case N+1 next round" is exactly what a
+    hand-picked list cannot close, which is IMP-3's finding: the round-3
+    decoy rows were themselves hand-picked, and three of the four turned out
+    to be structurally vacuous (see `test_prefix_decoy_matches_plain_verdict`
+    below for why, and `TestGeneratedGlobalOptionValuesMatchThePlainVerdict`
+    for the mechanically-generated matrix that replaces "pick more examples"
+    as the primary net).
 
     Instead of asserting a hardcoded `allow`/`deny` per spelling, this
     generates a bounded matrix of global-option spellings and asserts each
@@ -1399,9 +1430,8 @@ class TestGlobalOptionSpellingsMatchThePlainVerdict:
     empty-quoted values; a value containing a space, a `-`, or an `=`; a
     single option and two stacked; a tab separator; a `\\<newline>`
     continuation right after the global options; and — CRIT-4's class as a
-    property, not an example — a quoted value that itself CONTAINS the text
-    of a `-C`, a `cd`, or a gated verb, so a decoy inside quotes can never
-    again change the verdict for the real command around it.
+    property, not an example — a `-C` decoy (both quote styles) sitting
+    inside a quoted value of an unrelated option.
     """
 
     # Text to splice between the executable and the verb, e.g.
@@ -1425,13 +1455,23 @@ class TestGlobalOptionSpellingsMatchThePlainVerdict:
         "-C . -c user.name=x ",            # two stacked options
         "-c user.name=x -C . ",            # two stacked options, reversed
         "-C . \\\n",                       # line continuation after the options
-        # CRIT-4: a decoy sitting inside a QUOTED VALUE of an unrelated
+        # CRIT-6
+        r"-c user.name=A\ B ",              # backslash-escaped space
+        '"-c" k=v ',                        # the OPTION TOKEN itself quoted
+        "'-c' 'k=v w' ",                    # option AND value both quoted
+        # CRIT-4: a `-C` decoy sitting inside a QUOTED VALUE of an unrelated
         # option. Real git reads each of these back as ONE config value, not
-        # a second `-C`/a real `cd`/a second verb invocation.
+        # a second `-C`. IMP-3: this is the only decoy shape that is a real
+        # guard here (proved by MUT-A in the round-3 re-review) -- a decoy
+        # `cd`/verb spliced at this SAME position (between the executable
+        # and the verb) can never precede the verb match's own start, so
+        # `_targets_this_project`'s `preceding = [... c[0] < position]`
+        # filter can never even see it; that is what
+        # `test_prefix_decoy_matches_plain_verdict` below exists to cover
+        # instead. Both quote styles are tested since only the double-quoted
+        # one used to be live.
         '-c a.b="x -C /nonexistent-elsewhere" ',
-        '-c a.b="x && cd /nonexistent-elsewhere" ',
-        '-c a.b="x ; cd /tmp" ',
-        '-c a.b="x ' + "pu" + "sh origin ma" + 'in" ',
+        "-c a.b='x -C /nonexistent-elsewhere' ",
     )
 
     # hook -> (executable prefix, bare verb text with its own arguments).
@@ -1455,6 +1495,116 @@ class TestGlobalOptionSpellingsMatchThePlainVerdict:
         assert got == control, (
             f"{hook}: {candidate!r} verdict {got!r} != plain-form {plain!r} "
             f"verdict {control!r}"
+        )
+
+    # IMP-3: a decoy spliced BETWEEN the executable and the verb (the
+    # OPTION_SPELLINGS axis above) sits at an offset >= the verb match's own
+    # start (`position` in `_targets_this_project`), and `preceding = [c for
+    # c in cd_matches if c[0] < position]` can never see anything at or after
+    # `position` -- so a decoy `cd` there can NEVER exercise the
+    # `_shell_scan` vouching on `cd`-detection, no matter how the decoy is
+    # spelled. The round-3 re-review proved this by mutation (MUT-B: drop
+    # `_shell_scan` from `cd`-detection, re-breaking #326 -- 105 passed,
+    # nothing red). A decoy only threatens that code path when it sits
+    # BEFORE the verb, which is what this axis does.
+    PREFIX_DECOYS = (
+        'echo "x && cd /nonexistent-elsewhere" && ',
+        "echo 'x && cd /nonexistent-elsewhere' && ",
+        'echo "x ; cd /tmp" && ',
+        'echo "x -C /nonexistent-elsewhere" && ',
+    )
+
+    @pytest.mark.parametrize("prefix", PREFIX_DECOYS)
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_prefix_decoy_matches_plain_verdict(self, tmp_path, hook, prefix):
+        exe, verb = self.HOOK_VERBS[hook]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        plain = exe + verb
+        control = TestHookBlockingPathsFire._decide(work, env, hook, plain)
+        candidate = prefix + exe + verb
+        got = TestHookBlockingPathsFire._decide(work, env, hook, candidate)
+        assert got == control, (
+            f"{hook}: {candidate!r} verdict {got!r} != plain-form {plain!r} "
+            f"verdict {control!r}"
+        )
+
+
+def _double_quote_escape(value: str) -> str:
+    """`value` wrapped in double quotes, backslash-escaping `\\` and `"`."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _backslash_escape(value: str) -> str:
+    """`value` with every non-alphanumeric/`-_./` character backslash-escaped.
+
+    Over-escaping an already-safe character (`\\a` for `a`) is harmless in
+    POSIX shells -- a backslash before a character with no special meaning
+    is just that character -- so this does not need to be precise about
+    which characters truly need escaping.
+    """
+    safe = set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./"
+    )
+    return "".join(("\\" + c) if c not in safe else c for c in value)
+
+
+class TestGeneratedGlobalOptionValuesMatchThePlainVerdict:
+    """IMP-3's "stop hand-picking spellings" fix. Rounds 1-4 each found a
+    fail-open the hand-picked `OPTION_SPELLINGS` list above had not thought
+    of, because the same mind chose its rows every time (CRIT-1's
+    half-quoted value, NEW-1's unbalanced quote, CRIT-6's backslash-escaped
+    space and quoted option token -- four different escaping ideas across
+    four rounds). This class generates spellings mechanically instead: a
+    small set of AWKWARD VALUES crossed with a small set of QUOTING STYLES,
+    each built with `shlex.quote` or an explicit escaping function rather
+    than typed out by hand, so the matrix does not depend on anyone
+    thinking of the next awkward case.
+
+    7 values x 3 styles = 21 combinations, x 5 hooks = 105 rows. Runs in the
+    same few seconds per row as the rest of this file's subprocess-based
+    tests -- bounded and fast, not a fuzzer.
+    """
+
+    VALUES = {
+        "space": "a b",
+        "single-quote": "a'b",
+        "double-quote": 'a"b',
+        "semicolon": "a;b",
+        "equals": "a=b",
+        "backslash": "a\\b",
+        "empty": "",
+    }
+
+    # Each style takes a raw value and returns a shell-embeddable spelling
+    # of it. `shlex` is Python's canonical POSIX-quoting implementation --
+    # using it (rather than hand-typing more quoted examples) is the point:
+    # it models the same tokenisation the shell does.
+    STYLES = {
+        "shlex-quote": shlex.quote,
+        "double-quoted": _double_quote_escape,
+        "backslash-escaped": _backslash_escape,
+    }
+
+    HOOK_VERBS = TestGlobalOptionSpellingsMatchThePlainVerdict.HOOK_VERBS
+
+    @pytest.mark.parametrize("value_name", sorted(VALUES))
+    @pytest.mark.parametrize("style_name", sorted(STYLES))
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_generated_value_matches_plain_verdict(
+        self, tmp_path, hook, style_name, value_name
+    ):
+        exe, verb = self.HOOK_VERBS[hook]
+        styled = self.STYLES[style_name](self.VALUES[value_name])
+        spelling = f"-c a.b={styled} "
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        plain = exe + verb
+        control = TestHookBlockingPathsFire._decide(work, env, hook, plain)
+        candidate = exe + spelling + verb
+        got = TestHookBlockingPathsFire._decide(work, env, hook, candidate)
+        assert got == control, (
+            f"{hook}: {candidate!r} ({style_name}/{value_name}) verdict "
+            f"{got!r} != plain-form {plain!r} verdict {control!r}"
         )
 
 
@@ -1491,6 +1641,18 @@ class TestDecisionTimeIsBounded:
 
     BUDGET_MS = 500
 
+    # A per-row subprocess timeout just above the budget, not the shared
+    # 60s harness default. Round 3's implementation used the harness's
+    # ordinary `_decide`-style 60s cap, so a genuine regression died as
+    # `subprocess.TimeoutExpired` — an ERROR whose message says "60
+    # seconds", not "over the 500ms budget" — and cost ~10 minutes of wall
+    # clock to discover (2 pathological rows x 5 hooks x 60s each) (#351
+    # IMP-4). 4x the budget is generous headroom for scheduling jitter
+    # (nothing measured here comes within 5x of 500ms honestly) while
+    # still failing in low single-digit seconds per row instead of a full
+    # minute.
+    SUBPROCESS_TIMEOUT_S = 2
+
     # label -> command. Chosen to stress the three shapes rounds 1-3 each
     # found a fail-open or a blowup in: unbalanced quotes (CRIT-3), a long
     # run of global-option tokens (more `_GLOBAL_OPTS` iterations), and an
@@ -1512,12 +1674,22 @@ class TestDecisionTimeIsBounded:
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
         command = self.ADVERSARIAL_INPUTS[label]
         start = time.perf_counter()
-        proc = subprocess.run(
-            [sys.executable, str(work / ".claude/hooks" / f"{hook}.py")],
-            input=json.dumps({"tool_name": "Bash",
-                              "tool_input": {"command": command}}),
-            capture_output=True, text=True, timeout=60, cwd=work, env=env,
-        )
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(work / ".claude/hooks" / f"{hook}.py")],
+                input=json.dumps({"tool_name": "Bash",
+                                  "tool_input": {"command": command}}),
+                capture_output=True, text=True,
+                timeout=self.SUBPROCESS_TIMEOUT_S, cwd=work, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            pytest.fail(
+                f"{hook} took over {elapsed_ms:.0f}ms on {label!r}, well "
+                f"past the {self.BUDGET_MS}ms budget (subprocess killed at "
+                f"the {self.SUBPROCESS_TIMEOUT_S}s safety cap) -- likely "
+                f"catastrophic backtracking or another superlinear blowup"
+            )
         elapsed_ms = (time.perf_counter() - start) * 1000
         assert proc.returncode == 0, (
             f"{hook} exited {proc.returncode} on {label!r}: "
