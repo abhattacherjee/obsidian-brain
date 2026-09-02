@@ -1227,6 +1227,23 @@ class TestVerbFormsCannotSkipTheGate:
          'git -C "" pu' + "sh origin ma" + "in", "deny"),
         ("prevent-direct-push",
          "git -C '' pu" + "sh origin ma" + "in", "deny"),
+        # CRIT-3: a run of unbalanced quotes must still resolve to a verdict
+        # (see TestDecisionTimeIsBounded for the actual timing assertion);
+        # here we only check it still denies, i.e. still matches the verb.
+        ("prevent-direct-push",
+         'git -a ' + '"' * 40 + ' pu' + "sh origin ma" + "in", "deny"),
+        # CRIT-4: a decoy `-C`/`cd` sitting inside a QUOTED VALUE of an
+        # unrelated option must not descope the command -- git reads the
+        # whole quoted string back as ONE config value, not a real `-C`.
+        ("prevent-direct-push",
+         'git -c a.b="x -C /nonexistent-elsewhere" pu' + "sh origin ma" + "in",
+         "deny"),
+        ("prevent-direct-push",
+         'git -c a.b="x -C /nonexistent-elsewhere" pu'
+         + "sh origin --delete ma" + "in", "deny"),
+        ("prevent-direct-push",
+         'git -c a.b="x && cd /nonexistent-elsewhere" pu'
+         + "sh origin ma" + "in", "deny"),
 
         # --- validate-branch-name: git checkout -b ---
         ("validate-branch-name", "git chec" + "kout -b nonsense-branch", "deny"),
@@ -1252,6 +1269,10 @@ class TestVerbFormsCannotSkipTheGate:
          'git -C "" chec' + "kout -b nonsense-branch", "deny"),
         ("validate-branch-name",
          "git -C '' chec" + "kout -b nonsense-branch", "deny"),
+        # CRIT-4
+        ("validate-branch-name",
+         'git -c a.b="x -C /nonexistent-elsewhere" chec'
+         + "kout -b nonsense-branch", "deny"),
 
         # --- require-preflight: git commit ---
         ("require-preflight", "git com" + "mit -m wip", "deny"),
@@ -1273,6 +1294,9 @@ class TestVerbFormsCannotSkipTheGate:
         # NEW-2
         ("require-preflight", 'git -C "" com' + "mit -m wip", "deny"),
         ("require-preflight", "git -C '' com" + "mit -m wip", "deny"),
+        # CRIT-4
+        ("require-preflight",
+         'git -c a.b="x -C /nonexistent-elsewhere" com' + "mit -m wip", "deny"),
 
         # --- enforce-pr-base-branch: gh pr create ---
         ("enforce-pr-base-branch", "gh pr cre" + "ate --base ma" + "in", "deny"),
@@ -1353,11 +1377,14 @@ class TestVerbFormsCannotSkipTheGate:
 
 class TestGlobalOptionSpellingsMatchThePlainVerdict:
     """The durable regression net for the whole `_GLOBAL_OPTS`/`_Q` class
-    (#351), not just the specific cases CRIT-1/CRIT-2/NEW-1/NEW-2 happened to
-    probe. Round 1 fixed a fail-open on a half-quoted value; round 2 found
-    TWO MORE fail-opens the fix itself introduced (an unbalanced quote, an
-    empty `-C` value) — the pattern of "case 22 next round" is exactly what
-    a hand-picked example list cannot close.
+    (#351), not just the specific cases CRIT-1/CRIT-2/NEW-1/NEW-2/CRIT-3/
+    CRIT-4 happened to probe. Round 1 fixed a fail-open on a half-quoted
+    value; round 2 found TWO MORE fail-opens the fix itself introduced (an
+    unbalanced quote, an empty `-C` value); round 3 found a ReDoS the round-2
+    fix introduced AND a decoy-`-C`-inside-a-quoted-value bypass that had
+    been live since round 0 and untouched by every round in between — the
+    pattern of "case N+1 next round" is exactly what a hand-picked example
+    list cannot close.
 
     Instead of asserting a hardcoded `allow`/`deny` per spelling, this
     generates a bounded matrix of global-option spellings and asserts each
@@ -1370,8 +1397,11 @@ class TestGlobalOptionSpellingsMatchThePlainVerdict:
     stays in the seconds range: separate and `=`-joined values; bare,
     single-quoted, double-quoted, half-quoted, unbalanced-quoted and
     empty-quoted values; a value containing a space, a `-`, or an `=`; a
-    single option and two stacked; a tab separator; and a `\\<newline>`
-    continuation right after the global options.
+    single option and two stacked; a tab separator; a `\\<newline>`
+    continuation right after the global options; and — CRIT-4's class as a
+    property, not an example — a quoted value that itself CONTAINS the text
+    of a `-C`, a `cd`, or a gated verb, so a decoy inside quotes can never
+    again change the verdict for the real command around it.
     """
 
     # Text to splice between the executable and the verb, e.g.
@@ -1395,6 +1425,13 @@ class TestGlobalOptionSpellingsMatchThePlainVerdict:
         "-C . -c user.name=x ",            # two stacked options
         "-c user.name=x -C . ",            # two stacked options, reversed
         "-C . \\\n",                       # line continuation after the options
+        # CRIT-4: a decoy sitting inside a QUOTED VALUE of an unrelated
+        # option. Real git reads each of these back as ONE config value, not
+        # a second `-C`/a real `cd`/a second verb invocation.
+        '-c a.b="x -C /nonexistent-elsewhere" ',
+        '-c a.b="x && cd /nonexistent-elsewhere" ',
+        '-c a.b="x ; cd /tmp" ',
+        '-c a.b="x ' + "pu" + "sh origin ma" + 'in" ',
     )
 
     # hook -> (executable prefix, bare verb text with its own arguments).
@@ -1418,6 +1455,78 @@ class TestGlobalOptionSpellingsMatchThePlainVerdict:
         assert got == control, (
             f"{hook}: {candidate!r} verdict {got!r} != plain-form {plain!r} "
             f"verdict {control!r}"
+        )
+
+
+class TestDecisionTimeIsBounded:
+    """A standing wall-clock budget on adversarial input, per hook (#351
+    CRIT-3). Round 3's reviewer found the round-2 fix's widened `_Q`
+    catch-all made a quote character both a balanced-run opener and an
+    ordinary character in the same `(?:...)*` repeat, which is catastrophic
+    backtracking: a 43-byte command (34 unbalanced double quotes) took 932ms
+    against the shipped 4d67581 pattern, and the reviewer measured over 10s
+    at 40. That is what turns "a reviewer happened to think to time it" into
+    a standing assertion nothing else in this file would have caught --
+    every other test in this class only checks the VERDICT, never how long
+    it took to arrive at one.
+
+    Budget: 500ms. Chosen from measurements on this machine (a 2026-era
+    Mac): an honest `git status` costs ~22-29ms per hook here --
+    interpreter/subprocess startup dominates that number, not the regex
+    work -- and the heaviest NON-pathological input measured (a ~900KB
+    single argument, close to the 1MB stdin cap, through
+    `prevent-direct-push`, which also runs `_push_invocations` and
+    `_protected_delete_refs`) cost ~90ms. 500ms is ~5x headroom over that
+    measured worst case and ~20x over the honest baseline -- room to
+    absorb a slower CI runner -- while staying far under a
+    human-noticeable stall (UX guidance generally puts the "user's flow of
+    thought stays uninterrupted" threshold around 1s). The CRIT-3 pattern
+    blew past 500ms by roughly 2x at just 34 quotes and would have blown
+    past it by orders of magnitude at the adversarial sizes used here.
+
+    A PreToolUse hook runs on every Bash tool call in this session, with a
+    1MB stdin cap on what it will read — a slow gate here is not merely an
+    inconvenience, it stalls every command the user runs.
+    """
+
+    BUDGET_MS = 500
+
+    # label -> command. Chosen to stress the three shapes rounds 1-3 each
+    # found a fail-open or a blowup in: unbalanced quotes (CRIT-3), a long
+    # run of global-option tokens (more `_GLOBAL_OPTS` iterations), and an
+    # argument near the stdin cap (`_push_invocations`'s `_SHLEX_MAX` path).
+    ADVERSARIAL_INPUTS = {
+        "2000 unbalanced double-quotes":
+            "git -a " + '"' * 2000 + " x",
+        "2000 unbalanced single-quotes":
+            "git -a " + "'" * 2000 + " x",
+        "500 stacked global-option tokens":
+            "git " + ("-c a=b " * 500) + "pu" + "sh origin ma" + "in",
+        "a ~900KB single argument, near the 1MB stdin cap":
+            "git pu" + "sh origin " + ("x" * 900_000),
+    }
+
+    @pytest.mark.parametrize("label", sorted(ADVERSARIAL_INPUTS))
+    @pytest.mark.parametrize("hook", TestHookInputFailsClosed.HOOKS)
+    def test_decision_within_budget(self, tmp_path, hook, label):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = self.ADVERSARIAL_INPUTS[label]
+        start = time.perf_counter()
+        proc = subprocess.run(
+            [sys.executable, str(work / ".claude/hooks" / f"{hook}.py")],
+            input=json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": command}}),
+            capture_output=True, text=True, timeout=60, cwd=work, env=env,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        assert proc.returncode == 0, (
+            f"{hook} exited {proc.returncode} on {label!r}: "
+            f"{proc.stderr[-400:]!r}"
+        )
+        assert elapsed_ms < self.BUDGET_MS, (
+            f"{hook} took {elapsed_ms:.1f}ms on {label!r}, over the "
+            f"{self.BUDGET_MS}ms budget -- possible catastrophic "
+            f"backtracking or other superlinear blowup"
         )
 
 

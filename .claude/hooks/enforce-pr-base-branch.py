@@ -46,9 +46,26 @@ import subprocess
 # quoted run is still preferred (tried first in the alternation, so a space
 # inside `"A B"` still bridges), and only an UNBALANCED quote falls through
 # to matching as an ordinary character, same as the old permissive `\S+`.
-_Q = r'''(?:"[^"]*"|'[^']*'|[^\s])'''
-_GLOBAL_OPTS = (r'(?:-' + _Q + r'*(?:\s+(?:(?:"[^"]*"|'
-                r"'[^']*'|[^-\s])" + _Q + r'*))?\s+)*')
+#
+# That widened catch-all made a quote char both a balanced-run OPENER and
+# an ordinary character inside a `(?:...)*`repeat, so a run of unbalanced
+# quotes let the engine try both interpretations at every position and
+# backtrack over all of them when the tail failed to match -- catastrophic
+# backtracking. Measured on the shipped 4d67581 pattern: a 43-byte command
+# (34 double quotes) took 932ms; the reviewer measured over 10s at 40. A
+# PreToolUse hook runs on every Bash call with a 1MB stdin cap, so this was
+# a live DoS reachable by an ordinary command containing unbalanced quotes
+# (#351 CRIT-3). Fixed by making the alternatives DISJOINT with a lookahead
+# instead of widening a shared catch-all: `"(?![^"]*")` matches a `"` as a
+# literal character ONLY when no closing `"` exists ahead of it, so a given
+# quote character is never simultaneously eligible for the balanced-run
+# alternative AND the catch-all -- nothing left to backtrack between.
+_Q = r'''(?:"[^"]*"|'[^']*'|"(?![^"]*")|'(?![^']*')|[^\s"'])'''
+_GLOBAL_OPTS = (
+    r'(?:-' + _Q + r'*(?:\s+(?:(?:"[^"]*"|'
+    r"'[^']*'|\"(?![^\"]*\")|'(?![^']*')|[^-\s\"'])"
+    + _Q + r'*))?\s+)*'
+)
 
 _PR_CREATE_VERB = r'\bgh\s+' + _GLOBAL_OPTS + r'pr\s+create\b'
 _PR_MERGE_VERB = r'\bgh\s+' + _GLOBAL_OPTS + r'pr\s+merge\b'
@@ -374,8 +391,26 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         # options. Anything ambiguous (several `-C`s, whose effects compound
         # relative to each other; an unresolvable path) falls through to the
         # `cd` logic below and ends up gated, which is fail-closed.
-        c_dirs = re.findall(
-            r'''(?:^|\s)-C\s+(?:"([^"]*)"|'([^']*)'|(\S+))''', m.group(0))
+        #
+        # `m.group(0)` has no idea it might itself be sitting inside a
+        # QUOTED VALUE of an unrelated option: `-c a.b="x -C /elsewhere"` is
+        # ONE shell argument -- git reads it back as a single config value,
+        # not a second `-C` -- so a naive search over `m.group(0)` found
+        # this decoy and let it descope the whole command (#351 CRIT-4),
+        # the same bypass class as #326 one layer deeper. `_shell_scan`
+        # already answers "would a shell really be executing here, or is
+        # this inside quotes/backticks/a substitution"; give the `-C`
+        # extraction that same test, keyed by its ABSOLUTE offset in `cmd`
+        # (`position + cd.start()`, not an offset into `m.group(0)`). A
+        # `-C` the scan cannot vouch for is not provably real, so it is
+        # dropped here and the occurrence falls through to the `cd` logic
+        # below, exactly like `len(c_dirs) != 1` -- gated.
+        c_dirs = [
+            cd for cd in re.finditer(
+                r'''(?<![^\s])-C\s+(?:"([^"]*)"|'([^']*)'|(\S+))''',
+                m.group(0))
+            if _shell_scan(cmd[:position + cd.start()])[0]
+        ]
         if len(c_dirs) == 1:
             # `-C ""` is documented git behaviour ("if <path> is present but
             # empty, the current working directory is left unchanged") and is
@@ -387,7 +422,7 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
             # fail-open (#351 NEW-2). An empty/unresolved `-C` value is
             # ambiguous, not provably out of scope, so it falls through to
             # the `cd` logic below exactly like `len(c_dirs) != 1` -- gated.
-            target = next((t for t in c_dirs[0] if t), None)
+            target = next((t for t in c_dirs[0].groups() if t), None)
             if target is not None:
                 try:
                     target = os.path.realpath(
