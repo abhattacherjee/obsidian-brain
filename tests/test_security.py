@@ -1704,6 +1704,76 @@ class TestGeneratedGlobalOptionValuesMatchThePlainVerdict:
         )
 
 
+# ---------------------------------------------------------------------------
+# A GENERATED end-to-end timing matrix, for the reason round 4 of Task 1
+# generated the spelling matrix instead of listing it: three separate
+# superlinear regressions in this file were each missed by a hand-picked
+# list of remembered worst cases, and the third was a QUADRATIC one that the
+# list walked straight past. `ADVERSARIAL_INPUTS` below holds inputs like
+# `"x" * 900_000` -- 900 KB with no quote and no separator in it, which is
+# exactly the shape that CANNOT exercise the span/separator interaction, and
+# it measured a comfortable 72 ms while a same-sized command holding both
+# took 37.9 SECONDS.
+#
+# So the axes are enumerated instead of the examples: separator density x
+# quote density x total length. A cell is a repeating unit at a size; the
+# units cover both ends of both axes and the combinations between them.
+_MATRIX_UNITS = {
+    # Both axes high at once -- the shape that was quadratic. Every unit
+    # contributes one closed quoted span AND two separators, so the span
+    # count and the separator count both grow with the input.
+    "quoted separators": ("PUSH origin feature/x && ", 'echo "a;b" && '),
+    "single-quoted separators": ("PUSH origin feature/x && ", "echo 'a;b' && "),
+    # Same, but the separator is a newline -- the path where `_quoted_spans`
+    # DROPS a span rather than vouching for it.
+    "newline separators": ("PUSH origin feature/x\n", 'echo "a;b"\n'),
+    # Separators only.
+    "bare separators": ("PUSH origin feature/x && ", "echo a && "),
+    "separator run": ("PUSH origin feature/x", ";"),
+    # Quotes only, closed and unclosed.
+    "quoted words": ("PUSH origin ", '"ab" '),
+    "balanced quote run": ("PUSH origin ", '"" '),
+    "unbalanced quote run": ("PUSH origin feature/x ", '"'),
+    # Neither -- the control, and the shape the old hand-picked list had.
+    "no structure": ("PUSH origin ", "x"),
+}
+
+# 4 KB is an ordinary long command; 64 KB is where a quadratic term first
+# becomes unmistakable; 900 KB sits just under the hooks' 1 MB stdin cap.
+_MATRIX_SIZES_KB = (4, 64, 900)
+
+_MATRIX_LABELS = sorted(
+    f"{unit} @ {kb}KB"
+    for unit in _MATRIX_UNITS
+    for kb in _MATRIX_SIZES_KB
+)
+
+
+def _matrix_command(label):
+    """Build one cell, sized by its JSON PAYLOAD rather than its length.
+
+    Sizing on the raw string is a trap that silently empties the cell: a
+    quote-heavy shape roughly doubles under JSON escaping, so an "850 KB"
+    command became a >1 MB payload, tripped the hooks' own `_STDIN_CAP` and
+    was refused WITHOUT being parsed at all. Four of nine cells measured that
+    way -- fast, green, and testing nothing. Sizing on the encoded payload
+    keeps every cell just under the cap and genuinely through the parser.
+    """
+    unit_label, _, size = label.rpartition(" @ ")
+    target = int(size.removesuffix("KB")) * 1024
+    prefix, unit = _MATRIX_UNITS[unit_label]
+    prefix = prefix.replace("PUSH", "git pu" + "sh")
+    n = max(1, (target - len(prefix)) // len(unit))
+    for _ in range(6):
+        cmd = prefix + unit * n
+        got = len(json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": cmd}}))
+        if got <= target:
+            return cmd
+        n = max(1, int(n * target / got))
+    return prefix + unit * n
+
+
 class TestDecisionTimeIsBounded:
     """A standing wall-clock budget on adversarial input, per hook (#351
     CRIT-3). Round 3's reviewer found the round-2 fix's widened `_Q`
@@ -1819,6 +1889,50 @@ class TestDecisionTimeIsBounded:
             f"{hook} took {elapsed_ms:.1f}ms on {label!r}, over the "
             f"{self.BUDGET_MS}ms budget -- possible catastrophic "
             f"backtracking or other superlinear blowup"
+        )
+
+    @pytest.mark.parametrize("label", _MATRIX_LABELS)
+    @pytest.mark.parametrize("hook", TestHookInputFailsClosed.HOOKS)
+    def test_generated_shape_within_budget(self, tmp_path, hook, label):
+        """The same budget, over GENERATED shapes rather than remembered ones.
+
+        Worst cell measured on this machine after the fix: 241 ms
+        (`prevent-direct-push`, `balanced quote run @ 900KB`), against the
+        500 ms budget -- about 2x headroom, thinner than the hand-picked
+        rows enjoy, and deliberately so: these shapes are chosen to be the
+        expensive ones. The regression this class exists to catch is
+        superlinear, not a constant factor, so it does not arrive at 600 ms
+        -- the quadratic term measured 37.9 SECONDS on the 128 KB cell of
+        `quoted separators`, and cells here are seven times larger again.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = _matrix_command(label)
+        start = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(work / ".claude/hooks" / f"{hook}.py")],
+                input=json.dumps({"tool_name": "Bash",
+                                  "tool_input": {"command": command}}),
+                capture_output=True, text=True,
+                timeout=self.SUBPROCESS_TIMEOUT_S, cwd=work, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            pytest.fail(
+                f"{hook} took over {elapsed_ms:.0f}ms on the generated shape "
+                f"{label!r}, well past the {self.BUDGET_MS}ms budget "
+                f"(subprocess killed at the {self.SUBPROCESS_TIMEOUT_S}s "
+                f"safety cap) -- a superlinear blowup over separator or "
+                f"quote density"
+            )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        assert proc.returncode == 0, (
+            f"{hook} exited {proc.returncode} on {label!r}: "
+            f"{proc.stderr[-400:]!r}"
+        )
+        assert elapsed_ms < self.BUDGET_MS, (
+            f"{hook} took {elapsed_ms:.1f}ms on the generated shape "
+            f"{label!r}, over the {self.BUDGET_MS}ms budget"
         )
 
 
@@ -3166,6 +3280,15 @@ class TestAllowlistsCannotShadowTheDenyGates:
          f"{PUSH} origin refs/heads/feature/{MAIN}", "allow"),
         ("a branch whose leaf is spelt like develop",
          f"{PUSH} origin foo team/develop", "allow"),
+        # C5: `"origin main" in command` fires INSIDE `origin maintenance`,
+        # so an ordinary branch was refused — measured deny at 74cf1b1 and
+        # at fc551f2. `_protected_push_refs` decides the same question on
+        # ref tokens, which is both correct and narrower, so the two
+        # substring arms are deleted rather than patched.
+        ("an ordinary branch the substring arm caught",
+         f"{PUSH} origin {MAIN}tenance", "allow"),
+        ("an ordinary branch the develop substring arm caught",
+         f"{PUSH} origin developer", "allow"),
         # A legitimate MULTI-REF push. Every other negative control for this
         # arm carries a protected-looking name; this one carries none, so it
         # is the row that catches an arm which simply refuses more than one
@@ -3205,6 +3328,43 @@ class TestAllowlistsCannotShadowTheDenyGates:
         ("half-abbreviated mirror push", f"{PUSH} --mir origin", "deny"),
         ("abbreviated prune push",
          f"{PUSH} --pru origin +refs/heads/*:refs/heads/*", "deny"),
+        # ---- C2: the same class as --mirror, one layer out. None of these
+        # NAMES a protected ref, and none carries --delete, so every
+        # ref-token gate below is blind to them; each was measured ALLOW at
+        # 74cf1b1 and at fc551f2, and each puts refs/heads/main AND
+        # refs/heads/develop on the remote. `--branches` is the modern
+        # spelling of `--all`.
+        ("push every branch", f"{PUSH} --all origin", "deny"),
+        ("push every branch, modern spelling",
+         f"{PUSH} --branches origin", "deny"),
+        ("abbreviated push-every-branch", f"{PUSH} --al origin", "deny"),
+        ("abbreviated modern spelling", f"{PUSH} --br origin", "deny"),
+        # A refspec whose DESTINATION is a glob covering branches does the
+        # same job with no flag at all.
+        ("a branch-glob refspec",
+         f"{PUSH} origin +refs/heads/*:refs/heads/*", "deny"),
+        ("a bare glob refspec", f"{PUSH} origin '*:*'", "deny"),
+        ("a glob that covers a protected name", f"{PUSH} origin 'ma*'",
+         "deny"),
+        # ---- C2 negative controls: globs that CANNOT reach a protected ref
+        # must stay allowed, or this becomes "deny every wildcard".
+        ("a tag glob", f"{PUSH} origin 'refs/tags/*:refs/tags/*'", "allow"),
+        ("a feature glob", f"{PUSH} origin 'feature/*'", "allow"),
+        ("a qualified feature glob",
+         f"{PUSH} origin 'refs/heads/feature/*:refs/heads/feature/*'",
+         "allow"),
+        # Source side is branches, destination is tags: it creates tags and
+        # touches no branch, so it allows. The DESTINATION is what matters.
+        ("branches pushed into tags",
+         f"{PUSH} origin 'refs/heads/*:refs/tags/*'", "allow"),
+        # ---- C3: `_is_tag_ref` reads a refspec's DESTINATION, after the
+        # last colon. No row pushed a tag INTO a branch, so flipping that
+        # choice to the source side left the class green while this flipped
+        # deny->allow — the gate-3 stand-down sits above the refspec arm.
+        ("a tag ref pushed into a protected branch",
+         f"{PUSH} origin refs/tags/v1:refs/heads/{MAIN}", "deny"),
+        ("a tag ref pushed into a protected branch, unqualified",
+         f"{PUSH} origin refs/tags/v1:{MAIN}", "deny"),
         # ---- the QUOTED spelling of a flag, on both deny gates ----
         # `_push_invocations` falls back to a whitespace split when
         # `shlex.split` raises on an unbalanced quote, and that split does not
@@ -3372,6 +3532,42 @@ class TestAllowlistsCannotShadowTheDenyGates:
             work, env, "prevent-direct-push", command)
         assert got == expected, f"{label}: expected {expected}, got {got}"
 
+    # C4. Two guards in `_is_tag_push_only` that no row reached. Both are
+    # about text where the hook's two matchers DISAGREE, which is why no
+    # ordinary command exercises them — and both hand out a stand-down, so
+    # the direction that matters is the one where they refuse.
+    DISAGREEMENT_CASES = (
+        # `_PUSH_VERB`'s `\s+` matches a newline, so the entry test sees one
+        # `git push` spanning it; `_push_invocations` splits there and finds
+        # none. Valid bash (it runs `git`, then `push`, which is not a
+        # command), and the two matchers reach opposite answers. If the
+        # `if not invocations: return False` guard returned True instead,
+        # gate 3 would stand the hook down on it.
+        ("the two matchers disagree across a newline",
+         "git \npu" + "sh origin " + MAIN, "deny"),
+        # A separator inside a quoted run that closes is NOT a separator, so
+        # this arrives as one ref token spelt `refs/tags/v1;<protected>`.
+        # It starts with `refs/tags/`, so without the separator refusal in
+        # `_is_tag_ref` it reads as a tag and stands the hook down. Judged
+        # from `main`, where a stand-down and a fall-through differ.
+        ("a separator inside a quoted ref token",
+         f'{PUSH} origin "refs/tags/v1;{MAIN}"', "deny"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        DISAGREEMENT_CASES,
+        ids=[c[0].replace(" ", "-") for c in DISAGREEMENT_CASES],
+    )
+    def test_matcher_disagreement_does_not_stand_the_hook_down(
+            self, tmp_path, label, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b",
+                        self.MAIN], env=env, check=True, capture_output=True)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
     def test_the_gate_order_is_what_carries_these(self):
         """The negative control on ORDER, which no verdict row can express.
 
@@ -3385,9 +3581,11 @@ class TestAllowlistsCannotShadowTheDenyGates:
         `_is_delete()` and `_all_ref_flags()` by itself before it ever looks
         at a ref. The two are belt and braces — the position and the internal
         checks each close #351 alone — and this is the only test that can
-        catch the position half going. (Deleting the mirror/prune deny, by
-        contrast, turns seven verdict rows red; changing `all` to `any` turns
-        the mixed-ref rows red.)
+        catch the position half going. (Deleting the gate-2 denies, by
+        contrast, turns seventeen verdict rows red; changing `all` to `any`
+        turns the mixed-ref rows red; and dropping the `_protected_push_refs`
+        arm turns forty-nine red, because since the two substring arms were
+        removed it is the only thing carrying a protected-push deny at all.)
         """
         source = Path(".claude/hooks/prevent-direct-push.py").read_text(
             encoding="utf-8")
