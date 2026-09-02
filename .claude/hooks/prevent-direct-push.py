@@ -10,6 +10,7 @@ Installed by /harden-repo into target repo's .claude/hooks/
 import json
 import os
 import re
+import shlex
 import sys
 import subprocess
 
@@ -356,8 +357,144 @@ if "refs/tags/" in command or "--tags" in command:
 if re.search(r'git push\s+\S+\s+v\d+\.\d+\.\d+', command):
     sys.exit(0)
 
+# --- Branch deletion (--delete / -d) ---
+#
+# This gate was two unanchored substring tests — `"--delete" in command` and
+# `"release/" in command or "hotfix/" in command` — so a protected ref riding
+# ALONGSIDE a release ref stood the whole hook down: `--delete origin
+# release/x main` deleted `main` (#333).
+#
+# Tightening the allowlist alone would not have fixed it, which is why there
+# is a deny here as well. Nothing downstream catches that command: "origin
+# main" is not a substring of it, the refspec arms below need a `:` or a
+# `heads/` spelling, and on a feature branch `current_branch` is clean.
+# Measured before this change: allow. A deletion is also worse than a push to
+# the same branch — a bad push can be reverted, a deleted ref is gone.
+#
+# Both halves are decided on REF TOKENS instead. `_PROTECTED_REF` is the
+# whole-ref matcher from #332, reused so that `mainline` and `maintenance`
+# stay the ordinary branches they are.
+_PROTECTED_REF = r'(?:main|develop)(?![A-Za-z0-9._/-])'
+_PROTECTED_REF_RE = re.compile(_PROTECTED_REF)
+
+
+def _bare_ref(token: str) -> str:
+    """A ref token with the decorations git accepts stripped off.
+
+    `main`, `heads/main`, `refs/heads/main` and `+refs/heads/main` are one
+    destination; a leading `:` is the old-style delete spelling.
+    """
+    token = token.lstrip("+:")
+    for prefix in ("refs/heads/", "heads/"):
+        if token.startswith(prefix):
+            return token[len(prefix):]
+    return token
+
+
+def _push_invocations(cmd: str):
+    """One list of argument tokens per `git push` in ``cmd``.
+
+    Split on shell separators first, so each push in a compound command is
+    judged on its OWN arguments rather than on the whole string — which is the
+    mistake the substring allowlist made. ``shlex`` is what strips the quotes,
+    so `"refs/heads/main"` is the same token as `refs/heads/main`; a segment
+    it cannot parse falls back to a whitespace split, which can only yield
+    MORE ref tokens than the truth, never fewer. That direction is the safe
+    one: a spurious extra ref can add a deny or withhold the stand-down, never
+    grant one.
+    """
+    invocations = []
+    for part in re.split(r'[;&|\n]+', cmd):
+        m = re.search(r'\bgit\s+push\b', part)
+        if not m:
+            continue
+        tail = part[m.end():]
+        try:
+            invocations.append(shlex.split(tail))
+        except ValueError:
+            invocations.append(tail.split())
+    return invocations
+
+
+def _is_delete(tokens) -> bool:
+    """True when these arguments delete a ref.
+
+    `-d` is bundleable: git's parse-options reads `-fd` as `--force --delete`,
+    so a test for the exact token `-d` misses it. Any single-dash token
+    containing a `d` counts — no other single-dash `git push` flag carries
+    one, and over-reading here only ever adds a deny.
+    """
+    return any(
+        t == "--delete"
+        or (len(t) > 1 and t[0] == "-" and t[1] != "-" and "d" in t)
+        for t in tokens
+    )
+
+
+def _ref_tokens(tokens):
+    """The refs an invocation acts on: every non-flag token after the remote.
+
+    A flag taking a SEPARATE value (`-o ci.skip`) shifts this by one and pulls
+    an extra token in as a ref. Deliberate, same direction as above: an extra
+    ref can only add a deny or withhold the stand-down.
+    """
+    non_flags = [t for t in tokens if not t.startswith("-")]
+    return non_flags[1:]
+
+
+def _protected_delete_refs(cmd: str):
+    """Every protected ref ``cmd`` would delete, across all of its pushes."""
+    found = []
+    for tokens in _push_invocations(cmd):
+        if not _is_delete(tokens):
+            continue
+        found.extend(
+            t for t in _ref_tokens(tokens)
+            if _PROTECTED_REF_RE.fullmatch(_bare_ref(t))
+        )
+    return found
+
+
+def _is_release_cleanup_only(cmd: str) -> bool:
+    """True when EVERY push here deletes nothing but release/hotfix refs.
+
+    "Every", not "any": one release ref on the line no longer buys a
+    stand-down for whatever else is on it.
+    """
+    invocations = _push_invocations(cmd)
+    if not invocations:
+        return False
+    for tokens in invocations:
+        refs = _ref_tokens(tokens)
+        if not _is_delete(tokens) or not refs:
+            return False
+        if not all(
+            _bare_ref(r).startswith(("release/", "hotfix/")) for r in refs
+        ):
+            return False
+    return True
+
+
+_deleted_protected = _protected_delete_refs(command)
+if _deleted_protected:
+    _deny("""❌ Deleting a protected branch is not allowed!
+
+Refused ref(s): {refs}
+
+Protected branches:
+  - main (production)
+  - develop (integration)
+
+There is no revert for this. A bad push to a protected branch can be undone;
+a deleted ref is gone.
+
+To clean up a release or hotfix branch, name only those refs:
+
+  git push origin --delete release/<version>""".format(
+        refs=", ".join(_deleted_protected)))
+
 # Allow branch deletion (--delete) for release/hotfix cleanup
-if "--delete" in command and ("release/" in command or "hotfix/" in command):
+if _is_release_cleanup_only(command):
     sys.exit(0)
 
 # Get current branch
@@ -438,7 +575,7 @@ if current_branch in ["main", "develop"]:
 # `[\s+]` alone let the quoted spelling through while the bare one denied.
 # The colon arm needs no such boundary — it anchors on the `:` itself, which
 # is why `'HEAD:main'` already denied.
-_PROTECTED_REF = r'(?:main|develop)(?![A-Za-z0-9._/-])'
+# _PROTECTED_REF is defined with the deletion gate above, which needs it first.
 _PROTECTED_REFSPEC_RE = re.compile(
     r':(?:(?:refs/)?heads/)?' + _PROTECTED_REF
     + r'''|(?:^|[\s+'"])(?:refs/)?heads/''' + _PROTECTED_REF
