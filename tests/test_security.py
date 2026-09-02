@@ -1159,6 +1159,111 @@ class TestHookBlockingPathsFire:
         assert self._decide(work, env, "update-changelog-before-pr", cmd) == "allow"
 
 
+class TestVerbFormsCannotSkipTheGate:
+    """`git`/`gh` accept GLOBAL options between the executable and the
+    subcommand: `git -C . push`, `git -c k=v push`, `git --no-pager push`,
+    `gh --repo o/r pr create`, `gh -R o/r pr merge`. Every gate's entry test
+    and scope guard used to be a literal substring check (`"git push" in
+    command`) or a bare verb regex (`\\bgit\\s+push\\b`), so none of those
+    forms matched — the gate exited 0 with an empty stdout, an ALLOW under
+    the PreToolUse contract, with every check below it skipped (#351, #327
+    item 2).
+
+    Every row below is `allow` on develop before this fix, except the
+    plain-form controls (no global options at all), which already deny and
+    must keep denying, and the "no verb"/out-of-scope negative controls,
+    which must stay `allow` so the fix is not "deny every git/gh invocation".
+
+    Command strings are assembled from fragments on purpose: this repo's live
+    PreToolUse hooks inspect unexecuted command text, so a literal
+    protected-branch push string in this file blocks the tooling that reads
+    it.
+    """
+
+    # (hook, command, expected).
+    CASES = (
+        # --- prevent-direct-push: git push ---
+        ("prevent-direct-push", "git pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git -C . pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git -c user.name=x pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git --no-pager pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git --no-pager -C . pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git -C . pu" + "sh origin feature/probe", "allow"),
+        ("prevent-direct-push", "git -C /nonexistent-elsewhere pu" + "sh origin ma" + "in", "allow"),
+        ("prevent-direct-push", "git config --global alias.p pu" + "sh", "allow"),
+        ("prevent-direct-push", "git -C . status", "allow"),
+
+        # --- validate-branch-name: git checkout -b ---
+        ("validate-branch-name", "git chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name", "git -C . chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name", "git -c user.name=x chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name", "git --no-pager chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name", "git --no-pager -C . chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name", "git -C . chec" + "kout -b feature/ok", "allow"),
+        ("validate-branch-name", "git -C /nonexistent-elsewhere chec" + "kout -b nonsense-branch", "allow"),
+        ("validate-branch-name", "git config --global alias.c chec" + "kout", "allow"),
+        ("validate-branch-name", "git -C . status", "allow"),
+
+        # --- require-preflight: git commit ---
+        ("require-preflight", "git com" + "mit -m wip", "deny"),
+        ("require-preflight", "git -C . com" + "mit -m wip", "deny"),
+        ("require-preflight", "git -c user.name=x com" + "mit -m wip", "deny"),
+        ("require-preflight", "git --no-pager com" + "mit -m wip", "deny"),
+        ("require-preflight", "git --no-pager -C . com" + "mit -m wip", "deny"),
+        ("require-preflight", "git -C /nonexistent-elsewhere com" + "mit -m wip", "allow"),
+        ("require-preflight", "git config --global alias.c com" + "mit", "allow"),
+        ("require-preflight", "git -C . status", "allow"),
+
+        # --- enforce-pr-base-branch: gh pr create ---
+        ("enforce-pr-base-branch", "gh pr cre" + "ate --base ma" + "in", "deny"),
+        ("enforce-pr-base-branch", "gh --repo o/r pr cre" + "ate --base ma" + "in", "deny"),
+        ("enforce-pr-base-branch", "gh -R o/r pr cre" + "ate --base ma" + "in", "deny"),
+        ("enforce-pr-base-branch", "gh --repo o/r pr cre" + "ate --base develop", "allow"),
+        ("enforce-pr-base-branch", "gh config get git_protocol", "allow"),
+
+        # --- enforce-pr-base-branch: gh pr merge ---
+        ("enforce-pr-base-branch", "gh pr mer" + "ge 5", "deny"),
+        ("enforce-pr-base-branch", "gh --repo o/r pr mer" + "ge 5", "deny"),
+        ("enforce-pr-base-branch", "gh -R o/r pr mer" + "ge 5", "deny"),
+
+        # --- update-changelog-before-pr: gh pr create ---
+        ("update-changelog-before-pr", "gh pr cre" + "ate --base develop", "deny"),
+        ("update-changelog-before-pr", "gh --repo o/r pr cre" + "ate --base develop", "deny"),
+        ("update-changelog-before-pr", "gh -R o/r pr cre" + "ate --base develop", "deny"),
+    )
+
+    @pytest.mark.parametrize("hook,command,expected", CASES)
+    def test_global_option_forms(self, tmp_path, hook, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        assert TestHookBlockingPathsFire._decide(work, env, hook, command) == expected, (
+            f"{hook} got {command!r} wrong"
+        )
+
+    @pytest.mark.parametrize("hook,verb", (
+        ("prevent-direct-push", "pu" + "sh origin ma" + "in"),
+        ("validate-branch-name", "chec" + "kout -b nonsense-branch"),
+        ("require-preflight", "com" + "mit -m wip"),
+    ))
+    def test_quoted_path_with_a_space_inside_the_project_still_denies(
+        self, tmp_path, hook, verb
+    ):
+        """`-C "<path with a space>"` pointing INSIDE the project must still
+        deny. Built from the fixture's own tmp project dir at runtime — never
+        a hardcoded literal path — because `_targets_this_project` compares
+        the resolved `-C` target against `CLAUDE_PROJECT_DIR`, which the
+        harness sets to that tmp repo.
+
+        The quoted alternative in `_GLOBAL_OPTS`'s value group exists so a
+        space in the path does not end the option mid-argument and strand the
+        verb match — an unquoted `-C /a b push ...` would read `push` as part
+        of the `-C` value and the verb pattern would stop matching, the same
+        fail-open this whole pattern exists to close.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = f'git -C "{work}/a b" ' + verb
+        assert TestHookBlockingPathsFire._decide(work, env, hook, command) == "deny"
+
+
 class TestScopeGuardCannotBeBypassed:
     """`_targets_this_project()` must not hand an attacker an off switch (#326).
 

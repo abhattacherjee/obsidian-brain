@@ -14,6 +14,31 @@ import re
 import sys
 import subprocess
 
+# `git` and `gh` accept GLOBAL options between the executable and the
+# subcommand: `git -C . push`, `git -c k=v push`, `git --no-pager push`,
+# `gh --repo o/r pr create`. A literal `"git push" in command` never matches
+# those, so the gate exited 0 with an empty stdout — an ALLOW under the
+# PreToolUse contract, with every check below it skipped (#351, #327 item 2).
+#
+# A global option is always `-`-prefixed (this holds for every documented
+# git and gh global option), and may take a SEPARATE value: `-C .`,
+# `-c k=v`, `-R o/r`. The quoted alternatives matter because a path with a
+# space (`-C "/a b"`) otherwise ends the run mid-argument and the verb stops
+# matching — the same fail-open this pattern exists to close.
+#
+# Over-matching here can only ever ADD a gate, never remove one, so the
+# pattern is deliberately permissive.
+_GLOBAL_OPTS = r'''(?:-\S+(?:\s+(?:"[^"]*"|'[^']*'|[^-\s]\S*))?\s+)*'''
+
+_PR_CREATE_VERB = r'\bgh\s+' + _GLOBAL_OPTS + r'pr\s+create\b'
+_PR_MERGE_VERB = r'\bgh\s+' + _GLOBAL_OPTS + r'pr\s+merge\b'
+
+# `gh -R/--repo` is deliberately NOT descoped the way `git -C` is: resolving
+# an `owner/name` slug to a filesystem path needs a config or network lookup
+# a PreToolUse gate must not do. So a `-R`-redirected `gh` command is still
+# gated by this repo's rules — fail-closed, at the cost of a false deny on
+# legitimate cross-repo `gh` work (#351).
+
 _STDIN_CAP = 1_000_000
 
 
@@ -292,10 +317,10 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         return True  # Unresolvable project dir — can't scope, be safe
 
     try:
-        verb_positions = [m.start() for m in re.finditer(verb, cmd)]
+        verb_matches = list(re.finditer(verb, cmd))
     except re.error:
         return True  # Unusable verb pattern — can't scope, be safe
-    if not verb_positions:
+    if not verb_matches:
         # The caller matched this verb but this function cannot find it: the
         # two matchers disagree, so gate rather than guess.
         return True
@@ -313,7 +338,27 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         target = m.group("dq") or m.group("sq") or m.group("bare")
         cd_matches.append((m.start(), m.end(), target, subshells))
 
-    for position in verb_positions:
+    for m in verb_matches:
+        position = m.start()
+        # `git -C <path>` retargets THIS invocation at another checkout — the
+        # same thing `cd <path> &&` does for the rest of the line, and it is
+        # inside the matched text because the verb pattern spans the global
+        # options. Anything ambiguous (several `-C`s, whose effects compound
+        # relative to each other; an unresolvable path) falls through to the
+        # `cd` logic below and ends up gated, which is fail-closed.
+        c_dirs = re.findall(
+            r'''(?:^|\s)-C\s+(?:"([^"]*)"|'([^']*)'|(\S+))''', m.group(0))
+        if len(c_dirs) == 1:
+            target = next(t for t in c_dirs[0] if t)
+            try:
+                target = os.path.realpath(
+                    os.path.expandvars(os.path.expanduser(target)))
+            except (ValueError, OSError):
+                return True
+            if not (target == project_dir
+                    or target.startswith(project_dir + os.sep)):
+                continue  # this occurrence provably acts on another checkout
+
         preceding = [c for c in cd_matches if c[0] < position]
         if not preceding:
             # No cd before this occurrence — it runs in the session cwd, which
@@ -361,9 +406,9 @@ def get_current_branch() -> str:
 # ── gh pr create: enforce --base develop for feature branches ──
 # Use command-boundary regex to avoid false positives on strings containing
 # "gh pr create" (e.g. echo, grep, heredocs).
-if re.search(r'(?:^|[;&|]\s*)gh\s+pr\s+create\b', command):
+if re.search(r'(?:^|[;&|]\s*)gh\s+' + _GLOBAL_OPTS + r'pr\s+create\b', command):
     # Skip if every occurrence targets a repo outside this project
-    if not _targets_this_project(command, r'gh\s+pr\s+create\b'):
+    if not _targets_this_project(command, _PR_CREATE_VERB):
         sys.exit(0)
     branch = get_current_branch()
     if branch.startswith("feature/"):
@@ -389,12 +434,12 @@ if re.search(r'(?:^|[;&|]\s*)gh\s+pr\s+create\b', command):
 
 # ── gh pr merge: verify base branch before merging ──
 # Handles "gh pr merge 30", "gh pr merge --squash 30", and "gh pr merge" (no number).
-if re.search(r'(?:^|[;&|]\s*)gh\s+pr\s+merge\b', command):
+if re.search(r'(?:^|[;&|]\s*)gh\s+' + _GLOBAL_OPTS + r'pr\s+merge\b', command):
     # Skip if every occurrence targets a repo outside this project
-    if not _targets_this_project(command, r'gh\s+pr\s+merge\b'):
+    if not _targets_this_project(command, _PR_MERGE_VERB):
         sys.exit(0)
     # Extract PR number from anywhere in the args (handles flags before number)
-    pr_number_match = re.search(r'gh\s+pr\s+merge\b.*?(\d+)', command)
+    pr_number_match = re.search(_PR_MERGE_VERB + r'.*?(\d+)', command)
     pr_number = pr_number_match.group(1) if pr_number_match else None
 
     if not pr_number:

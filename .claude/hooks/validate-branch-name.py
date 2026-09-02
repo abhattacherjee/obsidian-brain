@@ -120,10 +120,10 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         return True  # Unresolvable project dir — can't scope, be safe
 
     try:
-        verb_positions = [m.start() for m in re.finditer(verb, cmd)]
+        verb_matches = list(re.finditer(verb, cmd))
     except re.error:
         return True  # Unusable verb pattern — can't scope, be safe
-    if not verb_positions:
+    if not verb_matches:
         # The caller matched this verb but this function cannot find it: the
         # two matchers disagree, so gate rather than guess.
         return True
@@ -141,7 +141,27 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         target = m.group("dq") or m.group("sq") or m.group("bare")
         cd_matches.append((m.start(), m.end(), target, subshells))
 
-    for position in verb_positions:
+    for m in verb_matches:
+        position = m.start()
+        # `git -C <path>` retargets THIS invocation at another checkout — the
+        # same thing `cd <path> &&` does for the rest of the line, and it is
+        # inside the matched text because the verb pattern spans the global
+        # options. Anything ambiguous (several `-C`s, whose effects compound
+        # relative to each other; an unresolvable path) falls through to the
+        # `cd` logic below and ends up gated, which is fail-closed.
+        c_dirs = re.findall(
+            r'''(?:^|\s)-C\s+(?:"([^"]*)"|'([^']*)'|(\S+))''', m.group(0))
+        if len(c_dirs) == 1:
+            target = next(t for t in c_dirs[0] if t)
+            try:
+                target = os.path.realpath(
+                    os.path.expandvars(os.path.expanduser(target)))
+            except (ValueError, OSError):
+                return True
+            if not (target == project_dir
+                    or target.startswith(project_dir + os.sep)):
+                continue  # this occurrence provably acts on another checkout
+
         preceding = [c for c in cd_matches if c[0] < position]
         if not preceding:
             # No cd before this occurrence — it runs in the session cwd, which
@@ -333,6 +353,24 @@ def _read_hook_input(what):
     raise SystemExit(2)
 
 
+# `git` and `gh` accept GLOBAL options between the executable and the
+# subcommand: `git -C . push`, `git -c k=v push`, `git --no-pager push`,
+# `gh --repo o/r pr create`. A literal `"git push" in command` never matches
+# those, so the gate exited 0 with an empty stdout — an ALLOW under the
+# PreToolUse contract, with every check below it skipped (#351, #327 item 2).
+#
+# A global option is always `-`-prefixed (this holds for every documented
+# git and gh global option), and may take a SEPARATE value: `-C .`,
+# `-c k=v`, `-R o/r`. The quoted alternatives matter because a path with a
+# space (`-C "/a b"`) otherwise ends the run mid-argument and the verb stops
+# matching — the same fail-open this pattern exists to close.
+#
+# Over-matching here can only ever ADD a gate, never remove one, so the
+# pattern is deliberately permissive.
+_GLOBAL_OPTS = r'''(?:-\S+(?:\s+(?:"[^"]*"|'[^']*'|[^-\s]\S*))?\s+)*'''
+
+_CHECKOUT_VERB = r'\bgit\s+' + _GLOBAL_OPTS + r'checkout\s+-b\b'
+
 input_data = _read_hook_input("Branch-name hook")
 
 tool_name = input_data.get("tool_name", "")
@@ -340,15 +378,15 @@ tool_input = input_data.get("tool_input", {})
 command = tool_input.get("command", "")
 
 # Only validate git checkout -b commands
-if tool_name != "Bash" or "git checkout -b" not in command:
+if tool_name != "Bash" or re.search(_CHECKOUT_VERB, command) is None:
     sys.exit(0)
 
 # Skip if targeting a different repo
-if not _targets_this_project(command, r"git checkout -b"):
+if not _targets_this_project(command, _CHECKOUT_VERB):
     sys.exit(0)
 
 # Extract branch name
-match = re.search(r'git checkout -b\s+([^\s]+)', command)
+match = re.search(_CHECKOUT_VERB + r'\s+([^\s]+)', command)
 if not match:
     sys.exit(0)
 
