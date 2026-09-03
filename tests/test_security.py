@@ -3948,6 +3948,120 @@ class TestAllowlistsCannotShadowTheDenyGates:
             work, env, "prevent-direct-push", command)
         assert got == expected, f"{label}: expected {expected}, got {got}"
 
+    # ---- BH-1: an interior backslash escape ------------------------------
+    # `_push_invocations` falls back to `str.split` whenever the tail holds no
+    # quote character, and `str.split` does not remove backslash escapes. So
+    # `ma\\in` -- which bash hands to git as the protected branch -- reached
+    # every ref-token gate spelt with the backslash still in it and matched
+    # nothing. One backslash turned off `_protected_push_refs`,
+    # `_protected_delete_refs`, `_all_ref_flags` and `_branch_glob_refspecs`
+    # at once, i.e. most of what this PR adds. Measured ALLOW at 74cf1b1 and
+    # at b159a2b, `bash -n` clean, and
+    # `bash -c 'printf "[%s]" origin --delete ma\\in'` really prints
+    # `[origin][--delete][main]`.
+    #
+    # De-escaping happens at the one point the fallback tokens are built, not
+    # in each consumer -- that asymmetry (quoting normalised in one place,
+    # escaping in none) is what allowed this.
+    ESCAPE = chr(92)
+    BACKSLASH_CASES = (
+        ("an escaped protected ref, deleted",
+         f"{PUSH} origin --delete {MAIN[:2]}{ESCAPE}{MAIN[2:]}", "deny"),
+        ("an escaped protected ref, pushed",
+         f"{PUSH} origin {MAIN[:2]}{ESCAPE}{MAIN[2:]}", "deny"),
+        ("an escaped protected ref, qualified",
+         f"{PUSH} origin refs/heads/{MAIN[:2]}{ESCAPE}{MAIN[2:]}", "deny"),
+        ("an escaped protected ref, as a refspec destination",
+         f"{PUSH} origin HEAD:{MAIN[:2]}{ESCAPE}{MAIN[2:]}", "deny"),
+        ("an escaped mirror flag",
+         f"{PUSH} --mirr{ESCAPE}or origin", "deny"),
+        ("an escaped all-branches flag",
+         f"{PUSH} --a{ESCAPE}ll origin", "deny"),
+        ("an escaped delete flag",
+         f"{PUSH} origin --dele{ESCAPE}te {MAIN}", "deny"),
+        # The control that located the bug: add ANY quote character and the
+        # command routes through `shlex.split`, which de-escapes correctly --
+        # so this row denied even before the fix, and its bare twin did not.
+        ("the same command with a quote character in it",
+         f'{PUSH} origin --delete {MAIN[:2]}{ESCAPE}{MAIN[2:]} ""', "deny"),
+        # ---- and the negative controls -----------------------------------
+        # De-escaping must not invent a protected ref where there is none.
+        ("an escaped mainline branch",
+         f"{PUSH} origin {MAIN[:2]}{ESCAPE}{MAIN[2:]}line", "allow"),
+        ("an escaped branch whose leaf looks protected",
+         f"{PUSH} origin feature/{MAIN[:2]}{ESCAPE}{MAIN[2:]}", "allow"),
+        ("an escaped ordinary branch",
+         f"{PUSH} origin featu{ESCAPE}re/x", "allow"),
+        # A refspec INTO a tag is not a branch push, escaped or not.
+        ("an escaped protected ref as the refspec SOURCE",
+         f"{PUSH} origin {MAIN[:2]}{ESCAPE}{MAIN[2:]}:refs/tags/v1", "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        BACKSLASH_CASES,
+        ids=[c[0].replace(" ", "-") for c in BACKSLASH_CASES],
+    )
+    def test_backslash_escapes_do_not_hide_a_ref_or_flag(
+            self, tmp_path, label, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # ---- BH-2: the two matchers contradicting each other -----------------
+    # The entry test matches a push verb; `_push_invocations` finds none; every
+    # gate is then a loop over an empty list and the command sails through.
+    # Reachable from valid bash: an apostrophe in a trailing `#` comment never
+    # closes, so `_quoted_spans` returns None and the split falls back to
+    # every separator -- including a `|` inside a quoted `-c` value, which
+    # tears the verb in half. Measured ALLOW at 74cf1b1 and at b159a2b.
+    #
+    # The gate now denies on the contradiction itself, the same way
+    # `_targets_this_project` gates when its verb search disagrees with its
+    # caller's.
+    PAGER = 'core.pager="less|cat"'
+    CONTRADICTION_CASES = (
+        ("a protected deletion hidden by a comment apostrophe",
+         f"git -c {PAGER} pu" + f"sh origin --delete {MAIN} # it's fine",
+         "deny"),
+        # Controls isolating the cause: remove EITHER ingredient and the verb
+        # match survives, so the command is judged normally.
+        ("the same command with no comment",
+         f"git -c {PAGER} pu" + f"sh origin --delete {MAIN}", "deny"),
+        ("the same comment with no quoted separator",
+         f"{PUSH} origin --delete {MAIN} # it's fine", "deny"),
+        ("a benign push with a comment apostrophe",
+         f"{PUSH} origin feature/x # it's fine", "allow"),
+        ("a benign push with a comment and an UNquoted separator",
+         f"{PUSH} origin feature/x && echo done # it's fine", "allow"),
+        ("a benign push with a quoted separator and no comment",
+         f"git -c {PAGER} pu" + "sh origin feature/x", "allow"),
+        ("a benign push with a comment and a quoted value holding no separator",
+         'git -c core.pager="lesscat" pu' + "sh origin feature/x # it's fine",
+         "allow"),
+        # THE COST, pinned deliberately rather than hidden. This is a
+        # legitimate feature-branch push and it is now REFUSED, because it
+        # carries both ingredients at once. It is fail-CLOSED and the
+        # workaround is to drop the comment or the apostrophe; the
+        # alternative was a fail-open that deletes a protected branch. Both
+        # ingredients are required -- every row above removes one and allows.
+        ("a legitimate push carrying BOTH ingredients is refused",
+         f"git -c {PAGER} pu" + "sh origin feature/x # it's fine", "deny"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        CONTRADICTION_CASES,
+        ids=[c[0].replace(" ", "-") for c in CONTRADICTION_CASES],
+    )
+    def test_matcher_contradiction_denies(self, tmp_path, label, command,
+                                          expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
     def test_the_gate_order_is_what_carries_these(self):
         """The negative control on ORDER, which no verdict row can express.
 
