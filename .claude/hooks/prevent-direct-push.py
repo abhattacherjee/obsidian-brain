@@ -708,22 +708,47 @@ def _quoted_spans(cmd: str):
     Looking at the WHOLE command rather than a prefix is what separates
     them -- `-c a.b="c;d"` has a quote that closes.
 
-    A span that CONTAINS A NEWLINE is dropped, and the reason is that the
-    "a lone quote never closes, so we return None" half of the paragraph
-    above was wrong whenever the command holds TWO of them. A `'` in a `#`
-    comment or a heredoc body is not a quote to the shell at all, but this
-    scanner cannot see comments or heredocs; it pairs that `'` with the
-    next one it finds, on a LATER LINE, and vouches for everything in
-    between -- including real separators. `echo hi # don't`⏎`git push origin
-    --delete main&&echo x # it's` then merged into one segment, the ref
-    token came out as `main&&echo`, and `_bare_ref`'s trailing-separator
-    strip cannot reach a separator with text after it: a delete of a
-    protected branch that `develop` denies was ALLOWED (#351).
+    A span that CONTAINS A NEWLINE is dropped, for a bypass found earlier:
+    a `'` in a `#` comment or a heredoc body is not a quote to the shell at
+    all, but this scanner cannot see comments or heredocs, so it pairs that
+    `'` with the next one it finds on a LATER LINE and vouches for
+    everything in between -- real separators included. `echo hi # don't`⏎
+    `git push origin --delete main&&echo x # it's` merged into one segment,
+    the ref token came out as `main&&echo`, and a delete of a protected
+    branch was ALLOWED (#351). A genuine quoted shell word does not span
+    lines, so dropping such a span costs nothing real.
 
-    Dropping the span costs nothing real, because a genuine quoted shell
-    word does not span lines, and the whole bypass class needs a newline:
-    `#` runs to end of line, and a heredoc cannot exist without one. What
-    is left is the fail-closed direction -- an unvouched separator splits.
+    READ THE RETURNS CAREFULLY; the three of them do not mean what they
+    look like, and each has been wrong once:
+
+    1. `None` is NOT an empty list. It is returned the moment ANY quote
+       fails to close, from inside the loop -- so the newline filter on the
+       final `return` is never reached on that path, and the protection
+       described above DOES NOT APPLY to it. One unclosed quote discards
+       every span already collected, including good ones.
+    2. To the caller, `None` and `[]` are the same instruction: nothing can
+       suppress a split, so split at EVERY separator.
+    3. Splitting at every separator is the fail-closed direction for FINDING
+       A SEPARATOR -- an extra segment with no verb is skipped -- and it is
+       the fail-OPEN direction for FINDING AN INVOCATION, because it can cut
+       the verb match itself in half. `git -c core.pager="less|cat" push
+       origin --delete main # it's fine` is valid bash: the apostrophe never
+       closes, so this returns `None`, the `|` inside the quoted value then
+       splits the command, neither half holds a complete verb, and
+       `_push_invocations` yields nothing for a real push. Every gate below
+       is a loop over that empty list, so ALL of them silently pass (#351
+       BH-2).
+
+    WHAT CARRIES THE GUARANTEE IS NOT THIS FUNCTION. This scanner has now
+    been wrong three times -- direction of doubt, cross-line pairing, and
+    the bail-out above -- and each of the first two fixes made it cleverer,
+    which is what left the third reachable. The contradiction check in the
+    gate sequence (the entry test matched a push verb, `_push_invocations`
+    yielded nothing, therefore DENY) is the first fix that makes the
+    DECISION safe whatever this function concludes. A fourth refinement here
+    is almost certainly the wrong instinct: if a new bypass turns up, check
+    whether the contradiction check should have caught it before touching
+    the scanner.
     """
     spans, i, n = [], 0, len(cmd)
     while i < n:
