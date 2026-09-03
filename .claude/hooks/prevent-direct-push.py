@@ -880,6 +880,24 @@ def _is_delete(tokens) -> bool:
     containing a `d` counts — no other single-dash `git push` flag carries
     one, and over-reading here only ever adds a deny.
 
+    The long form is matched by PREFIX for the same reason `_all_ref_flags`
+    is: git's parse-options accepts any UNAMBIGUOUS abbreviation, so `--del`,
+    `--dele` and `--delet` all reach the ref stage and delete. Testing
+    `t == "--delete"` missed every one of them, and the consequence was the
+    worst this file has: on a `release/*` branch — the branch the release
+    flow actually runs from — this function returning False means the
+    deletion gate never fires, and the Git Flow allowance below exits 0
+    before the ref-token arm gets a look. Measured ALLOW at 74cf1b1 and at
+    b48f1b1 for `push --del origin main`, denied from every other branch,
+    which is why probing a feature branch showed nothing.
+
+    `--dry-run` is the near miss that keeps the test the right way round:
+    the question is whether the TYPED name is a prefix of `delete`, not
+    whether `delete` is a prefix of it, so `"delete".startswith("dry-run")`
+    is False and a dry run is not a deletion. `--d` IS matched even though
+    git rejects it as ambiguous with `--dry-run` — over-matching only ever
+    adds a deny on a command git refuses anyway.
+
     Quote characters come off first, for the reason `_bare_ref` takes them
     off a REF token: when `shlex.split` raises on an unbalanced quote,
     `_push_invocations` falls back to a whitespace split, which does NOT
@@ -890,11 +908,15 @@ def _is_delete(tokens) -> bool:
     delete at all and a deletion of main was permitted. This is
     the FLAG side of the bypass `_bare_ref` already closes on the ref side.
     """
-    return any(
-        t == "--delete"
-        or (len(t) > 1 and t[0] == "-" and t[1] != "-" and "d" in t)
-        for t in (t.strip("\"'") for t in tokens)
-    )
+    for raw in tokens:
+        t = raw.strip("\"'")
+        if t.startswith("--"):
+            name = t[2:].split("=", 1)[0]
+            if name and "delete".startswith(name):
+                return True
+        elif len(t) > 1 and t[0] == "-" and t[1] != "-" and "d" in t:
+            return True
+    return False
 
 
 # Flags that write or delete protected refs WITHOUT NAMING ONE. Every

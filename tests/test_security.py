@@ -3786,6 +3786,44 @@ class TestAllowlistsCannotShadowTheDenyGates:
         # makes the rows above meaningful rather than incidental.
         ("a release branch may push main during a finish",
          f"{PUSH} origin {MAIN}", "allow"),
+        # ---- git accepts unambiguous long-option ABBREVIATIONS ------------
+        # `_all_ref_flags` was taught this for --mirror/--prune; `_is_delete`
+        # was not, and it is the same fact one function up. With the
+        # abbreviation `_is_delete` is False, so the deletion gate never
+        # fires -- and on a release branch the Git Flow allowance exits 0
+        # BEFORE the ref-token arm gets a look, so nothing catches it. On a
+        # feature branch the ref-token arm still does, which is why every
+        # probe anyone ran came back clean.
+        #
+        # `release/*` is the branch the release flow actually runs from, and
+        # the consequence is an unrecoverable deletion of a protected branch.
+        # Measured ALLOW here at 74cf1b1 and at b48f1b1; deny everywhere else.
+        # `--del`, `--dele` and `--delet` all reach git's ref stage.
+        ("abbreviated delete, flag first",
+         f"{PUSH} --del origin {MAIN}", "deny"),
+        ("abbreviated delete, longer prefix",
+         f"{PUSH} --dele origin {MAIN}", "deny"),
+        ("abbreviated delete, longest prefix",
+         f"{PUSH} --delet origin {MAIN}", "deny"),
+        ("abbreviated delete after the remote",
+         f"{PUSH} origin --del {MAIN}", "deny"),
+        ("abbreviated delete of develop",
+         f"{PUSH} origin --dele develop", "deny"),
+        # git rejects `--d` as ambiguous with `--dry-run`, so denying it costs
+        # nothing -- and over-matching here only ever adds a deny.
+        ("the ambiguous one-letter prefix",
+         f"{PUSH} --d origin {MAIN}", "deny"),
+        # ---- and the negative controls for the same change ---------------
+        # `--dry-run` also begins with `d` and must NOT read as a delete;
+        # "delete".startswith("dry-run") is False, which is what keeps it out.
+        ("a dry run is not a deletion",
+         f"{PUSH} --dry-run origin release/x", "allow"),
+        # The case the allowlist exists for, in abbreviated form: the release
+        # cleanup must still stand down once `_is_delete` recognises it.
+        ("abbreviated release cleanup still stands down",
+         f"{PUSH} --del origin release/x", "allow"),
+        ("abbreviated hotfix cleanup still stands down",
+         f"{PUSH} --delet origin hotfix/y", "allow"),
     )
 
     @pytest.mark.parametrize(
