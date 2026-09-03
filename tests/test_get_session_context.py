@@ -1811,12 +1811,15 @@ def test_isolate_harness_session_id_globally_clears_the_real_value():
     assert "CLAUDE_CODE_SESSION_ID" not in os.environ
 
 
-def test_resolve_session_id_allow_env_is_inert_this_task(
+def test_resolve_session_id_allow_env_false_ignores_env_allow_env_true_uses_it(
     isolated_home, monkeypatch, tmp_path
 ):
-    """allow_env=False and allow_env=True must resolve identically — the
-    parameter is threaded but not yet consulted anywhere (#330 task 1; the
-    env layer itself is task 2)."""
+    """#330 task 1 landed this as an inertness test ("allow_env has no effect
+    yet"). Task 2 wires the actual read, which makes that premise false by
+    design — updated here to assert the now-live split instead: allow_env=False
+    must still ignore a well-formed env var and resolve via the scan (used by
+    _slow_path_newest_sid / check_hook_status, which must not validate the env
+    var against itself), while allow_env=True must now return it."""
     sid = _unique_sid()
     project = "allow-env-inert-proj"
 
@@ -1835,11 +1838,10 @@ def test_resolve_session_id_allow_env_is_inert_this_task(
     )
 
     # The env var must hold a DIFFERENT, well-formed sid than the one the
-    # scan layers resolve. Setting it to `sid` would make this test vacuous:
-    # a wired env layer would return `sid` too and the assertion would still
-    # pass, so the test could not tell an inert layer from a live one.
-    # Verified by mutation — wiring the env read into _resolve_session_id
-    # leaves this test green when both values agree, and red as written.
+    # scan layers resolve — otherwise neither assertion below could tell a
+    # live layer from a dead one. Verified by mutation (see #330 task 2
+    # verification): deleting the layer-0 block turns result_true == sid
+    # (RED against the assertion below), proving this isn't vacuous.
     env_sid = _unique_sid()
     assert env_sid != sid
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
@@ -1847,7 +1849,8 @@ def test_resolve_session_id_allow_env_is_inert_this_task(
     result_false = obsidian_utils._resolve_session_id(allow_env=False)
     result_true = obsidian_utils._resolve_session_id(allow_env=True)
 
-    assert result_false == result_true == sid
+    assert result_false == sid
+    assert result_true == env_sid
 
 
 def test_slow_path_newest_sid_passes_allow_env_false(isolated_home, monkeypatch):
@@ -1867,3 +1870,254 @@ def test_slow_path_newest_sid_passes_allow_env_false(isolated_home, monkeypatch)
 
     assert captured["kwargs"].get("allow_bootstrap") is False
     assert captured["kwargs"].get("allow_env") is False
+
+
+# ─── #330 task 2: env-var layer 0 is live ──────────────────────────────
+#
+# Every test below sets CLAUDE_CODE_SESSION_ID to a value that DIFFERS from
+# whatever the scan layers would resolve (never the same value) — see the
+# plan's "CRITICAL — tests must be non-vacuous" note. The task-1 inertness
+# test (now renamed above) was vacuous for exactly the opposite reason: an
+# env value equal to the scan's answer cannot distinguish "the layer ran" from
+# "the layer is dead and the scan happened to agree".
+
+def test_resolve_session_id_env_layer_wins_over_a_real_resolvable_transcript(
+    isolated_home, monkeypatch, tmp_path
+):
+    """Layer 0: a well-formed env var wins over the mtime-scan layers, even
+    when a real, resolvable transcript exists on disk for a DIFFERENT sid."""
+    project = "env-layer-wins-proj"
+    scan_sid = _unique_sid()
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    env_sid = _unique_sid()
+    assert env_sid != scan_sid
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+
+    assert obsidian_utils._resolve_session_id() == env_sid
+
+
+def test_resolve_session_id_env_layer_short_circuits_before_any_scan(
+    isolated_home, monkeypatch
+):
+    """No mtime scan runs when the env layer resolves: both scan entry
+    points are monkeypatched to raise, and resolution must still succeed by
+    returning the env value untouched."""
+    def _boom(*a, **kw):
+        raise AssertionError("scan layer ran despite a valid env var")
+
+    monkeypatch.setattr(obsidian_utils, "_try_bootstrap_fast_path", _boom)
+    monkeypatch.setattr(obsidian_utils, "_try_slow_jsonl_glob", _boom)
+
+    env_sid = _unique_sid()
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+
+    assert obsidian_utils._resolve_session_id() == env_sid
+
+
+@pytest.mark.parametrize(
+    "bad_env_sid", ["../../etc/passwd", "has space", "", "   "]
+)
+def test_resolve_session_id_malformed_env_falls_through_to_scan(
+    isolated_home, monkeypatch, tmp_path, bad_env_sid
+):
+    """A malformed CLAUDE_CODE_SESSION_ID is never trusted — resolution falls
+    through to the existing scan layers and returns their answer, never
+    raising."""
+    project = "malformed-env-proj"
+    scan_sid = _unique_sid()
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", bad_env_sid)
+
+    assert obsidian_utils._resolve_session_id() == scan_sid
+
+
+def test_resolve_session_id_env_absent_matches_pre_existing_scan_behavior(
+    isolated_home, monkeypatch, tmp_path
+):
+    """No env var at all → identical to pre-#330 behavior: resolve via the
+    scan layers. The autouse fixture already deletes the var for every test;
+    this makes the contract explicit rather than relying on that side effect
+    alone."""
+    project = "env-absent-proj"
+    scan_sid = _unique_sid()
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    assert "CLAUDE_CODE_SESSION_ID" not in os.environ
+    assert obsidian_utils._resolve_session_id() == scan_sid
+
+
+def test_get_session_context_stable_under_env_unstable_without_it(
+    isolated_home, monkeypatch, tmp_path
+):
+    """Core #330 regression, reproduced directly: two consecutive
+    get_session_context() calls must resolve to the SAME session while a
+    competing transcript becomes the newest-mtime winner in between — this
+    is the exact shape of the crossed retro note (source_session and
+    source_session_note disagreeing because two calls in one note write
+    resolved via two different newest-mtime winners).
+
+    The negative control (same scenario, no env var) must resolve
+    DIFFERENTLY on the second call — proving the stability comes from the
+    env layer actually being consulted, not from get_session_context()'s own
+    cache or from the test being trivially true either way."""
+    import time
+
+    # --- with the env var: stable across both calls -----------------
+    project = "stability-env-proj"
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{_unique_sid()}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    env_sid = _unique_sid()
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+
+    ctx1 = obsidian_utils.get_session_context()
+
+    # Touch a competing transcript so it becomes the newest-mtime winner.
+    later_sid = _unique_sid()
+    later_path = cc_dir / f"{later_sid}.jsonl"
+    later_path.write_text("{}\n")
+    later_ts = time.time() + 3600
+    os.utime(later_path, (later_ts, later_ts))
+
+    ctx2 = obsidian_utils.get_session_context()
+
+    assert ctx1["session_id"] == env_sid
+    assert ctx2["session_id"] == env_sid
+    assert ctx1["session_note_name"] == ctx2["session_note_name"]
+
+    # --- negative control: no env var → the winner changes -----------
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+
+    project2 = "stability-noenv-proj"
+    cc_dir2 = isolated_home / ".claude" / "projects" / f"-Users-test-{project2}"
+    cc_dir2.mkdir(parents=True, exist_ok=True)
+    first_sid = _unique_sid()
+    (cc_dir2 / f"{first_sid}.jsonl").write_text("{}\n")
+
+    target2 = tmp_path / project2
+    target2.mkdir()
+    monkeypatch.chdir(target2)
+
+    ctx3 = obsidian_utils.get_session_context()
+    assert ctx3["session_id"] == first_sid
+
+    second_sid = _unique_sid()
+    second_path = cc_dir2 / f"{second_sid}.jsonl"
+    second_path.write_text("{}\n")
+    later_ts2 = time.time() + 3600
+    os.utime(second_path, (later_ts2, later_ts2))
+
+    ctx4 = obsidian_utils.get_session_context()
+    assert ctx4["session_id"] == second_sid
+    assert ctx3["session_id"] != ctx4["session_id"], (
+        "negative control did not reproduce instability — the test setup "
+        "cannot distinguish env-layer stability from an unrelated cache hit"
+    )
+
+
+def test_check_hook_status_ignores_env_var_uses_jsonl_scan(
+    isolated_home, monkeypatch, tmp_path
+):
+    """check_hook_status() must stay allow_env=False end-to-end: a valid,
+    well-formed env var pointing at a sid with NO transcript must not leak
+    into the health check via _slow_path_newest_sid — it must keep reporting
+    based on the JSONL scan, exactly as if the env var were unset."""
+    project = "check-hook-status-proj"
+    bootstrap_sid = _unique_sid()
+    _seed_bootstrap(isolated_home, project, bootstrap_sid)
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    bdir = isolated_home / ".claude" / "obsidian-brain"
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-")
+
+    # No JSONL transcripts exist anywhere for this project — the scan must
+    # return 'unknown'. env_sid deliberately differs from bootstrap_sid so an
+    # env-var leak would flip the reported "ok" state and message, rather
+    # than accidentally reproducing the correct answer.
+    env_sid = _unique_sid()
+    assert env_sid != bootstrap_sid
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+
+    result = obsidian_utils.check_hook_status()
+
+    assert result["current_sid"] == "unknown"
+    assert result["ok"] is False
+    assert "No session files found" in result["message"]
+
+
+def test_resolve_session_id_env_no_transcript_warns_once_but_still_returns_it(
+    isolated_home, monkeypatch, tmp_path, capsys
+):
+    """Well-formed env var with no matching transcript on disk yet is still
+    trusted (format-only gate — a brand-new session has no transcript yet),
+    but a one-time WARN is emitted so a genuinely stale/misdirected env var
+    is visible without being fatal. Called twice to prove the WARN fires
+    once, not once per call."""
+    project = "env-no-transcript-proj"
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    env_sid = _unique_sid()
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+
+    # No ~/.claude/projects/*<project>/ directory exists at all yet.
+    result1 = obsidian_utils._resolve_session_id()
+    result2 = obsidian_utils._resolve_session_id()
+
+    assert result1 == env_sid
+    assert result2 == env_sid
+
+    err = capsys.readouterr().err
+    assert err.count("no Claude Code transcript") == 1, err
+    assert env_sid in err
+
+
+def test_resolve_session_id_env_with_transcript_present_no_warn(
+    isolated_home, monkeypatch, tmp_path, capsys
+):
+    """No WARN when the env sid's own transcript already exists — only the
+    'no transcript yet' case is diagnostic-worthy."""
+    project = "env-with-transcript-proj"
+    env_sid = _unique_sid()
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{env_sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+
+    assert obsidian_utils._resolve_session_id() == env_sid
+    err = capsys.readouterr().err
+    assert "no Claude Code transcript" not in err

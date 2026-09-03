@@ -39,6 +39,13 @@ def _reset_session_resolution_state():
         "_sole_match_not_cwd_warned",
         "_unknown_sid_warned",
         "_transcript_dir_arbitration",
+        # #330 task 2: the env-layer's one-shot WARN registry and its
+        # transcript-existence memo. Same statefulness hazard as the others
+        # above — a test asserting the WARN fires would pass or fail
+        # depending on whether an earlier test already consumed the
+        # (project, sid) key.
+        "_env_sid_no_transcript_warned",
+        "_env_sid_transcript_checked",
         # Process-lifetime snapshot index (#70). Keyed by resolved sessions
         # folder, so cross-test collisions are unlikely — but pytest can hand
         # the same tmp_path prefix to a re-run and the memo would then answer
@@ -284,7 +291,8 @@ def _isolate_harness_session_id_globally(monkeypatch):
     fixture it set up (#330).
 
     Subprocess tests that do os.environ.copy() simply inherit the absence,
-    same as _isolate_vault_index_db_globally above; harmless today since
-    nothing in this repo reads the var yet (#330 task 2 adds the first
-    reader)."""
+    same as _isolate_vault_index_db_globally above; the resolver's layer 0
+    now reads this var (#330 task 2), so without this fixture the developer's
+    real session id would leak into resolution tests via the ambient
+    environment rather than the fixture each test explicitly sets up."""
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)

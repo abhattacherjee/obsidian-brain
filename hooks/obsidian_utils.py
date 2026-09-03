@@ -1297,6 +1297,18 @@ def canonical_project_name(cwd: str | None = None) -> str:
 _ambiguous_project_dirs_warned: set[tuple[str, ...]] = set()
 _sole_match_not_cwd_warned: set[tuple[str, ...]] = set()
 _unknown_sid_warned: set[str] = set()
+_env_sid_no_transcript_warned: set[tuple[str, str]] = set()
+
+# Memo for the env-layer transcript check below, keyed by (project, env_sid).
+#
+# WHY: CLAUDE_CODE_SESSION_ID and the resolved project basename are both
+# constant for the life of a process, so the answer to "does this sid have a
+# transcript yet" cannot change mid-run. Without this cache, the same targeted
+# glob would re-run on every _get_session_id_fast() call — once per NOTE via
+# read_note_metadata() (see the WHY above _transcript_dir_arbitration) — for
+# the entire life of the env layer's fast-return path, which exists precisely
+# to AVOID that per-note glob cost (#330).
+_env_sid_transcript_checked: dict[tuple[str, str], bool] = {}
 
 
 def _warn_once(registry: set, key, message: str) -> None:
@@ -1696,11 +1708,10 @@ def _slow_path_newest_sid() -> str:
     recent-bootstrap directory scan). Used by health checks (e.g.,
     check_hook_status) that must not be fooled by stale bootstraps.
 
-    Also env-blind (allow_env=False): once the env layer exists (#330 task
-    2), trusting CLAUDE_CODE_SESSION_ID here would let check_hook_status
-    validate the env var against itself instead of against the JSONLs on
-    disk — a health check that can no longer detect the env var pointing at
-    a session with no transcript.
+    Also env-blind (allow_env=False): trusting CLAUDE_CODE_SESSION_ID here
+    would let check_hook_status validate the env var against itself instead
+    of against the JSONLs on disk — a health check that can no longer detect
+    the env var pointing at a session with no transcript (#330 task 2).
 
     Returns 'unknown' if no JSONLs are found for the current cwd.
     """
@@ -1788,12 +1799,34 @@ def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) ->
     """Single source of truth for current-session SID resolution. Never raises.
 
     Resolution layers (each failure → next):
-      0. CLAUDE_CODE_SESSION_ID env var — RESERVED, gated by `allow_env`.
-         Not yet consulted anywhere in this function (#330 task 1); `allow_env`
-         is accepted and threaded but has no effect until task 2 wires the
-         actual read. Once wired, this layer trusts the harness-provided id
-         ahead of the mtime-scan layers below, which cannot distinguish two
-         sessions racing in the same project directory (#330).
+      0. CLAUDE_CODE_SESSION_ID env var (#330 task 2), gated by `allow_env`
+         and validated by format only (_SID_FILENAME_SAFE) — NOT by whether a
+         transcript exists for it yet. This layer wins over every layer below
+         it, and it wins ON PURPOSE:
+
+         Layers 1-4 all resolve by newest-mtime over a project directory, and
+         two live sessions in one repo both append to their own transcript
+         constantly. Newest-mtime cannot tell them apart — whichever session
+         happened to write last wins, and the OTHER session gets its id. A
+         real vault note was caught with exactly this: `source_session` and
+         `source_session_note` disagreed because two calls inside one note
+         write (skills/retro/SKILL.md, ~40 lines apart) each resolved via a
+         DIFFERENT newest-mtime winner. The harness-provided env var has
+         neither problem — it is the id Claude Code itself assigned to THIS
+         process, so it is authoritative regardless of which transcript was
+         touched most recently, and it is CONSTANT for the life of the
+         session, so repeated calls resolve identically (the stability the
+         mtime layers cannot offer).
+
+         Gating on format rather than on transcript existence is deliberate:
+         a brand-new session has no transcript on disk yet (SessionStart may
+         fire before the first JSONL line is flushed), and the harness's own
+         id is correct regardless — refusing it in that window and falling
+         through to the mtime scan would be exactly the bug this layer exists
+         to close. When the value is well-formed but no transcript is found
+         for it under the resolved project, a one-time WARN is emitted (see
+         _env_sid_no_transcript_warned) and the env value is still returned;
+         this is informational, not a validation gate.
       1. Project basename via _resolve_project_basename (cwd → env → None)
       2. Bootstrap fast path (skipped if allow_bootstrap=False)
       3. Slow-path JSONL glob
@@ -1833,6 +1866,36 @@ def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) ->
     narrowed #105 to "worktree deleted AND the env var happens to be unset",
     silently returning 'unknown' where it used to recover the sid.
     """
+    if allow_env:
+        env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+        if env_sid and _SID_FILENAME_SAFE.fullmatch(env_sid):
+            env_project, _env_source = _resolve_project_basename_with_source()
+            if env_project is not None:
+                check_key = (env_project, env_sid)
+                has_transcript = _env_sid_transcript_checked.get(check_key)
+                if has_transcript is None:
+                    safe_env_project = glob.escape(env_project)
+                    has_transcript = bool(
+                        _glob_project_jsonls(safe_env_project, suffix=f"{env_sid}.jsonl")
+                    )
+                    _env_sid_transcript_checked[check_key] = has_transcript
+                if not has_transcript:
+                    _warn_once(
+                        _env_sid_no_transcript_warned,
+                        check_key,
+                        f"[obsidian-brain] WARN: CLAUDE_CODE_SESSION_ID="
+                        f"{env_sid!r} is well-formed but no Claude Code "
+                        f"transcript for project {env_project!r} has that "
+                        f"name yet; trusting it anyway — the harness assigns "
+                        f"this id before the transcript file exists, so a "
+                        f"brand-new session legitimately has no match here. "
+                        f"If this keeps firing for the SAME sid across "
+                        f"calls, the transcript may never appear (verify "
+                        f"the env var is not stale or pointing at a "
+                        f"different project than the current cwd)",
+                    )
+            return env_sid
+
     project, source = _resolve_project_basename_with_source()
     if project is not None:
         if allow_bootstrap:
@@ -1861,7 +1924,7 @@ def _get_session_id_fast(allow_env: bool = True) -> str:
     See _try_bootstrap_fast_path for the validation strategy and
     _resolve_session_id for the full layered fallback chain (issue #105).
     `allow_env` is threaded straight through to _resolve_session_id; see its
-    docstring for what the (currently inert) env layer will do (#330).
+    docstring for the CLAUDE_CODE_SESSION_ID layer-0 fast path (#330).
     """
     return _resolve_session_id(allow_bootstrap=True, allow_env=allow_env)
 
