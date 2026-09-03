@@ -46,12 +46,6 @@ def _reset_session_resolution_state():
         # (project, sid) key.
         "_env_sid_no_transcript_warned",
         "_env_sid_transcript_checked",
-        # #330 task 3: the ambiguous-concurrent-sessions one-shot WARN
-        # registry. Same statefulness hazard — missing from this fixture
-        # meant a test asserting the WARN fires could pass or fail depending
-        # on whether an earlier test already consumed the sids-tuple key
-        # (#330 review item 7).
-        "_concurrent_sids_warned",
         # #330 review item 8: malformed CLAUDE_CODE_SESSION_ID one-shot WARN.
         "_env_sid_malformed_warned",
         # #330 review item 2: resolve_source_session_note's contradiction

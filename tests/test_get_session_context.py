@@ -1231,45 +1231,6 @@ def test_resolve_session_id_cwd_gone_with_env_dir_resolves_via_jsonl(
     assert obsidian_utils._resolve_session_id() == real_sid
 
 
-def test_resolve_session_id_cwd_gone_ambiguous_scan_refuses_not_cross_project_guess(
-    isolated_home, monkeypatch
-):
-    """#330 review item 5: when cwd is gone (source == "env" via
-    CLAUDE_PROJECT_DIR) AND the JSONL scan under that directory is ITSELF
-    ambiguous (2+ concurrent transcripts within the window), layer 4's
-    cross-project bootstrap scan must NOT be consulted to rescue it.
-
-    Before this fix: _try_slow_jsonl_glob's WARN said "'unknown' is returned
-    instead", but control fell through to _recent_bootstrap_sid() anyway
-    (source == "env" unconditionally fell through) and returned a sid from a
-    COMPLETELY DIFFERENT project's bootstrap file — a confident wrong answer
-    dressed up as a refusal. This pins that the ambiguity refusal wins.
-    """
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    decoy_sid = _unique_sid()
-    _seed_bootstrap(isolated_home, "unrelated-project", decoy_sid)
-
-    worktree = "/Users/x/dev/repo--feature-branch"
-    cc_dir = _encoded_project_dir(isolated_home, worktree)
-    cc_dir.mkdir(parents=True)
-    now = 1_800_000_000.0
-    _write_transcript(cc_dir, _unique_sid(), now)
-    _write_transcript(cc_dir, _unique_sid(), now + 1.0)  # 1s apart: concurrent
-
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
-
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", worktree)
-
-    result = obsidian_utils._resolve_session_id()
-    assert result == "unknown", (
-        f"expected 'unknown' from the ambiguity refusal, got {result!r} "
-        f"(decoy_sid={decoy_sid!r})"
-    )
-    assert result != decoy_sid
-
-
 def test_get_session_context_rejects_cached_context_from_a_different_cwd(
     isolated_home, tmp_path, monkeypatch, capsys
 ):
@@ -2263,14 +2224,18 @@ def test_resolve_session_id_env_transcript_check_memoized(
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
     calls = []
-    real_glob = obsidian_utils._glob_project_jsonls
+    # Layer 0's existence probe calls _glob_project_jsonls_union directly
+    # (#354 review item 4 — it deliberately bypasses the restricted
+    # _glob_project_jsonls / shared cwd-arbitration memo), so that is the
+    # function to patch here.
+    real_glob = obsidian_utils._glob_project_jsonls_union
 
     def counting_glob(safe_project, suffix="*.jsonl"):
         if suffix == f"{env_sid}.jsonl":
             calls.append(safe_project)
         return real_glob(safe_project, suffix=suffix)
 
-    monkeypatch.setattr(obsidian_utils, "_glob_project_jsonls", counting_glob)
+    monkeypatch.setattr(obsidian_utils, "_glob_project_jsonls_union", counting_glob)
 
     result1 = obsidian_utils._resolve_session_id()
     result2 = obsidian_utils._resolve_session_id()
@@ -2283,269 +2248,60 @@ def test_resolve_session_id_env_transcript_check_memoized(
     )
 
 
-# ─── #330 task 3: ambiguity yields 'unknown', never a guess ────────────
-#
-# The autouse fixture in conftest.py clears CLAUDE_CODE_SESSION_ID for every
-# test, so these exercise the scan path (layers 1-3) by default. Where env
-# interaction matters (last test below), it is set explicitly.
-
-def _write_transcript(cc_dir: Path, sid: str, ts: float) -> Path:
-    """Create <sid>.jsonl under cc_dir with mtime pinned to exactly `ts`."""
-    path = cc_dir / f"{sid}.jsonl"
-    path.write_text("{}\n", encoding="utf-8")
-    os.utime(path, (ts, ts))
-    return path
-
-
-def _project_cwd(tmp_path: Path, monkeypatch, isolated_home: Path, name: str) -> Path:
-    """chdir into tmp_path/name and return ITS OWN encoded
-    ~/.claude/projects/ directory (via _encoded_project_dir, same helper used
-    by the #260 tests above). Using the cwd's own encoding means
-    _restrict_matches_to_cwd_project takes the no-I/O 'unchanged' branch —
-    no transcript-cwd read, no unrelated 'sole match unverifiable' WARN — so
-    stderr assertions below only ever see the #330 task-3 WARN they're
-    testing for."""
-    here = tmp_path / name
-    here.mkdir(parents=True, exist_ok=True)
-    monkeypatch.chdir(here)
-    cc_dir = _encoded_project_dir(isolated_home, os.getcwd())
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    return cc_dir
-
-
-_WINDOW = 120.0  # mirrors obsidian_utils._CONCURRENT_SESSION_WINDOW_SECONDS
-
-
-def test_slow_jsonl_glob_two_transcripts_one_second_apart_returns_unknown(
-    isolated_home, tmp_path, monkeypatch, capsys
-):
-    """Two live sessions writing a second apart is exactly the concurrent
-    shape #330 exists to catch — newest-mtime cannot tell them apart, so the
-    scan must refuse rather than guess."""
-    cc_dir = _project_cwd(tmp_path, monkeypatch, isolated_home, "concurrent1s")
-    now = 1_800_000_000.0
-    _write_transcript(cc_dir, _unique_sid(), now)
-    _write_transcript(cc_dir, _unique_sid(), now + 1.0)
-
-    assert obsidian_utils._try_slow_jsonl_glob("concurrent1s") == "unknown"
-    err = capsys.readouterr().err
-    assert "WARN" in err and "concurrently active" in err, err
-    assert "cannot tell which is the current one" in err
-    assert "refusing to guess" in err
-    assert "'unknown' is returned instead" in err
-
-
-def test_slow_jsonl_glob_two_transcripts_ten_minutes_apart_returns_newest(
+def test_layer0_narrow_probe_does_not_poison_the_shared_cwd_memo(
     isolated_home, tmp_path, monkeypatch
 ):
-    """Proves the window doesn't over-fire: two transcripts well outside the
-    120s window resolve to the newest sid, exactly like before task 3."""
-    cc_dir = _project_cwd(tmp_path, monkeypatch, isolated_home, "tenminapart")
-    now = 1_800_000_000.0
-    sid_new = _unique_sid()
-    _write_transcript(cc_dir, _unique_sid(), now)
-    _write_transcript(cc_dir, sid_new, now + 600.0)  # 10 minutes
-
-    assert obsidian_utils._try_slow_jsonl_glob("tenminapart") == sid_new
-
-
-def test_slow_jsonl_glob_boundary_exactly_120s_is_still_ambiguous(
-    isolated_home, tmp_path, monkeypatch
-):
-    """Pins the INCLUSIVE side of the boundary: a delta of EXACTLY
-    _CONCURRENT_SESSION_WINDOW_SECONDS (120.0s) still counts as 'within' the
-    window and must return 'unknown'. A wide-gap fixture (e.g. 10 minutes,
-    above) cannot distinguish `<=` from `<` — only an exact-120.0s delta can.
-    Paired with the 120.1s test below to pin the operator: mutating `<=` to
-    `<` makes THIS test go RED while the 120.1s test stays green (see #330
-    task 3 verification)."""
-    cc_dir = _project_cwd(tmp_path, monkeypatch, isolated_home, "boundary120")
-    now = 1_800_000_000.0
-    _write_transcript(cc_dir, _unique_sid(), now)
-    _write_transcript(cc_dir, _unique_sid(), now + _WINDOW)  # delta == 120.0s exactly
-
-    assert obsidian_utils._try_slow_jsonl_glob("boundary120") == "unknown"
-
-
-def test_slow_jsonl_glob_boundary_120_point_1s_is_not_ambiguous(
-    isolated_home, tmp_path, monkeypatch
-):
-    """The other side of the same boundary: a delta of 120.1s — just OUTSIDE
-    the window — must resolve to the newest sid, not 'unknown'. Paired with
-    the 120.0s test above: mutating `<=` to `<` leaves THIS test green while
-    the 120.0s test goes red, which is what pins the operator rather than
-    merely the window's rough size."""
-    cc_dir = _project_cwd(tmp_path, monkeypatch, isolated_home, "boundary1201")
-    now = 1_800_000_000.0
-    sid_new = _unique_sid()
-    _write_transcript(cc_dir, _unique_sid(), now)
-    _write_transcript(cc_dir, sid_new, now + _WINDOW + 0.1)  # delta == 120.1s
-
-    assert obsidian_utils._try_slow_jsonl_glob("boundary1201") == sid_new
-
-
-def test_slow_jsonl_glob_single_transcript_unchanged(isolated_home, tmp_path, monkeypatch):
-    """No ambiguity is possible with exactly one viable transcript — the
-    long-standing single-session behavior is unchanged by task 3."""
-    cc_dir = _project_cwd(tmp_path, monkeypatch, isolated_home, "onlyone")
-    sid = _unique_sid()
-    _write_transcript(cc_dir, sid, 1_800_000_000.0)
-
-    assert obsidian_utils._try_slow_jsonl_glob("onlyone") == sid
-
-
-def test_slow_jsonl_glob_three_plus_ambiguous_warn_names_the_count(
-    isolated_home, tmp_path, monkeypatch, capsys
-):
-    """3+ concurrently-touched transcripts are still just 'ambiguous', and
-    the WARN names how many — not merely 'more than one'."""
-    cc_dir = _project_cwd(tmp_path, monkeypatch, isolated_home, "threeway")
-    now = 1_800_000_000.0
-    for i in range(3):
-        _write_transcript(cc_dir, _unique_sid(), now + i)
-
-    assert obsidian_utils._try_slow_jsonl_glob("threeway") == "unknown"
-    err = capsys.readouterr().err
-    assert "3 distinct sessions look concurrently active" in err, err
-
-
-def test_slow_jsonl_glob_warn_fires_once_per_distinct_ambiguous_set(
-    isolated_home, tmp_path, monkeypatch, capsys
-):
-    """The same ambiguous pair warns only once across repeated calls (the
-    established _warn_once discipline), but a genuinely DIFFERENT ambiguous
-    set — a different project, a different pair of sids — warns again."""
-    cc_a = _project_cwd(tmp_path, monkeypatch, isolated_home, "warnoncea")
-    now = 1_800_000_000.0
-    _write_transcript(cc_a, _unique_sid(), now)
-    _write_transcript(cc_a, _unique_sid(), now + 1.0)
-
-    assert obsidian_utils._try_slow_jsonl_glob("warnoncea") == "unknown"
-    assert obsidian_utils._try_slow_jsonl_glob("warnoncea") == "unknown"
-    err = capsys.readouterr().err
-    assert err.count("concurrently active") == 1, err
-
-    cc_b = _project_cwd(tmp_path, monkeypatch, isolated_home, "warnonceb")
-    _write_transcript(cc_b, _unique_sid(), now)
-    _write_transcript(cc_b, _unique_sid(), now + 1.0)
-
-    assert obsidian_utils._try_slow_jsonl_glob("warnonceb") == "unknown"
-    err2 = capsys.readouterr().err
-    assert err2.count("concurrently active") == 1, err2
-
-
-def test_slow_jsonl_glob_same_sid_under_two_encodings_is_not_ambiguous(
-    isolated_home, monkeypatch, capsys
-):
-    """#330 review item 6: _concurrent_viable_sids must dedupe by SID, not by
-    PATH. _glob_project_jsonls deliberately UNIONs every directory-encoding
-    variant for one cwd (see its docstring), so the SAME live session's
-    transcript can legitimately appear at two different paths — e.g. both
-    the '_'-folded and literal encodings of one checkout. Counting PATHS
-    there double-counts a single live session as two and trips the
-    `len(...) >= 2` ambiguity refusal for perfectly ordinary single-session
-    work. Verified on this machine: 8 project directories collide under
-    '_'/'.' folding.
+    """#354 review item 4: layer 0's existence probe globs with a NARROWED
+    suffix (env_sid.jsonl only). Before the fix it routed that narrow match
+    through _restrict_matches_to_cwd_project -> _dirs_by_transcript_cwd,
+    whose memo key is (here, tuple(sorted(dirs))) and deliberately excludes
+    `matches` — so the narrow probe's "cannot tell" verdict (a brand-new
+    transcript's first line typically has no `cwd` field) got memoized under
+    the exact key the LATER, BROAD glob (layers 1-3) would hit too,
+    downgrading a genuine #260 "positively contradicted -> refuse" into
+    "cannot tell -> keep anyway" for a file the narrow probe never even
+    looked at. Reproduces the ordering that broke it: layer 0 runs first
+    (as it always does inside _resolve_session_id), then the env-blind
+    broad scan must still see the contradiction and refuse.
     """
-    our_cwd = "/Users/x/dev/a_b"
-    monkeypatch.setattr(os, "getcwd", lambda: our_cwd)
+    here = tmp_path / ".openclaw"
+    here.mkdir()
+    monkeypatch.chdir(here)
 
-    projects = isolated_home / ".claude" / "projects"
-    dir_literal = projects / our_cwd.replace("/", "-")  # "_" kept
-    dir_folded = projects / our_cwd.replace("/", "-").replace("_", "-")  # "_" folded
-    assert dir_literal != dir_folded, "fixture premise: two distinct dir names"
-    dir_literal.mkdir(parents=True)
-    dir_folded.mkdir(parents=True)
-
-    sid = _unique_sid()
-    now = 1_800_000_000.0
-    # Same sid, same instant, under BOTH directory encodings — the same live
-    # session appearing twice via the deliberate encoding union, not two
-    # concurrent sessions.
-    _write_transcript(dir_literal, sid, now)
-    _write_transcript(dir_folded, sid, now)
-
-    assert obsidian_utils._try_slow_jsonl_glob("a_b") == sid
-    err = capsys.readouterr().err
-    assert "concurrently active" not in err, err
-
-
-def test_bootstrap_fast_path_exact_mtime_tie_refuses_not_trusts_cache(
-    isolated_home, tmp_path, monkeypatch
-):
-    """The pre-existing same-second tie-breaker used to TRUST the cache when
-    `cached_newest == newest_mtime` (see its old docstring: 'same-second race
-    across worktrees -> trust cache'). Task 3 makes an exact tie the
-    STRONGEST possible concurrency signal instead: two transcripts sharing
-    one mtime is precisely the shape of two sessions writing in the same
-    instant, so the ambiguity refusal must win and return None (never the
-    cached sid) — even though the cache is internally consistent (its own
-    file really is present and really does share the newest mtime)."""
-    project = "tierefuse"
-    cc_dir = _project_cwd(tmp_path, monkeypatch, isolated_home, project)
-
-    ts = 1_800_000_000.0
-    cached_sid = "aaaa-cached-tie-sid"
-    other_sid = "zzzz-other-tie-sid"
-    _write_transcript(cc_dir, cached_sid, ts)
-    _write_transcript(cc_dir, other_sid, ts)  # identical mtime -> exact tie
-
-    _seed_bootstrap(isolated_home, project, cached_sid)
-    bdir = isolated_home / ".claude" / "obsidian-brain"
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-")
-
-    assert obsidian_utils._try_bootstrap_fast_path(project) is None, (
-        "the old tie-break trusted the cache on an exact mtime match — "
-        "ambiguity must win instead"
-    )
-    assert obsidian_utils._resolve_session_id() == "unknown", (
-        "bootstrap fall-through must compose with the slow path's own "
-        "refusal, landing on 'unknown' end-to-end"
-    )
-
-
-def test_bootstrap_fast_path_fallthrough_composes_with_slow_path_refusal(
-    isolated_home, tmp_path, monkeypatch, capsys
-):
-    """Task 3 spec: 'the same refusal must apply to _try_bootstrap_fast_path's
-    fall-through'. Here the cached sid is NOT the newest (no tie either) —
-    the pre-existing 'return None' fall-through composes with
-    _try_slow_jsonl_glob's new window check with NO duplicated logic: the
-    caller falls through to the slow path, which independently re-derives
-    the same ambiguity and returns 'unknown'. Pins the composition
-    end-to-end, not just the None return at the boundary."""
-    project = "fallthroughcompose"
-    cc_dir = _project_cwd(tmp_path, monkeypatch, isolated_home, project)
-
-    ts = 1_800_000_000.0
-    cached_sid = _unique_sid()
-    newer_sid = _unique_sid()
-    _write_transcript(cc_dir, cached_sid, ts)
-    _write_transcript(cc_dir, newer_sid, ts + 5.0)  # strictly newer, no tie,
-    # but well within the 120s window -> ambiguous
-
-    _seed_bootstrap(isolated_home, project, cached_sid)
-    bdir = isolated_home / ".claude" / "obsidian-brain"
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-")
-
-    assert obsidian_utils._try_bootstrap_fast_path(project) is None
-    assert obsidian_utils._resolve_session_id() == "unknown"
-    err = capsys.readouterr().err
-    assert "concurrently active" in err, err
-
-
-def test_resolve_session_id_env_wins_even_when_scan_would_be_ambiguous(
-    isolated_home, tmp_path, monkeypatch
-):
-    """Layer 0 runs before any of task 3's window logic (per _resolve_session_id
-    layer ordering): a well-formed env var must win even when the scan
-    layers, if reached, would refuse as ambiguous."""
-    cc_dir = _project_cwd(tmp_path, monkeypatch, isolated_home, "envwinsambiguous")
-    ts = 1_800_000_000.0
-    _write_transcript(cc_dir, _unique_sid(), ts)
-    _write_transcript(cc_dir, _unique_sid(), ts + 1.0)
+    # Only ONE directory matches the ".openclaw" -> "-openclaw" suffix glob,
+    # and it belongs to a DIFFERENT repo — the live #260 shape (see
+    # test_sole_matching_dir_contradicted_by_its_transcripts_is_refused).
+    stranger = (isolated_home / ".claude" / "projects"
+                / "-Users-x-dev-claude-workspace-openclaw")
+    stranger.mkdir(parents=True)
 
     env_sid = _unique_sid()
+    # The env sid's own transcript: first line has NO cwd field (a
+    # queue-operation record, the same shape as a transcript CC has not
+    # populated a cwd for yet) -> _transcript_cwd reads it as "cannot tell".
+    (stranger / f"{env_sid}.jsonl").write_text(
+        json.dumps({"type": "queue-operation"}) + "\n", encoding="utf-8"
+    )
+    # A second, unrelated transcript in the SAME directory whose cwd field
+    # POSITIVELY CONTRADICTS ours — this is what the broad glob (layers
+    # 1-3) must see and refuse on.
+    other_sid = _unique_sid()
+    (stranger / f"{other_sid}.jsonl").write_text(
+        _jsonl_line("/Users/x/dev/claude_workspace/openclaw"), encoding="utf-8"
+    )
+
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
-    assert obsidian_utils._resolve_session_id() == env_sid
+    # Layer 0 runs first (inside the normal call) and wins on its own terms.
+    result_env = obsidian_utils._resolve_session_id(allow_env=True)
+    assert result_env == env_sid
+
+    # The env-blind path (layers 1-3, broad glob) must still see the
+    # contradiction and refuse — not silently reuse the narrow probe's
+    # "cannot tell" verdict from a memo it must not have shared.
+    result_scan = obsidian_utils._resolve_session_id(allow_env=False)
+    assert result_scan == "unknown", (
+        f"expected the #260 contradiction refusal to still fire on the "
+        f"broad scan, got {result_scan!r} — the narrow layer-0 probe must "
+        f"not have poisoned the shared _dirs_by_transcript_cwd memo"
+    )

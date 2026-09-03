@@ -2427,56 +2427,6 @@ def test_check_hook_status_no_session_files(tmp_path, monkeypatch):
     assert status["current_sid"] == "unknown"
 
 
-def test_check_hook_status_ambiguous_concurrent_sessions_distinct_message(tmp_path, monkeypatch):
-    """#354 review item 4: with two live transcripts and a valid bootstrap,
-    check_hook_status() must NOT report "No session files found — run
-    /obsidian-setup to verify configuration" — that message is both the
-    wrong diagnosis (files WERE found) and the wrong remedy (setup has
-    nothing to fix when the real situation is "found several, can't tell
-    which is current"). It must report a DISTINCT message naming the
-    ambiguity, and must not tell the user to re-run setup."""
-    import obsidian_utils
-    import os
-    import time
-
-    project_basename = "concurrent-proj"
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
-
-    # Two JSONLs with IDENTICAL mtimes — the strongest possible ambiguity
-    # signal (see test_get_session_id_fast_same_second_tiebreaker above).
-    now = time.time()
-    jsonl_a = cc_projects / "session-a.jsonl"
-    jsonl_b = cc_projects / "session-b.jsonl"
-    jsonl_a.write_text("{}", encoding="utf-8")
-    jsonl_b.write_text("{}", encoding="utf-8")
-    os.utime(jsonl_a, (now, now))
-    os.utime(jsonl_b, (now, now))
-
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    bootstrap.write_text("session-a", encoding="utf-8")
-
-    status = obsidian_utils.check_hook_status()
-    assert status["ok"] is False
-    assert status["current_sid"] == "unknown"
-    assert "No session files found" not in status["message"], (
-        "the ambiguous-concurrent-sessions case must not be reported as "
-        "'no session files found' — files WERE found"
-    )
-    assert "obsidian-setup" not in status["message"], (
-        "re-running /obsidian-setup is the wrong remedy for concurrent "
-        "sessions — it fixes nothing here"
-    )
-    assert "concurrent" in status["message"].lower() or "cannot identify" in status["message"].lower()
-
-
 def test_slow_path_underscore_to_hyphen_fallback(tmp_path, monkeypatch):
     """_slow_path_newest_sid matches when cwd has underscores but CC dir has hyphens."""
     import obsidian_utils
@@ -2636,18 +2586,7 @@ def test_build_context_brief_without_hook_status(tmp_path):
 
 
 def test_get_session_id_fast_same_second_tiebreaker(tmp_path, monkeypatch):
-    """Same-second mtime ties: BEHAVIOR CHANGED by #330 task 3.
-
-    Before task 3, the same-mtime tie-breaker trusted the cached sid ("the
-    cached sid wins when its JSONL is tied for newest"). Task 3 makes an
-    exact mtime tie the STRONGEST possible signal of two concurrently active
-    sessions instead — two transcripts sharing a mtime is exactly the shape
-    of two sessions writing in the same instant — so the ambiguity refusal
-    now wins over this tie-break and the resolver must return 'unknown'
-    rather than guess via the cache. See
-    tests/test_get_session_context.py::test_bootstrap_fast_path_exact_mtime_tie_refuses_not_trusts_cache
-    for the same scenario pinned directly at _try_bootstrap_fast_path.
-    """
+    """Same-second mtime ties: cached sid wins when its JSONL is tied for newest."""
     import obsidian_utils
     import os
     import time
@@ -2671,32 +2610,28 @@ def test_get_session_id_fast_same_second_tiebreaker(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
-    # Bootstrap claims "aaa-previous" is current. Pre-#330-task-3, path-sort
-    # tiebreak would otherwise pick "zzz-current" (lexicographically larger)
-    # as the newest, so the cached sid used to win via the same-mtime
-    # tie-breaker. Now the tied mtimes are read as ambiguity instead.
+    # Bootstrap claims "aaa-previous" is current. Because path-sort tiebreak
+    # would otherwise pick "zzz-current" (lexicographically larger) as the
+    # newest, the cached sid must win via the same-mtime tie-breaker.
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
     bootstrap.write_text("aaa-previous", encoding="utf-8")
 
     result = obsidian_utils._get_session_id_fast()
-    assert result == "unknown", (
-        f"expected the ambiguity refusal to win over the same-mtime tie, got {result}"
+    assert result == "aaa-previous", (
+        f"expected cached sid to win same-mtime tie, got {result}"
     )
 
 
 def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypatch):
-    """BEHAVIOR CHANGED by #330 task 3: this used to prove the cache was
-    trusted "when at least one cached match ties the newest mtime". That is
-    exactly the shape task 3 targets — two DIFFERENT sids (the cached one via
-    b_jsonl, and other_jsonl's) tied at the newest mtime is two concurrently
-    active sessions, and the ambiguity refusal now wins over the tiebreaker
-    this test was named for, so the resolver must return 'unknown' rather
-    than trust either.
+    """When multiple project dirs contain the cached sid's JSONL, at least one
+    must tie the newest mtime for the cache to be trusted.
 
-    The competing JSONL is named so that it sorts AFTER the cached sid — see
-    the original tiebreak rationale below, which still explains why the
-    fixture is shaped this way (it is what makes `newest_sid != cached_sid`,
-    so the OLD trust-branch would not fire before task 3's new check does).
+    The competing JSONL is named so that it sorts AFTER the cached sid. That is
+    load-bearing: `max(viable)` breaks an mtime tie on the path string, so with
+    a lexicographically smaller competitor the cached sid would come back as
+    `newest_sid` and the function would return one branch EARLIER — the
+    tiebreaker this test is named for would never execute (it did not, before
+    this rename).
 
     The two directories are the two path ENCODINGS Claude Code has used for
     this same cwd (older CC kept '_' in the encoded name, current CC folds it
@@ -2738,14 +2673,11 @@ def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypa
     b_jsonl.write_text("{}", encoding="utf-8")
     other_jsonl.write_text("{}", encoding="utf-8")
 
-    # Scenario: a_jsonl is OLDER (well outside the #330 concurrency window),
-    # b_jsonl matches newest mtime, other_jsonl is also at newest mtime.
-    # Pre-#330-task-3, the tiebreaker trusted the cache because at least one
-    # cached match (b_jsonl) tied newest mtime. Now b_jsonl's sid and
-    # other_jsonl's sid — two DIFFERENT sids both at the newest mtime — are
-    # exactly the ambiguity task 3 refuses to guess through.
+    # Scenario: a_jsonl is OLDER, b_jsonl matches newest mtime, other_jsonl
+    # is also at newest mtime. Tiebreaker MUST trust the cache because
+    # at least one cached match (b_jsonl) ties newest mtime.
     now = time.time()
-    os.utime(a_jsonl, (now - 3600, now - 3600))  # old, outside the 120s window
+    os.utime(a_jsonl, (now - 3600, now - 3600))  # old
     os.utime(b_jsonl, (now, now))  # tied with other
     os.utime(other_jsonl, (now, now))  # tied with b
 
@@ -2756,9 +2688,8 @@ def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypa
     bootstrap.write_text(cached_sid, encoding="utf-8")
 
     result = obsidian_utils._get_session_id_fast()
-    assert result == "unknown", (
-        f"expected the ambiguity refusal to win over the multi-match "
-        f"tiebreaker, got {result}"
+    assert result == cached_sid, (
+        f"expected cached sid to win multi-match tiebreak, got {result}"
     )
 
 
@@ -2844,134 +2775,6 @@ def test_get_session_id_fast_slow_path_returns_without_writing(tmp_path, monkeyp
     # Slow path must NOT have created a bootstrap file
     assert not bootstrap.exists(), (
         "slow path should be read-only and not create the bootstrap file"
-    )
-
-
-# ===========================================================================
-# Section: #354 review item 3 — session resolution under real concurrency
-# ===========================================================================
-
-
-def test_resolve_session_id_ex_concurrent_ambiguity_no_cross_thread_leakage(tmp_path, monkeypatch):
-    """Two threads resolving DIFFERENT projects at the same instant — one
-    ambiguous (2+ concurrently active sessions), one clean — must each get
-    back their OWN answer, never the other's.
-
-    This is a real hazard, not a hypothetical: `upgrade_batch()` runs a
-    `ThreadPoolExecutor`, and its worker `upgrade_note_with_summary()`
-    reaches `_get_session_id_fast()` -> `_resolve_session_id` for every note
-    it processes. The pre-#354 implementation tracked ambiguity in a
-    module-level `_last_slow_glob_ambiguous` flag set immediately before
-    every `_try_slow_jsonl_glob` return and read by the caller a few lines
-    later: thread A (ambiguous) sets it True and returns; if thread B
-    (unambiguous, a different project) runs its own call — which resets the
-    flag False at entry and never sets it back True — anywhere in the
-    narrow window before A's caller reads it, A's caller reads B's False and
-    falls through to a cross-project sid guess. That is the exact
-    mis-attribution bug #330 built this resolver to prevent, reopened by
-    #330's own review-item-5 fix.
-
-    `_try_slow_jsonl_glob_ex` is patched here to force the EXACT interleave
-    that broke the old implementation, deterministically instead of leaving
-    it to scheduler luck: the ambiguous thread's real call runs and returns
-    its answer, then — BEFORE returning to ITS OWN caller — a
-    `threading.Event` handoff guarantees the clean thread's ENTIRE call
-    (start to finish) runs to completion, only THEN does the ambiguous
-    thread's caller get control back. That is precisely the historical race
-    window (thread A's answer computed -> thread B's unrelated call runs in
-    between -> thread A's caller reads state) forced to happen on every run,
-    not merely possible on some. Against the #354 fix this still passes
-    despite that forced worst-case ordering, because each thread's
-    `ambiguous` is a plain local from its own tuple return — there is no
-    shared variable left for the other thread's call to clobber.
-    """
-    import threading
-    import time
-    import obsidian_utils
-
-    home = tmp_path
-    monkeypatch.setenv("HOME", str(home))
-
-    # Ambiguous project: 2 JSONLs with identical mtime (the strongest
-    # concurrency signal, see test_get_session_id_fast_same_second_tiebreaker).
-    amb_dir = home / ".claude" / "projects" / "-foo-ambiguous-proj"
-    amb_dir.mkdir(parents=True)
-    now = time.time()
-    for name in ("thread-a-sess", "thread-a-sess-2"):
-        f = amb_dir / f"{name}.jsonl"
-        f.write_text("{}", encoding="utf-8")
-        os.utime(f, (now, now))
-
-    # Clean project: exactly 1 JSONL, unambiguous.
-    clean_dir = home / ".claude" / "projects" / "-foo-clean-proj"
-    clean_dir.mkdir(parents=True)
-    clean_jsonl = clean_dir / "thread-b-sess.jsonl"
-    clean_jsonl.write_text("{}", encoding="utf-8")
-    os.utime(clean_jsonl, (now - 60, now - 60))
-
-    # Route "cwd" per-thread by thread name — os.getcwd() is process-global
-    # and cannot differ per thread, so the project-resolution layer is
-    # stubbed to stand in for "this thread's cwd" instead.
-    thread_project = {"ambiguous-thread": "ambiguous-proj", "clean-thread": "clean-proj"}
-
-    def fake_resolve_project_basename_with_source():
-        return thread_project[threading.current_thread().name], "cwd"
-
-    monkeypatch.setattr(
-        obsidian_utils,
-        "_resolve_project_basename_with_source",
-        fake_resolve_project_basename_with_source,
-    )
-
-    # Deterministic ordered handoff (no sleeps): the ambiguous thread computes
-    # its own answer, signals, then BLOCKS until the clean thread's entire
-    # call has completed — guaranteeing the clean call's side effects (a
-    # shared flag, under the old implementation) land strictly BETWEEN the
-    # ambiguous thread's own computation and its caller reading anything.
-    a_computed = threading.Event()
-    b_done = threading.Event()
-    real_glob_ex = obsidian_utils._try_slow_jsonl_glob_ex
-
-    def synced_glob_ex(project):
-        if threading.current_thread().name == "ambiguous-thread":
-            result = real_glob_ex(project)  # A computes its own answer first
-            a_computed.set()
-            assert b_done.wait(timeout=5), "clean thread did not finish in time"
-            return result
-        assert a_computed.wait(timeout=5), "ambiguous thread did not compute in time"
-        result = real_glob_ex(project)  # B's ENTIRE call runs while A is blocked
-        b_done.set()
-        return result
-
-    monkeypatch.setattr(obsidian_utils, "_try_slow_jsonl_glob_ex", synced_glob_ex)
-
-    results: dict[str, tuple[str, bool]] = {}
-    errors: list[BaseException] = []
-
-    def worker(name):
-        threading.current_thread().name = name
-        try:
-            results[name] = obsidian_utils._resolve_session_id_ex(
-                allow_bootstrap=False, allow_env=False
-            )
-        except BaseException as e:  # noqa: BLE001 — surface any thread exception to the main thread
-            errors.append(e)
-
-    t_amb = threading.Thread(target=worker, args=("ambiguous-thread",))
-    t_clean = threading.Thread(target=worker, args=("clean-thread",))
-    t_amb.start()
-    t_clean.start()
-    t_amb.join(timeout=10)
-    t_clean.join(timeout=10)
-
-    assert not errors, f"worker thread(s) raised: {errors}"
-    assert results["ambiguous-thread"] == ("unknown", True), (
-        f"the ambiguous thread must see its OWN ambiguity refusal, not a "
-        f"cross-thread cross-project guess — got {results['ambiguous-thread']!r}"
-    )
-    assert results["clean-thread"] == ("thread-b-sess", False), (
-        f"the clean thread must resolve its OWN unambiguous sid, unaffected "
-        f"by the other thread's ambiguity — got {results['clean-thread']!r}"
     )
 
 

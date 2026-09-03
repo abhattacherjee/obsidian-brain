@@ -124,7 +124,18 @@ if _rejected:
     # is fed straight into the model context via the transcript.
     print(f"rejected {_rejected} invalid also-session-id argument(s)", file=sys.stderr)
     sys.exit(1)
-from obsidian_utils import load_config, get_session_context, gather_session_evidence, resolve_source_session_note
+from obsidian_utils import load_config, get_session_context, gather_session_evidence
+try:
+    from obsidian_utils import resolve_source_session_note
+except ImportError:
+    # Stale hooks predating #330: fall back to the pre-#330 unguarded
+    # backlink rather than omitting it. Returning an empty string here would
+    # silently strip source_session_note from every retro on a partial
+    # upgrade -- the same regression the #330 review caught in the main path.
+    # NOTE: no apostrophes in this block; it lives inside a single-quoted
+    # python3 -c argument and one would terminate the shell string.
+    def resolve_source_session_note(_n="", *_a): return _n
+    print("WARN: stale obsidian-brain hooks; using the unguarded source_session_note", file=sys.stderr)
 c = load_config()
 ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
 bundle = gather_session_evidence(

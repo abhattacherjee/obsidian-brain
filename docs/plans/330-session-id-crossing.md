@@ -73,6 +73,8 @@ an explicit stability test for it.
 1. **Env var first; `unknown` on any tie.** Trust `CLAUDE_CODE_SESSION_ID` when
    well-formed. Only when it is absent do we scan, and then two transcripts
    touched inside the window yield `unknown` rather than a guess.
+   **The second half of this decision (the tie/window refusal) was reversed
+   before shipping — see "Reversed after adversarial review" below.**
 2. **vault-doctor reports crossed only.** Flag `source_session` != the target
    note's `session_id`. Dangling backlinks stay with `snapshot-integrity` and
    #214.
@@ -169,6 +171,10 @@ Baseline on clean `develop`: **3984 passed, 30 xfailed**.
 
 ### Task 3 — ambiguity yields `unknown`, never a guess
 
+**REVERSED before shipping — see "Reversed after adversarial review" below.
+Kept here as the historical record of what was built and why it did not
+work.**
+
 - In `_try_slow_jsonl_glob()`: when two or more viable transcripts have mtime
   within `_CONCURRENT_SESSION_WINDOW_SECONDS` of the newest, return `"unknown"`
   instead of the newest.
@@ -224,6 +230,37 @@ Baseline on clean `develop`: **3984 passed, 30 xfailed**.
 - **Tests:** crossed pair → one issue; matching pair → none; dangling link →
   none (explicit negative control, since that is the case we chose to exclude);
   missing `session_id` on target → none.
+
+## Reversed after adversarial review
+
+Task 3's concurrency-ambiguity refusal (the `_CONCURRENT_SESSION_WINDOW_SECONDS
+= 120.0` window and everything built on it) was removed before this branch
+shipped. It was calibrated wrong: measured correctly — for each transcript,
+was ANOTHER transcript in the same project directory touched within 120s
+at-or-before its own last write — **69.2% of 3892 transcripts would have been
+refused**. The original 3714-transcript measurement checked whether a second
+transcript existed anywhere in the window, which is a different (and much
+weaker) question than whether resolving THIS transcript would have hit the
+refusal.
+
+Root cause: agent/teammate fan-out (subagents, dispatched agents) writes its
+own top-level `<sid>.jsonl` into the SAME project directory as the parent
+session, and those files are indistinguishable from a second real user
+session by anything this resolver can see — same shape, no `isSidechain`
+marker, no parent-session reference, a distinct top-level `sessionId`. The
+heuristic cannot tell "my own subagents fanned out" from "a second live
+session is genuinely active here", and no purely mtime/count-based filter can
+fix that — the two shapes are the same shape.
+
+Layer 0 (`CLAUDE_CODE_SESSION_ID`) already resolves the original #330 bug
+exactly, wherever the env var is available — it is authoritative regardless
+of how many other transcripts exist in the project directory. Task 3's
+refusal only mattered on the fallback path (env var absent), and firing on
+~69% of resolutions there is worse than the newest-mtime guess it replaced.
+Removed rather than re-tuned: `_try_slow_jsonl_glob` and
+`_try_bootstrap_fast_path` return to their pre-#330 newest-mtime behaviour
+(including the original same-second cache tie-break) when the env var is
+unavailable.
 
 ### Task 7 — docs
 

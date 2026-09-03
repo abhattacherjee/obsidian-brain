@@ -62,7 +62,7 @@ from . import Issue, Result
 _HOOKS_DIR = Path(__file__).resolve().parents[2] / "hooks"
 if str(_HOOKS_DIR) not in sys.path:
     sys.path.insert(0, str(_HOOKS_DIR))
-from obsidian_utils import read_note_metadata  # noqa: E402
+from obsidian_utils import _parse_note_metadata_uncached  # noqa: E402
 
 NAME = "crossed-source-session"
 DESCRIPTION = (
@@ -86,6 +86,36 @@ DEFAULT_WINDOW_DAYS = 9999  # unbounded — the damage is historic; scan all not
 _CONFIDENCE = 0.95
 
 
+def _read_note_metadata_uncached(path: Path) -> dict | None:
+    """Pure, uncached frontmatter read — bypasses obsidian_utils.read_note_metadata()'s
+    session cache (#354 review items 2/3).
+
+    ``read_note_metadata()`` does a ``cache_get``/``cache_set`` round-trip
+    against ``~/.claude/obsidian-brain/cache-<sid>.json`` on EVERY call, and
+    with ``DEFAULT_WINDOW_DAYS = 9999`` this check's own scan is unbounded —
+    on a 2472-note vault that balloons the cache file to 1.32 MB, and every
+    later ``load_config()``, ``get_session_context()`` and
+    ``read_note_metadata()`` call in the session pays to read and rewrite the
+    whole thing. The cache is also keyed only on ``metadata:<realpath>`` with
+    no mtime/size/hash and nothing ever invalidates it, so after a user
+    hand-edits a crossed note's ``source_session`` and re-runs this check, a
+    cached run reads back the PRE-EDIT value and reports the crossing as
+    still unresolved — in the one check whose entire workflow is "a human
+    reads the two ids and fixes it by hand".
+
+    ``_parse_note_metadata_uncached`` is the exact parsing
+    ``read_note_metadata()`` uses, minus the cache round-trip — see its own
+    docstring ("bulk scanners can read hundreds of notes without paying that
+    function's per-file cache I/O"). Sibling checks avoid the session-cached
+    helpers the same way: ``project_name_normalization.py`` imports only the
+    pure ``parse_frontmatter_field``, ``source_sessions.py`` has its own
+    ``_parse_frontmatter``, and ``session_coverage.py`` documents in comments
+    why it will not import the session-cached helpers either.
+    """
+    meta, _reason, _cacheable = _parse_note_metadata_uncached(str(path))
+    return meta
+
+
 def _wikilink_stem(raw: str) -> str:
     """Strip a ``[[stem]]`` wikilink (and any leftover quoting) down to
     ``stem``. ``read_note_metadata`` already strips a SURROUNDING pair of
@@ -97,6 +127,25 @@ def _wikilink_stem(raw: str) -> str:
     if val.startswith("[[") and val.endswith("]]"):
         val = val[2:-2]
     return val.strip().strip('"').strip("'").strip()
+
+
+def _is_readable_dir(path: Path) -> bool:
+    """``Path.is_dir()``, but a raised ``OSError`` reads as "not a directory"
+    instead of propagating (#354 review item 5).
+
+    On Python 3.13, ``is_dir()`` RAISES ``PermissionError`` when a parent
+    directory is mode ``0o000``, rather than returning ``False`` the way
+    earlier Python versions did. Both call sites below gate a ``for folder
+    in (...)`` loop over multiple directories, so an unguarded raise on the
+    FIRST folder would abort the whole scan and skip every folder after it
+    — producing exactly the "reported clean having scanned nothing" outcome
+    ``_list_md_files`` (which uses ``iterdir()`` for the same reason) exists
+    to prevent.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
 
 
 def _list_md_files(folder_path: Path) -> tuple[list[Path], str | None]:
@@ -141,7 +190,7 @@ def _index_sessions_by_stem(
     """
     index: dict[str, Path] = {}
     folder_path = vault_root / sessions_folder
-    if not folder_path.is_dir():
+    if not _is_readable_dir(folder_path):
         return index, 0, None
     entries, err = _list_md_files(folder_path)
     if err is not None:
@@ -187,7 +236,7 @@ def scan(
 
     for folder in (insights_folder, sessions_folder):
         folder_path = vault_root / folder
-        if not folder_path.is_dir():
+        if not _is_readable_dir(folder_path):
             continue
 
         entries, folder_err = _list_md_files(folder_path)
@@ -205,7 +254,7 @@ def scan(
                 continue
 
             n_scanned += 1
-            meta = read_note_metadata(str(md_file))
+            meta = _read_note_metadata_uncached(md_file)
             if not meta:
                 n_skipped += 1
                 print(
@@ -237,7 +286,7 @@ def scan(
                 n_dangling += 1
                 continue
 
-            target_meta = read_note_metadata(str(target_path))
+            target_meta = _read_note_metadata_uncached(target_path)
             if not target_meta:
                 # Target note exists but could not be read/parsed — cannot
                 # compare, and unlike a dangling link this IS worth a

@@ -419,3 +419,102 @@ def test_unparsable_link_target_is_counted_and_warned(tmp_path, capsys):
     assert "could not parse link target" in err
     assert "2026-08-26-demo-df46.md" in err
     assert "1 target unreadable" in err
+
+def test_rescan_after_hand_edit_sees_new_value_not_stale_cache(tmp_path):
+    """#354 review item 3: after a human hand-edits a crossed note's
+    source_session to match the target (the check's whole workflow — it
+    never auto-repairs) and re-runs the check in the SAME process, the
+    second scan() must see the FRESH value. The old implementation read
+    notes through obsidian_utils.read_note_metadata(), whose cache key is
+    ``metadata:<realpath>`` with no mtime/size/hash and nothing to
+    invalidate it, so a second scan in the same process replayed the
+    pre-edit value and reported the crossing as still unresolved. Item 2's
+    pure, uncached parser closes this — there is no cache left to go
+    stale."""
+    v = _vault(tmp_path)
+    _write_session(v["sessions"] / "2026-08-26-demo-df46.md", session_id="session-B")
+    insight_path = v["insights"] / "2026-08-27-demo-retro.md"
+    _write_insight(
+        insight_path,
+        source_session="session-A",
+        source_session_note_stem="2026-08-26-demo-df46",
+    )
+
+    issues_before = css.scan(str(v["root"]), SESSIONS, INSIGHTS, 30)
+    assert len(issues_before) == 1
+
+    # Human fixes the crossing by hand: rewrite source_session to match.
+    _write_insight(
+        insight_path,
+        source_session="session-B",
+        source_session_note_stem="2026-08-26-demo-df46",
+    )
+
+    issues_after = css.scan(str(v["root"]), SESSIONS, INSIGHTS, 30)
+    assert issues_after == [], (
+        "re-scan after a hand-edit must see the fresh source_session, not a "
+        "stale cached pre-edit value"
+    )
+
+
+def test_stem_index_survives_is_dir_permission_error(tmp_path, monkeypatch):
+    """#354 review item 5: on Python 3.13, Path.is_dir() can RAISE
+    PermissionError (when a parent is mode 0o000) instead of returning
+    False. _index_sessions_by_stem's unguarded is_dir() call must not
+    propagate that — an unreadable sessions_folder must degrade to "index
+    empty, no error", the same shape as a folder that legitimately does not
+    exist, not crash the whole check."""
+    v = _vault(tmp_path)
+    _write_session(v["sessions"] / "2026-08-26-demo-df46.md", session_id="session-B")
+
+    real_is_dir = Path.is_dir
+
+    def raising_is_dir(self):
+        if self == v["sessions"]:
+            raise PermissionError("Permission denied")
+        return real_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", raising_is_dir)
+
+    index, n_listed, err = css._index_sessions_by_stem(v["root"], SESSIONS)
+    assert index == {}
+    assert n_listed == 0
+    assert err is None
+
+
+def test_scan_loop_survives_is_dir_permission_error_on_first_folder(
+    tmp_path, monkeypatch
+):
+    """#354 review item 5: the scan() loop's is_dir() call sits inside
+    `for folder in (insights_folder, sessions_folder)`. An unguarded raise
+    on the FIRST folder checked (insights_folder) must not abort the loop
+    before it reaches sessions_folder — that would report the whole run
+    clean having scanned nothing, exactly the failure _list_md_files
+    (iterdir()) already guards against. Puts a self-contained crossing
+    INSIDE sessions_folder (both folders are scanned for the stamped
+    fields regardless of note type — see the module docstring) so a
+    reported issue proves the second folder was actually reached."""
+    v = _vault(tmp_path)
+    _write_session(v["sessions"] / "2026-08-26-demo-df46.md", session_id="session-B")
+    _write_insight(
+        v["sessions"] / "2026-08-27-crossing-in-sessions-folder.md",
+        source_session="session-A",
+        source_session_note_stem="2026-08-26-demo-df46",
+    )
+
+    real_is_dir = Path.is_dir
+
+    def raising_is_dir(self):
+        if self == v["insights"]:
+            raise PermissionError("Permission denied")
+        return real_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", raising_is_dir)
+
+    issues = css.scan(str(v["root"]), SESSIONS, INSIGHTS, 30)
+
+    assert len(issues) == 1, (
+        "sessions_folder (the second folder in the loop) must still be "
+        "scanned despite insights_folder's is_dir() raising"
+    )
+    assert issues[0].extra["source_session"] == "session-A"

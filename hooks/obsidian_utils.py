@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -254,7 +255,7 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
     Refuses to write when `session_id` is empty, whitespace-only, or the
     literal string "unknown" (#330 task 4). Those values cannot be an
     authoritative session id: "unknown" is `get_session_context()`'s explicit
-    ambiguity sentinel (#330 task 3), so a sentinel filed under it is a dead
+    cannot-resolve sentinel, so a sentinel filed under it is a dead
     key by construction — the Stop hook (`obsidian_retro_gate.py`) looks up
     the harness's own `session_id` from its stdin JSON, which is never
     "unknown" or blank, and would never find it. Arming under a dead key is
@@ -269,7 +270,7 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
         return "Failed: refusing to arm retro gate — session_id is empty; gate NOT armed, Stop hook will not enforce classification for this session"
 
     if session_id.strip() == "unknown":
-        return "Failed: refusing to arm retro gate — session_id is \"unknown\" (ambiguous resolution); gate NOT armed, Stop hook will not enforce classification for this session"
+        return "Failed: refusing to arm retro gate — session_id is \"unknown\" (unresolved session); gate NOT armed, Stop hook will not enforce classification for this session"
 
     sanitized = _RETRO_SID_SAFE.sub("_", session_id)
     if not sanitized:
@@ -1316,20 +1317,6 @@ def canonical_project_name(cwd: str | None = None) -> str:
     return name.lower().replace(" ", "-").replace("_", "-")
 
 
-# Window (seconds) inside which two-or-more viable transcripts in the same
-# project directory are treated as concurrently active sessions, rather than
-# trusting whichever one has the newest mtime (#330 task 3).
-#
-# WHY 120s: measured across 3714 transcripts in 40 project directories on the
-# dev machine, normal single-session work never had a second transcript
-# touched within 120s of the current one — a session's own JSONL is the only
-# thing appending to it, and edits/tool calls are spaced well beyond that.
-# Two concurrent sessions in one repo, by contrast, both append within
-# SECONDS of each other (both are live, both are being driven). 120s sits
-# comfortably above the observed single-session noise floor and comfortably
-# below the concurrent-session signal. Re-measure if this proves noisy.
-_CONCURRENT_SESSION_WINDOW_SECONDS = 120.0
-
 # One-shot WARN registries for the session-id resolution path (#260 I3/S6).
 #
 # WHY a registry and not a bare print: _get_session_id_fast() is called once per
@@ -1343,10 +1330,6 @@ _CONCURRENT_SESSION_WINDOW_SECONDS = 120.0
 _ambiguous_project_dirs_warned: set[tuple[str, ...]] = set()
 _sole_match_not_cwd_warned: set[tuple[str, ...]] = set()
 _unknown_sid_warned: set[str] = set()
-# Keyed by the tuple of ambiguous sids (sorted, for a deterministic key) so a
-# DIFFERENT ambiguous pair/set later in the same process still warns once more
-# (#330 task 3).
-_concurrent_sids_warned: set[tuple[str, ...]] = set()
 _env_sid_no_transcript_warned: set[tuple[str, str]] = set()
 # Keyed by the raw (unvalidated) env value itself so a DIFFERENT malformed
 # value later in the same process still warns once more (#330 review item 8).
@@ -1367,11 +1350,22 @@ _env_sid_malformed_warned: set[str] = set()
 _env_sid_transcript_checked: dict[tuple[str, str], bool] = {}
 
 
+# Guards every _warn_once() registry against the check-then-act race
+# (#354 review item 6): upgrade_batch() runs a ThreadPoolExecutor, and two
+# worker threads can both read `key in registry` as False before either adds
+# it, printing the same one-shot warning twice (or more). One lock for every
+# registry is enough — the critical section is a set membership check plus an
+# add, never more, so contention across unrelated registries costs nothing
+# worth splitting further.
+_warn_once_lock = threading.Lock()
+
+
 def _warn_once(registry: set, key, message: str) -> None:
     """Print `message` to stderr the first time `key` is seen in `registry`."""
-    if key in registry:
-        return
-    registry.add(key)
+    with _warn_once_lock:
+        if key in registry:
+            return
+        registry.add(key)
     print(message, file=sys.stderr)
 
 
@@ -1698,8 +1692,9 @@ def _project_glob_variants(safe_project: str) -> list[str]:
     return sorted(variants)
 
 
-def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str]:
-    """Glob ~/.claude/projects/*<project>/<suffix> over every encoding CC may use.
+def _glob_project_jsonls_union(safe_project: str, suffix: str = "*.jsonl") -> list[str]:
+    """Glob ~/.claude/projects/*<project>/<suffix> over every encoding CC may
+    use, WITHOUT filtering the result through _restrict_matches_to_cwd_project.
 
     Claude Code normalizes both underscores and dots to hyphens in project
     directory names, so a project at ``personal_ws/`` is stored as
@@ -1714,16 +1709,24 @@ def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str
     never runs (#260 S9 — the same union-don't-overwrite reasoning already used
     for redundant filter queries in the vault index).
 
-    The leading ``*`` makes this a suffix match over the path-encoded dir name,
-    so the union is filtered through _restrict_matches_to_cwd_project before it
-    is returned — see that function for why (#260).
-
-    An empty result means EITHER "nothing matched" OR "matches were refused as
-    ambiguous", and callers cannot tell them apart — so no caller may act on the
-    difference. _try_slow_jsonl_glob reports 'unknown' for both, and
-    _try_bootstrap_fast_path derives its cached-sid view by filtering THIS list
-    instead of globbing a second time, so it can no longer read a refusal as
-    "no other JSONLs exist, trust the bootstrap" (#260 C1).
+    Split out from `_glob_project_jsonls` (#354 review item 4) so a caller
+    that only needs a raw existence check — not "which directory is ours" —
+    never touches `_restrict_matches_to_cwd_project`'s shared
+    `_dirs_by_transcript_cwd` memo. That memo is keyed by
+    ``(here, tuple(sorted(dirs)))`` only — deliberately excluding `matches`,
+    per its own docstring — so a caller globbing a NARROWED suffix (one
+    specific sid's filename, as the env layer 0 existence probe does below)
+    and a caller globbing the default ``*.jsonl`` suffix for the SAME
+    directory set collide on the same memo key despite having inspected
+    different files. A brand-new transcript's first line typically carries no
+    `cwd` field (a queue-operation record), so the narrow probe answers
+    "cannot tell" and — before this split — that got memoized under the key
+    the later, BROAD glob (layers 1-3) would hit too, silently downgrading a
+    genuine #260 "positively contradicted -> refuse" into "cannot tell ->
+    keep anyway" for files the narrow probe never looked at. The layer-0
+    existence probe only needs "does a file with this name exist under a
+    project directory whose encoded name matches" — it does not care WHICH
+    directory, so skipping the restriction step loses it nothing.
     """
     import glob as _glob
     seen: set[str] = set()
@@ -1734,75 +1737,36 @@ def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str
             if path not in seen:
                 seen.add(path)
                 matches.append(path)
-    return _restrict_matches_to_cwd_project(matches)
+    return matches
 
 
-def _concurrent_viable_sids(
-    viable: list[tuple[float, str]], newest_mtime: float
-) -> list[str]:
-    """SIDs among `viable` (mtime, path) pairs within the concurrency window of
-    `newest_mtime` — i.e. `newest_mtime - mtime <= _CONCURRENT_SESSION_WINDOW_SECONDS`.
+def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str]:
+    """`_glob_project_jsonls_union`, filtered to the directories belonging to
+    the current cwd's project.
 
-    Shared by _try_slow_jsonl_glob and _try_bootstrap_fast_path so the window
-    constant and the `<=` boundary live in exactly ONE place (#330 task 3) —
-    two independent copies of a boundary comparison are two independent
-    chances to get `>=` vs `>` wrong in only one of them.
+    The leading ``*`` in the union glob makes this a suffix match over the
+    path-encoded dir name, so the union is filtered through
+    _restrict_matches_to_cwd_project before it is returned — see that
+    function for why (#260).
 
-    `<=` (not `<`) is deliberate: a delta of EXACTLY the window is still
-    "within" it — the strongest read of "two sessions touched their
-    transcripts 120.0s apart" is still ambiguous, not safely resolved.
-
-    DEDUPES by sid, not by path (#330 review item 6). `_glob_project_jsonls`
-    deliberately UNIONs every directory-encoding variant for one cwd (see its
-    docstring), so the SAME sid's transcript can legitimately appear at two
-    different paths — e.g. both the `_`-folded and `-`-folded encodings of
-    one checkout hold a copy/symlink of the same session's JSONL. Counting
-    PATHS there double-counts a single live session as two, which trips
-    `len(...) >= 2` and turns one ordinary session into a false 'unknown'.
-    Verified on this machine: 8 project directories collide under `_`/`.`
-    folding. A `set` comprehension collapses that back to one entry per
-    DISTINCT session, which is what "concurrently active" actually means.
-
-    Returns at least one sid (the newest itself, delta 0.0 always qualifies).
-    Callers treat `len(...) >= 2` as ambiguous.
+    An empty result means EITHER "nothing matched" OR "matches were refused as
+    ambiguous", and callers cannot tell them apart — so no caller may act on the
+    difference. _try_slow_jsonl_glob reports 'unknown' for both, and
+    _try_bootstrap_fast_path derives its cached-sid view by filtering THIS list
+    instead of globbing a second time, so it can no longer read a refusal as
+    "no other JSONLs exist, trust the bootstrap" (#260 C1).
     """
-    return sorted({
-        os.path.splitext(os.path.basename(p))[0]
-        for m, p in viable
-        if newest_mtime - m <= _CONCURRENT_SESSION_WINDOW_SECONDS
-    })
+    return _restrict_matches_to_cwd_project(
+        _glob_project_jsonls_union(safe_project, suffix)
+    )
 
 
-def _try_slow_jsonl_glob_ex(project: str) -> tuple[str, bool]:
+def _try_slow_jsonl_glob(project: str) -> str:
     """Slow path: glob all JSONLs under ~/.claude/projects/*<project>/, return
-    (SID of the newest, whether the result was ambiguity-driven). Used by both
-    _resolve_session_id_ex (when bootstrap is skipped or empty) and as the
-    existing health-check entry point.
+    the SID of the newest. Used by both _resolve_session_id (when bootstrap
+    is skipped or empty) and as the existing health-check entry point.
 
-    Returns ('unknown', False) if no JSONLs match, OR ('unknown', True) if 2+
-    viable transcripts have an mtime within _CONCURRENT_SESSION_WINDOW_SECONDS
-    of the newest — that shape is two sessions concurrently active in the same
-    project, and newest-mtime cannot tell them apart. Guessing the newest one
-    is exactly the bug #330 reports: whichever session happened to write last
-    wins, and the OTHER session gets its id, silently mis-attributing notes and
-    defeating the retro Stop-hook gate armed under the wrong sid. 'unknown' is
-    a supported, handled outcome (get_session_context refuses to cache it and
-    falls back to the live canonical_project_name()), so a correct "I don't
-    know" strictly beats a confident wrong guess here.
-
-    The second element of the tuple lets a caller tell these two 'unknown'
-    shapes apart (#330 review item 5) WITHOUT the module-level flag this
-    function used to set: `upgrade_batch()` runs a `ThreadPoolExecutor`, and
-    each worker's `upgrade_note_with_summary()` reaches this function via
-    `_get_session_id_fast()` — a shared mutable "last call's answer" flag is a
-    race under that fan-out (#354 review item 3): thread A sets it True for
-    its own project, thread B calls this function for a DIFFERENT, unambiguous
-    project and resets it False, and A then reads False and falls through to
-    a cross-project sid — exactly the mis-attribution bug the flag was added
-    to prevent, reopened under concurrency. Returning the value instead of
-    stashing it in module state makes that race structurally impossible: each
-    caller gets ITS OWN answer, on its own stack, no matter how many other
-    threads call this function in between.
+    Returns 'unknown' if no JSONLs match.
 
     Bootstrap-blind by contract — never reads or trusts the sid-<project>
     bootstrap file.
@@ -1813,29 +1777,9 @@ def _try_slow_jsonl_glob_ex(project: str) -> tuple[str, bool]:
     entries = [(_safe_mtime(p), p) for p in matches]
     viable = [(m, p) for m, p in entries if m >= 0]
     if not viable:
-        return "unknown", False
-    newest_mtime, newest_path = max(viable)
-    concurrent_sids = _concurrent_viable_sids(viable, newest_mtime)
-    if len(concurrent_sids) >= 2:
-        _warn_once(
-            _concurrent_sids_warned,
-            tuple(concurrent_sids),
-            f"[obsidian-brain] WARN: {len(concurrent_sids)} distinct sessions "
-            f"look concurrently active in this project, obsidian-brain cannot "
-            f"tell which is the current one, refusing to guess; a confident "
-            f"wrong id silently mis-attributes notes and defeats the retro "
-            f"Stop-hook gate, so 'unknown' is returned instead "
-            f"(sids: {concurrent_sids})",
-        )
-        return "unknown", True
-    return os.path.splitext(os.path.basename(newest_path))[0], False
-
-
-def _try_slow_jsonl_glob(project: str) -> str:
-    """Thin wrapper over `_try_slow_jsonl_glob_ex` for callers that only need
-    the sid — the pre-#354 health-check entry point and any other existing
-    caller. See `_try_slow_jsonl_glob_ex` for the full contract."""
-    return _try_slow_jsonl_glob_ex(project)[0]
+        return "unknown"
+    _newest_mtime, newest_path = max(viable)
+    return os.path.splitext(os.path.basename(newest_path))[0]
 
 
 def _slow_path_newest_sid() -> str:
@@ -1851,21 +1795,9 @@ def _slow_path_newest_sid() -> str:
     of against the JSONLs on disk — a health check that can no longer detect
     the env var pointing at a session with no transcript (#330 task 2).
 
-    Returns 'unknown' if no JSONLs are found for the current cwd. See
-    `_slow_path_newest_sid_ex` for a variant that also reports WHY (#354
-    review item 4).
+    Returns 'unknown' if no JSONLs are found for the current cwd.
     """
     return _resolve_session_id(allow_bootstrap=False, allow_env=False)
-
-
-def _slow_path_newest_sid_ex() -> tuple[str, bool]:
-    """Like `_slow_path_newest_sid`, but also returns whether an 'unknown'
-    result was ambiguity-driven (2+ concurrently active sessions) rather than
-    plain absence (no JSONL at all) — #354 review item 4. `check_hook_status`
-    uses this to stop reporting "No session files found — run /obsidian-setup"
-    (wrong diagnosis, wrong remedy) when the real situation is "found several,
-    can't tell which is current"."""
-    return _resolve_session_id_ex(allow_bootstrap=False, allow_env=False)
 
 
 def _try_bootstrap_fast_path(project: str) -> str | None:
@@ -1879,21 +1811,11 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
       3. Determine the newest JSONL deterministically via (mtime, path)
          tuple comparison. Ties broken by path string so the result is
          reproducible on filesystems with 1-second mtime resolution.
-      3a. Ambiguity refusal FIRST (#330 task 3): if 2+ viable JSONLs sit
-          within _CONCURRENT_SESSION_WINDOW_SECONDS of the newest, return
-          None regardless of what step 4 below would have decided — the
-          bootstrap file is keyed by project, not session, so it cannot
-          vouch for "current" once more than one session is live. This is
-          checked BEFORE step 4 so it overrides both of that step's trust
-          branches, including the same-second tie-break (an exact tie is
-          now read as the strongest concurrency signal, not a reason to
-          trust the cache).
       4. If the newest JSONL's basename equals the cached sid, trust the
          cache. If the cached JSONL shares the newest mtime (same-second
-         race), also trust the cache.
-      5. Otherwise return None (let caller fall through to slow path, which
-         independently re-derives the same ambiguity verdict and owns the
-         'unknown' + WARN behavior — see _try_slow_jsonl_glob).
+         race), also trust the cache — same-second races across worktrees are
+         common and the cache is the tiebreak of record for them.
+      5. Otherwise return None (let caller fall through to slow path).
 
     READ-ONLY — never writes the bootstrap file. SessionStart hook is the sole
     authoritative writer.
@@ -1944,27 +1866,6 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
 
     newest_mtime, newest_path = max(viable)
 
-    # Ambiguity refusal wins over BOTH trust branches below (#330 task 3).
-    #
-    # WHY here, before either branch: the bootstrap file is keyed by PROJECT,
-    # not by session, so it is really "whichever session's SessionStart wrote
-    # last" — not a claim about which transcript is newest right now. Either
-    # trust branch below can return that shared, possibly-stale cache value
-    # even while a second session is concurrently active, silently
-    # re-introducing the exact guess _try_slow_jsonl_glob just learned to
-    # refuse. Checked once here, before any return, so it wins over both the
-    # `newest_sid == cached_sid` direct match AND the same-second tie-break
-    # immediately below (that tie-break's whole premise — "an exact mtime tie
-    # means trust the cache" — is now backwards: an exact tie is the
-    # STRONGEST signal of concurrency, not the weakest).
-    #
-    # Deliberately does NOT re-derive or warn here: falling through to None
-    # sends the caller straight to _try_slow_jsonl_glob, which recomputes the
-    # same glob and owns the 'unknown' + WARN behavior in exactly one place
-    # (no duplicated window logic, no duplicated WARN text).
-    if len(_concurrent_viable_sids(viable, newest_mtime)) >= 2:
-        return None
-
     newest_sid = os.path.splitext(os.path.basename(newest_path))[0]
     if newest_sid == cached_sid:
         return cached_sid
@@ -1979,22 +1880,7 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
 
 
 def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) -> str:
-    """Thin wrapper over `_resolve_session_id_ex` for callers that only need
-    the sid. See `_resolve_session_id_ex` for the full layered resolution
-    contract and for why the ambiguity signal is a return value now, not
-    module state (#354 review item 3)."""
-    return _resolve_session_id_ex(allow_bootstrap, allow_env)[0]
-
-
-def _resolve_session_id_ex(allow_bootstrap: bool = True, allow_env: bool = True) -> tuple[str, bool]:
     """Single source of truth for current-session SID resolution. Never raises.
-
-    Returns ``(sid, ambiguous)`` — ``ambiguous`` is True only when the
-    returned sid is ``'unknown'`` AND that specific 'unknown' came from layer
-    3 finding 2+ concurrently active sessions (see `_try_slow_jsonl_glob_ex`),
-    as opposed to plain absence (no JSONL at all) or never reaching layer 3
-    (e.g. no project basename). Threaded as a LOCAL through this function,
-    never module state — see the concurrency note below.
 
     Resolution layers (each failure → next):
       0. CLAUDE_CODE_SESSION_ID env var (#330 task 2), gated by `allow_env`
@@ -2014,7 +1900,12 @@ def _resolve_session_id_ex(allow_bootstrap: bool = True, allow_env: bool = True)
          process, so it is authoritative regardless of which transcript was
          touched most recently, and it is CONSTANT for the life of the
          session, so repeated calls resolve identically (the stability the
-         mtime layers cannot offer).
+         mtime layers cannot offer). Where the env var is unavailable, this
+         resolver falls back to newest-mtime over the project directory, the
+         same heuristic used before #330 — see
+         docs/plans/330-session-id-crossing.md's "Reversed after adversarial
+         review" note for why a stricter concurrency-ambiguity refusal was
+         tried and then removed.
 
          Gating on format rather than on transcript existence is deliberate:
          a brand-new session has no transcript on disk yet (SessionStart may
@@ -2032,7 +1923,7 @@ def _resolve_session_id_ex(allow_bootstrap: bool = True, allow_env: bool = True)
          silently downgrading resolution quality to the mtime layers.
       1. Project basename via _resolve_project_basename (cwd → env → None)
       2. Bootstrap fast path (skipped if allow_bootstrap=False)
-      3. Slow-path JSONL glob
+      3. Slow-path JSONL glob (newest mtime wins)
       4. Recent-bootstrap best-effort scan — issue #105 fallback, reachable
          ONLY when cwd is gone: layer 1 produced no basename at all, or it
          produced one from CLAUDE_PROJECT_DIR (which is consulted only after
@@ -2068,32 +1959,6 @@ def _resolve_session_id_ex(allow_bootstrap: bool = True, allow_env: bool = True)
     that variable in hooks, so gating on `project is not None` would have
     narrowed #105 to "worktree deleted AND the env var happens to be unset",
     silently returning 'unknown' where it used to recover the sid.
-
-    A second, narrower gate sits in front of layer 4 (#330 review item 5):
-    when source == "env" and layer 3's 'unknown' was AMBIGUITY (2+ concurrent
-    sessions in this project, per the local `ambiguous` value returned by
-    `_try_slow_jsonl_glob_ex`) rather than absence (no JSONL at all), layer 4
-    is skipped too. Falling through unconditionally let the cross-project
-    scan silently override an ambiguity refusal with a confident guess from a
-    DIFFERENT repo's bootstrap — the WARN emitted by layer 3 says "'unknown'
-    is returned instead", but a cross-project sid is what a caller actually
-    got back. Layer 4 exists to rescue "no transcript for THIS session
-    because cwd is gone"; ambiguity is a different, unrelated failure mode
-    and must not be rescued by it.
-
-    CONCURRENCY (#354 review item 3): this resolver IS called from multiple
-    threads — `upgrade_batch()` runs a `ThreadPoolExecutor`, and each
-    worker's `upgrade_note_with_summary()` reaches this function via
-    `_get_session_id_fast()`. The pre-#354 implementation tracked the
-    ambiguity signal in a module-level `_last_slow_glob_ambiguous` flag,
-    which is exactly the shared-mutable-state shape that breaks under that
-    fan-out: thread A sets it True for its own (ambiguous) project, thread B
-    concurrently resolves a DIFFERENT, unambiguous project and resets it
-    False, and A then reads False and falls through to layer 4 — returning a
-    cross-project sid, reopening the very bug #330 built this resolver to
-    close. `ambiguous` here is a plain local computed fresh from this call's
-    own `_try_slow_jsonl_glob_ex` result and returned to THIS caller only, so
-    no other thread's call can ever overwrite it mid-flight.
     """
     if allow_env:
         env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
@@ -2105,7 +1970,7 @@ def _resolve_session_id_ex(allow_bootstrap: bool = True, allow_env: bool = True)
                 if has_transcript is None:
                     safe_env_project = glob.escape(env_project)
                     has_transcript = bool(
-                        _glob_project_jsonls(safe_env_project, suffix=f"{env_sid}.jsonl")
+                        _glob_project_jsonls_union(safe_env_project, suffix=f"{env_sid}.jsonl")
                     )
                     _env_sid_transcript_checked[check_key] = has_transcript
                 if not has_transcript:
@@ -2123,7 +1988,7 @@ def _resolve_session_id_ex(allow_bootstrap: bool = True, allow_env: bool = True)
                         f"the env var is not stale or pointing at a "
                         f"different project than the current cwd)",
                     )
-            return env_sid, False
+            return env_sid
         elif env_sid:
             # Well-formed check FAILED but the var is non-empty (#330 review
             # item 8): a truncated, quoted, or otherwise mangled
@@ -2150,38 +2015,21 @@ def _resolve_session_id_ex(allow_bootstrap: bool = True, allow_env: bool = True)
         if allow_bootstrap:
             sid = _try_bootstrap_fast_path(project)
             if sid:
-                return sid, False
-        sid, ambiguous = _try_slow_jsonl_glob_ex(project)
+                return sid
+        sid = _try_slow_jsonl_glob(project)
         if sid != "unknown":
-            return sid, False
+            return sid
         if source == "cwd":
             # cwd is readable but has no session of its own — do NOT fall
             # through to the cross-project scan below. See the docstring (#260).
-            return "unknown", ambiguous
+            return "unknown"
         # source == "env": cwd is gone, so there is nothing left to contradict
-        # the cross-project scan — #105's original case. Fall through to it...
-        #
-        # ...EXCEPT when THIS 'unknown' was ambiguity, not absence (#330
-        # review item 5). _try_slow_jsonl_glob_ex collapses "no JSONLs found
-        # at all" and "2+ concurrent sessions found" into the same 'unknown'
-        # sentinel; only its WARN text (and the local `ambiguous` value)
-        # tells them apart. Falling through unconditionally let layer 4's
-        # cross-project scan silently OVERRIDE that ambiguity refusal with a
-        # confident guess from a DIFFERENT repo's bootstrap — the WARN says
-        # "'unknown' is returned instead" while a wrong, cross-project sid is
-        # what actually came back. `ambiguous` was computed by the call
-        # immediately above, on this stack frame alone, so no other thread's
-        # resolution can have changed it — refuse outright, exactly like the
-        # source == "cwd" branch: absence of a transcript for THIS session
-        # is the only case layer 4 exists to rescue, and ambiguity is not
-        # absence.
-        if ambiguous:
-            return "unknown", True
+        # the cross-project scan — #105's original case. Fall through to it.
     if allow_bootstrap:
         sid = _recent_bootstrap_sid()
         if sid:
-            return sid, False
-    return "unknown", False
+            return sid
+    return "unknown"
 
 
 def _get_session_id_fast(allow_env: bool = True) -> str:
@@ -2412,10 +2260,7 @@ def check_hook_status() -> dict:
     A SID mismatch (bootstrap points at a previous session) is normal after
     reconnects and does NOT indicate a problem — sessions are still logged.
     "ok" is False only when the bootstrap file is missing entirely or no
-    session files can be found — or when 2+ sessions look concurrently
-    active and the check cannot tell which is current (#354 review item 4);
-    that last case gets its own message, since "run /obsidian-setup" is the
-    wrong remedy for it.
+    session files can be found.
     """
     # Cwd-based project name (NOT canonical) — used for CC's path-encoded
     # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
@@ -2433,14 +2278,8 @@ def check_hook_status() -> dict:
     # Use the bootstrap-independent slow path so the check isn't circular.
     # _get_session_id_fast() can return the cached bootstrap value, which
     # would make this health check report OK even when the bootstrap is
-    # stale. The _ex variant also reports WHETHER an 'unknown' result was
-    # ambiguity-driven (2+ concurrently active sessions) rather than plain
-    # absence (no JSONL at all) — #354 review item 4: without it, two live
-    # transcripts and a valid bootstrap were reported as "No session files
-    # found — run /obsidian-setup to verify configuration", which is both
-    # the wrong diagnosis (files WERE found) and the wrong remedy (setup has
-    # nothing to fix here).
-    current_sid, ambiguous = _slow_path_newest_sid_ex()
+    # stale.
+    current_sid = _slow_path_newest_sid()
 
     if bootstrap_sid is None:
         return {
@@ -2451,16 +2290,6 @@ def check_hook_status() -> dict:
         }
 
     if current_sid == "unknown":
-        if ambiguous:
-            return {
-                "ok": False,
-                "message": (
-                    "Two or more sessions look concurrently active in this "
-                    "project — cannot identify which is current"
-                ),
-                "bootstrap_sid": bootstrap_sid,
-                "current_sid": current_sid,
-            }
         return {
             "ok": False,
             "message": "No session files found — run /obsidian-setup to verify configuration",
@@ -2605,7 +2434,7 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
 # One-shot WARN registry for resolve_source_session_note's contradiction
 # branch, keyed by (stamped session_id, target note's own session_id) so a
 # DIFFERENT crossing later in the same process still warns once more — same
-# discipline as _concurrent_sids_warned above (#330 review item 2).
+# discipline as the other one-shot registries above (#330 review item 2).
 _crossed_source_session_warned: set[tuple[str, str]] = set()
 
 

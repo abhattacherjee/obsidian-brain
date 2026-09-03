@@ -446,8 +446,8 @@ Where:
   try:
       from obsidian_utils import resolve_source_session_note
   except ImportError:
-      def resolve_source_session_note(*_a): return ""
-      print("WARN: stale obsidian-brain hooks; source_session_note disabled", file=sys.stderr)
+      def resolve_source_session_note(_n="", *_a): return _n
+      print("WARN: stale obsidian-brain hooks; falling back to the pre-#330 unguarded backlink", file=sys.stderr)
   c = load_config()
   ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
   resolved_note = resolve_source_session_note(ctx["session_note_name"], ctx["session_id"], c["vault_path"], c.get("sessions_folder", "claude-sessions"))
