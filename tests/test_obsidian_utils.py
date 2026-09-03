@@ -3962,6 +3962,114 @@ def test_get_session_context_cache_key_isolates_distinct_worktrees(tmp_path, mon
 
 
 # ===========================================================================
+# #330 Task 5: resolve_source_session_note() write guard
+#
+# source_session_note must not point at a note whose OWN session_id
+# contradicts the source_session being stamped alongside it. This guards the
+# retro/insight/decide/error-log write path only — see
+# hooks/obsidian_context_snapshot.py's deliberate forward-reference exception,
+# regression-tested separately in tests/test_snapshots.py.
+# ===========================================================================
+
+def _write_session_note(sessions_dir, filename, session_id=None):
+    """Write a minimal claude-session note. Omits `session_id:` entirely
+    when session_id is None, to fixture case 4 (target exists, no
+    session_id field)."""
+    fm = ["---", "type: claude-session"]
+    if session_id is not None:
+        fm.append(f"session_id: {session_id}")
+    fm.append("---")
+    (sessions_dir / filename).write_text("\n".join(fm) + "\n\n# body\n", encoding="utf-8")
+
+
+def test_resolve_source_session_note_match_returns_stem(tmp_path):
+    """Case 1: target exists AND session_id matches -> field written."""
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    sid = "11111111-1111-1111-1111-111111111111"
+    _write_session_note(sessions, "2026-08-26-demo-aaaa.md", session_id=sid)
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa", sid, str(vault), "claude-sessions"
+    )
+    assert result == "2026-08-26-demo-aaaa"
+
+
+def test_resolve_source_session_note_missing_target_omits(tmp_path):
+    """Case 2: target file missing -> field omitted (empty string)."""
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    sid = "11111111-1111-1111-1111-111111111111"
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa", sid, str(vault), "claude-sessions"
+    )
+    assert result == ""
+
+
+def test_resolve_source_session_note_id_mismatch_omits_live_crossing_values(tmp_path):
+    """Case 3: target exists but session_id DIFFERS -> field omitted.
+
+    Uses the real values from the live #330 crossing so this fixture
+    mirrors production: a real vault note carried
+    `source_session: 18785285-d99d-48ce-a2f7-5bc0aba14055` (hashes to
+    `f157`) while its `source_session_note` named
+    `2026-08-26-openclaw-df46`, whose own `session_id` was
+    `504f461a-1881-4bc6-a262-0025f1420ea5` (`df46` is
+    `sha256("504f461a-...")[:4]`) — a different session entirely.
+    """
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    resolved_source_session = "18785285-d99d-48ce-a2f7-5bc0aba14055"
+    target_session_id = "504f461a-1881-4bc6-a262-0025f1420ea5"
+    _write_session_note(
+        sessions, "2026-08-26-openclaw-df46.md", session_id=target_session_id
+    )
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-openclaw-df46",
+        resolved_source_session,
+        str(vault),
+        "claude-sessions",
+    )
+    assert result == ""
+
+
+def test_resolve_source_session_note_no_session_id_on_target_omits(tmp_path):
+    """Case 4: target exists but has NO session_id in frontmatter -> omitted."""
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    _write_session_note(sessions, "2026-08-26-demo-aaaa.md", session_id=None)
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa",
+        "11111111-1111-1111-1111-111111111111",
+        str(vault),
+        "claude-sessions",
+    )
+    assert result == ""
+
+
+def test_resolve_source_session_note_unknown_session_id_omits(tmp_path):
+    """A caller with no resolved id (session_id == 'unknown') gets '' even
+    when a same-named target happens to exist — the helper is safe to call
+    unconditionally, without the caller pre-checking for 'unknown' first."""
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    _write_session_note(sessions, "2026-08-26-demo-aaaa.md", session_id="unknown")
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa", "unknown", str(vault), "claude-sessions"
+    )
+    assert result == ""
+
+
+# ===========================================================================
 # Task 4: generate_summary returns (text, fallback_reason)
 # ===========================================================================
 
@@ -4826,3 +4934,36 @@ class TestBatchRecovery:
         assert reason1 == "missing_section", (
             f"recovery disabled: expected 'missing_section', got {reason1!r}"
         )
+
+
+def test_resolve_source_session_note_blocks_path_traversal(tmp_path):
+    """A composed session_note_name must not be able to escape the vault.
+
+    session_note_name is built by make_filename() over a slugified project
+    name derived from the cwd basename, so it is composed rather than
+    literal. Without containment, a traversing name would read frontmatter
+    from an arbitrary file on disk and vouch for it as this session's note
+    (#330). Mirrors the check write_vault_note() already performs.
+    """
+    import obsidian_utils
+
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+
+    sid = "11111111-2222-3333-4444-555555555555"
+
+    # A real note OUTSIDE the vault whose session_id would otherwise match,
+    # so the only thing that can reject it is the containment check.
+    outside = tmp_path / "outside.md"
+    outside.write_text(
+        f"---\ntype: claude-session\nsession_id: {sid}\n---\n\n# outside\n",
+        encoding="utf-8",
+    )
+
+    escaped = obsidian_utils.resolve_source_session_note(
+        "../../outside", sid, str(vault), "claude-sessions"
+    )
+    assert escaped == "", (
+        "a traversing session_note_name resolved to a file outside the "
+        "vault and was vouched for as a session note"
+    )

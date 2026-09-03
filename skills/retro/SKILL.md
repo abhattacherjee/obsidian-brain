@@ -124,7 +124,7 @@ if _rejected:
     # is fed straight into the model context via the transcript.
     print(f"rejected {_rejected} invalid also-session-id argument(s)", file=sys.stderr)
     sys.exit(1)
-from obsidian_utils import load_config, get_session_context, gather_session_evidence
+from obsidian_utils import load_config, get_session_context, gather_session_evidence, resolve_source_session_note
 c = load_config()
 ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
 bundle = gather_session_evidence(
@@ -133,6 +133,10 @@ bundle = gather_session_evidence(
     c.get("insights_folder", "claude-insights"),
     ctx["session_id"], ctx["project"],
     also_session_ids=_also_ids,
+)
+ctx["resolved_source_session_note"] = resolve_source_session_note(
+    ctx["session_note_name"], ctx["session_id"],
+    c["vault_path"], c.get("sessions_folder", "claude-sessions"),
 )
 bundle["_ctx"] = ctx
 print(json.dumps(bundle))
@@ -153,7 +157,7 @@ print(json.dumps({
   'error_fixes': [],
   'retros': [],
   'discovery_errors': [f'evidence helper crashed (exit={rc}): {errmsg[:500]}'],
-  '_ctx': {'session_id': 'unknown', 'hash': 'unknown', 'project': 'unknown', 'session_note_name': 'unknown'},
+  '_ctx': {'session_id': 'unknown', 'hash': 'unknown', 'project': 'unknown', 'session_note_name': 'unknown', 'resolved_source_session_note': ''},
 }))
 "
 else
@@ -291,9 +295,9 @@ The Step 3a bundle already carries the cached session context as `bundle["_ctx"]
 - `SESSION_ID` = `bundle["_ctx"]["session_id"]`
 - `HASH` = `bundle["_ctx"]["hash"]`
 - `PROJECT` = `bundle["_ctx"]["project"]`
-- `SESSION_NOTE` = `bundle["_ctx"]["session_note_name"]`
+- `SESSION_NOTE` = `bundle["_ctx"]["resolved_source_session_note"]` (**not** `session_note_name` — this is already guarded: it is `""` unless the target note exists AND its own `session_id` frontmatter matches `SESSION_ID`, which is what stops a `source_session_note` backlink from pointing at a note that contradicts the stamped `source_session` (#330))
 
-**Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely.
+**Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely. Also omit `source_session_note` whenever `SESSION_NOTE` is empty (`""`), even when `SESSION_ID` is known — that means the guard above rejected the link.
 
 ### Step 6 — Show preview and ask for edits
 

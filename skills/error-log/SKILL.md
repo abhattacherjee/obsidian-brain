@@ -178,16 +178,17 @@ Where:
       _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
       return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
   sys.path.insert(0, _ob_hooks())
-  from obsidian_utils import load_config, get_session_context
+  from obsidian_utils import load_config, get_session_context, resolve_source_session_note
   c = load_config()
   ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
-  print("SID=" + ctx["session_id"] + " HASH=" + ctx["hash"] + " PROJECT=" + ctx["project"] + " SESSION_NOTE=" + ctx["session_note_name"])
+  resolved_note = resolve_source_session_note(ctx["session_note_name"], ctx["session_id"], c["vault_path"], c.get("sessions_folder", "claude-sessions"))
+  print("SID=" + ctx["session_id"] + " HASH=" + ctx["hash"] + " PROJECT=" + ctx["project"] + " SESSION_NOTE=" + ctx["session_note_name"] + " RESOLVED_NOTE=" + resolved_note)
   '
   ```
 
-  Parse the output to get `SESSION_ID`, `HASH`, `PROJECT`, and `SESSION_NOTE`.
+  Parse the output to get `SESSION_ID`, `HASH`, `PROJECT`, `SESSION_NOTE`, and `RESOLVED_NOTE`.
 
-  **Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely.
+  **Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely. Otherwise, use `RESOLVED_NOTE` (**not** `SESSION_NOTE`) for the `source_session_note` wikilink — `RESOLVED_NOTE` is `""` unless the target note exists AND its own `session_id` frontmatter matches `SESSION_ID` (#330). When `RESOLVED_NOTE` is empty, omit `source_session_note` entirely even though `SESSION_ID` is known.
 - `<project-name>` is the `PROJECT` value from `get_session_context()` (lowercased, hyphenated basename of cwd)
 - `<Error Title>` is a short, descriptive title for the error (e.g. "BrokenPipeError when piping subprocess output to head")
 - The `source_session_note` field creates an Obsidian backlink to the source session note

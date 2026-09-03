@@ -2443,6 +2443,80 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     return ctx
 
 
+def resolve_source_session_note(
+    session_note_name: str,
+    session_id: str,
+    vault_path: str,
+    sessions_folder: str,
+) -> str:
+    """Return the ``source_session_note`` wikilink stem, or ``""`` to omit it.
+
+    #330 acceptance criterion 3: a note's ``source_session_note`` backlink
+    must not point at a session note whose OWN ``session_id`` contradicts the
+    ``source_session`` being stamped alongside it. The live vault crossing
+    that motivated this: a retro carried ``source_session:
+    18785285-d99d-48ce-a2f7-5bc0aba14055`` (hashes to ``f157``) but
+    ``source_session_note: "[[2026-08-26-openclaw-df46]]"`` -- and ``df46``
+    is ``sha256("504f461a-1881-4bc6-a262-0025f1420ea5")[:4]``, a DIFFERENT
+    session. Composing the field blindly from ``get_session_context()``'s
+    ``session_note_name`` cannot catch that; this helper checks the target
+    note's own frontmatter before vouching for the link.
+
+    Returns ``session_note_name`` unchanged when BOTH hold:
+      - ``<vault_path>/<sessions_folder>/<session_note_name>.md`` exists, AND
+      - that note's frontmatter ``session_id`` equals ``session_id``.
+    Returns ``""`` otherwise (missing target, unparsable frontmatter, no
+    ``session_id`` field, or a mismatched one) -- callers must omit
+    ``source_session_note`` entirely rather than write it empty.
+
+    Scope: the retro/insight/decide/error-log write path only, where a
+    RESOLVED ``source_session`` is stamped and a wrong id would misattribute
+    the note. Deliberately **not** used by
+    ``hooks/obsidian_context_snapshot.py``, whose ``source_session_note`` is
+    a forward reference written at PreCompact to a parent session note that
+    SessionEnd has not created yet -- applying this existence check there
+    would strip the backlink from nearly every snapshot (see
+    ``docs/plans/330-session-id-crossing.md``, "Spec deviation to
+    reconcile").
+
+    A caller with no resolved id at all (``session_id in ("", "unknown")``)
+    already omits ``source_session_note`` per each SKILL.md's existing rule
+    ("If SESSION_ID is unknown, use unknown for source_session and omit
+    source_session_note entirely") -- that case is handled by the caller
+    before this helper is even reached, but is also guarded here so the
+    helper is safe to call unconditionally.
+    """
+    if not session_note_name or not session_id or session_id == "unknown":
+        return ""
+    if not vault_path or not sessions_folder:
+        return ""
+    target = Path(vault_path) / sessions_folder / f"{session_note_name}.md"
+
+    # Path containment before any filesystem access, per the same rule
+    # write_vault_note() follows. session_note_name is not free-form user
+    # input, but it is COMPOSED (make_filename() over a slugified project
+    # taken from the cwd basename), so it is not a literal either — and a
+    # traversal here would read frontmatter from an arbitrary file and
+    # vouch for it as a session note. Cheap check, removes the class.
+    try:
+        vault_real = Path(vault_path).resolve()
+        if not target.resolve().is_relative_to(vault_real):
+            print(f"[obsidian-brain] resolve_source_session_note: path "
+                  f"traversal blocked: {target}", file=sys.stderr)
+            return ""
+    except OSError:
+        return ""
+
+    if not target.is_file():
+        return ""
+    meta = read_note_metadata(str(target))
+    if not meta:
+        return ""
+    if meta.get("session_id") != session_id:
+        return ""
+    return session_note_name
+
+
 def _classify_note_parse_failure(reason: str | None) -> str:
     """Content-free category for a ``read_note_metadata_detailed`` reason.
 
