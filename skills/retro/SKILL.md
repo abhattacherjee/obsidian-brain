@@ -295,9 +295,9 @@ The Step 3a bundle already carries the cached session context as `bundle["_ctx"]
 - `SESSION_ID` = `bundle["_ctx"]["session_id"]`
 - `HASH` = `bundle["_ctx"]["hash"]`
 - `PROJECT` = `bundle["_ctx"]["project"]`
-- `SESSION_NOTE` = `bundle["_ctx"]["resolved_source_session_note"]` (**not** `session_note_name` — this is already guarded: it is `""` unless the target note exists AND its own `session_id` frontmatter matches `SESSION_ID`, which is what stops a `source_session_note` backlink from pointing at a note that contradicts the stamped `source_session` (#330))
+- `SESSION_NOTE` = `bundle["_ctx"]["resolved_source_session_note"]` (**not** `session_note_name` — this is already guarded: it is the note name in the normal case (the target either doesn't exist yet — SessionEnd hasn't written it, this is a forward reference just like the PreCompact snapshot backlink — or exists and agrees), and `""` ONLY when the target note exists, parses, and its own `session_id` frontmatter CONTRADICTS `SESSION_ID` — that is what stops a `source_session_note` backlink from pointing at a note that disagrees with the stamped `source_session` (#330))
 
-**Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely. Also omit `source_session_note` whenever `SESSION_NOTE` is empty (`""`), even when `SESSION_ID` is known — that means the guard above rejected the link.
+**Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely. Also omit `source_session_note` whenever `SESSION_NOTE` is empty (`""`), even when `SESSION_ID` is known — that means the guard above found a genuine contradiction and rejected the link (omit this line entirely when the resolved note is empty; do not write `source_session_note: ""`).
 
 ### Step 6 — Show preview and ask for edits
 
@@ -448,11 +448,13 @@ print(mark_retro_classification_pending(sys.argv[1], sys.argv[2]))
 ' "<current-session-id>" "$VAULT_PATH/$INSIGHTS_FOLDER/<filename>"
 ```
 
-(`<current-session-id>` is the value derived in Step 5. The gate is keyed on it and fails open: if the id can't be resolved the gate stays inactive — never blocking the session.)
+(`<current-session-id>` is the value derived in Step 5. The gate is keyed on it and fails open on an unusable id: if `session_id` is empty or `"unknown"` the gate stays inactive — never blocking the session.)
+
+**Check the printed output before continuing.** If it starts with `Failed:`, the gate did **NOT** arm — print that line to the user in the transcript so the refusal is visible (do not let it scroll past silently). Treat Step 7.5 below as **unenforced but still mandatory**: nothing will block the turn from ending if you skip it, so you must not skip it anyway. Do not print a "saved" confirmation that implies the classification step is enforced when it is not.
 
 ### Step 7.5 — Classify and file process improvements (DO THIS BEFORE Step 8)
 
-The retro is **not done** when the file is written. The literal next action after arming the classification gate is to act on what the retro surfaced — **do not print the "saved" confirmation until this step is complete.** Step 7 armed a Stop-hook gate that blocks the turn from ending until you clear it here, so this is enforced, not merely advised.
+The retro is **not done** when the file is written. The literal next action after arming the classification gate is to act on what the retro surfaced — **do not print the "saved" confirmation until this step is complete.** If Step 7's gate armed successfully (the printed output did not start with `Failed:`), it is a Stop-hook gate that blocks the turn from ending until you clear it here, so this is enforced, not merely advised. If Step 7's gate failed to arm, there is nothing blocking the turn — treat this step as **unenforced but still mandatory**, per Step 7's own instruction.
 
 1. **Extract** every item from the just-written **Process Improvements** and **Key Learnings** sections.
 2. **Classify** each item into exactly one bucket:

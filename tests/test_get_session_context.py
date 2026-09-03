@@ -1231,6 +1231,45 @@ def test_resolve_session_id_cwd_gone_with_env_dir_resolves_via_jsonl(
     assert obsidian_utils._resolve_session_id() == real_sid
 
 
+def test_resolve_session_id_cwd_gone_ambiguous_scan_refuses_not_cross_project_guess(
+    isolated_home, monkeypatch
+):
+    """#330 review item 5: when cwd is gone (source == "env" via
+    CLAUDE_PROJECT_DIR) AND the JSONL scan under that directory is ITSELF
+    ambiguous (2+ concurrent transcripts within the window), layer 4's
+    cross-project bootstrap scan must NOT be consulted to rescue it.
+
+    Before this fix: _try_slow_jsonl_glob's WARN said "'unknown' is returned
+    instead", but control fell through to _recent_bootstrap_sid() anyway
+    (source == "env" unconditionally fell through) and returned a sid from a
+    COMPLETELY DIFFERENT project's bootstrap file — a confident wrong answer
+    dressed up as a refusal. This pins that the ambiguity refusal wins.
+    """
+    _redirect_secure_paths(monkeypatch, isolated_home)
+    decoy_sid = _unique_sid()
+    _seed_bootstrap(isolated_home, "unrelated-project", decoy_sid)
+
+    worktree = "/Users/x/dev/repo--feature-branch"
+    cc_dir = _encoded_project_dir(isolated_home, worktree)
+    cc_dir.mkdir(parents=True)
+    now = 1_800_000_000.0
+    _write_transcript(cc_dir, _unique_sid(), now)
+    _write_transcript(cc_dir, _unique_sid(), now + 1.0)  # 1s apart: concurrent
+
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", worktree)
+
+    result = obsidian_utils._resolve_session_id()
+    assert result == "unknown", (
+        f"expected 'unknown' from the ambiguity refusal, got {result!r} "
+        f"(decoy_sid={decoy_sid!r})"
+    )
+    assert result != decoy_sid
+
+
 def test_get_session_context_rejects_cached_context_from_a_different_cwd(
     isolated_home, tmp_path, monkeypatch, capsys
 ):
@@ -1921,6 +1960,27 @@ def test_resolve_session_id_env_layer_short_circuits_before_any_scan(
     assert obsidian_utils._resolve_session_id() == env_sid
 
 
+def test_resolve_session_id_env_wins_when_project_basename_unresolvable(
+    monkeypatch,
+):
+    """#330 review item 12b: layer 0 (env var) must run AHEAD of, and
+    independently of, project-basename resolution. When cwd is entirely
+    gone (os.getcwd() raises) AND CLAUDE_PROJECT_DIR is also unset — the
+    exact precondition the #105 layer-4 cross-project recovery exists for —
+    a well-formed env var must still resolve directly rather than falling
+    through toward that recovery path or 'unknown'."""
+    def _raise(*a, **kw):
+        raise FileNotFoundError("cwd deleted")
+
+    monkeypatch.setattr(os, "getcwd", _raise)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+
+    env_sid = _unique_sid()
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+
+    assert obsidian_utils._resolve_session_id() == env_sid
+
+
 @pytest.mark.parametrize(
     "bad_env_sid", ["../../etc/passwd", "has space", "", "   "]
 )
@@ -1943,6 +2003,64 @@ def test_resolve_session_id_malformed_env_falls_through_to_scan(
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", bad_env_sid)
 
     assert obsidian_utils._resolve_session_id() == scan_sid
+
+
+@pytest.mark.parametrize("bad_env_sid", ["../../etc/passwd", "has space"])
+def test_resolve_session_id_malformed_nonempty_env_warns_once(
+    isolated_home, monkeypatch, tmp_path, capsys, bad_env_sid
+):
+    """#330 review item 8: a NON-EMPTY but malformed CLAUDE_CODE_SESSION_ID
+    (truncated/quoted/mangled) must emit a one-time WARN before falling
+    through — silently downgrading to the mtime-scan layers with no
+    diagnostic is exactly the asymmetry the benign no-transcript-yet WARN
+    (env_sid well-formed) already gets, but the more suspicious mangled case
+    did not."""
+    project = "malformed-nonempty-env-proj"
+    scan_sid = _unique_sid()
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", bad_env_sid)
+    capsys.readouterr()  # drain
+
+    assert obsidian_utils._resolve_session_id() == scan_sid
+    err = capsys.readouterr().err
+    assert "WARN" in err
+    assert bad_env_sid in err
+    assert "not a well-formed session id" in err
+
+    # One-shot: a second call with the SAME malformed value must not warn again.
+    assert obsidian_utils._resolve_session_id() == scan_sid
+    err2 = capsys.readouterr().err
+    assert err2 == ""
+
+
+def test_resolve_session_id_blank_env_never_warns_malformed(
+    isolated_home, monkeypatch, tmp_path, capsys
+):
+    """Blank/whitespace-only env values are the ordinary 'no env var set'
+    case, not a malformed one — must not trip the new malformed-value WARN."""
+    project = "blank-env-proj"
+    scan_sid = _unique_sid()
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "   ")
+    capsys.readouterr()  # drain
+
+    assert obsidian_utils._resolve_session_id() == scan_sid
+    err = capsys.readouterr().err
+    assert "not a well-formed session id" not in err
 
 
 def test_resolve_session_id_env_absent_matches_pre_existing_scan_behavior(
@@ -2123,6 +2241,48 @@ def test_resolve_session_id_env_with_transcript_present_no_warn(
     assert "no Claude Code transcript" not in err
 
 
+def test_resolve_session_id_env_transcript_check_memoized(
+    isolated_home, monkeypatch, tmp_path
+):
+    """#354 review item 5a: `_env_sid_transcript_checked` must actually cache
+    the transcript-existence glob, not just look decorative. CLAUDE_CODE_SESSION_ID
+    and the resolved project basename are both constant for the life of a
+    process (see the memo's own module comment), so a second call for the
+    SAME (project, env_sid) pair must not re-glob — that per-call cost is
+    exactly what the memo exists to avoid, since _resolve_session_id runs
+    once per note via read_note_metadata()."""
+    project = "env-memo-proj"
+    env_sid = _unique_sid()
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{env_sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+
+    calls = []
+    real_glob = obsidian_utils._glob_project_jsonls
+
+    def counting_glob(safe_project, suffix="*.jsonl"):
+        if suffix == f"{env_sid}.jsonl":
+            calls.append(safe_project)
+        return real_glob(safe_project, suffix=suffix)
+
+    monkeypatch.setattr(obsidian_utils, "_glob_project_jsonls", counting_glob)
+
+    result1 = obsidian_utils._resolve_session_id()
+    result2 = obsidian_utils._resolve_session_id()
+
+    assert result1 == env_sid
+    assert result2 == env_sid
+    assert len(calls) == 1, (
+        f"expected the env-sid transcript glob to run once and be memoized "
+        f"on the second call, but it ran {len(calls)} times"
+    )
+
+
 # ─── #330 task 3: ambiguity yields 'unknown', never a guess ────────────
 #
 # The autouse fixture in conftest.py clears CLAUDE_CODE_SESSION_ID for every
@@ -2246,7 +2406,7 @@ def test_slow_jsonl_glob_three_plus_ambiguous_warn_names_the_count(
 
     assert obsidian_utils._try_slow_jsonl_glob("threeway") == "unknown"
     err = capsys.readouterr().err
-    assert "3 sessions look concurrently active" in err, err
+    assert "3 distinct sessions look concurrently active" in err, err
 
 
 def test_slow_jsonl_glob_warn_fires_once_per_distinct_ambiguous_set(
@@ -2272,6 +2432,42 @@ def test_slow_jsonl_glob_warn_fires_once_per_distinct_ambiguous_set(
     assert obsidian_utils._try_slow_jsonl_glob("warnonceb") == "unknown"
     err2 = capsys.readouterr().err
     assert err2.count("concurrently active") == 1, err2
+
+
+def test_slow_jsonl_glob_same_sid_under_two_encodings_is_not_ambiguous(
+    isolated_home, monkeypatch, capsys
+):
+    """#330 review item 6: _concurrent_viable_sids must dedupe by SID, not by
+    PATH. _glob_project_jsonls deliberately UNIONs every directory-encoding
+    variant for one cwd (see its docstring), so the SAME live session's
+    transcript can legitimately appear at two different paths — e.g. both
+    the '_'-folded and literal encodings of one checkout. Counting PATHS
+    there double-counts a single live session as two and trips the
+    `len(...) >= 2` ambiguity refusal for perfectly ordinary single-session
+    work. Verified on this machine: 8 project directories collide under
+    '_'/'.' folding.
+    """
+    our_cwd = "/Users/x/dev/a_b"
+    monkeypatch.setattr(os, "getcwd", lambda: our_cwd)
+
+    projects = isolated_home / ".claude" / "projects"
+    dir_literal = projects / our_cwd.replace("/", "-")  # "_" kept
+    dir_folded = projects / our_cwd.replace("/", "-").replace("_", "-")  # "_" folded
+    assert dir_literal != dir_folded, "fixture premise: two distinct dir names"
+    dir_literal.mkdir(parents=True)
+    dir_folded.mkdir(parents=True)
+
+    sid = _unique_sid()
+    now = 1_800_000_000.0
+    # Same sid, same instant, under BOTH directory encodings — the same live
+    # session appearing twice via the deliberate encoding union, not two
+    # concurrent sessions.
+    _write_transcript(dir_literal, sid, now)
+    _write_transcript(dir_folded, sid, now)
+
+    assert obsidian_utils._try_slow_jsonl_glob("a_b") == sid
+    err = capsys.readouterr().err
+    assert "concurrently active" not in err, err
 
 
 def test_bootstrap_fast_path_exact_mtime_tie_refuses_not_trusts_cache(

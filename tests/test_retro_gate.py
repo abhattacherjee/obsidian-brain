@@ -305,6 +305,63 @@ class TestRetroGateHelpers:
         assert not path.lower().startswith("failed")
         assert Path(path).exists()
 
+    def test_mark_returns_failed_on_mkdir_oserror(self, monkeypatch):
+        """#330 review item 3: a gate-dir mkdir OSError is a genuinely
+        reachable failure path and must return an explicit "Failed: ..."
+        string, not a bare "" that the skill would print as a blank line
+        and mistake for success."""
+        gate_dir = self._gate_dir()
+        real_mkdir = Path.mkdir
+
+        def fake_mkdir(self, *args, **kwargs):
+            if self == gate_dir:
+                raise OSError("simulated mkdir failure")
+            return real_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", fake_mkdir)
+        result = obsidian_utils.mark_retro_classification_pending(SID, "/vault/retro.md")
+        assert result.startswith("Failed:")
+        assert "simulated mkdir failure" in result
+        assert not gate_dir.exists()
+
+    def test_mark_returns_failed_when_sentinel_escapes_gate_dir(self, monkeypatch):
+        """#330 review item 3: a sentinel path that resolves outside the gate
+        dir is a genuinely reachable failure path and must return an
+        explicit "Failed: ..." string."""
+        gate_dir = self._gate_dir()
+        gate_dir.mkdir(parents=True, exist_ok=True)
+        sanitized = obsidian_utils._RETRO_SID_SAFE.sub("_", SID)
+        expected_resolved = (gate_dir / f"{sanitized}.json").resolve()
+
+        real_relative_to = Path.relative_to
+
+        def fake_relative_to(self, *args, **kwargs):
+            if self == expected_resolved:
+                raise ValueError("simulated escape")
+            return real_relative_to(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "relative_to", fake_relative_to)
+        result = obsidian_utils.mark_retro_classification_pending(SID, "/vault/retro.md")
+        assert result.startswith("Failed:")
+        assert "escapes" in result.lower()
+
+    def test_mark_returns_failed_on_atomic_write_oserror(self, monkeypatch):
+        """#330 review item 3: an OSError from the atomic os.replace() write
+        is a genuinely reachable failure path and must return an explicit
+        "Failed: ..." string."""
+
+        def fake_replace(*args, **kwargs):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(obsidian_utils.os, "replace", fake_replace)
+        result = obsidian_utils.mark_retro_classification_pending(SID, "/vault/retro.md")
+        assert result.startswith("Failed:")
+        assert "simulated replace failure" in result
+        # No stray temp file left behind by the finally-block cleanup.
+        gate_dir = self._gate_dir()
+        leftovers = list(gate_dir.glob("*.tmp"))
+        assert leftovers == [], f"Expected temp file cleanup, found: {leftovers}"
+
     def test_get_returns_dict_after_mark(self):
         obsidian_utils.mark_retro_classification_pending(SID, "/vault/retro.md")
         data = obsidian_utils.get_retro_classification_pending(SID)

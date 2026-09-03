@@ -90,6 +90,44 @@ def test_cache_glob_finds_installed_hooks():
     )
 
 
+def test_skill_snippet_obsidian_utils_imports_exist():
+    """#330 review item 12a: every `from obsidian_utils import X, Y` in a
+    SKILL.md snippet must name attributes that ACTUALLY exist on the
+    obsidian_utils module.
+
+    test_python_snippet_syntax above only compile()s these snippets, which
+    proves they PARSE — a renamed or removed helper is a silent runtime
+    NameError/ImportError nobody catches until a user hits it at the Bash
+    prompt. This walks the AST of every snippet (skipping ones that fail to
+    parse — that failure mode is already covered by
+    test_python_snippet_syntax) and asserts hasattr(obsidian_utils, name)
+    for every imported name. Covers ALL skills, not just #330's
+    retro/compress/decide/error-log call sites — a wiring bug in any
+    skill's snippet is caught the same way.
+    """
+    # conftest.py already inserts hooks/ onto sys.path.
+    import obsidian_utils
+
+    missing = []
+    for name, code in _SNIPPETS:
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            continue  # already asserted elsewhere
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "obsidian_utils":
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    if not hasattr(obsidian_utils, alias.name):
+                        missing.append(f"{name}: from obsidian_utils import {alias.name}")
+
+    assert not missing, (
+        "SKILL.md snippet(s) import names that do not exist on the "
+        f"obsidian_utils module: {missing}"
+    )
+
+
 def test_no_tail_c_in_skills():
     """SKILL.md files must not use 'tail -c' for hash extraction.
 
@@ -1095,4 +1133,141 @@ def test_check_items_output_format_has_a_cache_line():
     assert "NOT updated" in output_block, (
         "the Output format section must document the failure wording, "
         "`NOT updated — <reason>`"
+    )
+
+
+# --- #354 review item 1: no trailing "# comment" on a frontmatter field line ---
+#
+# This repo's frontmatter reader is a flat line splitter (obsidian_utils.py
+# / vault_index.py), NOT a YAML parser: a field line is parsed with
+# `stripped.partition(':')` and `.strip('"')` — which only trims a leading
+# and trailing `"` character, never anything after it. A round-1 line like
+#
+#   source_session_note: "{{source_session_note}}"  # omit this line ...
+#
+# is fatal on exactly that parser: once the model fills in the placeholder
+# and copies the line verbatim, the trailing `# ...` comment is NOT
+# stripped — it becomes part of the field's VALUE. The corrupted wikilink
+# fails `_wikilink_stem`'s bracket test and `crossed_source_session.py`
+# then counts the note as DANGLING, invisible to the very check this PR
+# adds. Round 1 put this shape in seven places (three templates/*.md files,
+# four skills/*/SKILL.md fenced frontmatter examples); this test scans ALL
+# of them generically (any field, not just source_session_note) so the
+# mistake cannot come back on a different key.
+_FRONTMATTER_FIELD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):\s*(.*)$")
+
+
+def _frontmatter_lines_from_block(block_lines):
+    """Yield (line_no_in_block, line) for top-level `key: value` lines in a
+    frontmatter block — skips list items (`  - foo`) and blank lines, which
+    is exactly the line shape the flat parser treats as a field."""
+    for i, line in enumerate(block_lines):
+        if _FRONTMATTER_FIELD_RE.match(line):
+            yield i, line
+
+
+def _template_frontmatter_blocks():
+    """(source_label, [lines]) for the frontmatter block of every
+    templates/*.md file. Tolerates a leading HTML comment (template-only
+    documentation, see #354 review item 1) before the opening `---`."""
+    blocks = []
+    for path in sorted(glob.glob(os.path.join(_REPO_ROOT, "templates/*.md"))):
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        fence_idxs = [i for i, l in enumerate(lines) if l.strip() == "---"]
+        assert len(fence_idxs) >= 2, f"{path}: expected a --- ... --- frontmatter block"
+        start, end = fence_idxs[0], fence_idxs[1]
+        label = os.path.relpath(path, _REPO_ROOT)
+        blocks.append((label, lines[start + 1:end]))
+    return blocks
+
+
+_FENCE_RE = re.compile(r"^```[^\n]*\n(.*?)^```", re.DOTALL | re.MULTILINE)
+
+
+def _skill_frontmatter_blocks():
+    """(source_label, [lines]) for every fenced (```) code block in
+    skills/*/SKILL.md whose first line is a bare `---` — i.e. an example
+    note frontmatter block shown to the model, not an unrelated fence
+    (bash snippet, JSON, etc.)."""
+    blocks = []
+    for path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        for fi, m in enumerate(_FENCE_RE.finditer(content)):
+            fence_lines = m.group(1).splitlines()
+            if not fence_lines or fence_lines[0].strip() != "---":
+                continue
+            close_idxs = [i for i, l in enumerate(fence_lines[1:], start=1) if l.strip() == "---"]
+            if not close_idxs:
+                # A bare leading '---' with no closing '---' is a markdown
+                # horizontal rule inside an example block (e.g. a rendered
+                # report template), not YAML frontmatter — skip it rather
+                # than misparse it as one.
+                continue
+            end = close_idxs[0]
+            label = f"{os.path.relpath(path, _REPO_ROOT)}#fence{fi}"
+            blocks.append((label, fence_lines[1:end]))
+    return blocks
+
+
+def test_no_trailing_comment_on_frontmatter_field_lines():
+    """No `templates/*.md` or `skills/*/SKILL.md` example frontmatter block
+    may have a trailing `#` comment on a field line — see the module
+    comment above this test for why (#354 review item 1)."""
+    violations = []
+    for label, block_lines in _template_frontmatter_blocks() + _skill_frontmatter_blocks():
+        for i, line in _frontmatter_lines_from_block(block_lines):
+            if "#" in line:
+                violations.append(f"{label}:{i}: {line!r}")
+
+    assert not violations, (
+        "trailing '#' comment found on a frontmatter field line — this "
+        "repo's frontmatter reader is a flat line splitter, not a YAML "
+        "parser, so an inline comment corrupts the field's value once a "
+        "model copies the line verbatim (#354 review item 1). Move the "
+        "instruction to prose outside the frontmatter block instead.\n"
+        + "\n".join(violations)
+    )
+
+
+def test_no_trailing_comment_regression_fixture_would_have_caught_round1():
+    """Mutation proof: re-introducing the round-1 shape on an UNRELATED
+    field must fail test_no_trailing_comment_on_frontmatter_field_lines —
+    proves the scan is general, not source_session_note-specific."""
+    fixture = ["type: claude-insight", 'foo: "bar"  # omit this line entirely when empty']
+    violations = [
+        f"fixture:{i}: {line!r}"
+        for i, line in _frontmatter_lines_from_block(fixture)
+        if "#" in line
+    ]
+    assert violations, "the fixture itself must trip the detector"
+
+
+def test_every_template_starts_with_the_frontmatter_fence():
+    """A template must begin at byte 0 with '---'.
+
+    Anything before the opening fence — an HTML comment, a blank line, a
+    prose note — means the repo's own parser captures NO frontmatter at all,
+    so a note copied from that template is invisible to the index, to
+    /recall, and to every vault-doctor check. This repo ships a dedicated
+    `missing-frontmatter-fence` check for exactly that failure, which is how
+    seriously it is treated.
+
+    Regression guard: a #330 review fix moved an instruction comment above
+    the fence in insight/decision/error-fix, which silently broke all three.
+    The trailing-comment guard below could not see it, because the damage
+    was above the frontmatter rather than inside it.
+    """
+    import glob
+
+    offenders = []
+    for path in sorted(glob.glob(os.path.join(_REPO_ROOT, "templates", "*.md"))):
+        with open(path, encoding="utf-8") as fh:
+            head = fh.read(3)
+        if head != "---":
+            offenders.append(f"{os.path.basename(path)} starts {head!r}, not '---'")
+
+    assert not offenders, (
+        "template(s) do not begin with the frontmatter fence: " + "; ".join(offenders)
     )

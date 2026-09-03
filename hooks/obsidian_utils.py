@@ -242,8 +242,14 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
     Sentinel content: {"session_id": str, "retro_path": str, "created_at": float}
     Permissions: dir 0o700, file 0o600.
 
-    Returns the sentinel path as a string, or "" if session_id is falsy or
-    writing fails (silent-failure — swallows errors, always returns).
+    Returns the sentinel path as a string on success. On ANY failure to arm
+    the gate — an empty/"unknown" session_id, a gate-dir mkdir OSError, a
+    sanitized name that would escape the gate dir, or an OSError from the
+    atomic write itself — returns an explicit "Failed: ..." string, never a
+    bare "". The retro skill's Step 7 call site prints this return value
+    verbatim, so every one of these is a case where the gate did NOT arm and
+    the Stop hook will not enforce classification for this session; a blank
+    "" return would read as success to that print (#330 review item 3).
 
     Refuses to write when `session_id` is empty, whitespace-only, or the
     literal string "unknown" (#330 task 4). Those values cannot be an
@@ -286,7 +292,7 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
     except OSError as exc:
         print(f"[obsidian-brain] mark_retro_classification_pending: cannot create gate dir: {exc}",
               file=sys.stderr)
-        return ""
+        return f"Failed: cannot create retro gate directory: {exc}; gate NOT armed, Stop hook will not enforce classification for this session"
 
     # Opportunistically reap stale orphaned sentinels. Wrapped in its own
     # try/except so a reap failure can never break the mark operation.
@@ -304,7 +310,7 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
     except ValueError:
         print(f"[obsidian-brain] mark_retro_classification_pending: sentinel path escapes gate dir",
               file=sys.stderr)
-        return ""
+        return "Failed: sentinel path escapes the retro gate directory; gate NOT armed, Stop hook will not enforce classification for this session"
 
     payload = {
         "session_id": session_id,
@@ -325,7 +331,7 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
     except OSError as exc:
         print(f"[obsidian-brain] mark_retro_classification_pending: write failed: {exc}",
               file=sys.stderr)
-        return ""
+        return f"Failed: could not write retro gate sentinel: {exc}; gate NOT armed, Stop hook will not enforce classification for this session"
     finally:
         if tmp_path is not None:
             try:
@@ -1342,16 +1348,22 @@ _unknown_sid_warned: set[str] = set()
 # (#330 task 3).
 _concurrent_sids_warned: set[tuple[str, ...]] = set()
 _env_sid_no_transcript_warned: set[tuple[str, str]] = set()
+# Keyed by the raw (unvalidated) env value itself so a DIFFERENT malformed
+# value later in the same process still warns once more (#330 review item 8).
+_env_sid_malformed_warned: set[str] = set()
 
 # Memo for the env-layer transcript check below, keyed by (project, env_sid).
 #
-# WHY: CLAUDE_CODE_SESSION_ID and the resolved project basename are both
-# constant for the life of a process, so the answer to "does this sid have a
-# transcript yet" cannot change mid-run. Without this cache, the same targeted
-# glob would re-run on every _get_session_id_fast() call — once per NOTE via
-# read_note_metadata() (see the WHY above _transcript_dir_arbitration) — for
-# the entire life of the env layer's fast-return path, which exists precisely
-# to AVOID that per-note glob cost (#330).
+# WHY: CLAUDE_CODE_SESSION_ID is constant for the life of a process, and the
+# resolved project basename is too — but only because nothing in this module
+# calls os.chdir(); it is derived from os.getcwd() (or CLAUDE_PROJECT_DIR)
+# fresh on every call, and would change mid-run if the process's cwd did
+# (#354 review item 5c/6c). Given that, the answer to "does this sid have a
+# transcript yet" cannot change mid-run. Without this cache, the same
+# targeted glob would re-run on every _get_session_id_fast() call — once per
+# NOTE via read_note_metadata() (see the WHY above _transcript_dir_arbitration)
+# — for the entire life of the env layer's fast-return path, which exists
+# precisely to AVOID that per-note glob cost (#330).
 _env_sid_transcript_checked: dict[tuple[str, str], bool] = {}
 
 
@@ -1740,31 +1752,57 @@ def _concurrent_viable_sids(
     "within" it — the strongest read of "two sessions touched their
     transcripts 120.0s apart" is still ambiguous, not safely resolved.
 
+    DEDUPES by sid, not by path (#330 review item 6). `_glob_project_jsonls`
+    deliberately UNIONs every directory-encoding variant for one cwd (see its
+    docstring), so the SAME sid's transcript can legitimately appear at two
+    different paths — e.g. both the `_`-folded and `-`-folded encodings of
+    one checkout hold a copy/symlink of the same session's JSONL. Counting
+    PATHS there double-counts a single live session as two, which trips
+    `len(...) >= 2` and turns one ordinary session into a false 'unknown'.
+    Verified on this machine: 8 project directories collide under `_`/`.`
+    folding. A `set` comprehension collapses that back to one entry per
+    DISTINCT session, which is what "concurrently active" actually means.
+
     Returns at least one sid (the newest itself, delta 0.0 always qualifies).
     Callers treat `len(...) >= 2` as ambiguous.
     """
-    return sorted(
+    return sorted({
         os.path.splitext(os.path.basename(p))[0]
         for m, p in viable
         if newest_mtime - m <= _CONCURRENT_SESSION_WINDOW_SECONDS
-    )
+    })
 
 
-def _try_slow_jsonl_glob(project: str) -> str:
+def _try_slow_jsonl_glob_ex(project: str) -> tuple[str, bool]:
     """Slow path: glob all JSONLs under ~/.claude/projects/*<project>/, return
-    SID of the newest. Used by both _resolve_session_id (when bootstrap is
-    skipped or empty) and as the existing health-check entry point.
+    (SID of the newest, whether the result was ambiguity-driven). Used by both
+    _resolve_session_id_ex (when bootstrap is skipped or empty) and as the
+    existing health-check entry point.
 
-    Returns 'unknown' if no JSONLs match, OR if 2+ viable transcripts have an
-    mtime within _CONCURRENT_SESSION_WINDOW_SECONDS of the newest — that shape
-    is two sessions concurrently active in the same project, and newest-mtime
-    cannot tell them apart. Guessing the newest one is exactly the bug #330
-    reports: whichever session happened to write last wins, and the OTHER
-    session gets its id, silently mis-attributing notes and defeating the
-    retro Stop-hook gate armed under the wrong sid. 'unknown' is a supported,
-    handled outcome (get_session_context refuses to cache it and falls back to
-    the live canonical_project_name()), so a correct "I don't know" strictly
-    beats a confident wrong guess here.
+    Returns ('unknown', False) if no JSONLs match, OR ('unknown', True) if 2+
+    viable transcripts have an mtime within _CONCURRENT_SESSION_WINDOW_SECONDS
+    of the newest — that shape is two sessions concurrently active in the same
+    project, and newest-mtime cannot tell them apart. Guessing the newest one
+    is exactly the bug #330 reports: whichever session happened to write last
+    wins, and the OTHER session gets its id, silently mis-attributing notes and
+    defeating the retro Stop-hook gate armed under the wrong sid. 'unknown' is
+    a supported, handled outcome (get_session_context refuses to cache it and
+    falls back to the live canonical_project_name()), so a correct "I don't
+    know" strictly beats a confident wrong guess here.
+
+    The second element of the tuple lets a caller tell these two 'unknown'
+    shapes apart (#330 review item 5) WITHOUT the module-level flag this
+    function used to set: `upgrade_batch()` runs a `ThreadPoolExecutor`, and
+    each worker's `upgrade_note_with_summary()` reaches this function via
+    `_get_session_id_fast()` — a shared mutable "last call's answer" flag is a
+    race under that fan-out (#354 review item 3): thread A sets it True for
+    its own project, thread B calls this function for a DIFFERENT, unambiguous
+    project and resets it False, and A then reads False and falls through to
+    a cross-project sid — exactly the mis-attribution bug the flag was added
+    to prevent, reopened under concurrency. Returning the value instead of
+    stashing it in module state makes that race structurally impossible: each
+    caller gets ITS OWN answer, on its own stack, no matter how many other
+    threads call this function in between.
 
     Bootstrap-blind by contract — never reads or trusts the sid-<project>
     bootstrap file.
@@ -1775,22 +1813,29 @@ def _try_slow_jsonl_glob(project: str) -> str:
     entries = [(_safe_mtime(p), p) for p in matches]
     viable = [(m, p) for m, p in entries if m >= 0]
     if not viable:
-        return "unknown"
+        return "unknown", False
     newest_mtime, newest_path = max(viable)
     concurrent_sids = _concurrent_viable_sids(viable, newest_mtime)
     if len(concurrent_sids) >= 2:
         _warn_once(
             _concurrent_sids_warned,
             tuple(concurrent_sids),
-            f"[obsidian-brain] WARN: {len(concurrent_sids)} sessions look "
-            f"concurrently active in this project, obsidian-brain cannot "
+            f"[obsidian-brain] WARN: {len(concurrent_sids)} distinct sessions "
+            f"look concurrently active in this project, obsidian-brain cannot "
             f"tell which is the current one, refusing to guess; a confident "
             f"wrong id silently mis-attributes notes and defeats the retro "
             f"Stop-hook gate, so 'unknown' is returned instead "
             f"(sids: {concurrent_sids})",
         )
-        return "unknown"
-    return os.path.splitext(os.path.basename(newest_path))[0]
+        return "unknown", True
+    return os.path.splitext(os.path.basename(newest_path))[0], False
+
+
+def _try_slow_jsonl_glob(project: str) -> str:
+    """Thin wrapper over `_try_slow_jsonl_glob_ex` for callers that only need
+    the sid — the pre-#354 health-check entry point and any other existing
+    caller. See `_try_slow_jsonl_glob_ex` for the full contract."""
+    return _try_slow_jsonl_glob_ex(project)[0]
 
 
 def _slow_path_newest_sid() -> str:
@@ -1806,9 +1851,21 @@ def _slow_path_newest_sid() -> str:
     of against the JSONLs on disk — a health check that can no longer detect
     the env var pointing at a session with no transcript (#330 task 2).
 
-    Returns 'unknown' if no JSONLs are found for the current cwd.
+    Returns 'unknown' if no JSONLs are found for the current cwd. See
+    `_slow_path_newest_sid_ex` for a variant that also reports WHY (#354
+    review item 4).
     """
     return _resolve_session_id(allow_bootstrap=False, allow_env=False)
+
+
+def _slow_path_newest_sid_ex() -> tuple[str, bool]:
+    """Like `_slow_path_newest_sid`, but also returns whether an 'unknown'
+    result was ambiguity-driven (2+ concurrently active sessions) rather than
+    plain absence (no JSONL at all) — #354 review item 4. `check_hook_status`
+    uses this to stop reporting "No session files found — run /obsidian-setup"
+    (wrong diagnosis, wrong remedy) when the real situation is "found several,
+    can't tell which is current"."""
+    return _resolve_session_id_ex(allow_bootstrap=False, allow_env=False)
 
 
 def _try_bootstrap_fast_path(project: str) -> str | None:
@@ -1922,7 +1979,22 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
 
 
 def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) -> str:
+    """Thin wrapper over `_resolve_session_id_ex` for callers that only need
+    the sid. See `_resolve_session_id_ex` for the full layered resolution
+    contract and for why the ambiguity signal is a return value now, not
+    module state (#354 review item 3)."""
+    return _resolve_session_id_ex(allow_bootstrap, allow_env)[0]
+
+
+def _resolve_session_id_ex(allow_bootstrap: bool = True, allow_env: bool = True) -> tuple[str, bool]:
     """Single source of truth for current-session SID resolution. Never raises.
+
+    Returns ``(sid, ambiguous)`` — ``ambiguous`` is True only when the
+    returned sid is ``'unknown'`` AND that specific 'unknown' came from layer
+    3 finding 2+ concurrently active sessions (see `_try_slow_jsonl_glob_ex`),
+    as opposed to plain absence (no JSONL at all) or never reaching layer 3
+    (e.g. no project basename). Threaded as a LOCAL through this function,
+    never module state — see the concurrency note below.
 
     Resolution layers (each failure → next):
       0. CLAUDE_CODE_SESSION_ID env var (#330 task 2), gated by `allow_env`
@@ -1952,7 +2024,12 @@ def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) ->
          to close. When the value is well-formed but no transcript is found
          for it under the resolved project, a one-time WARN is emitted (see
          _env_sid_no_transcript_warned) and the env value is still returned;
-         this is informational, not a validation gate.
+         this is informational, not a validation gate. When the value FAILS
+         the format check outright (non-empty but malformed — truncated,
+         quoted, mangled), a separate one-time WARN is emitted (see
+         _env_sid_malformed_warned, #330 review item 8) before falling
+         through to layer 1, so a corrupted env var is visible rather than
+         silently downgrading resolution quality to the mtime layers.
       1. Project basename via _resolve_project_basename (cwd → env → None)
       2. Bootstrap fast path (skipped if allow_bootstrap=False)
       3. Slow-path JSONL glob
@@ -1991,6 +2068,32 @@ def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) ->
     that variable in hooks, so gating on `project is not None` would have
     narrowed #105 to "worktree deleted AND the env var happens to be unset",
     silently returning 'unknown' where it used to recover the sid.
+
+    A second, narrower gate sits in front of layer 4 (#330 review item 5):
+    when source == "env" and layer 3's 'unknown' was AMBIGUITY (2+ concurrent
+    sessions in this project, per the local `ambiguous` value returned by
+    `_try_slow_jsonl_glob_ex`) rather than absence (no JSONL at all), layer 4
+    is skipped too. Falling through unconditionally let the cross-project
+    scan silently override an ambiguity refusal with a confident guess from a
+    DIFFERENT repo's bootstrap — the WARN emitted by layer 3 says "'unknown'
+    is returned instead", but a cross-project sid is what a caller actually
+    got back. Layer 4 exists to rescue "no transcript for THIS session
+    because cwd is gone"; ambiguity is a different, unrelated failure mode
+    and must not be rescued by it.
+
+    CONCURRENCY (#354 review item 3): this resolver IS called from multiple
+    threads — `upgrade_batch()` runs a `ThreadPoolExecutor`, and each
+    worker's `upgrade_note_with_summary()` reaches this function via
+    `_get_session_id_fast()`. The pre-#354 implementation tracked the
+    ambiguity signal in a module-level `_last_slow_glob_ambiguous` flag,
+    which is exactly the shared-mutable-state shape that breaks under that
+    fan-out: thread A sets it True for its own (ambiguous) project, thread B
+    concurrently resolves a DIFFERENT, unambiguous project and resets it
+    False, and A then reads False and falls through to layer 4 — returning a
+    cross-project sid, reopening the very bug #330 built this resolver to
+    close. `ambiguous` here is a plain local computed fresh from this call's
+    own `_try_slow_jsonl_glob_ex` result and returned to THIS caller only, so
+    no other thread's call can ever overwrite it mid-flight.
     """
     if allow_env:
         env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
@@ -2020,28 +2123,65 @@ def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) ->
                         f"the env var is not stale or pointing at a "
                         f"different project than the current cwd)",
                     )
-            return env_sid
+            return env_sid, False
+        elif env_sid:
+            # Well-formed check FAILED but the var is non-empty (#330 review
+            # item 8): a truncated, quoted, or otherwise mangled
+            # CLAUDE_CODE_SESSION_ID silently drops back to the mtime-glob
+            # layers this PR exists to stop trusting, with no diagnostic —
+            # while the merely-BENIGN case just above (well-formed, no
+            # transcript yet) gets a long WARN. That asymmetry buries the
+            # more suspicious case. One-time WARN so a mangled env var is
+            # visible instead of silently downgrading resolution quality.
+            _warn_once(
+                _env_sid_malformed_warned,
+                env_sid,
+                f"[obsidian-brain] WARN: CLAUDE_CODE_SESSION_ID={env_sid!r} "
+                f"is set but is not a well-formed session id "
+                f"(fails _SID_FILENAME_SAFE); ignoring it and falling back "
+                f"to project-directory scanning, which cannot distinguish "
+                f"concurrent sessions the way the harness-provided id can — "
+                f"verify the environment is not truncating, quoting, or "
+                f"otherwise mangling this variable",
+            )
 
     project, source = _resolve_project_basename_with_source()
     if project is not None:
         if allow_bootstrap:
             sid = _try_bootstrap_fast_path(project)
             if sid:
-                return sid
-        sid = _try_slow_jsonl_glob(project)
+                return sid, False
+        sid, ambiguous = _try_slow_jsonl_glob_ex(project)
         if sid != "unknown":
-            return sid
+            return sid, False
         if source == "cwd":
             # cwd is readable but has no session of its own — do NOT fall
             # through to the cross-project scan below. See the docstring (#260).
-            return "unknown"
+            return "unknown", ambiguous
         # source == "env": cwd is gone, so there is nothing left to contradict
-        # the cross-project scan — #105's original case. Fall through to it.
+        # the cross-project scan — #105's original case. Fall through to it...
+        #
+        # ...EXCEPT when THIS 'unknown' was ambiguity, not absence (#330
+        # review item 5). _try_slow_jsonl_glob_ex collapses "no JSONLs found
+        # at all" and "2+ concurrent sessions found" into the same 'unknown'
+        # sentinel; only its WARN text (and the local `ambiguous` value)
+        # tells them apart. Falling through unconditionally let layer 4's
+        # cross-project scan silently OVERRIDE that ambiguity refusal with a
+        # confident guess from a DIFFERENT repo's bootstrap — the WARN says
+        # "'unknown' is returned instead" while a wrong, cross-project sid is
+        # what actually came back. `ambiguous` was computed by the call
+        # immediately above, on this stack frame alone, so no other thread's
+        # resolution can have changed it — refuse outright, exactly like the
+        # source == "cwd" branch: absence of a transcript for THIS session
+        # is the only case layer 4 exists to rescue, and ambiguity is not
+        # absence.
+        if ambiguous:
+            return "unknown", True
     if allow_bootstrap:
         sid = _recent_bootstrap_sid()
         if sid:
-            return sid
-    return "unknown"
+            return sid, False
+    return "unknown", False
 
 
 def _get_session_id_fast(allow_env: bool = True) -> str:
@@ -2272,7 +2412,10 @@ def check_hook_status() -> dict:
     A SID mismatch (bootstrap points at a previous session) is normal after
     reconnects and does NOT indicate a problem — sessions are still logged.
     "ok" is False only when the bootstrap file is missing entirely or no
-    session files can be found.
+    session files can be found — or when 2+ sessions look concurrently
+    active and the check cannot tell which is current (#354 review item 4);
+    that last case gets its own message, since "run /obsidian-setup" is the
+    wrong remedy for it.
     """
     # Cwd-based project name (NOT canonical) — used for CC's path-encoded
     # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
@@ -2290,8 +2433,14 @@ def check_hook_status() -> dict:
     # Use the bootstrap-independent slow path so the check isn't circular.
     # _get_session_id_fast() can return the cached bootstrap value, which
     # would make this health check report OK even when the bootstrap is
-    # stale.
-    current_sid = _slow_path_newest_sid()
+    # stale. The _ex variant also reports WHETHER an 'unknown' result was
+    # ambiguity-driven (2+ concurrently active sessions) rather than plain
+    # absence (no JSONL at all) — #354 review item 4: without it, two live
+    # transcripts and a valid bootstrap were reported as "No session files
+    # found — run /obsidian-setup to verify configuration", which is both
+    # the wrong diagnosis (files WERE found) and the wrong remedy (setup has
+    # nothing to fix here).
+    current_sid, ambiguous = _slow_path_newest_sid_ex()
 
     if bootstrap_sid is None:
         return {
@@ -2302,6 +2451,16 @@ def check_hook_status() -> dict:
         }
 
     if current_sid == "unknown":
+        if ambiguous:
+            return {
+                "ok": False,
+                "message": (
+                    "Two or more sessions look concurrently active in this "
+                    "project — cannot identify which is current"
+                ),
+                "bootstrap_sid": bootstrap_sid,
+                "current_sid": current_sid,
+            }
         return {
             "ok": False,
             "message": "No session files found — run /obsidian-setup to verify configuration",
@@ -2443,6 +2602,13 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     return ctx
 
 
+# One-shot WARN registry for resolve_source_session_note's contradiction
+# branch, keyed by (stamped session_id, target note's own session_id) so a
+# DIFFERENT crossing later in the same process still warns once more — same
+# discipline as _concurrent_sids_warned above (#330 review item 2).
+_crossed_source_session_warned: set[tuple[str, str]] = set()
+
+
 def resolve_source_session_note(
     session_note_name: str,
     session_id: str,
@@ -2452,7 +2618,7 @@ def resolve_source_session_note(
     """Return the ``source_session_note`` wikilink stem, or ``""`` to omit it.
 
     #330 acceptance criterion 3: a note's ``source_session_note`` backlink
-    must not point at a session note whose OWN ``session_id`` contradicts the
+    must not point at a session note whose OWN ``session_id`` CONTRADICTS the
     ``source_session`` being stamped alongside it. The live vault crossing
     that motivated this: a retro carried ``source_session:
     18785285-d99d-48ce-a2f7-5bc0aba14055`` (hashes to ``f157``) but
@@ -2462,22 +2628,50 @@ def resolve_source_session_note(
     ``session_note_name`` cannot catch that; this helper checks the target
     note's own frontmatter before vouching for the link.
 
-    Returns ``session_note_name`` unchanged when BOTH hold:
-      - ``<vault_path>/<sessions_folder>/<session_note_name>.md`` exists, AND
-      - that note's frontmatter ``session_id`` equals ``session_id``.
-    Returns ``""`` otherwise (missing target, unparsable frontmatter, no
-    ``session_id`` field, or a mismatched one) -- callers must omit
-    ``source_session_note`` entirely rather than write it empty.
+    The guard is a CONTRADICTION check, not an existence check -- this is the
+    one point in this docstring worth over-explaining, because the first cut
+    of this helper got it backwards and it silently disabled the feature:
+
+    - ``/compress``, ``/decide``, ``/error-log`` and ``/retro`` all run
+      MID-SESSION, strictly before SessionEnd writes the target session note.
+      The write here is therefore a FORWARD REFERENCE, exactly like the one
+      ``hooks/obsidian_context_snapshot.py`` writes at PreCompact -- the
+      target is *expected* to not exist yet. Treating "target absent" as
+      grounds to omit the field means the backlink is missing for
+      essentially every retro/insight/decision/error-fix note ever written,
+      which is not a narrow miss, it is the feature not firing.
+    - An existence check cannot detect a crossing even in principle:
+      ``session_note_name`` is composed from the SAME ``session_id`` being
+      stamped (``hash(session_id)[:4]``, see ``get_session_context()``), so a
+      WRONG ``session_id`` produces a self-consistent WRONG
+      ``session_note_name`` in the same direction -- there is nothing for an
+      existence check to disagree with. Only comparing against the target
+      note's OWN, independently-written ``session_id`` frontmatter (once that
+      note exists) can ever catch a crossing. That is what the mismatch
+      branch below does, and it is the only branch that can fire on the live
+      #330 crossing this helper exists to catch.
+
+    Returns ``session_note_name`` unchanged (the forward reference is kept)
+    when any of the following hold:
+      - the target note does not exist yet (normal, pre-SessionEnd case), or
+      - the target note exists but its frontmatter could not be parsed
+        (an unparsable file cannot be said to CONTRADICT anything), or
+      - the target note exists, parses, and its ``session_id`` matches
+        ``session_id``.
+    Returns ``""`` (omit the field) ONLY when the target note exists, parses,
+    and its ``session_id`` field is present and DIFFERS from ``session_id``
+    -- a genuine, provable contradiction.
 
     Scope: the retro/insight/decide/error-log write path only, where a
     RESOLVED ``source_session`` is stamped and a wrong id would misattribute
     the note. Deliberately **not** used by
     ``hooks/obsidian_context_snapshot.py``, whose ``source_session_note`` is
     a forward reference written at PreCompact to a parent session note that
-    SessionEnd has not created yet -- applying this existence check there
+    SessionEnd has not created yet -- applying an existence check there
     would strip the backlink from nearly every snapshot (see
     ``docs/plans/330-session-id-crossing.md``, "Spec deviation to
-    reconcile").
+    reconcile"). This helper now treats absence the same way for its own
+    callers, for the identical reason.
 
     A caller with no resolved id at all (``session_id in ("", "unknown")``)
     already omits ``source_session_note`` per each SKILL.md's existing rule
@@ -2508,11 +2702,30 @@ def resolve_source_session_note(
         return ""
 
     if not target.is_file():
-        return ""
+        return session_note_name  # forward reference: SessionEnd writes it later
     meta = read_note_metadata(str(target))
     if not meta:
-        return ""
-    if meta.get("session_id") != session_id:
+        return session_note_name  # unparsable target cannot contradict anything
+    target_session_id = (meta.get("session_id") or "").strip()
+    if target_session_id and target_session_id != session_id:
+        _warn_once(
+            _crossed_source_session_warned,
+            (session_id, target_session_id),
+            f"[obsidian-brain] WARN: source_session_note contradiction — "
+            f"the note being written stamps source_session={session_id!r}, "
+            f"but its resolved backlink target "
+            f"{str(target)!r} carries its OWN session_id="
+            f"{target_session_id!r}, a DIFFERENT session. This is exactly "
+            f"the crossed-attribution shape #330 exists to catch: two "
+            f"resolutions inside one write disagreed, or a stale "
+            f"session_note_name collided with an unrelated note of the "
+            f"same hash prefix. Omitting source_session_note for this "
+            f"write so the vault is not left with a backlink pointing at "
+            f"the wrong session; the crossed-source-session vault-doctor "
+            f"check can only ever see this if the field is actually "
+            f"written somewhere, so this WARN is the one place an ONGOING "
+            f"crossing is visible in the transcript.",
+        )
         return ""
     return session_note_name
 

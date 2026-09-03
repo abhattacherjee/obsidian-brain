@@ -69,6 +69,10 @@ DESCRIPTION = (
     "Detect notes whose source_session and source_session_note wikilink "
     "target disagree about which session produced them (#330)"
 )
+# The damage is historic and undated — a note crossed 4 months ago is exactly
+# as mis-attributed as one crossed today — so this check scans the whole
+# vault regardless of --days (mirrors memory_index.py's DEFAULT_WINDOW_DAYS
+# comment for the same reason).
 DEFAULT_WINDOW_DAYS = 9999  # unbounded — the damage is historic; scan all notes
 
 # Confidence for a crossed-source-session finding. Deliberately high (not
@@ -95,20 +99,56 @@ def _wikilink_stem(raw: str) -> str:
     return val.strip().strip('"').strip("'").strip()
 
 
-def _index_sessions_by_stem(vault_root: Path, sessions_folder: str) -> dict[str, Path]:
+def _list_md_files(folder_path: Path) -> tuple[list[Path], str | None]:
+    """List the ``*.md`` files directly in ``folder_path``, or ``([], error)``
+    if the directory itself could not be listed.
+
+    ``Path.glob()`` silently SWALLOWS ``OSError`` raised while walking a
+    directory (an unreadable subdirectory just vanishes from the results —
+    no exception, no partial-scan signal), while ``Path.iterdir()`` raises
+    it. Using ``glob("*.md")`` here would make an unreadable
+    ``sessions_folder`` look like an EMPTY one: the stem index in
+    ``_index_sessions_by_stem`` would come back empty, every resolvable
+    ``source_session_note`` link would look dangling (which this check
+    deliberately does not report — see the module docstring), and the whole
+    check would report CLEAN having actually scanned nothing. An empty
+    directory and a directory that could not be read must never look the
+    same. Same precedent as ``session_coverage.py``'s ``_index_session_notes``,
+    which uses ``iterdir()`` for exactly this reason.
+    """
+    try:
+        entries = sorted(
+            p for p in folder_path.iterdir()
+            if p.name.endswith(".md") and p.is_file()
+        )
+    except OSError as exc:
+        return [], str(exc)
+    return entries, None
+
+
+def _index_sessions_by_stem(
+    vault_root: Path, sessions_folder: str
+) -> tuple[dict[str, Path], int, str | None]:
     """Map ``stem -> path`` for every ``*.md`` in ``sessions_folder``.
 
     Used to resolve a ``source_session_note`` wikilink to a file without a
     second glob per note.
+
+    Returns ``(index, n_listed, list_error)``. ``list_error`` is set (and
+    ``index`` empty) when the directory itself could not be listed — the
+    caller must treat that as "the index is not trustworthy", never as "no
+    session notes exist" (see ``_list_md_files``).
     """
     index: dict[str, Path] = {}
     folder_path = vault_root / sessions_folder
     if not folder_path.is_dir():
-        return index
-    for md_file in folder_path.glob("*.md"):
-        if md_file.is_file():
-            index[md_file.stem] = md_file
-    return index
+        return index, 0, None
+    entries, err = _list_md_files(folder_path)
+    if err is not None:
+        return index, 0, err
+    for md_file in entries:
+        index[md_file.stem] = md_file
+    return index, len(entries), None
 
 
 def scan(
@@ -124,48 +164,102 @@ def scan(
     vault_root = Path(vault_path)
     issues: list[Issue] = []
 
-    sessions_by_stem = _index_sessions_by_stem(vault_root, sessions_folder)
+    sessions_by_stem, n_indexed, index_err = _index_sessions_by_stem(
+        vault_root, sessions_folder
+    )
+    if index_err is not None:
+        print(
+            f"[{NAME}] WARNING: could not list session notes under "
+            f"{vault_root / sessions_folder}: {index_err}; every "
+            f"source_session_note wikilink will read as unresolvable this "
+            f"run (not reported — dangling links are excluded by design — "
+            f"but a genuine crossing under an unreadable target could be "
+            f"missed)",
+            file=sys.stderr,
+        )
+
+    n_scanned = 0
+    n_skipped = 0  # source note itself unreadable/unparsable
+    n_no_stamp = 0  # no usable source_session / source_session_note to check
+    n_dangling = 0  # link resolves to nothing (by design, not reported)
+    n_target_unreadable = 0  # link resolves to a note we couldn't read/parse
+    n_clean = 0  # checked and matched
 
     for folder in (insights_folder, sessions_folder):
         folder_path = vault_root / folder
         if not folder_path.is_dir():
             continue
 
-        for md_file in sorted(folder_path.glob("*.md")):
-            if not md_file.is_file():
-                continue
+        entries, folder_err = _list_md_files(folder_path)
+        if folder_err is not None:
+            print(
+                f"[{NAME}] WARNING: could not list {folder_path}: "
+                f"{folder_err}; notes in this folder are NOT scanned this "
+                f"run",
+                file=sys.stderr,
+            )
+            continue
+
+        for md_file in entries:
             if project and f"-{project}-" not in md_file.name:
                 continue
 
+            n_scanned += 1
             meta = read_note_metadata(str(md_file))
             if not meta:
+                n_skipped += 1
+                print(
+                    f"[{NAME}] WARNING: could not parse {md_file}; skipped "
+                    f"(not counted as clean, not counted as crossed)",
+                    file=sys.stderr,
+                )
                 continue
 
             source_session = (meta.get("source_session") or "").strip()
             if not source_session or source_session == "unknown":
+                n_no_stamp += 1
                 continue
 
             raw_link = meta.get("source_session_note")
             if not raw_link:
+                n_no_stamp += 1
                 continue
             stem = _wikilink_stem(raw_link)
             if not stem:
+                n_no_stamp += 1
                 continue
 
             target_path = sessions_by_stem.get(stem)
             if target_path is None:
                 # Dangling link — deliberately not reported, see module
-                # docstring ("Deliberately NOT reported").
+                # docstring ("Deliberately NOT reported"). Also the shape
+                # every link takes when index_err fired above.
+                n_dangling += 1
                 continue
 
-            target_meta = read_note_metadata(str(target_path)) or {}
+            target_meta = read_note_metadata(str(target_path))
+            if not target_meta:
+                # Target note exists but could not be read/parsed — cannot
+                # compare, and unlike a dangling link this IS worth a
+                # diagnostic: the note is present on disk, so "cannot tell"
+                # is a scan gap, not the normal pre-SessionEnd shape.
+                n_target_unreadable += 1
+                print(
+                    f"[{NAME}] WARNING: could not parse link target "
+                    f"{target_path} (linked from {md_file}); cannot check "
+                    f"for a crossing",
+                    file=sys.stderr,
+                )
+                continue
             target_session_id = (target_meta.get("session_id") or "").strip()
             if not target_session_id:
-                # Target exists but carries no session_id we can compare
-                # against — nothing to cross-check.
+                # Target exists and parsed, but carries no session_id we can
+                # compare against — nothing to cross-check.
+                n_no_stamp += 1
                 continue
 
             if target_session_id == source_session:
+                n_clean += 1
                 continue
 
             issues.append(Issue(
@@ -189,6 +283,19 @@ def scan(
                     "target_note": str(target_path),
                 },
             ))
+
+    # End-of-scan stderr summary, unconditional (even when nothing was
+    # scanned) — a silent scan is indistinguishable from a scan that never
+    # ran. The buckets partition n_scanned exactly (n_crossed is len(issues)).
+    n_crossed = len(issues)
+    print(
+        f"[{NAME}] scanned {n_scanned} note(s) ({n_indexed} session note(s) "
+        f"indexed as link targets): {n_crossed} crossed, {n_clean} clean, "
+        f"{n_no_stamp} no source_session/link to check, {n_dangling} "
+        f"dangling link (not reported), {n_target_unreadable} target "
+        f"unreadable, {n_skipped} source note unreadable",
+        file=sys.stderr,
+    )
 
     return issues
 

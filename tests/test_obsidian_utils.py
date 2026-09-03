@@ -2427,6 +2427,56 @@ def test_check_hook_status_no_session_files(tmp_path, monkeypatch):
     assert status["current_sid"] == "unknown"
 
 
+def test_check_hook_status_ambiguous_concurrent_sessions_distinct_message(tmp_path, monkeypatch):
+    """#354 review item 4: with two live transcripts and a valid bootstrap,
+    check_hook_status() must NOT report "No session files found — run
+    /obsidian-setup to verify configuration" — that message is both the
+    wrong diagnosis (files WERE found) and the wrong remedy (setup has
+    nothing to fix when the real situation is "found several, can't tell
+    which is current"). It must report a DISTINCT message naming the
+    ambiguity, and must not tell the user to re-run setup."""
+    import obsidian_utils
+    import os
+    import time
+
+    project_basename = "concurrent-proj"
+    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+    cc_projects.mkdir(parents=True)
+
+    # Two JSONLs with IDENTICAL mtimes — the strongest possible ambiguity
+    # signal (see test_get_session_id_fast_same_second_tiebreaker above).
+    now = time.time()
+    jsonl_a = cc_projects / "session-a.jsonl"
+    jsonl_b = cc_projects / "session-b.jsonl"
+    jsonl_a.write_text("{}", encoding="utf-8")
+    jsonl_b.write_text("{}", encoding="utf-8")
+    os.utime(jsonl_a, (now, now))
+    os.utime(jsonl_b, (now, now))
+
+    proj_dir = tmp_path / project_basename
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
+    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+    bootstrap.write_text("session-a", encoding="utf-8")
+
+    status = obsidian_utils.check_hook_status()
+    assert status["ok"] is False
+    assert status["current_sid"] == "unknown"
+    assert "No session files found" not in status["message"], (
+        "the ambiguous-concurrent-sessions case must not be reported as "
+        "'no session files found' — files WERE found"
+    )
+    assert "obsidian-setup" not in status["message"], (
+        "re-running /obsidian-setup is the wrong remedy for concurrent "
+        "sessions — it fixes nothing here"
+    )
+    assert "concurrent" in status["message"].lower() or "cannot identify" in status["message"].lower()
+
+
 def test_slow_path_underscore_to_hyphen_fallback(tmp_path, monkeypatch):
     """_slow_path_newest_sid matches when cwd has underscores but CC dir has hyphens."""
     import obsidian_utils
@@ -2794,6 +2844,134 @@ def test_get_session_id_fast_slow_path_returns_without_writing(tmp_path, monkeyp
     # Slow path must NOT have created a bootstrap file
     assert not bootstrap.exists(), (
         "slow path should be read-only and not create the bootstrap file"
+    )
+
+
+# ===========================================================================
+# Section: #354 review item 3 — session resolution under real concurrency
+# ===========================================================================
+
+
+def test_resolve_session_id_ex_concurrent_ambiguity_no_cross_thread_leakage(tmp_path, monkeypatch):
+    """Two threads resolving DIFFERENT projects at the same instant — one
+    ambiguous (2+ concurrently active sessions), one clean — must each get
+    back their OWN answer, never the other's.
+
+    This is a real hazard, not a hypothetical: `upgrade_batch()` runs a
+    `ThreadPoolExecutor`, and its worker `upgrade_note_with_summary()`
+    reaches `_get_session_id_fast()` -> `_resolve_session_id` for every note
+    it processes. The pre-#354 implementation tracked ambiguity in a
+    module-level `_last_slow_glob_ambiguous` flag set immediately before
+    every `_try_slow_jsonl_glob` return and read by the caller a few lines
+    later: thread A (ambiguous) sets it True and returns; if thread B
+    (unambiguous, a different project) runs its own call — which resets the
+    flag False at entry and never sets it back True — anywhere in the
+    narrow window before A's caller reads it, A's caller reads B's False and
+    falls through to a cross-project sid guess. That is the exact
+    mis-attribution bug #330 built this resolver to prevent, reopened by
+    #330's own review-item-5 fix.
+
+    `_try_slow_jsonl_glob_ex` is patched here to force the EXACT interleave
+    that broke the old implementation, deterministically instead of leaving
+    it to scheduler luck: the ambiguous thread's real call runs and returns
+    its answer, then — BEFORE returning to ITS OWN caller — a
+    `threading.Event` handoff guarantees the clean thread's ENTIRE call
+    (start to finish) runs to completion, only THEN does the ambiguous
+    thread's caller get control back. That is precisely the historical race
+    window (thread A's answer computed -> thread B's unrelated call runs in
+    between -> thread A's caller reads state) forced to happen on every run,
+    not merely possible on some. Against the #354 fix this still passes
+    despite that forced worst-case ordering, because each thread's
+    `ambiguous` is a plain local from its own tuple return — there is no
+    shared variable left for the other thread's call to clobber.
+    """
+    import threading
+    import time
+    import obsidian_utils
+
+    home = tmp_path
+    monkeypatch.setenv("HOME", str(home))
+
+    # Ambiguous project: 2 JSONLs with identical mtime (the strongest
+    # concurrency signal, see test_get_session_id_fast_same_second_tiebreaker).
+    amb_dir = home / ".claude" / "projects" / "-foo-ambiguous-proj"
+    amb_dir.mkdir(parents=True)
+    now = time.time()
+    for name in ("thread-a-sess", "thread-a-sess-2"):
+        f = amb_dir / f"{name}.jsonl"
+        f.write_text("{}", encoding="utf-8")
+        os.utime(f, (now, now))
+
+    # Clean project: exactly 1 JSONL, unambiguous.
+    clean_dir = home / ".claude" / "projects" / "-foo-clean-proj"
+    clean_dir.mkdir(parents=True)
+    clean_jsonl = clean_dir / "thread-b-sess.jsonl"
+    clean_jsonl.write_text("{}", encoding="utf-8")
+    os.utime(clean_jsonl, (now - 60, now - 60))
+
+    # Route "cwd" per-thread by thread name — os.getcwd() is process-global
+    # and cannot differ per thread, so the project-resolution layer is
+    # stubbed to stand in for "this thread's cwd" instead.
+    thread_project = {"ambiguous-thread": "ambiguous-proj", "clean-thread": "clean-proj"}
+
+    def fake_resolve_project_basename_with_source():
+        return thread_project[threading.current_thread().name], "cwd"
+
+    monkeypatch.setattr(
+        obsidian_utils,
+        "_resolve_project_basename_with_source",
+        fake_resolve_project_basename_with_source,
+    )
+
+    # Deterministic ordered handoff (no sleeps): the ambiguous thread computes
+    # its own answer, signals, then BLOCKS until the clean thread's entire
+    # call has completed — guaranteeing the clean call's side effects (a
+    # shared flag, under the old implementation) land strictly BETWEEN the
+    # ambiguous thread's own computation and its caller reading anything.
+    a_computed = threading.Event()
+    b_done = threading.Event()
+    real_glob_ex = obsidian_utils._try_slow_jsonl_glob_ex
+
+    def synced_glob_ex(project):
+        if threading.current_thread().name == "ambiguous-thread":
+            result = real_glob_ex(project)  # A computes its own answer first
+            a_computed.set()
+            assert b_done.wait(timeout=5), "clean thread did not finish in time"
+            return result
+        assert a_computed.wait(timeout=5), "ambiguous thread did not compute in time"
+        result = real_glob_ex(project)  # B's ENTIRE call runs while A is blocked
+        b_done.set()
+        return result
+
+    monkeypatch.setattr(obsidian_utils, "_try_slow_jsonl_glob_ex", synced_glob_ex)
+
+    results: dict[str, tuple[str, bool]] = {}
+    errors: list[BaseException] = []
+
+    def worker(name):
+        threading.current_thread().name = name
+        try:
+            results[name] = obsidian_utils._resolve_session_id_ex(
+                allow_bootstrap=False, allow_env=False
+            )
+        except BaseException as e:  # noqa: BLE001 — surface any thread exception to the main thread
+            errors.append(e)
+
+    t_amb = threading.Thread(target=worker, args=("ambiguous-thread",))
+    t_clean = threading.Thread(target=worker, args=("clean-thread",))
+    t_amb.start()
+    t_clean.start()
+    t_amb.join(timeout=10)
+    t_clean.join(timeout=10)
+
+    assert not errors, f"worker thread(s) raised: {errors}"
+    assert results["ambiguous-thread"] == ("unknown", True), (
+        f"the ambiguous thread must see its OWN ambiguity refusal, not a "
+        f"cross-thread cross-project guess — got {results['ambiguous-thread']!r}"
+    )
+    assert results["clean-thread"] == ("thread-b-sess", False), (
+        f"the clean thread must resolve its OWN unambiguous sid, unaffected "
+        f"by the other thread's ambiguity — got {results['clean-thread']!r}"
     )
 
 
@@ -3996,8 +4174,16 @@ def test_resolve_source_session_note_match_returns_stem(tmp_path):
     assert result == "2026-08-26-demo-aaaa"
 
 
-def test_resolve_source_session_note_missing_target_omits(tmp_path):
-    """Case 2: target file missing -> field omitted (empty string)."""
+def test_resolve_source_session_note_missing_target_yields_forward_reference(tmp_path):
+    """Case 2: target file missing -> the forward reference is KEPT, not omitted.
+
+    /compress, /decide, /error-log and /retro all run mid-session, strictly
+    before SessionEnd writes the target session note — so "target absent" is
+    the NORMAL case for every one of these writes, exactly like the
+    PreCompact snapshot forward reference. Treating absence as a reason to
+    omit was the round-1 bug: it silently disabled the backlink for
+    essentially every retro/insight/decision/error-fix note ever written.
+    """
     vault = tmp_path / "vault"
     sessions = vault / "claude-sessions"
     sessions.mkdir(parents=True)
@@ -4006,7 +4192,26 @@ def test_resolve_source_session_note_missing_target_omits(tmp_path):
     result = obsidian_utils.resolve_source_session_note(
         "2026-08-26-demo-aaaa", sid, str(vault), "claude-sessions"
     )
-    assert result == ""
+    assert result == "2026-08-26-demo-aaaa"
+
+
+def test_resolve_source_session_note_unparsable_target_yields_forward_reference(tmp_path):
+    """Case 2b: target file exists but its frontmatter cannot be parsed ->
+    the forward reference is KEPT — an unparsable file cannot be said to
+    CONTRADICT anything, so there is nothing here to omit for."""
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    sid = "11111111-1111-1111-1111-111111111111"
+    # No closing '---' fence -> read_note_metadata() cannot parse this.
+    (sessions / "2026-08-26-demo-aaaa.md").write_text(
+        "---\nsession_id: " + sid + "\n# no closing fence\n", encoding="utf-8"
+    )
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa", sid, str(vault), "claude-sessions"
+    )
+    assert result == "2026-08-26-demo-aaaa"
 
 
 def test_resolve_source_session_note_id_mismatch_omits_live_crossing_values(tmp_path):
@@ -4038,8 +4243,66 @@ def test_resolve_source_session_note_id_mismatch_omits_live_crossing_values(tmp_
     assert result == ""
 
 
-def test_resolve_source_session_note_no_session_id_on_target_omits(tmp_path):
-    """Case 4: target exists but has NO session_id in frontmatter -> omitted."""
+def test_resolve_source_session_note_warns_on_contradiction(tmp_path, monkeypatch, capsys):
+    """The contradiction branch must WARN (#330 review item 2): a mismatch is
+    exactly what an ONGOING crossing looks like, and this is the one place
+    the crossed-source-session vault-doctor check can never see it directly
+    (a contradiction is omitted, never written) — the WARN is what makes an
+    ongoing crossing visible in the transcript."""
+    monkeypatch.setattr(obsidian_utils, "_crossed_source_session_warned", set())
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    resolved_source_session = "18785285-d99d-48ce-a2f7-5bc0aba14055"
+    target_session_id = "504f461a-1881-4bc6-a262-0025f1420ea5"
+    _write_session_note(
+        sessions, "2026-08-26-openclaw-df46.md", session_id=target_session_id
+    )
+
+    capsys.readouterr()  # drain
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-openclaw-df46",
+        resolved_source_session,
+        str(vault),
+        "claude-sessions",
+    )
+    assert result == ""
+    captured = capsys.readouterr()
+    assert resolved_source_session in captured.err
+    assert target_session_id in captured.err
+    assert str(sessions / "2026-08-26-openclaw-df46.md") in captured.err
+
+
+def test_resolve_source_session_note_no_warn_on_absence(tmp_path, monkeypatch, capsys):
+    """Absence (the normal, pre-SessionEnd case) must NOT warn — only a
+    provable contradiction should."""
+    monkeypatch.setattr(obsidian_utils, "_crossed_source_session_warned", set())
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    sid = "11111111-1111-1111-1111-111111111111"
+
+    capsys.readouterr()  # drain
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa", sid, str(vault), "claude-sessions"
+    )
+    assert result == "2026-08-26-demo-aaaa"
+    captured = capsys.readouterr()
+    assert "WARN" not in captured.err
+
+
+def test_resolve_source_session_note_no_session_id_on_target_keeps_forward_reference(tmp_path):
+    """Case 4: target exists but has NO session_id in frontmatter -> the
+    forward reference is KEPT, not omitted (#354 review item 2).
+
+    A missing `session_id` on the target is not a CONTRADICTION — there is
+    nothing to disagree with. Treating an absent field as `None != session_id`
+    fires the contradiction branch on the one signal #330 added for ongoing
+    crossings and emits a confidently false WARN ("carries its OWN
+    session_id=None, a DIFFERENT session"). This must resolve exactly like
+    the unparsable-target branch above and like crossed_source_session.py's
+    own "nothing to cross-check" classification for the identical input.
+    """
     vault = tmp_path / "vault"
     sessions = vault / "claude-sessions"
     sessions.mkdir(parents=True)
@@ -4051,7 +4314,37 @@ def test_resolve_source_session_note_no_session_id_on_target_omits(tmp_path):
         str(vault),
         "claude-sessions",
     )
-    assert result == ""
+    assert result == "2026-08-26-demo-aaaa"
+
+
+def test_resolve_source_session_note_no_warn_when_target_session_id_missing(tmp_path, monkeypatch, capsys):
+    """A missing `session_id` on the target must NOT trigger the
+    contradiction WARN — only a provable, present-and-differing value should
+    (#354 review item 2, companion to the no-warn-on-absence test above)."""
+    monkeypatch.setattr(obsidian_utils, "_crossed_source_session_warned", set())
+    # read_note_metadata() (called below the target-file check) derives its
+    # own cache key via _get_session_id_fast(), which globs the REAL
+    # ~/.claude/projects for whatever cwd this test runs under — on a dev
+    # machine with other Claude Code sessions open, that can independently
+    # emit the AMBIGUOUS-CONCURRENT-SESSIONS warning and make this
+    # assertion flaky for reasons unrelated to the code under test.
+    # Isolate by chdir'ing into an empty tmp dir with no matching project.
+    monkeypatch.chdir(tmp_path)
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    _write_session_note(sessions, "2026-08-26-demo-aaaa.md", session_id=None)
+
+    capsys.readouterr()  # drain
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa",
+        "11111111-1111-1111-1111-111111111111",
+        str(vault),
+        "claude-sessions",
+    )
+    assert result == "2026-08-26-demo-aaaa"
+    captured = capsys.readouterr()
+    assert "WARN" not in captured.err
 
 
 def test_resolve_source_session_note_unknown_session_id_omits(tmp_path):
