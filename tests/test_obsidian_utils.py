@@ -2689,7 +2689,7 @@ def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypa
 
     result = obsidian_utils._get_session_id_fast()
     assert result == cached_sid, (
-        f"expected cached sid to win via multi-match tiebreaker, got {result}"
+        f"expected cached sid to win multi-match tiebreak, got {result}"
     )
 
 
@@ -3943,6 +3943,229 @@ def test_get_session_context_cache_key_isolates_distinct_worktrees(tmp_path, mon
 
 
 # ===========================================================================
+# #330 Task 5: resolve_source_session_note() write guard
+#
+# source_session_note must not point at a note whose OWN session_id
+# contradicts the source_session being stamped alongside it. This guards the
+# retro/insight/decide/error-log write path only — see
+# hooks/obsidian_context_snapshot.py's deliberate forward-reference exception,
+# regression-tested separately in tests/test_snapshots.py.
+# ===========================================================================
+
+def _write_session_note(sessions_dir, filename, session_id=None):
+    """Write a minimal claude-session note. Omits `session_id:` entirely
+    when session_id is None, to fixture case 4 (target exists, no
+    session_id field)."""
+    fm = ["---", "type: claude-session"]
+    if session_id is not None:
+        fm.append(f"session_id: {session_id}")
+    fm.append("---")
+    (sessions_dir / filename).write_text("\n".join(fm) + "\n\n# body\n", encoding="utf-8")
+
+
+def test_resolve_source_session_note_match_returns_stem(tmp_path):
+    """Case 1: target exists AND session_id matches -> field written."""
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    sid = "11111111-1111-1111-1111-111111111111"
+    _write_session_note(sessions, "2026-08-26-demo-aaaa.md", session_id=sid)
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa", sid, str(vault), "claude-sessions"
+    )
+    assert result == "2026-08-26-demo-aaaa"
+
+
+def test_resolve_source_session_note_missing_target_yields_forward_reference(tmp_path):
+    """Case 2: target file missing -> the forward reference is KEPT, not omitted.
+
+    /compress, /decide, /error-log and /retro all run mid-session, strictly
+    before SessionEnd writes the target session note — so "target absent" is
+    the NORMAL case for every one of these writes, exactly like the
+    PreCompact snapshot forward reference. Treating absence as a reason to
+    omit was the round-1 bug: it silently disabled the backlink for
+    essentially every retro/insight/decision/error-fix note ever written.
+    """
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    sid = "11111111-1111-1111-1111-111111111111"
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa", sid, str(vault), "claude-sessions"
+    )
+    assert result == "2026-08-26-demo-aaaa"
+
+
+def test_resolve_source_session_note_unparsable_target_yields_forward_reference(tmp_path):
+    """Case 2b: target file exists but its frontmatter cannot be parsed ->
+    the forward reference is KEPT — an unparsable file cannot be said to
+    CONTRADICT anything, so there is nothing here to omit for."""
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    sid = "11111111-1111-1111-1111-111111111111"
+    # No closing '---' fence -> read_note_metadata() cannot parse this.
+    (sessions / "2026-08-26-demo-aaaa.md").write_text(
+        "---\nsession_id: " + sid + "\n# no closing fence\n", encoding="utf-8"
+    )
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa", sid, str(vault), "claude-sessions"
+    )
+    assert result == "2026-08-26-demo-aaaa"
+
+
+def test_resolve_source_session_note_id_mismatch_omits_live_crossing_values(tmp_path):
+    """Case 3: target exists but session_id DIFFERS -> field omitted.
+
+    Uses the real values from the live #330 crossing so this fixture
+    mirrors production: a real vault note carried
+    `source_session: 18785285-d99d-48ce-a2f7-5bc0aba14055` (hashes to
+    `f157`) while its `source_session_note` named
+    `2026-08-26-openclaw-df46`, whose own `session_id` was
+    `504f461a-1881-4bc6-a262-0025f1420ea5` (`df46` is
+    `sha256("504f461a-...")[:4]`) — a different session entirely.
+    """
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    resolved_source_session = "18785285-d99d-48ce-a2f7-5bc0aba14055"
+    target_session_id = "504f461a-1881-4bc6-a262-0025f1420ea5"
+    _write_session_note(
+        sessions, "2026-08-26-openclaw-df46.md", session_id=target_session_id
+    )
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-openclaw-df46",
+        resolved_source_session,
+        str(vault),
+        "claude-sessions",
+    )
+    assert result == ""
+
+
+def test_resolve_source_session_note_warns_on_contradiction(tmp_path, monkeypatch, capsys):
+    """The contradiction branch must WARN (#330 review item 2): a mismatch is
+    exactly what an ONGOING crossing looks like, and this is the one place
+    the crossed-source-session vault-doctor check can never see it directly
+    (a contradiction is omitted, never written) — the WARN is what makes an
+    ongoing crossing visible in the transcript."""
+    monkeypatch.setattr(obsidian_utils, "_crossed_source_session_warned", set())
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    resolved_source_session = "18785285-d99d-48ce-a2f7-5bc0aba14055"
+    target_session_id = "504f461a-1881-4bc6-a262-0025f1420ea5"
+    _write_session_note(
+        sessions, "2026-08-26-openclaw-df46.md", session_id=target_session_id
+    )
+
+    capsys.readouterr()  # drain
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-openclaw-df46",
+        resolved_source_session,
+        str(vault),
+        "claude-sessions",
+    )
+    assert result == ""
+    captured = capsys.readouterr()
+    assert resolved_source_session in captured.err
+    assert target_session_id in captured.err
+    assert str(sessions / "2026-08-26-openclaw-df46.md") in captured.err
+
+
+def test_resolve_source_session_note_no_warn_on_absence(tmp_path, monkeypatch, capsys):
+    """Absence (the normal, pre-SessionEnd case) must NOT warn — only a
+    provable contradiction should."""
+    monkeypatch.setattr(obsidian_utils, "_crossed_source_session_warned", set())
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    sid = "11111111-1111-1111-1111-111111111111"
+
+    capsys.readouterr()  # drain
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa", sid, str(vault), "claude-sessions"
+    )
+    assert result == "2026-08-26-demo-aaaa"
+    captured = capsys.readouterr()
+    assert "WARN" not in captured.err
+
+
+def test_resolve_source_session_note_no_session_id_on_target_keeps_forward_reference(tmp_path):
+    """Case 4: target exists but has NO session_id in frontmatter -> the
+    forward reference is KEPT, not omitted (#354 review item 2).
+
+    A missing `session_id` on the target is not a CONTRADICTION — there is
+    nothing to disagree with. Treating an absent field as `None != session_id`
+    fires the contradiction branch on the one signal #330 added for ongoing
+    crossings and emits a confidently false WARN ("carries its OWN
+    session_id=None, a DIFFERENT session"). This must resolve exactly like
+    the unparsable-target branch above and like crossed_source_session.py's
+    own "nothing to cross-check" classification for the identical input.
+    """
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    _write_session_note(sessions, "2026-08-26-demo-aaaa.md", session_id=None)
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa",
+        "11111111-1111-1111-1111-111111111111",
+        str(vault),
+        "claude-sessions",
+    )
+    assert result == "2026-08-26-demo-aaaa"
+
+
+def test_resolve_source_session_note_no_warn_when_target_session_id_missing(tmp_path, monkeypatch, capsys):
+    """A missing `session_id` on the target must NOT trigger the
+    contradiction WARN — only a provable, present-and-differing value should
+    (#354 review item 2, companion to the no-warn-on-absence test above)."""
+    monkeypatch.setattr(obsidian_utils, "_crossed_source_session_warned", set())
+    # read_note_metadata() (called below the target-file check) derives its
+    # own cache key via _get_session_id_fast(), which globs the REAL
+    # ~/.claude/projects for whatever cwd this test runs under — on a dev
+    # machine with other Claude Code sessions open, that can independently
+    # emit the AMBIGUOUS-CONCURRENT-SESSIONS warning and make this
+    # assertion flaky for reasons unrelated to the code under test.
+    # Isolate by chdir'ing into an empty tmp dir with no matching project.
+    monkeypatch.chdir(tmp_path)
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    _write_session_note(sessions, "2026-08-26-demo-aaaa.md", session_id=None)
+
+    capsys.readouterr()  # drain
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa",
+        "11111111-1111-1111-1111-111111111111",
+        str(vault),
+        "claude-sessions",
+    )
+    assert result == "2026-08-26-demo-aaaa"
+    captured = capsys.readouterr()
+    assert "WARN" not in captured.err
+
+
+def test_resolve_source_session_note_unknown_session_id_omits(tmp_path):
+    """A caller with no resolved id (session_id == 'unknown') gets '' even
+    when a same-named target happens to exist — the helper is safe to call
+    unconditionally, without the caller pre-checking for 'unknown' first."""
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    _write_session_note(sessions, "2026-08-26-demo-aaaa.md", session_id="unknown")
+
+    result = obsidian_utils.resolve_source_session_note(
+        "2026-08-26-demo-aaaa", "unknown", str(vault), "claude-sessions"
+    )
+    assert result == ""
+
+
+# ===========================================================================
 # Task 4: generate_summary returns (text, fallback_reason)
 # ===========================================================================
 
@@ -4807,3 +5030,36 @@ class TestBatchRecovery:
         assert reason1 == "missing_section", (
             f"recovery disabled: expected 'missing_section', got {reason1!r}"
         )
+
+
+def test_resolve_source_session_note_blocks_path_traversal(tmp_path):
+    """A composed session_note_name must not be able to escape the vault.
+
+    session_note_name is built by make_filename() over a slugified project
+    name derived from the cwd basename, so it is composed rather than
+    literal. Without containment, a traversing name would read frontmatter
+    from an arbitrary file on disk and vouch for it as this session's note
+    (#330). Mirrors the check write_vault_note() already performs.
+    """
+    import obsidian_utils
+
+    vault = tmp_path / "vault"
+    (vault / "claude-sessions").mkdir(parents=True)
+
+    sid = "11111111-2222-3333-4444-555555555555"
+
+    # A real note OUTSIDE the vault whose session_id would otherwise match,
+    # so the only thing that can reject it is the containment check.
+    outside = tmp_path / "outside.md"
+    outside.write_text(
+        f"---\ntype: claude-session\nsession_id: {sid}\n---\n\n# outside\n",
+        encoding="utf-8",
+    )
+
+    escaped = obsidian_utils.resolve_source_session_note(
+        "../../outside", sid, str(vault), "claude-sessions"
+    )
+    assert escaped == "", (
+        "a traversing session_note_name resolved to a file outside the "
+        "vault and was vouched for as a session note"
+    )
