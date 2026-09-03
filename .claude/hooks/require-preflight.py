@@ -138,10 +138,10 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         return True  # Unresolvable project dir — can't scope, be safe
 
     try:
-        verb_positions = [m.start() for m in re.finditer(verb, cmd)]
+        verb_matches = list(re.finditer(verb, cmd))
     except re.error:
         return True  # Unusable verb pattern — can't scope, be safe
-    if not verb_positions:
+    if not verb_matches:
         # The caller matched this verb but this function cannot find it: the
         # two matchers disagree, so gate rather than guess.
         return True
@@ -159,7 +159,68 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         target = m.group("dq") or m.group("sq") or m.group("bare")
         cd_matches.append((m.start(), m.end(), target, subshells))
 
-    for position in verb_positions:
+    for m in verb_matches:
+        position = m.start()
+        # `git -C <path>` retargets THIS invocation at another checkout — the
+        # same thing `cd <path> &&` does for the rest of the line, and it is
+        # inside the matched text because the verb pattern spans the global
+        # options. Anything ambiguous (several `-C`s, whose effects compound
+        # relative to each other; an unresolvable path) falls through to the
+        # `cd` logic below and ends up gated, which is fail-closed.
+        #
+        # `m.group(0)` has no idea it might itself be sitting inside a
+        # QUOTED VALUE of an unrelated option: `-c a.b="x -C /elsewhere"` is
+        # ONE shell argument -- git reads it back as a single config value,
+        # not a second `-C` -- so a naive search over `m.group(0)` found
+        # this decoy and let it descope the whole command (#351 CRIT-4),
+        # the same bypass class as #326 one layer deeper. `_shell_scan`
+        # already answers "would a shell really be executing here, or is
+        # this inside quotes/backticks/a substitution"; give the `-C`
+        # extraction that same test, keyed by its ABSOLUTE offset in `cmd`
+        # (`position + cd.start()`, not an offset into `m.group(0)`). A
+        # `-C` the scan cannot vouch for is not provably real, so it is
+        # dropped here and the occurrence falls through to the `cd` logic
+        # below, exactly like `len(c_dirs) != 1` -- gated.
+        #
+        # Inheriting `_shell_scan` also inherits its blind spots: a `#`
+        # comment on a PRECEDING line, an unbalanced quote inside such a
+        # comment, a `case ... )` pattern, and a heredoc body are all valid
+        # bash that `_shell_scan` cannot model, so a legitimately cross-repo
+        # `-C` after one of these now falls through to the `cd` logic and
+        # gets denied instead of descoped. All four are fail-CLOSED -- the
+        # cost lands only on cross-repo `-C` work, an in-project `-C` after
+        # the same constructs still denies correctly -- and are the accepted
+        # cost of "a `-C` the scan cannot vouch for is not provably real"
+        # (documented, not fixed: modelling comments/heredocs would be a
+        # redesign of the #326 `_shell_scan` machinery, not this task).
+        c_dirs = [
+            cd for cd in re.finditer(
+                r'''(?<![^\s])-C\s+(?:"([^"]*)"|'([^']*)'|(\S+))''',
+                m.group(0))
+            if _shell_scan(cmd[:position + cd.start()])[0]
+        ]
+        if len(c_dirs) == 1:
+            # `-C ""` is documented git behaviour ("if <path> is present but
+            # empty, the current working directory is left unchanged") and is
+            # rc 0 on git 2.50.1 -- all three capture groups are then the
+            # empty string, and the old `next(t for t in c_dirs[0] if t)`
+            # raised StopIteration with no target to fall back to. An
+            # uncaught exception exits non-zero, which is a NON-blocking
+            # error under the PreToolUse contract -- the crash itself was the
+            # fail-open (#351 NEW-2). An empty/unresolved `-C` value is
+            # ambiguous, not provably out of scope, so it falls through to
+            # the `cd` logic below exactly like `len(c_dirs) != 1` -- gated.
+            target = next((t for t in c_dirs[0].groups() if t), None)
+            if target is not None:
+                try:
+                    target = os.path.realpath(
+                        os.path.expandvars(os.path.expanduser(target)))
+                except (ValueError, OSError):
+                    return True
+                if not (target == project_dir
+                        or target.startswith(project_dir + os.sep)):
+                    continue  # this occurrence provably acts on another checkout
+
         preceding = [c for c in cd_matches if c[0] < position]
         if not preceding:
             # No cd before this occurrence — it runs in the session cwd, which
@@ -357,26 +418,145 @@ def _read_hook_input(what):
     raise SystemExit(2)
 
 
+# `git` and `gh` accept GLOBAL options between the executable and the
+# subcommand: `git -C . push`, `git -c k=v push`, `git --no-pager push`,
+# `gh --repo o/r pr create`. A literal `"git push" in command` never matches
+# those, so the gate exited 0 with an empty stdout — an ALLOW under the
+# PreToolUse contract, with every check below it skipped (#351, #327 item 2).
+#
+# A global option is always `-`-prefixed (this holds for every documented
+# git and gh global option), and may take a SEPARATE value: `-C .`,
+# `-c k=v`, `-R o/r`. The quoted alternatives matter because a path with a
+# space (`-C "/a b"`) otherwise ends the run mid-argument and the verb stops
+# matching — the same fail-open this pattern exists to close.
+#
+# Over-matching here can only ever ADD a gate, never remove one, so the
+# pattern is deliberately permissive.
+# A shell WORD is a run of non-space chars in which a quoted run may itself
+# contain spaces, so `-c user.name="A B"` is ONE argument. Matching only a
+# fully-quoted value (`-C "/a b"`) left the commoner half-quoted spelling
+# (`-c k="v w"`) stranded mid-argument: the option-value alternatives ended
+# at the first bare space, the required trailing `\s+` then landed on the
+# quote-terminated remainder, which is neither a `-`-prefixed option nor the
+# verb, and the match failed closed into an ALLOW (#351 CRIT-1).
+#
+# A quote char that never finds its matching close (`user.name=O'Brien`, a
+# real git idiom and rc 0 on the real binary) made the two alternatives
+# below FAIL outright rather than degrade: excluding quote chars from the
+# catch-all left `_Q*`/the value continuation unable to advance past a lone
+# `'`, which stopped the option/value token short and stranded the required
+# trailing `\s+` on a non-space character -- another route to the same
+# ALLOW (#351 NEW-1). The fix direction only ever ADDS a gate: a balanced
+# quoted run is still preferred (tried first in the alternation, so a space
+# inside `"A B"` still bridges), and only an UNBALANCED quote falls through
+# to matching as an ordinary character, same as the old permissive `\S+`.
+#
+# That widened catch-all made a quote char both a balanced-run OPENER and
+# an ordinary character inside a `(?:...)*`repeat, so a run of unbalanced
+# quotes let the engine try both interpretations at every position and
+# backtrack over all of them when the tail failed to match -- catastrophic
+# backtracking. Measured on the shipped 4d67581 pattern: a 43-byte command
+# (34 double quotes) took 932ms; the reviewer measured over 10s at 40. A
+# PreToolUse hook runs on every Bash call with a 1MB stdin cap, so this was
+# a live DoS reachable by an ordinary command containing unbalanced quotes
+# (#351 CRIT-3). Fixed by making the alternatives DISJOINT with a lookahead
+# instead of widening a shared catch-all: `"(?![^"]*")` matches a `"` as a
+# literal character ONLY when no closing `"` exists ahead of it, so a given
+# quote character is never simultaneously eligible for the balanced-run
+# alternative AND the catch-all -- nothing left to backtrack between.
+#
+# Two more spellings the catch-all still missed, both reaching the real
+# binary at rc 0 (#351 CRIT-6):
+#
+#  * a BACKSLASH-ESCAPED space (`user.name=A\ B`, no quotes at all). The
+#    catch-all excluded whitespace, so `_Q*` stopped dead at the space,
+#    the value truncated to `user.name=A\`, and the mandatory trailing
+#    `\s+` swallowed just that one space -- stranding `B` where `push`
+#    needed to be next. Fixed with a new `\\.` alternative that matches a
+#    backslash plus the character it escapes as ONE atomic unit -- bare
+#    backslash is now EXCLUDED from the catch-all (`[^\s"'\\]`) so a given
+#    backslash can only ever be consumed by `\\.`, never by both, keeping
+#    every alternative disjoint the same way the CRIT-3 fix requires.
+#  * a QUOTED OPTION TOKEN (`"-c"`, `'-c'`). Every alternative above
+#    assumed the option starts with a literal, unquoted `-`; git does not
+#    require that. `_OPT` adds two more shapes for "the option token
+#    itself" -- a double- or single-quoted run whose FIRST character is
+#    the `-` -- alongside the original `-`-prefixed one.
+#
+#    The `-` has to be INSIDE the quotes. Accepting ANY fully-quoted word
+#    as an option token (`"[^"]*"`, which is what round 4 of #351 shipped)
+#    made a quoted word eligible both as an option token AND as the
+#    PREVIOUS option's separate value, inside the same `(?:...)*` repeat.
+#    Every adjacent pair of quoted words could then be parsed two ways, so
+#    a run of n of them cost 2^n. Measured end-to-end through this hook:
+#    `git ` + `"a" ` x34 (141 chars) took 1.8s, and x40 (165 chars) took
+#    33s -- on input that need not even be a git command, since the hook
+#    reads TEXT and the run only has to follow the literal `git `/`gh `.
+#    Requiring the `-` makes the two roles disjoint again (a value like
+#    `'k=v w'` can no longer be an `_OPT`): the same run at 2000 words
+#    costs 0.05ms, and both quoted-option spellings above still match.
+#
+#    That is only HALF of it, though. A word like
+#    `"-c"` is a legal `_OPT` AND, being fully quoted, was still a legal
+#    SEPARATE VALUE for the option before it -- so a run of `"-c" "-c"
+#    ...` kept the same 2^n (measured on `_OPT`-with-the-dash alone:
+#    2.5ms at 20 words, ~2.6x per word after that). The separate-value
+#    group below therefore refuses a quoted run whose first character is
+#    a `-`: `"(?:[^-"][^"]*)?"` matches `""` and `"x..."` but never
+#    `"-..."`. That costs no permissiveness, because a word this group
+#    declines is picked up as the NEXT `_OPT` on the following iteration
+#    -- `git -c "-x" push` still matches -- and it makes "option token"
+#    and "separate value" disjoint at the WORD level, which is what
+#    removes the choice the engine was backtracking over. Measured
+#    linear to 50 000 repeats on every shape.
+#
+#    "More shapes can only ADD a gate" is true of the VERDICT and false of
+#    the COST -- the trap round 4 fell into. Every alternative added here
+#    must be DISJOINT from the others (the rule the CRIT-3 fix above
+#    established) and must be TIMED; `TestPatternDecisionTimeIsBounded`
+#    now asserts that over generated shapes instead of leaving it to
+#    whoever remembers to measure.
+_Q = r'''(?:"[^"]*"|'[^']*'|"(?![^"]*")|'(?![^']*')|\\.|[^\s"'\\])'''
+_OPT = r'''(?:-''' + _Q + r'''*|"-[^"]*"|'-[^']*')'''
+_GLOBAL_OPTS = (
+    r'(?:' + _OPT + r'(?:\s+(?:(?:"(?:[^-"][^"]*)?"|'
+    r"'(?:[^-'][^']*)?'|\"(?![^\"]*\")|'(?![^']*')|\\.|[^-\s\"'\\])"
+    + _Q + r'*))?\s+)*'
+)
+
+_COMMIT_VERB = r'\bgit\s+' + _GLOBAL_OPTS + r'commit\b'
+
+
 def main():
     input_data = _read_hook_input("Preflight hook")
 
     tool_name = input_data.get("tool_name", "")
     tool_input = input_data.get("tool_input", {})
     command = tool_input.get("command", "")
+    # A "\<newline>" is a line continuation -- whitespace, not a
+    # separator -- so `git \<NL> commit` is `git commit`. Normalise ONCE
+    # here, before the entry test below and the other raw-text checks on
+    # `command` ("--amend" in command, "SKIP_PREFLIGHT=1" in command): the
+    # entry test exiting 0 with empty stdout is an ALLOW, and it read
+    # un-collapsed text before `_targets_this_project` ever got a
+    # chance to collapse it itself -- that runs too late to save the
+    # entry test (#351 CRIT-2). Its own internal collapse stays; it is
+    # idempotent and is also exercised directly by tests.
+    command = command.replace("\\\n", " ")
 
     # Only validate git commit commands
     if tool_name != "Bash":
         allow()
 
     # Check if this is a git commit command
-    is_commit = "git commit" in command
+    is_commit = re.search(_COMMIT_VERB, command) is not None
     is_amend = "--amend" in command
 
     if not is_commit:
         allow()
 
     # Skip this hook if the command targets a repo outside this project
-    if not _targets_this_project(command, r"git commit"):
+    if not _targets_this_project(command, _COMMIT_VERB):
         allow()
 
     # Check for skip flag (for emergencies - user must explicitly approve)

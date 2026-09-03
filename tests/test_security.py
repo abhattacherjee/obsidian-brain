@@ -3,6 +3,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1159,6 +1160,1430 @@ class TestHookBlockingPathsFire:
         assert self._decide(work, env, "update-changelog-before-pr", cmd) == "allow"
 
 
+class TestVerbFormsCannotSkipTheGate:
+    """`git`/`gh` accept GLOBAL options between the executable and the
+    subcommand: `git -C . push`, `git -c k=v push`, `git --no-pager push`,
+    `gh --repo o/r pr create`, `gh -R o/r pr merge`. Every gate's entry test
+    and scope guard used to be a literal substring check (`"git push" in
+    command`) or a bare verb regex (`\\bgit\\s+push\\b`), so none of those
+    forms matched — the gate exited 0 with an empty stdout, an ALLOW under
+    the PreToolUse contract, with every check below it skipped (#351, #327
+    item 2).
+
+    Every row below is `allow` on develop before this fix, except the
+    plain-form controls (no global options at all), which already deny and
+    must keep denying, and the "no verb"/out-of-scope negative controls,
+    which must stay `allow` so the fix is not "deny every git/gh invocation".
+
+    Command strings are assembled from fragments on purpose: this repo's live
+    PreToolUse hooks inspect unexecuted command text, so a literal
+    protected-branch push string in this file blocks the tooling that reads
+    it.
+    """
+
+    # (hook, command, expected).
+    CASES = (
+        # --- prevent-direct-push: git push ---
+        ("prevent-direct-push", "git pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git -C . pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git -c user.name=x pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git --no-pager pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git --no-pager -C . pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git -C . pu" + "sh origin feature/probe", "allow"),
+        ("prevent-direct-push", "git -C /nonexistent-elsewhere pu" + "sh origin ma" + "in", "allow"),
+        ("prevent-direct-push", "git config --global alias.p pu" + "sh", "allow"),
+        ("prevent-direct-push", "git -C . status", "allow"),
+        # CRIT-1: a value quoted mid-token (`-c k="v w"`), not fully quoted.
+        ("prevent-direct-push",
+         'git -c user.name="A B" pu' + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -c user.name='A B' pu" + "sh origin ma" + "in", "deny"),
+        # CRIT-2: a line continuation between the executable and the verb.
+        ("prevent-direct-push", "git \\\n  pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push", "git -C \\\n  . pu" + "sh origin ma" + "in", "deny"),
+        # IMP-1: `_push_invocations` (the #333 deletion gate) with global options.
+        ("prevent-direct-push",
+         "git -C . pu" + "sh origin --delete ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git --no-pager pu" + "sh origin --delete ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -c k=v pu" + "sh origin --delete ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -C . pu" + "sh origin --delete release/1.0.0 ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -C . pu" + "sh origin --delete release/1.0.0", "allow"),
+        # NEW-1: an UNBALANCED quote inside a global option (a real git
+        # idiom, `-c user.name=O'Brien`) must degrade to matching as an
+        # ordinary character, not fail the whole match.
+        ("prevent-direct-push",
+         "git -c user.name=O'Brien pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         'git -c a.b="cd pu' + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -c a.b=O'B pu" + "sh origin --delete ma" + "in", "deny"),
+        # NEW-2: `-C ""` / `-C ''` (documented git behaviour: cwd unchanged)
+        # must not crash the hook -- an empty/unresolved -C target is
+        # ambiguous, not provably out of scope, so it falls through gated.
+        ("prevent-direct-push",
+         'git -C "" pu' + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -C '' pu" + "sh origin ma" + "in", "deny"),
+        # CRIT-3: a run of unbalanced quotes must still resolve to a verdict
+        # (see TestDecisionTimeIsBounded for the actual timing assertion);
+        # here we only check it still denies, i.e. still matches the verb.
+        ("prevent-direct-push",
+         'git -a ' + '"' * 40 + ' pu' + "sh origin ma" + "in", "deny"),
+        # CRIT-4: a decoy `-C`/`cd` sitting inside a QUOTED VALUE of an
+        # unrelated option must not descope the command -- git reads the
+        # whole quoted string back as ONE config value, not a real `-C`.
+        ("prevent-direct-push",
+         'git -c a.b="x -C /nonexistent-elsewhere" pu' + "sh origin ma" + "in",
+         "deny"),
+        ("prevent-direct-push",
+         'git -c a.b="x -C /nonexistent-elsewhere" pu'
+         + "sh origin --delete ma" + "in", "deny"),
+        ("prevent-direct-push",
+         'git -c a.b="x && cd /nonexistent-elsewhere" pu'
+         + "sh origin ma" + "in", "deny"),
+        # CRIT-5: a quoted `;` (or `&`/`|`) inside a global-option value
+        # defeats a text-blind segment split -- see `_push_invocations`.
+        ("prevent-direct-push",
+         'git -c a.b="c;d" pu' + "sh origin --delete ma" + "in", "deny"),
+        # CRIT-6: two more global-option spellings that reach real git.
+        ("prevent-direct-push",
+         "git -c user.name=A\\ B pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         'git "-c" k=v pu' + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git '-c' 'k=v w' pu" + "sh origin ma" + "in", "deny"),
+        ("prevent-direct-push",
+         "git -c a.b=c=d\\ e pu" + "sh origin ma" + "in", "deny"),
+
+        # --- validate-branch-name: git checkout -b ---
+        ("validate-branch-name", "git chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name", "git -C . chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name", "git -c user.name=x chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name", "git --no-pager chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name", "git --no-pager -C . chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name", "git -C . chec" + "kout -b feature/ok", "allow"),
+        ("validate-branch-name", "git -C /nonexistent-elsewhere chec" + "kout -b nonsense-branch", "allow"),
+        ("validate-branch-name", "git config --global alias.c chec" + "kout", "allow"),
+        ("validate-branch-name", "git -C . status", "allow"),
+        # CRIT-1
+        ("validate-branch-name",
+         'git -c user.name="A B" chec' + "kout -b nonsense-branch", "deny"),
+        # CRIT-2
+        ("validate-branch-name",
+         "git \\\n  chec" + "kout -b nonsense-branch", "deny"),
+        # NEW-1
+        ("validate-branch-name",
+         "git -c user.name=O'Brien chec" + "kout -b nonsense-branch", "deny"),
+        # NEW-2
+        ("validate-branch-name",
+         'git -C "" chec' + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name",
+         "git -C '' chec" + "kout -b nonsense-branch", "deny"),
+        # CRIT-4
+        ("validate-branch-name",
+         'git -c a.b="x -C /nonexistent-elsewhere" chec'
+         + "kout -b nonsense-branch", "deny"),
+        # CRIT-6
+        ("validate-branch-name",
+         "git -c user.name=A\\ B chec" + "kout -b nonsense-branch", "deny"),
+        ("validate-branch-name",
+         'git "-c" k=v chec' + "kout -b nonsense-branch", "deny"),
+
+        # --- require-preflight: git commit ---
+        ("require-preflight", "git com" + "mit -m wip", "deny"),
+        ("require-preflight", "git -C . com" + "mit -m wip", "deny"),
+        ("require-preflight", "git -c user.name=x com" + "mit -m wip", "deny"),
+        ("require-preflight", "git --no-pager com" + "mit -m wip", "deny"),
+        ("require-preflight", "git --no-pager -C . com" + "mit -m wip", "deny"),
+        ("require-preflight", "git -C /nonexistent-elsewhere com" + "mit -m wip", "allow"),
+        ("require-preflight", "git config --global alias.c com" + "mit", "allow"),
+        ("require-preflight", "git -C . status", "allow"),
+        # CRIT-1
+        ("require-preflight",
+         'git -c user.name="A B" com' + "mit -m wip", "deny"),
+        # CRIT-2
+        ("require-preflight", "git \\\n  com" + "mit -m wip", "deny"),
+        # NEW-1
+        ("require-preflight",
+         "git -c user.name=O'Brien com" + "mit -m wip", "deny"),
+        # NEW-2
+        ("require-preflight", 'git -C "" com' + "mit -m wip", "deny"),
+        ("require-preflight", "git -C '' com" + "mit -m wip", "deny"),
+        # CRIT-4
+        ("require-preflight",
+         'git -c a.b="x -C /nonexistent-elsewhere" com' + "mit -m wip", "deny"),
+        # CRIT-6
+        ("require-preflight",
+         "git -c user.name=A\\ B com" + "mit -m wip", "deny"),
+        ("require-preflight", "git '-c' 'k=v w' com" + "mit -m wip", "deny"),
+
+        # --- enforce-pr-base-branch: gh pr create ---
+        ("enforce-pr-base-branch", "gh pr cre" + "ate --base ma" + "in", "deny"),
+        ("enforce-pr-base-branch", "gh --repo o/r pr cre" + "ate --base ma" + "in", "deny"),
+        ("enforce-pr-base-branch", "gh -R o/r pr cre" + "ate --base ma" + "in", "deny"),
+        ("enforce-pr-base-branch", "gh --repo o/r pr cre" + "ate --base develop", "allow"),
+        ("enforce-pr-base-branch", "gh config get git_protocol", "allow"),
+        # CRIT-1
+        ("enforce-pr-base-branch",
+         'gh -c foo="a b" pr cre' + "ate --base ma" + "in", "deny"),
+        # CRIT-2
+        ("enforce-pr-base-branch", "gh \\\n  pr cre" + "ate --base ma" + "in", "deny"),
+        # NEW-1
+        ("enforce-pr-base-branch",
+         "gh -c foo=O'Brien pr cre" + "ate --base ma" + "in", "deny"),
+        # CRIT-6
+        ("enforce-pr-base-branch",
+         'gh "-c" foo=x pr cre' + "ate --base ma" + "in", "deny"),
+
+        # --- enforce-pr-base-branch: gh pr merge ---
+        ("enforce-pr-base-branch", "gh pr mer" + "ge 5", "deny"),
+        ("enforce-pr-base-branch", "gh --repo o/r pr mer" + "ge 5", "deny"),
+        ("enforce-pr-base-branch", "gh -R o/r pr mer" + "ge 5", "deny"),
+        # CRIT-1
+        ("enforce-pr-base-branch", 'gh -c foo="a b" pr mer' + "ge 5", "deny"),
+        # CRIT-2
+        ("enforce-pr-base-branch", "gh \\\n  pr mer" + "ge 5", "deny"),
+        # NEW-1
+        ("enforce-pr-base-branch", "gh -c foo=O'Brien pr mer" + "ge 5", "deny"),
+
+        # --- update-changelog-before-pr: gh pr create ---
+        ("update-changelog-before-pr", "gh pr cre" + "ate --base develop", "deny"),
+        ("update-changelog-before-pr", "gh --repo o/r pr cre" + "ate --base develop", "deny"),
+        ("update-changelog-before-pr", "gh -R o/r pr cre" + "ate --base develop", "deny"),
+        # CRIT-1
+        ("update-changelog-before-pr",
+         'gh -c foo="a b" pr cre' + "ate --base develop", "deny"),
+        # CRIT-2
+        ("update-changelog-before-pr",
+         "gh \\\n  pr cre" + "ate --base develop", "deny"),
+        # MIN-1: this gate had no `allow` negative control at all.
+        ("update-changelog-before-pr", "gh --repo o/r pr view 3", "allow"),
+        ("update-changelog-before-pr",
+         "gh pr list --search 'pr cre" + "ate'", "allow"),
+        # NEW-1
+        ("update-changelog-before-pr",
+         "gh -c foo=O'Brien pr cre" + "ate --base develop", "deny"),
+        # CRIT-6
+        ("update-changelog-before-pr",
+         "gh -c foo=x\\ y pr cre" + "ate --base develop", "deny"),
+    )
+
+    @pytest.mark.parametrize("hook,command,expected", CASES)
+    def test_global_option_forms(self, tmp_path, hook, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        assert TestHookBlockingPathsFire._decide(work, env, hook, command) == expected, (
+            f"{hook} got {command!r} wrong"
+        )
+
+    @pytest.mark.parametrize("hook,verb", (
+        ("prevent-direct-push", "pu" + "sh origin ma" + "in"),
+        ("validate-branch-name", "chec" + "kout -b nonsense-branch"),
+        ("require-preflight", "com" + "mit -m wip"),
+    ))
+    def test_quoted_path_with_a_space_inside_the_project_still_denies(
+        self, tmp_path, hook, verb
+    ):
+        """`-C "<path with a space>"` pointing INSIDE the project must still
+        deny. Built from the fixture's own tmp project dir at runtime — never
+        a hardcoded literal path — because `_targets_this_project` compares
+        the resolved `-C` target against `CLAUDE_PROJECT_DIR`, which the
+        harness sets to that tmp repo.
+
+        The quoted alternative in `_GLOBAL_OPTS`'s value group exists so a
+        space in the path does not end the option mid-argument and strand the
+        verb match — an unquoted `-C /a b push ...` would read `push` as part
+        of the `-C` value and the verb pattern would stop matching, the same
+        fail-open this whole pattern exists to close.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = f'git -C "{work}/a b" ' + verb
+        assert TestHookBlockingPathsFire._decide(work, env, hook, command) == "deny"
+
+
+class TestGlobalOptionSpellingsMatchThePlainVerdict:
+    """The durable regression net for the whole `_GLOBAL_OPTS`/`_Q` class
+    (#351), not just the specific cases CRIT-1/CRIT-2/NEW-1/NEW-2/CRIT-3/
+    CRIT-4/CRIT-5/CRIT-6 happened to probe. Every one of rounds 1-4 found a
+    fail-open or a blowup this file's own hand-picked example list had not
+    thought of yet — the pattern of "case N+1 next round" is exactly what a
+    hand-picked list cannot close, which is IMP-3's finding: the round-3
+    decoy rows were themselves hand-picked, and three of the four turned out
+    to be structurally vacuous (see `test_prefix_decoy_matches_plain_verdict`
+    below for why, and `TestGeneratedGlobalOptionValuesMatchThePlainVerdict`
+    for the mechanically-generated matrix that replaces "pick more examples"
+    as the primary net).
+
+    Instead of asserting a hardcoded `allow`/`deny` per spelling, this
+    generates a bounded matrix of global-option spellings and asserts each
+    one's verdict equals the PLAIN form's verdict (no global options at all)
+    for the same verb. The plain form is the control; a spelling that moves
+    the verdict away from it is a bug by construction, in EITHER direction —
+    a new fail-open, or a spelling that over-matches into a false deny.
+
+    Kept to a small, deliberately chosen set rather than a fuzzer, so it
+    stays in the seconds range: separate and `=`-joined values; bare,
+    single-quoted, double-quoted, half-quoted, unbalanced-quoted and
+    empty-quoted values; a value containing a space, a `-`, or an `=`; a
+    single option and two stacked; a tab separator; a `\\<newline>`
+    continuation right after the global options; and — CRIT-4's class as a
+    property, not an example — a `-C` decoy (both quote styles) sitting
+    inside a quoted value of an unrelated option.
+    """
+
+    # Text to splice between the executable and the verb, e.g.
+    # "git " + SPELLING + "push origin main". Every one of these must be a
+    # NO-OP on the verdict relative to the plain form with no global options.
+    OPTION_SPELLINGS = (
+        "-C . ",
+        "-c user.name=x ",
+        '-c user.name="A B" ',
+        "-c user.name='A B' ",
+        "-c user.name=O'Brien ",          # unbalanced quote (NEW-1)
+        '-c a.b="only-opens ',             # unbalanced quote, opens & never closes
+        "--no-pager ",
+        '-C "" ',                          # empty double-quoted value (NEW-2)
+        "-C '' ",                          # empty single-quoted value (NEW-2)
+        "-c k=v=w ",                       # value containing '='
+        "-c k=a-b ",                       # value containing '-'
+        "--repo=o/r ",                     # '='-joined long option
+        "-C .\t",                          # tab as the trailing separator
+        "-C\t. ",                          # tab between flag and value
+        "-C . -c user.name=x ",            # two stacked options
+        "-c user.name=x -C . ",            # two stacked options, reversed
+        "-C . \\\n",                       # line continuation after the options
+        # CRIT-6
+        r"-c user.name=A\ B ",              # backslash-escaped space
+        '"-c" k=v ',                        # the OPTION TOKEN itself quoted
+        "'-c' 'k=v w' ",                    # option AND value both quoted
+        # CRIT-4: a `-C` decoy sitting inside a QUOTED VALUE of an unrelated
+        # option. Real git reads each of these back as ONE config value, not
+        # a second `-C`. IMP-3: this is the only decoy shape that is a real
+        # guard here (proved by MUT-A in the round-3 re-review) -- a decoy
+        # `cd`/verb spliced at this SAME position (between the executable
+        # and the verb) can never precede the verb match's own start, so
+        # `_targets_this_project`'s `preceding = [... c[0] < position]`
+        # filter can never even see it; that is what
+        # `test_prefix_decoy_matches_plain_verdict` below exists to cover
+        # instead. Both quote styles are tested since only the double-quoted
+        # one used to be live.
+        '-c a.b="x -C /nonexistent-elsewhere" ',
+        "-c a.b='x -C /nonexistent-elsewhere' ",
+    )
+
+    # hook -> (executable prefix, bare verb text with its own arguments).
+    HOOK_VERBS = {
+        "prevent-direct-push": ("git ", "pu" + "sh origin ma" + "in"),
+        "validate-branch-name": ("git ", "chec" + "kout -b nonsense-branch"),
+        "require-preflight": ("git ", "com" + "mit -m wip"),
+        "enforce-pr-base-branch": ("gh ", "pr cre" + "ate --base ma" + "in"),
+        "update-changelog-before-pr": ("gh ", "pr cre" + "ate --base develop"),
+    }
+
+    @pytest.mark.parametrize("spelling", OPTION_SPELLINGS)
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_spelling_matches_plain_verdict(self, tmp_path, hook, spelling):
+        exe, verb = self.HOOK_VERBS[hook]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        plain = exe + verb
+        control = TestHookBlockingPathsFire._decide(work, env, hook, plain)
+        candidate = exe + spelling + verb
+        got = TestHookBlockingPathsFire._decide(work, env, hook, candidate)
+        assert got == control, (
+            f"{hook}: {candidate!r} verdict {got!r} != plain-form {plain!r} "
+            f"verdict {control!r}"
+        )
+
+    # IMP-3: a decoy spliced BETWEEN the executable and the verb (the
+    # OPTION_SPELLINGS axis above) sits at an offset >= the verb match's own
+    # start (`position` in `_targets_this_project`), and `preceding = [c for
+    # c in cd_matches if c[0] < position]` can never see anything at or after
+    # `position` -- so a decoy `cd` there can NEVER exercise the
+    # `_shell_scan` vouching on `cd`-detection, no matter how the decoy is
+    # spelled. The round-3 re-review proved this by mutation (MUT-B: drop
+    # `_shell_scan` from `cd`-detection, re-breaking #326 -- 105 passed,
+    # nothing red). A decoy only threatens that code path when it sits
+    # BEFORE the verb, which is what this axis does.
+    PREFIX_DECOYS = (
+        'echo "x && cd /nonexistent-elsewhere" && ',
+        "echo 'x && cd /nonexistent-elsewhere' && ",
+        'echo "x ; cd /tmp" && ',
+        'echo "x -C /nonexistent-elsewhere" && ',
+    )
+
+    @pytest.mark.parametrize("prefix", PREFIX_DECOYS)
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_prefix_decoy_matches_plain_verdict(self, tmp_path, hook, prefix):
+        exe, verb = self.HOOK_VERBS[hook]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        plain = exe + verb
+        control = TestHookBlockingPathsFire._decide(work, env, hook, plain)
+        candidate = prefix + exe + verb
+        got = TestHookBlockingPathsFire._decide(work, env, hook, candidate)
+        assert got == control, (
+            f"{hook}: {candidate!r} verdict {got!r} != plain-form {plain!r} "
+            f"verdict {control!r}"
+        )
+
+
+def _double_quote_escape(value: str) -> str:
+    """`value` wrapped in double quotes, backslash-escaping `\\` and `"`."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _backslash_escape(value: str) -> str:
+    """`value` with every non-alphanumeric/`-_./` character backslash-escaped.
+
+    Over-escaping an already-safe character (`\\a` for `a`) is harmless in
+    POSIX shells -- a backslash before a character with no special meaning
+    is just that character -- so this does not need to be precise about
+    which characters truly need escaping.
+    """
+    safe = set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./"
+    )
+    return "".join(("\\" + c) if c not in safe else c for c in value)
+
+
+def _option_token_quotings(token):
+    """Every quoting of `token` a POSIX shell reads back as exactly `token`.
+
+    Derived from the token by rule -- wrap it, wrap its tail, wrap its
+    first character, escape every character -- rather than typed out one
+    spelling at a time, which is the same discipline `_double_quote_escape`
+    and `_backslash_escape` apply to option VALUES.
+
+    The axis exists because varying the value alone turned out to be blind
+    to the half of #351 CRIT-6 that round 4 then broke. Reverting CRIT-6's
+    escaped-space half turned 5 generated rows red; reverting its
+    quoted-option-token half left all 105 green, because every generated
+    spelling was `-c a.b=<styled>` -- the value varied, the option token
+    was always a bare `-c`.
+    """
+    return {
+        "bare": token,
+        "fully-double-quoted": '"' + token + '"',
+        "fully-single-quoted": "'" + token + "'",
+        "tail-double-quoted": token[0] + '"' + token[1:] + '"',
+        "tail-single-quoted": token[0] + "'" + token[1:] + "'",
+        "leading-dash-double-quoted": '"' + token[0] + '"' + token[1:],
+        "leading-dash-single-quoted": "'" + token[0] + "'" + token[1:],
+        "every-character-escaped": "".join("\\" + c for c in token),
+    }
+
+
+_OPTION_TOKEN_QUOTINGS = _option_token_quotings("-c")
+
+# Spellings `_GLOBAL_OPTS` does not match today, so the gate stands down on
+# a command git accepts. Measured `allow` where the plain form is `deny`,
+# on all five hooks, at `74cf1b1` (before this branch), at `b428ff3` and
+# here -- pre-existing, unchanged by #351, NOT a regression.
+#
+# They are listed as strict xfails rather than left out: an omitted row is
+# a gap nobody can see, and `strict=True` means the day one of them starts
+# passing this test FAILS until the entry is deleted, so the ledger cannot
+# rot. The obvious fix -- letting `_OPT` start with a quote followed by the
+# dash -- was measured during round 5 at 221ms for 2000 tokens and rising
+# quadratically, i.e. it trades a fail-open for a slow-loris on every Bash
+# call, so it was not taken. See `TestPatternDecisionTimeIsBounded`.
+_OPTION_TOKEN_KNOWN_GAPS = frozenset({
+    "leading-dash-double-quoted",
+    "leading-dash-single-quoted",
+    "every-character-escaped",
+})
+
+# Two values, so the axis is not silently coupled to one value shape.
+_OPTION_TOKEN_VALUES = {
+    "bare": "a.b=v",
+    "shlex-quoted-space": "a.b=" + shlex.quote("x y"),
+}
+
+_OPTION_TOKEN_PARAMS = [
+    pytest.param(
+        quoting, value_name,
+        marks=(
+            [pytest.mark.xfail(
+                strict=True,
+                reason=f"known pre-existing gap: `_GLOBAL_OPTS` does not "
+                       f"match a {quoting} option token (same at 74cf1b1)",
+            )]
+            if quoting in _OPTION_TOKEN_KNOWN_GAPS else []
+        ),
+        id=f"{quoting}-{value_name}",
+    )
+    for quoting in sorted(_OPTION_TOKEN_QUOTINGS)
+    for value_name in sorted(_OPTION_TOKEN_VALUES)
+]
+
+
+class TestGeneratedGlobalOptionValuesMatchThePlainVerdict:
+    """IMP-3's "stop hand-picking spellings" fix. Rounds 1-4 each found a
+    fail-open the hand-picked `OPTION_SPELLINGS` list above had not thought
+    of, because the same mind chose its rows every time (CRIT-1's
+    half-quoted value, NEW-1's unbalanced quote, CRIT-6's backslash-escaped
+    space and quoted option token -- four different escaping ideas across
+    four rounds). This class generates spellings mechanically instead: a
+    small set of AWKWARD VALUES crossed with a small set of QUOTING STYLES,
+    each built with `shlex.quote` or an explicit escaping function rather
+    than typed out by hand, so the matrix does not depend on anyone
+    thinking of the next awkward case.
+
+    7 values x 3 styles = 21 combinations, x 5 hooks = 105 rows. Runs in the
+    same few seconds per row as the rest of this file's subprocess-based
+    tests -- bounded and fast, not a fuzzer.
+    """
+
+    VALUES = {
+        "space": "a b",
+        "single-quote": "a'b",
+        "double-quote": 'a"b',
+        "semicolon": "a;b",
+        "equals": "a=b",
+        "backslash": "a\\b",
+        "empty": "",
+    }
+
+    # Each style takes a raw value and returns a shell-embeddable spelling
+    # of it. `shlex` is Python's canonical POSIX-quoting implementation --
+    # using it (rather than hand-typing more quoted examples) is the point:
+    # it models the same tokenisation the shell does.
+    STYLES = {
+        "shlex-quote": shlex.quote,
+        "double-quoted": _double_quote_escape,
+        "backslash-escaped": _backslash_escape,
+    }
+
+    HOOK_VERBS = TestGlobalOptionSpellingsMatchThePlainVerdict.HOOK_VERBS
+
+    @pytest.mark.parametrize("value_name", sorted(VALUES))
+    @pytest.mark.parametrize("style_name", sorted(STYLES))
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_generated_value_matches_plain_verdict(
+        self, tmp_path, hook, style_name, value_name
+    ):
+        exe, verb = self.HOOK_VERBS[hook]
+        styled = self.STYLES[style_name](self.VALUES[value_name])
+        spelling = f"-c a.b={styled} "
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        plain = exe + verb
+        control = TestHookBlockingPathsFire._decide(work, env, hook, plain)
+        candidate = exe + spelling + verb
+        got = TestHookBlockingPathsFire._decide(work, env, hook, candidate)
+        assert got == control, (
+            f"{hook}: {candidate!r} ({style_name}/{value_name}) verdict "
+            f"{got!r} != plain-form {plain!r} verdict {control!r}"
+        )
+
+    @pytest.mark.parametrize("quoting,value_name", _OPTION_TOKEN_PARAMS)
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_generated_option_token_matches_plain_verdict(
+        self, tmp_path, hook, quoting, value_name
+    ):
+        """The same property over the OPTION TOKEN rather than its value.
+
+        `-c`, `"-c"`, `'-c'`, `-"c"`, `-'c'` are one option to any POSIX
+        shell, so all five must reach the same verdict as the plain form.
+        Three further quotings are strict xfails -- see
+        `_OPTION_TOKEN_KNOWN_GAPS`.
+        """
+        exe, verb = self.HOOK_VERBS[hook]
+        token = _OPTION_TOKEN_QUOTINGS[quoting]
+        spelling = f"{token} {_OPTION_TOKEN_VALUES[value_name]} "
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        plain = exe + verb
+        control = TestHookBlockingPathsFire._decide(work, env, hook, plain)
+        candidate = exe + spelling + verb
+        got = TestHookBlockingPathsFire._decide(work, env, hook, candidate)
+        assert got == control, (
+            f"{hook}: {candidate!r} ({quoting}/{value_name}) verdict "
+            f"{got!r} != plain-form {plain!r} verdict {control!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# A GENERATED end-to-end timing matrix, for the reason round 4 of Task 1
+# generated the spelling matrix instead of listing it: three separate
+# superlinear regressions in this file were each missed by a hand-picked
+# list of remembered worst cases, and the third was a QUADRATIC one that the
+# list walked straight past. `ADVERSARIAL_INPUTS` below holds inputs like
+# `"x" * 900_000` -- 900 KB with no quote and no separator in it, which is
+# exactly the shape that CANNOT exercise the span/separator interaction, and
+# it measured a comfortable 72 ms while a same-sized command holding both
+# took 37.9 SECONDS.
+#
+# So the axes are enumerated instead of the examples: separator density x
+# quote density x total length. A cell is a repeating unit at a size; the
+# units cover both ends of both axes and the combinations between them.
+_MATRIX_UNITS = {
+    # Both axes high at once -- the shape that was quadratic. Every unit
+    # contributes one closed quoted span AND two separators, so the span
+    # count and the separator count both grow with the input.
+    "quoted separators": ("PUSH origin feature/x && ", 'echo "a;b" && '),
+    "single-quoted separators": ("PUSH origin feature/x && ", "echo 'a;b' && "),
+    # Same, but the separator is a newline -- the path where `_quoted_spans`
+    # DROPS a span rather than vouching for it.
+    "newline separators": ("PUSH origin feature/x\n", 'echo "a;b"\n'),
+    # Separators only.
+    "bare separators": ("PUSH origin feature/x && ", "echo a && "),
+    "separator run": ("PUSH origin feature/x", ";"),
+    # Quotes only, closed and unclosed.
+    "quoted words": ("PUSH origin ", '"ab" '),
+    "balanced quote run": ("PUSH origin ", '"" '),
+    "unbalanced quote run": ("PUSH origin feature/x ", '"'),
+    # Neither -- the control, and the shape the old hand-picked list had.
+    "no structure": ("PUSH origin ", "x"),
+}
+
+# 4 KB is an ordinary long command; 64 KB is where a quadratic term first
+# becomes unmistakable; 900 KB sits just under the hooks' 1 MB stdin cap.
+_MATRIX_SIZES_KB = (4, 64, 900)
+
+# Sizes for the GROWTH assertion below. Doubling twice, chosen so the WORK
+# dominates the noise rather than merely exceeding the fixed ~42 ms of
+# interpreter start-up and git calls.
+#
+# `work = elapsed - baseline` is a difference of two measured numbers, so its
+# relative error is worst when the work is small -- and that is a flake, not
+# a finding. Measured under 12 CPU burners on 12 cores (2x oversubscription,
+# harsher than any CI runner): at 32/64/128 KB the assertion failed on five
+# of six runs with ratios of 3.05-5.24 across several shapes, because work
+# down at 3-15 ms is the same size as the jitter. At 128/256/512 KB the work
+# is 6-111 ms and the worst ratio over three runs was 2.13-2.33 -- BETTER
+# than the 2.50 measured idle at the smaller sizes, because the signal grew
+# faster than the noise.
+#
+# So the fix for a noisy ratio is more signal, not a bigger floor: raising
+# `_GROWTH_MIN_WORK_MS` would have discarded the cheap shapes entirely,
+# where moving up two doublings keeps every shape and measures all of them
+# better. A quadratic term is still unmistakable long before an absolute
+# ceiling would fire -- at these sizes the pre-fix hook does not finish a
+# single affected cell.
+_GROWTH_SIZES_KB = (128, 256, 512)
+
+# Best-of-N per cell. `min` picks the least-contended run, which is what makes
+# a wall-clock measurement mean something on a machine running several agents
+# at once -- the condition under which this suite has actually been observed
+# to slow from 4:00 to 6:09.
+_GROWTH_REPS = 3
+
+# Below this, a cell's work time is measurement noise rather than signal, and
+# a ratio computed from it is meaningless. Measured: on the fixed code the
+# smallest cells sit at 0.5-3 ms and produce ratios anywhere from 1.1 to 2.2
+# purely from jitter; on the PRE-fix code two shapes with sub-millisecond work
+# produced 4.60 and 4.06, which would have been false alarms rather than the
+# real quadratic sitting beside them. Cells under the floor are covered by the
+# absolute ceiling in `test_generated_shape_within_budget` instead.
+_GROWTH_MIN_WORK_MS = 3.0
+
+# Linear work doubles when the input doubles, so an honest ratio sits near
+# 2.0; quadratic work quadruples. Measured across all nine shapes on the fixed
+# code, worst ratio 2.24. 3.0 sits between the two regimes with ~34% headroom
+# over the measured worst case, and the quadratic it exists to catch does not
+# arrive at 3.1 -- the three affected shapes do not finish at all at 128 KB.
+_GROWTH_MAX_RATIO = 3.0
+
+
+# Memo for the size-matched baselines, keyed by (hook, size in KB).
+_SIZE_MATCHED_BASELINES = {}
+
+_MATRIX_LABELS = sorted(
+    f"{unit} @ {kb}KB"
+    for unit in _MATRIX_UNITS
+    for kb in _MATRIX_SIZES_KB
+)
+
+
+def _matrix_command(label):
+    """Build one cell, sized by its JSON PAYLOAD rather than its length.
+
+    Sizing on the raw string is a trap that silently empties the cell: a
+    quote-heavy shape roughly doubles under JSON escaping, so an "850 KB"
+    command became a >1 MB payload, tripped the hooks' own `_STDIN_CAP` and
+    was refused WITHOUT being parsed at all. Four of nine cells measured that
+    way -- fast, green, and testing nothing. Sizing on the encoded payload
+    keeps every cell just under the cap and genuinely through the parser.
+    """
+    unit_label, _, size = label.rpartition(" @ ")
+    target = int(size.removesuffix("KB")) * 1024
+    prefix, unit = _MATRIX_UNITS[unit_label]
+    prefix = prefix.replace("PUSH", "git pu" + "sh")
+    n = max(1, (target - len(prefix)) // len(unit))
+    for _ in range(6):
+        cmd = prefix + unit * n
+        got = len(json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": cmd}}))
+        if got <= target:
+            return cmd
+        n = max(1, int(n * target / got))
+    return prefix + unit * n
+
+
+class TestDecisionTimeIsBounded:
+    """A standing wall-clock budget on adversarial input, per hook (#351
+    CRIT-3). Round 3's reviewer found the round-2 fix's widened `_Q`
+    catch-all made a quote character both a balanced-run opener and an
+    ordinary character in the same `(?:...)*` repeat, which is catastrophic
+    backtracking: a 43-byte command (34 unbalanced double quotes) took 932ms
+    against the shipped 4d67581 pattern, and the reviewer measured over 10s
+    at 40. That is what turns "a reviewer happened to think to time it" into
+    a standing assertion nothing else in this file would have caught --
+    every other test in this class only checks the VERDICT, never how long
+    it took to arrive at one.
+
+    Budget: see SIZE_MATCHED_MULTIPLE and STALL_CEILING_MS -- the generated
+    matrix is judged against an equally large benign command, and the
+    hand-picked rows against a loose stall backstop. The 500ms figure below
+    survives only as a floor, and was chosen from measurements on this
+    machine (a 2026-era
+    Mac): an honest `git status` costs ~22-29ms per hook here --
+    interpreter/subprocess startup dominates that number, not the regex
+    work -- and the heaviest NON-pathological input measured (a ~900KB
+    single argument, close to the 1MB stdin cap, through
+    `prevent-direct-push`, which also runs `_push_invocations` and
+    `_protected_delete_refs`) cost ~90ms. 500ms is ~5x headroom over that
+    measured worst case and ~20x over the honest baseline -- room to
+    absorb a slower CI runner -- while staying far under a
+    human-noticeable stall (UX guidance generally puts the "user's flow of
+    thought stays uninterrupted" threshold around 1s). The CRIT-3 pattern
+    blew past 500ms by roughly 2x at just 34 quotes and would have blown
+    past it by orders of magnitude at the adversarial sizes used here.
+
+    A PreToolUse hook runs on every Bash tool call in this session, with a
+    1MB stdin cap on what it will read — a slow gate here is not merely an
+    inconvenience, it stalls every command the user runs.
+    """
+
+    BUDGET_MS = 500
+
+    # Two nets with different jobs, because one number cannot do both.
+    #
+    # CI killed the obvious model twice. A flat 500 ms failed on a shared
+    # runner. Scaling it by 12x a TINY-COMMAND baseline failed too, and the
+    # second failure is the instructive one: the runner's baseline was
+    # 39.4 ms against 39.4 ms here -- identical -- while the 900 KB cell took
+    # 551.6 ms against 235.8 ms. The runner starts an interpreter at the same
+    # speed and moves 900 KB far more slowly.
+    #
+    # The baseline and the cell were in different REGIMES. A tiny command is
+    # dominated by interpreter start-up and a couple of git calls, which is
+    # nearly machine-independent; a 900 KB command is dominated by memory and
+    # I/O throughput, which is exactly where a shared runner is worst. A ratio
+    # between two regimes measures the difference between the regimes, not the
+    # code, so K measured here could never transfer.
+    #
+    # The generated matrix therefore compares each cell against the BENIGN
+    # CELL OF THE SAME SIZE -- `no structure @ <same size>`, the same bytes
+    # through the same hook with the adversarial property removed. The
+    # assertion becomes "this shape costs no more than K x an equally large
+    # ordinary command", which is a statement about the code. Measured, that
+    # ratio is both tighter and stabler than the cross-regime one:
+    #
+    #                          worst ratio   worst ratio
+    #                                 idle   under 12 burners on 12 cores
+    #   vs a tiny command             6.06   --      (CI showed 14x)
+    #   vs the same-size benign cell  2.89   2.38-2.57
+    #
+    # Under load the size-matched baseline rose from 81.5 ms to 121-133 ms and
+    # the cell from 235.8 ms to 313-317 ms -- together, which is the property
+    # the tiny baseline did not have. Four of the five hooks sit at ~1.0x.
+    #
+    # K = 10 is ~3.5x headroom over the worst measured 2.89. It catches a
+    # constant-factor regression of ~3.5x or more in the span/separator
+    # machinery -- the failure mode the growth-ratio assertion CANNOT see,
+    # since a constant factor scales every size equally. Anything subtler is
+    # that assertion's job, and it is the primary detector: it is
+    # machine-independent by construction and stayed green through both CI
+    # failures.
+    SIZE_MATCHED_MULTIPLE = 10
+
+    # A floor, so a cheap cell whose baseline is a few milliseconds cannot
+    # produce a ceiling small enough to flake on scheduling noise.
+    CEILING_FLOOR_MS = 500
+
+    # The hand-picked ADVERSARIAL_INPUTS have no same-size benign partner --
+    # they are arbitrary remembered shapes, not points on a size axis -- so
+    # they keep a plain absolute bound, DEMOTED to what it can honestly claim:
+    # a catastrophic-stall backstop, not a tuned budget. 2 s is "a human has
+    # noticed and is wondering if it hung", not "this machine's fastest".
+    # Regressions on these shapes are caught by the growth assertion and by
+    # the size-matched matrix; this only catches a hang.
+    STALL_CEILING_MS = 2000
+
+    BASELINE_REPS = 2
+
+    # A per-row subprocess timeout just above the budget, not the shared
+    # 60s harness default. Round 3's implementation used the harness's
+    # ordinary `_decide`-style 60s cap, so a genuine regression died as
+    # `subprocess.TimeoutExpired` — an ERROR whose message says "60
+    # seconds", not "over the 500ms budget" — and cost ~10 minutes of wall
+    # clock to discover (2 pathological rows x 5 hooks x 60s each) (#351
+    # IMP-4). 4x the budget is generous headroom for scheduling jitter
+    # (nothing measured here comes within 5x of 500ms honestly) while
+    # still failing in low single-digit seconds per row instead of a full
+    # minute.
+    SUBPROCESS_TIMEOUT_S = 2
+
+    @classmethod
+    def _size_matched_baseline_ms(cls, work, env, hook, kb):
+        """Cost of the BENIGN cell of the same size, through the same hook.
+
+        Memoised per (hook, size): it is a property of the machine and the
+        input size, not of the adversarial shape being judged, and measuring
+        it per row would add hundreds of 900 KB runs to the suite.
+        """
+        key = (hook, kb)
+        if key in _SIZE_MATCHED_BASELINES:
+            return _SIZE_MATCHED_BASELINES[key]
+        command = _matrix_command(f"no structure @ {kb}KB")
+        best = None
+        for _ in range(cls.BASELINE_REPS):
+            start = time.perf_counter()
+            proc = subprocess.run(
+                [sys.executable, str(work / ".claude/hooks" / f"{hook}.py")],
+                input=json.dumps({"tool_name": "Bash",
+                                  "tool_input": {"command": command}}),
+                capture_output=True, text=True,
+                timeout=cls.SUBPROCESS_TIMEOUT_S, cwd=work, env=env,
+            )
+            assert proc.returncode == 0, (
+                f"{hook} size-matched baseline exited {proc.returncode}: "
+                f"{proc.stderr[-400:]!r}"
+            )
+            elapsed = (time.perf_counter() - start) * 1000
+            best = elapsed if best is None else min(best, elapsed)
+        _SIZE_MATCHED_BASELINES[key] = best
+        return best
+
+    # label -> command. Chosen to stress the three shapes rounds 1-3 each
+    # found a fail-open or a blowup in: unbalanced quotes (CRIT-3), a long
+    # run of global-option tokens (more `_GLOBAL_OPTS` iterations), and an
+    # argument near the stdin cap (`_push_invocations`'s `_SHLEX_MAX` path).
+    ADVERSARIAL_INPUTS = {
+        "2000 unbalanced double-quotes":
+            "git -a " + '"' * 2000 + " x",
+        "2000 unbalanced single-quotes":
+            "git -a " + "'" * 2000 + " x",
+        "500 stacked global-option tokens":
+            "git " + ("-c a=b " * 500) + "pu" + "sh origin ma" + "in",
+        "a ~900KB single argument, near the 1MB stdin cap":
+            "git pu" + "sh origin " + ("x" * 900_000),
+        # #351 round 4 shipped an `_OPT` under which a run of fully-quoted
+        # words was 2^n: 141 chars took 1.8s and 165 chars took 33s through
+        # this very hook. No row above is a run of fully-quoted words, so
+        # nothing here went red. These two are, in both of the spellings
+        # that blew up -- a word that is NOT an option token, and one that
+        # IS. Each carries the run after BOTH executables, because every
+        # other row in this dict says `git ` and is therefore a no-op for
+        # the two `gh` gates.
+        "2000 fully-quoted words after each executable":
+            "git " + ('"a" ' * 2000) + "x gh " + ('"a" ' * 2000) + "x",
+        "2000 quoted OPTION words after each executable":
+            "git " + ('"-c" ' * 2000) + "x gh " + ('"-c" ' * 2000) + "x",
+        # The #351 tag allowlist runs `_is_tag_ref` -- and with it
+        # `_VERSION_TAG_RE.fullmatch` -- once per ref TOKEN, so a command
+        # with thousands of them is the shape that would expose a
+        # superlinear cost there. No row above has more than a handful of
+        # ref tokens.
+        "5000 version-tag ref tokens":
+            "git pu" + "sh --tags origin " + ("v1.2.3 " * 5000),
+        # The same count in the shape that makes every one of them FAIL the
+        # tag test, so the allowance is refused on the last token rather
+        # than short-circuiting on the first.
+        "5000 near-miss tag ref tokens":
+            "git pu" + "sh origin " + ("v1.2.3x " * 5000),
+    }
+
+    @pytest.mark.parametrize("label", sorted(ADVERSARIAL_INPUTS))
+    @pytest.mark.parametrize("hook", TestHookInputFailsClosed.HOOKS)
+    def test_decision_within_budget(self, tmp_path, hook, label):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        ceiling = self.STALL_CEILING_MS
+        command = self.ADVERSARIAL_INPUTS[label]
+        start = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(work / ".claude/hooks" / f"{hook}.py")],
+                input=json.dumps({"tool_name": "Bash",
+                                  "tool_input": {"command": command}}),
+                capture_output=True, text=True,
+                timeout=self.SUBPROCESS_TIMEOUT_S, cwd=work, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            pytest.fail(
+                f"{hook} took over {elapsed_ms:.0f}ms on {label!r}, well "
+                f"past the {ceiling:.0f}ms ceiling (subprocess killed at "
+                f"the {self.SUBPROCESS_TIMEOUT_S}s safety cap) -- likely "
+                f"catastrophic backtracking or another superlinear blowup"
+            )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        assert proc.returncode == 0, (
+            f"{hook} exited {proc.returncode} on {label!r}: "
+            f"{proc.stderr[-400:]!r}"
+        )
+        assert elapsed_ms < ceiling, (
+            f"{hook} took {elapsed_ms:.1f}ms on {label!r}, over the "
+            f"{ceiling:.0f}ms catastrophic-stall backstop -- this bound only "
+            f"catches a hang; a smaller regression is the growth assertion's "
+            f"job"
+        )
+
+    @pytest.mark.parametrize("label", _MATRIX_LABELS)
+    @pytest.mark.parametrize("hook", TestHookInputFailsClosed.HOOKS)
+    def test_generated_shape_within_budget(self, tmp_path, hook, label):
+        """The same budget, over GENERATED shapes rather than remembered ones.
+
+        Worst cell measured on this machine after the fix: 241 ms
+        (`prevent-direct-push`, `balanced quote run @ 900KB`), against the
+        500 ms budget -- about 2x headroom, thinner than the hand-picked
+        rows enjoy, and deliberately so: these shapes are chosen to be the
+        expensive ones. The regression this class exists to catch is
+        superlinear, not a constant factor, so it does not arrive at 600 ms
+        -- the quadratic term measured 37.9 SECONDS on the 128 KB cell of
+        `quoted separators`, and cells here are seven times larger again.
+        """
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        kb = int(label.rpartition(" @ ")[2].removesuffix("KB"))
+        baseline = self._size_matched_baseline_ms(work, env, hook, kb)
+        ceiling = max(self.CEILING_FLOOR_MS,
+                      self.SIZE_MATCHED_MULTIPLE * baseline)
+        command = _matrix_command(label)
+        start = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(work / ".claude/hooks" / f"{hook}.py")],
+                input=json.dumps({"tool_name": "Bash",
+                                  "tool_input": {"command": command}}),
+                capture_output=True, text=True,
+                timeout=self.SUBPROCESS_TIMEOUT_S, cwd=work, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            pytest.fail(
+                f"{hook} took over {elapsed_ms:.0f}ms on the generated shape "
+                f"{label!r}, well past the {ceiling:.0f}ms ceiling "
+                f"({self.SIZE_MATCHED_MULTIPLE}x the {baseline:.1f}ms cost of "
+                f"an equally large benign command; subprocess killed at the "
+                f"{self.SUBPROCESS_TIMEOUT_S}s safety cap) -- a superlinear "
+                f"blowup over separator or quote density"
+            )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        assert proc.returncode == 0, (
+            f"{hook} exited {proc.returncode} on {label!r}: "
+            f"{proc.stderr[-400:]!r}"
+        )
+        assert elapsed_ms < ceiling, (
+            f"{hook} took {elapsed_ms:.1f}ms on the generated shape "
+            f"{label!r}, against a {baseline:.1f}ms baseline for an equally "
+            f"large BENIGN command through the same hook -- "
+            f"{elapsed_ms / baseline:.2f}x, over the "
+            f"{self.SIZE_MATCHED_MULTIPLE}x bound (ceiling {ceiling:.0f}ms). "
+            f"Both numbers are the same size on the same machine, so this is "
+            f"the code, not the runner."
+        )
+
+    # ---- the RELATIVE assertion --------------------------------------------
+    # Everything above is an absolute millisecond budget, and an absolute
+    # budget has two problems that this method exists to answer.
+    #
+    # It measures the MACHINE as much as the code. This suite has been
+    # observed taking 4:00 idle and 6:09 with several agents running, and a
+    # loaded machine is exactly when a hook feels slow to a human -- so the
+    # budget has to be set loose enough to survive load, which blunts it.
+    # Measuring an honest baseline command in the SAME run and subtracting it
+    # cancels most of that: interpreter start-up, git calls and scheduler
+    # contention move the baseline and the sample together.
+    #
+    # And it only fires once the input is already big enough to blow it. The
+    # quadratic term this class failed to catch was visible as a RATIO at
+    # 4 KB -- 70 ms against a flat 127 ms baseline -- long before it was
+    # visible as a budget breach at 64 KB. A net that watches the shape of
+    # the curve catches such a defect a hundred times smaller than one
+    # watching the total.
+    #
+    # Only `prevent-direct-push` is swept: it is the one hook with the
+    # `_push_invocations` span/separator machinery where the growth risk
+    # lives. The other four are covered by the absolute matrix above.
+    @pytest.mark.parametrize("unit", sorted(_MATRIX_UNITS))
+    def test_work_grows_no_faster_than_the_input(self, tmp_path, unit):
+        """Doubling the input must not much more than double the work.
+
+        Measured on the fixed code, worst ratio across all nine shapes:
+        2.50 idle, and 2.13-2.33 under 12 CPU burners on 12 cores (linear
+        work doubles, so ~2.0 is the honest figure). Against the pre-fix
+        hook the three shapes carrying both many quoted spans and many
+        separators do not finish a single cell -- so this separates the
+        regimes rather than merely ranking them.
+        """
+        work_dir, env = TestHookBlockingPathsFire._repo(tmp_path)
+
+        def measure(command):
+            best = None
+            for _ in range(_GROWTH_REPS):
+                start = time.perf_counter()
+                try:
+                    proc = subprocess.run(
+                        [sys.executable,
+                         str(work_dir / ".claude/hooks/prevent-direct-push.py")],
+                        input=json.dumps({"tool_name": "Bash",
+                                          "tool_input": {"command": command}}),
+                        capture_output=True, text=True,
+                        timeout=self.SUBPROCESS_TIMEOUT_S, cwd=work_dir,
+                        env=env,
+                    )
+                except subprocess.TimeoutExpired:
+                    return None
+                assert proc.returncode == 0, (
+                    f"prevent-direct-push exited {proc.returncode}: "
+                    f"{proc.stderr[-400:]!r}"
+                )
+                elapsed = (time.perf_counter() - start) * 1000
+                best = elapsed if best is None else min(best, elapsed)
+            return best
+
+        # The fixed cost of getting in and out of the hook at all, measured
+        # here rather than assumed, so load moves it with the samples.
+        baseline = measure("git pu" + "sh origin feature/probe")
+        assert baseline is not None, "the baseline command itself timed out"
+
+        works = []
+        for kb in _GROWTH_SIZES_KB:
+            elapsed = measure(_matrix_command(f"{unit} @ {kb}KB"))
+            if elapsed is None:
+                pytest.fail(
+                    f"prevent-direct-push did not finish {unit!r} at {kb}KB "
+                    f"within {self.SUBPROCESS_TIMEOUT_S}s -- superlinear "
+                    f"growth over separator or quote density (the fixed code "
+                    f"costs single-digit milliseconds of work here)"
+                )
+            works.append((kb, max(elapsed - baseline, 0.0)))
+
+        for (kb_a, work_a), (kb_b, work_b) in zip(works, works[1:]):
+            if work_a < _GROWTH_MIN_WORK_MS:
+                continue  # noise, not signal -- see _GROWTH_MIN_WORK_MS
+            ratio = work_b / work_a
+            assert ratio < _GROWTH_MAX_RATIO, (
+                f"prevent-direct-push work grew {ratio:.2f}x for {unit!r} "
+                f"when the input doubled from {kb_a}KB to {kb_b}KB "
+                f"({work_a:.1f}ms -> {work_b:.1f}ms over a {baseline:.1f}ms "
+                f"baseline), past the {_GROWTH_MAX_RATIO}x bound. Linear "
+                f"work doubles; quadratic work quadruples."
+            )
+
+
+def _hook_regex_constants(hook):
+    """Every regex constant a hook builds, folded out of its source.
+
+    The hooks are SCRIPTS -- importing one reads stdin and exits -- so the
+    patterns cannot simply be imported. They are, however, plain
+    string-concatenation expressions over `r'...'` literals and constants
+    defined above them, so this folds the three AST node types that takes
+    (a string constant, a name defined earlier in the same file, and `+`)
+    by hand. Deliberately NOT `eval`: a file that audits source should not
+    execute it, and a hand fold fails loudly on anything it does not model
+    instead of quietly running it.
+    """
+    src = (Path(".claude/hooks") / f"{hook}.py").read_text(encoding="utf-8")
+    ns = {}
+
+    def fold(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return ns[node.id]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return fold(node.left) + fold(node.right)
+        raise TypeError(type(node).__name__)
+
+    for node in ast.parse(src).body:
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            continue
+        name = node.targets[0].id
+        if not (name in ("_Q", "_OPT", "_GLOBAL_OPTS", "_VERSION_TAG")
+                or name.endswith("_VERB")):
+            continue
+        try:
+            ns[name] = fold(node.value)
+        except (TypeError, KeyError):
+            continue
+    return ns
+
+
+# Times ONE `re.search` and prints the milliseconds. Run as a subprocess so
+# a catastrophic backtrack is killed by a timeout instead of wedging pytest
+# (Python's `re` does not check for signals while matching, so an in-process
+# alarm cannot interrupt it). Pattern and text arrive as JSON on stdin --
+# never interpolated into this source, never passed as shell arguments.
+_PATTERN_TIMER_SRC = (
+    "import json, re, sys, time\n"
+    "req = json.load(sys.stdin)\n"
+    "rx = re.compile(req['pattern'])\n"
+    "start = time.perf_counter()\n"
+    "rx.search(req['text'])\n"
+    "print((time.perf_counter() - start) * 1000)\n"
+)
+
+
+_PATTERN_REPEATS = 5000
+
+# Repeated between the executable and a trailing non-verb word, so the
+# engine must EXHAUST the pattern rather than succeed early -- the worst
+# case, and the one a real fail-open command also hits. Module-level
+# because a class-body comprehension cannot see other class attributes.
+_PATTERN_TOKENS = {
+    "a fully-quoted word": '"a" ',
+    "a fully-quoted word holding a space": '"a b" ',
+    "a single-quoted word": "'a' ",
+    "a quoted OPTION word": '"-c" ',
+    "a single-quoted OPTION word": "'-c' ",
+    "a quoted option and a quoted value": '"-c" "k=v w" ',
+    "a quoted option and a bare value": '"-c" k=v ',
+    "a quoted option and a quoted dash-value": '"-c" "-x" ',
+    "a bare option and a quoted dash-value": '-c "-x" ',
+    "a backslash-escaped space in a value": "-c a.b=x\\ y ",
+    "a bare backslash escape": "\\x",
+    "an unbalanced double quote": '"',
+    "an unbalanced single quote": "'",
+}
+
+_PATTERN_LABELS = sorted(
+    [f"{name} x {_PATTERN_REPEATS}" for name in _PATTERN_TOKENS]
+    + ["a ~900KB single argument"]
+)
+
+
+class TestPatternDecisionTimeIsBounded:
+    """A timing budget on the PATTERNS themselves, not just end-to-end.
+
+    `TestDecisionTimeIsBounded` measures whole hooks, which is the number
+    that matters to a user but a coarse instrument: every row there pays
+    ~25ms of interpreter startup, and its four original inputs happened to
+    miss the shape that broke round 4. This class times a single
+    `re.search` per row against SHAPES GENERATED from a token template, so
+    the next spelling is covered by construction rather than by whoever
+    thinks of it.
+
+    Why this is a standing assertion rather than a habit: every single
+    regex change in `_Q`/`_OPT`/`_GLOBAL_OPTS` so far has been one
+    measurement away from a 30-second hook. Round 2 widened `_Q`'s
+    catch-all and made a quote both a run-opener and an ordinary character
+    (CRIT-3, 932ms at 34 quotes). Round 4 added a fully-quoted word as an
+    option token, which made it eligible as the PREVIOUS option's value
+    too (BLOCKING-1, 33s at 165 chars). Round 5's first attempt at the fix
+    required the `-` inside the quotes, which stops `"a" "a" ...` but not
+    `"-c" "-c" ...` -- still 2^n, still only visible by timing it. Each was
+    a verdict-preserving change, so no correctness test in this file could
+    have caught any of them.
+
+    The rule those three share, written into the pattern's own comment: in
+    a `(?:...)*` repeat, any two alternatives that can both match the same
+    text hand the engine a choice it will backtrack over. Adding an
+    alternative can only ever ADD a gate to the VERDICT; it can multiply
+    the COST.
+    """
+
+    # 200ms for one `re.search`. The worst honest measurement on this
+    # machine across every shape below, at ten times the repeat count used
+    # here, is ~27ms (a 600KB run of backslash-escaped values); at the
+    # 5000 repeats used here nothing exceeds ~3ms. 200ms is therefore
+    # ~60x headroom over the measured worst case while still catching a
+    # merely QUADRATIC regression (a candidate measured during round 5 hit
+    # 221ms at 2000 repeats), let alone an exponential one, which cannot
+    # finish at all at these sizes and dies on the subprocess cap instead.
+    BUDGET_MS = 200
+    SUBPROCESS_TIMEOUT_S = 5
+
+    REPEATS = _PATTERN_REPEATS
+    REPEATED_TOKENS = _PATTERN_TOKENS
+
+    HOOK_VERBS = TestGlobalOptionSpellingsMatchThePlainVerdict.HOOK_VERBS
+
+    @classmethod
+    def _texts(cls, exe, verb):
+        texts = {
+            f"{name} x {cls.REPEATS}": exe + token * cls.REPEATS + " x"
+            for name, token in cls.REPEATED_TOKENS.items()
+        }
+        texts["a ~900KB single argument"] = (
+            exe + verb + " " + "x" * 900_000)
+        return texts
+
+    @pytest.mark.parametrize("label", _PATTERN_LABELS)
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_pattern_search_within_budget(self, hook, label):
+        exe, verb = self.HOOK_VERBS[hook]
+        constants = _hook_regex_constants(hook)
+        # Every pattern the hook applies to command text, not just the entry
+        # verb. `prevent-direct-push` also carries `_VERSION_TAG`, added with
+        # the #351 tag allowlist; a new pattern that is never timed is
+        # exactly how rounds 2, 4 and 5 each shipped a 30-second hook.
+        patterns = {
+            k: v for k, v in constants.items()
+            if k.endswith("_VERB") or k == "_VERSION_TAG"
+        }
+        assert any(k.endswith("_VERB") for k in patterns), (
+            f"{hook}.py defines no `*_VERB` constant this test could fold "
+            f"-- a rename would otherwise make every row here vacuous"
+        )
+        text = self._texts(exe, verb)[label]
+        for name, pattern in sorted(patterns.items()):
+            start = time.perf_counter()
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-c", _PATTERN_TIMER_SRC],
+                    input=json.dumps({"pattern": pattern, "text": text}),
+                    capture_output=True, text=True,
+                    timeout=self.SUBPROCESS_TIMEOUT_S,
+                )
+            except subprocess.TimeoutExpired:
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                pytest.fail(
+                    f"{hook}.{name} did not finish one re.search on "
+                    f"{label!r} within {elapsed_ms:.0f}ms (killed at the "
+                    f"{self.SUBPROCESS_TIMEOUT_S}s cap), against a "
+                    f"{self.BUDGET_MS}ms budget -- catastrophic "
+                    f"backtracking: two alternatives in a repeat can both "
+                    f"match the same text"
+                )
+            assert proc.returncode == 0, (
+                f"{hook}.{name} timer exited {proc.returncode} on "
+                f"{label!r}: {proc.stderr[-400:]!r}"
+            )
+            match_ms = float(proc.stdout.strip())
+            assert match_ms < self.BUDGET_MS, (
+                f"{hook}.{name} took {match_ms:.1f}ms for one re.search on "
+                f"{label!r}, over the {self.BUDGET_MS}ms budget"
+            )
+
+
+class TestUnparseableTextResolvesTowardGating:
+    """Every consumer of `_shell_scan` must say which way "cannot tell"
+    resolves, and it has to be whichever way ADDS gating FOR THAT CONSUMER.
+
+    `_shell_scan` reports "this position is inside an open quote" and "this
+    text does not parse at all" as the same `False`, and it cannot tell
+    them apart, because it reads a PREFIX and a prefix that ends mid-quote
+    looks exactly like one that never closes. Its two consumers need
+    opposite things from that `False`:
+
+    * `_targets_this_project` DROPS a `cd`/`-C` it cannot vouch for. A
+      dropped `cd` leaves the command in scope, so the gate still applies.
+    * `_push_invocations` must SPLIT on a separator it cannot vouch for. An
+      extra segment with no verb is skipped; a MERGED one runs past the ref
+      and hands the deletion gate a token like `main;`.
+
+    Round 4 of #351 gave the second consumer the first one's answer --
+    reused `_shell_scan` and merged on doubt -- and three command shapes
+    that `develop` denies started to ALLOW a delete of a protected branch.
+    Measured, all four `_shell_scan` blind spots, on `prevent-direct-push`:
+    deny at `74cf1b1`, allow at `b428ff3`.
+
+    The fixtures below are all valid bash (`bash -n` rc 0) whose PREFIX a
+    real shell parses fine and `_shell_scan` cannot: an apostrophe in a `#`
+    comment, an unbalanced quote in one, a `case` pattern's bare `)`, and a
+    heredoc body. Each test asserts the GATING verdict, and pairs it with a
+    control proving the row is not trivially gated.
+    """
+
+    # label -> (prefix, suffix). The suffix closes the construct the prefix
+    # opens, so every fixture is a command bash would actually accept.
+    BAILS = {
+        "an apostrophe in a `#` comment": ("git status # don't\n", ""),
+        "an unbalanced quote in a `#` comment": ('git status # a "b\n', ""),
+        "a `case` pattern's bare `)`": ("case a in a) ", " ;; esac"),
+        "a heredoc body with an apostrophe":
+            ("cat <<'EOF'\ndon't\nEOF\n", ""),
+    }
+
+    HOOK_VERBS = TestGlobalOptionSpellingsMatchThePlainVerdict.HOOK_VERBS
+
+    # A `cd` to a directory outside the project stands every gate down --
+    # that is `_targets_this_project`'s whole job (#326).
+    ELSEWHERE = "cd /nonexistent-elsewhere && "
+
+    @pytest.mark.parametrize("bail", sorted(BAILS))
+    @pytest.mark.parametrize("hook", sorted(HOOK_VERBS))
+    def test_unvouched_cd_is_dropped_and_the_gate_still_applies(
+        self, tmp_path, hook, bail
+    ):
+        exe, verb = self.HOOK_VERBS[hook]
+        prefix, suffix = self.BAILS[bail]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+
+        # Controls, so a `deny` below is not just "this hook denies
+        # everything": the bare command is gated, and the SAME `cd` stands
+        # it down when the text ahead of it does parse.
+        assert decide(work, env, hook, exe + verb) == "deny"
+        assert decide(work, env, hook, self.ELSEWHERE + exe + verb) == "allow"
+
+        candidate = prefix + self.ELSEWHERE + exe + verb + suffix
+        assert decide(work, env, hook, candidate) == "deny", (
+            f"{hook}: {candidate!r} honoured a `cd` that {bail} makes "
+            f"unverifiable -- dropping it is the gating direction"
+        )
+
+    # `_push_invocations` is `prevent-direct-push`-only, and so is this.
+    DELETE = "git pu" + "sh origin --delete "
+
+    # What follows the ref. A shell needs no space around a separator, and
+    # the GLUED spellings are the ones only the split can catch: `_bare_ref`
+    # strips a TRAILING run of separator characters, so it rescues `main;`
+    # from `main; echo hi` but nothing recovers `main` from `main&&echo`.
+    # The spaced spelling is kept so both layers stay covered.
+    TAILS = ("; echo hi", ";echo hi", "&&echo hi", "|cat")
+
+    @pytest.mark.parametrize("tail", TAILS)
+    @pytest.mark.parametrize("bail", sorted(BAILS))
+    def test_unvouched_separator_still_splits_the_segment(
+        self, tmp_path, bail, tail
+    ):
+        prefix, suffix = self.BAILS[bail]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        hook = "prevent-direct-push"
+
+        protected = prefix + self.DELETE + "ma" + "in" + tail + suffix
+        assert decide(work, env, hook, protected) == "deny", (
+            f"{protected!r} deleted a protected branch: {bail} stopped the "
+            f"separator from splitting, so the ref token kept it attached "
+            f"and the #333 deletion gate never recognised it"
+        )
+
+        # The control: splitting must not have become "deny everything".
+        # A release-cleanup delete on the same shape still stands down.
+        release = prefix + self.DELETE + "release/1.0.0" + tail + suffix
+        assert decide(work, env, hook, release) == "allow", (
+            f"{release!r} was denied -- the release-cleanup stand-down has "
+            f"to survive the split, or this test proves nothing"
+        )
+
+    # A lone quote in a `#` comment or a heredoc body is not a quote to the
+    # shell, but `_quoted_spans` cannot see comments or heredocs. Given TWO
+    # of them it pairs the first with the second, on a LATER LINE, and
+    # vouches for every separator in between -- so the command merged into
+    # one segment. The merge alone is harmless; the fail-open needs the
+    # separator GLUED to the ref, which makes the token `main&&echo`, past
+    # the reach of `_bare_ref`'s trailing-separator strip. Measured `deny`
+    # at `74cf1b1`, `allow` at `950609c`. Both quote characters, all three
+    # separators, and a heredoc as well as a `#` comment.
+    #
+    # (prefix, tail) around the `<delete> <ref>` in the middle.
+    NEWLINE_SPANNING_QUOTES = {
+        "an apostrophe in a `#` comment, then another, glued `&&`":
+            ("echo hi # don't\n", "&&echo x # it's"),
+        "an apostrophe in a `#` comment, then another, glued `;`":
+            ("echo hi # don't\n", ";echo x # it's"),
+        "an apostrophe in a `#` comment, then another, glued `|`":
+            ("echo hi # don't\n", "|cat # it's"),
+        "an apostrophe in a heredoc body, then another, glued `&&`":
+            ("cat <<'EOF'\ndon't\nEOF\n", "&&echo x # it's"),
+        'a double quote in a `#` comment, then another, glued `&&`':
+            ('echo hi # don"t\n', '&&echo x # it"s'),
+    }
+
+    @pytest.mark.parametrize("shape", sorted(NEWLINE_SPANNING_QUOTES))
+    def test_a_span_across_a_newline_does_not_vouch_for_a_separator(
+        self, tmp_path, shape
+    ):
+        prefix, tail = self.NEWLINE_SPANNING_QUOTES[shape]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        decide = TestHookBlockingPathsFire._decide
+        hook = "prevent-direct-push"
+
+        protected = prefix + self.DELETE + "ma" + "in" + tail
+        assert decide(work, env, hook, protected) == "deny", (
+            f"{protected!r} deleted a protected branch: {shape} let "
+            f"`_quoted_spans` pair two quotes ACROSS a newline and vouch "
+            f"for the separator between them, so the segment never split "
+            f"and the ref token kept the separator glued to it"
+        )
+
+        # Same shape, release ref: the stand-down must still stand down, or
+        # this is just "deny everything after a quote".
+        release = prefix + self.DELETE + "release/1.0.0" + tail
+        assert decide(work, env, hook, release) == "allow", (
+            f"{release!r} was denied -- the release-cleanup stand-down has "
+            f"to survive the span filter"
+        )
+
+    # Isolate the cause: each of these differs from a row above in exactly
+    # one respect, and each denies at `74cf1b1` AND at `950609c`, so none
+    # of them can be what the rows above are really testing.
+    NEWLINE_SPAN_CONTROLS = {
+        # the separator is space-separated, so `main` is a clean token and
+        # `_bare_ref` never sees the separator at all
+        "the separator spaced away from the ref":
+            ("echo hi # don't\n", " && echo x # it's"),
+        # no second quote, so nothing pairs and no span is built
+        "no bracketing quotes at all":
+            ("echo hi # dont\n", "&&echo x # its"),
+        # no bail, no quotes: the ordinary shape
+        "neither a bail nor a quote": ("", "&&echo x"),
+    }
+
+    @pytest.mark.parametrize("shape", sorted(NEWLINE_SPAN_CONTROLS))
+    def test_newline_span_controls_are_unaffected(self, tmp_path, shape):
+        prefix, tail = self.NEWLINE_SPAN_CONTROLS[shape]
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        command = prefix + self.DELETE + "ma" + "in" + tail
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command) == "deny", (
+            f"{command!r} ({shape}) must deny at every revision -- it is a "
+            f"control, not a fixture for the span filter"
+        )
+
+    @staticmethod
+    def _bare_ref():
+        """`_bare_ref` loaded from the shipped source, not a copy of it.
+
+        Same technique as `TestScopeGuardFailsClosedWhenScopeIsUnknowable`.
+        """
+        src = Path(".claude/hooks/prevent-direct-push.py").read_text(
+            encoding="utf-8")
+        node = [
+            n for n in ast.walk(ast.parse(src))
+            if isinstance(n, ast.FunctionDef) and n.name == "_bare_ref"
+        ][0]
+        namespace = {}
+        exec(ast.get_source_segment(src, node), namespace)  # noqa: S102
+        return namespace["_bare_ref"]
+
+    # (token, the ref git would actually act on)
+    GLUED_REF_TOKENS = (
+        ("ma" + "in", "ma" + "in"),
+        ("ma" + "in;", "ma" + "in"),
+        ("ma" + "in&", "ma" + "in"),
+        ("ma" + "in|", "ma" + "in"),
+        ("ma" + "in;;", "ma" + "in"),
+        ('"refs/heads/ma' + 'in"', "ma" + "in"),
+        ("+refs/heads/ma" + "in;", "ma" + "in"),
+        # NOT stripped: a separator INSIDE the name is part of the ref git
+        # receives, and no branch is named `main;x`, so this must stay
+        # unprotected or a legitimate command starts being denied.
+        ("ma" + "in;x", "ma" + "in;x"),
+    )
+
+    @pytest.mark.parametrize("token,expected", GLUED_REF_TOKENS)
+    def test_bare_ref_strips_a_glued_trailing_separator(self, token, expected):
+        """The second layer, pinned on its own.
+
+        The segment split above is the primary fix, and it makes this
+        stripping redundant TODAY -- which is exactly why it needs its own
+        test: a defence-in-depth layer that no test exercises is deleted by
+        the next person who notices nothing goes red without it. It is here
+        because a `;`/`&`/`|` glued to a ref is how round 4 of #351 let a
+        delete of a protected branch through, and this is the last place
+        that can still be caught.
+        """
+        assert self._bare_ref()(token) == expected
+
+
 class TestScopeGuardCannotBeBypassed:
     """`_targets_this_project()` must not hand an attacker an off switch (#326).
 
@@ -1977,4 +3402,765 @@ class TestProtectedBranchDeletionIsBlocked:
         assert "_protected_delete_refs(command)" in source, (
             "the ref-token delete analysis is gone; nothing else in this hook "
             "denies `--delete origin release/x main`"
+        )
+
+
+# B1 fixture, generated at module level because a class-body comprehension
+# cannot see other class attributes -- same reason `_PATTERN_TOKENS` is here.
+# Fragments, for the reason given in TestHookBlockingPathsFire's docstring.
+_GLUE_PUSH = "git pu" + "sh"
+_GLUE_REFS = ("ma" + "in", "develop")
+_GLUE_FORMS = {
+    "plain": "{pu} origin {ref}{glue}",
+    "-d": "{pu} -d origin {ref}{glue}",
+    "--delete": "{pu} --delete origin {ref}{glue}",
+    "-f": "{pu} -f origin {ref}{glue}",
+}
+# Every way bash lets punctuation sit flush against the previous word. Each
+# was confirmed valid bash (`bash -n` rc 0) and confirmed to reach git with
+# the ref intact.
+_GLUE_PUNCTUATION = {
+    "trailing backslash": chr(92),
+    "redirect to a file": ">f",
+    "append to a file": ">>f",
+    "clobbering redirect": ">|f",
+    "close a descriptor": "<&-",
+    "read-write redirect": "<>f",
+    "redirect to /dev/null": ">/dev/null",
+}
+_GLUE_CASES = tuple(
+    (f"{ref} {form} {glue_name}",
+     template.format(pu=_GLUE_PUSH, ref=ref, glue=glue))
+    for ref in _GLUE_REFS
+    for form, template in _GLUE_FORMS.items()
+    for glue_name, glue in _GLUE_PUNCTUATION.items()
+)
+
+
+class TestAllowlistsCannotShadowTheDenyGates:
+    """#351: the tag allowlist ran ABOVE the deletion gate and stood the whole
+    hook down on an unanchored substring.
+
+    Three tests decided it, all on the raw command text and all before any
+    deny gate had run::
+
+        if "refs/tags/" in command or "--tags" in command:
+            sys.exit(0)
+        if re.search(r'git push\\s+\\S+\\s+v\\d+\\.\\d+\\.\\d+', command):
+            sys.exit(0)
+
+    None is tied to an argument, so ONE tag-shaped thing anywhere on the line
+    bought a stand-down for everything else on it. Measured at `1b0d3e5`, all
+    ALLOW from a feature branch:
+
+    * `--tags origin --delete main` deleted `main`;
+    * `origin refs/tags/v1 --delete main` and `origin v1.2.3 --delete main`
+      did the same in the other two spellings;
+    * `--tags origin main` pushed `main`.
+
+    Two more got through with no allowlist involved at all, because
+    `--mirror` and `--prune` delete remote refs with NO `--delete` flag: the
+    deletion gate's `_is_delete()` is false, no ref token is ever examined,
+    and nothing else in the hook looks at either flag. `--mirror origin`
+    measured ALLOW and removes every remote ref absent locally, `main`
+    included.
+
+    The fix is gate ORDER plus ref-token anchoring: both denies run first,
+    and the tag allowance now asks whether EVERY push on the line pushes
+    nothing but tags — the same correction #333 made to the release-cleanup
+    allowlist. The allowance still has to run BEFORE the current-branch
+    check, because the release flow really does run `git push origin v3.5.0`
+    from `main` (scripts/git-flow-finish.sh, phase 3).
+
+    Command strings are assembled from fragments for the reason given in
+    TestHookBlockingPathsFire's docstring: this repo's live hooks inspect
+    unexecuted command text, so a literal protected push here blocks the
+    tooling that reads this file.
+    """
+
+    PUSH = "git pu" + "sh"
+    GPUSH = "git -C . pu" + "sh"
+    MAIN = "ma" + "in"
+
+    # (label, command, expected) from a FEATURE branch. This is where the
+    # deny rows discriminate: on a feature branch the hook has no other
+    # reason to refuse, so anything that reaches the end allows.
+    CASES = (
+        # ---- the filed defect: an allowlist shadowing the deletion gate ----
+        ("--tags shadows the deletion gate",
+         f"{PUSH} --tags origin --delete {MAIN}", "deny"),
+        ("refs/tags/ shadows the deletion gate",
+         f"{PUSH} origin refs/tags/v1 --delete {MAIN}", "deny"),
+        ("a bare version tag shadows the deletion gate",
+         f"{PUSH} origin v1.2.3 --delete {MAIN}", "deny"),
+        # The widened suffix must not reopen the shadow it sits next to.
+        ("a prerelease tag shadows the deletion gate",
+         f"{PUSH} origin v1.2.3-rc1 --delete {MAIN}", "deny"),
+        ("a build-metadata tag shadows the deletion gate",
+         f"{PUSH} origin v1.2.3+build.5 --delete {MAIN}", "deny"),
+        ("--tags shadows a develop deletion",
+         f"{PUSH} --tags origin --delete develop", "deny"),
+        # ---- the filed defect: an allowlist shadowing a protected PUSH ----
+        ("--tags beside a protected branch",
+         f"{PUSH} --tags origin {MAIN}", "deny"),
+        ("--tags beside a qualified protected ref",
+         f"{PUSH} --tags origin refs/heads/{MAIN}", "deny"),
+        ("--tags beside a protected refspec",
+         f"{PUSH} --tags origin HEAD:{MAIN}", "deny"),
+        # ---- a protected ref that is not ADJACENT to the remote ----
+        # `targets_protected` tested the literal substring `"origin main"`, so
+        # a protected ref one word further along was missed entirely: measured
+        # ALLOW at 74cf1b1 from a feature branch, with no tag involved in the
+        # `foo` spelling at all. Same substring-vs-ref-token class #333 fixed
+        # for deletes, now fixed for pushes by `_protected_push_refs`, which
+        # reuses `_ref_tokens` + `_bare_ref` + `_PROTECTED_REF_RE`.
+        ("a protected ref one word past the remote",
+         f"{PUSH} origin foo {MAIN}", "deny"),
+        ("a protected ref past a feature ref",
+         f"{PUSH} origin feature/x {MAIN}", "deny"),
+        ("develop one word past the remote",
+         f"{PUSH} origin foo develop", "deny"),
+        ("a protected ref past a tag ref",
+         f"{PUSH} origin v1.2.3 {MAIN}", "deny"),
+        # Carried by the pre-existing refspec arm, not by the new one — kept
+        # as a control that the two agree rather than as proof of either.
+        ("a qualified protected ref past another ref",
+         f"{PUSH} origin foo refs/heads/{MAIN}", "deny"),
+        # Negative controls for the SAME arm: a branch whose name merely begins
+        # with a protected one is ordinary. `_PROTECTED_REF_RE.fullmatch` on
+        # `_bare_ref(t)` is what buys this; a substring test would deny all of
+        # them.
+        ("a mainline branch past another ref",
+         f"{PUSH} origin foo {MAIN}line", "allow"),
+        ("a maintenance branch past another ref",
+         f"{PUSH} origin foo {MAIN}tenance", "allow"),
+        ("a develop-x branch past another ref",
+         f"{PUSH} origin foo develop-x", "allow"),
+        ("a qualified mainline branch past another ref",
+         f"{PUSH} origin foo heads/{MAIN}line", "allow"),
+        # A branch whose LEAF is spelt like a protected one. This is the row
+        # that separates a whole-ref `fullmatch` from a `search`: the
+        # `mainline`/`maintenance` rows above do not, because
+        # `_PROTECTED_REF`'s trailing negative lookahead refuses those under
+        # either matcher. Here the lookahead is satisfied (the name ends the
+        # token) and only the whole-ref anchoring keeps an ordinary branch
+        # pushable.
+        ("a branch whose leaf is spelt like a protected one",
+         f"{PUSH} origin feature/{MAIN}", "allow"),
+        ("a qualified branch whose leaf is spelt like a protected one",
+         f"{PUSH} origin refs/heads/feature/{MAIN}", "allow"),
+        ("a branch whose leaf is spelt like develop",
+         f"{PUSH} origin foo team/develop", "allow"),
+        # C5: `"origin main" in command` fires INSIDE `origin maintenance`,
+        # so an ordinary branch was refused — measured deny at 74cf1b1 and
+        # at fc551f2. `_protected_push_refs` decides the same question on
+        # ref tokens, which is both correct and narrower, so the two
+        # substring arms are deleted rather than patched.
+        ("an ordinary branch the substring arm caught",
+         f"{PUSH} origin {MAIN}tenance", "allow"),
+        ("an ordinary branch the develop substring arm caught",
+         f"{PUSH} origin developer", "allow"),
+        # A legitimate MULTI-REF push. Every other negative control for this
+        # arm carries a protected-looking name; this one carries none, so it
+        # is the row that catches an arm which simply refuses more than one
+        # ref rather than reading them. git pushes all three.
+        ("several feature refs in one push",
+         f"{PUSH} origin feature/a feature/b", "allow"),
+        ("several feature refs, one of them qualified",
+         f"{PUSH} origin feature/a refs/heads/feature/b feature/c", "allow"),
+        # The value-flag handling in `_ref_tokens` exists so a flag's VALUE is
+        # never read as a ref. Going through `_ref_tokens` rather than
+        # re-deriving tokens is what keeps these right — re-deriving them is
+        # how #333's review found a legitimate release cleanup being DENIED.
+        ("a value flag whose value is not a ref",
+         f"{PUSH} -o ci.skip origin feature/x", "allow"),
+        ("a long value flag whose value is not a ref",
+         f"{PUSH} --push-option ci.skip origin feature/x", "allow"),
+        # The sharpest form of the same claim: a push option whose VALUE is
+        # spelt exactly like a protected branch. git sends it to the remote's
+        # hook as an opaque string and pushes `feature/x`; nothing touches the
+        # protected branch, so this must allow. It denies the moment
+        # `_protected_push_refs` stops going through `_ref_tokens`.
+        ("a value flag whose value is spelt like a protected branch",
+         f"{PUSH} -o {MAIN} origin feature/x", "allow"),
+        # ---- --mirror / --prune, which need no --delete to destroy refs ----
+        ("mirror push", f"{PUSH} --mirror origin", "deny"),
+        ("prune push",
+         f"{PUSH} --prune origin +refs/heads/*:refs/heads/*", "deny"),
+        ("mirror push the tag allowlist would have shadowed",
+         f"{PUSH} --mirror --tags origin", "deny"),
+        ("mirror push behind a global option",
+         f"{GPUSH} --mirror origin", "deny"),
+        # git's parse-options accepts an unambiguous ABBREVIATION of a long
+        # option. Verified on git 2.50.1 against a real bare remote: `--mi`,
+        # `--mir` and `--mirror` all pushed `refs/heads/main` plus every tag.
+        # An exact-token denylist is therefore bypassable by typing less.
+        ("abbreviated mirror push", f"{PUSH} --mi origin", "deny"),
+        ("half-abbreviated mirror push", f"{PUSH} --mir origin", "deny"),
+        ("abbreviated prune push",
+         f"{PUSH} --pru origin +refs/heads/*:refs/heads/*", "deny"),
+        # ---- C2: the same class as --mirror, one layer out. None of these
+        # NAMES a protected ref, and none carries --delete, so every
+        # ref-token gate below is blind to them; each was measured ALLOW at
+        # 74cf1b1 and at fc551f2, and each puts refs/heads/main AND
+        # refs/heads/develop on the remote. `--branches` is the modern
+        # spelling of `--all`.
+        ("push every branch", f"{PUSH} --all origin", "deny"),
+        ("push every branch, modern spelling",
+         f"{PUSH} --branches origin", "deny"),
+        ("abbreviated push-every-branch", f"{PUSH} --al origin", "deny"),
+        ("abbreviated modern spelling", f"{PUSH} --br origin", "deny"),
+        # A refspec whose DESTINATION is a glob covering branches does the
+        # same job with no flag at all.
+        ("a branch-glob refspec",
+         f"{PUSH} origin +refs/heads/*:refs/heads/*", "deny"),
+        ("a bare glob refspec", f"{PUSH} origin '*:*'", "deny"),
+        ("a glob that covers a protected name", f"{PUSH} origin 'ma*'",
+         "deny"),
+        # ---- C2 negative controls: globs that CANNOT reach a protected ref
+        # must stay allowed, or this becomes "deny every wildcard".
+        ("a tag glob", f"{PUSH} origin 'refs/tags/*:refs/tags/*'", "allow"),
+        ("a feature glob", f"{PUSH} origin 'feature/*'", "allow"),
+        ("a qualified feature glob",
+         f"{PUSH} origin 'refs/heads/feature/*:refs/heads/feature/*'",
+         "allow"),
+        # Source side is branches, destination is tags: it creates tags and
+        # touches no branch, so it allows. The DESTINATION is what matters.
+        ("branches pushed into tags",
+         f"{PUSH} origin 'refs/heads/*:refs/tags/*'", "allow"),
+        # ---- C3: `_is_tag_ref` reads a refspec's DESTINATION, after the
+        # last colon. No row pushed a tag INTO a branch, so flipping that
+        # choice to the source side left the class green while this flipped
+        # deny->allow — the gate-3 stand-down sits above the refspec arm.
+        ("a tag ref pushed into a protected branch",
+         f"{PUSH} origin refs/tags/v1:refs/heads/{MAIN}", "deny"),
+        ("a tag ref pushed into a protected branch, unqualified",
+         f"{PUSH} origin refs/tags/v1:{MAIN}", "deny"),
+        # ---- the QUOTED spelling of a flag, on both deny gates ----
+        # `_push_invocations` falls back to a whitespace split when
+        # `shlex.split` raises on an unbalanced quote, and that split does not
+        # strip quoting. `_bare_ref` has taken the quotes off REF tokens since
+        # #333; the FLAG tokens kept theirs, so a quoted flag did not start
+        # with `-` and every flag test skipped it. Measured at 74cf1b1: all
+        # three of these ALLOW, and the `--delete` one deletes a protected
+        # branch. Both helpers now strip the quote first.
+        ("a quoted mirror flag behind an unbalanced quote",
+         f'{PUSH} "--mirror" origin "', "deny"),
+        ("a single-quoted mirror flag behind an unbalanced quote",
+         f"{PUSH} '--mirror' origin \"", "deny"),
+        # This one goes through `shlex`, which strips the quotes itself, so it
+        # is the control proving the row above tests the FALLBACK path rather
+        # than just the flag matcher.
+        ("a quoted mirror flag that shlex can parse",
+         f'{PUSH} "--mirror" origin', "deny"),
+        # The same bypass on the #333 deletion gate. Kept here rather than in
+        # TestProtectedBranchDeletionIsBlocked because the quoting class is
+        # what this change fixed; the gate itself is unchanged.
+        ("a quoted delete flag beside a protected ref",
+         f'{PUSH} "--delete" origin "{MAIN}', "deny"),
+        # ---- negative controls: the fix must not be "deny every tag push" --
+        ("the release flow's tag push", f"{PUSH} origin v1.2.3", "allow"),
+        ("all tags", f"{PUSH} --tags origin", "allow"),
+        ("a qualified tag ref", f"{PUSH} origin refs/tags/v1.2.3", "allow"),
+        ("a tag push behind a global option", f"{GPUSH} origin v1.2.3",
+         "allow"),
+        ("a feature branch push", f"{PUSH} origin feature/probe", "allow"),
+        ("the #333 release cleanup",
+         f"{PUSH} origin --delete release/1.0.0", "allow"),
+        ("what git-branch-cleanup runs",
+         f"{PUSH} origin --delete feature/x", "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        CASES,
+        ids=[c[0].replace(" ", "-") for c in CASES],
+    )
+    def test_allowlist_decision(self, tmp_path, label, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # The allowance is only OBSERVABLE from a protected branch, for the reason
+    # spelled out on TestProtectedBranchDeletionIsBlocked.DEVELOP_CASES: on a
+    # feature branch "stood down" and "fell through" both end in allow. From
+    # `main` they separate, and `main` is also where the release flow really
+    # pushes its tag from (scripts/git-flow-finish.sh creates the tag on main,
+    # then runs `git push origin "$VERSION"`).
+    MAIN_CASES = (
+        # The case the allowance exists for. Every tag in this repo's history
+        # is the bare `vX.Y.Z` spelling.
+        ("the release flow's tag push from main",
+         f"{PUSH} origin v3.5.0", "allow"),
+        ("all tags from main", f"{PUSH} --tags origin", "allow"),
+        ("a qualified tag ref from main",
+         f"{PUSH} origin refs/tags/v1.2.3", "allow"),
+        ("several tags from main",
+         f"{PUSH} origin v1.2.3 refs/tags/v1.2.4", "allow"),
+        # The old version-tag test was a literal `git push` regex, so a tag
+        # push carrying a global option FALSELY DENIED from main — measured
+        # at `1b0d3e5`. The replacement reads ref tokens, so it does not care
+        # how the verb is spelled.
+        ("a tag push behind a global option, from main",
+         f"{GPUSH} origin v1.2.3", "allow"),
+        # A prerelease or build-metadata suffix is an ordinary thing to cut,
+        # and a false deny on the release flow is how a gate gets switched
+        # off. The suffix opens nothing: a ref matching this pattern is by
+        # construction neither `main` nor `develop`, and a branch that happens
+        # to be named `v1.2.3-foo` was always pushable anyway.
+        ("a prerelease tag from main", f"{PUSH} origin v4.0.0-rc1", "allow"),
+        ("a build-metadata tag from main",
+         f"{PUSH} origin v1.2.3+build.5", "allow"),
+        ("a prerelease tag behind a global option, from main",
+         f"{GPUSH} origin v2.0.0-beta.1", "allow"),
+        # ---- controls: main must not become an allow-everything branch ----
+        ("--tags beside a protected branch, from main",
+         f"{PUSH} --tags origin {MAIN}", "deny"),
+        ("--tags shadowing a deletion, from main",
+         f"{PUSH} --tags origin --delete {MAIN}", "deny"),
+        ("a plain protected push from main", f"{PUSH} origin {MAIN}", "deny"),
+        # The row that separates `all` from `any`. Both agree whenever there
+        # is exactly ONE ref token, so every other deny row here survives the
+        # `any` mutation: `--tags origin main` has one ref, `main`, which is
+        # not a tag either way. Only a MIX tells them apart — and it has to be
+        # judged from `main`, because on a feature branch a stand-down and a
+        # fall-through both end in allow.
+        ("a tag ref beside a protected branch ref, from main",
+         f"{PUSH} origin refs/tags/v1 {MAIN}", "deny"),
+        ("a tag ref beside an ordinary branch ref, from main",
+         f"{PUSH} origin v1.2.3 feature/x", "deny"),
+        ("a mirror push from main", f"{PUSH} --mirror origin", "deny"),
+        # `--follow-tags` is NOT a tags-only push and must not be treated as
+        # one. Verified on git 2.50.1 against a real bare remote with
+        # push.default=current: `git push --follow-tags origin` put
+        # `refs/heads/main` on the remote alongside the tag, where
+        # `git push --tags origin` pushed the tag ALONE. Standing the hook
+        # down on a bare `--follow-tags` would therefore have opened a fresh
+        # route to pushing `main` — the very thing this class closes.
+        ("--follow-tags is a branch push, from main",
+         f"{PUSH} --follow-tags origin", "deny"),
+        # With an explicit tag refspec it adds only reachable tags, so it is
+        # a genuine tags-only push and must still be allowed.
+        ("--follow-tags with an explicit tag ref, from main",
+         f"{PUSH} --follow-tags origin v1.2.3", "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        MAIN_CASES,
+        ids=[c[0].replace(" ", "-") for c in MAIN_CASES],
+    )
+    def test_allowlist_decision_from_main(self, tmp_path, label, command,
+                                          expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b",
+                        self.MAIN], env=env, check=True, capture_output=True)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # A release/hotfix branch exits at gate 5 (`is_release_or_hotfix_finish`)
+    # before gate 6 runs at all, so gate 6 cannot stand in for the deletion
+    # gate here. That makes this the ONLY place the quote strip in
+    # `_is_delete` is observable: everywhere else the ref-token arm of
+    # `targets_protected` reaches the same verdict by another route, and
+    # removing the strip turned no row red until these went in. The branch the
+    # release flow actually runs from is a `release/*` one, so this is the
+    # live path, not a contrived one.
+    RELEASE_CASES = (
+        ("a quoted delete flag, from a release branch",
+         f'{PUSH} "--delete" origin "{MAIN}', "deny"),
+        ("a single-quoted delete flag, from a release branch",
+         f"{PUSH} '--delete' origin \"{MAIN}", "deny"),
+        ("a quoted short delete flag, from a release branch",
+         f'{PUSH} "-d" origin "{MAIN}', "deny"),
+        # Control: the bare spelling already denied at 74cf1b1, so the three
+        # rows above are testing the QUOTING rather than the deletion gate.
+        ("a bare protected deletion, from a release branch",
+         f"{PUSH} --delete origin {MAIN}", "deny"),
+        # Control: a release branch must stay able to clean up its own refs.
+        ("the intended cleanup, from a release branch",
+         f"{PUSH} --delete origin release/x", "allow"),
+        # Control: gate 5 really does stand this branch down, which is what
+        # makes the rows above meaningful rather than incidental.
+        ("a release branch may push main during a finish",
+         f"{PUSH} origin {MAIN}", "allow"),
+        # ---- git accepts unambiguous long-option ABBREVIATIONS ------------
+        # `_all_ref_flags` was taught this for --mirror/--prune; `_is_delete`
+        # was not, and it is the same fact one function up. With the
+        # abbreviation `_is_delete` is False, so the deletion gate never
+        # fires -- and on a release branch the Git Flow allowance exits 0
+        # BEFORE the ref-token arm gets a look, so nothing catches it. On a
+        # feature branch the ref-token arm still does, which is why every
+        # probe anyone ran came back clean.
+        #
+        # `release/*` is the branch the release flow actually runs from, and
+        # the consequence is an unrecoverable deletion of a protected branch.
+        # Measured ALLOW here at 74cf1b1 and at b48f1b1; deny everywhere else.
+        # `--del`, `--dele` and `--delet` all reach git's ref stage.
+        ("abbreviated delete, flag first",
+         f"{PUSH} --del origin {MAIN}", "deny"),
+        ("abbreviated delete, longer prefix",
+         f"{PUSH} --dele origin {MAIN}", "deny"),
+        ("abbreviated delete, longest prefix",
+         f"{PUSH} --delet origin {MAIN}", "deny"),
+        ("abbreviated delete after the remote",
+         f"{PUSH} origin --del {MAIN}", "deny"),
+        ("abbreviated delete of develop",
+         f"{PUSH} origin --dele develop", "deny"),
+        # git rejects `--d` as ambiguous with `--dry-run`, so denying it costs
+        # nothing -- and over-matching here only ever adds a deny.
+        ("the ambiguous one-letter prefix",
+         f"{PUSH} --d origin {MAIN}", "deny"),
+        # ---- and the negative controls for the same change ---------------
+        # `--dry-run` also begins with `d` and must NOT read as a delete;
+        # "delete".startswith("dry-run") is False, which is what keeps it out.
+        ("a dry run is not a deletion",
+         f"{PUSH} --dry-run origin release/x", "allow"),
+        # The case the allowlist exists for, in abbreviated form: the release
+        # cleanup must still stand down once `_is_delete` recognises it.
+        ("abbreviated release cleanup still stands down",
+         f"{PUSH} --del origin release/x", "allow"),
+        ("abbreviated hotfix cleanup still stands down",
+         f"{PUSH} --delet origin hotfix/y", "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        RELEASE_CASES,
+        ids=[c[0].replace(" ", "-") for c in RELEASE_CASES],
+    )
+    def test_allowlist_decision_from_release_branch(self, tmp_path, label,
+                                                    command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b",
+                        "release/1.0.0"], env=env, check=True,
+                       capture_output=True)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # C4. Two guards in `_is_tag_push_only` that no row reached. Both are
+    # about text where the hook's two matchers DISAGREE, which is why no
+    # ordinary command exercises them — and both hand out a stand-down, so
+    # the direction that matters is the one where they refuse.
+    DISAGREEMENT_CASES = (
+        # `_PUSH_VERB`'s `\s+` matches a newline, so the entry test sees one
+        # `git push` spanning it; `_push_invocations` splits there and finds
+        # none. Valid bash (it runs `git`, then `push`, which is not a
+        # command), and the two matchers reach opposite answers. If the
+        # `if not invocations: return False` guard returned True instead,
+        # gate 3 would stand the hook down on it.
+        ("the two matchers disagree across a newline",
+         "git \npu" + "sh origin " + MAIN, "deny"),
+        # A separator inside a quoted run that closes is NOT a separator, so
+        # this arrives as one ref token spelt `refs/tags/v1;<protected>`.
+        # It starts with `refs/tags/`, so without the separator refusal in
+        # `_is_tag_ref` it reads as a tag and stands the hook down. Judged
+        # from `main`, where a stand-down and a fall-through differ.
+        ("a separator inside a quoted ref token",
+         f'{PUSH} origin "refs/tags/v1;{MAIN}"', "deny"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        DISAGREEMENT_CASES,
+        ids=[c[0].replace(" ", "-") for c in DISAGREEMENT_CASES],
+    )
+    def test_matcher_disagreement_does_not_stand_the_hook_down(
+            self, tmp_path, label, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b",
+                        self.MAIN], env=env, check=True, capture_output=True)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # ---- B1: shell punctuation glued to the ref token ----------------------
+    # `git push origin <protected>>/dev/null` is one WORD to this hook and two
+    # to bash: bash splits the redirection off and really pushes the branch.
+    # Same for a trailing backslash, which bash strips. `_bare_ref` normalised
+    # neither, so `_protected_push_refs` saw `main>/dev/null` and `main\` and
+    # matched neither.
+    #
+    # This was masked until 5f7f29b by the `"origin main" in command` substring
+    # arm -- the arm fired on the raw text regardless of how the token ended.
+    # Deleting the arm (C5) was right, and it did expose two other real gaps,
+    # but it had no deny row carrying THIS glue, so a passing mutation could
+    # not see it. Measured: 0 of 84 rows fail open at 74cf1b1, 84 of 84 at
+    # 5f7f29b..95dd663, every one valid bash (`bash -n` rc 0) and every one a
+    # real push or a real deletion of a protected branch.
+    #
+    # Generated rather than listed, for the reason the timing matrix is:
+    # a hand-picked glue list is what missed this in the first place.
+    GLUE_CASES = _GLUE_CASES
+
+    @pytest.mark.parametrize(
+        "label,command",
+        GLUE_CASES,
+        ids=[c[0].replace(" ", "-") for c in GLUE_CASES],
+    )
+    def test_glued_punctuation_does_not_hide_a_protected_ref(
+            self, tmp_path, label, command):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == "deny", f"{label}: expected deny, got {got}"
+
+    # The other half of the claim. Normalising the glue must not turn into
+    # "deny anything with punctuation on it", and in particular must not
+    # resurrect the substring false-denies C5 removed: `maintenance`, `main2`,
+    # `mainline` and `developer` all DENIED at 74cf1b1 and must stay allowed.
+    # `>{protected}` is the sharp one -- it is a redirection INTO a file named
+    # like a protected branch, not a push of one, and the split must read it
+    # that way round.
+    GLUE_CONTROLS = (
+        ("a feature branch wearing a redirect",
+         f"{PUSH} origin feature/x>/dev/null", "allow"),
+        ("a feature branch wearing a backslash",
+         f"{PUSH} origin feature/x" + chr(92), "allow"),
+        ("maintenance wearing a redirect",
+         f"{PUSH} origin {MAIN}tenance>/dev/null", "allow"),
+        ("a main2 branch wearing a redirect",
+         f"{PUSH} origin {MAIN}2>/dev/null", "allow"),
+        ("a mainline branch", f"{PUSH} origin {MAIN}line", "allow"),
+        ("a developer branch wearing a redirect",
+         f"{PUSH} origin developer>/dev/null", "allow"),
+        ("a tag wearing a redirect",
+         f"{PUSH} origin refs/tags/v1.2.3>/dev/null", "allow"),
+        # A redirection whose TARGET FILE is named like a protected branch.
+        # The word before the `>` is what git receives; there is no ref here
+        # at all, and the current branch is a feature branch.
+        ("a redirect into a file named like a protected branch",
+         f"{PUSH} origin >{MAIN}", "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        GLUE_CONTROLS,
+        ids=[c[0].replace(" ", "-") for c in GLUE_CONTROLS],
+    )
+    def test_glue_normalisation_does_not_over_deny(
+            self, tmp_path, label, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # ---- BH-1: an interior backslash escape ------------------------------
+    # `_push_invocations` falls back to `str.split` whenever the tail holds no
+    # quote character, and `str.split` does not remove backslash escapes. So
+    # `ma\\in` -- which bash hands to git as the protected branch -- reached
+    # every ref-token gate spelt with the backslash still in it and matched
+    # nothing. One backslash turned off `_protected_push_refs`,
+    # `_protected_delete_refs`, `_all_ref_flags` and `_branch_glob_refspecs`
+    # at once, i.e. most of what this PR adds. Measured ALLOW at 74cf1b1 and
+    # at b159a2b, `bash -n` clean, and
+    # `bash -c 'printf "[%s]" origin --delete ma\\in'` really prints
+    # `[origin][--delete][main]`.
+    #
+    # De-escaping happens at the one point the fallback tokens are built, not
+    # in each consumer -- that asymmetry (quoting normalised in one place,
+    # escaping in none) is what allowed this.
+    ESCAPE = chr(92)
+    BACKSLASH_CASES = (
+        ("an escaped protected ref, deleted",
+         f"{PUSH} origin --delete {MAIN[:2]}{ESCAPE}{MAIN[2:]}", "deny"),
+        ("an escaped protected ref, pushed",
+         f"{PUSH} origin {MAIN[:2]}{ESCAPE}{MAIN[2:]}", "deny"),
+        ("an escaped protected ref, qualified",
+         f"{PUSH} origin refs/heads/{MAIN[:2]}{ESCAPE}{MAIN[2:]}", "deny"),
+        ("an escaped protected ref, as a refspec destination",
+         f"{PUSH} origin HEAD:{MAIN[:2]}{ESCAPE}{MAIN[2:]}", "deny"),
+        ("an escaped mirror flag",
+         f"{PUSH} --mirr{ESCAPE}or origin", "deny"),
+        ("an escaped all-branches flag",
+         f"{PUSH} --a{ESCAPE}ll origin", "deny"),
+        ("an escaped delete flag",
+         f"{PUSH} origin --dele{ESCAPE}te {MAIN}", "deny"),
+        # The control that located the bug: add ANY quote character and the
+        # command routes through `shlex.split`, which de-escapes correctly --
+        # so this row denied even before the fix, and its bare twin did not.
+        ("the same command with a quote character in it",
+         f'{PUSH} origin --delete {MAIN[:2]}{ESCAPE}{MAIN[2:]} ""', "deny"),
+        # ---- and the negative controls -----------------------------------
+        # De-escaping must not invent a protected ref where there is none.
+        ("an escaped mainline branch",
+         f"{PUSH} origin {MAIN[:2]}{ESCAPE}{MAIN[2:]}line", "allow"),
+        ("an escaped branch whose leaf looks protected",
+         f"{PUSH} origin feature/{MAIN[:2]}{ESCAPE}{MAIN[2:]}", "allow"),
+        ("an escaped ordinary branch",
+         f"{PUSH} origin featu{ESCAPE}re/x", "allow"),
+        # A refspec INTO a tag is not a branch push, escaped or not.
+        ("an escaped protected ref as the refspec SOURCE",
+         f"{PUSH} origin {MAIN[:2]}{ESCAPE}{MAIN[2:]}:refs/tags/v1", "allow"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        BACKSLASH_CASES,
+        ids=[c[0].replace(" ", "-") for c in BACKSLASH_CASES],
+    )
+    def test_backslash_escapes_do_not_hide_a_ref_or_flag(
+            self, tmp_path, label, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    # ---- BH-2: the two matchers contradicting each other -----------------
+    # The entry test matches a push verb; `_push_invocations` finds none; every
+    # gate is then a loop over an empty list and the command sails through.
+    # Reachable from valid bash: an apostrophe in a trailing `#` comment never
+    # closes, so `_quoted_spans` returns None and the split falls back to
+    # every separator -- including a `|` inside a quoted `-c` value, which
+    # tears the verb in half. Measured ALLOW at 74cf1b1 and at b159a2b.
+    #
+    # The gate now denies on the contradiction itself, the same way
+    # `_targets_this_project` gates when its verb search disagrees with its
+    # caller's.
+    PAGER = 'core.pager="less|cat"'
+    CONTRADICTION_CASES = (
+        ("a protected deletion hidden by a comment apostrophe",
+         f"git -c {PAGER} pu" + f"sh origin --delete {MAIN} # it's fine",
+         "deny"),
+        # Controls isolating the cause: remove EITHER ingredient and the verb
+        # match survives, so the command is judged normally.
+        ("the same command with no comment",
+         f"git -c {PAGER} pu" + f"sh origin --delete {MAIN}", "deny"),
+        ("the same comment with no quoted separator",
+         f"{PUSH} origin --delete {MAIN} # it's fine", "deny"),
+        ("a benign push with a comment apostrophe",
+         f"{PUSH} origin feature/x # it's fine", "allow"),
+        ("a benign push with a comment and an UNquoted separator",
+         f"{PUSH} origin feature/x && echo done # it's fine", "allow"),
+        ("a benign push with a quoted separator and no comment",
+         f"git -c {PAGER} pu" + "sh origin feature/x", "allow"),
+        ("a benign push with a comment and a quoted value holding no separator",
+         'git -c core.pager="lesscat" pu' + "sh origin feature/x # it's fine",
+         "allow"),
+        # THE COST, pinned deliberately rather than hidden. This is a
+        # legitimate feature-branch push and it is now REFUSED, because it
+        # carries both ingredients at once. It is fail-CLOSED and the
+        # workaround is to drop the comment or the apostrophe; the
+        # alternative was a fail-open that deletes a protected branch. Both
+        # ingredients are required -- every row above removes one and allows.
+        ("a legitimate push carrying BOTH ingredients is refused",
+         f"git -c {PAGER} pu" + "sh origin feature/x # it's fine", "deny"),
+    )
+
+    @pytest.mark.parametrize(
+        "label,command,expected",
+        CONTRADICTION_CASES,
+        ids=[c[0].replace(" ", "-") for c in CONTRADICTION_CASES],
+    )
+    def test_matcher_contradiction_denies(self, tmp_path, label, command,
+                                          expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        got = TestHookBlockingPathsFire._decide(
+            work, env, "prevent-direct-push", command)
+        assert got == expected, f"{label}: expected {expected}, got {got}"
+
+    def test_the_gate_order_is_what_carries_these(self):
+        """The negative control on ORDER, which no verdict row can express.
+
+        Every deny row above would still pass against a hook that blocked
+        everything, and — more to the point — the whole defect was an
+        allowlist sitting in the wrong PLACE rather than a missing check.
+
+        This assertion is not redundant with the verdict rows, and the
+        mutation says so: moving `_is_tag_push_only` back above the deletion
+        gate turns NO verdict row red, because the function refuses on
+        `_is_delete()` and `_all_ref_flags()` by itself before it ever looks
+        at a ref. The two are belt and braces — the position and the internal
+        checks each close #351 alone — and this is the only test that can
+        catch the position half going. (Deleting the gate-2 denies, by
+        contrast, turns seventeen verdict rows red; changing `all` to `any`
+        turns the mixed-ref rows red; and dropping the `_protected_push_refs`
+        arm turns forty-nine red, because since the two substring arms were
+        removed it is the only thing carrying a protected-push deny at all.)
+        """
+        source = Path(".claude/hooks/prevent-direct-push.py").read_text(
+            encoding="utf-8")
+
+        # The three substring tests that were the defect. Matched in their
+        # CODE shape, not as bare prose: the replacement's own docstring
+        # quotes each of them to say what it replaced, the way
+        # `test_the_delete_analysis_is_what_carries_these` matches
+        # `'"--delete" in command and'` rather than `'"--delete"'`.
+        assert 'if "refs/tags/" in command' not in source, (
+            "the unanchored refs/tags/ substring allowlist is back; #351 is "
+            "reachable again"
+        )
+        assert 'or "--tags" in command:' not in source, (
+            "the unanchored --tags substring allowlist is back; #351 is "
+            "reachable again"
+        )
+        assert ("git pu" + "sh" + r"\s+\S+\s+v") not in source, (
+            "the unanchored version-tag regex is back; it also spelt the "
+            "verb literally, so a global-option tag push falsely denied"
+        )
+
+        delete_deny = source.index(
+            "_deleted_protected = _protected_delete_refs(command)")
+        mirror_deny = source.index("_all_ref_pushes = [")
+        tag_allow = source.index("if _is_tag_push_only(command):")
+        branch_check = source.index('["main", "develop"]')
+
+        assert delete_deny < tag_allow, (
+            "the tag allowance runs BEFORE the protected-deletion deny again "
+            "— that is exactly #351: one tag ref on the line stands the whole "
+            "hook down while `main` is being deleted"
+        )
+        assert mirror_deny < tag_allow, (
+            "the tag allowance runs BEFORE the mirror/prune deny again — "
+            "`--mirror --tags origin` is allowed as a tag push"
+        )
+        assert tag_allow < branch_check, (
+            "the tag allowance runs AFTER the current-branch check — the "
+            "release flow's `git push origin v3.5.0` from main now denies "
+            "(scripts/git-flow-finish.sh phase 3)"
+        )
+
+    def test_the_non_adjacent_arm_is_what_blocks_those(self):
+        """The negative control on the new `targets_protected` arm.
+
+        Without it the deny rows above would still pass against a hook that
+        blocked everything, and the `mainline`/`maintenance` allow rows would
+        still pass if the arm were deleted, because a feature branch has no
+        other reason to refuse them. Two claims: the arm exists, and it
+        decides on a WHOLE ref rather than a substring.
+        """
+        source = Path(".claude/hooks/prevent-direct-push.py").read_text(
+            encoding="utf-8")
+        assert "_protected_push_refs(command)" in source, (
+            "the non-adjacent protected-push arm is gone; `origin foo "
+            "<protected>` is allowed from a feature branch again"
+        )
+        body = source.split("def _protected_push_refs", 1)[1].split(
+            "\ndef ", 1)[0]
+        assert "_ref_tokens(tokens)" in body, (
+            "_protected_push_refs no longer goes through `_ref_tokens`, so a "
+            "value flag's value can be read as a ref — that is the false deny "
+            "#333's review found"
+        )
+        assert "_PROTECTED_REF_RE.fullmatch(_bare_ref(t))" in body, (
+            "_protected_push_refs no longer matches a WHOLE ref; `mainline` "
+            "and `maintenance` are ordinary branches and must stay allowed"
+        )
+
+    def test_the_tag_allowance_asks_about_every_ref(self):
+        """`all`, not `any` — the #333 correction, applied here.
+
+        Without it `--tags origin main` is a tag push with a branch riding
+        along, which is the shape of every deny row above.
+        """
+        source = Path(".claude/hooks/prevent-direct-push.py").read_text(
+            encoding="utf-8")
+        body = source.split("def _is_tag_push_only", 1)[1].split(
+            "\n_deleted_protected", 1)[0]
+        assert "if not all(_is_tag_ref(r) for r in refs):" in body, (
+            "_is_tag_push_only no longer asks about EVERY ref token; one tag "
+            "on the line buys a stand-down for whatever else is on it"
         )

@@ -7,6 +7,9 @@ tag pushes, and feature branch pushes.
 
 Installed by /harden-repo into target repo's .claude/hooks/
 """
+import bisect
+import fnmatch
+import functools
 import json
 import os
 import re
@@ -175,14 +178,133 @@ def _read_hook_input(what):
     raise SystemExit(2)
 
 
+# `git` and `gh` accept GLOBAL options between the executable and the
+# subcommand: `git -C . push`, `git -c k=v push`, `git --no-pager push`,
+# `gh --repo o/r pr create`. A literal `"git push" in command` never matches
+# those, so the gate exited 0 with an empty stdout — an ALLOW under the
+# PreToolUse contract, with every check below it skipped (#351, #327 item 2).
+#
+# A global option is always `-`-prefixed (this holds for every documented
+# git and gh global option), and may take a SEPARATE value: `-C .`,
+# `-c k=v`, `-R o/r`. The quoted alternatives matter because a path with a
+# space (`-C "/a b"`) otherwise ends the run mid-argument and the verb stops
+# matching — the same fail-open this pattern exists to close.
+#
+# Over-matching here can only ever ADD a gate, never remove one, so the
+# pattern is deliberately permissive.
+# A shell WORD is a run of non-space chars in which a quoted run may itself
+# contain spaces, so `-c user.name="A B"` is ONE argument. Matching only a
+# fully-quoted value (`-C "/a b"`) left the commoner half-quoted spelling
+# (`-c k="v w"`) stranded mid-argument: the option-value alternatives ended
+# at the first bare space, the required trailing `\s+` then landed on the
+# quote-terminated remainder, which is neither a `-`-prefixed option nor the
+# verb, and the match failed closed into an ALLOW (#351 CRIT-1).
+#
+# A quote char that never finds its matching close (`user.name=O'Brien`, a
+# real git idiom and rc 0 on the real binary) made the two alternatives
+# below FAIL outright rather than degrade: excluding quote chars from the
+# catch-all left `_Q*`/the value continuation unable to advance past a lone
+# `'`, which stopped the option/value token short and stranded the required
+# trailing `\s+` on a non-space character -- another route to the same
+# ALLOW (#351 NEW-1). The fix direction only ever ADDS a gate: a balanced
+# quoted run is still preferred (tried first in the alternation, so a space
+# inside `"A B"` still bridges), and only an UNBALANCED quote falls through
+# to matching as an ordinary character, same as the old permissive `\S+`.
+#
+# That widened catch-all made a quote char both a balanced-run OPENER and
+# an ordinary character inside a `(?:...)*`repeat, so a run of unbalanced
+# quotes let the engine try both interpretations at every position and
+# backtrack over all of them when the tail failed to match -- catastrophic
+# backtracking. Measured on the shipped 4d67581 pattern: a 43-byte command
+# (34 double quotes) took 932ms; the reviewer measured over 10s at 40. A
+# PreToolUse hook runs on every Bash call with a 1MB stdin cap, so this was
+# a live DoS reachable by an ordinary command containing unbalanced quotes
+# (#351 CRIT-3). Fixed by making the alternatives DISJOINT with a lookahead
+# instead of widening a shared catch-all: `"(?![^"]*")` matches a `"` as a
+# literal character ONLY when no closing `"` exists ahead of it, so a given
+# quote character is never simultaneously eligible for the balanced-run
+# alternative AND the catch-all -- nothing left to backtrack between.
+#
+# Two more spellings the catch-all still missed, both reaching the real
+# binary at rc 0 (#351 CRIT-6):
+#
+#  * a BACKSLASH-ESCAPED space (`user.name=A\ B`, no quotes at all). The
+#    catch-all excluded whitespace, so `_Q*` stopped dead at the space,
+#    the value truncated to `user.name=A\`, and the mandatory trailing
+#    `\s+` swallowed just that one space -- stranding `B` where `push`
+#    needed to be next. Fixed with a new `\\.` alternative that matches a
+#    backslash plus the character it escapes as ONE atomic unit -- bare
+#    backslash is now EXCLUDED from the catch-all (`[^\s"'\\]`) so a given
+#    backslash can only ever be consumed by `\\.`, never by both, keeping
+#    every alternative disjoint the same way the CRIT-3 fix requires.
+#  * a QUOTED OPTION TOKEN (`"-c"`, `'-c'`). Every alternative above
+#    assumed the option starts with a literal, unquoted `-`; git does not
+#    require that. `_OPT` adds two more shapes for "the option token
+#    itself" -- a double- or single-quoted run whose FIRST character is
+#    the `-` -- alongside the original `-`-prefixed one.
+#
+#    The `-` has to be INSIDE the quotes. Accepting ANY fully-quoted word
+#    as an option token (`"[^"]*"`, which is what round 4 of #351 shipped)
+#    made a quoted word eligible both as an option token AND as the
+#    PREVIOUS option's separate value, inside the same `(?:...)*` repeat.
+#    Every adjacent pair of quoted words could then be parsed two ways, so
+#    a run of n of them cost 2^n. Measured end-to-end through this hook:
+#    `git ` + `"a" ` x34 (141 chars) took 1.8s, and x40 (165 chars) took
+#    33s -- on input that need not even be a git command, since the hook
+#    reads TEXT and the run only has to follow the literal `git `/`gh `.
+#    Requiring the `-` makes the two roles disjoint again (a value like
+#    `'k=v w'` can no longer be an `_OPT`): the same run at 2000 words
+#    costs 0.05ms, and both quoted-option spellings above still match.
+#
+#    That is only HALF of it, though. A word like
+#    `"-c"` is a legal `_OPT` AND, being fully quoted, was still a legal
+#    SEPARATE VALUE for the option before it -- so a run of `"-c" "-c"
+#    ...` kept the same 2^n (measured on `_OPT`-with-the-dash alone:
+#    2.5ms at 20 words, ~2.6x per word after that). The separate-value
+#    group below therefore refuses a quoted run whose first character is
+#    a `-`: `"(?:[^-"][^"]*)?"` matches `""` and `"x..."` but never
+#    `"-..."`. That costs no permissiveness, because a word this group
+#    declines is picked up as the NEXT `_OPT` on the following iteration
+#    -- `git -c "-x" push` still matches -- and it makes "option token"
+#    and "separate value" disjoint at the WORD level, which is what
+#    removes the choice the engine was backtracking over. Measured
+#    linear to 50 000 repeats on every shape.
+#
+#    "More shapes can only ADD a gate" is true of the VERDICT and false of
+#    the COST -- the trap round 4 fell into. Every alternative added here
+#    must be DISJOINT from the others (the rule the CRIT-3 fix above
+#    established) and must be TIMED; `TestPatternDecisionTimeIsBounded`
+#    now asserts that over generated shapes instead of leaving it to
+#    whoever remembers to measure.
+_Q = r'''(?:"[^"]*"|'[^']*'|"(?![^"]*")|'(?![^']*')|\\.|[^\s"'\\])'''
+_OPT = r'''(?:-''' + _Q + r'''*|"-[^"]*"|'-[^']*')'''
+_GLOBAL_OPTS = (
+    r'(?:' + _OPT + r'(?:\s+(?:(?:"(?:[^-"][^"]*)?"|'
+    r"'(?:[^-'][^']*)?'|\"(?![^\"]*\")|'(?![^']*')|\\.|[^-\s\"'\\])"
+    + _Q + r'*))?\s+)*'
+)
+
+_PUSH_VERB = r'\bgit\s+' + _GLOBAL_OPTS + r'push\b'
+
 input_data = _read_hook_input("Push hook")
 
 tool_name = input_data.get("tool_name", "")
 tool_input = input_data.get("tool_input", {})
 command = tool_input.get("command", "")
+# A "\<newline>" is a line continuation -- whitespace, not a separator --
+# so `git \<NL> push` is `git push`. Normalise ONCE here, before the
+# entry test below and every other raw-text check on `command` (the
+# `targets_protected` substring arms; the --base regex in the sibling
+# gates): the entry test exiting 0 with
+# empty stdout is an ALLOW, and it read un-collapsed text before
+# `_targets_this_project` or `_push_invocations` ever got a chance to
+# collapse it themselves -- both run too late to save the entry test
+# (#351 CRIT-2). Their own internal collapses stay; they are idempotent
+# and are also exercised directly by tests.
+command = command.replace("\\\n", " ")
 
 # Only validate git push commands
-if tool_name != "Bash" or "git push" not in command:
+if tool_name != "Bash" or re.search(_PUSH_VERB, command) is None:
     sys.exit(0)
 
 # --- Project-scope guard ---
@@ -296,10 +418,10 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         return True  # Unresolvable project dir — can't scope, be safe
 
     try:
-        verb_positions = [m.start() for m in re.finditer(verb, cmd)]
+        verb_matches = list(re.finditer(verb, cmd))
     except re.error:
         return True  # Unusable verb pattern — can't scope, be safe
-    if not verb_positions:
+    if not verb_matches:
         # The caller matched this verb but this function cannot find it: the
         # two matchers disagree, so gate rather than guess.
         return True
@@ -317,7 +439,68 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         target = m.group("dq") or m.group("sq") or m.group("bare")
         cd_matches.append((m.start(), m.end(), target, subshells))
 
-    for position in verb_positions:
+    for m in verb_matches:
+        position = m.start()
+        # `git -C <path>` retargets THIS invocation at another checkout — the
+        # same thing `cd <path> &&` does for the rest of the line, and it is
+        # inside the matched text because the verb pattern spans the global
+        # options. Anything ambiguous (several `-C`s, whose effects compound
+        # relative to each other; an unresolvable path) falls through to the
+        # `cd` logic below and ends up gated, which is fail-closed.
+        #
+        # `m.group(0)` has no idea it might itself be sitting inside a
+        # QUOTED VALUE of an unrelated option: `-c a.b="x -C /elsewhere"` is
+        # ONE shell argument -- git reads it back as a single config value,
+        # not a second `-C` -- so a naive search over `m.group(0)` found
+        # this decoy and let it descope the whole command (#351 CRIT-4),
+        # the same bypass class as #326 one layer deeper. `_shell_scan`
+        # already answers "would a shell really be executing here, or is
+        # this inside quotes/backticks/a substitution"; give the `-C`
+        # extraction that same test, keyed by its ABSOLUTE offset in `cmd`
+        # (`position + cd.start()`, not an offset into `m.group(0)`). A
+        # `-C` the scan cannot vouch for is not provably real, so it is
+        # dropped here and the occurrence falls through to the `cd` logic
+        # below, exactly like `len(c_dirs) != 1` -- gated.
+        #
+        # Inheriting `_shell_scan` also inherits its blind spots: a `#`
+        # comment on a PRECEDING line, an unbalanced quote inside such a
+        # comment, a `case ... )` pattern, and a heredoc body are all valid
+        # bash that `_shell_scan` cannot model, so a legitimately cross-repo
+        # `-C` after one of these now falls through to the `cd` logic and
+        # gets denied instead of descoped. All four are fail-CLOSED -- the
+        # cost lands only on cross-repo `-C` work, an in-project `-C` after
+        # the same constructs still denies correctly -- and are the accepted
+        # cost of "a `-C` the scan cannot vouch for is not provably real"
+        # (documented, not fixed: modelling comments/heredocs would be a
+        # redesign of the #326 `_shell_scan` machinery, not this task).
+        c_dirs = [
+            cd for cd in re.finditer(
+                r'''(?<![^\s])-C\s+(?:"([^"]*)"|'([^']*)'|(\S+))''',
+                m.group(0))
+            if _shell_scan(cmd[:position + cd.start()])[0]
+        ]
+        if len(c_dirs) == 1:
+            # `-C ""` is documented git behaviour ("if <path> is present but
+            # empty, the current working directory is left unchanged") and is
+            # rc 0 on git 2.50.1 -- all three capture groups are then the
+            # empty string, and the old `next(t for t in c_dirs[0] if t)`
+            # raised StopIteration with no target to fall back to. An
+            # uncaught exception exits non-zero, which is a NON-blocking
+            # error under the PreToolUse contract -- the crash itself was the
+            # fail-open (#351 NEW-2). An empty/unresolved `-C` value is
+            # ambiguous, not provably out of scope, so it falls through to
+            # the `cd` logic below exactly like `len(c_dirs) != 1` -- gated.
+            target = next((t for t in c_dirs[0].groups() if t), None)
+            if target is not None:
+                try:
+                    target = os.path.realpath(
+                        os.path.expandvars(os.path.expanduser(target)))
+                except (ValueError, OSError):
+                    return True
+                if not (target == project_dir
+                        or target.startswith(project_dir + os.sep)):
+                    continue  # this occurrence provably acts on another checkout
+
         preceding = [c for c in cd_matches if c[0] < position]
         if not preceding:
             # No cd before this occurrence — it runs in the session cwd, which
@@ -347,15 +530,13 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
     # Every occurrence of the verb provably runs outside this project.
     return False
 
-if not _targets_this_project(command, r"git push"):
+if not _targets_this_project(command, _PUSH_VERB):
     sys.exit(0)
 
-# Allow tag pushes (refs/tags/*, --tags, or explicit version tags like v1.2.3)
-if "refs/tags/" in command or "--tags" in command:
-    sys.exit(0)
-# Allow pushing an explicit version tag (e.g., "git push origin v1.2.3")
-if re.search(r'git push\s+\S+\s+v\d+\.\d+\.\d+', command):
-    sys.exit(0)
+# The tag allowlist USED TO SIT HERE, above every deny gate, as three
+# unanchored substring tests on the raw command text. It now lives below
+# them and reads ref tokens — see `_is_tag_push_only` and the gate order at
+# the bottom of this file.
 
 # --- Branch deletion (--delete / -d) ---
 #
@@ -390,6 +571,44 @@ _VALUE_FLAGS = frozenset({
 })
 
 
+def _deescape(token: str) -> str:
+    """Drop the backslashes bash would consume, leaving the literal word.
+
+    `shlex.split` does this already; `str.split` does not, and
+    `_push_invocations` falls back to `str.split` whenever the tail holds no
+    quote character or runs past `_SHLEX_MAX`. So `ma\\in` -- which bash hands
+    to git as `main` -- reached every ref-token gate spelt with the backslash
+    still in it and matched nothing. Measured ALLOW at 74cf1b1 and at
+    b159a2b: `push origin --delete ma\\in` DELETED the branch, and
+    `--mirr\\or` / `--a\\ll` turned the flag gates off the same way. Adding any
+    quote character to the same command routed it through `shlex` and it
+    denied -- which is what proved the fallback, not the gates, was the hole
+    (#351 BH-1).
+
+    Normalising HERE rather than in each consumer is the point. Quoting is
+    stripped in one place (`shlex`, with `_bare_ref` catching the fallback);
+    escaping was handled in none. Putting it at the moment the tokens are
+    built means `_is_delete`, `_all_ref_flags`, `_branch_glob_refspecs`,
+    `_is_tag_ref` and `_bare_ref` all receive exactly what git will, with no
+    per-consumer rule to forget next time.
+
+    Applied ONLY to the `str.split` paths: `shlex` has already done it, and
+    running both would eat a real backslash twice.
+
+    A trailing lone backslash is left alone -- there is nothing after it to
+    escape -- and `_bare_ref` strips it, as it has since the redirection fix.
+    """
+    out, i, n = [], 0, len(token)
+    while i < n:
+        if token[i] == "\\" and i + 1 < n:
+            out.append(token[i + 1])
+            i += 2
+        else:
+            out.append(token[i])
+            i += 1
+    return "".join(out)
+
+
 def _bare_ref(token: str) -> str:
     """A ref token with the decorations git accepts stripped off.
 
@@ -406,8 +625,68 @@ def _bare_ref(token: str) -> str:
     happen FIRST, before `lstrip("+:")`, so a quoted qualified ref like
     `"refs/heads/main"` loses the quote before the `refs/heads/` prefix is
     tested, not after.
+
+    A TRAILING shell separator is stripped for the same reason, as defence
+    in depth behind the segment split in `_push_invocations`. If any path
+    ever fails to split a `;`/`&`/`|` away from the ref that precedes it,
+    the token arrives as `main;` -- which is not `main`, so
+    `_PROTECTED_REF_RE.fullmatch` misses it and the deletion gate lets the
+    delete through. That is exactly how round 4 of #351 regressed. Only the
+    trailing run is stripped, so a ref literally named `main;x` still reads
+    as `main;x` (git accepts it, it is not protected, and it must stay
+    allowed).
+
+    A REDIRECTION is cut off the same way, and a trailing BACKSLASH is
+    stripped with the rest. Both sit flush against the previous word, so this
+    hook sees one token where bash sees two: `push origin main>/dev/null`
+    really pushes the branch and redirects the output, and bash strips a
+    trailing backslash before git ever sees the argument. Measured across 84
+    generated rows -- two protected refs x six push forms x seven punctuation
+    forms, every one valid bash -- 0 fail open at 74cf1b1 and 84 at
+    5f7f29b..95dd663, including real DELETIONS. The substring arm in
+    `targets_protected` had been covering all of them, because it read the
+    raw text and did not care how the token ended; removing that arm exposed
+    them (#351 B1).
+
+    The redirection is CUT (everything from the first `<`/`>` onward is
+    dropped) rather than stripped from the right, because the punctuation is
+    not always last: `main>>f` and `main<&-` both carry a filename or a
+    descriptor after it. Cutting also gets the mirror case right --
+    `push origin >main` is a redirection INTO a file of that name and pushes
+    no ref at all, and cutting leaves the empty string rather than the
+    branch.
+
+    Deliberately `str.split`, not `re.split(r"[<>]", token, 1)`: passing
+    `maxsplit` positionally is deprecated as of Python 3.13 (measured on
+    3.13.3, the interpreter this repo runs) and raises `DeprecationWarning`.
+    Under `-W error`, or in the Python release that turns the deprecation
+    into an error, that is an exception inside a PreToolUse hook -- a
+    non-zero exit, which is a NON-BLOCKING error under the hook contract, so
+    the gate would fail OPEN. `str.split` has no such wrinkle and no regex
+    to time.
+
+    The closing half of a command substitution is stripped for the same
+    reason, and was found the same way. `X=$(cd /elsewhere && git push origin
+    main)` leaves the `)` attached to the last token, so the ref arrived as
+    `main)` and no gate recognised it as `main`; the backtick spelling of the
+    same substitution leaves a trailing backtick, and `${...}` a `}`. A
+    substring arm in `targets_protected` was quietly covering all three;
+    removing the arm exposed them (#351). Over-stripping here is the safe
+    direction -- it can only make MORE tokens resolve to a protected name,
+    and no real ref name ends in one of these.
     """
     token = token.strip("\"'")
+    token = token.split("<", 1)[0].split(">", 1)[0]
+    # A refspec writes its DESTINATION, so that is the half to judge --
+    # `HEAD:main` pushes `main`, `main:refs/tags/x` does not. This is the
+    # rule `_is_tag_ref` already applies; without it here, `HEAD:main` was
+    # caught only by `_PROTECTED_REFSPEC_RE`, which searches the RAW command
+    # and therefore missed `HEAD:ma\in` even once the token itself was
+    # de-escaped (#351 BH-1). It subsumes the old-style delete spelling
+    # `:main`, whose destination is the whole of it.
+    if ":" in token:
+        token = token.rsplit(":", 1)[1]
+    token = token.rstrip(";&|)}" + chr(96) + chr(92))
     token = token.lstrip("+:")
     for prefix in ("refs/heads/", "heads/"):
         if token.startswith(prefix):
@@ -415,6 +694,101 @@ def _bare_ref(token: str) -> str:
     return token
 
 
+def _quoted_spans(cmd: str):
+    """Offset pairs `(open, close)` of every CLOSED quoted run in ``cmd``.
+
+    ``None`` when a quote opens and never closes -- i.e. when the text does
+    not parse and nothing in it can be vouched for.
+
+    This exists because `_shell_scan` answers a DIFFERENT question, and the
+    difference is a bug class. It scans a PREFIX, so "the position sits
+    inside an open quote" and "the text does not parse" are the same code
+    path there and come back as the same `False`. `_push_invocations` needs
+    them separated: see the direction-of-doubt paragraph in its docstring.
+    Looking at the WHOLE command rather than a prefix is what separates
+    them -- `-c a.b="c;d"` has a quote that closes.
+
+    A span that CONTAINS A NEWLINE is dropped, for a bypass found earlier:
+    a `'` in a `#` comment or a heredoc body is not a quote to the shell at
+    all, but this scanner cannot see comments or heredocs, so it pairs that
+    `'` with the next one it finds on a LATER LINE and vouches for
+    everything in between -- real separators included. `echo hi # don't`⏎
+    `git push origin --delete main&&echo x # it's` merged into one segment,
+    the ref token came out as `main&&echo`, and a delete of a protected
+    branch was ALLOWED (#351). A genuine quoted shell word does not span
+    lines, so dropping such a span costs nothing real.
+
+    READ THE RETURNS CAREFULLY; the three of them do not mean what they
+    look like, and each has been wrong once:
+
+    1. `None` is NOT an empty list. It is returned the moment ANY quote
+       fails to close, from inside the loop -- so the newline filter on the
+       final `return` is never reached on that path, and the protection
+       described above DOES NOT APPLY to it. One unclosed quote discards
+       every span already collected, including good ones.
+    2. To the caller, `None` and `[]` are the same instruction: nothing can
+       suppress a split, so split at EVERY separator.
+    3. Splitting at every separator is the fail-closed direction for FINDING
+       A SEPARATOR -- an extra segment with no verb is skipped -- and it is
+       the fail-OPEN direction for FINDING AN INVOCATION, because it can cut
+       the verb match itself in half. `git -c core.pager="less|cat" push
+       origin --delete main # it's fine` is valid bash: the apostrophe never
+       closes, so this returns `None`, the `|` inside the quoted value then
+       splits the command, neither half holds a complete verb, and
+       `_push_invocations` yields nothing for a real push. Every gate below
+       is a loop over that empty list, so ALL of them silently pass (#351
+       BH-2).
+
+    WHAT CARRIES THE GUARANTEE IS NOT THIS FUNCTION. This scanner has now
+    been wrong three times -- direction of doubt, cross-line pairing, and
+    the bail-out above -- and each of the first two fixes made it cleverer,
+    which is what left the third reachable. The contradiction check in the
+    gate sequence (the entry test matched a push verb, `_push_invocations`
+    yielded nothing, therefore DENY) is the first fix that makes the
+    DECISION safe whatever this function concludes. A fourth refinement here
+    is almost certainly the wrong instinct: if a new bypass turns up, check
+    whether the contradiction check should have caught it before touching
+    the scanner.
+    """
+    spans, i, n = [], 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                return None
+            spans.append((i, j))
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and cmd[j] != '"':
+                j += 2 if cmd[j] == "\\" else 1
+            if j >= n:
+                return None
+            spans.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    return [(a, b) for a, b in spans if "\n" not in cmd[a:b]]
+
+
+def _escaped_at(cmd: str, pos: int) -> bool:
+    """True when ``cmd[pos]`` is preceded by an ODD run of backslashes.
+
+    An odd run escapes the character; an even run is escaped
+    backslashes followed by a live one. Linear overall: each call walks
+    only the backslash run immediately before ``pos``, and those runs
+    are disjoint stretches of the input.
+    """
+    n = 0
+    while pos - n - 1 >= 0 and cmd[pos - n - 1] == '\\':
+        n += 1
+    return n % 2 == 1
+
+
+@functools.lru_cache(maxsize=8)
 def _push_invocations(cmd: str):
     r"""One list of argument tokens per `git push` in ``cmd``.
 
@@ -447,21 +821,126 @@ def _push_invocations(cmd: str):
     the same whitespace split the ``ValueError`` path uses, and its tokens are
     normalised by ``_bare_ref`` — including the quotes, which is why skipping
     ``shlex`` cannot hide a protected ref.
+
+    The separator scan is QUOTE-AWARE. A plain ``re.split`` is text-blind,
+    so `git -c a.b="c;d" push origin --delete main` split on the quoted `;`
+    into two fragments — `git -c a.b="c` and `d" push origin --delete main`
+    — NEITHER of which contains a complete `git ... push` match.
+    `_push_invocations` returned no invocation at all for a real `git push`,
+    so `_protected_delete_refs` never saw the `main` ref and the deletion
+    gate missed it entirely (#351 CRIT-5). Suppressing that split keeps
+    `-c a.b="c;d"` as one token inside the SAME invocation, so the verb
+    match — and the ref tokens after it — survive intact.
+
+    DIRECTION OF DOUBT. Every consumer of a shell-text scan has to state
+    which way "cannot tell" resolves, and the answer is whichever way ADDS
+    gating FOR THAT CONSUMER — it is not a property of the scan.
+    `_targets_this_project` DROPS a `cd`/`-C` it cannot vouch for, because
+    dropping it leaves the command IN scope. This function is the mirror
+    image: SPLITTING is what adds gating here, because an extra segment
+    with no push verb is simply skipped, whereas a MERGED one runs `tail`
+    on past the ref and hands the deletion gate a token like `main;`, which
+    it does not recognise as `main`.
+
+    Round 4 of #351 got this backwards by reusing `_shell_scan`, which
+    reports "inside an open quote" and "this text does not parse" as the
+    same `False`, and suppressed the split on both. Its four documented
+    blind spots — a `#` comment, an unbalanced quote inside one, a
+    `case ... )` pattern, a heredoc body — then MERGED the whole command,
+    and `git status # don't`⏎`git push origin --delete main; echo hi`
+    (valid bash, denied on `develop`) started to ALLOW. So the default here
+    is the old text-blind behaviour — split at EVERY separator — and a
+    split is suppressed ONLY where `_quoted_spans` positively vouches that
+    the separator sits inside a quoted run that closes. Over-splitting is
+    safe; merging is not. `_bare_ref` strips a trailing separator as a
+    second layer, so a token some future path does merge still resolves.
+
+    COST. Five gates below ask this the same question about the same
+    string, so the result is memoised — `lru_cache`, not a module global,
+    because the tests exercise the helpers directly. Callers only ever
+    ITERATE the result; none mutates it, and a mutation would now be
+    visible to the other four.
+
+    Memoising alone was not enough. The "is this separator inside a quoted
+    run" test used to be `any(a < pos < b for a, b in spans)`, i.e. a fresh
+    pass over EVERY span for EVERY separator — and a command can hold
+    thousands of both. Measured end to end through this hook on
+    `git push origin feature/x && ` followed by repeats of
+    `echo "a;b" && `, which maximises both counts at once:
+
+        KB       74cf1b1        before
+         4        84.1 ms       137.8 ms
+        16        85.8 ms       808.9 ms
+        64       108.0 ms      9658.5 ms
+       128       106.4 ms     37894.2 ms
+
+    Flat against 4x per doubling: quadratic, and at the 1 MB stdin cap it
+    extrapolates to roughly forty minutes on a hook that runs before every
+    Bash call. `_quoted_spans` itself was never the problem (3.8 ms at
+    64 KB, linear); the scan over its output was.
+
+    `_quoted_spans` emits spans left to right and non-overlapping — it
+    walks one cursor forward and jumps past each closed run — so the
+    opening offsets are sorted and `bisect` finds the only span that can
+    contain a position, in log time instead of a full pass. That is what
+    makes the whole function linearithmic; the memo is then a further
+    constant factor of five.
     """
     cmd = cmd.replace("\\\n", " ")
     invocations = []
-    for part in re.split(r'[;&|\n]+', cmd):
-        m = re.search(r'\bgit\s+push\b', part)
+    # `_quoted_spans` walks the whole command, and the stdin cap allows a
+    # ~1MB one. Skip that walk when there is no quote character to find:
+    # with no quoted run, no separator can sit inside one, so the `[]` it
+    # would return and the `None` this leaves behind mean the same thing to
+    # the loop below — split at every separator.
+    spans = _quoted_spans(cmd) if ('"' in cmd or "'" in cmd) else None
+    # Sorted and non-overlapping by construction — see the COST paragraph.
+    # Empty (every span held a newline and was dropped) and None (no quote
+    # character at all) mean the same thing here: nothing can suppress a
+    # split, which is the fail-closed default.
+    span_starts = [a for a, _ in spans] if spans else None
+    parts, last = [], 0
+    for m in re.finditer(r'[;&|\n]+', cmd):
+        if _escaped_at(cmd, m.start()):
+            # A backslash-escaped separator is an ordinary character, so
+            # `a\;b` is ONE shell word. Splitting there cut a
+            # `git -c <key>=a\;b push` in half: neither fragment held a
+            # complete verb match, so this returned NOTHING for a real push
+            # and every ref-token gate went blind. A substring arm in
+            # `targets_protected` was covering it; removing that arm exposed
+            # it (#351).
+            #
+            # The whole run is skipped, not just the escaped character. That
+            # MERGES where bash would split the rest of a run -- the
+            # direction this function otherwise refuses -- and it is safe
+            # for the reason the docstring gives about extra tokens: a
+            # merged segment hands the gates MORE ref tokens, never fewer,
+            # and an extra ref token can only add a deny or withhold a
+            # stand-down.
+            continue
+        if span_starts:
+            # The last span that OPENS strictly before this position is the
+            # only one that can contain it. `bisect_left` is the strict
+            # form: it lands past any span opening exactly AT `pos`, which
+            # would not contain it either.
+            i = bisect.bisect_left(span_starts, m.start()) - 1
+            if i >= 0 and m.start() < spans[i][1]:
+                continue  # inside a closed quoted run — not a separator
+        parts.append(cmd[last:m.start()])
+        last = m.end()
+    parts.append(cmd[last:])
+    for part in parts:
+        m = re.search(_PUSH_VERB, part)
         if not m:
             continue
         tail = part[m.end():]
         if len(tail) > _SHLEX_MAX or ('"' not in tail and "'" not in tail):
-            invocations.append(tail.split())
+            invocations.append([_deescape(t) for t in tail.split()])
             continue
         try:
             invocations.append(shlex.split(tail))
         except ValueError:
-            invocations.append(tail.split())
+            invocations.append([_deescape(t) for t in tail.split()])
     return invocations
 
 
@@ -472,12 +951,110 @@ def _is_delete(tokens) -> bool:
     so a test for the exact token `-d` misses it. Any single-dash token
     containing a `d` counts — no other single-dash `git push` flag carries
     one, and over-reading here only ever adds a deny.
+
+    The long form is matched by PREFIX for the same reason `_all_ref_flags`
+    is: git's parse-options accepts any UNAMBIGUOUS abbreviation, so `--del`,
+    `--dele` and `--delet` all reach the ref stage and delete. Testing
+    `t == "--delete"` missed every one of them, and the consequence was the
+    worst this file has: on a `release/*` branch — the branch the release
+    flow actually runs from — this function returning False means the
+    deletion gate never fires, and the Git Flow allowance below exits 0
+    before the ref-token arm gets a look. Measured ALLOW at 74cf1b1 and at
+    b48f1b1 for `push --del origin main`, denied from every other branch,
+    which is why probing a feature branch showed nothing.
+
+    `--dry-run` is the near miss that keeps the test the right way round:
+    the question is whether the TYPED name is a prefix of `delete`, not
+    whether `delete` is a prefix of it, so `"delete".startswith("dry-run")`
+    is False and a dry run is not a deletion. `--d` IS matched even though
+    git rejects it as ambiguous with `--dry-run` — over-matching only ever
+    adds a deny on a command git refuses anyway.
+
+    Quote characters come off first, for the reason `_bare_ref` takes them
+    off a REF token: when `shlex.split` raises on an unbalanced quote,
+    `_push_invocations` falls back to a whitespace split, which does NOT
+    strip quoting. Measured at 74cf1b1 and still ALLOW until this strip went
+    in: a `--delete` written in double quotes, alongside a protected ref
+    behind an unbalanced quote, produced the token `"--delete"` — neither
+    equal to `--delete` nor `-`-prefixed — so the deletion gate saw no
+    delete at all and a deletion of main was permitted. This is
+    the FLAG side of the bypass `_bare_ref` already closes on the ref side.
     """
-    return any(
-        t == "--delete"
-        or (len(t) > 1 and t[0] == "-" and t[1] != "-" and "d" in t)
-        for t in tokens
-    )
+    for raw in tokens:
+        t = raw.strip("\"'")
+        if t.startswith("--"):
+            name = t[2:].split("=", 1)[0]
+            if name and "delete".startswith(name):
+                return True
+        elif len(t) > 1 and t[0] == "-" and t[1] != "-" and "d" in t:
+            return True
+    return False
+
+
+# Flags that write or delete protected refs WITHOUT NAMING ONE. Every
+# ref-token gate in this file is blind to them by construction: they carry no
+# ref to inspect, and `--mirror`/`--prune` carry no `--delete` either, so
+# `_is_delete()` is false as well. Each was measured ALLOW on a feature
+# branch, and each reaches `main` and `develop`:
+#
+#   --mirror      removes every remote ref absent locally, and pushes the rest
+#   --prune       removes remote branches with no local counterpart
+#   --all         pushes every local branch, `main` and `develop` included
+#   --branches    the modern spelling of `--all`; identical effect
+#
+# `--mirror` and `--prune` delete remote refs with no `--delete` flag, so
+# `_is_delete()` is false and no ref token is ever examined: measured ALLOW
+# at 1b0d3e5 for `git push --mirror origin`, which removes every remote ref
+# absent locally — `main` included (#351 item 2). Verified against a real
+# bare remote on git 2.50.1: `--mirror origin` put `refs/heads/main` and
+# every tag on the remote in one step.
+#
+# The hook cannot know WHICH refs either would remove without querying the
+# remote, so in a repo with protected branches the only fail-closed option is
+# to refuse both outright. Recorded as the decision #351 asked for. Neither
+# flag appears anywhere in `scripts/`, `.github/`, `.claude/` or `skills/`
+# (grepped), so no current workflow relies on it. A mirror configured through
+# `remote.<name>.mirror` rather than the flag is NOT detected — out of reach
+# of command text alone, and noted here so the limit is on the record.
+#
+# Matched by PREFIX, not by exact token, because git's parse-options accepts
+# any UNAMBIGUOUS abbreviation of a long option. Measured on git 2.50.1
+# against a real bare remote: `--mi`, `--mir` and `--mirror` all mirrored
+# identically, so a `frozenset({"--mirror", "--prune"})` would have been
+# bypassable by typing less. Over-matching is safe here in a way it is not
+# on the allow side: a prefix this accepts that git would reject as
+# ambiguous (`--pr`, shared with `--progress`) only ever costs a deny on a
+# command git refuses anyway.
+#
+# `--tags --all` needs no special handling: git refuses that combination
+# outright, so it never reaches a remote.
+_ALL_REF_FLAG_NAMES = ("mirror", "prune", "all", "branches")
+
+
+def _all_ref_flags(tokens):
+    """Every ``--mirror``/``--prune`` in one invocation's arguments.
+
+    Returns the tokens as written, so the deny message can name what it
+    refused rather than the flag it decided they meant.
+    """
+    found = []
+    for t in tokens:
+        # Quotes come off BEFORE the `--` test, not after. The whitespace
+        # split `_push_invocations` falls back to on an unbalanced quote
+        # leaves them attached, so a `--mirror` written in double quotes does
+        # not start with `--` and was skipped entirely — measured ALLOW while
+        # the bare spelling denied. Same bypass `_bare_ref` closes on the ref
+        # side and `_is_delete` on the flag side.
+        bare = t.strip("\"'")
+        if not bare.startswith("--"):
+            continue
+        # `--` on its own is the end-of-options marker, and an `=`-joined
+        # value belongs to the option rather than to its name. An empty name
+        # would prefix-match everything, hence the guard.
+        name = bare[2:].split("=", 1)[0]
+        if name and any(f.startswith(name) for f in _ALL_REF_FLAG_NAMES):
+            found.append(t)
+    return found
 
 
 def _ref_tokens(tokens):
@@ -510,12 +1087,194 @@ def _ref_tokens(tokens):
     return non_flags[1:]
 
 
+# Every spelling of a protected destination a glob has to be tested against.
+# `_bare_ref` cannot help here: it normalises a LITERAL ref, and the question
+# is whether a PATTERN would match one.
+_PROTECTED_GLOB_TARGETS = tuple(
+    form
+    for name in ("main", "develop")
+    for form in (name, f"heads/{name}", f"refs/heads/{name}")
+)
+
+
+def _branch_glob_refspecs(tokens):
+    """Refspecs whose DESTINATION glob could cover a protected branch.
+
+    The flag-free half of the class above: `+refs/heads/*:refs/heads/*` and
+    `*:*` write every local branch over the remote's, `main` and `develop`
+    included, while naming neither — measured ALLOW on a feature branch, and
+    invisible to every ref-token gate because no token IS a protected ref.
+
+    Asking "does this pattern match a protected ref" rather than "does this
+    contain a `*`" is what keeps the gate narrow. `feature/*` and
+    `refs/tags/*` cannot reach `main` however they are spelt, so they still
+    allow; a blanket wildcard refusal would have denied ordinary work.
+    `fnmatch` is the more permissive matcher of the two (its `*` crosses `/`,
+    git's does not), which errs toward the deny — the safe direction for a
+    gate that only ever ADDS one.
+
+    The DESTINATION is what matters, same as `_is_tag_ref`:
+    `refs/heads/*:refs/tags/*` creates tags and touches no branch.
+    """
+    found = []
+    for t in _ref_tokens(tokens):
+        dest = t.strip("\"'").lstrip("+")
+        if ":" in dest:
+            dest = dest.rsplit(":", 1)[1]
+        if "*" not in dest:
+            continue
+        if any(fnmatch.fnmatchcase(f, dest) for f in _PROTECTED_GLOB_TARGETS):
+            found.append(t)
+    return found
+
+
+# A bare `vX.Y.Z` tag push is what scripts/git-flow-finish.sh really runs
+# (phase 3, from `main`, right after tagging), and it is what the old
+# version-tag regex allowed. Every tag in this repo's history is that shape.
+# Anchored with `fullmatch` on a single ref TOKEN rather than `search`ed over
+# the whole command, which is what let the old test stand the hook down while
+# a protected branch was being deleted on the same line.
+#
+# The optional suffix accepts a semver prerelease or build-metadata tag
+# (`v4.0.0-rc1`, `v1.2.3+build.5`). Matching only the bare triple would have
+# denied an ordinary prerelease cut from `main`, and a false deny on the
+# release flow is how a gate ends up switched off. It opens nothing: a ref
+# matching this is by construction neither `main` nor `develop` (both fail at
+# the leading `v`), and a branch that happens to be named `v1.2.3-foo` was
+# always pushable anyway.
+#
+# Timed before shipping, per the rule in `TestPatternDecisionTimeIsBounded`:
+# worst measured `fullmatch` over nine adversarial 600-900 KB shapes is
+# 6.6ms, on a suffix that runs to the end but for a trailing space. Linear —
+# the three numeric groups are pinned by the two literal dots, and the suffix
+# alternative can only start on a `-`/`+`, which `\d` cannot match, so the
+# two are disjoint and there is nothing for the engine to backtrack over.
+_VERSION_TAG = r'v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?'
+_VERSION_TAG_RE = re.compile(_VERSION_TAG)
+
+
+def _is_tag_ref(token: str) -> bool:
+    """True when a ref token names a TAG, not a branch.
+
+    The destination is what matters, so a refspec is read after its last
+    ``:`` — `main:refs/tags/x` pushes a tag, `x:main` pushes a branch.
+
+    A token still carrying a shell separator is refused outright. `_bare_ref`
+    strips a TRAILING one because declining to recognise `main;` as `main`
+    would miss a deny; here the direction of doubt is the opposite way round
+    — this function grants a STAND-DOWN, so a token this cannot fully account
+    for must not be read as a tag. The cost is nil: a ref genuinely named
+    with a `;` is not protected, so it still allows on its own merits.
+    """
+    token = token.strip("\"'").lstrip("+")
+    if any(c in token for c in ";&|\n"):
+        return False
+    if ":" in token:
+        token = token.rsplit(":", 1)[1]
+    if token.startswith(("refs/tags/", "tags/")):
+        return True
+    return _VERSION_TAG_RE.fullmatch(token) is not None
+
+
+def _is_tag_push_only(cmd: str) -> bool:
+    """True when EVERY push here pushes nothing but tags.
+
+    This replaces three unanchored substring tests — `"refs/tags/"`,
+    `"--tags"` and a `git push \\S+ vN.N.N` regex, each tested against the
+    raw command text — that ran BEFORE the deletion gate and stood the whole
+    hook down on a match anywhere in the command. Measured ALLOW at 1b0d3e5:
+    `git push --tags origin --delete main` deleted `main`; so did the
+    `refs/tags/` and `vN.N.N` spellings alongside a `--delete main`, and
+    `git push --tags origin main` pushed `main` (#351).
+
+    "Every", not "any": one tag ref on the line no longer buys a stand-down
+    for whatever else is on it — the same correction #333 made to the
+    release-cleanup allowlist.
+
+    The `_is_delete`/`_all_ref_flags` test on the first line of the loop is
+    BELT AND BRACES, and deliberately so: gates 1 and 2 have already denied
+    every command it can fire on, so removing it turns no row red and no
+    test claims otherwise. It stays because it makes this function correct
+    on its own terms rather than correct only in its current position --
+    the same reason the gate ORDER is asserted on the source text.
+
+    DIRECTION OF DOUBT. This function hands out a stand-down, so anything it
+    cannot fully account for returns False. That is only a DENY the user can
+    work around by naming the refs; returning True on a half-parsed command
+    is a ref that is gone. Hence: no invocations at all is False (the caller
+    matched a push verb this did not, and two matchers disagreeing is not
+    evidence of safety), an unrecognised flag spelling is False, and — unlike
+    the deny side above — abbreviations are NOT honoured, so `git push --tag
+    origin` falls through and denies from a protected branch rather than
+    standing the hook down on a spelling this did not verify.
+    """
+    invocations = _push_invocations(cmd)
+    if not invocations:
+        return False
+    for tokens in invocations:
+        if _is_delete(tokens) or _all_ref_flags(tokens):
+            return False
+        refs = _ref_tokens(tokens)
+        if not refs:
+            # `git push --tags origin` pushes tags and NOTHING else —
+            # verified against a real bare remote on git 2.50.1: the remote
+            # ended with `refs/tags/v0.0.1` alone, no branch.
+            #
+            # `--follow-tags` is deliberately absent. The same experiment
+            # with `push.default=current` left `refs/heads/main` on the
+            # remote alongside the tag, because with no refspec it takes the
+            # default-branch path and merely ADDS reachable annotated tags.
+            # Treating it as tags-only would have opened a fresh route to
+            # pushing `main` — the defect this gate exists to close. With an
+            # explicit tag refspec it adds only tags, and that case is
+            # handled by the ref-token branch below.
+            if "--tags" not in tokens:
+                return False
+            continue
+        if not all(_is_tag_ref(r) for r in refs):
+            return False
+    return True
+
+
 def _protected_delete_refs(cmd: str):
     """Every protected ref ``cmd`` would delete, across all of its pushes."""
     found = []
     for tokens in _push_invocations(cmd):
         if not _is_delete(tokens):
             continue
+        found.extend(
+            t for t in _ref_tokens(tokens)
+            if _PROTECTED_REF_RE.fullmatch(_bare_ref(t))
+        )
+    return found
+
+
+def _protected_push_refs(cmd: str):
+    """Every protected ref ``cmd`` would PUSH, across all of its pushes.
+
+    `_protected_delete_refs` without the delete filter, and it exists for the
+    same reason: `targets_protected` below tested the literal substring
+    `"origin main"`, which only fires when the protected ref sits IMMEDIATELY
+    after the remote. One word further along and it was missed —
+    `origin foo <protected>` measured ALLOW from a feature branch at
+    74cf1b1, with no tag or allowlist involved anywhere (#351). Same
+    substring-versus-ref-token class #333 fixed for deletions.
+
+    Deletions are not excluded. One that names a protected ref has already
+    been refused by the deletion gate far above, so including them here can
+    only ever restate a verdict that is settled.
+
+    Going through `_ref_tokens` is load-bearing, not tidiness: it is what
+    stops a flag's SEPARATE value being read as a ref. Re-deriving the tokens
+    here is how #333's review found a legitimate release cleanup being
+    DENIED, and `--repo origin --delete <protected>` — which git refuses
+    outright, changing nothing on the remote — would start denying too.
+
+    `_PROTECTED_REF_RE.fullmatch(_bare_ref(t))` is what keeps `mainline`,
+    `maintenance` and `develop-x` the ordinary branches they are.
+    """
+    found = []
+    for tokens in _push_invocations(cmd):
         found.extend(
             t for t in _ref_tokens(tokens)
             if _PROTECTED_REF_RE.fullmatch(_bare_ref(t))
@@ -543,6 +1302,48 @@ def _is_release_cleanup_only(cmd: str) -> bool:
     return True
 
 
+# --- The two matchers must agree ---
+#
+# The entry test above matched a push verb. If `_push_invocations` then finds
+# none, the two matchers contradict each other, and EVERY gate below is a
+# loop over that empty list -- so the command sails through with nothing
+# examined. That is a fail-open, and it is reachable from valid bash:
+#
+#   git -c core.pager="less|cat" push origin --delete main # it's fine
+#
+# measured ALLOW at 74cf1b1 and at b159a2b. The apostrophe in the trailing
+# `#` comment never closes, so `_quoted_spans` cannot vouch for anything and
+# returns None; the loop then splits at EVERY separator, the `|` inside the
+# quoted `-c` value tears the command in two, and neither fragment holds a
+# complete verb match (#351 BH-2).
+#
+# This is the third face of the direction-of-doubt rule in
+# `_push_invocations`, and the one its docstring did not enumerate. Splitting
+# on doubt is fail-closed for FINDING a separator -- an extra segment with no
+# verb is skipped -- but splitting everywhere can destroy the verb match
+# itself, and no invocations means no gate fires. Doubt has to resolve toward
+# gating at the level of the DECISION, not of the individual split.
+#
+# Written as an explicit contradiction rather than as more cleverness in
+# `_quoted_spans`: that scanner has been wrong three times, and the file
+# already has this exact pattern in `_targets_this_project` ("the caller
+# matched this verb but this function cannot find it ... gate rather than
+# guess").
+if not _push_invocations(command):
+    _deny("""❌ This push command could not be parsed, so it is refused.
+
+The gate matched a `git push` here, but could not split the command into
+invocations it could inspect -- so no ref, flag or refspec below was ever
+examined. A command this gate cannot read is not a command it can vouch for.
+
+This usually means shell punctuation the parser cannot resolve: an unclosed
+quote somewhere in the line (including inside a trailing `#` comment) next to
+a `;`, `&` or `|` inside a quoted value.
+
+Rewrite it as a plain push and it will be judged normally:
+
+  git push origin <branch>""")
+
 _deleted_protected = _protected_delete_refs(command)
 if _deleted_protected:
     _deny("""❌ Deleting a protected branch is not allowed!
@@ -560,6 +1361,68 @@ To clean up a release or hotfix branch, name only those refs:
 
   git push origin --delete release/<version>""".format(
         refs=", ".join(_deleted_protected)))
+
+# --- Gate order below this point is the #351 fix, and it is load-bearing ---
+#
+#   1. protected-ref deletion            deny   (above)
+#   2. all-ref flags and branch globs    deny   (here)
+#   3. tag-only push                     allow
+#   4. release/hotfix cleanup delete     allow
+#   5. current-branch and Git Flow       allow
+#   6. targets_protected                 deny
+#
+# 1 and 2 MUST precede 3, or `--tags origin --delete main` and
+# `--mirror --tags origin` are allowed again — that is the exact defect.
+# 3 MUST precede 5 and 6, or the release flow's `git push origin v3.5.0`
+# from `main` starts denying.
+_all_ref_pushes = [
+    f for tokens in _push_invocations(command) for f in _all_ref_flags(tokens)
+]
+if _all_ref_pushes:
+    _deny("""❌ Mirror and prune pushes are not allowed in this repo!
+
+Refused flag(s): {flags}
+
+Both delete remote refs that have no local counterpart — including main and
+develop — and neither carries --delete, so nothing below this point ever sees
+a ref to check. This hook cannot know which refs the remote would lose
+without querying it, so it refuses both outright.
+
+There is no revert for this. Push the refs you mean, by name:
+
+  git push origin <branch>
+  git push origin --delete release/<version>""".format(
+        flags=", ".join(sorted(set(_all_ref_pushes)))))
+
+_glob_refspecs = [
+    r for tokens in _push_invocations(command)
+    for r in _branch_glob_refspecs(tokens)
+]
+if _glob_refspecs:
+    _deny("""❌ That refspec would overwrite protected branches!
+
+Refused refspec(s): {refs}
+
+The destination side is a wildcard that covers main and develop, so this
+writes every matching local branch over the remote's without naming one --
+which is why nothing below this point sees a ref to check.
+
+Push the refs you mean, by name:
+
+  git push origin <branch>
+
+Tag globs are fine, and so is any pattern that cannot reach a protected
+branch:
+
+  git push origin 'refs/tags/*:refs/tags/*'
+  git push origin 'refs/heads/feature/*:refs/heads/feature/*'""".format(
+        refs=", ".join(sorted(set(_glob_refspecs)))))
+
+# Tag pushes are fine — but only when the push is tags and NOTHING else, and
+# only after the two deny gates above have had their say. See
+# _is_tag_push_only.
+if _is_tag_push_only(command):
+    sys.exit(0)
 
 # Allow branch deletion (--delete) for release/hotfix cleanup
 if _is_release_cleanup_only(command):
@@ -649,10 +1512,24 @@ _PROTECTED_REFSPEC_RE = re.compile(
     + r'''|(?:^|[\s+'"])(?:refs/)?heads/''' + _PROTECTED_REF
 )
 
+# The ref-token arm. It reads the actual refs, so a protected ref anywhere in
+# the argument list is caught. See `_protected_push_refs`. It sits here, below
+# the Git Flow allowances, so a release finish pushing `main` from `main`
+# still exits above it.
+#
+# It REPLACES two substring arms, `"origin main" in command` and
+# `"origin develop" in command`, which were both redundant and wrong. Wrong,
+# because neither is tied to an argument: `"origin main"` occurs inside
+# `origin maintenance`, so an ordinary branch was refused (measured deny at
+# 74cf1b1, on a feature branch). Redundant, because every command they
+# correctly caught has the protected name as a REF TOKEN, which this arm
+# reads directly -- proved by mutation: with both arms deleted, no deny row
+# anywhere in the suite goes red.
+_pushed_protected = _protected_push_refs(command)
+
 targets_protected = (
-    "origin main" in command or
-    "origin develop" in command or
     _PROTECTED_REFSPEC_RE.search(command) is not None or
+    bool(_pushed_protected) or
     current_branch in ["main", "develop"]
 )
 
@@ -666,7 +1543,13 @@ targets_protected = (
 # `--force-with-lease` all fell through to allow, under a comment claiming
 # refspec pushes were detected (#327).
 if targets_protected:
-    reason = f"""❌ Direct push to main/develop is not allowed!
+    # Name the refs when it was a ref that decided it. Without this the
+    # message talks about the CURRENT branch, which on a feature branch is
+    # not what was refused, and the user is left guessing which argument
+    # tripped the gate.
+    refused = ("\n\nRefused ref(s): " + ", ".join(_pushed_protected)
+               if _pushed_protected else "")
+    reason = f"""❌ Direct push to main/develop is not allowed!{refused}
 
 Protected branches:
   - main (production)
