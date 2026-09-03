@@ -1284,6 +1284,20 @@ def canonical_project_name(cwd: str | None = None) -> str:
     return name.lower().replace(" ", "-").replace("_", "-")
 
 
+# Window (seconds) inside which two-or-more viable transcripts in the same
+# project directory are treated as concurrently active sessions, rather than
+# trusting whichever one has the newest mtime (#330 task 3).
+#
+# WHY 120s: measured across 3714 transcripts in 40 project directories on the
+# dev machine, normal single-session work never had a second transcript
+# touched within 120s of the current one — a session's own JSONL is the only
+# thing appending to it, and edits/tool calls are spaced well beyond that.
+# Two concurrent sessions in one repo, by contrast, both append within
+# SECONDS of each other (both are live, both are being driven). 120s sits
+# comfortably above the observed single-session noise floor and comfortably
+# below the concurrent-session signal. Re-measure if this proves noisy.
+_CONCURRENT_SESSION_WINDOW_SECONDS = 120.0
+
 # One-shot WARN registries for the session-id resolution path (#260 I3/S6).
 #
 # WHY a registry and not a bare print: _get_session_id_fast() is called once per
@@ -1297,6 +1311,10 @@ def canonical_project_name(cwd: str | None = None) -> str:
 _ambiguous_project_dirs_warned: set[tuple[str, ...]] = set()
 _sole_match_not_cwd_warned: set[tuple[str, ...]] = set()
 _unknown_sid_warned: set[str] = set()
+# Keyed by the tuple of ambiguous sids (sorted, for a deterministic key) so a
+# DIFFERENT ambiguous pair/set later in the same process still warns once more
+# (#330 task 3).
+_concurrent_sids_warned: set[tuple[str, ...]] = set()
 _env_sid_no_transcript_warned: set[tuple[str, str]] = set()
 
 # Memo for the env-layer transcript check below, keyed by (project, env_sid).
@@ -1681,13 +1699,49 @@ def _glob_project_jsonls(safe_project: str, suffix: str = "*.jsonl") -> list[str
     return _restrict_matches_to_cwd_project(matches)
 
 
+def _concurrent_viable_sids(
+    viable: list[tuple[float, str]], newest_mtime: float
+) -> list[str]:
+    """SIDs among `viable` (mtime, path) pairs within the concurrency window of
+    `newest_mtime` — i.e. `newest_mtime - mtime <= _CONCURRENT_SESSION_WINDOW_SECONDS`.
+
+    Shared by _try_slow_jsonl_glob and _try_bootstrap_fast_path so the window
+    constant and the `<=` boundary live in exactly ONE place (#330 task 3) —
+    two independent copies of a boundary comparison are two independent
+    chances to get `>=` vs `>` wrong in only one of them.
+
+    `<=` (not `<`) is deliberate: a delta of EXACTLY the window is still
+    "within" it — the strongest read of "two sessions touched their
+    transcripts 120.0s apart" is still ambiguous, not safely resolved.
+
+    Returns at least one sid (the newest itself, delta 0.0 always qualifies).
+    Callers treat `len(...) >= 2` as ambiguous.
+    """
+    return sorted(
+        os.path.splitext(os.path.basename(p))[0]
+        for m, p in viable
+        if newest_mtime - m <= _CONCURRENT_SESSION_WINDOW_SECONDS
+    )
+
+
 def _try_slow_jsonl_glob(project: str) -> str:
     """Slow path: glob all JSONLs under ~/.claude/projects/*<project>/, return
     SID of the newest. Used by both _resolve_session_id (when bootstrap is
     skipped or empty) and as the existing health-check entry point.
 
-    Returns 'unknown' if no JSONLs match. Bootstrap-blind by contract — never
-    reads or trusts the sid-<project> bootstrap file.
+    Returns 'unknown' if no JSONLs match, OR if 2+ viable transcripts have an
+    mtime within _CONCURRENT_SESSION_WINDOW_SECONDS of the newest — that shape
+    is two sessions concurrently active in the same project, and newest-mtime
+    cannot tell them apart. Guessing the newest one is exactly the bug #330
+    reports: whichever session happened to write last wins, and the OTHER
+    session gets its id, silently mis-attributing notes and defeating the
+    retro Stop-hook gate armed under the wrong sid. 'unknown' is a supported,
+    handled outcome (get_session_context refuses to cache it and falls back to
+    the live canonical_project_name()), so a correct "I don't know" strictly
+    beats a confident wrong guess here.
+
+    Bootstrap-blind by contract — never reads or trusts the sid-<project>
+    bootstrap file.
     """
     import glob as _glob
     safe_project = _glob.escape(project)
@@ -1696,8 +1750,21 @@ def _try_slow_jsonl_glob(project: str) -> str:
     viable = [(m, p) for m, p in entries if m >= 0]
     if not viable:
         return "unknown"
-    _, newest = max(viable)
-    return os.path.splitext(os.path.basename(newest))[0]
+    newest_mtime, newest_path = max(viable)
+    concurrent_sids = _concurrent_viable_sids(viable, newest_mtime)
+    if len(concurrent_sids) >= 2:
+        _warn_once(
+            _concurrent_sids_warned,
+            tuple(concurrent_sids),
+            f"[obsidian-brain] WARN: {len(concurrent_sids)} sessions look "
+            f"concurrently active in this project, obsidian-brain cannot "
+            f"tell which is the current one, refusing to guess; a confident "
+            f"wrong id silently mis-attributes notes and defeats the retro "
+            f"Stop-hook gate, so 'unknown' is returned instead "
+            f"(sids: {concurrent_sids})",
+        )
+        return "unknown"
+    return os.path.splitext(os.path.basename(newest_path))[0]
 
 
 def _slow_path_newest_sid() -> str:
@@ -1729,10 +1796,21 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
       3. Determine the newest JSONL deterministically via (mtime, path)
          tuple comparison. Ties broken by path string so the result is
          reproducible on filesystems with 1-second mtime resolution.
+      3a. Ambiguity refusal FIRST (#330 task 3): if 2+ viable JSONLs sit
+          within _CONCURRENT_SESSION_WINDOW_SECONDS of the newest, return
+          None regardless of what step 4 below would have decided — the
+          bootstrap file is keyed by project, not session, so it cannot
+          vouch for "current" once more than one session is live. This is
+          checked BEFORE step 4 so it overrides both of that step's trust
+          branches, including the same-second tie-break (an exact tie is
+          now read as the strongest concurrency signal, not a reason to
+          trust the cache).
       4. If the newest JSONL's basename equals the cached sid, trust the
          cache. If the cached JSONL shares the newest mtime (same-second
          race), also trust the cache.
-      5. Otherwise return None (let caller fall through to slow path).
+      5. Otherwise return None (let caller fall through to slow path, which
+         independently re-derives the same ambiguity verdict and owns the
+         'unknown' + WARN behavior — see _try_slow_jsonl_glob).
 
     READ-ONLY — never writes the bootstrap file. SessionStart hook is the sole
     authoritative writer.
@@ -1782,6 +1860,28 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
         return cached_sid  # no viable JSONLs; trust cache
 
     newest_mtime, newest_path = max(viable)
+
+    # Ambiguity refusal wins over BOTH trust branches below (#330 task 3).
+    #
+    # WHY here, before either branch: the bootstrap file is keyed by PROJECT,
+    # not by session, so it is really "whichever session's SessionStart wrote
+    # last" — not a claim about which transcript is newest right now. Either
+    # trust branch below can return that shared, possibly-stale cache value
+    # even while a second session is concurrently active, silently
+    # re-introducing the exact guess _try_slow_jsonl_glob just learned to
+    # refuse. Checked once here, before any return, so it wins over both the
+    # `newest_sid == cached_sid` direct match AND the same-second tie-break
+    # immediately below (that tie-break's whole premise — "an exact mtime tie
+    # means trust the cache" — is now backwards: an exact tie is the
+    # STRONGEST signal of concurrency, not the weakest).
+    #
+    # Deliberately does NOT re-derive or warn here: falling through to None
+    # sends the caller straight to _try_slow_jsonl_glob, which recomputes the
+    # same glob and owns the 'unknown' + WARN behavior in exactly one place
+    # (no duplicated window logic, no duplicated WARN text).
+    if len(_concurrent_viable_sids(viable, newest_mtime)) >= 2:
+        return None
+
     newest_sid = os.path.splitext(os.path.basename(newest_path))[0]
     if newest_sid == cached_sid:
         return cached_sid

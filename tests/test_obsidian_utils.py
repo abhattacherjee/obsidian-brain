@@ -2586,7 +2586,18 @@ def test_build_context_brief_without_hook_status(tmp_path):
 
 
 def test_get_session_id_fast_same_second_tiebreaker(tmp_path, monkeypatch):
-    """Same-second mtime ties: cached sid wins when its JSONL is tied for newest."""
+    """Same-second mtime ties: BEHAVIOR CHANGED by #330 task 3.
+
+    Before task 3, the same-mtime tie-breaker trusted the cached sid ("the
+    cached sid wins when its JSONL is tied for newest"). Task 3 makes an
+    exact mtime tie the STRONGEST possible signal of two concurrently active
+    sessions instead — two transcripts sharing a mtime is exactly the shape
+    of two sessions writing in the same instant — so the ambiguity refusal
+    now wins over this tie-break and the resolver must return 'unknown'
+    rather than guess via the cache. See
+    tests/test_get_session_context.py::test_bootstrap_fast_path_exact_mtime_tie_refuses_not_trusts_cache
+    for the same scenario pinned directly at _try_bootstrap_fast_path.
+    """
     import obsidian_utils
     import os
     import time
@@ -2610,28 +2621,32 @@ def test_get_session_id_fast_same_second_tiebreaker(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
-    # Bootstrap claims "aaa-previous" is current. Because path-sort tiebreak
-    # would otherwise pick "zzz-current" (lexicographically larger) as the
-    # newest, the cached sid must win via the same-mtime tie-breaker.
+    # Bootstrap claims "aaa-previous" is current. Pre-#330-task-3, path-sort
+    # tiebreak would otherwise pick "zzz-current" (lexicographically larger)
+    # as the newest, so the cached sid used to win via the same-mtime
+    # tie-breaker. Now the tied mtimes are read as ambiguity instead.
     bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
     bootstrap.write_text("aaa-previous", encoding="utf-8")
 
     result = obsidian_utils._get_session_id_fast()
-    assert result == "aaa-previous", (
-        f"expected cached sid to win same-mtime tie, got {result}"
+    assert result == "unknown", (
+        f"expected the ambiguity refusal to win over the same-mtime tie, got {result}"
     )
 
 
 def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypatch):
-    """When multiple project dirs contain the cached sid's JSONL, at least one
-    must tie the newest mtime for the cache to be trusted.
+    """BEHAVIOR CHANGED by #330 task 3: this used to prove the cache was
+    trusted "when at least one cached match ties the newest mtime". That is
+    exactly the shape task 3 targets — two DIFFERENT sids (the cached one via
+    b_jsonl, and other_jsonl's) tied at the newest mtime is two concurrently
+    active sessions, and the ambiguity refusal now wins over the tiebreaker
+    this test was named for, so the resolver must return 'unknown' rather
+    than trust either.
 
-    The competing JSONL is named so that it sorts AFTER the cached sid. That is
-    load-bearing: `max(viable)` breaks an mtime tie on the path string, so with
-    a lexicographically smaller competitor the cached sid would come back as
-    `newest_sid` and the function would return one branch EARLIER — the
-    tiebreaker this test is named for would never execute (it did not, before
-    this rename).
+    The competing JSONL is named so that it sorts AFTER the cached sid — see
+    the original tiebreak rationale below, which still explains why the
+    fixture is shaped this way (it is what makes `newest_sid != cached_sid`,
+    so the OLD trust-branch would not fire before task 3's new check does).
 
     The two directories are the two path ENCODINGS Claude Code has used for
     this same cwd (older CC kept '_' in the encoded name, current CC folds it
@@ -2673,11 +2688,14 @@ def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypa
     b_jsonl.write_text("{}", encoding="utf-8")
     other_jsonl.write_text("{}", encoding="utf-8")
 
-    # Scenario: a_jsonl is OLDER, b_jsonl matches newest mtime, other_jsonl
-    # is also at newest mtime. Tiebreaker MUST trust the cache because
-    # at least one cached match (b_jsonl) ties newest mtime.
+    # Scenario: a_jsonl is OLDER (well outside the #330 concurrency window),
+    # b_jsonl matches newest mtime, other_jsonl is also at newest mtime.
+    # Pre-#330-task-3, the tiebreaker trusted the cache because at least one
+    # cached match (b_jsonl) tied newest mtime. Now b_jsonl's sid and
+    # other_jsonl's sid — two DIFFERENT sids both at the newest mtime — are
+    # exactly the ambiguity task 3 refuses to guess through.
     now = time.time()
-    os.utime(a_jsonl, (now - 3600, now - 3600))  # old
+    os.utime(a_jsonl, (now - 3600, now - 3600))  # old, outside the 120s window
     os.utime(b_jsonl, (now, now))  # tied with other
     os.utime(other_jsonl, (now, now))  # tied with b
 
@@ -2688,8 +2706,9 @@ def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypa
     bootstrap.write_text(cached_sid, encoding="utf-8")
 
     result = obsidian_utils._get_session_id_fast()
-    assert result == cached_sid, (
-        f"expected cached sid to win via multi-match tiebreaker, got {result}"
+    assert result == "unknown", (
+        f"expected the ambiguity refusal to win over the multi-match "
+        f"tiebreaker, got {result}"
     )
 
 
