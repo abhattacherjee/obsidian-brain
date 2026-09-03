@@ -244,13 +244,39 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
 
     Returns the sentinel path as a string, or "" if session_id is falsy or
     writing fails (silent-failure — swallows errors, always returns).
+
+    Refuses to write when `session_id` is empty, whitespace-only, or the
+    literal string "unknown" (#330 task 4). Those values cannot be an
+    authoritative session id: "unknown" is `get_session_context()`'s explicit
+    ambiguity sentinel (#330 task 3), so a sentinel filed under it is a dead
+    key by construction — the Stop hook (`obsidian_retro_gate.py`) looks up
+    the harness's own `session_id` from its stdin JSON, which is never
+    "unknown" or blank, and would never find it. Arming under a dead key is
+    strictly worse than not arming at all: the skill would believe the gate
+    is live while the Stop hook enforces nothing, a silent loss of
+    enforcement rather than a visible one. So this case returns an explicit
+    "Failed: ..." string instead of "" — the skill's Step 7 call site prints
+    this return value verbatim, so the refusal reaches the transcript instead
+    of a blank line that reads as success.
     """
-    if not session_id:
-        return ""
+    if session_id is None or not session_id.strip():
+        return "Failed: refusing to arm retro gate — session_id is empty; gate NOT armed, Stop hook will not enforce classification for this session"
+
+    if session_id.strip() == "unknown":
+        return "Failed: refusing to arm retro gate — session_id is \"unknown\" (ambiguous resolution); gate NOT armed, Stop hook will not enforce classification for this session"
 
     sanitized = _RETRO_SID_SAFE.sub("_", session_id)
     if not sanitized:
-        return ""
+        # Unreachable by construction, kept as belt-and-braces: the guards
+        # above reject empty/whitespace-only ids, and _RETRO_SID_SAFE.sub()
+        # substitutes one character per bad character, so it can never
+        # shorten a non-empty id to nothing. Returns the same "Failed:"
+        # shape as those guards rather than the bare "" it used to, so a
+        # caller that echoes the result cannot print a blank line and leave
+        # the user thinking the gate was armed (#330).
+        return ("Failed: refusing to arm retro gate — session_id sanitized "
+                "to an empty string; gate NOT armed, Stop hook will not "
+                "enforce classification for this session")
 
     gate_dir = _retro_gate_dir()
     try:

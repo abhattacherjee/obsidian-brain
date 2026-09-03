@@ -145,6 +145,101 @@ class TestRetroGateSubprocess:
 
 
 # ---------------------------------------------------------------------------
+# Cross-source (arm via get_session_context(), check via the Stop hook) — #330
+# ---------------------------------------------------------------------------
+#
+# Every test above (and every unit test below) writes the sentinel directly
+# with a hardcoded sid — it never exercises the real arm path, which resolves
+# the sid through get_session_context() (the retro skill's Step 7 call site).
+# These tests drive BOTH sides for real: arm via get_session_context() (with
+# CLAUDE_CODE_SESSION_ID set, so resolution layer 0 supplies the id) and check
+# via the hook subprocess fed the harness's own stdin session_id, exactly as
+# the Stop hook receives it in production. #330's whole premise is that these
+# two sources can disagree even though both sanitize identically — nothing
+# before this class would have caught that.
+
+
+class TestRetroGateCrossSource:
+    @pytest.fixture(autouse=True)
+    def _redirect_home(self, tmp_path, monkeypatch):
+        self._tmp_home = tmp_path / "home"
+        self._tmp_home.mkdir()
+        monkeypatch.setenv("HOME", str(self._tmp_home))
+
+    def _run_hook_here(self, session_id: str, stop_hook_active: bool = False) -> subprocess.CompletedProcess:
+        return _run_hook(
+            {"session_id": session_id, "stop_hook_active": stop_hook_active},
+            self._tmp_home,
+        )
+
+    def test_arm_via_get_session_context_then_check_via_hook(self, monkeypatch):
+        """The real arm->check path, end to end.
+
+        Arm: resolve the sid via get_session_context() (layer 0 = the
+        CLAUDE_CODE_SESSION_ID env var, same as skills/retro/SKILL.md Step 7
+        does via ctx["session_id"]), then call
+        mark_retro_classification_pending() with THAT resolved value.
+
+        Check: drive hooks/obsidian_retro_gate.py as a subprocess with the
+        SAME id in its synthetic stdin JSON, as the harness does. This is the
+        pairing that was previously untested — every other test in this file
+        writes the sentinel directly with a hardcoded sid.
+        """
+        sid = "e2e-cross-source-9f8e7d1c"
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+
+        ctx = obsidian_utils.get_session_context()
+        assert ctx["session_id"] == sid, "layer 0 should resolve the env var verbatim"
+
+        result = obsidian_utils.mark_retro_classification_pending(ctx["session_id"], "/vault/e2e-retro.md")
+        assert result, "Expected a non-empty sentinel path"
+
+        blocked = self._run_hook_here(sid, stop_hook_active=False)
+        assert blocked.returncode == 0
+        stdout = blocked.stdout.strip()
+        assert stdout, "Expected block output but got empty stdout"
+        data = json.loads(stdout)
+        assert data["decision"] == "block"
+
+        # Clear (as the hook itself does on a stop_hook_active re-entry) and
+        # confirm enforcement stops.
+        cleared = self._run_hook_here(sid, stop_hook_active=True)
+        assert cleared.returncode == 0
+        assert cleared.stdout.strip() == ""
+
+        after_clear = self._run_hook_here(sid, stop_hook_active=False)
+        assert after_clear.returncode == 0
+        assert after_clear.stdout.strip() == "", "Gate should no longer block after clearing"
+
+    def test_crossing_regression_arm_a_check_b_does_not_block(self, monkeypatch):
+        """Pins the #330 failure mode: arm under one sid, check under another.
+
+        This documents the DAMAGE the issue reports, not desired behaviour —
+        a real id-crossing bug (get_session_context() resolving a different
+        session's id on two calls within one turn) reproduces exactly this
+        shape: the gate is armed under sid A's key, the Stop hook looks up
+        sid B, finds nothing, and enforcement silently vanishes. There is no
+        fix for this test to pin beyond Tasks 1-3 making arm and check agree
+        by construction — this test exists so a future regression that makes
+        them disagree again is caught here, not discovered via a silently
+        skipped classification step in production.
+        """
+        sid_a = "e2e-crossing-sid-a-111"
+        sid_b = "e2e-crossing-sid-b-222"
+
+        result = obsidian_utils.mark_retro_classification_pending(sid_a, "/vault/crossing.md")
+        assert result, "Expected a non-empty sentinel path for sid A"
+
+        checked_under_b = self._run_hook_here(sid_b, stop_hook_active=False)
+        assert checked_under_b.returncode == 0
+        assert checked_under_b.stdout.strip() == "", (
+            "Gate armed under sid A must NOT block a Stop hook invocation for "
+            "sid B — this is the silent enforcement loss #330 reports, not a "
+            "desired outcome"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Unit tests for obsidian_utils helpers
 # ---------------------------------------------------------------------------
 
@@ -178,9 +273,37 @@ class TestRetroGateHelpers:
         assert data["retro_path"] == "/vault/retro.md"
         assert isinstance(data["created_at"], float)
 
-    def test_mark_returns_empty_for_falsy_session_id(self):
-        assert obsidian_utils.mark_retro_classification_pending("", "/vault/retro.md") == ""
-        assert obsidian_utils.mark_retro_classification_pending(None, "/vault/retro.md") == ""  # type: ignore[arg-type]
+    def test_mark_refuses_unusable_session_id(self):
+        """#330 task 4: empty, whitespace-only, and the literal "unknown"
+        must refuse to arm the gate — an explicit error string, not "".
+
+        Arming under a dead key is worse than not arming: the Stop hook
+        looks up the HARNESS's own session_id and would never find a
+        sentinel filed under "unknown" or blank, so the gate would appear
+        armed to the skill (a truthy return) while the Stop hook enforces
+        nothing — the exact silent-loss-of-enforcement failure #330 reports.
+        A visible refusal lets the skill surface it instead.
+        """
+        gate_dir = self._gate_dir()
+        before = set(gate_dir.glob("*.json")) if gate_dir.exists() else set()
+
+        for bad_sid in ("", "   ", "unknown", None):
+            result = obsidian_utils.mark_retro_classification_pending(bad_sid, "/vault/retro.md")  # type: ignore[arg-type]
+            assert result, f"Expected a non-empty error string for {bad_sid!r}, got {result!r}"
+            assert result.lower().startswith("failed"), (
+                f"Expected an explicit refusal string for {bad_sid!r}, got {result!r}"
+            )
+
+        after = set(gate_dir.glob("*.json")) if gate_dir.exists() else set()
+        assert after == before, "No sentinel file should be written for any refused session_id"
+
+    def test_mark_still_arms_for_a_valid_session_id(self):
+        """Regression guard for the refusal guard above: a normal, non-empty,
+        non-"unknown" session_id must still arm the gate exactly as before."""
+        path = obsidian_utils.mark_retro_classification_pending(SID, "/vault/retro.md")
+        assert path, "Expected a non-empty sentinel path"
+        assert not path.lower().startswith("failed")
+        assert Path(path).exists()
 
     def test_get_returns_dict_after_mark(self):
         obsidian_utils.mark_retro_classification_pending(SID, "/vault/retro.md")
