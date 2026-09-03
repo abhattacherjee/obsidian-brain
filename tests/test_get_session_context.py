@@ -1800,3 +1800,70 @@ def test_get_session_context_announces_an_unresolvable_session_once(
     assert err.count("could not identify the current session") == 1, err
     assert os.getcwd() in err
     assert "session-scoped evidence" in err
+
+
+# ─── #330 task 1: allow_env plumbing (no behavior yet) ─────────────────
+
+def test_isolate_harness_session_id_globally_clears_the_real_value():
+    """Proves the autouse fixture in conftest.py works: the suite runs inside
+    a live Claude Code session, so CLAUDE_CODE_SESSION_ID is set in pytest's
+    own environment unless something clears it per test (#330)."""
+    assert "CLAUDE_CODE_SESSION_ID" not in os.environ
+
+
+def test_resolve_session_id_allow_env_is_inert_this_task(
+    isolated_home, monkeypatch, tmp_path
+):
+    """allow_env=False and allow_env=True must resolve identically — the
+    parameter is threaded but not yet consulted anywhere (#330 task 1; the
+    env layer itself is task 2)."""
+    sid = _unique_sid()
+    project = "allow-env-inert-proj"
+
+    _seed_bootstrap(isolated_home, project, sid)
+    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{sid}.jsonl").write_text("{}\n")
+
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+
+    bdir = isolated_home / ".claude" / "obsidian-brain"
+    monkeypatch.setattr(
+        obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-"
+    )
+
+    # The env var must hold a DIFFERENT, well-formed sid than the one the
+    # scan layers resolve. Setting it to `sid` would make this test vacuous:
+    # a wired env layer would return `sid` too and the assertion would still
+    # pass, so the test could not tell an inert layer from a live one.
+    # Verified by mutation — wiring the env read into _resolve_session_id
+    # leaves this test green when both values agree, and red as written.
+    env_sid = _unique_sid()
+    assert env_sid != sid
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+
+    result_false = obsidian_utils._resolve_session_id(allow_env=False)
+    result_true = obsidian_utils._resolve_session_id(allow_env=True)
+
+    assert result_false == result_true == sid
+
+
+def test_slow_path_newest_sid_passes_allow_env_false(isolated_home, monkeypatch):
+    """_slow_path_newest_sid must call _resolve_session_id with
+    allow_env=False, mirroring allow_bootstrap=False — otherwise
+    check_hook_status becomes circular once the env layer is wired (#330)."""
+    captured = {}
+
+    def _fake_resolve(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return "unknown"
+
+    monkeypatch.setattr(obsidian_utils, "_resolve_session_id", _fake_resolve)
+
+    obsidian_utils._slow_path_newest_sid()
+
+    assert captured["kwargs"].get("allow_bootstrap") is False
+    assert captured["kwargs"].get("allow_env") is False

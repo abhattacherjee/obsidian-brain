@@ -273,3 +273,18 @@ def _isolate_acted_items_path_globally(tmp_path_factory, monkeypatch):
         return  # module not present in some test contexts
     acted = tmp_path_factory.mktemp("acted") / "deep-acted-items.json"
     monkeypatch.setattr(deep_cli, "_ACTED_ITEMS_PATH", str(acted))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_harness_session_id_globally(monkeypatch):
+    """Clear CLAUDE_CODE_SESSION_ID for every test. The suite runs inside a
+    live Claude Code session, so this is already set in pytest's own
+    environment to the developer's real session id. Without this fixture, a
+    resolver test would assert against that live value instead of the
+    fixture it set up (#330).
+
+    Subprocess tests that do os.environ.copy() simply inherit the absence,
+    same as _isolate_vault_index_db_globally above; harmless today since
+    nothing in this repo reads the var yet (#330 task 2 adds the first
+    reader)."""
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)

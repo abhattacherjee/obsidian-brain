@@ -1696,9 +1696,15 @@ def _slow_path_newest_sid() -> str:
     recent-bootstrap directory scan). Used by health checks (e.g.,
     check_hook_status) that must not be fooled by stale bootstraps.
 
+    Also env-blind (allow_env=False): once the env layer exists (#330 task
+    2), trusting CLAUDE_CODE_SESSION_ID here would let check_hook_status
+    validate the env var against itself instead of against the JSONLs on
+    disk — a health check that can no longer detect the env var pointing at
+    a session with no transcript.
+
     Returns 'unknown' if no JSONLs are found for the current cwd.
     """
-    return _resolve_session_id(allow_bootstrap=False)
+    return _resolve_session_id(allow_bootstrap=False, allow_env=False)
 
 
 def _try_bootstrap_fast_path(project: str) -> str | None:
@@ -1778,10 +1784,16 @@ def _try_bootstrap_fast_path(project: str) -> str | None:
     return None  # different session is strictly newer — fall through
 
 
-def _resolve_session_id(allow_bootstrap: bool = True) -> str:
+def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) -> str:
     """Single source of truth for current-session SID resolution. Never raises.
 
     Resolution layers (each failure → next):
+      0. CLAUDE_CODE_SESSION_ID env var — RESERVED, gated by `allow_env`.
+         Not yet consulted anywhere in this function (#330 task 1); `allow_env`
+         is accepted and threaded but has no effect until task 2 wires the
+         actual read. Once wired, this layer trusts the harness-provided id
+         ahead of the mtime-scan layers below, which cannot distinguish two
+         sessions racing in the same project directory (#330).
       1. Project basename via _resolve_project_basename (cwd → env → None)
       2. Bootstrap fast path (skipped if allow_bootstrap=False)
       3. Slow-path JSONL glob
@@ -1793,7 +1805,9 @@ def _resolve_session_id(allow_bootstrap: bool = True) -> str:
 
     The `allow_bootstrap` flag gates BOTH bootstrap-reading layers (2 and 4),
     so callers that need a bootstrap-blind result (e.g., health checks via
-    _slow_path_newest_sid) get a JSONL-only resolution.
+    _slow_path_newest_sid) get a JSONL-only resolution. `allow_env` gates
+    layer 0 the same way, for the same reason: a health check must not
+    validate the env var against itself.
 
     Layer 4 is scoped to the cwd-gone case ON PURPOSE (#260). It scans
     ~/.claude/obsidian-brain/sid-* across EVERY project and returns a sid when
@@ -1841,13 +1855,15 @@ def _resolve_session_id(allow_bootstrap: bool = True) -> str:
     return "unknown"
 
 
-def _get_session_id_fast() -> str:
+def _get_session_id_fast(allow_env: bool = True) -> str:
     """Derive session ID, using bootstrap file for speed on repeat calls.
 
     See _try_bootstrap_fast_path for the validation strategy and
     _resolve_session_id for the full layered fallback chain (issue #105).
+    `allow_env` is threaded straight through to _resolve_session_id; see its
+    docstring for what the (currently inert) env layer will do (#330).
     """
-    return _resolve_session_id(allow_bootstrap=True)
+    return _resolve_session_id(allow_bootstrap=True, allow_env=allow_env)
 
 
 def cache_get(session_id: str, key: str):

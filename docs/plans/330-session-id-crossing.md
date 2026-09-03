@@ -40,6 +40,34 @@ Hooks already receive an authoritative `session_id` in their stdin JSON. The env
 var is the same authority made available to the skill/CLI side, which is the side
 that currently guesses.
 
+## Sharper diagnosis: resolution is UNSTABLE, not merely wrong
+
+The one crossed note in the live vault proves something stronger than "a wrong
+id was resolved once".
+
+`claude-insights/2026-08-27-retro-d205.md` carries:
+
+- `source_session: 18785285-d99d-48ce-a2f7-5bc0aba14055` — which hashes to `f157`
+- `source_session_note: "[[2026-08-26-openclaw-df46]]"` — and `df46` is
+  `sha256("504f461a-1881-4bc6-a262-0025f1420ea5")[:4]`
+
+Both fields are populated from `get_session_context()`. Had they come from ONE
+resolution they would agree by construction, because `session_note_name` is
+resolved via `hash(session_id)[:4]`. They disagree, so the two fields were filled
+from **two different resolutions during a single note write** — the retro skill
+calls `get_session_context()` at `skills/retro/SKILL.md:129` and again at `:167`,
+and the newest-mtime winner changed between the two calls.
+
+The existing cache cannot prevent this. `get_session_context()` does
+`cache_get(sid, key)` where `sid` is the value just resolved, so a different
+resolution lands in a different cache file. **The cache is keyed on the thing
+being resolved, so it can never pin it.**
+
+Consequence for the fix: layer 0 must make resolution *stable across repeated
+calls within a session*, not merely more accurate on one call. The env var does
+this by construction — it is a constant for the session's lifetime. Task 2 gets
+an explicit stability test for it.
+
 ## Design decisions (confirmed with the user)
 
 1. **Env var first; `unknown` on any tie.** Trust `CLAUDE_CODE_SESSION_ID` when
@@ -124,9 +152,20 @@ Baseline on clean `develop`: **3984 passed, 30 xfailed**.
 - `_slow_path_newest_sid()` keeps `allow_bootstrap=False` and passes
   `allow_env=False`, so `check_hook_status()` stays a real health check rather
   than becoming circular.
+- **The suite is blind to this layer by construction — measured.** With the env
+  read fully wired as a mutation, all **3987 tests still passed**. The task-1
+  isolation fixture deletes `CLAUDE_CODE_SESSION_ID` for every test, which is
+  correct (it stops the developer's live id leaking in) but means no existing
+  test can observe the feature. Every task-2 test must set the var **explicitly**,
+  and must set it to a value that DIFFERS from whatever the scan layers would
+  resolve — otherwise it passes whether or not the layer is wired. The task-1
+  inertness test was vacuous for exactly this reason and was fixed after a
+  mutation proved it green under a wired layer.
 - **Tests:** env set + valid → returned without any glob; env set + malformed →
   ignored, falls through; env absent → existing behaviour unchanged; subagent
-  inheritance case (parent id used).
+  inheritance case (parent id used); **stability** — two consecutive
+  `get_session_context()` calls return the same id while a competing transcript
+  is touched in between (the intra-note drift proved above).
 
 ### Task 3 — ambiguity yields `unknown`, never a guess
 
