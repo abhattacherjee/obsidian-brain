@@ -1,118 +1,18 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+Read [CLAUDE.md](CLAUDE.md) for the repository's shared development, security,
+architecture, and Git Flow rules. Its `.claude-plugin/` paths, `~/.claude/`
+configuration, and `claude -p` commands describe the current implementation;
+do not replace them with Codex paths unless the corresponding code exists.
 
-## Project Overview
+## Codex guidance
 
-Obsidian Brain is a Codex plugin that turns an Obsidian vault into a persistent knowledge base across sessions. It auto-logs sessions, captures curated knowledge, and enables project-scoped context resume via structured markdown notes.
-
-**Integration pattern:** Direct filesystem writes only — no MCP server, no REST API, no Obsidian plugins required (except Dataview for dashboards).
-
-## Development Commands
-
-There is no build step, test suite, or linter. This is a pure Python (stdlib only) + Markdown plugin. Validation is manual:
-
-```bash
-# Verify hook registration is valid JSON
-python3 -c "import json; json.load(open('hooks/hooks.json'))"
-
-# Verify plugin manifest
-python3 -c "import json; json.load(open('.Codex-plugin/plugin.json'))"
-
-# Test a hook script directly (requires config at ~/.Codex/obsidian-brain-config.json)
-python3 hooks/obsidian_session_log.py
-python3 hooks/obsidian_session_hint.py
-python3 hooks/obsidian_context_snapshot.py
-```
-
-## Architecture
-
-### Two execution modes
-
-1. **Hooks (auto-running Python scripts)** — Triggered by Codex lifecycle events. Registered in `hooks/hooks.json`. Must exit 0, use only Python stdlib, and write atomically (temp file + rename).
-2. **Skills (prompt-based procedures)** — Each `skills/*/SKILL.md` is a step-by-step prompt that Codex follows. No code files — skills use standard CC tools (Bash, Read, Write, Grep). Changes to SKILL.md directly change skill behavior.
-
-### Key files
-
-- `hooks/obsidian_utils.py` — Shared utility module (~655 lines) used by all three hooks. Contains transcript parsing, metadata extraction, summarization (shells out to `Codex -p --model haiku`), and atomic vault writes.
-- `hooks/obsidian_session_log.py` — SessionEnd: writes raw session note immediately (AI summarization deferred to `/recall`), and appends a structured outcome line to `~/.Codex/obsidian-brain-hook.log` for every exit path.
-- `hooks/obsidian_session_hint.py` — SessionStart: injects last-session context hint for the current project.
-- `hooks/obsidian_context_snapshot.py` — PreCompact: saves context snapshot before compression.
-- `templates/` — Markdown templates for each note type (session, insight, decision, error-fix, snapshot, imported-session).
-- `dashboards/` — Dataview query templates installed to the user's vault.
-
-### Data flow
-
-Sessions are logged with a **write-first pattern**: the raw note (with conversation excerpts, tool usage, metadata) is always saved to the vault immediately. AI summarization is deferred entirely: notes are written in raw form and upgraded by `/recall` on demand.
-
-Structured outcome telemetry is appended to `~/.Codex/obsidian-brain-hook.log` for every SessionEnd exit path (success, all skip reasons, write failure, exception) and every SessionStart bootstrap event. The log uses one line per event with grep-friendly `key=value` fields, rotates at 100 KB to `obsidian-brain-hook.log.1`, and is the primary diagnostic surface for sessions that did not produce a vault note. Inspect with `awk '/SessionEnd/ {print $5}' ~/.Codex/obsidian-brain-hook.log | sort | uniq -c` for a SessionEnd outcome distribution.
-
-### Configuration
-
-Machine-local config at `~/.Codex/obsidian-brain-config.json` (outside the vault, outside this repo). Created by `/obsidian-setup`. Contains vault path, folder names, filtering thresholds, and feature flags.
-
-### Tag convention
-
-All frontmatter tags use the `Codex/` prefix: `Codex/session`, `Codex/insight`, `Codex/decision`, `Codex/error-fix`, `Codex/snapshot`, `Codex/imported`, `Codex/standup`, `Codex/retro`, `Codex/project/<name>`, `Codex/topic/<topic>`, `Codex/auto`.
-
-### Keeping the architecture page current
-
-`docs/architecture/architecture.json` is the canonical, machine-readable architecture of this plugin (rendered to `docs/architecture/architecture.html`). It is consumed by future agents, so it must not drift from the code.
-
-**Whenever a change adds, removes, or renames a hook, skill, vault-doctor check, CLI/support module, datastore, env var, or alters a data flow, update the architecture artifacts in the same PR:**
-
-- Edit `docs/architecture/architecture.json` (layers / components / flows / types / environment), keeping `lastUpdated` set to the change date and `version` in sync with `plugin.json`. Every `flows[].steps[].from`/`to` must reference a real `layers[].components[].id`, and every component `files[]` path must exist on disk.
-- Re-render the viewer: `~/.Codex/skills/architecture-page/scripts/render-html.sh --json docs/architecture/architecture.json --output docs/architecture/architecture.html`
-- Validate before committing: `~/.Codex/skills/architecture-page/scripts/smoke-test.sh --json docs/architecture/architecture.json` — both `[main]` and `[sparse]` must pass.
-- For a large or structural change, regenerate from scratch via the `architecture-page` skill rather than hand-editing.
-- Ground every claim in live source (run `wc -l`, read the actual file) — never copy a number or path from prose/docs that may be stale.
-
-`docs/.nojekyll` keeps GitHub Pages serving these files verbatim; do not remove it.
-
-## Conventions
-
-- **Commits:** Use conventional commit format — `feat(obsidian-brain):`, `fix:`, `chore:`, `docs:`
-- **Python:** stdlib only, no pip dependencies. All hooks must be deterministic and safe to run at session boundaries.
-- **Atomic writes:** All vault writes must use temp file + rename pattern (see `write_vault_note()` in `obsidian_utils.py`).
-- **Version:** Bump `plugin.json` and `.Codex-plugin/marketplace.json` in lockstep (use `scripts/bump-version.sh`), and update `CHANGELOG.md` for releases.
-- **Branching:** Never commit directly to develop/main — use feature branches.
-
-## Security Patterns
-
-When writing new hooks, skills, or scripts, follow these rules:
-
-- **Path containment:** Never construct file paths from user input without `resolve()` + `is_relative_to()` containment check against the vault root.
-- **No predictable /tmp paths:** Use `~/.Codex/obsidian-brain/` (0o700) or `tempfile.mkstemp` — never hardcoded `/tmp/ob-*` paths.
-- **No path interpolation in python3 -c:** Always pass paths via `sys.argv`, never as string literals in the source code.
-- **JSON via stdin, not shell args:** Use `printf '%s' "$VAR" | python3 -c '... json.load(sys.stdin)'` — never pass JSON arrays as shell arguments.
-- **Atomic writes only:** All vault file writes must use temp file + rename — never `sed -i` or direct overwrite.
-- **Owner-only permissions:** `0o600` for files containing user data (notes, DB, config). `0o700` for working directories.
-- **Cap stdin reads:** Hook entry points must use `sys.stdin.read(1_000_000)` — never unbounded `read()`.
-- **Scrub secrets:** Apply `scrub_secrets()` to any user message content before writing to vault notes.
-
-## Git Flow Rules
-
-- Never commit directly to `main` or `develop` — use feature branches
-- Branch naming: `feature/*`, `release/*`, `hotfix/*`
-- Features branch from and merge to `develop`
-- Releases branch from `develop`, merge to both `main` and `develop`
-- Hotfixes branch from `main`, merge to both `main` and `develop`
-- Run `./scripts/commit-preflight.sh` before every commit
-
-## Distribution & Release
-
-obsidian-brain is distributed as a **standalone marketplace from this repo**
-(`abhattacherjee/obsidian-brain`). The repo's `.Codex-plugin/marketplace.json`
-(`source: "./"`) is authoritative — there is **no longer a sync step to the
-Codex-skills monorepo**.
-
-Release flow (Git Flow):
-1. `release/*` branch from `develop`; run `scripts/bump-version.sh <part>` to
-   bump `plugin.json` and `.Codex-plugin/marketplace.json` in lockstep.
-2. Update `CHANGELOG.md`.
-3. Merge to `main`, tag `vX.Y.Z`, publish a GitHub Release.
-4. Back-merge `main` into `develop`.
-
-Users update via `/plugin marketplace update`. Local dev testing uses
-`/dev-test install` (which calls `scripts/test-dev-skill.sh`, now
-source-agnostic about the cache directory).
+- Run `./scripts/commit-preflight.sh` before committing. It runs the pytest
+  coverage gate and the repository checks.
+- Codex parity is specified in
+  [docs/codex-claude-parity-design.md](docs/codex-claude-parity-design.md).
+  The shared runtime, Codex lifecycle hooks, and Codex plugin packaging in
+  that design have not shipped. Do not claim parity from this repository's
+  Codex project guidance alone.
+- Keep host-specific instructions in this file. Put shared rules in
+  `CLAUDE.md` and link to them here so the two instruction files stay in step.

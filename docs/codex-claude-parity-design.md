@@ -1,7 +1,7 @@
 # Obsidian Brain: Claude Code and Codex parity
 
 - Date: 2026-09-21
-- Status: Draft for user review; implementation not started
+- Status: Draft for user review; repository guidance added, parity runtime not started
 - Source baseline: `b7d8597`, plugin `3.5.1`
 - Tracking: [#360](https://github.com/abhattacherjee/obsidian-brain/issues/360)
 - Supersedes: `docs/codex-compatibility-design.md`
@@ -13,7 +13,7 @@ Claude Code, Codex desktop, and Codex CLI use the same Obsidian vault. Users can
 The user selected these requirements:
 
 1. Support Codex desktop and CLI alongside Claude Code.
-2. Deliver full parity across all 19 skills and automatic capture/recovery. Intermediate milestones are not a parity release.
+2. Deliver full parity across every skill in the §9 table (19 at baseline `b7d8597`) and automatic capture/recovery. Intermediate milestones are not a parity release.
 3. AI operations use the invoking assistant's backend. No silent cross-provider fallback.
 4. Keep existing folders, tags, note types, filenames, and backlinks compatible. No bulk renaming.
 5. Checkpoint after completed turns, update one session note, save before compaction, and finalize at session end. Apply this behavior to both assistants.
@@ -30,17 +30,17 @@ The first supported local environments are macOS desktop/CLI and Linux CLI. Wind
 | `_resolve_session_id` prioritizes `CLAUDE_CODE_SESSION_ID` and can fall back to recent Claude transcripts. The inspected Codex process had different Claude and Codex IDs. | Runtime identity must be explicit. Never infer a Codex session from a Claude ID or the newest transcript. |
 | `obsidian_session_log.py` restricts transcript paths to Claude storage. The reaper also discovers Claude project files. | Separate host discovery and validation from capture/recovery logic. |
 | Summarizers in `obsidian_utils.py` and classifiers in `check_items_cli.py` launch `claude -p`. | Replace provider calls with a typed AI execution interface. |
-| All 19 skill files contain `.claude` paths. `recall` also names Claude task/subagent tools. | Share procedures but move path resolution and execution into deterministic helpers. |
+| All skills listed in §9 contain `.claude` paths. `recall` also names Claude task/subagent tools. | Share procedures but move path resolution and execution into deterministic helpers. |
 | `deep_cli.py` uses a single `deep-pipeline.json` cache with an age-only reuse check. Session state and several scratch paths are not host-scoped. | Scope jobs and cache keys to their actual inputs, vault, host, and session. |
 | `note_writer.py` already locks append updates; session writing and summary upgrades have separate write paths. | Extend one writer transaction protocol to every producer. Atomic rename alone is insufficient. |
 | Existing session filenames use a short hash. Recovery uses existence checks and an mtime watermark. | Use full identity checks and per-source revision cursors; preserve legacy names when their identity matches. |
-| There are 95 `test_*.py` files. `setup.cfg` excludes the large `obsidian_utils.py` module from coverage enforcement. `CLAUDE.md` incorrectly says no tests exist. | Update contributor docs; new runtime modules must be covered rather than inherit the monolith's exclusion. |
+| At baseline `b7d8597` there are 95 `test_*.py` files. `setup.cfg` excludes `hooks/obsidian_utils.py` from the coverage threshold. `CLAUDE.md` incorrectly said no tests exist. | Contributor docs are corrected in this PR; new runtime modules must not be added to that exclusion. |
 
 The July proposal landed through #270/#271 as documentation. Vault history records #272 being closed because its prerequisites were not actionable, not because Codex support shipped. Sources: `2026-07-26-obsidian-brain-f609` and `2026-09-05-obsidian-brain-55e8`.
 
 Local `codex --version` reported `0.155.1`. Its help exposes `exec`, `--ephemeral`, `--output-schema`, and `--output-last-message`. A real rollout was inspected for record shapes only; private conversation content must not become a committed fixture. Desktop lifecycle behavior has not yet been tested end to end.
 
-Current OpenAI documentation resolves the old uncertainty about plugin-root variables and hook registration. Codex supports `SessionEnd`, but limits it to three seconds and does not treat switching conversations as immediate session end. Its transcript format is not a stable hook interface. These are reasons for turn checkpoints and versioned parser fixtures, not reasons to substitute `Stop` for finalization. [Hooks](https://learn.chatgpt.com/docs/hooks)
+OpenAI hook documentation, accessed 2026-09-24 while the local Codex version was `0.155.1`, documents `SessionEnd` with a three-second limit and says switching conversations is not immediate session end. Recheck these claims for each supported client version in §11 step 1. The transcript format is not a stable hook interface. These are reasons for turn checkpoints and versioned parser fixtures, not reasons to substitute `Stop` for finalization. [Hooks](https://learn.chatgpt.com/docs/hooks)
 
 ## 3. Architecture
 
@@ -76,13 +76,13 @@ Session key: `(host, native_session_id)` within the selected vault. Project iden
 
 Keep Claude's existing config path. Codex uses `$CODEX_HOME/obsidian-brain-config.json`, falling back to `~/.codex/obsidian-brain-config.json`. Both contain the same vault/folder settings when paired. No config is written into a plugin cache.
 
-Resolve explicit CLI options before `OBSIDIAN_BRAIN_CONFIG`, then the invoking host's native config. Codex setup may offer an existing Claude configuration as a source, but normal Codex commands do not silently load Claude settings. Setup copies only shared vault/schema/index settings; host-specific AI models and permissions are not copied.
+Add a new `OBSIDIAN_BRAIN_CONFIG` override. Resolve explicit CLI options first, then this override, then the invoking host's native config. Codex setup may offer an existing Claude configuration as a source, but normal Codex commands do not silently load Claude settings. Setup copies only shared vault/schema/index settings; host-specific AI models and permissions are not copied.
 
 Add an explicit `index_path`. Paired hosts use one index for the same vault so access history, themes, and ranking do not diverge. When pairing an existing Claude installation, preserve its current DB path and contents. For a new vault, default to `~/.local/share/obsidian-brain/vaults/<vault-key>/index.sqlite3`. The vault key hashes the resolved vault path. Do not relocate existing databases automatically. `OBSIDIAN_BRAIN_DB` remains an explicit override, including for tests.
 
 Store and verify vault/folder identity in the index. Refuse to synchronize an index against a different vault or conflicting folder set. Setup reports pairing conflicts and requires a deliberate selection instead of combining settings silently.
 
-Keep runtime scratch data under the invoking host's existing state root, with a new versioned subtree keyed by vault, host, session, and unique operation ID. Support `OBSIDIAN_BRAIN_STATE_DIR` for isolation. Shared session cursors and writer locks live in an owner-only coordination directory beside the selected index. Index rebuilds preserve coordination state; cursors are not disposable search cache data.
+Keep runtime scratch data under the invoking host's existing state root, with a new versioned subtree keyed by vault, host, session, and unique operation ID. Add a new `OBSIDIAN_BRAIN_STATE_DIR` override for isolation. Record both new overrides in `docs/architecture/architecture.json` `environment` when implemented. Shared session cursors and writer locks live in an owner-only coordination directory beside the selected index. Index rebuilds preserve coordination state; cursors are not disposable search cache data.
 
 No global `current-session` file is authoritative. Cache reuse requires a matching input digest, vault/project identity, algorithm version, and relevant backend settings; age alone is insufficient.
 
@@ -118,11 +118,11 @@ The writer provides at-least-once processing with idempotent note updates. Event
 
 For overlapping events, acquire the shared per-session lock, merge from the last committed revision, and serialize publication. Finalization cannot discard a newer checkpoint. A replayed compaction event creates no duplicate snapshot. Snapshot identity includes the session, source revision, and trigger; date changes do not break its parent link.
 
-Hooks perform no full-vault scan, index rebuild, or AI call. Codex `SessionEnd` explicitly uses its three-second timeout; the implementation reserves time for a small durable pending-work record and must exit before the deadline. Heavy source catch-up occurs at normal turn checkpoints or recovery. Never advance the cursor beyond durable data. A remaining unread source is reported as pending; source disappearance is reported as loss of recoverable input, not success.
+Hooks perform no full-vault scan, index rebuild, or AI call. Codex `SessionEnd` uses its documented three-second timeout. The implementation plan must set measurable start/recovery limits (maximum sources and wall time per invocation) and an end-handler deadline with a safety margin below three seconds. Contract tests and timing gates enforce those numbers. The handler records unfinished work durably and exits before the deadline. Heavy source catch-up occurs at normal turn checkpoints or recovery. Never advance the cursor beyond durable data. A remaining unread source is reported as pending; source disappearance is reported as loss of recoverable input, not success.
 
 Recover pending work on start/resume, recall, and vault-doctor. Refactor the existing reaper to use the same identity/parser/writer services. It must not finalize active sessions, skip an incomplete note merely because it exists, or use a rounded global mtime watermark. Bounded scans keep deterministic per-source cursors so interrupted batches cannot strand files. Recovery needs no background service.
 
-For Codex, `Stop` output must use the documented JSON contract. Capture does not block completion. The retro policy may request continuation, but respects `stop_hook_active` and records its decision per host/session/turn to avoid loops. A capture failure must not look like a retro-policy block. Claude's wrapper preserves its native output contract. [Codex hook contracts](https://learn.chatgpt.com/docs/hooks)
+For Codex, `Stop` output must use the documented JSON contract, checked against the installed client in §11 step 1. Capture does not block completion. The retro policy may request continuation, but respects `stop_hook_active` and records its decision per host/session/turn to avoid loops. A capture failure must not look like a retro-policy block. Claude's wrapper preserves its native output contract. [Codex hook contracts](https://learn.chatgpt.com/docs/hooks), accessed 2026-09-24 while the local Codex version was `0.155.1`.
 
 ## 7. Notes, concurrent updates, and compatibility
 
@@ -158,6 +158,8 @@ Enforce timeouts, bounded output, cancellation cleanup, and output-schema checks
 
 Author common workflow instructions once. Keep small host-specific references for invocation, setup, permissions, and execution. Do not maintain a second independently edited `skills-codex/` tree. Where a host requires different descriptor text, generate it from the common source and test that generation is deterministic.
 
+The §9 table is the acceptance inventory. At implementation, generate it from the capability matrix or test that its skill names equal the discovered `skills/*/SKILL.md` names in both directions. A newly added skill without a host decision fails CI.
+
 `brain_cli.py` is the stable data-operation interface. Commands return JSON status, result, warnings, and structured errors. Supply host/context explicitly; resolve packaged resources relative to the installed resource path instead of searching for the newest cache version. Existing lower-level helpers remain usable during migration.
 
 | Skill | Required parity acceptance |
@@ -186,7 +188,7 @@ Keep `.claude-plugin` packaging. Add OpenAI packaging with explicit Codex hook s
 
 Setup distinguishes package installation, hook trust, vault write permission, and backend readiness. It must not treat discovered skills as proof that hooks run. Run installed-package checks from an unrelated working directory and paths containing spaces. Development installs restore prior configuration on removal. Release/version tooling must keep both descriptors synchronized.
 
-Update README, CLAUDE.md, add AGENTS.md, and update architecture JSON/HTML when implementation changes land. Explain native invocation syntax in each client. Core workflows must not depend on optional external skills such as context-shield or conversation-search being installed.
+Update README, CLAUDE.md, AGENTS.md, and architecture JSON/HTML when implementation changes land. AGENTS.md already links to the current Claude-side facts in CLAUDE.md; keep shared guidance there and Codex differences in AGENTS.md. Explain native invocation syntax in each client. Core workflows must not depend on optional external skills such as context-shield or conversation-search being installed.
 
 ## 10. Acceptance and release gates
 
@@ -196,12 +198,12 @@ All gates must pass before claiming parity. Passing unit tests alone does not pr
 |---|---|
 | Legacy behavior | Existing Claude regression suite passes; approved checkpoint behavior has explicit updated tests. Old notes, queries, links, and custom folder settings remain usable. |
 | Host independence | Codex workflows pass with Claude executable/config absent; Claude passes with Codex absent. Foreign IDs are deliberately present and ignored. |
-| Client matrix | All 19 workflow checks plus start, stop, compact, resume, interrupt/crash recovery, and end run on Claude Code, Codex desktop, and Codex CLI. Record exact versions and permissions. |
+| Client matrix | Every skill in the §9 table plus start, stop, compact, resume, interrupt/crash recovery, and end run on Claude Code, Codex desktop, and Codex CLI. Record exact versions and permissions. |
 | Transcript correctness | Sanitized fixtures for actual runtime shapes, repeated/mirrored events, nested tools, metadata-only files, compaction, forks, partial lines, rotation, missing sources, and unknown formats. |
 | Simultaneous use | Two hosts in one repo; one Codex thread in desktop/CLI; equal native IDs across hosts; different repos with equal basenames; moved/deleted worktrees. |
 | Durable writes | Kill after checkpoint, note publication, and cursor commit; replay remains idempotent. Race capture/reaper, summary/capture, two summaries, and manual edits. No lost content. |
 | Timing | Measure small and large transcripts, lock contention, cold startup, and slow writes. Codex end handler stays within its three-second limit; unfinished work is durable and later recovered. |
-| Privacy/security | No hidden reasoning or secret leakage; containment/symlink tests; 0600 files and 0700 private directories; unsupported sources never trigger unsafe writes. |
+| Privacy/security | No hidden reasoning or secret leakage; containment/symlink tests; 0600 files and 0700 private directories; hook entry points cap stdin with `sys.stdin.read(1_000_000)`; paths passed to `python3 -c` use `sys.argv`; JSON passes via stdin, not shell arguments; `scrub_secrets()` runs before vault writes; unsupported sources never trigger unsafe writes. |
 | AI failures | Missing auth/CLI, policy denial, timeout, cancellation, invalid schema, and nested-hook recursion. No cross-provider invocation or success claim on failure. |
 | Installation | Fresh installs, existing-vault pairing, custom CODEX_HOME, upgrades, hook trust, unrelated cwd, and paths with spaces on supported platforms. |
 | Diagnostics | Explain partial/pending/conflicted states and recovery action without revealing prompt contents or secrets. |
@@ -212,17 +214,35 @@ Tests must isolate config, scratch state, coordination state, and databases in t
 
 Run the existing full pytest coverage gate, DB-pollution check, security checks, skill-snippet checks, and architecture validation. Add coverage for every new runtime module. Add macOS and Linux CLI coverage; desktop lifecycle/trust/permission checks require a recorded live run. Current CI is Ubuntu-only and does not establish desktop support.
 
+The source, matrix, lint, resolver, and contract checks in §12 run in CI on every PR and become required status checks on `develop` before parity is declared. Only the desktop live run remains a release-time check.
+
 The release evidence records tested client versions and parser format fingerprints. Unsupported versions/formats get a capability warning or fail closed for affected writes. Do not promise compatibility solely from a version number or a schema on an unreleased upstream branch.
 
 ## 11. Implementation sequence
 
-1. Capture sanitized runtime fixtures and establish lifecycle/output contracts for installed clients. Verify host-native AI execution without vault writes.
+1. Capture sanitized runtime fixtures and establish lifecycle/output contracts for installed clients. Recheck that `SessionEnd` exists and its timeout and `Stop` output contract for the exact installed Codex version. Verify host-native AI execution without vault writes.
 2. Extract identity/config/resource resolution and shared CLI boundaries while retaining legacy wrappers.
 3. Introduce the writer transaction, shared cursors, managed regions, and conflict handling. Fix overlapping cache/reaper defects in the same work.
 4. Add transcript adapters and capture checkpoints, snapshots, finalization, and recovery for both hosts.
-5. Port AI execution and all 19 skill procedures; remove unconditional Claude paths and tool assumptions from shared workflows.
-6. Complete packaging, setup/doctor/dev-test, documentation, and the full acceptance matrix.
+5. Port AI execution and every skill in the §9 table; remove unconditional Claude paths and tool assumptions from shared workflows.
+6. Complete packaging, setup/doctor/dev-test, documentation, and the full acceptance matrix. Wire every §12 check into CI and require it on `develop`.
 
 These are implementation stages within one compatibility effort, not separate claims of partial parity. Scope fixes exposed here into this change-set rather than generating a follow-up issue for each path or cache bug.
 
 The written implementation plan follows user review of this spec. It will map these stages to files, tests, and reviewable commits. This document authorizes no deployment or merge.
+
+## 12. Keeping hosts in parity
+
+Parity is a per-PR invariant after implementation, not a one-time release audit. The implementation is done only when the following checks run in CI for every PR and are required on `develop`. Every check must compare discovered source items with the declared inventory in both directions, so a new item and a stale entry both fail. Use `tests/test_hooks_resolver_drift.py` as the precedent for equality checks, then replace its Claude-only resolver assumptions with the shared resolver.
+
+| Check | Required behavior |
+|---|---|
+| Single source for hooks | Keep policy code once, with only thin host entry points. `tests/test_host_hook_single_source.py` rejects a copied `.codex/hooks/*.py` body or a duplicate hash of `.claude/hooks/*.py`. A `scripts/ci-checks/` lint rejects `/Users/` and `/home/` paths in tracked hook registrations. This PR replaces copied Git policy hooks and machine-specific registration with Codex registration of the existing `.claude/hooks/` scripts. |
+| Capability matrix | Add `docs/parity/capabilities.json`. Inventory every hook event and handler, skill, `brain_cli.py` subcommand, config key, environment variable, and vault-doctor check. For Claude Code, Codex CLI, and Codex desktop, mark each item `supported`, `unsupported:<reason>`, or `n/a`. Tests discover items from `hooks/hooks.json`, the Codex manifest, `skills/*/SKILL.md`, CLI subcommands, `scripts/vault_doctor_checks/*.py`, and `load_config` keys; compare exact sets and require a reviewed status for every host. The matrix carries the supported client version range and fixture provenance. |
+| Host-neutral shared code | A pytest beside `tests/test_skill_snippets.py` rejects `~/.claude`, `claude -p`, Claude tool names, and direct host-specific resource lookup in `skills/**` and shared `hooks/*.py`. Only named adapters and host reference files may contain them. Rewrite `tests/test_hooks_resolver_drift.py` around the host-neutral resolver as part of this change. |
+| One config/env resolver | `runtime_context.py` owns config and environment resolution. A `scripts/ci-checks/` lint rejects direct `os.environ` reads of `OBSIDIAN_BRAIN_*`, `CLAUDE_*`, and `CODEX_*`, and hardcoded `.claude/` paths, outside that module and named adapters. Every environment variable must also appear in the matrix and `docs/architecture/architecture.json` `environment`, including the new `OBSIDIAN_BRAIN_CONFIG` and `OBSIDIAN_BRAIN_STATE_DIR` overrides. |
+| Both-host hook contracts | A parameterized pytest runs each host wrapper as a subprocess with sanitized golden fixtures under `tests/fixtures/hosts/<host>/<event>.json`. It asserts exit code, output schema, and wall time, including a safety margin under Codex's documented three-second `SessionEnd` limit. Pin the client version and capture date with each fixture. The matrix check requires fixtures for every supported hook event; a live desktop run still verifies installation and trust. |
+| Upstream Codex drift | The matrix pins the supported Codex version range. Vault-doctor compares `codex --version` with it and reports parser `partial` or `unsupported` outcomes. A weekly CI job captures a fresh sanitized fixture from a synthetic session, reruns parser and hook contracts, and rechecks `SessionEnd` availability and timeout. If automated fresh capture is not possible, a required release-checklist step performs it before widening the supported range. |
+| Instructions and review | `AGENTS.md` links to `CLAUDE.md` and contains only Codex differences. CI checks instruction-file links and referenced repository paths. Add a `hosts` field to each component in `docs/architecture/architecture.json` and validate it against the matrix. Add `.github/pull_request_template.md` with `Codex impact: none / updated / unsupported (reason)` and make the PR CI check require a filled choice. Extend `scripts/bump-version.sh` and the version-sync preflight check to cover the OpenAI descriptor when it is added. |
+
+Do not mark a capability `supported` solely because its descriptor or hook registration exists. A supported status requires passing contract tests and the appropriate installed-client validation in §10. Any later Claude-side change to a shared capability must either update Codex behavior and fixtures or record an explicit unsupported decision with a reason.

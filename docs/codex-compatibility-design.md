@@ -1,7 +1,7 @@
 # Codex Compatibility Design
 
 Date: 2026-07-06
-Status: superseded by [Claude Code and Codex parity design](codex-claude-parity-design.md)
+Status: superseded pending approval of [Claude Code and Codex parity design](codex-claude-parity-design.md)
 
 ## Summary
 

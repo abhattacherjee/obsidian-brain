@@ -10,7 +10,7 @@ Obsidian Brain is a Claude Code plugin that turns an Obsidian vault into a persi
 
 ## Development Commands
 
-There is no build step, test suite, or linter. This is a pure Python (stdlib only) + Markdown plugin. Validation is manual:
+There is no build step or linter. This is a Python (stdlib only) + Markdown plugin with a pytest suite and a 90% coverage gate. Run `./scripts/commit-preflight.sh` before committing. Individual checks include:
 
 ```bash
 # Verify hook registration is valid JSON
@@ -34,7 +34,7 @@ python3 hooks/obsidian_context_snapshot.py
 
 ### Key files
 
-- `hooks/obsidian_utils.py` — Shared utility module (~655 lines) used by all three hooks. Contains transcript parsing, metadata extraction, summarization (shells out to `claude -p --model haiku`), and atomic vault writes.
+- `hooks/obsidian_utils.py` — Shared utility module used by the lifecycle hooks. Contains transcript parsing, metadata extraction, summarization (shells out to `claude -p --model haiku`), and atomic vault writes.
 - `hooks/obsidian_session_log.py` — SessionEnd: writes raw session note immediately (AI summarization deferred to `/recall`), and appends a structured outcome line to `~/.claude/obsidian-brain-hook.log` for every exit path.
 - `hooks/obsidian_session_hint.py` — SessionStart: injects last-session context hint for the current project.
 - `hooks/obsidian_context_snapshot.py` — PreCompact: saves context snapshot before compression.

@@ -1,4 +1,5 @@
 {
+  "description": "Repository Git policy checks shared with Claude Code.",
   "hooks": {
     "PreToolUse": [
       {
@@ -6,47 +7,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 '/Users/abhishek/dev/claude_workspace/obsidian-brain/.codex/hooks/prevent-direct-push.py'",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/prevent-direct-push.py\"",
             "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
+          },
           {
             "type": "command",
-            "command": "python3 '/Users/abhishek/dev/claude_workspace/obsidian-brain/.codex/hooks/require-preflight.py'",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/require-preflight.py\"",
             "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
+          },
           {
             "type": "command",
-            "command": "python3 '/Users/abhishek/dev/claude_workspace/obsidian-brain/.codex/hooks/validate-branch-name.py'",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/validate-branch-name.py\"",
             "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
+          },
           {
             "type": "command",
-            "command": "python3 '/Users/abhishek/dev/claude_workspace/obsidian-brain/.codex/hooks/update-changelog-before-pr.py'",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/update-changelog-before-pr.py\"",
             "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
+          },
           {
             "type": "command",
-            "command": "python3 '/Users/abhishek/dev/claude_workspace/obsidian-brain/.codex/hooks/enforce-pr-base-branch.py'",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/enforce-pr-base-branch.py\"",
             "timeout": 10
           }
         ]
