@@ -1,6 +1,7 @@
 """Keep Codex's repository policy hooks on the Claude-tested source files."""
 
 import json
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -12,6 +13,11 @@ REGISTRATIONS = (
     ROOT / ".claude/settings.json",
     ROOT / "hooks/hooks.json",
 )
+
+
+def _hook_env():
+    return {key: value for key, value in os.environ.items()
+            if not key.startswith("GIT_")}
 
 
 def test_codex_policy_hooks_use_one_source():
@@ -40,7 +46,8 @@ def test_codex_policy_hooks_use_one_source():
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}})
     for command in commands:
         result = subprocess.run(command, shell=True, cwd=ROOT, input=payload,
-                                text=True, capture_output=True, timeout=10)
+                                text=True, capture_output=True, timeout=10,
+                                env=_hook_env())
         assert result.returncode == 0, (command, result.stderr)
         assert not result.stdout, command
 
@@ -59,7 +66,8 @@ def test_codex_policy_hook_denies_protected_push():
     payload = json.dumps({"tool_name": "Bash", "tool_input": {
         "command": "git push origin main"}})
     result = subprocess.run(push, shell=True, cwd=ROOT, input=payload,
-                            text=True, capture_output=True, timeout=10)
+                            text=True, capture_output=True, timeout=10,
+                            env=_hook_env())
     assert result.returncode == 0, result.stderr
     decision = json.loads(result.stdout)["hookSpecificOutput"]
     assert decision["hookEventName"] == "PreToolUse"
@@ -74,7 +82,8 @@ def test_codex_policy_hook_allows_missing_worktree(tmp_path):
         "command": "git status"}})
     for command in commands:
         result = subprocess.run(command, shell=True, cwd=tmp_path, input=payload,
-                                text=True, capture_output=True, timeout=10)
+                                text=True, capture_output=True, timeout=10,
+                                env=_hook_env())
         assert result.returncode == 0, (command, result.stderr)
         assert result.stdout == ""
         assert "no Git worktree" in result.stderr
