@@ -1813,17 +1813,17 @@
     {
       "name": "CODEX_THREAD_ID",
       "default": "(set by Codex)",
-      "purpose": "Foreign-host marker. Set by Codex in every tool shell; the only marker in an unsandboxed run. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer (#362), cache_get/cache_set skip the 'unknown' id, and check_hook_status reports Claude logging as not checked. CODEX_HOME is deliberately not a marker."
+      "purpose": "Foreign-host marker. Set by Codex in every tool shell; the only marker in an unsandboxed run. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer and check_hook_status reports Claude logging as not checked (#362). Separately, and regardless of host, cache_get/cache_set/cache_invalidate never use the 'unknown' id. CODEX_HOME is deliberately not a marker."
     },
     {
       "name": "CODEX_SANDBOX",
       "default": "(set by Codex)",
-      "purpose": "Foreign-host marker. Set by Codex when its sandbox is on. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer (#362), cache_get/cache_set skip the 'unknown' id, and check_hook_status reports Claude logging as not checked. CODEX_HOME is deliberately not a marker."
+      "purpose": "Foreign-host marker. Set by Codex when its sandbox is on. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer and check_hook_status reports Claude logging as not checked (#362). Separately, and regardless of host, cache_get/cache_set/cache_invalidate never use the 'unknown' id. CODEX_HOME is deliberately not a marker."
     },
     {
       "name": "CODEX_SANDBOX_NETWORK_DISABLED",
       "default": "(set by Codex)",
-      "purpose": "Foreign-host marker. Set by Codex when its sandbox blocks network. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer (#362), cache_get/cache_set skip the 'unknown' id, and check_hook_status reports Claude logging as not checked. CODEX_HOME is deliberately not a marker."
+      "purpose": "Foreign-host marker. Set by Codex when its sandbox blocks network. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer and check_hook_status reports Claude logging as not checked (#362). Separately, and regardless of host, cache_get/cache_set/cache_invalidate never use the 'unknown' id. CODEX_HOME is deliberately not a marker."
     },
     {
       "name": "OBSIDIAN_BRAIN_DB",

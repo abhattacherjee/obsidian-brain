@@ -1340,7 +1340,8 @@ _foreign_host_warned: set[str] = set()
 # Environment variables Codex sets in the shells it runs tools in (#362).
 # Checked against the codex-cli 0.155.1 binary. The two sandbox variables are
 # set only when the sandbox is on, so an unsandboxed run is detected by
-# CODEX_THREAD_ID alone; a Codex build that predates it is not detected there. CODEX_HOME is deliberately NOT
+# CODEX_THREAD_ID alone. An unsandboxed run of a Codex build older than
+# CODEX_THREAD_ID is therefore not detected. CODEX_HOME is deliberately NOT
 # here: it is user configuration and is often exported in an ordinary shell
 # profile, so its presence says nothing about which host launched this process.
 _CODEX_HOST_MARKERS = (
