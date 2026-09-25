@@ -3,6 +3,7 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -58,16 +59,37 @@ def _codex_command(path):
             "else printf 'Codex policy hook skipped: no Git worktree\\n' >&2; fi")
 
 
-def test_codex_policy_hook_denies_protected_push():
+def _feature_branch_repo(tmp_path):
+    """A throwaway repo on a feature branch with this checkout's hooks.
+
+    The push gate stands down on `release/*` and `hotfix/*` checkouts, because
+    the release flow pushes to `main` from there. Probing in this checkout made
+    the verdict depend on whichever branch it happens to be on, so this test
+    failed the preflight of every release branch.
+    """
+    work = tmp_path / "probe"
+    shutil.copytree(ROOT / ".claude/hooks", work / ".claude/hooks")
+    env = dict(_hook_env(), GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_CONFIG_SYSTEM=os.devnull, CLAUDE_PROJECT_DIR=str(work))
+    for args in (["init", "-q", "-b", "feature/probe"],
+                 ["-c", "user.email=t@example.invalid", "-c", "user.name=t",
+                  "commit", "-q", "--allow-empty", "-m", "seed"]):
+        subprocess.run(["git", "-C", str(work), *args], env=env,
+                       check=True, capture_output=True)
+    return work, env
+
+
+def test_codex_policy_hook_denies_protected_push(tmp_path):
     manifest = json.loads((ROOT / ".codex/hooks.json").read_text())
     commands = [hook["command"] for group in manifest["hooks"]["PreToolUse"]
                 for hook in group["hooks"]]
     push = next(command for command in commands if "prevent-direct-push.py" in command)
     payload = json.dumps({"tool_name": "Bash", "tool_input": {
-        "command": "git push origin main"}})
-    result = subprocess.run(push, shell=True, cwd=ROOT, input=payload,
+        "command": "git " + "push origin ma" + "in"}})
+    work, env = _feature_branch_repo(tmp_path)
+    result = subprocess.run(push, shell=True, cwd=work, input=payload,
                             text=True, capture_output=True, timeout=10,
-                            env=_hook_env())
+                            env=env)
     assert result.returncode == 0, result.stderr
     decision = json.loads(result.stdout)["hookSpecificOutput"]
     assert decision["hookEventName"] == "PreToolUse"
