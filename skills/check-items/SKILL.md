@@ -774,6 +774,13 @@ except (OSError, json.JSONDecodeError, ValueError) as exc:
 sessions_folder = config.get("sessions_folder", "claude-sessions")
 sessions_dir = os.path.join(vault_path, sessions_folder)
 
+# #340: source_skips now decides which groups cascade, not just how the report
+# renders, so a spelling difference between the path the primary-flip loop
+# recorded and os.path.join(sessions_dir, basename) (a symlinked vault, a
+# trailing slash) would silently cancel the cascade. Compare real paths.
+def _skip_key(path, line):
+    return (os.path.realpath(str(path)), int(line))
+
 buckets = json.load(open(buckets_path))
 scope = json.load(open(scope_path))
 
@@ -799,9 +806,15 @@ if skips_file and os.path.exists(skips_file):
         raw_skips = json.load(open(skips_file))
         for entry in raw_skips or []:
             if isinstance(entry, list) and len(entry) == 2:
-                source_skips.add((str(entry[0]), int(entry[1])))
+                source_skips.add(_skip_key(entry[0], entry[1]))
     except (OSError, json.JSONDecodeError, ValueError) as exc:
-        print(f"[check-items] WARNING: source_skips load failed ({exc}); cascade summary may be inaccurate", file=sys.stderr)
+        print(
+            f"[check-items] WARNING: source_skips load failed ({exc}); no item "
+            f"will be stamped applied and NO sibling cascade runs this run -- "
+            f"the checkoffs from steps 1-4 are on disk, but the report will "
+            f"show them open. Re-run /check-items to cascade.",
+            file=sys.stderr,
+        )
         source_skips = set()
 
 # #318 Task 6: stamp applied=True on each buckets record whose own occurrence
@@ -823,9 +836,25 @@ for b in buckets["review"]:
         if not basename or line_num is None:
             continue
         full_path = os.path.join(sessions_dir, basename)
-        if (full_path, line_num) in source_skips:
+        try:
+            key = _skip_key(full_path, line_num)
+        except (TypeError, ValueError):
+            continue
+        if key in source_skips:
             b["applied"] = True
             break
+
+# #340: a non-empty source_skips that stamps nothing means every recorded path
+# failed to match a group member -- the cascade below would then silently do
+# nothing, which prints exactly like "the user deselected everything".
+_stamped = sum(1 for b in buckets["review"] if b.get("applied"))
+if source_skips and not _stamped:
+    print(
+        f"[check-items] WARNING: {len(source_skips)} primary flip(s) recorded "
+        f"but none matched a grouped item, so no sibling cascade runs and the "
+        f"report shows them open. Recorded paths must be under {sessions_dir}.",
+        file=sys.stderr,
+    )
 
 # M3: atomic temp+rename for a REWRITE of a file downstream steps depend
 # on (repo rule -- see write_vault_note()/save_cache()'s pattern), not a
@@ -875,7 +904,7 @@ for b in buckets["review"]:
         line_num = m.get("line")
         if not basename or line_num is None:
             continue
-        full_path = os.path.join(sessions_dir, basename)
+        full_path = os.path.realpath(os.path.join(sessions_dir, basename))
         resolved_members.append({"file": full_path, "line": line_num, "text": m.get("text", "")})
     if resolved_members:
         groups_to_cascade.append({"members": resolved_members})

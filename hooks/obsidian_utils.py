@@ -5489,8 +5489,9 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
     # sandboxed environments that don't ship with `find`.
     # rglob() swallows the OSError from an unreadable directory and simply
     # yields nothing from it, so an unreadable tree already ends at the
-    # `return None` below. The handler covers only errors from resolve() and
-    # the per-path checks, not an unreadable directory (#336).
+    # `return None` below. The handler covers errors raised while iterating an
+    # already-open directory, from resolve() and from the per-path checks,
+    # but never an unreadable directory (#336).
     try:
         for path in projects_dir.rglob(target):
             if path.is_file():

@@ -1276,16 +1276,24 @@ def test_every_template_starts_with_the_frontmatter_fence():
     )
 
 
-def _run_step8(tmp_path, groups, review, skips):
+def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root=None):
     """Run the real Step 8 heredoc against a scratch vault and return
-    (completed process, sessions dir, buckets after the run)."""
+    (completed process, sessions dir, buckets after the run).
+
+    symlinked_vault: config names a symlink to the vault, as with an iCloud
+    or Dropbox vault. skip_root: directory the skip paths are written under
+    (default: the sessions dir the config names)."""
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
     vault = tmp_path / "vault"
     sessions = vault / "claude-sessions"
     sessions.mkdir(parents=True)
+    config_vault = vault
+    if symlinked_vault:
+        config_vault = tmp_path / "vault-link"
+        config_vault.symlink_to(vault)
     (home / ".claude" / "obsidian-brain-config.json").write_text(
-        json.dumps({"vault_path": str(vault), "sessions_folder": "claude-sessions"})
+        json.dumps({"vault_path": str(config_vault), "sessions_folder": "claude-sessions"})
     )
     files = {}
     for g in groups:
@@ -1305,7 +1313,8 @@ def _run_step8(tmp_path, groups, review, skips):
     (work / "scope.json").write_text("{}")
     (work / "buckets.json").write_text(json.dumps({"review": review}))
     skips_file = work / "skips.json"
-    skips_file.write_text(json.dumps([[str(sessions / f), ln] for f, ln in skips]))
+    root = sessions if skip_root is None else skip_root
+    skips_file.write_text(json.dumps([[str(root / f), ln] for f, ln in skips]))
     env = dict(os.environ, HOME=str(home),
                SCOPE_PATH=str(work / "scope.json"),
                BUCKETS_PATH=str(work / "buckets.json"),
@@ -1362,3 +1371,47 @@ def test_step8_cascades_only_groups_the_user_flipped(tmp_path):
         if (sessions / m["file"]).read_text().splitlines()[m["line"] - 1].startswith("- [x] ")
     }
     assert checked_groups <= {gid for gid, on in applied.items() if on}
+
+
+def _two_group_fixture():
+    groups = [
+        {"group_id": "g1", "members": [
+            {"file": "a.md", "line": 1, "text": "Ship the widget", "_line": "- [x] Ship the widget"},
+            {"file": "b.md", "line": 1, "text": "Ship the widget", "_line": "- [ ] Ship the widget"},
+        ]},
+    ]
+    review = [{"group_id": "g1", "classification": "DONE", "tier": "HIGH",
+               "canonical_text": "Ship the widget"}]
+    return groups, review
+
+
+def test_step8_matches_skips_through_a_symlinked_vault(tmp_path):
+    """#340 review: the stamp now gates the cascade, so a path spelling
+    difference must not cancel it. Config names a symlink to the vault; the
+    primary-flip loop recorded the resolved path. The sibling must still be
+    cascaded and the group stamped."""
+    groups, review = _two_group_fixture()
+    proc, sessions, buckets = _run_step8(
+        tmp_path, groups, review, skips=[("a.md", 1)],
+        symlinked_vault=True, skip_root=(tmp_path / "vault" / "claude-sessions"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "cascaded_total=1" in proc.stdout, proc.stdout + proc.stderr
+    assert (sessions / "b.md").read_text().splitlines()[0] == "- [x] Ship the widget"
+    assert buckets["review"][0].get("applied") is True
+
+
+def test_step8_warns_when_recorded_flips_match_no_group(tmp_path):
+    """#340 review: recorded flips that match no group member leave nothing
+    stamped and nothing cascaded. That must be said, not printed as an
+    ordinary cascaded_total=0."""
+    groups, review = _two_group_fixture()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    proc, sessions, buckets = _run_step8(
+        tmp_path, groups, review, skips=[("a.md", 1)], skip_root=elsewhere,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "cascaded_total=0" in proc.stdout
+    assert "none matched a grouped item" in proc.stderr, proc.stderr
+    assert (sessions / "b.md").read_text().splitlines()[0] == "- [ ] Ship the widget"
