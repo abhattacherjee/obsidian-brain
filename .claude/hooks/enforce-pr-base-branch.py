@@ -11,6 +11,7 @@ Prevents the mistake of merging feature work directly to main.
 import json
 import os
 import re
+import shlex
 import sys
 import subprocess
 
@@ -557,34 +558,77 @@ def get_current_branch() -> str:
 # --base main; or a merge PR number in an earlier echo) would otherwise speak
 # for the real one.
 
-# Where an occurrence's own arguments end. Deliberately ignores quoting: a
-# separator inside a quoted --body ends the span early, which can only hide a
-# later --base or PR number and so resolves toward a deny.
-_SPAN_END = re.compile(r'[\n;&|`)]')
+# Each occurrence's own arguments, tokenised the way the shell would read them.
+# shlex (posix, punctuation_chars) honours quotes, so a `;` or `)` inside a
+# quoted --subject/--body no longer ends the arguments early -- which for a
+# merge used to hide the PR number and send the check to the CURRENT branch's
+# PR instead of the one being merged (#334 review round 2). A newline and a
+# backtick end a command too, but shlex does not know that, so they are turned
+# into `;` first; inside quotes that only changes body text, never a token
+# boundary that matters here.
+_CONTROL_OPS = {";", "&", "&&", "|", "||", ")", "(", ";;", "|&"}
 
 
-def _verb_spans(cmd: str, verb: str):
-    """The argument text after each occurrence of `verb`, up to the next
-    command separator."""
-    spans = []
+def _occurrence_args(cmd: str, verb: str):
+    """For each occurrence of `verb`: the list of argument tokens up to the
+    next control operator, or None when the rest of the command does not
+    tokenise (unbalanced quotes) -- the caller must fail closed on None."""
+    out = []
     for m in re.finditer(verb, cmd):
-        end = _SPAN_END.search(cmd, m.end())
-        spans.append(cmd[m.end():end.start() if end else len(cmd)])
-    return spans
+        rest = cmd[m.end():].replace("\n", " ; ").replace("`", " ; ")
+        lex = shlex.shlex(rest, posix=True, punctuation_chars=";&|()")
+        lex.whitespace_split = True
+        try:
+            tokens = list(lex)
+        except ValueError:
+            out.append(None)
+            continue
+        args = []
+        for tok in tokens:
+            if tok in _CONTROL_OPS or set(tok) <= set(";&|()"):
+                break
+            args.append(tok)
+        out.append(args)
+    return out
 
 
-def _span_base(span: str):
-    """The --base an occurrence passes, or None. The LAST one wins, as in gh's
-    own flag parser. Surrounding quotes are dropped."""
-    bases = re.findall(r'--base(?:=|\s+)(\S+)', span)
-    return bases[-1].strip("'\"") if bases else None
+def _span_base(args):
+    """The --base / -B an occurrence passes, or None. The LAST one wins, as in
+    gh's own flag parser."""
+    base = None
+    for i, tok in enumerate(args):
+        if tok in ("--base", "-B") and i + 1 < len(args):
+            base = args[i + 1]
+        elif tok.startswith("--base="):
+            base = tok.split("=", 1)[1]
+    return base
 
 
-def _span_pr_number(span: str):
-    """The PR number an occurrence names, or None (then gh uses the current
-    branch's PR)."""
-    m = re.search(r'(?:^|\s)#?(\d+)(?=\s|$)', span)
-    return m.group(1) if m else None
+# gh pr merge flags that take a separate value. Their value is never the PR.
+_MERGE_VALUE_FLAGS = {"-t", "--subject", "-b", "--body", "-F", "--body-file",
+                      "-A", "--author-email", "--match-head-commit",
+                      "-R", "--repo"}
+
+
+def _span_pr_selector(args):
+    """The PR an occurrence names -- a number, `#N`, a pull URL (reduced to
+    its number) or a branch -- or None when it names none (gh then uses the
+    current branch's PR)."""
+    skip = False
+    for tok in args:
+        if skip:
+            skip = False
+            continue
+        if tok in _MERGE_VALUE_FLAGS:
+            skip = True
+            continue
+        if tok.startswith("-"):
+            continue
+        url = re.search(r"/pull/(\d+)", tok)
+        if url:
+            return url.group(1)
+        return tok.lstrip("#") or None
+    return None
 
 
 # ── gh pr create: enforce --base develop for feature branches ──
@@ -594,7 +638,8 @@ _has_merge = re.search(_PR_MERGE_VERB, command) is not None
 if _has_create and _targets_this_project(command, _PR_CREATE_VERB):
     branch = get_current_branch()
     if branch.startswith("feature/"):
-        for base in [_span_base(sp) for sp in _verb_spans(command, _PR_CREATE_VERB)]:
+        for args in _occurrence_args(command, _PR_CREATE_VERB):
+            base = None if args is None else _span_base(args)
             if base is None:
                 deny(
                     f"❌ PR base branch not specified!\n\n"
@@ -618,8 +663,14 @@ if _has_create and _targets_this_project(command, _PR_CREATE_VERB):
 # number), for every occurrence in the command.
 if _has_merge and _targets_this_project(command, _PR_MERGE_VERB):
     pr_numbers = []
-    for sp in _verb_spans(command, _PR_MERGE_VERB):
-        pr_number = _span_pr_number(sp)
+    for args in _occurrence_args(command, _PR_MERGE_VERB):
+        if args is None:
+            deny(
+                "⚠️ Cannot parse the arguments of gh pr merge (unbalanced quotes).\n\n"
+                "Merge blocked because the base-branch safety check could not "
+                "tell which PR is being merged."
+            )
+        pr_number = _span_pr_selector(args)
         if not pr_number:
             # Resolve PR number from current branch
             try:

@@ -4407,7 +4407,7 @@ class TestBashTruthDifferential:
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir(exist_ok=True)
         (bin_dir / "git").symlink_to(shutil.which("git"))
-        lines = ["#!/bin/sh", 'case "$3" in']
+        lines = ["#!/bin/sh", 'case "$3" in', '  --json) echo 1 ;;']
         for num, answer in bases.items():
             lines.append(f'  {num}) echo "{answer}" ;;')
         lines += ["  *) exit 1 ;;", "esac"]
@@ -4429,6 +4429,12 @@ class TestBashTruthDifferential:
         # Positive controls: a well-based create stays allowed.
         ("CREATE --base develop", "allow"),
         ("CREATE --base=develop --title x", "allow"),
+        # -B is gh's short form of --base.
+        ("CREATE -B main", "deny"),
+        ("CREATE -B develop", "allow"),
+        # A separator inside a quoted --body is body text, not a command end.
+        ("CREATE --body 'a; b (c)' --base develop", "allow"),
+        ("CREATE --body 'a; b (c)' --base main", "deny"),
         ("echo CREATE --base develop\nCREATE --base develop", "allow"),
     ])
     def test_each_create_occurrence_is_judged_on_its_own_base(
@@ -4448,16 +4454,32 @@ class TestBashTruthDifferential:
         # Each merge is checked against its own PR, not the first number.
         ("echo MERGE 1; MERGE 2 --squash", "deny"),
         ("MERGE 1 --squash\nMERGE 2 --squash", "deny"),
+        # A quoted `;` or `)` in --subject/--body, a pull URL, or a flag
+        # value that looks like a number must not hide the PR being merged
+        # and send the check to the current branch's PR (1) instead.
+        ("MERGE --squash --subject 'x; y' 2", "deny"),
+        ("MERGE --squash --body 'see (a) b' 2", "deny"),
+        ("MERGE https://github.com/o/r/pull/2 --squash", "deny"),
+        ("MERGE -t 5 2 --squash", "deny"),
+        ("MERGE '#2' --squash", "deny"),
+        # Unbalanced quotes cannot be parsed: fail closed.
+        ("MERGE 1 --body 'oops", "deny"),
         # Positive controls: a feature PR based on develop may merge.
         ("MERGE 1 --squash", "allow"),
+        ("MERGE --squash", "allow"),
+        ("MERGE -t 'a; b' 1 --squash", "allow"),
+        ("MERGE https://github.com/o/r/pull/1", "allow"),
         ("echo CREATE --base develop; MERGE 1 --squash", "allow"),
     ])
     def test_each_merge_occurrence_is_judged_on_its_own_pr(
             self, tmp_path, command, expected):
-        """PR 1 is feature -> develop (fine); PR 2 is feature -> main."""
+        """PR 1 (the current branch's) and PR 5 are feature -> develop
+        (fine); PR 2 is feature -> main. PR 5 is valid so that `-t 5` reading
+        as the PR would ALLOW, not deny for an unrelated reason."""
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
         env = dict(env, PATH=self._fake_gh(tmp_path, {
-            "1": "develop feature/a", "2": "main feature/b"}))
+            "1": "develop feature/a", "2": "main feature/b",
+            "5": "develop feature/c"}))
         cmd = command.replace("CREATE", self.CREATE).replace("MERGE", self.MERGE)
         assert TestHookBlockingPathsFire._decide(
             work, env, "enforce-pr-base-branch", cmd) == expected, cmd
