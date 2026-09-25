@@ -223,7 +223,9 @@ def _reap_stale_retro_sentinels() -> int:
     cutoff = time.time() - RETRO_GATE_TTL_SECONDS
     reaped = 0
     try:
-        candidates = list(gate_dir.glob("*.json"))
+        # iterdir(), not glob(): glob() swallows the scandir OSError and yields
+        # nothing, so this handler could never fire (#336).
+        candidates = [p for p in gate_dir.iterdir() if p.suffix == ".json"]
     except OSError:
         return 0
     for f in candidates:
@@ -774,12 +776,19 @@ def _resolve_session_note_by_hash(
         return None, []
 
     try:
-        matches = sorted(sessions_dir.glob(f"*-{h}.md"))
+        # iterdir(), not glob(): glob() swallows the underlying scandir
+        # OSError and yields nothing, so an unreadable sessions dir read as
+        # "no match", the caller composed a fresh name, and a duplicate
+        # session note could be written with no diagnostic (#336).
+        matches = sorted(
+            p for p in sessions_dir.iterdir()
+            if p.name.endswith(f"-{h}.md") and p.is_file()
+        )
     except OSError as exc:
         # Permission errors / transient I/O on the sessions dir must not crash
         # SessionEnd. Fall back to (None, []) so callers compose a fresh name.
         print(
-            f"[obsidian-brain] _resolve_session_note_by_hash: glob failed on "
+            f"[obsidian-brain] _resolve_session_note_by_hash: cannot list "
             f"{sessions_dir}: {exc}",
             file=sys.stderr,
         )
@@ -5478,6 +5487,11 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
     # Fallback: pure-Python rglob. Only reached when `find` is unavailable,
     # never when it timed out. Dependency-free so /recall still works in
     # sandboxed environments that don't ship with `find`.
+    # rglob() swallows the OSError from an unreadable directory and simply
+    # yields nothing from it, so an unreadable tree already ends at the
+    # `return None` below. The handler covers errors raised while iterating an
+    # already-open directory, from resolve() and from the per-path checks,
+    # but never an unreadable directory (#336).
     try:
         for path in projects_dir.rglob(target):
             if path.is_file():

@@ -741,28 +741,31 @@ def test_safe_getcwd_returns_empty_on_oserror(monkeypatch):
     assert obsidian_utils._safe_getcwd() == ""
 
 
-def test_resolver_glob_oserror_returns_none(tmp_path, monkeypatch, capsys):
-    """If glob raises OSError (transient I/O, permission), resolver returns
-    (None, []) and logs to stderr — does not propagate.
-
-    Patches Path.glob globally because the resolver does ``Path(sessions_dir)``
-    internally, which produces a fresh Path object whose `glob` method is
-    bound at call time.
-    """
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root can read a 0o000 directory, so the listing never fails",
+)
+def test_resolver_unreadable_sessions_dir_returns_none_and_logs(tmp_path, capsys):
+    """An unreadable sessions dir returns (None, []) and says why on stderr
+    (#336). Uses a real 0o000 directory rather than a patched Path.glob: the
+    real glob() swallows the scandir error and returns [], so a patched one
+    that raises tested a failure the code could never see. A matching note is
+    present, so a listing that silently came back empty is caught too."""
     sessions = tmp_path / "sessions"
     sessions.mkdir()
-
-    def _raising_glob(self, pattern):
-        raise OSError("simulated I/O error")
-    monkeypatch.setattr(Path, "glob", _raising_glob)
-
-    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
-        sessions, "abcd", cwd="/cwd/x"
-    )
+    (sessions / "2026-01-01-proj-abcd.md").write_text("---\ntype: claude-session\n---\n")
+    sessions.chmod(0o000)
+    try:
+        basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+            sessions, "abcd", cwd="/cwd/x"
+        )
+    finally:
+        sessions.chmod(0o700)
     assert basename is None
     assert collisions == []
-    captured = capsys.readouterr()
-    assert "glob failed" in captured.err.lower()
+    err = capsys.readouterr().err
+    assert "cannot list" in err
+    assert str(sessions) in err
 
 
 def test_resolve_treats_type_missing_as_session(tmp_path):
