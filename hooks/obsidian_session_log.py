@@ -230,16 +230,16 @@ def _run() -> None:
     # Codex currently auto-discovers these Claude lifecycle handlers. Do not
     # interpret its rollout as a malformed Claude transcript while adapters
     # and explicit Codex hook selection are being built under #272.
-    marker = obsidian_utils._foreign_host_marker()
-    if marker:
+    codex_reason = obsidian_utils._hook_payload_codex_reason(hook_input)
+    if codex_reason:
         cwd = hook_input.get("cwd", "")
         project = _project_slug_for_log(cwd)
-        print(f"[obsidian-brain] SessionEnd outcome=SKIPPED_CODEX_HOST marker={marker}", file=sys.stderr)
+        print(f"[obsidian-brain] SessionEnd outcome=SKIPPED_CODEX_HOST reason={codex_reason}", file=sys.stderr)
         _append_sessionend_log(
             project=project,
             session_id=session_id,
             outcome=_Outcome.SKIPPED_CODEX_HOST,
-            detail=marker,
+            detail=codex_reason,
         )
         return
 

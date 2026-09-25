@@ -20,7 +20,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from obsidian_utils import (  # noqa: E402
-    _foreign_host_marker,
+    _hook_payload_codex_reason,
     _bootstrap_prefix,
     _ensure_secure_dir,
     _HOOK_LOG_MAX_BYTES,
@@ -119,10 +119,6 @@ def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool,
 
 
 def main() -> None:
-    marker = _foreign_host_marker()
-    if marker:
-        print(f"[obsidian-brain] SessionStart outcome=SKIPPED_CODEX_HOST marker={marker}", file=sys.stderr)
-        return
     try:
         _run()
     except Exception as exc:
@@ -137,6 +133,13 @@ def _run() -> None:
         hook_input = json.loads(raw) if raw.strip() else {}
     except (json.JSONDecodeError, ValueError):
         hook_input = {}
+
+    if not isinstance(hook_input, dict):
+        hook_input = {}
+    codex_reason = _hook_payload_codex_reason(hook_input)
+    if codex_reason:
+        print(f"[obsidian-brain] SessionStart outcome=SKIPPED_CODEX_HOST reason={codex_reason}", file=sys.stderr)
+        return
 
     cwd = hook_input.get("cwd", os.getcwd())
 
