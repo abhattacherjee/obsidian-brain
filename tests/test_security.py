@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2897,12 +2898,25 @@ class TestScopeGuardCannotBeBypassed:
                 and n.func.id == "_targets_this_project"
             ]
 
+        def verb_matched_first(test):
+            # `_has_create and _targets_this_project(...)`: `and` short-circuits,
+            # so the scope call only runs once the verb has matched (#334).
+            return (isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And)
+                    and isinstance(test.values[0], ast.Name)
+                    and test.values[0].id in ("_has_create", "_has_merge")
+                    and not scope_calls(test.values[0]))
+
         guarded = []
         for node in ast.walk(tree):
             if isinstance(node, ast.If):
                 test_src = ast.get_source_segment(src, node.test) or ""
-                if "re.search" in test_src and "pr" in test_src:
+                if "re.search" in test_src and "pr" in test_src.lower():
                     guarded.extend(scope_calls(node))
+                elif verb_matched_first(node.test):
+                    guarded.extend(scope_calls(node))
+        # The _has_* flags must themselves come from a verb match.
+        assert re.search(r"_has_create = re\.search\(_PR_CREATE_VERB", src)
+        assert re.search(r"_has_merge = re\.search\(_PR_MERGE_VERB", src)
 
         assert len(scope_calls(tree)) == len(guarded) == 2, (
             "every _targets_this_project call must sit inside a branch that has "
@@ -4164,3 +4178,349 @@ class TestAllowlistsCannotShadowTheDenyGates:
             "_is_tag_push_only no longer asks about EVERY ref token; one tag "
             "on the line buys a stand-down for whatever else is on it"
         )
+
+
+_BASH = shutil.which("bash")
+_REQUIRES_BASH = pytest.mark.skipif(_BASH is None, reason="bash not available")
+
+
+@_REQUIRES_BASH
+class TestBashTruthDifferential:
+    """#334: bash decides what runs; the gate only gets to agree.
+
+    Ported from the #327 review branch (PR #331, not merged), where it found
+    every root cause in one pass. The hand-written fixture tables in this file
+    were 3035 tests green while 16 of 55 constructs that bash really executes
+    got past the push gate. The census of all 165 fixtures showed why: none
+    contained a bare newline, a redirection, a heredoc, a pipe or a tab. The
+    tables and the matcher came from one mental model, so the tests could only
+    confirm it.
+
+    So this class does not assert a verdict list. It builds constructs by
+    combination, asks BASH whether the verb really executed, and requires a
+    deny for every construct that did. A construct bash does not execute is
+    skipped rather than asserted on: this is a bypass hunt, and a fail-closed
+    deny on inert text is not a bypass. The hand-written classes above stay as
+    regression pins for specific past bugs.
+
+    The marker is a FILESYSTEM side-effect, never stdout. Half these
+    constructs run the verb inside `$( )` or backticks, where stdout is
+    captured by the substitution and never reaches the probe. A stdout marker
+    reports "did not run" for exactly the constructs that hide a live verb,
+    which is the wrong answer in the fail-open direction.
+
+    Deterministic on purpose: a fixed prefix/suffix/wrapper product, not random
+    generation, so a failure names a construct that can be pasted into a shell,
+    and a green run means the same thing tomorrow. Adding a construct to the
+    tables below is the only maintenance.
+
+    Templates are assembled with `VERB` substituted late, for the same reason
+    as the rest of this file: the live PreToolUse hooks read unexecuted
+    command text.
+    """
+
+    PREFIX = ("", "true; ", "true && ", "true || ", "false || ", "echo hi\n",
+              "echo hi   \n", "# c\n", "x=1 ", "{ ", ">/dev/null ", "2>&1 ",
+              "1>&2 ", "&>out ", "3>&1 ", "</dev/null ", "if true; then ",
+              "for i in 1; do ", "while false; do : ; done; ", "! ", "time ",
+              "sudo ", "nice -n 10 ", "command ", "eval ", "\\", "(", "$(", "`",
+              "true | ", "echo hi |\n", "true & ", "\t", "true;\t", "\n",
+              "echo $'a' && ", "echo ${HOME} && ", "echo `:` && ",
+              "# don't\n", "# don't\n# it's\n", '# say "hi"\n',
+              "cat <<EOF\ndon't\nEOF\n", "cat <<'EOF'\ndon't\nEOF\n",
+              "cat <<-EOF\n\tx\n\tEOF\n", "cat <<<x && ", "A+=1 ", "A[0]=1 ",
+              "caffeinate ", "arch ", "arch -arm64 ", "script -q /dev/null ")
+    SUFFIX = ("", ";", " ; }", " ; done", " ; fi", ")", "`", " | cat",
+              " 2>/dev/null", " >out", " </dev/null", " &", "\t", "\n",
+              " ${FORCE}", " `:`", " $(true)", "\n# it's fine",
+              " # don't", "\ncat <<EOF\ndon't\nEOF")
+    WRAPPERS = ("%s", "`%s`", "$(%s)", "( %s )", "{ %s ; }")
+    WRAP_PREFIX = ("", "true; ", "true && ", "echo hi\n", "x=1 ", ">/dev/null ",
+                   "2>&1 ", "true | ", "\t")
+
+    # Constructs the executed corpus must keep containing. Each is a shape the
+    # #327 census found ZERO fixtures for, plus the two that had one each.
+    REQUIRED = {
+        "bare newline": lambda t: "\n" in t,
+        "redirection": lambda t: bool(re.search(r"(?<![<])[<>](?![<(])", t)),
+        "heredoc": lambda t: "<<" in t,
+        "single pipe": lambda t: bool(re.search(r"(?<!\|)\|(?!\|)", t)),
+        "||": lambda t: "||" in t,
+        "background &": lambda t: bool(re.search(r"(?<![&>])&(?![&>])", t)),
+        "tab": lambda t: "\t" in t,
+        "$'...'": lambda t: "$'" in t,
+        "${VAR}": lambda t: "${" in t,
+        "backtick": lambda t: "`" in t,
+        "$( )": lambda t: "$(" in t,
+    }
+
+    @classmethod
+    def _templates(cls, prefix=None, suffix=None, wrappers=None, wrap_prefix=None):
+        """The deterministic construct set, VERB still a placeholder."""
+        out = set()
+        for p in cls.PREFIX if prefix is None else prefix:
+            for s in cls.SUFFIX if suffix is None else suffix:
+                out.add(p + "VERB" + s)
+        for w in cls.WRAPPERS if wrappers is None else wrappers:
+            for p in cls.WRAP_PREFIX if wrap_prefix is None else wrap_prefix:
+                out.add(p + w % "VERB")
+        return sorted(out)
+
+    @classmethod
+    def _missing_constructs(cls, templates):
+        """Names of REQUIRED constructs that no template contains."""
+        return sorted(name for name, has in cls.REQUIRED.items()
+                      if not any(has(t) for t in templates))
+
+    @staticmethod
+    def _bash_runs_it(work, template, marker_name="FUZZ_RAN"):
+        """Did bash EXECUTE the verb? Marker is a file, not stdout. Each
+        concurrent probe needs its own marker_name."""
+        marker = work / marker_name
+        if marker.exists():
+            marker.unlink()
+        # sudo reads its password from /dev/tty, not stdin, so stdin=DEVNULL
+        # alone still prompted on a developer's terminal and blocked for the
+        # full timeout. A new session has no controlling tty, so sudo fails
+        # fast; and on timeout the whole group is killed, because a timed-out
+        # `sudo VERB | cat` otherwise left `sudo touch ...` orphaned.
+        proc = subprocess.Popen(
+            [_BASH, "-c", template.replace("VERB", f"touch {marker}")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=work, start_new_session=True,
+        )
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, 9)
+            except OSError:
+                pass
+            proc.communicate()
+            return False
+        # A backgrounded verb (`VERB &`) may still be running when bash
+        # returns; give it a moment rather than reading "did not run".
+        for _ in range(50):
+            if marker.exists():
+                break
+            if "&" not in template:
+                break
+            time.sleep(0.01)
+        ran = marker.exists()
+        if ran:
+            marker.unlink()
+        return ran
+
+    # Probes and hook calls are independent subprocesses, so they run in a
+    # pool; serially the product took ~80s. Each bash probe gets its own
+    # scratch dir so a `>out` or `&>out` in one cannot race another.
+    _WORKERS = 8
+
+    def _executed(self, work):
+        templates = self._templates()
+
+        def probe(item):
+            i, t = item
+            d = work / f"bash-{i}"
+            d.mkdir(parents=True, exist_ok=True)
+            return t if self._bash_runs_it(d, t) else None
+
+        with ThreadPoolExecutor(self._WORKERS) as pool:
+            return [t for t in pool.map(probe, enumerate(templates)) if t]
+
+    # (hook, verb) — one gated verb per command gate. Each gate's verb is
+    # denied from a feature branch in a throwaway repo, so any construct that
+    # bash executes must come back "deny". Fragments, see the class docstring.
+    GATES = (
+        ("prevent-direct-push", "git pu" + "sh origin ma" + "in"),
+        ("require-preflight", "git com" + "mit -m wip"),
+        ("validate-branch-name", "git chec" + "kout -b nonsense-branch"),
+        ("enforce-pr-base-branch", "gh pr cre" + "ate --base ma" + "in"),
+    )
+
+    @pytest.fixture(scope="class")
+    def executed(self, tmp_path_factory):
+        """The constructs bash executes. Verb-independent (the probe runs
+        `touch`), so it is computed once and shared by every gate."""
+        root = tmp_path_factory.mktemp("bash-truth")
+        found = self._executed(root / "probe")
+        # The oracle has to keep finding live constructs, or every gate test
+        # passes by testing nothing. 663 executed when this was written.
+        assert len(found) >= 500, (
+            f"only {len(found)} constructs executed; the bash oracle is "
+            "broken, not the gate"
+        )
+        assert not self._missing_constructs(found), (
+            "the EXECUTED corpus lost constructs: "
+            f"{self._missing_constructs(found)}"
+        )
+        if sys.platform == "darwin":
+            for wrapper in ("caffeinate ", "arch ", "script -q /dev/null "):
+                assert any(t.startswith(wrapper + "VERB") or
+                           t.startswith(wrapper) for t in found), (
+                    f"no construct wrapped in {wrapper.strip()!r} executed on "
+                    "macOS, where it exists; that wrapper is no longer tested"
+                )
+        return found
+
+    @pytest.mark.parametrize("hook,verb", GATES, ids=[g for g, _ in GATES])
+    def test_every_construct_bash_executes_is_denied(self, tmp_path, executed, hook, verb):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+
+        def allowed(t):
+            return TestHookBlockingPathsFire._decide(
+                work, env, hook, t.replace("VERB", verb)) != "deny"
+
+        with ThreadPoolExecutor(self._WORKERS) as pool:
+            verdicts = list(pool.map(allowed, executed))
+        bypasses = [t for t, bad in zip(executed, verdicts) if bad]
+        assert not bypasses, (
+            f"{hook}: {len(bypasses)} of {len(executed)} constructs run the "
+            "verb and the gate allowed them:\n  "
+            + "\n  ".join(repr(t) for t in bypasses[:40])
+        )
+
+    @pytest.mark.parametrize("template", [
+        "VERB", "echo hi\nVERB", "\tVERB", "x=1 VERB", "$(VERB)", "`VERB`",
+        "{ VERB ; }", "( VERB )", "true | VERB",
+    ])
+    def test_pr_merge_is_judged_in_every_command_position(self, tmp_path, template):
+        """#334: `gh pr merge` shared the PR-create trigger's anchoring, so a
+        merge after a newline, a tab, `x=1 ` or inside `$( )` skipped the base
+        check. With `gh` off PATH the check cannot verify the PR and must
+        deny; before the fix these constructs never reached it and allowed.
+        Not in the oracle above because each call would shell out to `gh`."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "git").symlink_to(shutil.which("git"))
+        env = dict(env, PATH=str(bin_dir))
+        verb = "gh pr mer" + "ge 5 --squash"
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", template.replace("VERB", verb)
+        ) == "deny"
+
+    @staticmethod
+    def _fake_gh(tmp_path, bases):
+        """A `gh` on PATH that answers `gh pr view N --json ...` from `bases`
+        ({"N": "base head"}) and fails for any other PR number."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        (bin_dir / "git").symlink_to(shutil.which("git"))
+        lines = ["#!/bin/sh", 'case "$3" in', '  --json) echo 1 ;;']
+        for num, answer in bases.items():
+            lines.append(f'  {num}) echo "{answer}" ;;')
+        lines += ["  *) exit 1 ;;", "esac"]
+        gh = bin_dir / "gh"
+        gh.write_text("\n".join(lines) + "\n")
+        gh.chmod(0o755)
+        return str(bin_dir)
+
+    CREATE = "gh pr cre" + "ate"
+    MERGE = "gh pr mer" + "ge"
+
+    @pytest.mark.parametrize("command,expected", [
+        # A mention placed first must not speak for the real occurrence.
+        ("echo CREATE --base develop\nCREATE --base main", "deny"),
+        ("# CREATE --base develop\nCREATE --base main", "deny"),
+        # Every base spelling must be develop: which one gh keeps is not
+        # guessed (a value another flag swallows, or a later override).
+        ("CREATE --base develop --title x --base main", "deny"),
+        ("CREATE --base main --title x --base develop", "deny"),
+        ("CREATE --base develop -Bmain", "deny"),
+        ("CREATE --base develop -B=main", "deny"),
+        ("CREATE -dB main", "deny"),
+        ("CREATE -B main -t --base=develop", "deny"),
+        ("CREATE -Bdevelop --title x", "allow"),
+        # Positive controls: a well-based create stays allowed.
+        ("CREATE --base develop", "allow"),
+        ("CREATE --base=develop --title x", "allow"),
+        # -B is gh's short form of --base.
+        ("CREATE -B main", "deny"),
+        ("CREATE -B develop", "allow"),
+        # A separator inside a quoted --body is body text, not a command end.
+        ("CREATE --body 'a; b (c)' --base develop", "allow"),
+        ("CREATE --body 'a; b (c)' --base main", "deny"),
+        ("echo CREATE --base develop\nCREATE --base develop", "allow"),
+    ])
+    def test_each_create_occurrence_is_judged_on_its_own_base(
+            self, tmp_path, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        cmd = command.replace("CREATE", self.CREATE)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", cmd) == expected, cmd
+
+    @pytest.mark.parametrize("command,expected", [
+        # A create mention before a merge used to exit the gate before the
+        # merge was ever judged.
+        # (Separators chosen so the old first-match read "develop" cleanly;
+        # with `develop;` or `develop'` it denied for an unrelated reason.)
+        ("echo CREATE --base develop\nMERGE 2 --squash", "deny"),
+        ("MERGE 2 --squash # CREATE --base develop", "deny"),
+        # Each merge is checked against its own PR, not the first number.
+        ("echo MERGE 1; MERGE 2 --squash", "deny"),
+        ("MERGE 1 --squash\nMERGE 2 --squash", "deny"),
+        # A quoted `;` or `)` in --subject/--body, a pull URL, or a flag
+        # value that looks like a number must not hide the PR being merged
+        # and send the check to the current branch's PR (1) instead.
+        ("MERGE --squash --subject 'x; y' 2", "deny"),
+        ("MERGE --squash --body 'see (a) b' 2", "deny"),
+        ("MERGE https://github.com/o/r/pull/2 --squash", "deny"),
+        ("MERGE -t 5 2 --squash", "deny"),
+        ("MERGE '#2' --squash", "deny"),
+        # Stacked short flags: pflag reads -st 5 as -s -t 5, so gh merges 2.
+        ("MERGE -st 5 2", "deny"),
+        ("MERGE -sb 5 2", "deny"),
+        # A `#` inside a word is not a comment; the selector after it counts.
+        ("MERGE -t a#b 2", "deny"),
+        # A selector computed at run time cannot be checked.
+        ("MERGE `echo 2`", "deny"),
+        ("MERGE $(echo 2)", "deny"),
+        # Unbalanced quotes cannot be parsed: fail closed.
+        ("MERGE 1 --body 'oops", "deny"),
+        # Positive controls: a feature PR based on develop may merge.
+        ("MERGE 1 --squash", "allow"),
+        ("MERGE --squash", "allow"),
+        ("MERGE -t 'a; b' 1 --squash", "allow"),
+        ("MERGE https://github.com/o/r/pull/1", "allow"),
+        ("MERGE -st 5 1", "allow"),
+        ("MERGE 1 # note", "allow"),
+        ("echo CREATE --base develop; MERGE 1 --squash", "allow"),
+    ])
+    def test_each_merge_occurrence_is_judged_on_its_own_pr(
+            self, tmp_path, command, expected):
+        """PR 1 (the current branch's) and PR 5 are feature -> develop
+        (fine); PR 2 is feature -> main. PR 5 is valid so that `-t 5` reading
+        as the PR would ALLOW, not deny for an unrelated reason."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = dict(env, PATH=self._fake_gh(tmp_path, {
+            "1": "develop feature/a", "2": "main feature/b",
+            "5": "develop feature/c"}))
+        cmd = command.replace("CREATE", self.CREATE).replace("MERGE", self.MERGE)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", cmd) == expected, cmd
+
+    def test_the_census_fails_when_the_corpus_is_narrowed(self):
+        """The alphabet guard must catch a corpus narrowed back to the #327
+        shape: single-line commands joined only by `;` or `&&`."""
+        narrowed = self._templates(prefix=("", "true; ", "true && "),
+                                   suffix=("", ";"), wrappers=("%s",),
+                                   wrap_prefix=("",))
+        missing = self._missing_constructs(narrowed)
+        for name in ("bare newline", "redirection", "heredoc", "single pipe",
+                     "tab", "background &"):
+            assert name in missing, (name, missing)
+        assert self._missing_constructs(self._templates()) == []
+
+    def test_the_census_detectors_are_not_fooled_by_lookalikes(self):
+        """`||`, `&&`, `&>`, `2>&1` and `<<` must not count as a pipe,
+        background, or plain redirection on their own."""
+        req = self.REQUIRED
+        assert not req["single pipe"]("true || VERB")
+        assert not req["background &"]("true && VERB")
+        assert not req["background &"]("&>out VERB")
+        assert not req["background &"]("VERB 2>&1")
+        assert not req["redirection"]("cat <<EOF\nx\nEOF\nVERB")
+        assert req["redirection"]("VERB >out")
+        assert req["background &"]("VERB &")
+        assert req["single pipe"]("VERB | cat")
