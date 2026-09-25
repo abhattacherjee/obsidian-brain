@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2897,14 +2898,25 @@ class TestScopeGuardCannotBeBypassed:
                 and n.func.id == "_targets_this_project"
             ]
 
+        def verb_matched_first(test):
+            # `_has_create and _targets_this_project(...)`: `and` short-circuits,
+            # so the scope call only runs once the verb has matched (#334).
+            return (isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And)
+                    and isinstance(test.values[0], ast.Name)
+                    and test.values[0].id in ("_has_create", "_has_merge")
+                    and not scope_calls(test.values[0]))
+
         guarded = []
         for node in ast.walk(tree):
             if isinstance(node, ast.If):
                 test_src = ast.get_source_segment(src, node.test) or ""
-                # Lower-cased: the guards match via _PR_CREATE_VERB /
-                # _PR_MERGE_VERB rather than an inline "pr\s+..." literal (#334).
                 if "re.search" in test_src and "pr" in test_src.lower():
                     guarded.extend(scope_calls(node))
+                elif verb_matched_first(node.test):
+                    guarded.extend(scope_calls(node))
+        # The _has_* flags must themselves come from a verb match.
+        assert re.search(r"_has_create = re\.search\(_PR_CREATE_VERB", src)
+        assert re.search(r"_has_merge = re\.search\(_PR_MERGE_VERB", src)
 
         assert len(scope_calls(tree)) == len(guarded) == 2, (
             "every _targets_this_project call must sit inside a branch that has "
@@ -4168,8 +4180,11 @@ class TestAllowlistsCannotShadowTheDenyGates:
         )
 
 
-@pytest.mark.skipif(not os.path.exists("/bin/bash"),
-                    reason="the bash-truth oracle needs /bin/bash")
+_BASH = shutil.which("bash")
+_REQUIRES_BASH = pytest.mark.skipif(_BASH is None, reason="bash not available")
+
+
+@_REQUIRES_BASH
 class TestBashTruthDifferential:
     """#334: bash decides what runs; the gate only gets to agree.
 
@@ -4264,15 +4279,24 @@ class TestBashTruthDifferential:
         marker = work / marker_name
         if marker.exists():
             marker.unlink()
+        # sudo reads its password from /dev/tty, not stdin, so stdin=DEVNULL
+        # alone still prompted on a developer's terminal and blocked for the
+        # full timeout. A new session has no controlling tty, so sudo fails
+        # fast; and on timeout the whole group is killed, because a timed-out
+        # `sudo VERB | cat` otherwise left `sudo touch ...` orphaned.
+        proc = subprocess.Popen(
+            [_BASH, "-c", template.replace("VERB", f"touch {marker}")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=work, start_new_session=True,
+        )
         try:
-            subprocess.run(
-                ["/bin/bash", "-c", template.replace("VERB", f"touch {marker}")],
-                capture_output=True, text=True, cwd=work, timeout=10,
-                # sudo must fail fast instead of reading a password off the
-                # terminal the suite is running in.
-                stdin=subprocess.DEVNULL,
-            )
+            proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, 9)
+            except OSError:
+                pass
+            proc.communicate()
             return False
         # A backgrounded verb (`VERB &`) may still be running when bash
         # returns; give it a moment rather than reading "did not run".
@@ -4293,7 +4317,6 @@ class TestBashTruthDifferential:
     _WORKERS = 8
 
     def _executed(self, work):
-        from concurrent.futures import ThreadPoolExecutor
         templates = self._templates()
 
         def probe(item):
@@ -4331,11 +4354,17 @@ class TestBashTruthDifferential:
             "the EXECUTED corpus lost constructs: "
             f"{self._missing_constructs(found)}"
         )
+        if sys.platform == "darwin":
+            for wrapper in ("caffeinate ", "arch ", "script -q /dev/null "):
+                assert any(t.startswith(wrapper + "VERB") or
+                           t.startswith(wrapper) for t in found), (
+                    f"no construct wrapped in {wrapper.strip()!r} executed on "
+                    "macOS, where it exists; that wrapper is no longer tested"
+                )
         return found
 
     @pytest.mark.parametrize("hook,verb", GATES, ids=[g for g, _ in GATES])
     def test_every_construct_bash_executes_is_denied(self, tmp_path, executed, hook, verb):
-        from concurrent.futures import ThreadPoolExecutor
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
 
         def allowed(t):
@@ -4370,6 +4399,68 @@ class TestBashTruthDifferential:
         assert TestHookBlockingPathsFire._decide(
             work, env, "enforce-pr-base-branch", template.replace("VERB", verb)
         ) == "deny"
+
+    @staticmethod
+    def _fake_gh(tmp_path, bases):
+        """A `gh` on PATH that answers `gh pr view N --json ...` from `bases`
+        ({"N": "base head"}) and fails for any other PR number."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        (bin_dir / "git").symlink_to(shutil.which("git"))
+        lines = ["#!/bin/sh", 'case "$3" in']
+        for num, answer in bases.items():
+            lines.append(f'  {num}) echo "{answer}" ;;')
+        lines += ["  *) exit 1 ;;", "esac"]
+        gh = bin_dir / "gh"
+        gh.write_text("\n".join(lines) + "\n")
+        gh.chmod(0o755)
+        return str(bin_dir)
+
+    CREATE = "gh pr cre" + "ate"
+    MERGE = "gh pr mer" + "ge"
+
+    @pytest.mark.parametrize("command,expected", [
+        # A mention placed first must not speak for the real occurrence.
+        ("echo CREATE --base develop\nCREATE --base main", "deny"),
+        ("# CREATE --base develop\nCREATE --base main", "deny"),
+        # gh keeps the LAST --base, so the gate must too.
+        ("CREATE --base develop --title x --base main", "deny"),
+        ("CREATE --base main --title x --base develop", "allow"),
+        # Positive controls: a well-based create stays allowed.
+        ("CREATE --base develop", "allow"),
+        ("CREATE --base=develop --title x", "allow"),
+        ("echo CREATE --base develop\nCREATE --base develop", "allow"),
+    ])
+    def test_each_create_occurrence_is_judged_on_its_own_base(
+            self, tmp_path, command, expected):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        cmd = command.replace("CREATE", self.CREATE)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", cmd) == expected, cmd
+
+    @pytest.mark.parametrize("command,expected", [
+        # A create mention before a merge used to exit the gate before the
+        # merge was ever judged.
+        # (Separators chosen so the old first-match read "develop" cleanly;
+        # with `develop;` or `develop'` it denied for an unrelated reason.)
+        ("echo CREATE --base develop\nMERGE 2 --squash", "deny"),
+        ("MERGE 2 --squash # CREATE --base develop", "deny"),
+        # Each merge is checked against its own PR, not the first number.
+        ("echo MERGE 1; MERGE 2 --squash", "deny"),
+        ("MERGE 1 --squash\nMERGE 2 --squash", "deny"),
+        # Positive controls: a feature PR based on develop may merge.
+        ("MERGE 1 --squash", "allow"),
+        ("echo CREATE --base develop; MERGE 1 --squash", "allow"),
+    ])
+    def test_each_merge_occurrence_is_judged_on_its_own_pr(
+            self, tmp_path, command, expected):
+        """PR 1 is feature -> develop (fine); PR 2 is feature -> main."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = dict(env, PATH=self._fake_gh(tmp_path, {
+            "1": "develop feature/a", "2": "main feature/b"}))
+        cmd = command.replace("CREATE", self.CREATE).replace("MERGE", self.MERGE)
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", cmd) == expected, cmd
 
     def test_the_census_fails_when_the_corpus_is_narrowed(self):
         """The alphabet guard must catch a corpus narrowed back to the #327

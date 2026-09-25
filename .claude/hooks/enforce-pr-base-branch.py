@@ -542,110 +542,142 @@ def get_current_branch() -> str:
         return ""
 
 
-# ── gh pr create: enforce --base develop for feature branches ──
-# Matched ANYWHERE in the command, like require-preflight's commit verb (#334).
-# This used to be anchored to the start of the command or a `;`/`&`/`|`, to
-# spare strings that merely mention the verb (echo, grep, heredocs). But bash
-# also starts a command after a newline, a tab, `VAR=x `, `$(`, a backtick,
-# `(` and `{ `, and every one of those walked past the gate unchecked — the
-# bash-truth oracle in tests/test_security.py counted 468 of 663 executing
-# constructs allowed. A mention in an echo is now judged too; that is the
+# Both verbs are matched ANYWHERE in the command, like require-preflight's
+# commit verb (#334). They used to be anchored to the start of the command or
+# a `;`/`&`/`|`, to spare strings that merely mention a verb (echo, grep,
+# heredocs). But bash also starts a command after a newline, a tab, `VAR=x `,
+# `$(`, a backtick, `(` and `{ `, and every one of those walked past the gate
+# unchecked -- the bash-truth oracle in tests/test_security.py counted 468 of
+# 663 executing constructs allowed. A mention is now judged too; that is the
 # fail-closed direction, the same trade the other gates already make.
-if re.search(_PR_CREATE_VERB, command):
-    # Skip if every occurrence targets a repo outside this project
-    if not _targets_this_project(command, _PR_CREATE_VERB):
-        sys.exit(0)
+#
+# Each OCCURRENCE is judged on its own arguments, never the first match in the
+# whole command (#334 review): with the triggers unanchored, a mention placed
+# first (an echo of a create with --base develop, then a real create with
+# --base main; or a merge PR number in an earlier echo) would otherwise speak
+# for the real one.
+
+# Where an occurrence's own arguments end. Deliberately ignores quoting: a
+# separator inside a quoted --body ends the span early, which can only hide a
+# later --base or PR number and so resolves toward a deny.
+_SPAN_END = re.compile(r'[\n;&|`)]')
+
+
+def _verb_spans(cmd: str, verb: str):
+    """The argument text after each occurrence of `verb`, up to the next
+    command separator."""
+    spans = []
+    for m in re.finditer(verb, cmd):
+        end = _SPAN_END.search(cmd, m.end())
+        spans.append(cmd[m.end():end.start() if end else len(cmd)])
+    return spans
+
+
+def _span_base(span: str):
+    """The --base an occurrence passes, or None. The LAST one wins, as in gh's
+    own flag parser. Surrounding quotes are dropped."""
+    bases = re.findall(r'--base(?:=|\s+)(\S+)', span)
+    return bases[-1].strip("'\"") if bases else None
+
+
+def _span_pr_number(span: str):
+    """The PR number an occurrence names, or None (then gh uses the current
+    branch's PR)."""
+    m = re.search(r'(?:^|\s)#?(\d+)(?=\s|$)', span)
+    return m.group(1) if m else None
+
+
+# ── gh pr create: enforce --base develop for feature branches ──
+_has_create = re.search(_PR_CREATE_VERB, command) is not None
+_has_merge = re.search(_PR_MERGE_VERB, command) is not None
+
+if _has_create and _targets_this_project(command, _PR_CREATE_VERB):
     branch = get_current_branch()
     if branch.startswith("feature/"):
-        # Check if --base is specified (supports both --base X and --base=X)
-        base_match = re.search(r'--base[=\s]+(\S+)', command)
-        if not base_match:
-            deny(
-                f"❌ PR base branch not specified!\n\n"
-                f"Feature branch '{branch}' must target develop.\n"
-                f"Add --base develop to your gh pr create command:\n\n"
-                f"  gh pr create --base develop ...\n\n"
-                f"Without --base, GitHub defaults to main, which bypasses Git Flow."
-            )
-        elif base_match.group(1) != "develop":
-            specified_base = base_match.group(1)
-            deny(
-                f"❌ Wrong PR base branch!\n\n"
-                f"Feature branch '{branch}' targets '{specified_base}' but must target 'develop'.\n"
-                f"Change --base to develop:\n\n"
-                f"  gh pr create --base develop ..."
-            )
-    sys.exit(0)
+        for base in [_span_base(sp) for sp in _verb_spans(command, _PR_CREATE_VERB)]:
+            if base is None:
+                deny(
+                    f"❌ PR base branch not specified!\n\n"
+                    f"Feature branch '{branch}' must target develop.\n"
+                    f"Add --base develop to your gh pr create command:\n\n"
+                    f"  gh pr create --base develop ...\n\n"
+                    f"Without --base, GitHub defaults to main, which bypasses Git Flow."
+                )
+            elif base != "develop":
+                deny(
+                    f"❌ Wrong PR base branch!\n\n"
+                    f"Feature branch '{branch}' targets '{base}' but must target 'develop'.\n"
+                    f"Change --base to develop:\n\n"
+                    f"  gh pr create --base develop ..."
+                )
+# No exit here: a command can carry a merge as well as a create (or a mention
+# of one), and the merge must still be judged below (#334 review).
 
 # ── gh pr merge: verify base branch before merging ──
-# Handles "gh pr merge 30", "gh pr merge --squash 30", and "gh pr merge" (no number).
-# Matched anywhere, for the same reason as gh pr create above (#334).
-if re.search(_PR_MERGE_VERB, command):
-    # Skip if every occurrence targets a repo outside this project
-    if not _targets_this_project(command, _PR_MERGE_VERB):
-        sys.exit(0)
-    # Extract PR number from anywhere in the args (handles flags before number)
-    pr_number_match = re.search(_PR_MERGE_VERB + r'.*?(\d+)', command)
-    pr_number = pr_number_match.group(1) if pr_number_match else None
+# Handles "gh pr merge 30", "gh pr merge --squash 30", and "gh pr merge" (no
+# number), for every occurrence in the command.
+if _has_merge and _targets_this_project(command, _PR_MERGE_VERB):
+    pr_numbers = []
+    for sp in _verb_spans(command, _PR_MERGE_VERB):
+        pr_number = _span_pr_number(sp)
+        if not pr_number:
+            # Resolve PR number from current branch
+            try:
+                pr_number = subprocess.check_output(
+                    ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
+                    stderr=subprocess.DEVNULL, text=True
+                ).strip()
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                deny(
+                    "⚠️ Cannot determine PR number from current branch.\n\n"
+                    "Merge blocked because the base-branch safety check could not run.\n"
+                    "Specify the PR number explicitly: gh pr merge <number> --squash"
+                )
+            if not pr_number:
+                deny(
+                    "⚠️ No open PR found for the current branch.\n\n"
+                    "Merge blocked because the base-branch safety check could not run."
+                )
+        if pr_number not in pr_numbers:
+            pr_numbers.append(pr_number)
 
-    if not pr_number:
-        # Resolve PR number from current branch
+    for pr_number in pr_numbers:
+        # Get both base and head ref from the PR itself (not current branch)
         try:
-            pr_number = subprocess.check_output(
-                ["gh", "pr", "view", "--json", "number", "--jq", ".number"],
+            pr_info = subprocess.check_output(
+                ["gh", "pr", "view", pr_number, "--json", "baseRefName,headRefName",
+                 "--jq", ".baseRefName + \" \" + .headRefName"],
                 stderr=subprocess.DEVNULL, text=True
             ).strip()
-        except (subprocess.CalledProcessError, FileNotFoundError):
+            base_ref, head_ref = pr_info.split(" ", 1)
+        except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
             deny(
-                "⚠️ Cannot determine PR number from current branch.\n\n"
-                "Merge blocked because the base-branch safety check could not run.\n"
-                "Specify the PR number explicitly: gh pr merge <number> --squash"
+                f"⚠️ Cannot verify PR #{pr_number} base branch (gh pr view failed).\n\n"
+                "Merge blocked because the safety check could not run.\n"
+                "Common causes: gh auth expired, network issue, invalid PR number."
             )
 
-    if not pr_number:
-        deny(
-            "⚠️ No open PR found for the current branch.\n\n"
-            "Merge blocked because the base-branch safety check could not run."
-        )
+        # Use the PR's head ref (not current branch) for Git Flow classification
+        if head_ref.startswith("feature/") and base_ref != "develop":
+            deny(
+                f"❌ PR #{pr_number} targets '{base_ref}' but feature branches must merge to 'develop'!\n\n"
+                f"PR head: {head_ref}\n"
+                f"PR base: {base_ref}\n\n"
+                f"Fix: close this PR and recreate with --base develop:\n"
+                f"  gh pr close {pr_number}\n"
+                f"  gh pr create --base develop"
+            )
 
-    # Get both base and head ref from the PR itself (not current branch)
-    try:
-        pr_info = subprocess.check_output(
-            ["gh", "pr", "view", pr_number, "--json", "baseRefName,headRefName",
-             "--jq", ".baseRefName + \" \" + .headRefName"],
-            stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        base_ref, head_ref = pr_info.split(" ", 1)
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-        deny(
-            f"⚠️ Cannot verify PR #{pr_number} base branch (gh pr view failed).\n\n"
-            "Merge blocked because the safety check could not run.\n"
-            "Common causes: gh auth expired, network issue, invalid PR number."
-        )
+        # Release/hotfix branches merge to main
+        if (head_ref.startswith("release/") or head_ref.startswith("hotfix/")) and base_ref != "main":
+            deny(
+                f"❌ PR #{pr_number} targets '{base_ref}' but {head_ref.split('/')[0]} branches must merge to 'main'!\n\n"
+                f"PR head: {head_ref}\n"
+                f"PR base: {base_ref}\n\n"
+                f"Fix: close this PR and recreate with --base main:\n"
+                f"  gh pr close {pr_number}\n"
+                f"  gh pr create --base main"
+            )
 
-    # Use the PR's head ref (not current branch) for Git Flow classification
-    if head_ref.startswith("feature/") and base_ref != "develop":
-        deny(
-            f"❌ PR #{pr_number} targets '{base_ref}' but feature branches must merge to 'develop'!\n\n"
-            f"PR head: {head_ref}\n"
-            f"PR base: {base_ref}\n\n"
-            f"Fix: close this PR and recreate with --base develop:\n"
-            f"  gh pr close {pr_number}\n"
-            f"  gh pr create --base develop"
-        )
-
-    # Release/hotfix branches merge to main
-    if (head_ref.startswith("release/") or head_ref.startswith("hotfix/")) and base_ref != "main":
-        deny(
-            f"❌ PR #{pr_number} targets '{base_ref}' but {head_ref.split('/')[0]} branches must merge to 'main'!\n\n"
-            f"PR head: {head_ref}\n"
-            f"PR base: {base_ref}\n\n"
-            f"Fix: close this PR and recreate with --base main:\n"
-            f"  gh pr close {pr_number}\n"
-            f"  gh pr create --base main"
-        )
-
-    sys.exit(0)
-
-# Not a PR command — allow
+# Not a PR command, or every check passed — allow
 sys.exit(0)
