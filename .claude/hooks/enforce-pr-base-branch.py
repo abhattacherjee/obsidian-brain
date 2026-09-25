@@ -578,6 +578,9 @@ def _occurrence_args(cmd: str, verb: str):
         rest = cmd[m.end():].replace("\n", " ; ").replace("`", " ; ")
         lex = shlex.shlex(rest, posix=True, punctuation_chars=";&|()")
         lex.whitespace_split = True
+        # Bash only starts a comment at the START of a word; shlex's default
+        # `#` commenter also cut `a#b` short and dropped the selector after it.
+        lex.commenters = ""
         try:
             tokens = list(lex)
         except ValueError:
@@ -592,30 +595,74 @@ def _occurrence_args(cmd: str, verb: str):
     return out
 
 
-def _span_base(args):
-    """The --base / -B an occurrence passes, or None. The LAST one wins, as in
-    gh's own flag parser."""
-    base = None
+def _short_flag_value(tok, letters, args, i):
+    """For a short-flag cluster like `-sB`, `-Bmain`, `-B=main` or `-st`:
+    (value, consumes_next) for the first letter in `letters`, or None when
+    the cluster holds none of them. pflag reads `-st 5` as `-s -t 5` and
+    strips a `=` after a short flag, so `-B=main` is base "main"."""
+    if not tok.startswith("-") or tok.startswith("--") or len(tok) < 2:
+        return None
+    body = tok[1:]
+    for k, ch in enumerate(body):
+        if ch in letters:
+            rest = body[k + 1:]
+            if rest:
+                return rest[1:] if rest.startswith("=") else rest, False
+            return (args[i + 1] if i + 1 < len(args) else None), True
+    return None
+
+
+def _span_bases(args):
+    """EVERY base an occurrence passes, in any spelling gh accepts:
+    `--base X`, `--base=X`, `-B X`, `-BX`, `-B=X`, `-dB X`. The caller
+    requires all of them to be develop, rather than guessing which one gh
+    keeps: a value that another flag swallows (`-t --base=develop`) or a
+    later override then fails closed instead of speaking for the real base
+    (#334 review round 3)."""
+    bases = []
     for i, tok in enumerate(args):
-        if tok in ("--base", "-B") and i + 1 < len(args):
-            base = args[i + 1]
+        if tok == "--base" and i + 1 < len(args):
+            bases.append(args[i + 1])
         elif tok.startswith("--base="):
-            base = tok.split("=", 1)[1]
-    return base
+            bases.append(tok.split("=", 1)[1])
+        else:
+            hit = _short_flag_value(tok, "B", args, i)
+            if hit and hit[0] is not None:
+                bases.append(hit[0])
+    return bases
 
 
 # gh pr merge flags that take a separate value. Their value is never the PR.
 _MERGE_VALUE_FLAGS = {"-t", "--subject", "-b", "--body", "-F", "--body-file",
                       "-A", "--author-email", "--match-head-commit",
                       "-R", "--repo"}
+_MERGE_VALUE_SHORT = "tbFAR"
+_PR_REF = re.compile(r"^#?(\d+)$")
 
 
-def _span_pr_selector(args):
-    """The PR an occurrence names -- a number, `#N`, a pull URL (reduced to
-    its number) or a branch -- or None when it names none (gh then uses the
-    current branch's PR)."""
+def _span_pr_selectors(args):
+    """Every PR this occurrence might merge. The positional selector (a
+    number, `#N`, a pull URL reduced to its number, or a branch) plus EVERY
+    token anywhere in the arguments that looks like a PR reference, flag
+    values included. Checking all of them means a flag-parsing difference
+    from gh (`-st 5 7` is `-s -t 5` then PR 7) can only add a check, never
+    move it to the wrong PR (#334 review round 3). An empty result means gh
+    uses the current branch's PR."""
+    found = []
+
+    def add(ref):
+        if ref and ref not in found:
+            found.append(ref)
+
     skip = False
-    for tok in args:
+    positional = None
+    for i, tok in enumerate(args):
+        url = re.search(r"/pull/(\d+)", tok)
+        ref = _PR_REF.match(tok)
+        if url:
+            add(url.group(1))
+        elif ref:
+            add(ref.group(1))
         if skip:
             skip = False
             continue
@@ -623,12 +670,15 @@ def _span_pr_selector(args):
             skip = True
             continue
         if tok.startswith("-"):
+            hit = _short_flag_value(tok, _MERGE_VALUE_SHORT, args, i)
+            if hit and hit[1]:
+                skip = True
             continue
-        url = re.search(r"/pull/(\d+)", tok)
-        if url:
-            return url.group(1)
-        return tok.lstrip("#") or None
-    return None
+        if positional is None:
+            positional = url.group(1) if url else tok.lstrip("#")
+    if positional:
+        add(positional)
+    return found
 
 
 # ── gh pr create: enforce --base develop for feature branches ──
@@ -639,7 +689,9 @@ if _has_create and _targets_this_project(command, _PR_CREATE_VERB):
     branch = get_current_branch()
     if branch.startswith("feature/"):
         for args in _occurrence_args(command, _PR_CREATE_VERB):
-            base = None if args is None else _span_base(args)
+            bases = [] if args is None else _span_bases(args)
+            wrong = [b for b in bases if b != "develop"]
+            base = wrong[0] if wrong else (bases[0] if bases else None)
             if base is None:
                 deny(
                     f"❌ PR base branch not specified!\n\n"
@@ -663,14 +715,30 @@ if _has_create and _targets_this_project(command, _PR_CREATE_VERB):
 # number), for every occurrence in the command.
 if _has_merge and _targets_this_project(command, _PR_MERGE_VERB):
     pr_numbers = []
-    for args in _occurrence_args(command, _PR_MERGE_VERB):
+    _raw_after = [command[m.end():] for m in re.finditer(_PR_MERGE_VERB, command)]
+    for n_occ, args in enumerate(_occurrence_args(command, _PR_MERGE_VERB)):
         if args is None:
             deny(
                 "⚠️ Cannot parse the arguments of gh pr merge (unbalanced quotes).\n\n"
                 "Merge blocked because the base-branch safety check could not "
                 "tell which PR is being merged."
             )
-        pr_number = _span_pr_selector(args)
+        selectors = _span_pr_selectors(args)
+        if not selectors:
+            # No selector read. If the arguments hold a command substitution
+            # the PR is computed at run time (`gh pr merge `echo 7``), so
+            # "the current branch's PR" would be a guess (#334 review 3).
+            _own = re.split(r"[\n;&|]", _raw_after[n_occ], maxsplit=1)[0]
+            if "`" in _own or "$(" in _own:
+                deny(
+                    "⚠️ gh pr merge takes its PR from a command substitution.\n\n"
+                    "Merge blocked because the base-branch safety check cannot "
+                    "tell which PR that is. Pass the PR number literally."
+                )
+        pr_number = selectors[0] if selectors else None
+        for extra in selectors[1:]:
+            if extra not in pr_numbers:
+                pr_numbers.append(extra)
         if not pr_number:
             # Resolve PR number from current branch
             try:

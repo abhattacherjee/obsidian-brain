@@ -4423,9 +4423,15 @@ class TestBashTruthDifferential:
         # A mention placed first must not speak for the real occurrence.
         ("echo CREATE --base develop\nCREATE --base main", "deny"),
         ("# CREATE --base develop\nCREATE --base main", "deny"),
-        # gh keeps the LAST --base, so the gate must too.
+        # Every base spelling must be develop: which one gh keeps is not
+        # guessed (a value another flag swallows, or a later override).
         ("CREATE --base develop --title x --base main", "deny"),
-        ("CREATE --base main --title x --base develop", "allow"),
+        ("CREATE --base main --title x --base develop", "deny"),
+        ("CREATE --base develop -Bmain", "deny"),
+        ("CREATE --base develop -B=main", "deny"),
+        ("CREATE -dB main", "deny"),
+        ("CREATE -B main -t --base=develop", "deny"),
+        ("CREATE -Bdevelop --title x", "allow"),
         # Positive controls: a well-based create stays allowed.
         ("CREATE --base develop", "allow"),
         ("CREATE --base=develop --title x", "allow"),
@@ -4462,6 +4468,14 @@ class TestBashTruthDifferential:
         ("MERGE https://github.com/o/r/pull/2 --squash", "deny"),
         ("MERGE -t 5 2 --squash", "deny"),
         ("MERGE '#2' --squash", "deny"),
+        # Stacked short flags: pflag reads -st 5 as -s -t 5, so gh merges 2.
+        ("MERGE -st 5 2", "deny"),
+        ("MERGE -sb 5 2", "deny"),
+        # A `#` inside a word is not a comment; the selector after it counts.
+        ("MERGE -t a#b 2", "deny"),
+        # A selector computed at run time cannot be checked.
+        ("MERGE `echo 2`", "deny"),
+        ("MERGE $(echo 2)", "deny"),
         # Unbalanced quotes cannot be parsed: fail closed.
         ("MERGE 1 --body 'oops", "deny"),
         # Positive controls: a feature PR based on develop may merge.
@@ -4469,6 +4483,8 @@ class TestBashTruthDifferential:
         ("MERGE --squash", "allow"),
         ("MERGE -t 'a; b' 1 --squash", "allow"),
         ("MERGE https://github.com/o/r/pull/1", "allow"),
+        ("MERGE -st 5 1", "allow"),
+        ("MERGE 1 # note", "allow"),
         ("echo CREATE --base develop; MERGE 1 --squash", "allow"),
     ])
     def test_each_merge_occurrence_is_judged_on_its_own_pr(
