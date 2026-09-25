@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.5.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-09-24",
+  "lastUpdated": "2026-09-25",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -159,7 +159,7 @@
           "files": [
             "hooks/obsidian_session_log.py"
           ],
-          "purpose": "SessionEnd: writes the raw session note immediately. Discovers sibling snapshots (cross-midnight: unions a today+yesterday dated scan, deliberately WITHOUT the read-path snapshot-index memo, since it reads the list back after writing), applies message-count + duration thresholds (snapshot presence bypasses skips), dedup-claims before the expensive raw-body build, and logs a structured outcome line for every exit path."
+          "purpose": "SessionEnd: uses the transcript path before inherited Codex markers; skips Codex rollouts with a structured SKIPPED_CODEX_HOST outcome until host adapters ship. For Claude, writes the raw session note immediately. Discovers sibling snapshots (cross-midnight: unions a today+yesterday dated scan, deliberately WITHOUT the read-path snapshot-index memo, since it reads the list back after writing), applies message-count + duration thresholds (snapshot presence bypasses skips), dedup-claims before the expensive raw-body build, and logs a structured outcome line for every exit path."
         },
         {
           "id": "hook-session-hint",
@@ -168,7 +168,7 @@
           "files": [
             "hooks/obsidian_session_hint.py"
           ],
-          "purpose": "SessionStart (matcher startup|resume|clear|compact): refreshes the bootstrap sid-file atomically, invokes the orphan reaper, and injects a read-only last-session context hint via hookSpecificOutput.additionalContext."
+          "purpose": "SessionStart (matcher startup|resume|clear|compact): uses the payload's transcript path before inherited Codex markers and skips Codex rollouts with SKIPPED_CODEX_HOST stderr telemetry. For Claude, refreshes the bootstrap sid-file atomically, invokes the orphan reaper, and injects a read-only last-session context hint via hookSpecificOutput.additionalContext."
         },
         {
           "id": "hook-context-snapshot",
@@ -177,7 +177,7 @@
           "files": [
             "hooks/obsidian_context_snapshot.py"
           ],
-          "purpose": "PreCompact: saves a context snapshot before compression. Gates on snapshot_on_compact/snapshot_on_clear, scrubs secrets, and writes a snapshot note backlinked to its parent session. Stderr-only telemetry (no hook-log line)."
+          "purpose": "PreCompact: uses the payload's transcript path before inherited Codex markers and skips Codex rollouts with SKIPPED_CODEX_HOST stderr telemetry. For Claude, saves a context snapshot before compression. Gates on snapshot_on_compact/snapshot_on_clear, scrubs secrets, and writes a snapshot note backlinked to its parent session. Stderr-only telemetry (no hook-log line)."
         },
         {
           "id": "hook-session-reaper",
@@ -195,7 +195,7 @@
           "files": [
             "hooks/obsidian_retro_gate.py"
           ],
-          "purpose": "ENFORCE. Stop hook that blocks turn-end until /retro Step 7.5 classification clears the session-scoped retro-gate sentinel (returns {decision: block} with the classify-Process-Improvements reminder). Fail-open on any error; stop_hook_active re-entry and a 2h TTL both auto-clear so it can never wedge a session."
+          "purpose": "ENFORCE. Uses the payload's transcript path before inherited Codex markers and skips Codex rollouts with SKIPPED_CODEX_HOST stderr telemetry until host adapters ship. For Claude, blocks turn-end until /retro Step 7.5 classification clears the session-scoped retro-gate sentinel (returns {decision: block} with the classify-Process-Improvements reminder). Fail-open on any error; stop_hook_active re-entry and a 2h TTL both auto-clear so it can never wedge a session."
         },
         {
           "id": "hooks-registration",
@@ -1076,7 +1076,7 @@
     {
       "id": "session-end-autolog",
       "name": "SessionEnd auto-log (write-first)",
-      "description": "When a Claude Code session ends, the raw note is written immediately; AI summarization is deferred to /recall.",
+      "description": "Codex-host invocations skip with explicit telemetry until adapters ship. When a Claude Code session ends, the raw note is written immediately; AI summarization is deferred to /recall.",
       "steps": [
         {
           "from": "hooks-registration",
@@ -1111,7 +1111,7 @@
         {
           "from": "hook-session-log",
           "to": "telemetry-log",
-          "label": "outcome=OK_RAW_NOTE_ONLY / SKIPPED / WRITE_FAILED"
+          "label": "outcome=OK_RAW_NOTE_ONLY / SKIPPED_CODEX_HOST / other SKIPPED / WRITE_FAILED"
         }
       ]
     },
@@ -1150,7 +1150,7 @@
     {
       "id": "precompact-snapshot",
       "name": "PreCompact context snapshot",
-      "description": "Before context compression, persist a scrubbed snapshot backlinked to the parent session.",
+      "description": "Claude PreCompact persists a scrubbed snapshot backlinked to the parent session; a Codex-host invocation skips until adapters ship.",
       "steps": [
         {
           "from": "hooks-registration",

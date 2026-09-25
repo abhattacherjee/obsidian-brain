@@ -34,6 +34,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from obsidian_utils import (  # noqa: E402
+    _hook_payload_codex_reason,
     RETRO_GATE_TTL_SECONDS,
     clear_retro_classification_pending,
     get_retro_classification_pending,
@@ -61,6 +62,13 @@ def main() -> None:
     try:
         raw = sys.stdin.read(1_000_000)
         data = json.loads(raw)
+
+        if not isinstance(data, dict):
+            return
+        codex_reason = _hook_payload_codex_reason(data)
+        if codex_reason:
+            print(f"[obsidian-brain] Stop outcome=SKIPPED_CODEX_HOST reason={codex_reason}", file=sys.stderr)
+            return
 
         session_id = data.get("session_id") or ""
         stop_hook_active = bool(data.get("stop_hook_active", False))

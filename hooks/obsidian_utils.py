@@ -1367,6 +1367,30 @@ def _foreign_host_marker() -> str | None:
             return name
     return None
 
+
+def _hook_payload_codex_reason(hook_input: dict) -> str | None:
+    """Use a hook's transcript path before inherited host environment markers.
+
+    Codex rollouts live below CODEX_HOME/sessions; Claude transcripts live in
+    ~/.claude/projects. A nonempty path that is not a Codex rollout is never
+    overridden by an inherited CODEX_* marker. The marker is only a fallback
+    for hook events whose payload has no transcript path.
+    """
+    transcript_path = hook_input.get("transcript_path")
+    if isinstance(transcript_path, str) and transcript_path.strip():
+        codex_home = os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")
+        sessions_root = os.path.realpath(os.path.join(codex_home, "sessions"))
+        source = os.path.realpath(transcript_path)
+        try:
+            in_sessions = os.path.commonpath((source, sessions_root)) == sessions_root
+        except ValueError:
+            in_sessions = False
+        name = os.path.basename(source)
+        if in_sessions and name.startswith("rollout-") and name.endswith(".jsonl"):
+            return "codex-rollout"
+        return None
+    return _foreign_host_marker()
+
 # Memo for the env-layer transcript check below, keyed by (project, env_sid).
 #
 # WHY: CLAUDE_CODE_SESSION_ID is constant for the life of a process, and the
