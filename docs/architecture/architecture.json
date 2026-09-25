@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.5.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-09-03",
+  "lastUpdated": "2026-09-24",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -1809,6 +1809,11 @@
       "name": "CLAUDE_CODE_SESSION_ID",
       "default": "(set by Claude Code)",
       "purpose": "Authoritative layer-0 session id in the SID resolution chain (#330): trusted ahead of every mtime-scan layer, validated by format only, constant for the life of the session. Ignored by _slow_path_newest_sid (allow_env=False) so check_hook_status never validates the env var against itself."
+    },
+    {
+      "name": "CODEX_THREAD_ID / CODEX_SANDBOX / CODEX_SANDBOX_NETWORK_DISABLED",
+      "default": "(set by Codex in its tool shells)",
+      "purpose": "Foreign-host markers (#362). When any is non-empty, _resolve_session_id returns 'unknown' before every layer, so a Codex-run skill never stamps a Claude session id (inherited CLAUDE_CODE_SESSION_ID or the newest Claude transcript) on a vault note. CODEX_HOME is deliberately not a marker."
     },
     {
       "name": "OBSIDIAN_BRAIN_DB",

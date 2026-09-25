@@ -2305,3 +2305,77 @@ def test_layer0_narrow_probe_does_not_poison_the_shared_cwd_memo(
         f"broad scan, got {result_scan!r} — the narrow layer-0 probe must "
         f"not have poisoned the shared _dirs_by_transcript_cwd memo"
     )
+
+
+# ─── #362: a Codex process never resolves a Claude session id ──────────
+
+def _seed_live_claude_transcript(home: Path, tmp_path: Path, monkeypatch, project: str) -> str:
+    """A fresh Claude transcript for `project`, with cwd inside that project —
+    the state a concurrent Claude Code session leaves on disk (#362)."""
+    sid = _unique_sid()
+    cc_dir = home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{sid}.jsonl").write_text("{}\n")
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+    return sid
+
+
+def test_resolve_session_id_without_codex_marker_finds_the_claude_transcript(
+    isolated_home, monkeypatch, tmp_path
+):
+    """Negative control for the tests below: with no Codex marker, the same
+    fixture resolves the Claude transcript. Without it, a fixture that never
+    resolved anything would make the 'unknown' assertions vacuous."""
+    sid = _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-ctl-proj")
+    assert obsidian_utils._resolve_session_id() == sid
+
+
+@pytest.mark.parametrize("marker", ["CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED"])
+def test_resolve_session_id_under_codex_refuses_newest_claude_transcript(
+    isolated_home, monkeypatch, tmp_path, marker
+):
+    """#362: the newest Claude transcript in the repo belongs to the Claude
+    session open alongside Codex, so a Codex process must not take it."""
+    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-scan-proj")
+    monkeypatch.setenv(marker, "019a0000-0000-7000-8000-000000000000")
+    assert obsidian_utils._resolve_session_id() == "unknown"
+    assert obsidian_utils._slow_path_newest_sid() == "unknown"
+
+
+def test_resolve_session_id_under_codex_ignores_inherited_claude_env(
+    isolated_home, monkeypatch, tmp_path
+):
+    """#362: Codex started from a Claude Code shell inherits
+    CLAUDE_CODE_SESSION_ID. That id is the Claude session's, not Codex's."""
+    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-env-proj")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", _unique_sid())
+    monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000001")
+    assert obsidian_utils._resolve_session_id() == "unknown"
+
+
+def test_resolve_session_id_ignores_blank_codex_marker_and_codex_home(
+    isolated_home, monkeypatch, tmp_path
+):
+    """CODEX_HOME is user config, often exported in a plain shell profile, and
+    an empty marker is not a marker. Neither may switch resolution off."""
+    sid = _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-home-proj")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("CODEX_THREAD_ID", "   ")
+    assert obsidian_utils._resolve_session_id() == sid
+
+
+def test_get_session_context_under_codex_returns_unknown_and_warns_once(
+    isolated_home, monkeypatch, tmp_path, capsys
+):
+    """End to end through the entry point skills call: no session id, no note
+    link, and one WARN naming the marker."""
+    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-ctx-proj")
+    monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000002")
+    ctx = obsidian_utils.get_session_context(str(tmp_path / "vault"), "claude-sessions")
+    obsidian_utils.get_session_context(str(tmp_path / "vault"), "claude-sessions")
+    assert ctx["session_id"] == "unknown"
+    assert ctx["session_note_name"] == ""
+    err = capsys.readouterr().err
+    assert err.count("CODEX_THREAD_ID is set") == 1, err

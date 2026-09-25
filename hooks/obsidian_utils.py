@@ -1334,6 +1334,26 @@ _env_sid_no_transcript_warned: set[tuple[str, str]] = set()
 # Keyed by the raw (unvalidated) env value itself so a DIFFERENT malformed
 # value later in the same process still warns once more (#330 review item 8).
 _env_sid_malformed_warned: set[str] = set()
+# Keyed by the Codex marker variable that fired (#362).
+_foreign_host_warned: set[str] = set()
+
+# Environment variables Codex sets in the shells it runs tools in (#362).
+# Checked against the codex-cli 0.155.1 binary. CODEX_HOME is deliberately NOT
+# here: it is user configuration and is often exported in an ordinary shell
+# profile, so its presence says nothing about which host launched this process.
+_CODEX_HOST_MARKERS = (
+    "CODEX_THREAD_ID",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+)
+
+
+def _foreign_host_marker() -> str | None:
+    """Name of the first Codex marker set in this environment, or None."""
+    for name in _CODEX_HOST_MARKERS:
+        if os.environ.get(name, "").strip():
+            return name
+    return None
 
 # Memo for the env-layer transcript check below, keyed by (project, env_sid).
 #
@@ -1959,7 +1979,31 @@ def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) ->
     that variable in hooks, so gating on `project is not None` would have
     narrowed #105 to "worktree deleted AND the env var happens to be unset",
     silently returning 'unknown' where it used to recover the sid.
+
+    Foreign host (#362): when a Codex marker is set (_CODEX_HOST_MARKERS), every
+    layer is refused and 'unknown' is returned before any of them runs. Each
+    layer answers "which CLAUDE session is this?" — layer 0 because Codex
+    inherits CLAUDE_CODE_SESSION_ID when started from a Claude Code shell, and
+    layers 2-4 because the newest Claude transcript in this repo belongs to
+    whichever Claude session is open alongside Codex. Either way a Codex-run
+    skill stamped a Claude session's id on its note. The guard covers
+    allow_env=False too, so the health-check path cannot hand out a Claude id
+    either. A Claude Code process started from inside a Codex shell also
+    inherits the markers and resolves 'unknown'; the two cases look identical
+    from inside the process, and 'unknown' is the answer that is never wrong.
     """
+    marker = _foreign_host_marker()
+    if marker is not None:
+        _warn_once(
+            _foreign_host_warned,
+            marker,
+            f"[obsidian-brain] WARN: {marker} is set, so this looks like a "
+            f"Codex process; not resolving a Claude Code session id "
+            f"(neither CLAUDE_CODE_SESSION_ID nor the newest Claude "
+            f"transcript identifies a Codex session). Notes are written "
+            f"without session links this run",
+        )
+        return "unknown"
     if allow_env:
         env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
         if env_sid and _SID_FILENAME_SAFE.fullmatch(env_sid):
