@@ -741,28 +741,31 @@ def test_safe_getcwd_returns_empty_on_oserror(monkeypatch):
     assert obsidian_utils._safe_getcwd() == ""
 
 
-def test_resolver_glob_oserror_returns_none(tmp_path, monkeypatch, capsys):
-    """If glob raises OSError (transient I/O, permission), resolver returns
-    (None, []) and logs to stderr — does not propagate.
-
-    Patches Path.glob globally because the resolver does ``Path(sessions_dir)``
-    internally, which produces a fresh Path object whose `glob` method is
-    bound at call time.
-    """
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root can read a 0o000 directory, so the listing never fails",
+)
+def test_resolver_unreadable_sessions_dir_returns_none_and_logs(tmp_path, capsys):
+    """An unreadable sessions dir returns (None, []) and says why on stderr
+    (#336). Uses a real 0o000 directory rather than a patched Path.glob: the
+    real glob() swallows the scandir error and returns [], so a patched one
+    that raises tested a failure the code could never see. A matching note is
+    present, so a listing that silently came back empty is caught too."""
     sessions = tmp_path / "sessions"
     sessions.mkdir()
-
-    def _raising_glob(self, pattern):
-        raise OSError("simulated I/O error")
-    monkeypatch.setattr(Path, "glob", _raising_glob)
-
-    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
-        sessions, "abcd", cwd="/cwd/x"
-    )
+    (sessions / "2026-01-01-proj-abcd.md").write_text("---\ntype: claude-session\n---\n")
+    sessions.chmod(0o000)
+    try:
+        basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+            sessions, "abcd", cwd="/cwd/x"
+        )
+    finally:
+        sessions.chmod(0o700)
     assert basename is None
     assert collisions == []
-    captured = capsys.readouterr()
-    assert "glob failed" in captured.err.lower()
+    err = capsys.readouterr().err
+    assert "cannot list" in err
+    assert str(sessions) in err
 
 
 def test_resolve_treats_type_missing_as_session(tmp_path):
@@ -2305,3 +2308,137 @@ def test_layer0_narrow_probe_does_not_poison_the_shared_cwd_memo(
         f"broad scan, got {result_scan!r} — the narrow layer-0 probe must "
         f"not have poisoned the shared _dirs_by_transcript_cwd memo"
     )
+
+
+# ─── #362: a Codex process never resolves a Claude session id ──────────
+
+def _seed_live_claude_transcript(home: Path, tmp_path: Path, monkeypatch, project: str) -> str:
+    """A fresh Claude transcript for `project`, with cwd inside that project —
+    the state a concurrent Claude Code session leaves on disk (#362)."""
+    sid = _unique_sid()
+    cc_dir = home / ".claude" / "projects" / f"-Users-test-{project}"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    (cc_dir / f"{sid}.jsonl").write_text("{}\n")
+    target = tmp_path / project
+    target.mkdir()
+    monkeypatch.chdir(target)
+    return sid
+
+
+def test_resolve_session_id_without_codex_marker_finds_the_claude_transcript(
+    isolated_home, monkeypatch, tmp_path
+):
+    """Negative control for the tests below: with no Codex marker, the same
+    fixture resolves the Claude transcript. Without it, a fixture that never
+    resolved anything would make the 'unknown' assertions vacuous."""
+    sid = _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-ctl-proj")
+    assert obsidian_utils._resolve_session_id() == sid
+
+
+@pytest.mark.parametrize("marker", ["CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED"])
+def test_resolve_session_id_under_codex_refuses_newest_claude_transcript(
+    isolated_home, monkeypatch, tmp_path, marker
+):
+    """#362: the newest Claude transcript in the repo belongs to the Claude
+    session open alongside Codex, so a Codex process must not take it."""
+    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-scan-proj")
+    monkeypatch.setenv(marker, "019a0000-0000-7000-8000-000000000000")
+    assert obsidian_utils._resolve_session_id() == "unknown"
+    assert obsidian_utils._slow_path_newest_sid() == "unknown"
+
+
+def test_resolve_session_id_under_codex_ignores_inherited_claude_env(
+    isolated_home, monkeypatch, tmp_path
+):
+    """#362: Codex started from a Claude Code shell inherits
+    CLAUDE_CODE_SESSION_ID. That id is the Claude session's, not Codex's."""
+    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-env-proj")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", _unique_sid())
+    monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000001")
+    assert obsidian_utils._resolve_session_id() == "unknown"
+
+
+def test_resolve_session_id_ignores_blank_codex_marker_and_codex_home(
+    isolated_home, monkeypatch, tmp_path
+):
+    """CODEX_HOME is user config, often exported in a plain shell profile, and
+    an empty marker is not a marker. Neither may switch resolution off."""
+    sid = _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-home-proj")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("CODEX_THREAD_ID", "   ")
+    assert obsidian_utils._resolve_session_id() == sid
+
+
+def test_get_session_context_under_codex_returns_unknown_and_warns_once(
+    isolated_home, monkeypatch, tmp_path, capsys
+):
+    """End to end through the entry point skills call: no session id, no note
+    link, and one WARN naming the marker."""
+    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-ctx-proj")
+    monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000002")
+    ctx = obsidian_utils.get_session_context(str(tmp_path / "vault"), "claude-sessions")
+    obsidian_utils.get_session_context(str(tmp_path / "vault"), "claude-sessions")
+    assert ctx["session_id"] == "unknown"
+    assert ctx["session_note_name"] == ""
+    err = capsys.readouterr().err
+    assert err.count("CODEX_THREAD_ID is set") == 1, err
+    # The generic 'unknown' WARN says no Claude transcript resolves, which is
+    # false here: one did, and was refused. Only the Codex WARN may appear.
+    assert "could not identify the current session" not in err, err
+
+
+@pytest.mark.parametrize("sid", ["unknown", ""])
+def test_cache_never_stores_under_an_uncacheable_sid(sid):
+    """#362: every Codex run resolves 'unknown', and SessionEnd only cleans up
+    real ids, so cache-unknown.json served frozen config and frontmatter
+    forever. The cache must refuse the id outright — no read, no write, and
+    no file on disk."""
+    obsidian_utils.cache_set(sid, "config", {"vault_path": "/stale"})
+    assert obsidian_utils.cache_get(sid, "config") is None
+    assert not os.path.exists(f"{obsidian_utils._CACHE_PREFIX}{sid}.json")
+    obsidian_utils.cache_invalidate(sid)  # must not raise
+
+
+def test_cache_ignores_a_leftover_cache_unknown_file():
+    """A cache-unknown.json written before #362 is still on disk on real
+    machines (1.5 MB, with a frozen config entry). Reads must ignore it, not
+    just stop adding to it."""
+    path = f"{obsidian_utils._CACHE_PREFIX}unknown.json"
+    with open(path, "w") as f:
+        json.dump({"config": {"vault_path": "/stale"}}, f)
+    assert obsidian_utils.cache_get("unknown", "config") is None
+
+
+def test_cache_still_stores_under_a_real_sid():
+    """Negative control: a real id still round-trips, so the refusal above is
+    specific to the uncacheable ids and not a broken cache."""
+    sid = _unique_sid()
+    obsidian_utils.cache_set(sid, "config", {"vault_path": "/v"})
+    assert obsidian_utils.cache_get(sid, "config") == {"vault_path": "/v"}
+
+
+def test_load_config_under_codex_sees_a_config_edit(isolated_home, monkeypatch, tmp_path):
+    """#362 end to end: with a Codex marker set, a config edit between two
+    load_config() calls must be visible to the second."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000003")
+    cfg = tmp_path / "obsidian-brain-config.json"
+    monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", cfg)
+    cfg.write_text(json.dumps({"vault_path": str(tmp_path / "v1")}))
+    assert obsidian_utils.load_config()["vault_path"] == str(tmp_path / "v1")
+    cfg.write_text(json.dumps({"vault_path": str(tmp_path / "v2")}))
+    assert obsidian_utils.load_config()["vault_path"] == str(tmp_path / "v2")
+
+
+def test_check_hook_status_under_codex_does_not_report_a_setup_failure(
+    isolated_home, monkeypatch, tmp_path
+):
+    """#362: /recall prints any [WARN] from check_hook_status verbatim. Under
+    Codex the resolver refuses Claude ids, so without a guard this told the
+    user to re-run /obsidian-setup although nothing was wrong."""
+    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-health-proj")
+    monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
+    status = obsidian_utils.check_hook_status()
+    assert status["ok"] is True
+    assert "obsidian-setup" not in status["message"]
+    assert "CODEX_SANDBOX" in status["message"]

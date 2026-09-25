@@ -48,6 +48,8 @@ def _reset_session_resolution_state():
         "_env_sid_transcript_checked",
         # #330 review item 8: malformed CLAUDE_CODE_SESSION_ID one-shot WARN.
         "_env_sid_malformed_warned",
+        # #362: foreign-host (Codex marker) one-shot WARN.
+        "_foreign_host_warned",
         # #330 review item 2: resolve_source_session_note's contradiction
         # one-shot WARN.
         "_crossed_source_session_warned",
@@ -301,3 +303,8 @@ def _isolate_harness_session_id_globally(monkeypatch):
     real session id would leak into resolution tests via the ambient
     environment rather than the fixture each test explicitly sets up."""
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    # Same for the Codex host markers (#362): a suite run from a Codex shell
+    # would otherwise resolve every session id to 'unknown'.
+    import obsidian_utils
+    for name in obsidian_utils._CODEX_HOST_MARKERS:
+        monkeypatch.delenv(name, raising=False)

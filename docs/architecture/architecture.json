@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.5.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-09-03",
+  "lastUpdated": "2026-09-24",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -887,7 +887,7 @@
           "files": [
             "skills/check-items/SKILL.md"
           ],
-          "purpose": "TRIAGE. Two-pass AI triage of open items: auto-checks PR-shipped items, cache-backed, cascades sibling checkoffs. Owns partition() and classifier dispatch over the triage-pipeline modules. Step 6 (Classify) gap-fills only the group_ids classify_groups_with_agent did not cover — via classify_groups_heuristic on the residual set, not the whole payload — and stamps classifier_source ('agent'/'heuristic'/'cache') onto every verdict. Step 7 (Apply tier rules) threads classifier_source into assign_tier, reads classifier_mode off the classifications payload and prints a degradation banner whenever it is not 'ok', and marks each heuristic-derived review row with a trailing ' [heuristic]' marker. Step 10 (Persist cache) carries classifier_source through into the cache write so check_items_cache.update_cache can refuse to persist heuristic verdicts (#297); it reuses the per-project HEAD captured at Step 3 (via partition.json's heads key) rather than re-deriving it with its own git rev-parse HEAD call, so a commit landing between Step 3 and Step 10 cannot stamp a mid-run HEAD onto verdicts derived at the older one (#305). #318: Step 1 calls describe_plugin_install_divergence() (swallowing any exception) and prints a WARNING to stderr when installed obsidian-brain copies disagree on version, naming which one the hooks actually resolved to. Step 5 gathers note-completion evidence (open_item_dedup.gather_note_completion_evidence via deep_analysis_pipeline) for a repo-less project and writes the pipeline's evidence_gaps block to gaps.json. Step 8's cascade block reuses source_skips — the primary-flip loop's own record of what it actually Read-Verified-Edited — to stamp applied=True on each buckets record it corresponds to (across every classification, not just DONE) and persists the stamp back to buckets_path before Step 9 reads it. Step 9 passes merges=merge_records_from_groups(...) (never a raw count) and evidence_gaps=<the dict loaded from gaps_path>, and its classifications argument must be buckets['review'] reloaded fresh from buckets_path, not an earlier copy, so Step 8's applied stamps are not silently dropped."
+          "purpose": "TRIAGE. Two-pass AI triage of open items: auto-checks PR-shipped items, cache-backed, cascades sibling checkoffs only for DONE groups the user actually flipped (#340). Owns partition() and classifier dispatch over the triage-pipeline modules. Step 6 (Classify) gap-fills only the group_ids classify_groups_with_agent did not cover — via classify_groups_heuristic on the residual set, not the whole payload — and stamps classifier_source ('agent'/'heuristic'/'cache') onto every verdict. Step 7 (Apply tier rules) threads classifier_source into assign_tier, reads classifier_mode off the classifications payload and prints a degradation banner whenever it is not 'ok', and marks each heuristic-derived review row with a trailing ' [heuristic]' marker. Step 10 (Persist cache) carries classifier_source through into the cache write so check_items_cache.update_cache can refuse to persist heuristic verdicts (#297); it reuses the per-project HEAD captured at Step 3 (via partition.json's heads key) rather than re-deriving it with its own git rev-parse HEAD call, so a commit landing between Step 3 and Step 10 cannot stamp a mid-run HEAD onto verdicts derived at the older one (#305). #318: Step 1 calls describe_plugin_install_divergence() (swallowing any exception) and prints a WARNING to stderr when installed obsidian-brain copies disagree on version, naming which one the hooks actually resolved to. Step 5 gathers note-completion evidence (open_item_dedup.gather_note_completion_evidence via deep_analysis_pipeline) for a repo-less project and writes the pipeline's evidence_gaps block to gaps.json. Step 8's cascade block reuses source_skips — the primary-flip loop's own record of what it actually Read-Verified-Edited — to stamp applied=True on each buckets record it corresponds to (across every classification, not just DONE) and persists the stamp back to buckets_path before Step 9 reads it. Step 9 passes merges=merge_records_from_groups(...) (never a raw count) and evidence_gaps=<the dict loaded from gaps_path>, and its classifications argument must be buckets['review'] reloaded fresh from buckets_path, not an earlier copy, so Step 8's applied stamps are not silently dropped."
         },
         {
           "id": "sk-emerge",
@@ -1390,7 +1390,7 @@
         {
           "from": "sk-check-items",
           "to": "check-items-report",
-          "label": "Step 8 stamps applied=True (via source_skips) on every buckets record it actually flipped, across all classifications, and persists it to buckets_path before Step 9 reads it; check-items-report renders each checkbox from applied, not classification (#318)"
+          "label": "Step 8 stamps applied=True (via source_skips) on every buckets record it actually flipped, across all classifications, and persists it to buckets_path before Step 9 reads it; check-items-report renders each checkbox from applied, not classification (#318); only DONE groups stamped applied cascade to sibling lines, so a deselected DONE stays unchecked in both vault and report (#340)"
         },
         {
           "from": "open-item-dedup",
@@ -1809,6 +1809,21 @@
       "name": "CLAUDE_CODE_SESSION_ID",
       "default": "(set by Claude Code)",
       "purpose": "Authoritative layer-0 session id in the SID resolution chain (#330): trusted ahead of every mtime-scan layer, validated by format only, constant for the life of the session. Ignored by _slow_path_newest_sid (allow_env=False) so check_hook_status never validates the env var against itself."
+    },
+    {
+      "name": "CODEX_THREAD_ID",
+      "default": "(set by Codex)",
+      "purpose": "Foreign-host marker. Set by Codex in every tool shell; the only marker in an unsandboxed run. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer and check_hook_status reports Claude logging as not checked (#362). Separately, and regardless of host, cache_get/cache_set/cache_invalidate never use the 'unknown' id. CODEX_HOME is deliberately not a marker."
+    },
+    {
+      "name": "CODEX_SANDBOX",
+      "default": "(set by Codex)",
+      "purpose": "Foreign-host marker. Set by Codex when its sandbox is on. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer and check_hook_status reports Claude logging as not checked (#362). Separately, and regardless of host, cache_get/cache_set/cache_invalidate never use the 'unknown' id. CODEX_HOME is deliberately not a marker."
+    },
+    {
+      "name": "CODEX_SANDBOX_NETWORK_DISABLED",
+      "default": "(set by Codex)",
+      "purpose": "Foreign-host marker. Set by Codex when its sandbox blocks network. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer and check_hook_status reports Claude logging as not checked (#362). Separately, and regardless of host, cache_get/cache_set/cache_invalidate never use the 'unknown' id. CODEX_HOME is deliberately not a marker."
     },
     {
       "name": "OBSIDIAN_BRAIN_DB",
