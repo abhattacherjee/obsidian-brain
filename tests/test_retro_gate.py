@@ -482,6 +482,24 @@ class TestRetroGateHelpers:
 
         assert result == 0
 
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root can read a 0o000 directory, so the listing never fails",
+    )
+    def test_reap_handles_unreadable_dir(self):
+        """An existing but unreadable gate dir returns 0 without raising
+        (#336). iterdir() raises here where glob() used to swallow it, so
+        this is the case the reaper's except OSError now actually covers."""
+        gate_dir = self._gate_dir()
+        gate_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (gate_dir / "stale.json").write_text("{}")
+        gate_dir.chmod(0o000)
+        try:
+            result = obsidian_utils._reap_stale_retro_sentinels()
+        finally:
+            gate_dir.chmod(0o700)
+        assert result == 0
+
     def test_reap_removes_multiple_stale_orphans(self):
         """All stale orphans are reaped (not just the first), and the count is returned."""
         gate_dir = self._gate_dir()

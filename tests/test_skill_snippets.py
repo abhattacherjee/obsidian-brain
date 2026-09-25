@@ -2,8 +2,11 @@
 
 import ast
 import glob
+import json
 import os
 import re
+import subprocess
+import sys
 import textwrap
 import pytest
 
@@ -1271,3 +1274,144 @@ def test_every_template_starts_with_the_frontmatter_fence():
     assert not offenders, (
         "template(s) do not begin with the frontmatter fence: " + "; ".join(offenders)
     )
+
+
+def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root=None):
+    """Run the real Step 8 heredoc against a scratch vault and return
+    (completed process, sessions dir, buckets after the run).
+
+    symlinked_vault: config names a symlink to the vault, as with an iCloud
+    or Dropbox vault. skip_root: directory the skip paths are written under
+    (default: the sessions dir the config names)."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    config_vault = vault
+    if symlinked_vault:
+        config_vault = tmp_path / "vault-link"
+        config_vault.symlink_to(vault)
+    (home / ".claude" / "obsidian-brain-config.json").write_text(
+        json.dumps({"vault_path": str(config_vault), "sessions_folder": "claude-sessions"})
+    )
+    files = {}
+    for g in groups:
+        for m in g["members"]:
+            files.setdefault(m["file"], {})[m["line"]] = m["_line"]
+    for name, lines in files.items():
+        body = [lines.get(i, "filler") for i in range(1, max(lines) + 1)]
+        (sessions / name).write_text("\n".join(body) + "\n")
+    work = tmp_path / "work"
+    work.mkdir()
+    merged = {"merged_by_proj": {"p": [
+        {"group_id": g["group_id"],
+         "members": [{k: v for k, v in m.items() if k != "_line"} for m in g["members"]]}
+        for g in groups
+    ]}}
+    (work / "merged.json").write_text(json.dumps(merged))
+    (work / "scope.json").write_text("{}")
+    (work / "buckets.json").write_text(json.dumps({"review": review}))
+    skips_file = work / "skips.json"
+    root = sessions if skip_root is None else skip_root
+    skips_file.write_text(json.dumps([[str(root / f), ln] for f, ln in skips]))
+    env = dict(os.environ, HOME=str(home),
+               SCOPE_PATH=str(work / "scope.json"),
+               BUCKETS_PATH=str(work / "buckets.json"),
+               MERGED_PATH=str(work / "merged.json"),
+               SKIPS_FILE=str(skips_file))
+    proc = subprocess.run(
+        [sys.executable, "-c", _read_step8_heredoc()],
+        cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=60,
+    )
+    buckets = json.loads((work / "buckets.json").read_text())
+    return proc, sessions, buckets
+
+
+def test_step8_cascades_only_groups_the_user_flipped(tmp_path):
+    """#340: a DONE group the user did not flip must not be cascaded. Before
+    the fix, Step 8 cascaded every DONE group, so the deselected group's lines
+    were checked off in the vault while Step 9's report (which renders from
+    the `applied` stamp) showed them open. The flipped group is the negative
+    control: its sibling must still be cascaded, or the gate has simply
+    switched the cascade off."""
+    groups = [
+        {"group_id": "g-flipped", "members": [
+            {"file": "a.md", "line": 1, "text": "Ship the widget", "_line": "- [x] Ship the widget"},
+            {"file": "b.md", "line": 1, "text": "Ship the widget", "_line": "- [ ] Ship the widget"},
+        ]},
+        {"group_id": "g-deselected", "members": [
+            {"file": "a.md", "line": 2, "text": "Fix the gadget", "_line": "- [ ] Fix the gadget"},
+            {"file": "b.md", "line": 2, "text": "Fix the gadget", "_line": "- [ ] Fix the gadget"},
+        ]},
+    ]
+    review = [
+        {"group_id": "g-flipped", "classification": "DONE", "tier": "HIGH",
+         "canonical_text": "Ship the widget"},
+        {"group_id": "g-deselected", "classification": "DONE", "tier": "HIGH",
+         "canonical_text": "Fix the gadget"},
+    ]
+    proc, sessions, buckets = _run_step8(tmp_path, groups, review, skips=[("a.md", 1)])
+    assert proc.returncode == 0, proc.stderr
+    assert "cascaded_total=1" in proc.stdout, proc.stdout
+
+    a = (sessions / "a.md").read_text().splitlines()
+    b = (sessions / "b.md").read_text().splitlines()
+    assert b[0] == "- [x] Ship the widget"          # sibling of a flipped group
+    assert a[1] == "- [ ] Fix the gadget"           # deselected: untouched
+    assert b[1] == "- [ ] Fix the gadget"
+
+    applied = {r["group_id"]: bool(r.get("applied")) for r in buckets["review"]}
+    assert applied == {"g-flipped": True, "g-deselected": False}
+    # The report invariant #340 is about: every checked line in the vault
+    # belongs to a group the report renders checked.
+    checked_groups = {
+        g["group_id"] for g in groups
+        for m in g["members"]
+        if (sessions / m["file"]).read_text().splitlines()[m["line"] - 1].startswith("- [x] ")
+    }
+    assert checked_groups <= {gid for gid, on in applied.items() if on}
+
+
+def _two_group_fixture():
+    groups = [
+        {"group_id": "g1", "members": [
+            {"file": "a.md", "line": 1, "text": "Ship the widget", "_line": "- [x] Ship the widget"},
+            {"file": "b.md", "line": 1, "text": "Ship the widget", "_line": "- [ ] Ship the widget"},
+        ]},
+    ]
+    review = [{"group_id": "g1", "classification": "DONE", "tier": "HIGH",
+               "canonical_text": "Ship the widget"}]
+    return groups, review
+
+
+def test_step8_matches_skips_through_a_symlinked_vault(tmp_path):
+    """#340 review: the stamp now gates the cascade, so a path spelling
+    difference must not cancel it. Config names a symlink to the vault; the
+    primary-flip loop recorded the resolved path. The sibling must still be
+    cascaded and the group stamped."""
+    groups, review = _two_group_fixture()
+    proc, sessions, buckets = _run_step8(
+        tmp_path, groups, review, skips=[("a.md", 1)],
+        symlinked_vault=True, skip_root=(tmp_path / "vault" / "claude-sessions"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "cascaded_total=1" in proc.stdout, proc.stdout + proc.stderr
+    assert (sessions / "b.md").read_text().splitlines()[0] == "- [x] Ship the widget"
+    assert buckets["review"][0].get("applied") is True
+
+
+def test_step8_warns_when_recorded_flips_match_no_group(tmp_path):
+    """#340 review: recorded flips that match no group member leave nothing
+    stamped and nothing cascaded. That must be said, not printed as an
+    ordinary cascaded_total=0."""
+    groups, review = _two_group_fixture()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    proc, sessions, buckets = _run_step8(
+        tmp_path, groups, review, skips=[("a.md", 1)], skip_root=elsewhere,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "cascaded_total=0" in proc.stdout
+    assert "none matched a grouped item" in proc.stderr, proc.stderr
+    assert (sessions / "b.md").read_text().splitlines()[0] == "- [ ] Ship the widget"
