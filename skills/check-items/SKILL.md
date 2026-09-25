@@ -847,10 +847,20 @@ def _atomic_write_json(path, data):
 _atomic_write_json(buckets_path, buckets)
 
 # Build groups_to_cascade: DONE items from buckets["review"] that have members
-# in merged.json. Resolve member basenames to full paths.
+# in merged.json AND were stamped applied above. Resolve member basenames to
+# full paths.
+#
+# #340: only a group whose own occurrence the user actually flipped cascades.
+# Cascading every DONE group ignored the user's choices (a deselected DONE, or
+# a MED DONE they never opted into, was checked off anyway), and each such
+# cascade-only flip rendered `- [ ]` in Step 9's report while the vault said
+# `- [x]`. Gating on the stamp makes every cascaded group one the report
+# already renders checked.
 groups_to_cascade = []
 for b in buckets["review"]:
     if b.get("classification") != "DONE":
+        continue
+    if not b.get("applied"):
         continue
     gid = b.get("group_id")
     merged_group = groups_by_id.get(gid) if gid else None
@@ -928,7 +938,7 @@ PYEOF
 rm -f "$_skips_file"
 ```
 
-**Note on primary-flip loop tracking:** After each successful Edit in steps 1–4, append the flipped item's full file path and line number as `[path, line]` to a Python list, then write that list as JSON to `$_skips_file` before running the cascade block. This prevents the cascade from double-flipping lines the SKILL already handled. `batch_cascade_checkoff` is retained for ad-hoc text-search use outside this SKILL flow. `source_skips` has a second consumer now (#318 Task 6): the cascade block above also uses it to stamp `applied=True` on each buckets record it corresponds to, and rewrites `buckets_path` with that stamp before Step 9 runs.
+**Note on primary-flip loop tracking:** After each successful Edit in steps 1–4, append the flipped item's full file path and line number as `[path, line]` to a Python list, then write that list as JSON to `$_skips_file` before running the cascade block. This prevents the cascade from double-flipping lines the SKILL already handled. `batch_cascade_checkoff` is retained for ad-hoc text-search use outside this SKILL flow. `source_skips` has a second consumer now (#318 Task 6): the cascade block above also uses it to stamp `applied=True` on each buckets record it corresponds to, and rewrites `buckets_path` with that stamp before Step 9 runs. Only stamped DONE groups cascade (#340), so a DONE item the user deselected stays unchecked everywhere, siblings included.
 
 **Reading `cascade_total` and `cascade_skipped_total`:** Step 9 reads both mechanically from `cascade_summary.json` (written above, alongside `buckets_path`) — nothing to carry forward by hand. Still surface both to the terminal Output format's `Cascaded:` and `Skipped:` lines from this block's own printed `[cascade]`/`cascade_skipped_total=` output. If the python block above exited non-zero, its `WRITE FAILED` line is the reason — report it to the user verbatim rather than proceeding as if the cascade fully succeeded.
 
