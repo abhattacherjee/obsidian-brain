@@ -543,9 +543,15 @@ def get_current_branch() -> str:
 
 
 # ── gh pr create: enforce --base develop for feature branches ──
-# Use command-boundary regex to avoid false positives on strings containing
-# "gh pr create" (e.g. echo, grep, heredocs).
-if re.search(r'(?:^|[;&|]\s*)gh\s+' + _GLOBAL_OPTS + r'pr\s+create\b', command):
+# Matched ANYWHERE in the command, like require-preflight's commit verb (#334).
+# This used to be anchored to the start of the command or a `;`/`&`/`|`, to
+# spare strings that merely mention the verb (echo, grep, heredocs). But bash
+# also starts a command after a newline, a tab, `VAR=x `, `$(`, a backtick,
+# `(` and `{ `, and every one of those walked past the gate unchecked — the
+# bash-truth oracle in tests/test_security.py counted 468 of 663 executing
+# constructs allowed. A mention in an echo is now judged too; that is the
+# fail-closed direction, the same trade the other gates already make.
+if re.search(_PR_CREATE_VERB, command):
     # Skip if every occurrence targets a repo outside this project
     if not _targets_this_project(command, _PR_CREATE_VERB):
         sys.exit(0)
@@ -573,7 +579,8 @@ if re.search(r'(?:^|[;&|]\s*)gh\s+' + _GLOBAL_OPTS + r'pr\s+create\b', command):
 
 # ── gh pr merge: verify base branch before merging ──
 # Handles "gh pr merge 30", "gh pr merge --squash 30", and "gh pr merge" (no number).
-if re.search(r'(?:^|[;&|]\s*)gh\s+' + _GLOBAL_OPTS + r'pr\s+merge\b', command):
+# Matched anywhere, for the same reason as gh pr create above (#334).
+if re.search(_PR_MERGE_VERB, command):
     # Skip if every occurrence targets a repo outside this project
     if not _targets_this_project(command, _PR_MERGE_VERB):
         sys.exit(0)
