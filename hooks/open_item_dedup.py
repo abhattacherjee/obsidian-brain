@@ -16,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from obsidian_utils import get_workspace_roots
+from obsidian_utils import get_workspace_roots, match_items_against_evidence
 
 # --- Module-level compiled regexes (computed once at import) ---
 
@@ -78,6 +78,67 @@ def anchor_text_matches(line_text: str, reference_text: str, min_chars: int = _A
         return a == b and bool(a)
     return _longest_common_substring_len(a, b) >= min_chars
 
+
+def _format_text_verification_skips(
+    skips: "list[tuple[str, int]]",
+    unit: str,
+    reason: str = "failing text verification",
+    cap: int = 5,
+) -> str:
+    """Build a compact 'Skipped N <unit>(s) <reason>: ...' line.
+
+    ``reason`` defaults to the original drift wording so existing callers
+    are unaffected; #320 F4/F5 pass distinct wording for the checkbox-gone
+    and unverifiable(blank-text) skip classes so a reader can tell drift,
+    an already-consumed checkbox, and unreadable stored text apart instead
+    of one undifferentiated "failing text verification" bucket.
+
+    Caps the enumerated ``basename:line`` list at ``cap`` entries with a
+    ``+N more`` tail so a large drift event can't produce an unbounded
+    summary string (#250 Task 3).
+    """
+    shown = skips[:cap]
+    enumerated = ", ".join(f"{os.path.basename(fp)}:{ln}" for fp, ln in shown)
+    extra = len(skips) - len(shown)
+    tail = f", +{extra} more" if extra > 0 else ""
+    return f"Skipped {len(skips)} {unit}(s) {reason}: {enumerated}{tail}"
+
+
+_RE_SKIPPED_COUNT = re.compile(r"^Skipped (\d+)")
+# Matches the exact WRITE FAILED shape built by cascade_group_members /
+# batch_cascade_checkoff:
+#   f"WRITE FAILED for {len(write_failures)} file(s); "
+#   f"{total_lost} verified flip(s) were NOT saved: {names}"
+# Group 1 captures the lost-flip count (M), not the file count (N).
+_RE_WRITE_FAILED_COUNT = re.compile(
+    r"^WRITE FAILED for \d+ file\(s\); (\d+) verified flip\(s\) were NOT saved"
+)
+
+
+def parse_cascade_skipped_total(summary: str) -> int:
+    """Sum every skip/loss count out of a cascade summary string.
+
+    Adds each ``Skipped N ...`` line's N and each ``WRITE FAILED for N
+    file(s); M verified flip(s) were NOT saved: ...`` line's M (the lost
+    verified-flip count). This is the single source of truth for
+    skills/check-items/SKILL.md's ``cascade_skipped_total``, whose doc
+    (Output format section) promises a sum across every ``Skipped ...``/
+    ``WRITE FAILED`` line -- the inline parsing there previously summed
+    only ``Skipped`` lines, silently diverging from that doc (#320 R1
+    Gemini).
+    """
+    total = 0
+    for line in summary.splitlines():
+        sm = _RE_SKIPPED_COUNT.match(line)
+        if sm:
+            total += int(sm.group(1))
+            continue
+        wm = _RE_WRITE_FAILED_COUNT.match(line)
+        if wm:
+            total += int(wm.group(1))
+    return total
+
+
 _STOPWORDS = frozenset({
     'the', 'a', 'an', 'to', 'for', 'in', 'on', 'of', 'and', 'or',
     'but', 'is', 'are', 'was', 'were', 'be', 'not', 'this', 'that',
@@ -87,6 +148,19 @@ _STOPWORDS = frozenset({
 # ---------------------------------------------------------------------------
 # Confidence tier rules (spec § Confidence tiers, lines 324-332)
 # ---------------------------------------------------------------------------
+
+# #318: the exact citation shape check_items_cli's CLASSIFIER_PROMPT tells
+# the model to use for a note_completions hit ("reported done in session
+# YYYY-MM-DD (<title>)"). Shared between CONFIDENCE_TIER_RULES (normal MED
+# matching) and assign_tier's pre-HIGH-loop shape check (F1 below) so the
+# two never drift apart. F8 (#318 fix round 2 addendum): case-insensitive
+# -- sentence-casing ("Reported done...") is the most natural way a model
+# writes the start of a citation, and a bare case-sensitive match let a
+# single capital letter walk the citation past this fallback into the HIGH
+# loop. A sentence-cased citation should still reach MED through this
+# pattern; the note_evidence_only flag (F7) is the real, wording-independent
+# guard regardless.
+_NOTE_COMPLETION_CITATION_PATTERN = r"(?i)\breported done in session \d{4}-\d{2}-\d{2}\b"
 
 CONFIDENCE_TIER_RULES = {
     "HIGH": {
@@ -102,6 +176,7 @@ CONFIDENCE_TIER_RULES = {
             r"\bshipped\b",
             r"\bcovered by\b",
             r"#\d+",
+            _NOTE_COMPLETION_CITATION_PATTERN,
         ],
     },
     "LOW": {
@@ -135,7 +210,7 @@ def _outer_subagent_timeout() -> int:
 
 
 def assign_tier(evidence_citation, item_text, classification=None,
-                classifier_source=None):
+                classifier_source=None, note_evidence_only=False):
     """Deterministically assign HIGH | MED | LOW from evidence citation shape.
 
     HIGH requires a literal ref (sha, #N, vX.Y) appearing in BOTH the citation
@@ -153,12 +228,42 @@ def assign_tier(evidence_citation, item_text, classification=None,
     with existing callers, appended rather than inserted — all 23 pre-#297
     call sites pass 1-3 positional args). See the #297 comment below the cap.
 
+    `note_evidence_only` is optional and defaults to False (appended last,
+    same backward-compat rule). See #318 fix round 2 (F7) below: this is
+    THE enforcing guard for a note-completion citation, not the citation-
+    shape regex check that follows it.
+
     Spec § Confidence tiers (lines 324-332).
     """
     if not evidence_citation or not item_text:
         return "LOW"
     citation = str(evidence_citation)
     text = str(item_text)
+
+    # #318 fix round 2 (F7, CRITICAL): the citation-shape check below (added
+    # in fix round 1) is TEXT PATTERN MATCHING against a string the
+    # classifier model composes freely. A reviewer found five one-word-off
+    # phrasings ("session note 2026-02-01" / "reported complete in session"
+    # / no template at all, just "#318 is done") that all skip the regex and
+    # fall through to the HIGH literal-ref loop -- persuading a model to
+    # reproduce a literal string is not enforcement. `note_evidence_only` is
+    # DATA WE CONTROL: check_items_cli stamps it from the evidence bundle's
+    # own keys (whether the project's evidence is note_completions-only, no
+    # git-derived bucket at all), so it cannot be defeated by wording. If
+    # true, no citation for this item can legitimately be HIGH regardless of
+    # what the model wrote — cap at MED unconditionally, before anything
+    # else runs.
+    if note_evidence_only:
+        return "MED"
+
+    # #318/#297 fix round 1: fallback second line of defence for a project
+    # that ALSO has git evidence (so note_evidence_only is False) but whose
+    # citation still happens to match the exact template
+    # check_items_cli.CLASSIFIER_PROMPT asks for. Kept, but no longer the
+    # only guard — see F7 above for why text-shape matching alone doesn't
+    # enforce anything.
+    if re.search(_NOTE_COMPLETION_CITATION_PATTERN, citation):
+        return "MED"
 
     # #297: a heuristic citation is BUILT FROM a token lifted out of the item
     # text, so "ref appears in both citation and text" is trivially true and
@@ -317,6 +422,151 @@ def collect_open_items(
 
         if matched >= max_sessions:
             break
+
+    return results
+
+
+_NOTE_EVIDENCE_WINDOW = 10  # mirrors obsidian_utils._OPEN_ITEM_EVIDENCE_WINDOW
+_SUMMARY_RE = re.compile(r"## Summary\n(.+?)(?=\n## |\Z)", re.DOTALL)
+
+
+def gather_note_completion_evidence(
+    vault_path: str,
+    sessions_folder: str,
+    project: str,
+    max_sessions: int = 10,
+) -> list[dict]:
+    """Open items that a STRICTLY NEWER session's own summary reports done.
+
+    The one evidence source that needs no git repo (#318). Same signal
+    /recall surfaces as `contradicted_by`, same two guards: the evidence
+    session must be strictly newer than the item's own session, and the
+    match must carry a completion phrase — a mere co-mention of the same
+    branch or file is not completion (BH-001).
+
+    Returns [{"text", "file", "line", "contradicted_by",
+              "contradicted_by_title", "confidence"}].
+    """
+    sessions_dir = os.path.join(vault_path, sessions_folder)
+    if not os.path.isdir(sessions_dir):
+        return []
+
+    all_files = sorted(os.listdir(sessions_dir), reverse=True)
+
+    # Single pass, newest-first: apply the SAME project/type filter
+    # collect_open_items() uses (first 20 frontmatter lines, quote-stripped,
+    # no `type:` field means legacy session) while also picking up `date:`.
+    # Building the evidence pool and the per-note date map here (rather than
+    # re-deriving them from a second scan) guarantees both cover exactly the
+    # same note set collect_open_items() will read below.
+    evidence_pool: list[tuple[str, str, str]] = []  # (date, title, summary_text)
+    date_by_path: dict[str, str] = {}
+    matched = 0
+
+    for fname in all_files:
+        if not fname.endswith('.md'):
+            continue
+
+        fpath = os.path.join(sessions_dir, fname)
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+        except OSError as exc:
+            print(f"[obsidian-brain] note-completion: skipping unreadable note {fname}: {exc}", file=sys.stderr)
+            continue
+        except UnicodeDecodeError as exc:
+            print(f"[obsidian-brain] note-completion: encoding error in {fname}: {exc}", file=sys.stderr)
+            continue
+
+        project_match = False
+        is_session = True  # default for notes with no type field (legacy)
+        type_field_seen = False
+        note_date = ''
+        for line in lines[:20]:
+            stripped = line.strip()
+            if stripped.startswith('project:'):
+                val = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                if val == project:
+                    project_match = True
+            elif stripped.startswith('type:'):
+                type_field_seen = True
+                tval = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                is_session = (tval == 'claude-session')
+            elif stripped.startswith('date:'):
+                note_date = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+        if not project_match or (type_field_seen and not is_session):
+            continue
+
+        matched += 1
+        # An item whose source note has no date: is never flagged --
+        # "strictly newer" is undefined without one. Simply don't record it.
+        if note_date:
+            date_by_path[os.path.abspath(fpath)] = note_date
+
+            # F9 (#318 fix round 2 addendum): no separate pool-size cap here.
+            # A prior version gated this append on `len(evidence_pool) <
+            # _pool_cap` (F3's fix), but that check is unreachable-False by
+            # construction: `matched` (incremented once per matching note,
+            # unconditionally, above) can never exceed max_sessions -- the
+            # loop's own `if matched >= max_sessions: break` guarantees it --
+            # and evidence_pool grows by at most one entry per matching note.
+            # So len(evidence_pool) < matched <= max_sessions always, i.e.
+            # the body-read below already runs at most max_sessions times
+            # without any extra gate. A guard that can never turn False is
+            # not a guard; the real bound is the loop's own break condition.
+            content = ''.join(lines)
+            m = _SUMMARY_RE.search(content)
+            if m:
+                summary_text = m.group(1).strip()
+                if summary_text:
+                    first_line = summary_text.split('\n')[0].strip()
+                    title = first_line or f"Session: {project}"
+                    evidence_pool.append((note_date, title, summary_text))
+
+        if matched >= max_sessions:
+            break
+
+    items = collect_open_items(vault_path, sessions_folder, project, max_sessions)
+    if not items:
+        return []
+
+    results: list[dict] = []
+    for fpath, line_num, item_text in items:
+        item_date = date_by_path.get(os.path.abspath(fpath), '')
+        if not item_date:
+            continue
+        best: dict | None = None
+        for ev_date, ev_title, ev_summary in evidence_pool:
+            # Compare day-prefixes so a `date:` carrying a full datetime
+            # still compares correctly against a date-only value.
+            if ev_date[:10] <= item_date[:10]:
+                continue  # same-date or older session — never contradicts
+            candidates = match_items_against_evidence(
+                ev_summary, [(fpath, line_num, item_text)]
+            )
+            for c in candidates:
+                # BH-001: a co-mentioned branch/file alone is not completion.
+                # Preflight ruling R6: match_items_against_evidence() already
+                # rejects score < 3 before returning, and the completion-
+                # phrase boost below adds +2 AFTER that check — so every
+                # candidate reaching this point with has_completion_phrase
+                # already carries confidence >= 5. Re-checking a confidence
+                # floor here would be unreachable dead code.
+                if not c.get("has_completion_phrase"):
+                    continue
+                if best is None or c["confidence"] > best["confidence"]:
+                    # F2: store the date-only prefix, not the raw `date:`
+                    # value. A datetime-shaped date (e.g.
+                    # "2026-02-01T09:30:00Z") would otherwise flow into the
+                    # "reported done in session <contradicted_by>" citation
+                    # and break the MED regex's trailing \b (no word
+                    # boundary between the day's last digit and "T"),
+                    # silently dropping the tier to LOW.
+                    c["contradicted_by"] = ev_date[:10]
+                    c["contradicted_by_title"] = ev_title
+                    best = c
+        if best is not None:
+            results.append(best)
 
     return results
 
@@ -499,9 +749,35 @@ def batch_cascade_checkoff(
     for checked_text in checked_texts:
         dupes = cascade_checkoff(checked_text, existing)
         for fpath, line_num, item_text, confidence in dupes:
+            # #320 R1 (Gemini): same line_num hardening as
+            # cascade_group_members above -- line_num is a hint carried
+            # from find_duplicates/existing_items and is not guaranteed to
+            # be a genuine positive int. Reject at the boundary instead of
+            # letting a bad value reach `idx = ln - 1` / `lines[idx]` in the
+            # write loop below, which raises TypeError mid-loop and can
+            # leave a cascade half-applied after earlier files were already
+            # committed via os.replace. isinstance(True, int) is True in
+            # Python, so bool must be excluded explicitly.
+            if not isinstance(line_num, int) or isinstance(line_num, bool) or line_num <= 0:
+                print(
+                    f"[obsidian-brain] batch_cascade_checkoff: candidate in "
+                    f"{os.path.basename(fpath)} has a malformed line number "
+                    f"({line_num!r}, type {type(line_num).__name__}); skipping.",
+                    file=sys.stderr,
+                )
+                continue
             key = (fpath, line_num)
             if confidence == "high":
-                high_targets[key] = item_text
+                # #320 F7: item_text is a hint carried from upstream grouping
+                # data, not guaranteed to be a string (a corrupted cache
+                # entry could hand back an int/list/dict). A non-string
+                # reaches .strip() at the flip site below and raises
+                # AttributeError mid-loop, which can leave a cascade
+                # half-applied after earlier files were already committed
+                # via os.replace. Sanitize at the boundary instead: treat
+                # anything non-string as blank (unverifiable), same as an
+                # empty string.
+                high_targets[key] = item_text if isinstance(item_text, str) else ""
             else:
                 fuzzy_raw.append((key, item_text, os.path.basename(fpath)))
 
@@ -514,16 +790,22 @@ def batch_cascade_checkoff(
     if not high_targets and not fuzzy_suggestions:
         return "No duplicates found for cascading."
 
-    # Edit files for high-confidence targets
-    # Group by file to minimize file rewrites
-    files_to_edit: dict[str, list[int]] = {}
-    for (fpath, line_num), _ in high_targets.items():
-        files_to_edit.setdefault(fpath, []).append(line_num)
+    # Edit files for high-confidence targets. Carry each target's stored item
+    # text through so the flip site can verify it, not just trust the index
+    # (#250 -- verify-don't-re-resolve, mirroring the group-member cascade).
+    # Group by file to minimize file rewrites.
+    files_to_edit: dict[str, list[tuple[int, str]]] = {}
+    for (fpath, line_num), item_text in high_targets.items():
+        files_to_edit.setdefault(fpath, []).append((line_num, item_text))
 
     edited_count = 0
     edited_files: set[str] = set()
+    drift_skips: list[tuple[str, int]] = []
+    unverifiable_skips: list[tuple[str, int]] = []  # #320 F5: blank/missing text, split from drift
+    checkbox_skips: list[tuple[str, int]] = []  # #320 F4: checkbox already gone, was stderr-only
+    write_failures: list[tuple[str, int]] = []  # #320 F2: verified flips lost to a failed os.replace
 
-    for fpath, line_nums in files_to_edit.items():
+    for fpath, line_refs in files_to_edit.items():
         try:
             with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
@@ -532,12 +814,35 @@ def batch_cascade_checkoff(
             continue
 
         file_edit_count = 0
-        for ln in line_nums:
+        for ln, ref_text in line_refs:
             idx = ln - 1  # 0-indexed
             if 0 <= idx < len(lines) and lines[idx].lstrip().startswith('- [ ] '):
-                lines[idx] = lines[idx].replace('- [ ] ', '- [x] ', 1)
-                file_edit_count += 1
+                # Checkbox guard passed (unchanged -- this is what prevents
+                # prose corruption). Verify the line still IS the item we
+                # mean to check off before flipping it: never re-resolve to
+                # a different line, only confirm or refuse this one (#250).
+                if not ref_text.strip():
+                    unverifiable_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade: line {ln} in {os.path.basename(fpath)} "
+                        f"has no reference text to verify against (unverifiable); skipping.",
+                        file=sys.stderr,
+                    )
+                elif anchor_text_matches(lines[idx].rstrip("\n"), ref_text):
+                    lines[idx] = lines[idx].replace('- [ ] ', '- [x] ', 1)
+                    file_edit_count += 1
+                else:
+                    drift_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade: line {ln} in {os.path.basename(fpath)} "
+                        f"no longer matches the recorded item text (line drifted); skipping.",
+                        file=sys.stderr,
+                    )
             else:
+                # #320 F4: this was stderr-only, which made a renumbered line
+                # landing on prose or an already-checked box the most likely
+                # real drift signal AND the one least likely to be seen.
+                checkbox_skips.append((fpath, ln))
                 print(
                     f"[obsidian-brain] cascade: line {ln} in {os.path.basename(fpath)} "
                     f"no longer contains expected checkbox (file may have changed)",
@@ -563,17 +868,30 @@ def batch_cascade_checkoff(
                 edited_count += file_edit_count  # count only after successful write
             except OSError as exc:
                 print(f"[obsidian-brain] cascade: write failed for {os.path.basename(fpath)}: {exc}", file=sys.stderr)
+                # #320 F2: file_edit_count verified flips were computed but
+                # never reached disk. Name the loss instead of letting it
+                # silently collapse into "nothing to cascade".
+                write_failures.append((fpath, file_edit_count))
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
 
-    # Build summary
+    # Build summary. #320 F3: once ANY high-confidence target existed, never
+    # collapse "every one of them was refused or lost" down to the same
+    # "No duplicates found for cascading." wording used for a genuinely
+    # empty run -- that early return above already covers the true empty
+    # case. Keep the success wording byte-identical.
     parts: list[str] = []
     if edited_count:
         parts.append(
             f"Cascaded {edited_count} high-confidence duplicate(s) "
             f"in {len(edited_files)} file(s)."
+        )
+    elif drift_skips or unverifiable_skips or checkbox_skips or write_failures:
+        parts.append(
+            "Cascaded 0 high-confidence duplicate(s) — "
+            "every candidate was refused or failed to save."
         )
     if fuzzy_suggestions:
         parts.append("Fuzzy suggestions (edit manually if same item):")
@@ -583,6 +901,26 @@ def batch_cascade_checkoff(
             if key not in seen:
                 seen.add(key)
                 parts.append(f'  - "{item_text}" in {basename}')
+    if drift_skips:
+        # #250 Task 3: surface text-verification skips in the RETURN VALUE,
+        # not only stderr -- a hook's caller may never show stderr.
+        parts.append(_format_text_verification_skips(drift_skips, "item"))
+    if unverifiable_skips:
+        parts.append(_format_text_verification_skips(
+            unverifiable_skips, "item",
+            reason="with no text to verify against (unverifiable)",
+        ))
+    if checkbox_skips:
+        parts.append(_format_text_verification_skips(
+            checkbox_skips, "item", reason="whose checkbox is gone",
+        ))
+    if write_failures:
+        total_lost = sum(n for _, n in write_failures)
+        names = ", ".join(os.path.basename(fp) for fp, _ in write_failures)
+        parts.append(
+            f"WRITE FAILED for {len(write_failures)} file(s); "
+            f"{total_lost} verified flip(s) were NOT saved: {names}"
+        )
 
     return "\n".join(parts) if parts else "No duplicates found for cascading."
 
@@ -600,37 +938,92 @@ def cascade_group_members(
     Lines that no longer contain a ``- [ ] `` checkbox at apply-time are
     skipped with a stderr warning (file may have changed since grouping).
 
+    Verify-don't-re-resolve (#250): each target is flipped ONLY when the line
+    at its stored index still text-anchors to the member's own stored
+    ``text`` (via ``anchor_text_matches``). A member is never re-searched for
+    elsewhere in the file -- the index is a hint that is confirmed or
+    refused, never re-resolved to a different line. This is deliberately NOT
+    #201 Guard B's "unique text match -> act, 2+ -> refuse" contract: a
+    cascade group IS a set of near-identical lines by construction, so
+    refusing on 2+ matches would refuse exactly the case the cascade exists
+    to serve. Verifying each member against its own index instead preserves
+    multi-sibling cascades while still closing the drift hole (a member line
+    that drifted onto a DIFFERENT still-active checkbox is no longer
+    flipped). Blank/missing stored text is UNVERIFIABLE and is skipped, not
+    flipped, for the same reason.
+
     Returns a compact summary string: ``"Cascaded N member-line(s) across M
-    file(s)."`` or ``"No member lines to cascade."`` for empty input.
+    file(s)."`` or ``"No member lines to cascade."`` for empty input. Any
+    text-verification skips (drifted or unverifiable) are appended as an
+    additional line so a hook caller sees them even without stderr.
     """
     if source_skips is None:
         source_skips = set()
 
-    # Collect all (full_path, line_number) targets, deduplicated
-    targets: dict[tuple[str, int], None] = {}  # ordered dict as ordered set
+    # Collect all (full_path, line_number) -> reference text targets,
+    # deduplicated. When the same key appears twice, keep the FIRST
+    # non-blank text rather than letting a later blank overwrite a usable
+    # anchor (#250).
+    targets: dict[tuple[str, int], str] = {}  # ordered dict as ordered map
     for group in groups or []:
         for m in group.get("members", []) or []:
             fpath = m.get("file", "")
             line_num = m.get("line")
-            if not fpath or line_num is None:
+            if not fpath:
+                continue
+            # #320 R1 (Gemini): line_num is a hint carried from merged.json,
+            # not guaranteed to be a genuine positive int (a corrupted cache
+            # entry could hand back a str/float/bool). `not isinstance(...,
+            # int) or isinstance(..., bool) or line_num <= 0` mirrors the
+            # non-string `text` sanitization above -- reject at the boundary
+            # instead of letting a bad value reach `idx = ln - 1` /
+            # `lines[idx]` below, which raises TypeError mid-loop and can
+            # leave a cascade half-applied after earlier files were already
+            # committed via os.replace. isinstance(True, int) is True in
+            # Python, so bool must be excluded explicitly -- a bool must
+            # NOT be accepted as a line number (True would silently flip
+            # line 0).
+            if not isinstance(line_num, int) or isinstance(line_num, bool) or line_num <= 0:
+                print(
+                    f"[obsidian-brain] cascade_group_members: member in "
+                    f"{os.path.basename(fpath)} has a malformed line number "
+                    f"({line_num!r}, type {type(line_num).__name__}); skipping.",
+                    file=sys.stderr,
+                )
                 continue
             key = (fpath, line_num)
             if key in source_skips:
                 continue
-            targets[key] = None
+            # #320 F7: a member's "text" is a hint carried from merged.json,
+            # not guaranteed to be a string (a corrupted cache entry could
+            # hand back an int/list/dict). A non-string reaches .strip() at
+            # the flip site below and raises AttributeError mid-loop, which
+            # can leave a cascade half-applied after earlier files were
+            # already committed via os.replace. Sanitize at the boundary:
+            # treat anything non-string as blank (unverifiable).
+            text = m.get("text", "")
+            text = text if isinstance(text, str) else ""
+            if key not in targets:
+                targets[key] = text
+            elif not targets[key].strip() and text.strip():
+                targets[key] = text
 
     if not targets:
         return "No member lines to cascade."
 
     # Group by file to minimise rewrites
-    files_to_lines: dict[str, list[int]] = {}
-    for fpath, line_num in targets:
-        files_to_lines.setdefault(fpath, []).append(line_num)
+    files_to_lines: dict[str, list[tuple[int, str]]] = {}
+    for (fpath, line_num), ref_text in targets.items():
+        files_to_lines.setdefault(fpath, []).append((line_num, ref_text))
 
     total_flipped = 0
     files_edited: set[str] = set()
+    drift_skips: list[tuple[str, int]] = []
+    unverifiable_skips: list[tuple[str, int]] = []  # #320 F5: blank/missing text, split from drift
+    checkbox_skips: list[tuple[str, int]] = []  # #320 F4: checkbox already gone, was stderr-only
+    write_failures: list[tuple[str, int]] = []  # #320 F2: verified flips lost to a failed os.replace
 
-    for fpath, line_nums in files_to_lines.items():
+    for fpath, line_refs in files_to_lines.items():
         try:
             with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.readlines()
@@ -643,12 +1036,36 @@ def cascade_group_members(
             continue
 
         file_flipped = 0
-        for ln in line_nums:
+        for ln, ref_text in line_refs:
             idx = ln - 1  # 0-indexed
             if 0 <= idx < len(lines) and lines[idx].lstrip().startswith("- [ ] "):
-                lines[idx] = lines[idx].replace("- [ ] ", "- [x] ", 1)
-                file_flipped += 1
+                # Checkbox guard passed (unchanged -- this is what prevents
+                # prose corruption, #250's "mode 2"). Verify the line still
+                # IS the member we mean to check off before flipping it.
+                if not ref_text.strip():
+                    unverifiable_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade_group_members: line {ln} in "
+                        f"{os.path.basename(fpath)} has no reference text to "
+                        f"verify against (unverifiable); skipping.",
+                        file=sys.stderr,
+                    )
+                elif anchor_text_matches(lines[idx].rstrip("\n"), ref_text):
+                    lines[idx] = lines[idx].replace("- [ ] ", "- [x] ", 1)
+                    file_flipped += 1
+                else:
+                    drift_skips.append((fpath, ln))
+                    print(
+                        f"[obsidian-brain] cascade_group_members: line {ln} in "
+                        f"{os.path.basename(fpath)} no longer matches the "
+                        f"grouped item text (line drifted); skipping.",
+                        file=sys.stderr,
+                    )
             else:
+                # #320 F4: this was stderr-only, which made a renumbered line
+                # landing on prose or an already-checked box the most likely
+                # real drift signal AND the one least likely to be seen.
+                checkbox_skips.append((fpath, ln))
                 print(
                     f"[obsidian-brain] cascade_group_members: line {ln} in "
                     f"{os.path.basename(fpath)} no longer contains expected "
@@ -680,16 +1097,49 @@ def cascade_group_members(
                 f"{os.path.basename(fpath)}: {exc}",
                 file=sys.stderr,
             )
+            # #320 F2: file_flipped verified flips were computed but never
+            # reached disk. Name the loss instead of letting it silently
+            # collapse into "nothing to cascade".
+            write_failures.append((fpath, file_flipped))
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
 
-    if total_flipped == 0:
-        return "No member lines to cascade."
-    return (
-        f"Cascaded {total_flipped} member-line(s) across {len(files_edited)} file(s)."
-    )
+    # #320 F3: once ANY target existed, never collapse "every one of them
+    # was refused or lost" down to the same "No member lines to cascade."
+    # wording used for a genuinely empty run -- that early return above
+    # already covers the true empty case. Keep the success wording
+    # byte-identical.
+    if total_flipped:
+        base = f"Cascaded {total_flipped} member-line(s) across {len(files_edited)} file(s)."
+    elif drift_skips or unverifiable_skips or checkbox_skips or write_failures:
+        base = "Cascaded 0 member-line(s) — every candidate was refused or failed to save."
+    else:
+        base = "No member lines to cascade."
+
+    parts = [base]
+    if drift_skips:
+        # #250 Task 3: surface text-verification skips in the RETURN VALUE,
+        # not only stderr -- a hook's caller may never show stderr.
+        parts.append(_format_text_verification_skips(drift_skips, "member-line"))
+    if unverifiable_skips:
+        parts.append(_format_text_verification_skips(
+            unverifiable_skips, "member-line",
+            reason="with no text to verify against (unverifiable)",
+        ))
+    if checkbox_skips:
+        parts.append(_format_text_verification_skips(
+            checkbox_skips, "member-line", reason="whose checkbox is gone",
+        ))
+    if write_failures:
+        total_lost = sum(n for _, n in write_failures)
+        names = ", ".join(os.path.basename(fp) for fp, _ in write_failures)
+        parts.append(
+            f"WRITE FAILED for {len(write_failures)} file(s); "
+            f"{total_lost} verified flip(s) were NOT saved: {names}"
+        )
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -790,7 +1240,7 @@ def deep_analysis_pipeline(
 ) -> str:
     """Single-pass deep analysis: similarity, open items, evidence gathering.
 
-    Returns 'OK:<total_items>:<groups>:<projects_with_evidence>'.
+    Returns 'OK:<total_items>:<groups>:<projects_with_evidence>:<projects_without_repo_count>'.
     Writes structured JSON to output_path (atomic: tempfile + rename).
 
     15-minute module-level cache keyed on (projects_json, vault_path,
@@ -946,165 +1396,214 @@ def deep_analysis_pipeline(
     project_paths = _resolve_project_paths()
     evidence: dict[str, dict] = {}
     projects_with_evidence = 0
+    projects_without_repo: list[str] = []
 
     for project in projects:
         repo_path = project_paths.get(project)
         if not repo_path:
-            continue
+            # #318: this used to `continue` in silence. EVERY evidence source
+            # below is git-derived, so a repo-less project reaches the
+            # classifier with an empty bundle, caps at tier LOW, and can never
+            # reach DONE+HIGH (the only combination Step 7 preselects). The
+            # run then presents as a normal triage. Name it instead.
+            projects_without_repo.append(project)
+            print(
+                f"[obsidian-brain] {project}: no local git repo — every "
+                f"git-derived evidence source is unavailable, so no item in "
+                f"this project can reach tier HIGH or classification DONE",
+                file=sys.stderr,
+            )
 
         proj_evidence: dict[str, object] = {}
 
-        # git log (last 40 commits)
-        try:
-            proc = subprocess.run(
-                ["git", "log", "--oneline", "-40"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                proj_evidence["commits"] = proc.stdout.strip().split("\n")[:40]
-            else:
-                print(f"[obsidian-brain] git log failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] git log error for {project}: {exc}", file=sys.stderr)
-
-        # git tag --list (#264 Task 2: widen git ground truth). A genuinely-
-        # shipped item may be grounded in a release tag rather than a PR/issue
-        # title (e.g. the reporter's `feature/pull-to-refresh-v2` case, shipped
-        # via tag v2.0.0 with no #N anchor in the checkbox text). Sorted by
-        # creation recency and capped/deduped to keep the evidence blob small.
-        try:
-            proc = subprocess.run(
-                ["git", "tag", "--list", "--sort=-creatordate"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                _seen_tags: set[str] = set()
-                _tags: list[str] = []
-                for _line in proc.stdout.strip().split("\n"):
-                    _line = _line.strip()
-                    if not _line or _line in _seen_tags:
-                        continue
-                    _seen_tags.add(_line)
-                    _tags.append(_line)
-                    if len(_tags) >= _MAX_EVIDENCE_TAGS:
-                        break
-                proj_evidence["tags"] = _tags
-            else:
-                print(f"[obsidian-brain] git tag failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["tags"] = []
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] git tag error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["tags"] = []
-
-        # git log --name-only (#264 Task 2: changed file paths on the default
-        # branch's recent history). Completion may live in changed paths rather
-        # than a PR title (e.g. source/test/doc files landing under a shipped
-        # component's directory). Deduped and hard-capped so the evidence blob
-        # stays bounded regardless of commit size.
-        try:
-            proc = subprocess.run(
-                ["git", "log", "--name-only", "--pretty=format:", "-40"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                _seen_paths: set[str] = set()
-                _paths: list[str] = []
-                for _line in proc.stdout.strip().split("\n"):
-                    _line = _line.strip()
-                    if not _line or _line in _seen_paths:
-                        continue
-                    _seen_paths.add(_line)
-                    _paths.append(_line)
-                    if len(_paths) >= _MAX_EVIDENCE_CHANGED_PATHS:
-                        break
-                proj_evidence["changed_paths"] = _paths
-            else:
-                print(f"[obsidian-brain] git log --name-only failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["changed_paths"] = []
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] git log --name-only error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["changed_paths"] = []
-
-        # gh release list
-        try:
-            proc = subprocess.run(
-                ["gh", "release", "list", "--limit", "5"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                proj_evidence["releases"] = proc.stdout.strip().split("\n")[:5]
-            else:
-                print(f"[obsidian-brain] gh release list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"[obsidian-brain] gh release error for {project}: {exc}", file=sys.stderr)
-
-        # gh pr list --state merged
-        try:
-            proc = subprocess.run(
-                ["gh", "pr", "list", "--state", "merged", "--limit", "20",
-                 "--json", "number,title,mergedAt,url"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                try:
-                    proj_evidence["merged_prs"] = json.loads(proc.stdout)
-                except json.JSONDecodeError as exc:
-                    print(f"[obsidian-brain] gh pr list JSON error for {project}: {exc}", file=sys.stderr)
-                    proj_evidence["merged_prs"] = []
-            else:
-                print(f"[obsidian-brain] gh pr list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["merged_prs"] = []
-        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-            print(f"[obsidian-brain] gh pr list error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["merged_prs"] = []
-
-        # gh issue list --state closed
-        try:
-            proc = subprocess.run(
-                ["gh", "issue", "list", "--state", "closed", "--limit", "20",
-                 "--json", "number,title,closedAt,body,url"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0:
-                try:
-                    proj_evidence["closed_issues"] = json.loads(proc.stdout)
-                except json.JSONDecodeError as exc:
-                    print(f"[obsidian-brain] gh issue list JSON error for {project}: {exc}", file=sys.stderr)
-                    proj_evidence["closed_issues"] = []
-            else:
-                print(f"[obsidian-brain] gh issue list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
-                proj_evidence["closed_issues"] = []
-        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-            print(f"[obsidian-brain] gh issue list error for {project}: {exc}", file=sys.stderr)
-            proj_evidence["closed_issues"] = []
-
-        # CHANGELOG.md excerpt
-        changelog_path = os.path.join(repo_path, "CHANGELOG.md")
-        if os.path.isfile(changelog_path):
+        if repo_path:
+            # git log (last 40 commits)
             try:
-                with open(changelog_path, 'r', encoding='utf-8', errors='replace') as f:
-                    proj_evidence["changelog_excerpt"] = f.read(2000)
-            except OSError:
-                pass
-
-        # FTS5 search for each open item scoped to THIS project
-        proj_items = [g["representative"] for g in all_groups if g["project"] == project]
-        fts_mentions: dict[str, int] = {}
-        for item_text in proj_items[:10]:  # cap to avoid excessive queries
-            kws = vault_index.extract_keywords(item_text, limit=3)
-            if kws:
-                # Pass keywords as space-separated (not "OR"-joined — search_vault
-                # handles tokenization internally; literal "OR" would be a search term)
-                hits = vault_index.search_vault(
-                    actual_db, " ".join(kws), project=project, limit=5,
+                proc = subprocess.run(
+                    ["git", "log", "--oneline", "-40"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
                 )
-                fts_mentions[item_text[:60]] = len(hits)
-        if fts_mentions:
-            proj_evidence["fts_mentions"] = fts_mentions
+                if proc.returncode == 0:
+                    proj_evidence["commits"] = proc.stdout.strip().split("\n")[:40]
+                else:
+                    print(f"[obsidian-brain] git log failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] git log error for {project}: {exc}", file=sys.stderr)
+
+            # git tag --list (#264 Task 2: widen git ground truth). A genuinely-
+            # shipped item may be grounded in a release tag rather than a PR/issue
+            # title (e.g. the reporter's `feature/pull-to-refresh-v2` case, shipped
+            # via tag v2.0.0 with no #N anchor in the checkbox text). Sorted by
+            # creation recency and capped/deduped to keep the evidence blob small.
+            try:
+                proc = subprocess.run(
+                    ["git", "tag", "--list", "--sort=-creatordate"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    _seen_tags: set[str] = set()
+                    _tags: list[str] = []
+                    for _line in proc.stdout.strip().split("\n"):
+                        _line = _line.strip()
+                        if not _line or _line in _seen_tags:
+                            continue
+                        _seen_tags.add(_line)
+                        _tags.append(_line)
+                        if len(_tags) >= _MAX_EVIDENCE_TAGS:
+                            break
+                    proj_evidence["tags"] = _tags
+                else:
+                    print(f"[obsidian-brain] git tag failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["tags"] = []
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] git tag error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["tags"] = []
+
+            # git log --name-only (#264 Task 2: changed file paths on the default
+            # branch's recent history). Completion may live in changed paths rather
+            # than a PR title (e.g. source/test/doc files landing under a shipped
+            # component's directory). Deduped and hard-capped so the evidence blob
+            # stays bounded regardless of commit size.
+            try:
+                proc = subprocess.run(
+                    ["git", "log", "--name-only", "--pretty=format:", "-40"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    _seen_paths: set[str] = set()
+                    _paths: list[str] = []
+                    for _line in proc.stdout.strip().split("\n"):
+                        _line = _line.strip()
+                        if not _line or _line in _seen_paths:
+                            continue
+                        _seen_paths.add(_line)
+                        _paths.append(_line)
+                        if len(_paths) >= _MAX_EVIDENCE_CHANGED_PATHS:
+                            break
+                    proj_evidence["changed_paths"] = _paths
+                else:
+                    print(f"[obsidian-brain] git log --name-only failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["changed_paths"] = []
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] git log --name-only error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["changed_paths"] = []
+
+            # gh release list
+            try:
+                proc = subprocess.run(
+                    ["gh", "release", "list", "--limit", "5"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    proj_evidence["releases"] = proc.stdout.strip().split("\n")[:5]
+                else:
+                    print(f"[obsidian-brain] gh release list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[obsidian-brain] gh release error for {project}: {exc}", file=sys.stderr)
+
+            # gh pr list --state merged
+            try:
+                proc = subprocess.run(
+                    ["gh", "pr", "list", "--state", "merged", "--limit", "20",
+                     "--json", "number,title,mergedAt,url"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    try:
+                        proj_evidence["merged_prs"] = json.loads(proc.stdout)
+                    except json.JSONDecodeError as exc:
+                        print(f"[obsidian-brain] gh pr list JSON error for {project}: {exc}", file=sys.stderr)
+                        proj_evidence["merged_prs"] = []
+                else:
+                    print(f"[obsidian-brain] gh pr list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["merged_prs"] = []
+            except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+                print(f"[obsidian-brain] gh pr list error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["merged_prs"] = []
+
+            # gh issue list --state closed
+            try:
+                proc = subprocess.run(
+                    ["gh", "issue", "list", "--state", "closed", "--limit", "20",
+                     "--json", "number,title,closedAt,body,url"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    try:
+                        proj_evidence["closed_issues"] = json.loads(proc.stdout)
+                    except json.JSONDecodeError as exc:
+                        print(f"[obsidian-brain] gh issue list JSON error for {project}: {exc}", file=sys.stderr)
+                        proj_evidence["closed_issues"] = []
+                else:
+                    print(f"[obsidian-brain] gh issue list failed for {project}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+                    proj_evidence["closed_issues"] = []
+            except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+                print(f"[obsidian-brain] gh issue list error for {project}: {exc}", file=sys.stderr)
+                proj_evidence["closed_issues"] = []
+
+            # CHANGELOG.md excerpt
+            changelog_path = os.path.join(repo_path, "CHANGELOG.md")
+            if os.path.isfile(changelog_path):
+                try:
+                    with open(changelog_path, 'r', encoding='utf-8', errors='replace') as f:
+                        proj_evidence["changelog_excerpt"] = f.read(2000)
+                except OSError:
+                    pass
+
+            # FTS5 search for each open item scoped to THIS project
+            proj_items = [g["representative"] for g in all_groups if g["project"] == project]
+            fts_mentions: dict[str, int] = {}
+            for item_text in proj_items[:10]:  # cap to avoid excessive queries
+                kws = vault_index.extract_keywords(item_text, limit=3)
+                if kws:
+                    # Pass keywords as space-separated (not "OR"-joined — search_vault
+                    # handles tokenization internally; literal "OR" would be a search term)
+                    hits = vault_index.search_vault(
+                        actual_db, " ".join(kws), project=project, limit=5,
+                    )
+                    fts_mentions[item_text[:60]] = len(hits)
+            if fts_mentions:
+                proj_evidence["fts_mentions"] = fts_mentions
+
+        else:
+            # #318 I3 ruling: note-completion evidence is gathered ONLY when
+            # there is no repo, not unconditionally for every project. This
+            # used to run outside the `if repo_path:` block above, so a
+            # repo-backed project's bundle carried note_completions
+            # ALONGSIDE git-derived keys -- note_evidence_only_for() (the MED
+            # cap) is a per-PROJECT flag, not per-verdict, so any git key
+            # being present at all (even an empty one) flips it False and a
+            # paraphrased note citation sharing a literal ref with the item
+            # text could reach HIGH and get auto-checked. Scoping this to
+            # repo-less projects makes the safety property unconditional: a
+            # note-derived verdict can never reach HIGH, full stop. This
+            # trades away the note-completion signal on repo-backed
+            # projects entirely (live dogfood found 6 of 7 real hits there)
+            # -- restoring it needs per-verdict provenance, not a per-project
+            # flag, and is a follow-up issue, not this branch.
+            try:
+                _note_done = gather_note_completion_evidence(
+                    vault_path, sessions_folder, project,
+                )
+            except OSError as exc:
+                print(f"[obsidian-brain] note-completion scan failed for "
+                      f"{project}: {exc}", file=sys.stderr)
+                _note_done = []
+            if _note_done:
+                proj_evidence["note_completions"] = _note_done
 
         if proj_evidence:
             evidence[project] = proj_evidence
             projects_with_evidence += 1
+
+    if projects and not projects_with_evidence:
+        print(
+            f"[obsidian-brain] WARNING: 0 of {len(projects)} project(s) "
+            f"produced any evidence. This run cannot classify anything as "
+            f"DONE; every item will read ACTIVE/REVIEW at tier LOW. This is "
+            f"a precondition failure, not a triage result.",
+            file=sys.stderr,
+        )
 
     # 5. Build output JSON
     output_data = {
@@ -1116,6 +1615,12 @@ def deep_analysis_pipeline(
             "group_count": len(all_groups),
         },
         "evidence": evidence,
+        "evidence_gaps": {
+            "projects_scanned": len(projects),
+            "projects_with_evidence": projects_with_evidence,
+            "projects_without_repo": projects_without_repo,
+            "all_projects_gapped": bool(projects) and projects_with_evidence == 0,
+        },
     }
 
     # Atomic write: tempfile + rename (ensure dir exists first)
@@ -1137,7 +1642,7 @@ def deep_analysis_pipeline(
 
     total = len(all_raw_items)
     groups = len(all_groups)
-    _result = f"OK:{total}:{groups}:{projects_with_evidence}"
+    _result = f"OK:{total}:{groups}:{projects_with_evidence}:{len(projects_without_repo)}"
     # Cache from in-memory output_data rather than re-reading the file on disk.
     # Re-reading could yield an empty string on a race or disk error, which
     # would make later cache hits silently rewrite output_path with empty JSON.
@@ -1293,7 +1798,7 @@ def build_deep_presentation(
                         f"**{total_raw}** raw items classified: {count_parts}.\n")
 
         # Render each classification group in priority order
-        class_order = ["COMPLETED", "REDUNDANT", "STALE", "ACTIVE"]
+        class_order = _DEEP_CLASS_ORDER
         for cls in class_order:
             items_in_class = by_class.get(cls, [])
             if not items_in_class:
@@ -1549,6 +2054,40 @@ def merge_groups_semantically(coarse_groups):
     return surviving
 
 
+def merge_records_from_groups(groups) -> list:
+    """Derive `## Merged Groups` records from post-merge group dicts.
+
+    `merge_groups_semantically` returns surviving GROUPS (each carrying
+    `absorbed_reasoning`), not merge records -- so the dashboard's Merged
+    Groups section had no correct value to be passed and callers guessed
+    (#318 bug 3: a count was passed, raising TypeError). This adapts one
+    shape to the other.
+
+    Accepts the list form or the `{project: [groups]}` dict form that
+    `merge_groups_semantically(return_dict_shape=True)` returns.
+
+    Groups with no (or empty) `absorbed_reasoning` absorbed nothing and
+    produce no record.
+    """
+    if isinstance(groups, dict):
+        groups = [g for v in groups.values() for g in v]
+
+    records = []
+    for g in groups:
+        absorbed_reasoning = g.get("absorbed_reasoning") or []
+        if not absorbed_reasoning:
+            continue
+        absorbed_ids = [entry.get("absorbed") for entry in absorbed_reasoning]
+        reasons = [entry.get("reasoning", "") for entry in absorbed_reasoning
+                   if entry.get("reasoning")]
+        records.append({
+            "canonical_group_id": g.get("group_id"),
+            "absorbed_group_ids": absorbed_ids,
+            "reasoning": "; ".join(reasons),
+        })
+    return records
+
+
 def _check_items_workdir():
     """Return the 0o700 workdir under ~/.claude/obsidian-brain."""
     p = Path.home() / ".claude" / "obsidian-brain"
@@ -1573,7 +2112,25 @@ def get_last_semantic_merge_mode():
 # Stage 4: classify_groups_with_agent orchestrator (Task 16)
 # ---------------------------------------------------------------------------
 
-_VALID_CLASSIFICATIONS = {"DONE", "NEEDS-ACTION", "STALE", "ACTIVE", "REVIEW"}
+# Priority order for /standup deep's classification sections, and the single
+# source of truth for which labels are valid at all (#243).
+#
+# These MUST be one definition, not two. They were two: class_order in
+# build_deep_presentation still listed the pre-#264 labels COMPLETED/REDUNDANT,
+# which no classifier has emitted since, so DONE / NEEDS-ACTION / REVIEW matched
+# nothing and fell through to the trailing "remaining" branch. That branch is
+# not merely unordered — it renders only canonical + evidence, dropping the
+# project label and the "Found in `file:line`" provenance that the prioritized
+# branch emits. The three buckets a standup is actually read for were the three
+# rendered with no way to locate the item.
+#
+# Deriving the valid set from the ordered tuple makes that drift impossible:
+# adding a label here is what makes it valid, so a new label cannot be accepted
+# by the validator while being invisible to the renderer. check_items_cli.py
+# keeps its own copy of the set for import-independence; a test pins the two
+# together.
+_DEEP_CLASS_ORDER = ("DONE", "NEEDS-ACTION", "REVIEW", "STALE", "ACTIVE")
+_VALID_CLASSIFICATIONS = frozenset(_DEEP_CLASS_ORDER)
 _REQUIRED_CLASSIFIER_FIELDS = {
     "group_id", "classification", "confidence",
     "canonical_text", "evidence_citation", "action_required",
@@ -1806,14 +2363,541 @@ def get_last_classifier_mode():
 # Stage 4: classify_groups_heuristic (Task 17 — long-term fallback)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The PHRASE GATE and the TOKEN GATE below sit UPSTREAM of the pair loop in
+# _heuristic_member_verdict, and that placement used to make any narrowing of
+# either one SILENT BY CONSTRUCTION. The #299 reporting contract covers the
+# pair loop: a pair rejected there returns (tok, phr, reason) and the reason
+# reaches the citation and stderr. But when a narrowing here suppressed the
+# ONLY token or the ONLY completion phrase in a member text, no pair was ever
+# built — _heuristic_member_verdict returned (None, None, None), the cue and
+# boundary machinery never ran, and the record was ACTIVE with
+# evidence_citation None and nothing logged. Indistinguishable from a text that
+# simply had no completion language in it.
+#
+# That was not hypothetical. The trailing compound anchor added to
+# _COMPLETION_PHRASE_RE for #299 suppressed the only completion word in "This
+# was merged-in with #51", turning a real DONE into exactly such a silent
+# ACTIVE; it took a cross-model review to find, because there was no output to
+# notice. The particle allowlist below fixed those instances without touching
+# the hazard itself, which belongs to the POSITION of these gates rather than
+# to their contents: a replay of 3671 live open-item texts (every `- [ ]` line
+# in the vault plus every merged.json member text) still showed 21 verdict
+# downgrades against pre-#299, of which 2 carried no citation and printed
+# nothing.
+#
+# The PHRASE side of that channel is now CLOSED. When no pair survives the loop
+# above, _heuristic_member_verdict re-scans with _LOOSE_COMPLETION_PHRASE_RE —
+# the pre-#299 shape, without the compound anchor — and reports whatever the
+# anchor swallowed as a _COMPOUND_PHRASE_REASON rejection. Both live silent
+# cases became reported rejections and no verdict moved (measured on all three
+# corpora: same downgrade counts, 0 upgrades, 0 silent downgrades). A FUTURE
+# narrowing of _COMPLETION_PHRASE_RE is therefore self-documenting for free, so
+# long as it stays a TIGHTENING of the loose shape rather than an edit to the
+# word list the two regexes share.
+#
+# The TOKEN side is NOT closed. _DISTINCTIVE_TOKEN_RE has no loose counterpart,
+# so narrowing it still suppresses pairs without a trace. ANY future narrowing
+# of the token gate must therefore be justified against a replay of the live
+# corpora, not against intuition or a synthetic fixture. The question to answer
+# is not "does this block the shape I have in mind" but "which live texts lose
+# their ONLY match, and is each of those genuinely not a completion" — because
+# the ones that are will disappear without a trace.
+# ---------------------------------------------------------------------------
 _DISTINCTIVE_TOKEN_RE = re.compile(
     r"(#\d+|\b[0-9a-f]{7,40}\b|\bv\d+\.\d+(?:\.\d+)?\b)"
 )
+# Verb particles allowed to follow a completion word across a hyphen. Chosen as
+# the particles that form a completion phrasal verb with the words below —
+# "merged-in", "merged-into", "closed-out", "fixed-up", "shipped-off",
+# "merged-back", "closed-down", "done-over", "seen-through". The particle must
+# be the WHOLE final hyphen-segment (`(?![\w-])`), so "release-overhaul" and
+# "closed-out-of-scope" stay compound modifiers.
+#
+# Known limit, accepted: the exception re-admits an IDENTIFIER whose final
+# hyphen segment happens to be a particle — `scripts/release-out.sh` and
+# `docs/closed-out.md` read as completion words. Requiring the particle to be
+# followed by whitespace or sentence punctuation would not fix it (it would
+# still admit `release-out.sh`, since the `.` reads as punctuation), and the
+# live corpus does not motivate it either way: of 3671 open-item texts exactly
+# ONE carries a `<completion-word>-<particle>` shape at all, "a closed-out
+# feature work" — an adjectival compound, followed by whitespace, so the
+# proposed tightening would admit it too. Both sides of this exception rest on
+# synthetic examples; it is not worth narrowing on the evidence available.
+#
+# `on` is deliberately absent, and what that exclusion actually buys is
+# "merged-on main" / "closed-on friday" — a branch or date qualifier rather
+# than a completion phrasal verb — staying blocked. It is NOT what blocks the
+# live vault's "Development-Complete-on-board": that one is blocked EITHER WAY
+# by the segment-exactness lookahead, because its `on` is followed by `-board`
+# and so is not the whole final segment. Mutation-verified: adding `on` here
+# leaves "Development-Complete-on-board" blocked and breaks only the two
+# "merged-on"/"closed-on" assertions in
+# test_verb_particle_survives_the_trailing_compound_anchor.
+_COMPLETION_PARTICLES = r"in|into|out|up|off|over|back|through|down"
+
+# The trailing anchor is load-bearing, and the leading `\b` deliberately is not
+# symmetric with it. A completion word followed by a hyphen is USUALLY part of a
+# compound modifier, not a claim: live vault item "the post-release-verification
+# DoD item will flip" put 'release' within 120 chars of '#101' and the all-pairs
+# sweep turned it into a false DONE — the exact #299 defect class. All 10 live
+# member texts carrying a `<completion-word>-<word>` shape are compounds of that
+# kind (release-notes, closed-range, release-version-sweep,
+# github-release-board-promote, ...), so dropping the anchor is not an option. A
+# LEADING hyphen, by contrast, still reads as a claim ("auto-merged",
+# "back-merged"), so `\b` stays on the left.
+#
+# The one exception on the right is a verb PARTICLE. "This was merged-in with
+# #51" and "Issue #77 was closed-out last week" are completion claims, and a
+# bare `(?![-\w])` rejected both SILENTLY — no other pair in either text
+# qualified, so the guard produced an ACTIVE with no rejection to cite.
+# `(?!-(?!particle))` reads as: reject a following hyphen UNLESS a particle
+# follows it.
+_COMPLETION_WORDS = (
+    r"done|merged|shipped|closed|fixed|complete[d]?|resolved|release[d]?"
+)
 _COMPLETION_PHRASE_RE = re.compile(
-    r"\b(done|merged|shipped|closed|fixed|complete[d]?|resolved|release[d]?)\b",
+    r"\b(" + _COMPLETION_WORDS + r")\b"
+    r"(?!-(?!(?:" + _COMPLETION_PARTICLES + r")(?![\w-])))",
     re.IGNORECASE,
 )
+# The pre-#299 phrase shape: the SAME word list, without the trailing compound
+# anchor. Never used to reach a DONE — it exists so the anchor cannot suppress
+# a completion word silently. Because the two regexes are generated from one
+# word list and differ ONLY by that anchor, every occurrence this one matches
+# and _COMPLETION_PHRASE_RE does not is, by construction, a completion word
+# followed by a non-particle hyphen segment: a hyphenated compound. See
+# _compound_phrase_rejection and the block comment above.
+_LOOSE_COMPLETION_PHRASE_RE = re.compile(
+    r"\b(" + _COMPLETION_WORDS + r")\b", re.IGNORECASE,
+)
 _HEURISTIC_PROXIMITY_CHARS = 120
+
+# ---------------------------------------------------------------------------
+# #299: conditional / forward-looking guard on the heuristic's DONE verdict
+#
+# Token-near-phrase co-occurrence cannot tell a CLAIM of past completion
+# ("Fixed in #51") from a REFERENCE to a completion that has not happened yet
+# ("Waiting on #51 to be closed", "Blocked until #64 is resolved"). Both shapes
+# put a distinctive token within 120 chars of a completion phrase, so the
+# pre-#299 rule called every one of them DONE. Production case from the issue:
+#   "Confirm whether a fresh /plugin update on adversarial-review will pull
+#    the new version once #51 is resolved"
+# The guard therefore looks at what GOVERNS the co-occurrence, in two tiers.
+#
+# Tier 1 — pending-intent cues. These name an outstanding action by the
+# author of the item (waiting/blocking, or verification-intent). If one governs
+# the co-occurrence, the item is about *reaching* the completion, whatever the
+# tense of the phrase, so the cue alone rejects DONE. "Confirm #51 was merged"
+# is an open verification task even though "was merged" is past tense.
+#
+# Tier 2 — time/condition subordinators. These appear just as often inside
+# genuine completion claims ("After the outage we finally fixed #51"), so on
+# their own they would cost real DONEs. They reject only when the completion
+# phrase is ALSO in a forward-looking form (see _FORWARD_FORM_RE).
+#
+# Both tiers are searched only in the text to the LEFT of the completion phrase,
+# because a cue governs what follows it: "Fixed in #51 — confirm with the team"
+# is a completion claim with a follow-up note attached, not a pending item. Cost
+# of that scoping: a cue placed after the co-occurrence never fires. That is
+# deliberate — it is the difference between narrowing DONE and rejecting it
+# everywhere, and an over-corrected heuristic that only ever says ACTIVE is a
+# silent failure of its own.
+#
+# The two tiers differ in how far left they look, and the split is grounded in
+# what each kind of cue scopes over:
+#   * A tier-1 cue describes the ITEM's own action, so it is searched across the
+#     whole enclosing SENTENCE, clause boundaries included. Live vault case:
+#     "Monitor when PR #228 merges to main; auto-promote #227 on next release" —
+#     'Monitor' sits two clauses before the #227/'release' pair it governs, and
+#     clause-clipping let that one through as DONE.
+#   * A tier-2 subordinator scopes over its own CLAUSE, so it is clipped at
+#     ';'/':' as well. Widened to the sentence, "Fix #99 merged - this work is
+#     done; release shipped." style notes start losing real DONEs. The CLAUSE
+#     clip covers BOTH halves of the tier-2 test — the cue search and the
+#     forward-form search that corroborates it. Clipping only the cue left the
+#     lookback anchored at the sentence, so a modal in a PRECEDING clause could
+#     corroborate a cue in this one: "It will ship; once #51 merged." rejected
+#     a bare-past claim by citing the 'will' from the clause next door. The
+#     verdict was reported, not silent, but the reason named corroboration the
+#     documented scope excludes, and a reason that cites the wrong evidence is
+#     the same class of defect as no reason at all.
+# A (token, phrase) pair must itself sit within one sentence to qualify at all —
+# "Blocked until #64 is resolved. Fixed #12." pairs #12 with 'Fixed', not with
+# the governed 'resolved' in the sentence next door. That gate REPORTS the pairs
+# it drops (as a lower-priority rejection than a real cue) instead of dropping
+# them silently: it is the one path that can turn a pre-#299 DONE into an ACTIVE
+# with no cue to blame, and an unexplained downgrade is the same silent failure
+# the guard exists to remove. Precedence: an ungoverned pair (DONE) beats a cue
+# rejection, which beats a boundary rejection.
+#
+# Finally, a rejection recorded against one member survives even when a SIBLING
+# member of the same group yields DONE. The group verdict stays DONE, but
+# skills/check-items/SKILL.md Step 8 cascades a DONE group's checkoff to every
+# member (file, line) it has — so the objection against the member the guard
+# judged NOT done has to reach the citation and the log, or the cascade ticks
+# that line off on another member's evidence with the reason already deleted.
+# The objection therefore names that member's own (file, line) too: the reason
+# alone tells an operator that SOMETHING was disputed, but the cascade acts on
+# lines, and without the location the only thing quoted is the group
+# representative — a different line from the one about to be ticked off.
+# ---------------------------------------------------------------------------
+
+# Sentence and clause terminators. Three things here are load-bearing:
+#   * `(?=\s|$)` stops "v1.2.0" and "3.4.1" from being split into sentences.
+#   * `_ABBREV_LOOKBEHINDS` stops a KNOWN abbreviation's trailing dot from
+#     splitting. "Waiting on infra, e.g. #51 to be closed" is one sentence;
+#     splitting at "e.g." clipped the tier-1 window so the item read as DONE.
+#     Covered set: `e.g.`, `i.e.`, `etc.`, `vs.` — and nothing else. Any other
+#     dot, including an initial ("A.B.") or a title ("Dr."), intentionally ENDS
+#     the sentence. See the allowlist comment below.
+#   * A BLANK line, not a bare newline, terminates a sentence. A wrapped line is
+#     one sentence, and treating `\n` as a terminator silently dropped pairs
+#     ("Fixed in\n#51") that the pre-#299 code called DONE. Accepted cost: a
+#     multi-line member whose lines are separate list items is now read as ONE
+#     sentence, so a tier-1 cue reaches across the newline and can reject a pair
+#     on the next line. That widening is not reachable on current data — of 1437
+#     live member texts, 0 contain a newline at all — so the change is
+#     latent-only today in both directions.
+# Abbreviations whose trailing dot must NOT end a sentence, as an ALLOWLIST of
+# literal spellings rather than a shape. The shape this replaces,
+# `(?<![A-Za-z]\.[A-Za-z])`, also matched INITIALS: "Awaiting update from A.B.
+# The fix for #51 is merged." collapsed into ONE sentence, so the tier-1 cue
+# 'Awaiting' in the first half governed the '#51'/'merged' pair in the second
+# and a real completion read ACTIVE. Same discipline as `_HIGH_TRUST_SOURCES`
+# and the #297 note on assign_tier: a shape/denylist fails open, an allowlist
+# fails closed. Of 43 live member texts carrying an `X.Y.` dot the sampled ones
+# are all `e.g.`, so the allowlist keeps the benefit and drops the `Dr.`/
+# initials false positive.
+#
+# It does NOT drop that false positive for `etc.`, and the shortfall is
+# deliberate. Unlike the other three entries, `etc.` is commonly SENTENCE-FINAL,
+# and there the lookbehind stops it terminating its own sentence, so a tier-1
+# cue reaches across into the next one: "Waiting on infra, DBs, etc. Fixed #51."
+# reads ACTIVE where the pre-#299 code read DONE. That is the same mechanism as
+# the `A.B.` initials false ACTIVE this allowlist was introduced to remove,
+# reintroduced for the one entry that commonly ends a sentence. There is no
+# clean fix — mid-sentence and sentence-final `etc.` need opposite treatment
+# from a regex that can only do one — and dropping `etc.` from the allowlist
+# would trade this safe-direction error (the item stays open, WITH a reported
+# reason on the citation and in the log) for a false DONE that ticks a live item
+# off. Python lookbehinds are fixed-width, hence one per spelling; the
+# zero-width `\b` keeps "Netc." from reading as "etc.".
+_ABBREV_LOOKBEHINDS = (
+    r"(?<!\b[Ee]\.[Gg])(?<!\b[Ii]\.[Ee])"
+    r"(?<!\b[Ee][Tt][Cc])(?<!\b[Vv][Ss])"
+)
+_SENTENCE_BOUNDARY_RE = re.compile(
+    r"(?:" + _ABBREV_LOOKBEHINDS + r"[.!?](?=\s|$))|\r?\n[ \t]*\r?\n"
+)
+_CLAUSE_BOUNDARY_RE = re.compile(
+    r"(?:" + _ABBREV_LOOKBEHINDS + r"[.;:!?](?=\s|$))|\r?\n[ \t]*\r?\n"
+)
+
+# Tier 1 — self-sufficient. Waiting/blocking language plus verification-intent
+# verbs. Grounded in the reported failures ("Waiting on #51...", "Blocked until
+# #64...", "Check back after v1.2.0...", "Track whether abc1234...", "Confirm
+# whether ... once #51 ...") and their immediate inflections. `validate` is in
+# the set for the #297 production case documented on assign_tier: token 'v3.4.0'
+# near completion phrase 'release' on an *unperformed* validation task.
+# `(?<![\w./-])` / `(?![\w./-])` keep the cue anchored to prose. Live vault case:
+# "Implement fix in git-flow#21: modify `check-pr-base.py` to allow `release/*`"
+# — a bare \b let 'check' match inside the FILENAME and reject the item for a
+# reason that has nothing to do with its meaning. A guard that fires for the
+# wrong reason is not a guard, it is a coincidence.
+#
+# The optional `(?:re|cross|double|self)-` prefix exists because the leading
+# anchor rejects a preceding '-': without it `re-verify`, `re-check`,
+# `cross-check`, `re-confirm` and `self-check` never fired at all, and only the
+# hand-spelled `double-?check` worked. The TRAILING `(?![\w./-])` is what
+# actually protects `check-pr-base.py`, so the leading '-' was costing those
+# cues for nothing.
+_PENDING_INTENT_CUE_RE = re.compile(
+    r"(?<![\w./-])((?:(?:re|cross|double|self)-)?(?:"
+    r"waiting\s+(?:on|for)|waiting|awaiting|await|"
+    r"blocked(?:\s+(?:on|by|until))?|blocker|"
+    r"pending|"
+    r"depends?\s+on|depending\s+on|dependent\s+on|"
+    r"confirm|verify|validate|ensure|double-?check|check(?:\s+back)?|"
+    r"track|monitor|revisit|follow[\s-]?up"
+    r"))(?![\w./-])",
+    re.IGNORECASE,
+)
+
+# Tier 2 — needs corroboration from _FORWARD_FORM_RE. Anchored like tier 1, but
+# with `/` deliberately LEFT OUT of both classes. A slash joins prose
+# alternatives at least as often as it joins path segments, and including it
+# made the most explicitly conditional phrasing there is match NOTHING: in
+# "Bump the cache if/when #51 is merged", 'if' failed the TRAILING anchor and
+# 'when' failed the LEADING one, so tier 2 went silent and the item read DONE
+# ("when/if", "before/after" the same way).
+#
+# The asymmetry against tier 1, which keeps `/`, is principled rather than an
+# oversight. A tier-1 cue rejects on its own, so a path segment that happens to
+# read as a cue ('scripts/verify.sh', 'docs/track') must not fire — that is the
+# live case the anchoring was added for. Tier 2 cannot reject on a cue alone;
+# it also needs a forward-looking verb form, and _FORWARD_FORM_RE KEEPS `/` in
+# its classes. So re-admitting a path segment such as `hooks/after/x` as a
+# tier-2 cue costs nothing on its own.
+#
+# The DOT stays in both classes, and it is the dot — not the slash — that
+# protects the case this anchoring exists for: "After `go.get.it`, #123 was
+# closed." keeps its DONE because 'get' cannot match inside the dotted
+# filename and corroborate 'After'.
+#
+# Known limit, deliberate: a slash-joined TIER-1 pair ("confirm/verify #51 is
+# merged") still matches neither cue, because tier 1 keeps `/` for the reason
+# above. Under-firing there yields a false DONE, but the fix is not to drop `/`
+# from tier 1 — that would let a filename reject an item outright, which is the
+# worse failure and the one already observed on live data.
+_CONDITIONAL_CUE_RE = re.compile(
+    r"(?<![\w.-])(once|until|till|unless|if|when|whenever|after|before|whether)"
+    r"(?![\w.-])",
+    re.IGNORECASE,
+)
+
+# Forward-looking verb forms: copula/non-finite/modal constructions that put the
+# completion in the future or in question ("is resolved", "to be closed",
+# "will be merged", "gets merged"). Deliberately EXCLUDES past forms — "was
+# fixed", "were closed", "has been merged" are completion claims, and a tense
+# test that swept them in would turn "After the outage #51 was fixed" into a
+# false ACTIVE. That exclusion is why tense discrimination is not redundant with
+# the tier-2 cue list: it is what keeps bare-past claims out of the guard.
+_FORWARD_FORM_RE = re.compile(
+    r"(?<![\w./-])(be|is|are|isn't|aren't|get|gets|getting|will|won't|would|"
+    r"should|shall|can|could|may|might|must|needs?|going\s+to|gonna)"
+    r"(?![\w./-])",
+    re.IGNORECASE,
+)
+
+# How far back from the completion phrase a forward-looking form may sit.
+# "will finally be closed" is 3 words; 24 chars covers that. The window is the
+# TIGHTER of this distance and the enclosing clause, so it bounds the reach
+# WITHIN a clause while the clause start bounds it across clauses — the char
+# count alone would still walk past a ';' on a short leading clause.
+_FORWARD_FORM_LOOKBACK_CHARS = 24
+
+# Bound on regex matches scanned per member text, so a pathologically long
+# member cannot make the pair sweep quadratic-with-a-big-constant.
+_HEURISTIC_MAX_MATCHES = 20
+
+
+def _segment_start(text, pos, boundary_re):
+    """Index of the start of the `boundary_re`-delimited segment holding `pos`.
+
+    The scan runs over the FULL text and stops at the first boundary ending
+    past `pos`, rather than handing `pos` to finditer as an endpos. An endpos
+    makes `$` match there, so a '.' at `pos - 1` reads as a terminator even
+    when the real text has no whitespace after it: `_sentence_start("Waiting on
+    the fix.#51 is closed", 19)` returned 19 instead of 0. That artifact can
+    only ever DROP a pair, never manufacture a DONE — but a dropped pair is now
+    a reported rejection rather than a no-op, and any future relaxation of the
+    same-sentence gate would turn it into a false-DONE vector.
+    """
+    start = 0
+    for boundary in boundary_re.finditer(text):
+        end = boundary.end()
+        if end > pos:
+            break
+        start = end
+    return start
+
+
+def _sentence_start(text, pos):
+    """Index of the start of the sentence containing `pos`."""
+    return _segment_start(text, pos, _SENTENCE_BOUNDARY_RE)
+
+
+def _clause_start(text, pos):
+    """Index of the start of the clause containing `pos` (';' and ':' split)."""
+    return _segment_start(text, pos, _CLAUSE_BOUNDARY_RE)
+
+
+def _conditional_rejection(text, tok_match, phr_match):
+    """Return a human-readable reason when this token/phrase co-occurrence is
+    a forward-looking or pending reference rather than a completion claim,
+    else None (#299). See the block comment above for the two-tier rule."""
+    span_start = min(tok_match.start(), phr_match.start())
+    sent_start = _sentence_start(text, span_start)
+
+    # Tier 1: the whole sentence ahead of the phrase, clauses included.
+    pending = _PENDING_INTENT_CUE_RE.search(text, sent_start, phr_match.start())
+    if pending:
+        return (f"pending-intent cue '{pending.group(0).strip()}' governs it "
+                f"(the item's own action is still outstanding)")
+
+    # Tier 2: clipped to the clause holding the co-occurrence.
+    clause_start = _clause_start(text, span_start)
+    conditional = _CONDITIONAL_CUE_RE.search(text, clause_start, phr_match.start())
+    if not conditional:
+        return None
+
+    # Tier 2 needs a forward-looking verb form immediately before the phrase,
+    # and that form is clipped to the same CLAUSE as the cue it corroborates —
+    # `clause_start`, not `sent_start`. See the block comment above.
+    look_from = max(clause_start,
+                    phr_match.start() - _FORWARD_FORM_LOOKBACK_CHARS)
+    forward = _FORWARD_FORM_RE.search(text, look_from, phr_match.start())
+    if forward:
+        return (f"conditional cue '{conditional.group(0).strip()}' + "
+                f"forward-looking form '{forward.group(0).strip()}' make it a "
+                f"reference to future completion")
+    return None
+
+
+_CROSS_SENTENCE_REASON = (
+    "the token and the completion phrase sit in different sentences, so "
+    "neither governs the other"
+)
+
+# The final clause states the condition that actually routes a text HERE, and
+# it is not "no phrase survived the phrase gate". _compound_phrase_rejection is
+# reached when the pair LOOP produced nothing — no DONE, no cue rejection, no
+# boundary rejection — which is exactly when no surviving phrase sat within
+# `_HEURISTIC_PROXIMITY_CHARS` of a token, since every in-range pair lands in
+# one of those three. Strict phrases elsewhere in the text can and do survive:
+# "Fixed the flaky parser here. <140 chars> the post-release-verification for
+# #101" keeps 'Fixed', and the earlier wording called that text's citation a
+# lie. Of the 4 compound citations on the live 3671-text corpus, 2 are of that
+# shape, so the false clause was printed text, not a constructible edge case.
+_COMPOUND_PHRASE_REASON = (
+    "that completion word is part of a hyphenated compound modifier rather "
+    "than a completion claim, and no phrase that survived the phrase gate "
+    "sat within range of a distinctive token"
+)
+
+# Both reasons above are compared by VALUE, never by identity, at the two
+# bucketing sites in classify_groups_heuristic. `is` happens to work today only
+# because each constant object is threaded through the return path unchanged.
+# Any value-preserving reconstruction — a round-trip through JSON, a `str()`
+# copy, a reason assembled from parts, a helper that returns an equal string —
+# yields a DIFFERENT object, and an identity test would then drop the rejection
+# into the CUE bucket, inverting the precedence the buckets exist to establish,
+# with nothing failing. (Mutation-checked: rebuilding either reason as an
+# equal-but-distinct string leaves the suite green under `==` and fails
+# test_rejection_kinds_have_a_total_order_across_members under `is`.)
+#
+# What `==` does NOT buy: if a future change makes a reason genuinely different
+# TEXT — interpolating the offending compound, say — neither comparison matches
+# and the bucketing has to move to an explicit kind tag rather than to the
+# message string. `==` removes the silent failure from the value-preserving
+# case; it is not a licence to vary the text.
+
+
+def _heuristic_member_verdict(text):
+    """Scan one member text for a DONE-qualifying co-occurrence (#299).
+
+    Returns (tok_match, phr_match, rejection):
+      (tok, phr, None)   - an ungoverned co-occurrence: DONE.
+      (tok, phr, reason) - no pair reached DONE: either every qualifying pair
+                           was governed by a conditional/pending cue, or the
+                           only pairs in range straddled a sentence boundary.
+                           Not DONE; `reason` goes on the citation.
+      (None, None, None) - no token/phrase pair within the proximity window.
+
+    All (token, phrase) pairs are considered, up to `_HEURISTIC_MAX_MATCHES`
+    of each. The pre-#299 code searched once for each and tested that single
+    pair, so with the guard bolted on, one governed mention ("Blocked until #64
+    is resolved. Fixed #12.") would have suppressed a genuine claim elsewhere
+    in the same text purely because of regex match order. Widening to all pairs
+    makes the verdict a property of the content instead. The cap is the cost of
+    that widening: a qualifying pair past the 20th token or 20th phrase is not
+    seen, which can only lose a DONE, never invent one.
+
+    A cue rejection outranks a cross-sentence rejection: the cue says WHY the
+    item is still open, while the boundary only says the pair proves nothing
+    either way. Below both sits the compound-phrase rejection recovered by
+    _compound_phrase_rejection, which says only that the phrase gate left
+    nothing in range.
+    """
+    tokens = list(_DISTINCTIVE_TOKEN_RE.finditer(text))[:_HEURISTIC_MAX_MATCHES]
+    phrases = list(_COMPLETION_PHRASE_RE.finditer(text))[:_HEURISTIC_MAX_MATCHES]
+    first_rejection = None
+    boundary_rejection = None
+    for tok_match in tokens:
+        for phr_match in phrases:
+            if abs(tok_match.start() - phr_match.start()) > _HEURISTIC_PROXIMITY_CHARS:
+                continue
+            # A pair split across a sentence boundary is not a co-occurrence
+            # the guard can reason about: the cue region for one half would
+            # reach into the other half's clause (#299). Recorded rather than
+            # dropped — this is the one path that downgrades a pre-#299 DONE
+            # with no cue to name, so dropping it silently would leave an
+            # unexplained ACTIVE with evidence_citation None.
+            if (_sentence_start(text, tok_match.start())
+                    != _sentence_start(text, phr_match.start())):
+                if boundary_rejection is None:
+                    boundary_rejection = (tok_match, phr_match,
+                                          _CROSS_SENTENCE_REASON)
+                continue
+            reason = _conditional_rejection(text, tok_match, phr_match)
+            if reason is None:
+                return tok_match, phr_match, None
+            if first_rejection is None:
+                first_rejection = (tok_match, phr_match, reason)
+    if first_rejection is not None:
+        return first_rejection
+    if boundary_rejection is not None:
+        return boundary_rejection
+    return _compound_phrase_rejection(text, tokens)
+
+
+def _compound_phrase_rejection(text, tokens):
+    """Report a pair the PHRASE GATE swallowed, rather than returning silence.
+
+    Reached only when no pair survived the loop above, which is exactly when
+    the #299 reporting contract used to produce an ACTIVE carrying
+    evidence_citation None and printing nothing (see the block comment on the
+    gates). Any pair found HERE is a completion word inside a hyphenated
+    compound, by construction rather than by assumption: a loose match that is
+    ALSO a strict match was already seen by the loop, which would have returned
+    DONE, a cue rejection or a boundary rejection instead of falling through —
+    so reaching this point means the trailing compound anchor is the only thing
+    that removed it.
+
+    The _HEURISTIC_MAX_MATCHES cap does not open a hole in that argument, which
+    is worth spelling out because it is the non-obvious half. The two regexes
+    share a word list and differ only by a trailing negative lookahead, so the
+    strict matches are a SUBSEQUENCE of the loose ones at identical spans
+    (a rejected match cannot shift the scan onto a different span: the leading
+    `\b` gives no other start inside the same word). The loose list is
+    therefore at least as long, its 20-item truncation cuts no later, and a
+    strict match past the strict cap is necessarily past the loose cap too —
+    it can never reach this scan to be misreported as a compound. Verified over
+    20,000 randomized completion-word/suffix texts: 0 violations of either
+    property. A re-test against _COMPLETION_PHRASE_RE here would be dead code.
+
+    Reporting-only. The verdict is ACTIVE either way; the caller ranks this
+    below every other rejection precisely because it explains an ABSENCE of
+    evidence rather than naming a reason the item is open. What changes is that
+    the downgrade stops being invisible.
+    """
+    loose = list(
+        _LOOSE_COMPLETION_PHRASE_RE.finditer(text)
+    )[:_HEURISTIC_MAX_MATCHES]
+    for tok_match in tokens:
+        for phr_match in loose:
+            if abs(tok_match.start()
+                   - phr_match.start()) <= _HEURISTIC_PROXIMITY_CHARS:
+                return tok_match, phr_match, _COMPOUND_PHRASE_REASON
+    return None, None, None
+
+
+def _member_location(member):
+    """`" at <file>:<line>"` for a member, or "" when either part is missing.
+
+    Appended to the DONE-DISPUTED citation and log line: Step 8 cascades a DONE
+    group's checkoff to every member (file, line), so an operator reading the
+    objection needs to know WHICH line is about to be ticked off on a sibling's
+    evidence. Members reach the heuristic straight from merged.json, so a
+    missing or null file/line is possible; the suffix is dropped rather than
+    printing "at None:None".
+    """
+    file_path = member.get("file")
+    line_no = member.get("line")
+    if not file_path or line_no is None:
+        return ""
+    return f" at {file_path}:{line_no}"
 
 
 def classify_groups_heuristic(merged_groups, evidence):
@@ -1824,6 +2908,10 @@ def classify_groups_heuristic(merged_groups, evidence):
     DONE requires BOTH a distinctive token AND a completion phrase within
     +/- 120 chars in the same member text. Otherwise -> ACTIVE.
 
+    #299: that co-occurrence is additionally rejected when a conditional or
+    pending-intent cue governs it, so forward-looking items ("Blocked until #64
+    is resolved") no longer read as completions. See the block comment above.
+
     NEEDS-ACTION and STALE are not assigned by the heuristic (they need
     cross-source evidence the sub-agent provides).
     """
@@ -1833,26 +2921,146 @@ def classify_groups_heuristic(merged_groups, evidence):
         confidence = "LOW"
         evidence_citation = None
         canonical_text = g.get("representative", "")
+        cue_rejection = None
+        boundary_rejection = None
+        compound_rejection = None
+        done_match = None
+        # Both guard log lines quote the item, because a bare group_id makes an
+        # operator map an opaque id back to an item by hand. Whitespace is
+        # collapsed first: the log contract is one line per event, and a
+        # representative carrying a newline would split the line in two and
+        # break the grep the lines exist for.
+        _log_text = " ".join(canonical_text.split())[:80]
 
+        # Every member is scanned even after one yields DONE: a rejection
+        # recorded against a LATER member still has to be reported, because
+        # SKILL.md Step 8 cascades the group's checkoff to that member's
+        # (file, line) too.
         for m in g.get("members", []) or []:
             text = m.get("text", "") or ""
-            tok_match = _DISTINCTIVE_TOKEN_RE.search(text)
-            phr_match = _COMPLETION_PHRASE_RE.search(text)
-            if tok_match and phr_match:
-                distance = abs(tok_match.start() - phr_match.start())
-                if distance <= _HEURISTIC_PROXIMITY_CHARS:
-                    classification = "DONE"
-                    # #297: the heuristic's own token-co-occurrence evidence
-                    # cannot justify HIGH confidence at any distance —
-                    # confidence is written to the dashboard and the cache,
-                    # and a consumer keying off it (rather than the
-                    # assign_tier-derived tier) must not read it as HIGH.
-                    confidence = "MED"
-                    evidence_citation = (
-                        f"heuristic: token '{tok_match.group(0)}' "
-                        f"near completion phrase '{phr_match.group(0)}'"
-                    )
-                    break
+            tok_match, phr_match, reason = _heuristic_member_verdict(text)
+            if not tok_match:
+                continue
+            if reason is None:
+                if done_match is None:
+                    done_match = (tok_match.group(0), phr_match.group(0))
+                continue
+            # `==`, not `is`: see the note on the reason constants.
+            rejected = (tok_match.group(0), phr_match.group(0), reason,
+                        _member_location(m))
+            if reason == _CROSS_SENTENCE_REASON:
+                if boundary_rejection is None:
+                    boundary_rejection = rejected
+            elif reason == _COMPOUND_PHRASE_REASON:
+                if compound_rejection is None:
+                    compound_rejection = rejected
+            elif cue_rejection is None:
+                cue_rejection = rejected
+
+        # Precedence across members, kept in explicit buckets so it mirrors the
+        # within-member contract in _heuristic_member_verdict rather than
+        # restating it as a conditional overwrite: ungoverned DONE beats a cue
+        # rejection beats a boundary rejection. A cue says WHY the item is
+        # open; the boundary only says the pair proves nothing either way; and
+        # the compound rejection, last, only says the phrase gate left nothing
+        # in range. Choosing first-come across members, as the code used to,
+        # made the reported reason depend on member ORDER — the same group with
+        # the same two members cited the uninformative boundary reason or the
+        # governing cue purely by list position, and that reason is what rides
+        # on the citation and, for a DONE group, on the sibling-objection
+        # parenthetical.
+        rejection = cue_rejection or boundary_rejection or compound_rejection
+        # ... but only an OBJECTION reaches the sibling-dispute path below. The
+        # two consumers ask different questions. The ACTIVE citation asks "this
+        # group was downgraded — why?", and a compound rejection answers that:
+        # it names the phrase the gate removed, which is the whole reason the
+        # downgrade is not silent. DONE-DISPUTED asks "this line is about to be
+        # ticked off on a SIBLING's evidence — did the guard object to it?", and
+        # a compound rejection does not object to anything. It is reached only
+        # when the member had no in-range (token, surviving-phrase) pair at all
+        # — the same evidentiary state as a member with no completion language
+        # whatsoever, which raises no alarm. Firing on one and not the other
+        # split two indistinguishable absences: members ["Fixed in #51", "Bump
+        # the release-notes for #77"] raised DONE-DISPUTED while ["Fixed in
+        # #51", "some prose with no token at all"] did not.
+        #
+        # A boundary rejection DOES belong here, and the line between them is
+        # not arbitrary: it is reached only from inside the proximity check, so
+        # a real token and a phrase that survived the gate were within range of
+        # each other and the guard declined to credit them. That is the guard
+        # refusing a verdict on evidence it examined — and it is the one path
+        # that turns a DONE the pre-#299 code emitted into an ACTIVE, so a
+        # cascade onto such a line is landing on a line this code actively
+        # disputed. A cue rejection is stronger still, naming why it is open.
+        #
+        # Nothing is lost when a compound rejection is dropped here: it exists
+        # to explain a DOWNGRADE, and a DONE group was not downgraded.
+        disputed = cue_rejection or boundary_rejection
+
+        if done_match is not None:
+            classification = "DONE"
+            # #297: the heuristic's own token-co-occurrence evidence
+            # cannot justify HIGH confidence at any distance —
+            # confidence is written to the dashboard and the cache,
+            # and a consumer keying off it (rather than the
+            # assign_tier-derived tier) must not read it as HIGH.
+            confidence = "MED"
+            _dtok, _dphr = done_match
+            evidence_citation = (
+                f"heuristic: token '{_dtok}' "
+                f"near completion phrase '{_dphr}'"
+            )
+            if disputed is not None:
+                # The group is DONE on this member's evidence, but another
+                # member was judged NOT done. Keep that objection: Step 8
+                # cascades the checkoff to every member line of a DONE group,
+                # so the rejected line gets ticked off on a sibling's evidence
+                # — the human needs to see which line the guard disputed.
+                _rtok, _rphr, _rreason, _rwhere = disputed
+                evidence_citation += (
+                    f" (sibling member rejected{_rwhere}: token '{_rtok}' near "
+                    f"completion phrase '{_rphr}', but {_rreason})"
+                )
+                print(
+                    f"[check-items] heuristic-guard DONE-DISPUTED: group "
+                    f"{g.get('group_id')} [{_log_text}]: classified DONE, but "
+                    f"sibling member rejected{_rwhere} — token '{_rtok}' near "
+                    f"'{_rphr}', but {_rreason}",
+                    file=sys.stderr,
+                )
+
+        if classification == "ACTIVE" and rejection is not None:
+            # #299: a rejected DONE must not become an indistinguishable
+            # ACTIVE. The reason rides on the record's evidence_citation so
+            # classifications.json (and any consumer reading it before
+            # partition_for_review) keeps it, and is ALSO logged to stderr
+            # because partition_for_review deliberately scrubs
+            # evidence_citation on ACTIVE before the dashboard write (spec
+            # § Classification semantics line 322) — without the log line the
+            # reason would die at that boundary, which is exactly the silent
+            # failure this guard exists to avoid.
+            #
+            # ACTIVE, not REVIEW: REVIEW (#264) means "distinctive open item
+            # with a weak POSITIVE signal the classifier could not confirm",
+            # and it is routed to the visible review bucket for adjudication.
+            # Here the signal is explicitly negative — the guard has a reason
+            # to believe the item is not done — so promoting it to a review row
+            # would ask the human to re-adjudicate a verdict already decided.
+            # The location is deliberately NOT appended here: an all-ACTIVE
+            # group ticks nothing off, so there is no line for an operator to
+            # go look at, and the group's own canonical text is already on the
+            # log line.
+            _tok, _phr, _reason, _ = rejection
+            evidence_citation = (
+                f"heuristic: DONE rejected — token '{_tok}' near completion "
+                f"phrase '{_phr}', but {_reason}"
+            )
+            print(
+                f"[check-items] heuristic-guard DONE-REJECTED: group "
+                f"{g.get('group_id')} [{_log_text}]: DONE rejected — token "
+                f"'{_tok}' near '{_phr}', but {_reason}",
+                file=sys.stderr,
+            )
 
         out.append({
             "group_id": g.get("group_id"),

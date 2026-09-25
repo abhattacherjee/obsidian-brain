@@ -1,8 +1,12 @@
 """Validate python3 -c '...' snippets in all SKILL.md files compile without SyntaxError."""
 
+import ast
 import glob
+import json
 import os
 import re
+import subprocess
+import sys
 import textwrap
 import pytest
 
@@ -86,6 +90,44 @@ def test_cache_glob_finds_installed_hooks():
     hooks_dir = matches[-1]
     assert os.path.isfile(os.path.join(hooks_dir, "obsidian_utils.py")), (
         f"Cache hooks dir {hooks_dir} exists but obsidian_utils.py not found"
+    )
+
+
+def test_skill_snippet_obsidian_utils_imports_exist():
+    """#330 review item 12a: every `from obsidian_utils import X, Y` in a
+    SKILL.md snippet must name attributes that ACTUALLY exist on the
+    obsidian_utils module.
+
+    test_python_snippet_syntax above only compile()s these snippets, which
+    proves they PARSE — a renamed or removed helper is a silent runtime
+    NameError/ImportError nobody catches until a user hits it at the Bash
+    prompt. This walks the AST of every snippet (skipping ones that fail to
+    parse — that failure mode is already covered by
+    test_python_snippet_syntax) and asserts hasattr(obsidian_utils, name)
+    for every imported name. Covers ALL skills, not just #330's
+    retro/compress/decide/error-log call sites — a wiring bug in any
+    skill's snippet is caught the same way.
+    """
+    # conftest.py already inserts hooks/ onto sys.path.
+    import obsidian_utils
+
+    missing = []
+    for name, code in _SNIPPETS:
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            continue  # already asserted elsewhere
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "obsidian_utils":
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    if not hasattr(obsidian_utils, alias.name):
+                        missing.append(f"{name}: from obsidian_utils import {alias.name}")
+
+    assert not missing, (
+        "SKILL.md snippet(s) import names that do not exist on the "
+        f"obsidian_utils module: {missing}"
     )
 
 
@@ -428,3 +470,948 @@ def test_every_version_key_snippet_imports_re():
             if "re.findall" in line:
                 assert imported, f"Snippet {name} uses re.findall before importing re"
                 break
+
+
+def test_check_items_skill_captures_head_only_once():
+    """#305: skills/check-items/SKILL.md must call `git rev-parse HEAD`
+    exactly once (Step 3), not twice. Step 10 used to re-derive HEAD with its
+    own `git rev-parse HEAD` call; a commit landing between the two reads
+    would stamp the newer HEAD onto verdicts derived at the older one. Step
+    10 now reuses the head captured at Step 3 via partition.json's "heads"
+    key instead. Anchored on `"HEAD"` specifically so Step 3's unrelated
+    `git rev-parse --show-toplevel` call (line ~129) is not counted."""
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    # The pattern must tolerate BOTH the argv-list form this file uses today
+    # (`["git", "-C", p, "rev-parse", "HEAD"]`) and the bare shell form
+    # (`git rev-parse HEAD`, `head=$(git -C "$r" rev-parse HEAD)`) — SKILL.md
+    # is mostly bash, so a re-derivation reintroduced there is the likelier
+    # regression, and an argv-only pattern would let it back in silently.
+    # `HEAD(?![\w~^])` keeps revision expressions (HEAD~1, HEAD^) out: those
+    # name a specific past commit and are not a re-derivation of current HEAD.
+    # Step 3's `git rev-parse --show-toplevel` (line ~129) never matches.
+    occurrences = re.findall(r'''rev-parse[\s,"']+HEAD(?![\w~^])''', content)
+    assert len(occurrences) == 1, (
+        f"expected exactly one `rev-parse ... HEAD` call in {path}, "
+        f"found {len(occurrences)} — Step 10 must reuse Step 3's captured "
+        "head, not re-derive it"
+    )
+
+
+def test_check_items_heads_handoff_key_matches():
+    """#305: Step 3 captures each project's HEAD into partition.json and Step
+    10 reads it back instead of re-deriving it. Nothing else pins that
+    cross-block contract, and breaking it FAILS SILENTLY IN THE WORST
+    DIRECTION: Step 10's `heads.get(proj)` returns None for every project, so
+    every project hits `continue` and /check-items stops persisting
+    classifications entirely — announced only on stderr, which this repo
+    documents as ignorable. Verified by mutation: deleting `"heads": heads`
+    from Step 3's json.dump leaves the entire 2645-test suite green.
+
+    Both sides are extracted and compared rather than string-matched, so
+    reformatting the dict or the call does not break the test — only an
+    actual rename or removal on either end does.
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+
+    write = re.search(r'json\.dump\(\{[^}]*"([A-Za-z_]\w*)":\s*heads\b', content)
+    assert write, (
+        "Step 3 must serialize the captured per-project HEADs into "
+        "partition.json (expected a `\"<key>\": heads` entry in its json.dump)"
+    )
+    read = re.search(r'heads\s*=\s*part\.get\(\s*"([A-Za-z_]\w*)"', content)
+    assert read, (
+        "Step 10 must read the HEADs Step 3 captured out of partition.json "
+        "(expected `heads = part.get(\"<key>\", ...)`)"
+    )
+    assert write.group(1) == read.group(1), (
+        f"partition.json heads-key mismatch: Step 3 writes "
+        f"{write.group(1)!r} but Step 10 reads {read.group(1)!r} — every "
+        "cache update would be silently skipped"
+    )
+
+
+_PYEOF_HEREDOC_RE = re.compile(r"<< 'PYEOF'\n(.*?)\nPYEOF", re.DOTALL)
+
+
+def _read_step6_heredoc():
+    """Extract the Step 6 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md — the classifier fallback-chain block
+    (agent -> heuristic gap-fill -> cache-merge), distinguished from the
+    other 6 same-delimiter PYEOF blocks (see _read_step7_heredoc's
+    docstring) by the presence of `classify_groups_with_agent`, which is
+    unique to Step 6.
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step6_blocks = [b for b in blocks if "classify_groups_with_agent" in b]
+    assert len(step6_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"classify_groups_with_agent, found {len(step6_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step6_blocks[0]
+
+
+def _dict_has_pair(node, key_value, val_value):
+    """True if an ast.Dict literal has a Constant `key_value: val_value`
+    entry. Zips node.keys/node.values directly (parallel lists, same order,
+    same length by construction) rather than building a plain dict from
+    them first — several of this dict's other entries are Call nodes
+    (`g.get(...)`), not Constants, so a naive `dict(zip(...))` collapse
+    would still work here, but zipping keeps the intent explicit: we are
+    looking for one specific, unambiguous (key, value) pair, not building a
+    general-purpose lookup."""
+    for k, v in zip(node.keys, node.values):
+        if (
+            isinstance(k, ast.Constant) and k.value == key_value
+            and isinstance(v, ast.Constant) and v.value == val_value
+        ):
+            return True
+    return False
+
+
+def _dict_key_names(node):
+    """Constant string keys of an ast.Dict literal (skips any non-Constant
+    key, though this codebase never uses one)."""
+    return {k.value for k in node.keys if isinstance(k, ast.Constant)}
+
+
+def test_check_items_step6_cache_merge_stamps_note_evidence_only():
+    """#318 fix round 4 (F12, CRITICAL): the cache-merge block that replays
+    a cached classification for a `known_unchanged` group must stamp
+    note_evidence_only onto the constructed dict.
+
+    Without it, Step 7's `item.get("note_evidence_only", False)` silently
+    defaults to False on the missing key -- and classifier_source="cache"
+    IS a member of _HIGH_TRUST_SOURCES, so a cached DONE citation sharing a
+    literal #N with the item text reaches HIGH and gets auto-checked, on
+    EVERY re-run of the command after the first (the run that populated the
+    cache). This is worse than the original F1/F7 defect: the first run is
+    safe, the cached replay silently is not.
+
+    Parsed with `ast`, not a substring search: walks for the ast.Dict
+    literal carrying the Constant pair `"classifier_source": "cache"` (the
+    one cache-merge dict in this block -- Step 6's other classifications
+    all flow through classify_groups_with_agent / classify_groups_heuristic,
+    neither of which constructs a literal dict inline here), and asserts
+    "note_evidence_only" is among that dict's keys. A regex for the bare
+    substring "note_evidence_only" would be satisfied by a comment or an
+    unrelated dict elsewhere in the block.
+    """
+    source = _read_step6_heredoc()
+    tree = ast.parse(source)
+
+    cache_dicts = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        and _dict_has_pair(node, "classifier_source", "cache")
+    ]
+    assert len(cache_dicts) == 1, (
+        f"expected exactly one dict literal with "
+        f'"classifier_source": "cache" in Step 6\'s heredoc, found '
+        f"{len(cache_dicts)}"
+    )
+    assert "note_evidence_only" in _dict_key_names(cache_dicts[0]), (
+        "Step 6's cache-merge dict does not stamp note_evidence_only -- "
+        f"found keys {sorted(_dict_key_names(cache_dicts[0]))!r}. Without "
+        "it, every cached (classifier_source=\"cache\", a high-trust "
+        "source) verdict for a note-only project defaults "
+        "note_evidence_only=False at Step 7 and can reach HIGH again "
+        "(#318 F12)."
+    )
+
+
+def _read_step5_heredoc():
+    """Extract the Step 5 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md -- the evidence-gathering block, distinguished
+    from the other 6 same-delimiter PYEOF blocks by the presence of
+    `deep_analysis_pipeline(`, which is unique to Step 5 (Step 5's `from
+    open_item_dedup import deep_analysis_pipeline` line contains the bare
+    name without a paren, but the call site `status = deep_analysis_pipeline(`
+    is the actual invocation and appears nowhere else).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step5_blocks = [b for b in blocks if "deep_analysis_pipeline(" in b]
+    assert len(step5_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"deep_analysis_pipeline(, found {len(step5_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step5_blocks[0]
+
+
+def _is_dict_get_call(node, dict_name, key_value):
+    """True if `node` is a Call matching `<dict_name>.get(<key_value>, ...)`."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == dict_name
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == key_value
+    )
+
+
+def test_check_items_step5_extracts_evidence_gaps_from_pipeline_output():
+    """#318 Fix round 1 (F14): Step 5 reads `pipeline_data` (deep_analysis_
+    pipeline's output_path JSON) and previously extracted only
+    `pipeline_data.get("evidence", {})`, dropping `evidence_gaps` on the
+    floor. deep_analysis_pipeline already writes evidence_gaps into that
+    same JSON (#318 Task 3) -- it is the ONLY record of which projects had
+    no local git repo. Step 9's dashboard can only ever render the
+    ## Evidence Gaps section (Task 5 Step 5.5) if this extraction exists;
+    without it the section and its tests are correct but dead code in a
+    real /check-items run.
+
+    Parsed with `ast`, not a substring search: walks for a Call node
+    matching `pipeline_data.get("evidence_gaps", ...)` specifically (not
+    just any occurrence of the string "evidence_gaps", which would also
+    match a comment or the write_check_items_dashboard() call this same
+    block does NOT make).
+    """
+    source = _read_step5_heredoc()
+    tree = ast.parse(source)
+
+    gap_extractions = [
+        node for node in ast.walk(tree)
+        if _is_dict_get_call(node, "pipeline_data", "evidence_gaps")
+    ]
+    assert gap_extractions, (
+        "Step 5's heredoc does not extract "
+        'pipeline_data.get("evidence_gaps", ...) -- the dashboard\'s '
+        "## Evidence Gaps section can never receive real data from a "
+        "live /check-items run (#318 F14)."
+    )
+
+
+def _read_step7_heredoc():
+    """Extract the Step 7 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md.
+
+    Steps 3-10 ALL use `python3 << 'PYEOF' ... PYEOF` (7 occurrences, same
+    delimiter every time — unlike note_writer's per-invocation `<eof4>`
+    convention) — a naive first-match regex grabs Step 3's block, not
+    Step 7's. Scanned for the one block that actually contains
+    `assign_tier(`, which is unique to Step 7. `python3 -c '...'` snippets
+    elsewhere are already covered by _extract_python_snippets() above via
+    _SQ_SNIPPET_RE / _DQ_SNIPPET_RE (neither pattern matches a heredoc, so
+    no PYEOF block was ever visible to any existing snippet test). Reads
+    the real file on disk, not a fixture, so this test guards the actual
+    call site rather than a stand-in for it (#318 fix round 3, F11).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step7_blocks = [b for b in blocks if "assign_tier(" in b]
+    assert len(step7_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing assign_tier(, "
+        f"found {len(step7_blocks)} (of {len(blocks)} total heredoc blocks)"
+    )
+    return step7_blocks[0]
+
+
+def test_check_items_step7_threads_note_evidence_only_into_assign_tier():
+    """#318 fix round 3 (F11): Step 7's assign_tier(...) call must pass
+    note_evidence_only through, or every note-only project's citation
+    silently reverts to the pre-F7 HIGH-reachable bypass — announced
+    nowhere, since an omitted argument just falls back to
+    note_evidence_only's own default (False).
+
+    tests/test_check_items_note_evidence.py's
+    test_step7_wiring_threads_note_evidence_only_into_assign_tier pins the
+    *semantics* of that call shape (drop the 5th arg -> HIGH instead of
+    MED) but only against a Python-level reproduction of it — it cannot
+    catch a regression in the real markdown, because nothing executes
+    SKILL.md. This test closes that gap by parsing the ACTUAL Step 7
+    heredoc off disk.
+
+    Uses `ast`, not a substring/regex search for "note_evidence_only": a
+    regex would be satisfied by a comment or a string literal that never
+    reaches the call, which is exactly the kind of false-green a future
+    "helpful" edit could introduce. Walking the parsed AST for the
+    `assign_tier(...)` Call node and inspecting its actual arguments (via
+    `ast.unparse`, stdlib since Python 3.9 — no CI-version risk per
+    test_no_python_3_13_only_apis's floor) can only pass if the argument is
+    genuinely there.
+    """
+    source = _read_step7_heredoc()
+    tree = ast.parse(source)
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "assign_tier"
+    ]
+    assert len(calls) == 1, (
+        f"expected exactly one assign_tier(...) call in Step 7's heredoc, "
+        f"found {len(calls)}"
+    )
+    call = calls[0]
+
+    arg_sources = [ast.unparse(a) for a in call.args]
+    kw_names = {kw.arg for kw in call.keywords if kw.arg}
+
+    threaded_as_keyword = "note_evidence_only" in kw_names
+    threaded_as_5th_positional = (
+        len(arg_sources) >= 5 and "note_evidence_only" in arg_sources[4]
+    )
+    assert threaded_as_keyword or threaded_as_5th_positional, (
+        "Step 7's assign_tier(...) call does not pass note_evidence_only "
+        f"through — found {len(arg_sources)} positional arg(s) "
+        f"{arg_sources!r} and keyword(s) {sorted(kw_names)!r}. Without it, "
+        "every note-only project's citation defaults to "
+        "note_evidence_only=False and can reach HIGH again (#318 F7)."
+    )
+
+
+def _read_step8_heredoc():
+    """Extract the Step 8 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md -- the cascade block, distinguished from the
+    other 6 same-delimiter PYEOF blocks by the presence of
+    `cascade_group_members(`, which is unique to Step 8 (the `from
+    open_item_dedup import cascade_group_members` line contains the bare
+    name without a paren; the actual call site is the discriminator).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step8_blocks = [b for b in blocks if "cascade_group_members(" in b]
+    assert len(step8_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"cascade_group_members(, found {len(step8_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step8_blocks[0]
+
+
+def test_check_items_step8_stamps_applied_on_flipped_records():
+    """#318 Task 6: Step 8's cascade block must stamp `applied=True` onto
+    each buckets record whose occurrence was actually Read-Verified-Edited
+    by the primary-flip loop (tracked in `source_skips`), and persist that
+    stamp back to `buckets_path` -- before Step 9 reads it.
+
+    Without this, check_items_report._body's by-fact rendering (#318 Task
+    6, `c.get("applied")`) has nothing to key off of in a real run: every
+    classification record loaded from buckets_path would carry no
+    `applied` key at all, so the dashboard's checkboxes would silently
+    revert to always-unchecked (or, for DONE before this task's fix,
+    always-checked) -- correct code shipping dead, exactly like the
+    ## Evidence Gaps section before Fix round 1 (F14).
+
+    Parsed with `ast`, not a substring search: walks for an Assign node
+    whose target is a Subscript matching `<name>["applied"]` with value
+    `True` -- a regex for the bare string "applied" would also match the
+    unrelated `applied` count/heading logic living in check_items_report.py
+    (a different file, not even loaded here) or a comment in this block.
+    """
+    source = _read_step8_heredoc()
+    tree = ast.parse(source)
+
+    def _is_applied_true_assign(node):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            return False
+        target = node.targets[0]
+        return (
+            isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Name)
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value == "applied"
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+        )
+
+    stamps = [node for node in ast.walk(tree) if _is_applied_true_assign(node)]
+    assert stamps, (
+        'Step 8\'s cascade block does not contain an `<name>["applied"] = '
+        "True` assignment -- the dashboard's applied-by-fact rendering "
+        "(#318 Task 6) can never receive real data from a live "
+        "/check-items run."
+    )
+
+    # The stamp must also be persisted to buckets_path, or the mutation is
+    # invisible to the fresh `json.load(open(buckets_path))` Step 9 does.
+    # #318 M3: the write is now routed through _atomic_write_json(path, data)
+    # (temp+rename, not a plain open("w")) -- checked via ast for a Call to
+    # that name with buckets_path/buckets as its two arguments, not a
+    # substring search for "json.dump(buckets", which no longer appears
+    # literally in this block (the json.dump call now lives inside the
+    # helper's generic (path, data) parameters).
+    persist_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_atomic_write_json"
+        and len(node.args) == 2
+        and isinstance(node.args[0], ast.Name) and node.args[0].id == "buckets_path"
+        and isinstance(node.args[1], ast.Name) and node.args[1].id == "buckets"
+    ]
+    assert persist_calls, (
+        "Step 8's cascade block stamps applied but never writes buckets "
+        "back to buckets_path via _atomic_write_json(buckets_path, buckets) "
+        "-- the in-memory mutation is lost when this subprocess exits, "
+        "since Step 9 runs as a separate python3 invocation that re-reads "
+        "buckets_path from disk."
+    )
+
+
+def test_check_items_step8_atomic_write_helper_uses_temp_and_replace():
+    """#318 M3: the buckets_path REWRITE (and the new cascade_summary.json
+    write) must go through temp-file-then-rename, not a plain `open(path,
+    "w")` -- the repo's atomic-write convention (write_vault_note(),
+    check_items_cache.save_cache()). A plain in-place write left the
+    previous test's `_atomic_write_json(buckets_path, buckets)` call site
+    guard satisfied by a helper that still truncates the file directly, so
+    this checks the helper's OWN body for `tempfile.mkstemp` and
+    `os.replace`, not just that something named `_atomic_write_json` gets
+    called."""
+    source = _read_step8_heredoc()
+    tree = ast.parse(source)
+
+    funcs = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_atomic_write_json"
+    ]
+    assert len(funcs) == 1, (
+        f"expected exactly one _atomic_write_json def in Step 8's heredoc, "
+        f"found {len(funcs)}"
+    )
+    body_src = ast.unparse(funcs[0])
+    assert "tempfile.mkstemp" in body_src, (
+        "_atomic_write_json does not use tempfile.mkstemp -- it is not "
+        "writing to a temp file first."
+    )
+    assert "os.replace" in body_src, (
+        "_atomic_write_json does not use os.replace -- a temp file with no "
+        "rename into place is not an atomic write, just a stray temp file."
+    )
+
+
+def _read_step9_heredoc():
+    """Extract the Step 9 `python3 << 'PYEOF' ... PYEOF` heredoc body from
+    skills/check-items/SKILL.md -- the dashboard-write block, distinguished
+    from the other 7 same-delimiter PYEOF blocks by the presence of
+    `write_check_items_dashboard(` (the actual call, with its opening
+    paren -- the bare `write_check_items_dashboard()` mention in this
+    step's own prose, outside any heredoc, is never part of the extracted
+    block strings in the first place, so it can't cause a false match here).
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks = _PYEOF_HEREDOC_RE.findall(content)
+    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
+    step9_blocks = [b for b in blocks if "write_check_items_dashboard(" in b]
+    assert len(step9_blocks) == 1, (
+        f"expected exactly one PYEOF heredoc block containing "
+        f"write_check_items_dashboard(, found {len(step9_blocks)} (of "
+        f"{len(blocks)} total heredoc blocks)"
+    )
+    return step9_blocks[0]
+
+
+def test_check_items_step9_passes_merges_and_evidence_gaps():
+    """#318 I1: Step 9 was prose-only ("call write_check_items_dashboard()
+    with the scope, classifications, ...") with no executable block behind
+    it -- the same shape as F14 (## Evidence Gaps): code that is written,
+    tested, and unreachable unless a model happens to follow the prose.
+    `merge_records_from_groups` had ZERO production callers outside that
+    prose. Step 9 now has a real heredoc; this guards that its
+    write_check_items_dashboard(...) call actually passes `merges=` and
+    `evidence_gaps=` as keyword arguments, not just that the function is
+    called at all.
+
+    Parsed with `ast`: walks for the Call node whose func is the Name
+    `write_check_items_dashboard`, then inspects its keyword arguments by
+    name -- a regex for the bare strings "merges" / "evidence_gaps" would
+    also match their assignment above the call (`merges = ...`,
+    `evidence_gaps = ...`) or a comment, neither of which proves they
+    reached the call itself.
+    """
+    source = _read_step9_heredoc()
+    tree = ast.parse(source)
+
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "write_check_items_dashboard"
+    ]
+    assert len(calls) == 1, (
+        f"expected exactly one write_check_items_dashboard(...) call in "
+        f"Step 9's heredoc, found {len(calls)}"
+    )
+    kw_names = {kw.arg for kw in calls[0].keywords if kw.arg}
+    missing = {"merges", "evidence_gaps"} - kw_names
+    assert not missing, (
+        f"Step 9's write_check_items_dashboard(...) call is missing "
+        f"keyword argument(s) {sorted(missing)} -- found keywords "
+        f"{sorted(kw_names)!r}. Without merges=, '## Merged Groups' has "
+        f"nothing correct to render (#318 bug 3); without evidence_gaps=, "
+        f"'## Evidence Gaps' silently never renders (#318 F14)."
+    )
+
+    # N6: the other two of I1's three "must be mechanical" items were
+    # unguarded -- pinned only by the keyword-argument check above binding
+    # `classifications=classifications` and `cascaded=cascaded`, neither of
+    # which proves those NAMES were themselves derived from a fresh
+    # buckets_path read / cascade_summary_path read, as opposed to (say) a
+    # stale variable left over from an earlier, unrelated block.
+    def _is_json_load_open_call(node, arg_name):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "load"
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "json"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Name) and node.args[0].func.id == "open"
+            and node.args[0].args
+            and isinstance(node.args[0].args[0], ast.Name)
+            and node.args[0].args[0].id == arg_name
+        )
+
+    buckets_reads = [n for n in ast.walk(tree) if _is_json_load_open_call(n, "buckets_path")]
+    assert buckets_reads, (
+        "Step 9's heredoc does not contain json.load(open(buckets_path)) -- "
+        "classifications must be reloaded fresh from buckets_path (#318 "
+        "Task 6), not a stale copy, or every checkbox silently reverts to "
+        "reading from classification instead of Step 8's applied stamps."
+    )
+
+    classifications_from_buckets = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "classifications"
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "get"
+        and isinstance(node.value.func.value, ast.Name) and node.value.func.value.id == "buckets"
+    ]
+    assert classifications_from_buckets, (
+        "Step 9's heredoc does not assign classifications = buckets.get(...) "
+        "-- json.load(open(buckets_path)) being present doesn't prove "
+        "`classifications` itself comes from it, only that SOMETHING reads "
+        "the file."
+    )
+
+    cascade_summary_reads = [
+        n for n in ast.walk(tree) if _is_json_load_open_call(n, "cascade_summary_path")
+    ]
+    assert cascade_summary_reads, (
+        "Step 9's heredoc does not contain "
+        "json.load(open(cascade_summary_path)) -- cascaded/skipped would "
+        "silently default to 0/0 on every run, not just when Step 8 was "
+        "genuinely skipped (#318 I1/N3)."
+    )
+
+
+def test_check_items_step10_uses_locked_cache_not_bare_save():
+    """#306: Step 10 must persist cache updates through locked_cache(), the
+    context manager that serializes the whole load-mutate-save cycle behind
+    a lock, not the old unlocked `load_cache()` ... `save_cache(cache)`
+    pair. Skills are advisory prose, not enforced code (memory:
+    feedback_skills_advisory_not_enforcement) — a future edit could
+    silently drop back to the bare calls without anyone noticing; this pins
+    the call shape so that regresses as a failing test instead.
+
+    Extracted from the Step 10 block specifically (bounded by the next
+    `## ` header), not the whole file, so Step 3's own unlocked
+    load_cache() call — deliberately read-only per the #306 spec — cannot
+    false-positive this check.
+    """
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+
+    step10_start = content.index("## Step 10")
+    rest = content[step10_start + len("## Step 10"):]
+    next_header = re.search(r"\n## ", rest)
+    step10 = rest[:next_header.start()] if next_header else rest
+
+    assert re.search(r"from check_items_cache import[^\n]*\blocked_cache\b", step10), (
+        "Step 10 must import locked_cache from check_items_cache"
+    )
+    assert re.search(r"\bwith\s+locked_cache\s*\(", step10), (
+        "Step 10 must persist cache updates via `with locked_cache(...)`, "
+        "not a bare load_cache()/save_cache() pair"
+    )
+    assert not re.search(r"(?<!\w)save_cache\s*\(\s*cache\s*\)", step10), (
+        "Step 10 must not call save_cache(cache) directly — locked_cache() "
+        "saves internally as part of its lock-protected cycle"
+    )
+
+
+def _read_step10():
+    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    step10_start = content.index("## Step 10")
+    rest = content[step10_start + len("## Step 10"):]
+    next_header = re.search(r"\n## ", rest)
+    return content, rest[:next_header.start()] if next_header else rest
+
+
+def test_check_items_step10_reports_failure_on_stdout_and_exits_nonzero():
+    """#323 F3: two paths previously skipped the save entirely (a body
+    exception; save_cache() itself raising on a full/read-only disk) and
+    left the run looking clean anyway — nothing told the driving agent to
+    notice, and the terminal output still showed Step 7's `Cached: N
+    reused, M fresh` as if it were the final state. Step 10 must now catch
+    both, print `cache NOT updated: <reason>` on STDOUT (mirrors the
+    existing `#320 F2` precedent in Step 8: stderr is documented elsewhere
+    in this repo, skills/standup/SKILL.md, as ignorable, so the failure
+    signal must not live there), and exit non-zero."""
+    _, step10 = _read_step10()
+
+    assert re.search(r'except\s+Exception\s+as\s+\w+:', step10), (
+        "Step 10 must wrap the locked_cache block in a try/except so a "
+        "body exception or a save_cache() failure is caught rather than "
+        "left as a bare traceback"
+    )
+    assert re.search(r'print\(f?"cache NOT updated', step10), (
+        "Step 10 must print 'cache NOT updated: <reason>' when the "
+        "locked_cache block fails"
+    )
+    assert re.search(r'print\(f?"cache NOT updated[^\n]*\n\s*sys\.exit\(1\)', step10), (
+        "Step 10 must exit non-zero right after reporting the failure "
+        "(not merely print it and fall through as if nothing happened)"
+    )
+    assert 'print("cache updated")' in step10, (
+        "the pre-existing success message must still be there for the "
+        "happy path"
+    )
+
+
+def test_check_items_step10_does_not_rebind_cache_from_update_cache():
+    """#323 F6: `update_cache()` mutates its `cache` argument IN PLACE and
+    returns that same object — but `locked_cache()` saves its OWN `cache`
+    binding, not whatever a caller inside the `with` block reassigns the
+    name to. `cache = update_cache(...)` is safe today only because the
+    return value happens to be the same object; the day update_cache()
+    returns a copy instead, every run would silently persist the
+    pre-mutation snapshot while still printing 'cache updated'. Step 10
+    must call update_cache(...) unassigned."""
+    _, step10 = _read_step10()
+
+    assert not re.search(r"\bcache\s*=\s*update_cache\s*\(", step10), (
+        "Step 10 must not rebind `cache = update_cache(...)` — "
+        "locked_cache() saves its own binding, not the rebind (#323 F6)"
+    )
+    assert re.search(r"\bupdate_cache\(\s*\n", step10), (
+        "Step 10 must still call update_cache(...) (unassigned) so the "
+        "cache is actually mutated"
+    )
+
+
+def test_check_items_output_format_has_a_cache_line():
+    """#323 F3: the Output format block must surface Step 10's outcome via
+    a `Cache:` line, unconditionally printed — unlike `Skipped:`, which is
+    intentionally omitted when zero, `Cache:` must always appear so a
+    dropped update can never be mistaken for silence meaning success."""
+    content, _ = _read_step10()
+    output_start = content.index("## Output format")
+    output_block = content[output_start:output_start + 2000]
+
+    assert "Cache: updated" in output_block, (
+        "the example Output format block must show the success case, "
+        "`Cache: updated`"
+    )
+    assert "NOT updated" in output_block, (
+        "the Output format section must document the failure wording, "
+        "`NOT updated — <reason>`"
+    )
+
+
+# --- #354 review item 1: no trailing "# comment" on a frontmatter field line ---
+#
+# This repo's frontmatter reader is a flat line splitter (obsidian_utils.py
+# / vault_index.py), NOT a YAML parser: a field line is parsed with
+# `stripped.partition(':')` and `.strip('"')` — which only trims a leading
+# and trailing `"` character, never anything after it. A round-1 line like
+#
+#   source_session_note: "{{source_session_note}}"  # omit this line ...
+#
+# is fatal on exactly that parser: once the model fills in the placeholder
+# and copies the line verbatim, the trailing `# ...` comment is NOT
+# stripped — it becomes part of the field's VALUE. The corrupted wikilink
+# fails `_wikilink_stem`'s bracket test and `crossed_source_session.py`
+# then counts the note as DANGLING, invisible to the very check this PR
+# adds. Round 1 put this shape in seven places (three templates/*.md files,
+# four skills/*/SKILL.md fenced frontmatter examples); this test scans ALL
+# of them generically (any field, not just source_session_note) so the
+# mistake cannot come back on a different key.
+_FRONTMATTER_FIELD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):\s*(.*)$")
+
+
+def _frontmatter_lines_from_block(block_lines):
+    """Yield (line_no_in_block, line) for top-level `key: value` lines in a
+    frontmatter block — skips list items (`  - foo`) and blank lines, which
+    is exactly the line shape the flat parser treats as a field."""
+    for i, line in enumerate(block_lines):
+        if _FRONTMATTER_FIELD_RE.match(line):
+            yield i, line
+
+
+def _template_frontmatter_blocks():
+    """(source_label, [lines]) for the frontmatter block of every
+    templates/*.md file. Tolerates a leading HTML comment (template-only
+    documentation, see #354 review item 1) before the opening `---`."""
+    blocks = []
+    for path in sorted(glob.glob(os.path.join(_REPO_ROOT, "templates/*.md"))):
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        fence_idxs = [i for i, l in enumerate(lines) if l.strip() == "---"]
+        assert len(fence_idxs) >= 2, f"{path}: expected a --- ... --- frontmatter block"
+        start, end = fence_idxs[0], fence_idxs[1]
+        label = os.path.relpath(path, _REPO_ROOT)
+        blocks.append((label, lines[start + 1:end]))
+    return blocks
+
+
+_FENCE_RE = re.compile(r"^```[^\n]*\n(.*?)^```", re.DOTALL | re.MULTILINE)
+
+
+def _skill_frontmatter_blocks():
+    """(source_label, [lines]) for every fenced (```) code block in
+    skills/*/SKILL.md whose first line is a bare `---` — i.e. an example
+    note frontmatter block shown to the model, not an unrelated fence
+    (bash snippet, JSON, etc.)."""
+    blocks = []
+    for path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        for fi, m in enumerate(_FENCE_RE.finditer(content)):
+            fence_lines = m.group(1).splitlines()
+            if not fence_lines or fence_lines[0].strip() != "---":
+                continue
+            close_idxs = [i for i, l in enumerate(fence_lines[1:], start=1) if l.strip() == "---"]
+            if not close_idxs:
+                # A bare leading '---' with no closing '---' is a markdown
+                # horizontal rule inside an example block (e.g. a rendered
+                # report template), not YAML frontmatter — skip it rather
+                # than misparse it as one.
+                continue
+            end = close_idxs[0]
+            label = f"{os.path.relpath(path, _REPO_ROOT)}#fence{fi}"
+            blocks.append((label, fence_lines[1:end]))
+    return blocks
+
+
+def test_no_trailing_comment_on_frontmatter_field_lines():
+    """No `templates/*.md` or `skills/*/SKILL.md` example frontmatter block
+    may have a trailing `#` comment on a field line — see the module
+    comment above this test for why (#354 review item 1)."""
+    violations = []
+    for label, block_lines in _template_frontmatter_blocks() + _skill_frontmatter_blocks():
+        for i, line in _frontmatter_lines_from_block(block_lines):
+            if "#" in line:
+                violations.append(f"{label}:{i}: {line!r}")
+
+    assert not violations, (
+        "trailing '#' comment found on a frontmatter field line — this "
+        "repo's frontmatter reader is a flat line splitter, not a YAML "
+        "parser, so an inline comment corrupts the field's value once a "
+        "model copies the line verbatim (#354 review item 1). Move the "
+        "instruction to prose outside the frontmatter block instead.\n"
+        + "\n".join(violations)
+    )
+
+
+def test_no_trailing_comment_regression_fixture_would_have_caught_round1():
+    """Mutation proof: re-introducing the round-1 shape on an UNRELATED
+    field must fail test_no_trailing_comment_on_frontmatter_field_lines —
+    proves the scan is general, not source_session_note-specific."""
+    fixture = ["type: claude-insight", 'foo: "bar"  # omit this line entirely when empty']
+    violations = [
+        f"fixture:{i}: {line!r}"
+        for i, line in _frontmatter_lines_from_block(fixture)
+        if "#" in line
+    ]
+    assert violations, "the fixture itself must trip the detector"
+
+
+def test_every_template_starts_with_the_frontmatter_fence():
+    """A template must begin at byte 0 with '---'.
+
+    Anything before the opening fence — an HTML comment, a blank line, a
+    prose note — means the repo's own parser captures NO frontmatter at all,
+    so a note copied from that template is invisible to the index, to
+    /recall, and to every vault-doctor check. This repo ships a dedicated
+    `missing-frontmatter-fence` check for exactly that failure, which is how
+    seriously it is treated.
+
+    Regression guard: a #330 review fix moved an instruction comment above
+    the fence in insight/decision/error-fix, which silently broke all three.
+    The trailing-comment guard below could not see it, because the damage
+    was above the frontmatter rather than inside it.
+    """
+    import glob
+
+    offenders = []
+    for path in sorted(glob.glob(os.path.join(_REPO_ROOT, "templates", "*.md"))):
+        with open(path, encoding="utf-8") as fh:
+            head = fh.read(3)
+        if head != "---":
+            offenders.append(f"{os.path.basename(path)} starts {head!r}, not '---'")
+
+    assert not offenders, (
+        "template(s) do not begin with the frontmatter fence: " + "; ".join(offenders)
+    )
+
+
+def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root=None):
+    """Run the real Step 8 heredoc against a scratch vault and return
+    (completed process, sessions dir, buckets after the run).
+
+    symlinked_vault: config names a symlink to the vault, as with an iCloud
+    or Dropbox vault. skip_root: directory the skip paths are written under
+    (default: the sessions dir the config names)."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    vault = tmp_path / "vault"
+    sessions = vault / "claude-sessions"
+    sessions.mkdir(parents=True)
+    config_vault = vault
+    if symlinked_vault:
+        config_vault = tmp_path / "vault-link"
+        config_vault.symlink_to(vault)
+    (home / ".claude" / "obsidian-brain-config.json").write_text(
+        json.dumps({"vault_path": str(config_vault), "sessions_folder": "claude-sessions"})
+    )
+    files = {}
+    for g in groups:
+        for m in g["members"]:
+            files.setdefault(m["file"], {})[m["line"]] = m["_line"]
+    for name, lines in files.items():
+        body = [lines.get(i, "filler") for i in range(1, max(lines) + 1)]
+        (sessions / name).write_text("\n".join(body) + "\n")
+    work = tmp_path / "work"
+    work.mkdir()
+    merged = {"merged_by_proj": {"p": [
+        {"group_id": g["group_id"],
+         "members": [{k: v for k, v in m.items() if k != "_line"} for m in g["members"]]}
+        for g in groups
+    ]}}
+    (work / "merged.json").write_text(json.dumps(merged))
+    (work / "scope.json").write_text("{}")
+    (work / "buckets.json").write_text(json.dumps({"review": review}))
+    skips_file = work / "skips.json"
+    root = sessions if skip_root is None else skip_root
+    skips_file.write_text(json.dumps([[str(root / f), ln] for f, ln in skips]))
+    env = dict(os.environ, HOME=str(home),
+               SCOPE_PATH=str(work / "scope.json"),
+               BUCKETS_PATH=str(work / "buckets.json"),
+               MERGED_PATH=str(work / "merged.json"),
+               SKIPS_FILE=str(skips_file))
+    proc = subprocess.run(
+        [sys.executable, "-c", _read_step8_heredoc()],
+        cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=60,
+    )
+    buckets = json.loads((work / "buckets.json").read_text())
+    return proc, sessions, buckets
+
+
+def test_step8_cascades_only_groups_the_user_flipped(tmp_path):
+    """#340: a DONE group the user did not flip must not be cascaded. Before
+    the fix, Step 8 cascaded every DONE group, so the deselected group's lines
+    were checked off in the vault while Step 9's report (which renders from
+    the `applied` stamp) showed them open. The flipped group is the negative
+    control: its sibling must still be cascaded, or the gate has simply
+    switched the cascade off."""
+    groups = [
+        {"group_id": "g-flipped", "members": [
+            {"file": "a.md", "line": 1, "text": "Ship the widget", "_line": "- [x] Ship the widget"},
+            {"file": "b.md", "line": 1, "text": "Ship the widget", "_line": "- [ ] Ship the widget"},
+        ]},
+        {"group_id": "g-deselected", "members": [
+            {"file": "a.md", "line": 2, "text": "Fix the gadget", "_line": "- [ ] Fix the gadget"},
+            {"file": "b.md", "line": 2, "text": "Fix the gadget", "_line": "- [ ] Fix the gadget"},
+        ]},
+    ]
+    review = [
+        {"group_id": "g-flipped", "classification": "DONE", "tier": "HIGH",
+         "canonical_text": "Ship the widget"},
+        {"group_id": "g-deselected", "classification": "DONE", "tier": "HIGH",
+         "canonical_text": "Fix the gadget"},
+    ]
+    proc, sessions, buckets = _run_step8(tmp_path, groups, review, skips=[("a.md", 1)])
+    assert proc.returncode == 0, proc.stderr
+    assert "cascaded_total=1" in proc.stdout, proc.stdout
+
+    a = (sessions / "a.md").read_text().splitlines()
+    b = (sessions / "b.md").read_text().splitlines()
+    assert b[0] == "- [x] Ship the widget"          # sibling of a flipped group
+    assert a[1] == "- [ ] Fix the gadget"           # deselected: untouched
+    assert b[1] == "- [ ] Fix the gadget"
+
+    applied = {r["group_id"]: bool(r.get("applied")) for r in buckets["review"]}
+    assert applied == {"g-flipped": True, "g-deselected": False}
+    # The report invariant #340 is about: every checked line in the vault
+    # belongs to a group the report renders checked.
+    checked_groups = {
+        g["group_id"] for g in groups
+        for m in g["members"]
+        if (sessions / m["file"]).read_text().splitlines()[m["line"] - 1].startswith("- [x] ")
+    }
+    assert checked_groups <= {gid for gid, on in applied.items() if on}
+
+
+def _two_group_fixture():
+    groups = [
+        {"group_id": "g1", "members": [
+            {"file": "a.md", "line": 1, "text": "Ship the widget", "_line": "- [x] Ship the widget"},
+            {"file": "b.md", "line": 1, "text": "Ship the widget", "_line": "- [ ] Ship the widget"},
+        ]},
+    ]
+    review = [{"group_id": "g1", "classification": "DONE", "tier": "HIGH",
+               "canonical_text": "Ship the widget"}]
+    return groups, review
+
+
+def test_step8_matches_skips_through_a_symlinked_vault(tmp_path):
+    """#340 review: the stamp now gates the cascade, so a path spelling
+    difference must not cancel it. Config names a symlink to the vault; the
+    primary-flip loop recorded the resolved path. The sibling must still be
+    cascaded and the group stamped."""
+    groups, review = _two_group_fixture()
+    proc, sessions, buckets = _run_step8(
+        tmp_path, groups, review, skips=[("a.md", 1)],
+        symlinked_vault=True, skip_root=(tmp_path / "vault" / "claude-sessions"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "cascaded_total=1" in proc.stdout, proc.stdout + proc.stderr
+    assert (sessions / "b.md").read_text().splitlines()[0] == "- [x] Ship the widget"
+    assert buckets["review"][0].get("applied") is True
+
+
+def test_step8_warns_when_recorded_flips_match_no_group(tmp_path):
+    """#340 review: recorded flips that match no group member leave nothing
+    stamped and nothing cascaded. That must be said, not printed as an
+    ordinary cascaded_total=0."""
+    groups, review = _two_group_fixture()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    proc, sessions, buckets = _run_step8(
+        tmp_path, groups, review, skips=[("a.md", 1)], skip_root=elsewhere,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "cascaded_total=0" in proc.stdout
+    assert "none matched a grouped item" in proc.stderr, proc.stderr
+    assert (sessions / "b.md").read_text().splitlines()[0] == "- [ ] Ship the widget"

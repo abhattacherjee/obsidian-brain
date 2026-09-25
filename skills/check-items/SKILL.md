@@ -28,7 +28,7 @@ Each step below is a bash block; the embedded Python reads its inputs from `$1`,
 ```bash
 ARGUMENTS="${ARGUMENTS:-}"
 scope_path=$(python3 -c "
-import sys, os, glob, json, tempfile
+import sys, os, glob, json, tempfile, difflib
 import glob, json, os, re, sys
 def _ob_hooks():
     try:
@@ -48,9 +48,32 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
 sys.path.insert(0, _ob_hooks())
 from check_items_args import parse_scope
+from obsidian_utils import describe_plugin_install_divergence
 
 argv = sys.argv[1:]
 scope_obj = parse_scope(argv)
+if scope_obj.unknown_tokens:
+    # M2: reuse the project set parse_scope already computed instead of
+    # re-querying the vault index and re-walking every workspace root.
+    _all_projects = scope_obj.known_projects
+    _near = sorted(p for p in _all_projects
+                   if any(t.lower() in p.lower() or p.lower() in t.lower()
+                          for t in scope_obj.unknown_tokens))
+    for _t in scope_obj.unknown_tokens:
+        # difflib catches transpositions and single-character typos
+        # ('obsidian-brian' -> 'obsidian-brain'); the substring pass above
+        # only catches prefixes and truncations. Neither alone is enough.
+        for _c in difflib.get_close_matches(_t, sorted(_all_projects), n=3, cutoff=0.6):
+            if _c not in _near:
+                _near.append(_c)
+    _near = _near[:5]
+    print('ERROR: unrecognised argument(s): '
+          + ', '.join(repr(t) for t in scope_obj.unknown_tokens), file=sys.stderr)
+    if _near:
+        print('Did you mean: ' + ', '.join(_near), file=sys.stderr)
+    print('Valid forms: <project> | all | Nd | --show-all | --dry-run | --no-cache',
+          file=sys.stderr)
+    sys.exit(2)
 scope = {
     'mode': scope_obj.mode,
     'project': scope_obj.project,
@@ -66,6 +89,19 @@ scope_path = os.path.join(workdir, 'scope.json')
 with open(scope_path, 'w') as f:
     json.dump(scope, f)
 os.chmod(scope_path, 0o600)
+
+# #318 Task 7: warn (never fail) when installed obsidian-brain copies
+# disagree on version -- a diagnostic must never break the command it
+# diagnoses, so any failure here is swallowed. Printed to stderr, never
+# stdout: this whole block's stdout is captured as \$scope_path below, and
+# a second stdout line would corrupt that capture.
+try:
+    _skew = describe_plugin_install_divergence()
+    if _skew:
+        print('WARNING: ' + _skew, file=sys.stderr)
+except Exception:
+    pass
+
 print(scope_path)
 " $ARGUMENTS)
 
@@ -76,6 +112,10 @@ cat "$scope_path"
 Save the printed `scope.json` path in `$scope_path`; pass it to every subsequent step as the first arg.
 
 Note: `window_days` in scope controls how many sessions' files to pass as `basenames` in Step 5. The `collect_open_items` helper itself scans by `max_sessions` count (not calendar days); to apply a window filter, limit the basenames list to files dated within the window before passing to `deep_analysis_pipeline`.
+
+**Unrecognised arguments are fatal (#318).** `parse_scope` records any token that is not a flag, `all`, an `Nd` window, or a known project on `scope.unknown_tokens`, and the block above exits 2 rather than proceeding. A silently-dropped project name does not degrade the run — it makes the run answer about the *current* project while appearing to answer about the one that was named. Known projects are the union of workspace-root directories and every `project` value in the vault index, so a notes-only project with no git repo is recognised.
+
+If the block exits 2, stop and show the user the stderr verbatim; do not fall through to Step 2.
 
 ## Step 2 — Collect open items (Stage 1)
 
@@ -279,6 +319,7 @@ flat_groups = cross_project_dedup(coarse_by_proj) if scope["mode"] == "vault" el
 # Cache partition (per project).
 cache = load_cache()
 known, needs = [], []
+heads = {}
 for proj, groups in coarse_by_proj.items():
     repo_path = None
     for _root in get_workspace_roots():
@@ -305,13 +346,14 @@ for proj, groups in coarse_by_proj.items():
         needs.extend(groups)
         continue
     head = head_proc.stdout.strip()
+    heads[proj] = head
     k, n = partition(groups, cache, project=proj, head_sha=head, force=scope["no_cache"])
     known.extend(k)
     needs.extend(n)
 
 out = os.path.join(os.path.dirname(scope_path), "partition.json")
 with open(out, "w") as f:
-    json.dump({"flat_groups": flat_groups, "known": known, "needs": needs}, f, indent=2)
+    json.dump({"flat_groups": flat_groups, "known": known, "needs": needs, "heads": heads}, f, indent=2)
 os.chmod(out, 0o600)
 print(out)
 PYEOF
@@ -385,7 +427,7 @@ echo "merged_path=$merged_path"
 ## Step 5 — Gather evidence (Stage 3)
 
 ```bash
-evidence_path=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" python3 << 'PYEOF'
+_step5_out=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" python3 << 'PYEOF'
 import sys, os, glob, json, datetime
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -458,23 +500,43 @@ if not status.startswith("OK"):
     print(f"WARNING: deep_analysis_pipeline returned: {status}", file=sys.stderr)
 
 # Read the written evidence from output_path for downstream use.
+# evidence_gaps (#318 Task 5 F14) is extracted alongside evidence here, not
+# dropped: it is deep_analysis_pipeline's ONLY record of which projects had
+# no git repo to draw evidence from, and it must reach Step 9's dashboard
+# artefact -- the stderr warning deep_analysis_pipeline already prints is
+# not something the user keeps.
 try:
     pipeline_data = json.load(open(output_path))
     evidence = pipeline_data.get("evidence", {})
+    evidence_gaps = pipeline_data.get("evidence_gaps", {})
 except (OSError, json.JSONDecodeError) as e:
     print(f"WARNING: could not read pipeline output: {e}", file=sys.stderr)
     evidence = {}
+    evidence_gaps = {}
 
 out = os.path.join(os.path.dirname(scope_path), "evidence.json")
 with open(out, "w") as f:
     json.dump(evidence, f, default=str, indent=2)
 os.chmod(out, 0o600)
+
+gaps_out = os.path.join(os.path.dirname(scope_path), "gaps.json")
+with open(gaps_out, "w") as f:
+    json.dump(evidence_gaps, f, default=str, indent=2)
+os.chmod(gaps_out, 0o600)
+
 print(out)
+print(gaps_out)
 PYEOF
 )
 
+evidence_path=$(echo "$_step5_out" | sed -n '1p')
+gaps_path=$(echo "$_step5_out" | sed -n '2p')
+
 echo "evidence_path=$evidence_path"
+echo "gaps_path=$gaps_path"
 ```
+
+`deep_analysis_pipeline` gathers per-project evidence for every project in `merged_by_proj`. For a project with a resolved local git repo, evidence is git-derived: commits, merged PRs, closed issues, releases, FTS-indexed vault mentions, and tags/changed paths folded in from recent commits. For a project with no local repo, `gather_note_completion_evidence()` (#318) is the only evidence source: it flags an item when a strictly newer session's own `## Summary` reports it done (mirroring `/recall`'s `contradicted_by` signal), gated on the same completion-phrase guard the heuristic classifier uses so a bare co-mention can never fabricate DONE evidence. Both write into the same per-project bucket (`note_completions` alongside the git-derived keys) — Step 6's classifier and Step 7's `assign_tier` treat a project whose ONLY real evidence is `note_completions` as capped at tier MED regardless of citation wording, via `note_evidence_only_for()` (`hooks/check_items_cli.py`), never HIGH.
 
 ## Step 6 — Classify (Stage 4) with fallback chain
 
@@ -502,6 +564,7 @@ sys.path.insert(0, _ob_hooks())
 from open_item_dedup import (
     classify_groups_with_agent, classify_groups_heuristic, get_last_classifier_mode
 )
+from check_items_cli import note_evidence_only_for
 
 scope_path = os.environ["SCOPE_PATH"]
 merged_path = os.environ["MERGED_PATH"]
@@ -547,6 +610,7 @@ for g in all_merged:
             "action_required": g.get("_cached_action_required"),
             "project": g.get("project"),
             "classifier_source": "cache",
+            "note_evidence_only": note_evidence_only_for(evidence, g.get("project", "")),
         })
 
 out = os.path.join(os.path.dirname(scope_path), "classifications.json")
@@ -593,7 +657,8 @@ for item in data["classifications"]:
     item["tier"] = assign_tier(item.get("evidence_citation"),
                                item.get("canonical_text"),
                                item.get("classification"),
-                               item.get("classifier_source"))
+                               item.get("classifier_source"),
+                               item.get("note_evidence_only", False))
 
 buckets = partition_for_review(data["classifications"], show_all=scope["show_all"])
 
@@ -606,6 +671,9 @@ if mode != "ok":
           f"token-overlap heuristic, not evidence.", file=sys.stderr)
     print("   Heuristic citations read 'token X near completion phrase Y'. "
           "That is co-occurrence, NOT proof the item is done.", file=sys.stderr)
+    print("   A citation reading 'DONE rejected — ... but <cue> governs it' is "
+          "the #299 conditional guard: the co-occurrence was a pending or "
+          "forward-looking reference, so the item stayed open.", file=sys.stderr)
     print("   They are capped at tier MED and are never preselected. "
           "Verify each one manually before accepting.", file=sys.stderr)
 
@@ -668,7 +736,7 @@ print(path)
 # the JSON-serialised content written to $_skips_file after the primary-flip loop.
 
 SCOPE_PATH="$scope_path" BUCKETS_PATH="$buckets_path" MERGED_PATH="$merged_path" SKIPS_FILE="$_skips_file" python3 << 'PYEOF'
-import sys, os, glob, json, re
+import sys, os, glob, json, re, tempfile
 import glob, json, os, re, sys
 def _ob_hooks():
     try:
@@ -687,7 +755,7 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
-from open_item_dedup import cascade_group_members
+from open_item_dedup import cascade_group_members, parse_cascade_skipped_total
 
 scope_path = os.environ["SCOPE_PATH"]
 buckets_path = os.environ["BUCKETS_PATH"]
@@ -705,6 +773,13 @@ except (OSError, json.JSONDecodeError, ValueError) as exc:
     sys.exit(1)
 sessions_folder = config.get("sessions_folder", "claude-sessions")
 sessions_dir = os.path.join(vault_path, sessions_folder)
+
+# #340: source_skips now decides which groups cascade, not just how the report
+# renders, so a spelling difference between the path the primary-flip loop
+# recorded and os.path.join(sessions_dir, basename) (a symlinked vault, a
+# trailing slash) would silently cancel the cascade. Compare real paths.
+def _skip_key(path, line):
+    return (os.path.realpath(str(path)), int(line))
 
 buckets = json.load(open(buckets_path))
 scope = json.load(open(scope_path))
@@ -731,16 +806,90 @@ if skips_file and os.path.exists(skips_file):
         raw_skips = json.load(open(skips_file))
         for entry in raw_skips or []:
             if isinstance(entry, list) and len(entry) == 2:
-                source_skips.add((str(entry[0]), int(entry[1])))
+                source_skips.add(_skip_key(entry[0], entry[1]))
     except (OSError, json.JSONDecodeError, ValueError) as exc:
-        print(f"[check-items] WARNING: source_skips load failed ({exc}); cascade summary may be inaccurate", file=sys.stderr)
+        print(
+            f"[check-items] WARNING: source_skips load failed ({exc}); no item "
+            f"will be stamped applied and NO sibling cascade runs this run -- "
+            f"the checkoffs from steps 1-4 are on disk, but the report will "
+            f"show them open. Re-run /check-items to cascade.",
+            file=sys.stderr,
+        )
         source_skips = set()
 
+# #318 Task 6: stamp applied=True on each buckets record whose own occurrence
+# is a member of source_skips -- i.e. was actually Read-Verified-Edited by
+# the primary-flip loop above (steps 1-4), not merely classified. Covers
+# every classification (DONE, NEEDS-ACTION, REVIEW), not just DONE -- a
+# user-opted-in REVIEW checkoff is just as much "actually flipped" as a
+# preselected DONE one. Step 9's dashboard (check_items_report._body)
+# renders `- [x]` from THIS field, not from classification, so a DONE item
+# the user deselected (never reached source_skips) must stay unchecked.
+for b in buckets["review"]:
+    gid = b.get("group_id")
+    merged_group = groups_by_id.get(gid) if gid else None
+    if not merged_group:
+        continue
+    for m in merged_group.get("members", []) or []:
+        basename = m.get("file", "")
+        line_num = m.get("line")
+        if not basename or line_num is None:
+            continue
+        full_path = os.path.join(sessions_dir, basename)
+        try:
+            key = _skip_key(full_path, line_num)
+        except (TypeError, ValueError):
+            continue
+        if key in source_skips:
+            b["applied"] = True
+            break
+
+# #340: a non-empty source_skips that stamps nothing means every recorded path
+# failed to match a group member -- the cascade below would then silently do
+# nothing, which prints exactly like "the user deselected everything".
+_stamped = sum(1 for b in buckets["review"] if b.get("applied"))
+if source_skips and not _stamped:
+    print(
+        f"[check-items] WARNING: {len(source_skips)} primary flip(s) recorded "
+        f"but none matched a grouped item, so no sibling cascade runs and the "
+        f"report shows them open. Recorded paths must be under {sessions_dir}.",
+        file=sys.stderr,
+    )
+
+# M3: atomic temp+rename for a REWRITE of a file downstream steps depend
+# on (repo rule -- see write_vault_note()/save_cache()'s pattern), not a
+# plain in-place open("w"), which can leave buckets_path truncated or
+# half-written if this process is killed mid-write.
+def _atomic_write_json(path, data):
+    _dir = os.path.dirname(path) or "."
+    _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    with os.fdopen(_fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(_tmp, path)
+    os.chmod(path, 0o600)
+
+# Persist the applied stamps: Step 9 reads buckets_path fresh for its
+# classifications argument, so the in-memory mutation above is invisible
+# downstream unless written back here.
+_atomic_write_json(buckets_path, buckets)
+
 # Build groups_to_cascade: DONE items from buckets["review"] that have members
-# in merged.json. Resolve member basenames to full paths.
+# in merged.json AND were stamped applied above. Resolve member basenames to
+# full paths.
+#
+# #340: only a group whose own occurrence the user actually flipped cascades.
+# Cascading every DONE group ignored the user's choices (a deselected DONE, or
+# a MED DONE they never opted into, was checked off anyway), and each such
+# cascade-only flip rendered `- [ ]` in Step 9's report while the vault said
+# `- [x]`. Gating on the stamp makes every cascaded group one the report
+# already renders checked.
 groups_to_cascade = []
 for b in buckets["review"]:
     if b.get("classification") != "DONE":
+        continue
+    if not b.get("applied"):
         continue
     gid = b.get("group_id")
     merged_group = groups_by_id.get(gid) if gid else None
@@ -755,7 +904,7 @@ for b in buckets["review"]:
         line_num = m.get("line")
         if not basename or line_num is None:
             continue
-        full_path = os.path.join(sessions_dir, basename)
+        full_path = os.path.realpath(os.path.join(sessions_dir, basename))
         resolved_members.append({"file": full_path, "line": line_num, "text": m.get("text", "")})
     if resolved_members:
         groups_to_cascade.append({"members": resolved_members})
@@ -767,23 +916,68 @@ print(f"[cascade] {summary}")
 m = re.search(r"Cascaded (\d+)", summary)
 cascade_total = int(m.group(1)) if m else 0
 print(f"cascaded_total={cascade_total}")
+
+# #320 F1/F2: `summary` can carry Skipped/WRITE FAILED lines beyond the bare
+# count above -- surface them as distinct fields instead of letting them
+# disappear once cascade_total is extracted, and treat a lost write as a
+# hard failure rather than a silent success (0 exit code, "nothing to do").
+skipped_lines = [
+    ln for ln in summary.splitlines()
+    if ln.startswith("Skipped ") or ln.startswith("WRITE FAILED")
+]
+# #320 R1 (Gemini): the doc below (Output format section) promises
+# cascade_skipped_total sums every Skipped AND WRITE FAILED line -- the
+# inline parsing here previously only summed Skipped lines, silently
+# diverging from that doc. parse_cascade_skipped_total() (hooks/
+# open_item_dedup.py) is the single source of truth for both this script
+# and its unit tests, so the two can no longer drift apart.
+cascade_skipped_total = parse_cascade_skipped_total(summary)
+for ln in skipped_lines:
+    print(f"[cascade-skip] {ln}")
+print(f"cascade_skipped_total={cascade_skipped_total}")
+
+# #318 I1: persist cascaded/skipped to a sibling file (same directory,
+# chmod, and write style as buckets_path above) so Step 9's block can read
+# them mechanically instead of the driving agent copying printed numbers
+# across steps. Written BEFORE the WRITE FAILED check below so Step 9 still
+# gets an accurate count even when this run reports non-zero -- the
+# confirmed primary-flip checkoffs and any successful cascade flips are
+# still on disk either way.
+cascade_summary_path = os.path.join(os.path.dirname(scope_path), "cascade_summary.json")
+_atomic_write_json(cascade_summary_path, {"cascaded": cascade_total, "skipped": cascade_skipped_total})
+
+if "WRITE FAILED" in summary:
+    print(
+        "[cascade] FATAL: a verified checkoff flip failed to save to disk "
+        "-- do not report this run as fully successful",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 PYEOF
+
+# #320 F2: if the block above exited non-zero (WRITE FAILED), STOP here --
+# do not report the run as fully successful. Tell the user which file(s)
+# lost a verified flip (see the printed [cascade-skip] WRITE FAILED line
+# and stderr) and that they should re-run /check-items to retry the
+# cascade once the underlying disk/permission issue is resolved. The
+# confirmed checkoffs from steps 1-4 above are still on disk; only the
+# cascade to sibling copies failed to save.
 
 # Clean up source-skips tempfile.
 rm -f "$_skips_file"
 ```
 
-**Note on primary-flip loop tracking:** After each successful Edit in steps 1–4, append the flipped item's full file path and line number as `[path, line]` to a Python list, then write that list as JSON to `$_skips_file` before running the cascade block. This prevents the cascade from double-flipping lines the SKILL already handled. `batch_cascade_checkoff` is retained for ad-hoc text-search use outside this SKILL flow.
+**Note on primary-flip loop tracking:** After each successful Edit in steps 1–4, append the flipped item's full file path and line number as `[path, line]` to a Python list, then write that list as JSON to `$_skips_file` before running the cascade block. This prevents the cascade from double-flipping lines the SKILL already handled. `batch_cascade_checkoff` is retained for ad-hoc text-search use outside this SKILL flow. `source_skips` has a second consumer now (#318 Task 6): the cascade block above also uses it to stamp `applied=True` on each buckets record it corresponds to, and rewrites `buckets_path` with that stamp before Step 9 runs. Only stamped DONE groups cascade (#340), so a DONE item the user deselected stays unchecked everywhere, siblings included.
+
+**Reading `cascade_total` and `cascade_skipped_total`:** Step 9 reads both mechanically from `cascade_summary.json` (written above, alongside `buckets_path`) — nothing to carry forward by hand. Still surface both to the terminal Output format's `Cascaded:` and `Skipped:` lines from this block's own printed `[cascade]`/`cascade_skipped_total=` output. If the python block above exited non-zero, its `WRITE FAILED` line is the reason — report it to the user verbatim rather than proceeding as if the cascade fully succeeded.
 
 ## Step 9 — Write dashboard report (Stage 8) — ALWAYS
 
-(Implemented in Task 22.) Call `write_check_items_dashboard()` with the scope, classifications, applied count, cascade count, semantic-merge mode, and classifier mode. Path: `<vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md` (folder configurable, default `claude-check-items`).
-
-## Step 10 — Persist cache updates
+(Implemented in Task 22.) Every argument below is derived mechanically from files already on disk by this step's own block — #318 I1: before this fix, `classifications`/`merges`/`evidence_gaps` were prose instructions with no executable block behind them, the same "written, tested, and unreachable unless a model complies" shape as F14. `write_check_items_dashboard()`'s path convention: `<vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md` (folder configurable, default `claude-check-items`).
 
 ```bash
-SCOPE_PATH="$scope_path" CLASSIFICATIONS_PATH="$classifications_path" PARTITION_PATH="$part_path" python3 << 'PYEOF'
-import sys, os, glob, json, time, subprocess
+report_path=$(SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" PART_PATH="$part_path" MERGED_PATH="$merged_path" CLASSIFICATIONS_PATH="$classifications_path" BUCKETS_PATH="$buckets_path" GAPS_PATH="$gaps_path" python3 << 'PYEOF'
+import sys, os, glob, json, re, subprocess, datetime
 import glob, json, os, re, sys
 def _ob_hooks():
     try:
@@ -802,8 +996,152 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
-from check_items_cache import load_cache, save_cache, update_cache, canonical_hash
-from obsidian_utils import get_workspace_roots
+from open_item_dedup import merge_records_from_groups
+from check_items_report import write_check_items_dashboard
+
+scope_path = os.environ["SCOPE_PATH"]
+raw_path = os.environ["RAW_PATH"]
+part_path = os.environ["PART_PATH"]
+merged_path = os.environ["MERGED_PATH"]
+classifications_path = os.environ["CLASSIFICATIONS_PATH"]
+buckets_path = os.environ["BUCKETS_PATH"]
+gaps_path = os.environ["GAPS_PATH"]
+
+_config_path = os.path.expanduser("~/.claude/obsidian-brain-config.json")
+try:
+    config = json.load(open(_config_path))
+    vault_path = config.get("vault_path")
+    if not vault_path:
+        raise ValueError("vault_path missing from config")
+except (OSError, json.JSONDecodeError, ValueError) as exc:
+    print(f"ERROR: obsidian-brain config not loadable ({exc}); run /obsidian-setup", file=sys.stderr)
+    sys.exit(1)
+
+scope = json.load(open(scope_path))
+
+# scope_name: mirrors Step 2's own project-name resolution exactly, so the
+# dashboard filename/frontmatter always names what Step 2 actually scanned.
+if scope["mode"] == "vault":
+    scope_name = "vault"
+elif scope["mode"] == "project" and scope["project"]:
+    scope_name = scope["project"]
+else:
+    res = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    scope_name = os.path.basename(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else "unknown"
+
+date_str = datetime.date.today().isoformat()
+window_days = scope.get("window_days", 14)
+dry_run = bool(scope.get("dry_run", False))
+
+raw_count = len(json.load(open(raw_path)))
+group_count = len(json.load(open(part_path)).get("flat_groups", []))
+
+merged_data = json.load(open(merged_path))
+semantic_merge_mode = merged_data.get("mode", "ok")
+# merge_records_from_groups accepts the {project: [groups]} dict form
+# merged_by_proj already is -- no flattening needed here.
+merges = merge_records_from_groups(merged_data.get("merged_by_proj", {}))
+
+classifier_mode = json.load(open(classifications_path)).get("classifier_mode", "ok")
+
+# #318 Task 6 / I1: classifications is buckets["review"] reloaded fresh from
+# buckets_path -- the same file Step 8's cascade block rewrote with `applied`
+# stamps -- never a copy captured earlier in the run, or every checkbox would
+# silently revert to reading from classification instead of fact.
+buckets = json.load(open(buckets_path))
+classifications = buckets.get("review", [])
+# applied (run total) is derived the SAME way check_items_report._body now
+# reconciles it against the per-record data (#318 I2): the count of records
+# actually stamped applied=True, not a separately-tracked tally that could
+# silently drift from what Step 8 actually flipped.
+applied = sum(1 for c in classifications if c.get("applied"))
+
+try:
+    evidence_gaps = json.load(open(gaps_path))
+except (OSError, json.JSONDecodeError) as exc:
+    # N2: None, not {} -- write_check_items_dashboard() treats None as the
+    # argument being OMITTED (a true no-op: no section, no frontmatter
+    # key). {} is a real, evaluated-and-clean result and would stamp
+    # `evidence_gaps: 0`, asserting coverage that never actually happened
+    # because this file could not be read at all.
+    print(f"WARNING: could not read {gaps_path}: {exc} -- evidence_gaps "
+          f"omitted from this report", file=sys.stderr)
+    evidence_gaps = None
+
+# cascade_summary.json is written by Step 8's cascade block, AFTER computing
+# cascaded/skipped but before its own WRITE FAILED check, so it exists even
+# on a failed cascade run. It does NOT exist when Step 8 was skipped
+# entirely (dry_run or the user typed "none") -- 0/0 is correct there, since
+# nothing was cascaded. N3: it can ALSO be missing when Step 8 ran, flipped
+# some primary items, then died before reaching this write (an uncaught
+# exception, or the earlier "cannot load merged.json" FATAL) -- 0/0 is
+# silently WRONG in that case, so it's still the fallback (a report must
+# still get written) but the quiet-and-wrong case is now named on stderr
+# instead of reading identically to "nothing happened, nothing to cascade".
+cascade_summary_path = os.path.join(os.path.dirname(scope_path), "cascade_summary.json")
+try:
+    cascade_summary = json.load(open(cascade_summary_path))
+    cascaded = cascade_summary.get("cascaded", 0)
+    skipped = cascade_summary.get("skipped", 0)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"WARNING: could not read {cascade_summary_path}: {exc} -- "
+          f"cascaded/skipped default to 0, which is WRONG if Step 8 ran "
+          f"and died before writing this file (correct only if Step 8 was "
+          f"skipped entirely)", file=sys.stderr)
+    cascaded, skipped = 0, 0
+
+report_path = write_check_items_dashboard(
+    vault_path=vault_path,
+    scope_name=scope_name,
+    date_str=date_str,
+    window_days=window_days,
+    raw_count=raw_count,
+    group_count=group_count,
+    classifications=classifications,
+    applied=applied,
+    cascaded=cascaded,
+    merges=merges,
+    semantic_merge_mode=semantic_merge_mode,
+    classifier_mode=classifier_mode,
+    dry_run=dry_run,
+    skipped=skipped,
+    evidence_gaps=evidence_gaps,
+)
+print(report_path)
+PYEOF
+)
+
+echo "report_path=$report_path"
+```
+
+`report_path` is the dashboard note's full path — surface it to the user in the terminal Output format's `Report:` line.
+
+N5: this block has no top-level `try` around its core inputs (`raw_path`/`part_path`/`merged_path`/`classifications_path`/`buckets_path`) — the right fail-loud default for a step marked ALWAYS, since a dashboard built on a missing or corrupt upstream artefact would be worse than none at all. If this block exits non-zero, `$report_path` is unset and no dashboard was written this run — stop and show the user the traceback verbatim rather than reporting the run as complete.
+
+## Step 10 — Persist cache updates
+
+```bash
+SCOPE_PATH="$scope_path" CLASSIFICATIONS_PATH="$classifications_path" PARTITION_PATH="$part_path" python3 << 'PYEOF'
+import sys, os, glob, json, time
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
+from check_items_cache import locked_cache, update_cache, canonical_hash
 
 scope_path = os.environ["SCOPE_PATH"]
 classifications_path = os.environ["CLASSIFICATIONS_PATH"]
@@ -812,7 +1150,7 @@ scope = json.load(open(scope_path))
 data = json.load(open(classifications_path))
 part = json.load(open(partition_path))
 
-# Re-derive project list and HEAD shas for cache update.
+# Re-derive project list for cache update; HEAD shas are reused from Step 3 (#305).
 all_groups = part["flat_groups"]
 
 # Build a lookup from merged.json so we can attach members + mtime to each
@@ -875,40 +1213,54 @@ for fc in fresh_classifications:
     proj = fc.pop("_group_project", "unknown")
     fresh_by_proj.setdefault(proj, []).append(fc)
 
-cache = load_cache()
-_workspace_roots = get_workspace_roots()
-for proj, proj_groups in groups_by_proj.items():
-    repo_path = None
-    for _root in _workspace_roots:
-        _candidate = os.path.join(_root, proj)
-        if os.path.isdir(os.path.join(_candidate, ".git")):
-            repo_path = _candidate
-            break
-    if not repo_path:
-        print(f"[check-items] no repo found for {proj} in {_workspace_roots}; skipping cache update",
-              file=sys.stderr)
-        continue
-    head_proc = subprocess.run(
-        ["git", "-C", repo_path, "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if head_proc.returncode != 0 or not head_proc.stdout.strip():
-        print(f"[check-items] no HEAD for {proj} ({repo_path}); skipping cache update",
-              file=sys.stderr)
-        continue
-    head = head_proc.stdout.strip()
-    cache = update_cache(
-        cache=cache,
-        project=proj,
-        all_groups=proj_groups,
-        fresh_classifications=fresh_by_proj.get(proj, []),
-        head_sha=head,
-    )
+# #305: reuse the HEAD captured at Step 3 rather than re-deriving it here. A
+# commit landing between Step 3 and Step 10 would otherwise stamp a mid-run
+# HEAD onto verdicts that were actually derived against the OLD head —
+# laundering them as verified-current when they were never checked against
+# this newer commit.
+heads = part.get("heads", {})
+# #306: locked_cache() serializes the whole load-mutate-save cycle behind a
+# lock, so a concurrent run on a different project (same shared
+# cross-project cache file) cannot overwrite this run's update with a stale
+# snapshot. It loads, yields the cache to mutate below, and saves + releases
+# once this block exits.
+#
+# #323 F3: two paths previously skipped the save entirely and left the run
+# looking clean anyway — a body exception, or save_cache() itself raising
+# (a full or read-only disk) — with nothing telling the driving agent to
+# notice. Both are now caught here and reported explicitly rather than
+# left as a bare traceback. #323 F6: `update_cache()` mutates `cache` IN
+# PLACE and its return value is deliberately left unassigned below —
+# locked_cache() saves its OWN `cache` binding, so reassigning that name to
+# update_cache's return value here would be invisible to it the day
+# update_cache() stops returning the same object it was given (see
+# locked_cache()'s docstring).
+try:
+    with locked_cache() as cache:
+        for proj, proj_groups in groups_by_proj.items():
+            head = heads.get(proj)
+            if not head:
+                print(f"[check-items] no head captured at Step 3 for {proj}; skipping cache update",
+                      file=sys.stderr)
+                continue
+            update_cache(
+                cache=cache,
+                project=proj,
+                all_groups=proj_groups,
+                fresh_classifications=fresh_by_proj.get(proj, []),
+                head_sha=head,
+            )
+except Exception as exc:
+    # stdout, not stderr: skills/standup/SKILL.md documents stderr as
+    # ignorable, and this line must actually be noticed.
+    print(f"cache NOT updated: {exc}")
+    sys.exit(1)
 
-save_cache(cache)
 print("cache updated")
 PYEOF
 ```
+
+**#323 F3 — if the block above printed `cache NOT updated: <reason>` and exited non-zero:** STOP here — do not summarise this run as clean, and do not report `Cached: N reused, M fresh` (from Step 7) as if it were the final state. Report the `cache NOT updated: ...` line to the user verbatim. This run's classifications are lost (fail-safe: every group re-derives from scratch next run, at the cost of re-classification tokens, never incorrect output) — but any checkoffs already applied in Step 8 are on disk and unaffected.
 
 ## Output format
 
@@ -919,7 +1271,13 @@ PYEOF
   Result: 3 DONE (auto-checked), 2 NEEDS-ACTION (commands below), 4 REVIEW (needs a look), 19 ACTIVE (silent)
   Report: ~/Obsidian/claude-check-items/check-items-obsidian-brain-2026-05-11.md
   Cascaded: 2 sibling notes
+  Skipped: 3 sibling(s) refused or lost — see report for basename:line detail
+  Cache: updated
 ```
+
+`Skipped:` (#320 F1) is populated from `cascade_skipped_total` (Step 8) — the count of cascade candidates that were refused (drift, unverifiable stored text, checkbox already gone) or lost (a failed write), summed across every `Skipped ...`/`WRITE FAILED` line in the cascade summary. Omit the line entirely when `cascade_skipped_total` is 0 — don't print `Skipped: 0`.
+
+`Cache:` (#323 F3) reflects Step 10's outcome and is always printed, never omitted: `updated` on success, or `NOT updated — <reason>; verdicts will be re-derived next run` when Step 10 printed `cache NOT updated: <reason>` and exited non-zero.
 
 ## Notes
 

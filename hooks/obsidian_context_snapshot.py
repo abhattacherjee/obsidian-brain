@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from obsidian_utils import (  # noqa: E402
+    _hook_payload_codex_reason,
     claim_hook_run,
     extract_assistant_messages,
     extract_session_metadata,
@@ -189,6 +190,13 @@ def _run() -> None:
         hook_input = json.loads(raw)
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[obsidian-brain] invalid stdin JSON: {exc}", file=sys.stderr)
+        return
+
+    if not isinstance(hook_input, dict):
+        return
+    codex_reason = _hook_payload_codex_reason(hook_input)
+    if codex_reason:
+        print(f"[obsidian-brain] PreCompact outcome=SKIPPED_CODEX_HOST reason={codex_reason}", file=sys.stderr)
         return
 
     session_id = hook_input.get("session_id", "")

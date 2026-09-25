@@ -22,6 +22,47 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, os.path.abspath(_REPO_ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _reset_session_resolution_state():
+    """Clear obsidian_utils' one-shot WARN registries and transcript memo (#260).
+
+    They are module-level BY DESIGN — _get_session_id_fast() runs once per note
+    inside read_note_metadata(), so a WARN on that path must be said once per
+    process, not once per note. That same statefulness makes tests order-
+    dependent: a test asserting "this WARN is emitted" would silently pass or
+    fail depending on whether an earlier test already consumed the key.
+    """
+    import obsidian_utils
+
+    for name in (
+        "_ambiguous_project_dirs_warned",
+        "_sole_match_not_cwd_warned",
+        "_unknown_sid_warned",
+        "_transcript_dir_arbitration",
+        # #330 task 2: the env-layer's one-shot WARN registry and its
+        # transcript-existence memo. Same statefulness hazard as the others
+        # above — a test asserting the WARN fires would pass or fail
+        # depending on whether an earlier test already consumed the
+        # (project, sid) key.
+        "_env_sid_no_transcript_warned",
+        "_env_sid_transcript_checked",
+        # #330 review item 8: malformed CLAUDE_CODE_SESSION_ID one-shot WARN.
+        "_env_sid_malformed_warned",
+        # #362: foreign-host (Codex marker) one-shot WARN.
+        "_foreign_host_warned",
+        # #330 review item 2: resolve_source_session_note's contradiction
+        # one-shot WARN.
+        "_crossed_source_session_warned",
+        # Process-lifetime snapshot index (#70). Keyed by resolved sessions
+        # folder, so cross-test collisions are unlikely — but pytest can hand
+        # the same tmp_path prefix to a re-run and the memo would then answer
+        # from the previous test's file set. Clearing is one dict op.
+        "_snapshot_index_cache",
+    ):
+        getattr(obsidian_utils, name).clear()
+    yield
+
+
 @pytest.fixture
 def tmp_vault(tmp_path):
     """Create a temp vault with sessions and insights directories."""
@@ -246,3 +287,24 @@ def _isolate_acted_items_path_globally(tmp_path_factory, monkeypatch):
         return  # module not present in some test contexts
     acted = tmp_path_factory.mktemp("acted") / "deep-acted-items.json"
     monkeypatch.setattr(deep_cli, "_ACTED_ITEMS_PATH", str(acted))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_harness_session_id_globally(monkeypatch):
+    """Clear CLAUDE_CODE_SESSION_ID for every test. The suite runs inside a
+    live Claude Code session, so this is already set in pytest's own
+    environment to the developer's real session id. Without this fixture, a
+    resolver test would assert against that live value instead of the
+    fixture it set up (#330).
+
+    Subprocess tests that do os.environ.copy() simply inherit the absence,
+    same as _isolate_vault_index_db_globally above; the resolver's layer 0
+    now reads this var (#330 task 2), so without this fixture the developer's
+    real session id would leak into resolution tests via the ambient
+    environment rather than the fixture each test explicitly sets up."""
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    # Same for the Codex host markers (#362): a suite run from a Codex shell
+    # would otherwise resolve every session id to 'unknown'.
+    import obsidian_utils
+    for name in obsidian_utils._CODEX_HOST_MARKERS:
+        monkeypatch.delenv(name, raising=False)

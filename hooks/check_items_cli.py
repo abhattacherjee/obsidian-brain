@@ -273,7 +273,7 @@ CLASSIFIER_PROMPT = """You are the classifier sub-agent for /check-items. Read t
 <input-json-path>. It contains:
   - groups: list of merged open-item groups (post Stage 2b).
   - evidence: per-project bundle (commits, merged_prs, closed_issues,
-    releases, changelog_excerpt, fts_mentions).
+    releases, changelog_excerpt, fts_mentions, note_completions).
 
 ## Your job
 
@@ -285,6 +285,17 @@ NEEDS-ACTION, STALE, ACTIVE, or REVIEW. Cite the specific evidence you used.
 - DONE — the action is complete. Cite at least one of: merged PR title,
   commit sha, closed issue body, release note, or an insight note that
   explicitly marks the item done.
+  A `note_completions` entry is a valid DONE citation for a project with no
+  git repo: it means a STRICTLY NEWER session summary reports the item done.
+  Each entry carries a `contradicted_by` date (YYYY-MM-DD) and a
+  `contradicted_by_title` (the newer session's title/first summary line).
+  Build the citation from EXACTLY those two fields:
+  `reported done in session <contradicted_by> (<contradicted_by_title>)`
+  — this is the ONLY shape the tier rules recognise as a MED-tier
+  note-completion citation; anything else reads as a plain citation with
+  no special handling. (The guarantee that this source never reaches HIGH
+  is enforced in code from the evidence bundle's own shape, not from your
+  wording — do not rely on phrasing to keep it capped.)
 - NEEDS-ACTION — the fix is shipped, but the literal action is an
   external command this tool cannot run (e.g. `gh issue close`, token
   rotation, manual verification). Set `action_required` to a
@@ -374,6 +385,108 @@ def _strip_unreleased_section(changelog: str) -> str:
     return pattern.sub("", changelog)
 
 
+# H1 (#318 hardening pass): an ALLOWLIST of git-derived keys, read directly
+# off deep_analysis_pipeline's proj_evidence[...] assignment sites
+# (open_item_dedup.py) rather than trusting a prior draft. An open-ended
+# "any other key counts as git evidence" test (the pre-H1 shape) is right
+# for a future git-derived source and wrong for a future non-git one — and
+# #318 exists precisely to add non-git sources, so the next one is more
+# likely non-git than git. A key outside this set must be classified
+# deliberately; it does NOT default into "this project has real evidence,
+# uncap it".
+_GIT_DERIVED_EVIDENCE_KEYS = frozenset({
+    "commits", "tags", "changed_paths", "releases",
+    "merged_prs", "closed_issues", "changelog_excerpt", "fts_mentions",
+})
+
+
+def _is_empty(v) -> bool:
+    """Empty for a falsy value, and for a dict or list whose entries are
+    all falsy (H2, #318 hardening pass).
+
+    fts_mentions is a dict of hit COUNTS, so `{"x": 0}` is a truthy dict
+    meaning "searched, found nothing" -- a bare `not v` reads that as real
+    evidence. Same shape risk applies to any future evidence bucket built
+    the same way (a mapping or list of zero/empty results), so this is
+    written as a general emptiness check, not an fts_mentions special case.
+    """
+    if not v:
+        return True
+    if isinstance(v, dict):
+        return not any(v.values())
+    if isinstance(v, list):
+        return not any(v)
+    return False
+
+
+def note_evidence_only_for(evidence: dict, project: str) -> bool:
+    """True when a project's ONLY real evidence is note_completions.
+
+    The enforcing half of #318's MED cap (F7): if the only thing backing a
+    project is note_completions, no verdict for it can legitimately be
+    HIGH, whatever the classifier wrote — assign_tier's note_evidence_only
+    parameter caps at MED unconditionally when this is True, independent of
+    citation wording (the fix-round-2 CRITICAL: a text-shape regex alone is
+    not enforcement against a model's own prose).
+
+    Extracted to module level (F12, #318 fix round 4) so BOTH producers of
+    a classification record use the identical predicate and cannot drift
+    apart: run_classifier's per-project stamp (fresh sub-agent + L2
+    synthetic verdicts) and skills/check-items/SKILL.md Step 6's
+    cache-merge block (replayed verdicts for known_unchanged groups) — the
+    second of which had NO note_evidence_only key at all until F12, so a
+    cached DONE citation sharing a literal ref with the item text could
+    reach HIGH and get auto-checked on every re-run after the first.
+
+    VALUE-aware, not key-presence, for the git-derived buckets (F13, #318
+    fix round 4 addendum): deep_analysis_pipeline's git block sets
+    tags/changed_paths/merged_prs/closed_issues to `[]` on EVERY failure
+    branch (no tags, gh unauthenticated, etc. — the normal state on a
+    fresh machine or in CI), so a repo-backed project with zero usable git
+    evidence still carries those keys. Checking VALUES (via `_is_empty`),
+    not key presence, treats `{"tags": [], "note_completions": [...]}` the
+    same as `{"note_completions": [...]}` — correctly, since an empty list
+    proves nothing either way.
+
+    #318 hardening pass, on top of F12/F13:
+    - H1: git evidence is judged against `_GIT_DERIVED_EVIDENCE_KEYS`, an
+      explicit allowlist, not "any key other than note_completions".
+    - H2: `_is_empty` treats a dict/list of all-falsy entries as empty too,
+      not just a falsy container itself (the fts_mentions {"x": 0} case).
+    - H3: the gate on `note_completions` checks PRESENCE before emptiness
+      — distinguishes "this bundle never attempted a note-completion scan
+      for this project" (key absent) from "the scan ran and found
+      nothing" (key present, empty). Both read False today, but they are
+      different situations, and collapsing them into one truthiness check
+      is exactly the kind of normalization that would silently change
+      behaviour if deep_analysis_pipeline is ever edited to assign
+      note_completions unconditionally, the way its git-derived siblings
+      already are.
+    - H4: an unresolvable project (no name to look evidence up by at all —
+      `g.get("project", "")` defaults to `""` when a group carries no
+      `project` field) fails SAFE: cap it, don't uncap it, because we
+      cannot justify HIGH for a citation whose project we cannot even
+      identify. This is narrower than "the project name is valid but
+      produced no evidence" (an ordinary evidence-less project, e.g.
+      project="notes-only" simply absent from `evidence`), which stays
+      False — #297's `_cap_at_med` already caps that case via the
+      synthetic/heuristic path regardless of this flag.
+    """
+    if not project:
+        return True
+
+    proj = evidence.get(project) or {}
+    if "note_completions" not in proj:
+        return False
+    if _is_empty(proj["note_completions"]):
+        return False
+
+    has_git_evidence = any(
+        not _is_empty(proj.get(k)) for k in _GIT_DERIVED_EVIDENCE_KEYS
+    )
+    return not has_git_evidence
+
+
 def _bridge_project_evidence(evidence: dict, project: str) -> dict:
     """Convert project evidence to the _text-suffixed flat format expected by
     has_classifiable_evidence().
@@ -432,6 +545,13 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
             "releases_text": _to_text(proj.get("releases")),
             "changelog_excerpt": _strip_unreleased_section(proj.get("changelog_excerpt") or ""),
             "fts_mentions_text": _to_text(proj.get("fts_mentions")),
+            # #318: note_completions entries (gather_note_completion_evidence)
+            # carry pre-resolved item text, not a bucket to text-join like the
+            # zones above -- has_classifiable_evidence's Rule 0 compares each
+            # entry directly against a group's canonical text.
+            "note_completion_items": [
+                r.get("text", "") for r in (proj.get("note_completions") or [])
+            ],
         }
 
         # #264 Task 2 follow-up: fold the bounded/deduped `tags` and
@@ -447,7 +567,8 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
 
     # Shape B: already _text-suffixed at top level (test fixtures / simplified payloads)
     _TEXT_KEYS = {"commits_text", "merged_prs_text", "closed_issues_text",
-                  "releases_text", "changelog_excerpt", "fts_mentions_text"}
+                  "releases_text", "changelog_excerpt", "fts_mentions_text",
+                  "note_completion_items"}
     if _TEXT_KEYS.intersection(evidence.keys()):
         return evidence
 
@@ -458,7 +579,7 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
     # that contains at least one bare evidence key. In that case, the
     # legitimate answer is "no evidence for this project" — return {} silently.
     # Only WARN when neither shape A nor shape B is recognizable at all.
-    _BARE_KEYS = {"commits", "merged_prs", "closed_issues", "releases",
+    _BARE_KEYS = {"commits", "merged_prs", "closed_issues", "releases", "note_completions",
                   "changelog_excerpt", "fts_mentions"}
     _is_shape_a_payload = any(
         isinstance(v, dict) and _BARE_KEYS.intersection(v.keys())
@@ -803,6 +924,30 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
         merged_by_id[s["group_id"]] = s
     for s in synthetic:
         merged_by_id[s["group_id"]] = s
+
+    # -------------------------------------------------------------------
+    # F7 (#318 fix round 2, CRITICAL): stamp note_evidence_only per project
+    # onto every record -- sub-agent AND synthetic alike. This is DATA WE
+    # CONTROL (the evidence bundle's own keys), not text a model composes,
+    # so it can't be bypassed by off-template wording the way fix round 1's
+    # citation-shape regex could. If a project's evidence bundle contains
+    # ONLY note_completions (no git-derived bucket at all), no citation for
+    # any item in it can legitimately be HIGH -- Step 7 threads this flag
+    # into assign_tier(), which caps at MED unconditionally when it's set,
+    # regardless of what the classifier actually wrote. Computed once per
+    # project via a project -> bool memo, not once per group.
+    # -------------------------------------------------------------------
+    _note_only_by_project: dict[str, bool] = {}
+
+    def _note_evidence_only(project: str) -> bool:
+        if project not in _note_only_by_project:
+            _note_only_by_project[project] = note_evidence_only_for(evidence, project)
+        return _note_only_by_project[project]
+
+    for g in groups:
+        gid = g.get("group_id")
+        if gid in merged_by_id:
+            merged_by_id[gid]["note_evidence_only"] = _note_evidence_only(g.get("project", ""))
 
     ordered = [merged_by_id[g["group_id"]] for g in groups if g["group_id"] in merged_by_id]
 

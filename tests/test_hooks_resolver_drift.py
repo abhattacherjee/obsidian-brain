@@ -205,15 +205,18 @@ def _ob_repo():
 print(_ob_repo())"""
 
 # The independently derived tally (see the plan's task-4 brief, and #287's
-# Global Constraints). EQUALITY, not a floor: 56 + 2 + 9 + 1 + 3 = 71.
+# Global Constraints). EQUALITY, not a floor: 57 + 2 + 9 + 1 + 3 = 72.
+# #318 fix-wave I1: Step 9 gained a real python3 << 'PYEOF' block (it was
+# prose-only before), adding one new FORM_A double-quoted sys.path.insert
+# resolver site alongside Steps 5-8's existing ones.
 EXPECTED_FORM_COUNTS = {
-    FORM_A: 56,
+    FORM_A: 57,
     FORM_A_SINGLE: 2,
     FORM_B: 9,
     FORM_C: 1,
     FORM_D: 3,
 }
-EXPECTED_SITE_COUNT = 71
+EXPECTED_SITE_COUNT = 72
 
 #: Every canonical form, mapped to its constant NAME. One table, consulted by
 #: both ``_distinct_blocks()`` and ``test_canonical_form_family_counts_are_exact``
@@ -378,10 +381,11 @@ def test_block_partitions_cover_every_distinct_block():
 # ---------------------------------------------------------------------------
 
 
-def test_resolver_site_count_is_exactly_71():
-    """EQUALITY, deliberately — 71 is derived independently (56 + 2 + 9 + 1 + 3),
+def test_resolver_site_count_is_exactly_72():
+    """EQUALITY, deliberately — 72 is derived independently (57 + 2 + 9 + 1 + 3),
     not read back from the scan. A ``>=`` floor here would let a deleted site,
-    or a site reformatted past the extractor, pass silently."""
+    or a site reformatted past the extractor, pass silently. (#318 fix-wave
+    I1: Step 9's new real block added one FORM_A site, 71 -> 72.)"""
     assert len(_SITES) == EXPECTED_SITE_COUNT, (
         f"expected exactly {EXPECTED_SITE_COUNT} resolver sites, found "
         f"{len(_SITES)}: "

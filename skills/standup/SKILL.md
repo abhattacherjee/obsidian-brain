@@ -591,6 +591,11 @@ from open_item_dedup import batch_cascade_checkoff
 items = json.load(sys.stdin)
 summary = batch_cascade_checkoff(sys.argv[1], sys.argv[2], sys.argv[3], items)
 print(summary)
+# #320 F2: a WRITE FAILED line means a verified flip was computed but never
+# reached disk. Exit non-zero so the "non-zero exit = failure" rule below
+# actually fires instead of this being reported as a quiet success.
+if "WRITE FAILED" in summary:
+    sys.exit(1)
 ' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
 ```
 
@@ -602,11 +607,13 @@ If the command exits with a non-zero exit code, report the error to the user:
 
 > Cascade checkoff failed for $PROJECT: [first line of stderr]. The standup note is unaffected.
 
-Note: `batch_cascade_checkoff()` may emit warnings to stderr while still succeeding (e.g., a specific line changed). Only treat non-zero exit code as a failure.
+Note: `batch_cascade_checkoff()` may emit warnings to stderr while still succeeding (e.g., a specific line changed). Only treat non-zero exit code as a failure. Since #250, a target line that no longer text-matches the item it was recorded for (drifted onto a different active item, or has no recorded text at all) is skipped rather than flipped — that skip is named in `summary` itself (a trailing `Skipped N item(s) failing text verification: ...` line), not only on stderr, so it is visible even if stderr is not surfaced. Since #320, the checkbox-already-gone case is surfaced the same way (`Skipped N item(s) whose checkbox is gone: ...`), and a target that verified but whose write to disk failed makes the block exit non-zero with a `WRITE FAILED for N file(s); M verified flip(s) were NOT saved: ...` line in `summary` — that is the actual failure to report, not just "a specific line changed".
 
 **14c — Report cascade results.** After all cascade calls complete, report:
 
 > Cascaded N checkoff(s) across M vault note(s) for project(s): list.
+
+If `summary` contains a "Skipped ..." line (failing text verification, unverifiable, or checkbox gone) for any project, include it in the report so the user knows which items were left unchecked and why. If it contains a "WRITE FAILED" line, treat that project's cascade as failed — the flips it names were computed but never saved — and say so explicitly rather than folding it into the success count.
 
 If `batch_cascade_checkoff` is unavailable (import error), warn the user:
 

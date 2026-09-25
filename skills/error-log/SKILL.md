@@ -179,15 +179,21 @@ Where:
       return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
   sys.path.insert(0, _ob_hooks())
   from obsidian_utils import load_config, get_session_context
+  try:
+      from obsidian_utils import resolve_source_session_note
+  except ImportError:
+      def resolve_source_session_note(_n="", *_a): return _n
+      print("WARN: stale obsidian-brain hooks; falling back to the pre-#330 unguarded backlink", file=sys.stderr)
   c = load_config()
   ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
-  print("SID=" + ctx["session_id"] + " HASH=" + ctx["hash"] + " PROJECT=" + ctx["project"] + " SESSION_NOTE=" + ctx["session_note_name"])
+  resolved_note = resolve_source_session_note(ctx["session_note_name"], ctx["session_id"], c["vault_path"], c.get("sessions_folder", "claude-sessions"))
+  print("SID=" + ctx["session_id"] + " HASH=" + ctx["hash"] + " PROJECT=" + ctx["project"] + " SESSION_NOTE=" + ctx["session_note_name"] + " RESOLVED_NOTE=" + resolved_note)
   '
   ```
 
-  Parse the output to get `SESSION_ID`, `HASH`, `PROJECT`, and `SESSION_NOTE`.
+  Parse the output to get `SESSION_ID`, `HASH`, `PROJECT`, `SESSION_NOTE`, and `RESOLVED_NOTE`.
 
-  **Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely.
+  **Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely. Otherwise, use `RESOLVED_NOTE` (**not** `SESSION_NOTE`) for the `source_session_note` wikilink — `RESOLVED_NOTE` is the note name in the normal case (target absent yet, a forward reference, or present and agreeing) and `""` ONLY when the target note exists, parses, and its own `session_id` frontmatter CONTRADICTS `SESSION_ID` (#330). When `RESOLVED_NOTE` is empty, omit `source_session_note` entirely even though `SESSION_ID` is known (omit the line — do not write `source_session_note: ""`).
 - `<project-name>` is the `PROJECT` value from `get_session_context()` (lowercased, hyphenated basename of cwd)
 - `<Error Title>` is a short, descriptive title for the error (e.g. "BrokenPipeError when piping subprocess output to head")
 - The `source_session_note` field creates an Obsidian backlink to the source session note

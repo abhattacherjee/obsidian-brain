@@ -108,6 +108,10 @@ def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
     """Return True if the group has plausible completion evidence.
 
     Zone-aware rules (first match wins):
+      0. Note-completion match (#318): canonical_text (normalised) matches
+         one of evidence's note_completion_items verbatim — a strictly-newer
+         session's own summary already reported this exact item done. The
+         only rule that works with no git repo.
       1. Ref shortcut: REF_PATTERN matches #N or commit-sha in canonical_text.
       2. Completion-zone overlap: any content-token from canonical_text
          appears in (merged_prs_text + closed_issues_text + releases_text +
@@ -126,13 +130,27 @@ def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
                returns False.
         evidence: Dict with optional keys: commits_text, merged_prs_text,
                   closed_issues_text, releases_text, changelog_excerpt,
-                  fts_mentions_text. Any missing key is treated as empty.
+                  fts_mentions_text, note_completion_items. Any missing key
+                  is treated as empty.
 
     Returns:
         True if the sub-agent should classify this item; False if L2 can
         synthesize a result deterministically.
     """
     canonical_text = group.get("representative") or group.get("canonical_text", "")
+
+    # Rule 0 (#318): a strictly-newer session's own summary reports this item
+    # done. Unlike Rules 2 and 3 this signal is NOT derived from the item's
+    # own tokens — the producer already required an independent completion
+    # phrase in a different, later note — so it is safe as a standalone
+    # classifiable trigger. Compared on normalised text because the group's
+    # canonical phrasing may differ from the raw checkbox line.
+    _note_items = evidence.get("note_completion_items") or []
+    if _note_items:
+        from open_item_dedup import _normalize_item_text
+        _canon = _normalize_item_text(canonical_text)
+        if _canon and any(_normalize_item_text(t) == _canon for t in _note_items):
+            return True
 
     # Rule 1: explicit issue/PR/commit-sha reference
     if REF_PATTERN.search(canonical_text):
