@@ -1811,6 +1811,21 @@
       "purpose": "Authoritative layer-0 session id in the SID resolution chain (#330): trusted ahead of every mtime-scan layer, validated by format only, constant for the life of the session. Ignored by _slow_path_newest_sid (allow_env=False) so check_hook_status never validates the env var against itself."
     },
     {
+      "name": "CODEX_THREAD_ID",
+      "default": "(set by Codex)",
+      "purpose": "Foreign-host marker. Set by Codex in every tool shell; the only marker in an unsandboxed run. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer and check_hook_status reports Claude logging as not checked (#362). Separately, and regardless of host, cache_get/cache_set/cache_invalidate never use the 'unknown' id. CODEX_HOME is deliberately not a marker."
+    },
+    {
+      "name": "CODEX_SANDBOX",
+      "default": "(set by Codex)",
+      "purpose": "Foreign-host marker. Set by Codex when its sandbox is on. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer and check_hook_status reports Claude logging as not checked (#362). Separately, and regardless of host, cache_get/cache_set/cache_invalidate never use the 'unknown' id. CODEX_HOME is deliberately not a marker."
+    },
+    {
+      "name": "CODEX_SANDBOX_NETWORK_DISABLED",
+      "default": "(set by Codex)",
+      "purpose": "Foreign-host marker. Set by Codex when its sandbox blocks network. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer and check_hook_status reports Claude logging as not checked (#362). Separately, and regardless of host, cache_get/cache_set/cache_invalidate never use the 'unknown' id. CODEX_HOME is deliberately not a marker."
+    },
+    {
       "name": "OBSIDIAN_BRAIN_DB",
       "default": "the vault index DB under ~/.claude",
       "purpose": "Override the SQLite index path (#192); also used by tests to avoid polluting the live DB."
