@@ -2379,3 +2379,63 @@ def test_get_session_context_under_codex_returns_unknown_and_warns_once(
     assert ctx["session_note_name"] == ""
     err = capsys.readouterr().err
     assert err.count("CODEX_THREAD_ID is set") == 1, err
+    # The generic 'unknown' WARN says no Claude transcript resolves, which is
+    # false here: one did, and was refused. Only the Codex WARN may appear.
+    assert "could not identify the current session" not in err, err
+
+
+@pytest.mark.parametrize("sid", ["unknown", ""])
+def test_cache_never_stores_under_an_uncacheable_sid(sid):
+    """#362: every Codex run resolves 'unknown', and SessionEnd only cleans up
+    real ids, so cache-unknown.json served frozen config and frontmatter
+    forever. The cache must refuse the id outright — no read, no write, and
+    no file on disk."""
+    obsidian_utils.cache_set(sid, "config", {"vault_path": "/stale"})
+    assert obsidian_utils.cache_get(sid, "config") is None
+    assert not os.path.exists(f"{obsidian_utils._CACHE_PREFIX}{sid}.json")
+    obsidian_utils.cache_invalidate(sid)  # must not raise
+
+
+def test_cache_ignores_a_leftover_cache_unknown_file():
+    """A cache-unknown.json written before #362 is still on disk on real
+    machines (1.5 MB, with a frozen config entry). Reads must ignore it, not
+    just stop adding to it."""
+    path = f"{obsidian_utils._CACHE_PREFIX}unknown.json"
+    with open(path, "w") as f:
+        json.dump({"config": {"vault_path": "/stale"}}, f)
+    assert obsidian_utils.cache_get("unknown", "config") is None
+
+
+def test_cache_still_stores_under_a_real_sid():
+    """Negative control: a real id still round-trips, so the refusal above is
+    specific to the uncacheable ids and not a broken cache."""
+    sid = _unique_sid()
+    obsidian_utils.cache_set(sid, "config", {"vault_path": "/v"})
+    assert obsidian_utils.cache_get(sid, "config") == {"vault_path": "/v"}
+
+
+def test_load_config_under_codex_sees_a_config_edit(isolated_home, monkeypatch, tmp_path):
+    """#362 end to end: with a Codex marker set, a config edit between two
+    load_config() calls must be visible to the second."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000003")
+    cfg = tmp_path / "obsidian-brain-config.json"
+    monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", cfg)
+    cfg.write_text(json.dumps({"vault_path": str(tmp_path / "v1")}))
+    assert obsidian_utils.load_config()["vault_path"] == str(tmp_path / "v1")
+    cfg.write_text(json.dumps({"vault_path": str(tmp_path / "v2")}))
+    assert obsidian_utils.load_config()["vault_path"] == str(tmp_path / "v2")
+
+
+def test_check_hook_status_under_codex_does_not_report_a_setup_failure(
+    isolated_home, monkeypatch, tmp_path
+):
+    """#362: /recall prints any [WARN] from check_hook_status verbatim. Under
+    Codex the resolver refuses Claude ids, so without a guard this told the
+    user to re-run /obsidian-setup although nothing was wrong."""
+    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-health-proj")
+    monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
+    status = obsidian_utils.check_hook_status()
+    assert status["ok"] is True
+    assert "obsidian-setup" not in status["message"]
+    assert "CODEX_SANDBOX" in status["message"]

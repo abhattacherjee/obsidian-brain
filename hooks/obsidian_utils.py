@@ -1338,7 +1338,9 @@ _env_sid_malformed_warned: set[str] = set()
 _foreign_host_warned: set[str] = set()
 
 # Environment variables Codex sets in the shells it runs tools in (#362).
-# Checked against the codex-cli 0.155.1 binary. CODEX_HOME is deliberately NOT
+# Checked against the codex-cli 0.155.1 binary. The two sandbox variables are
+# set only when the sandbox is on, so an unsandboxed run is detected by
+# CODEX_THREAD_ID alone; a Codex build that predates it is not detected there. CODEX_HOME is deliberately NOT
 # here: it is user configuration and is often exported in an ordinary shell
 # profile, so its presence says nothing about which host launched this process.
 _CODEX_HOST_MARKERS = (
@@ -2087,8 +2089,21 @@ def _get_session_id_fast(allow_env: bool = True) -> str:
     return _resolve_session_id(allow_bootstrap=True, allow_env=allow_env)
 
 
+# Session ids that must never key a cache file (#362). 'unknown' is shared by
+# every process that could not identify its session — every Codex run, in
+# every project — and nothing ever deletes cache-unknown.json, because
+# SessionEnd cleans up by a real id. A cache under it served frozen config and
+# note frontmatter indefinitely. get_session_context() already refused to
+# cache 'unknown' for the same reason; this moves the refusal to the one place
+# every caller goes through.
+_UNCACHEABLE_SIDS = frozenset({"", "unknown"})
+
+
 def cache_get(session_id: str, key: str):
-    """Read a key from the session cache. Returns None on miss."""
+    """Read a key from the session cache. Returns None on miss, and always
+    for an uncacheable id (see _UNCACHEABLE_SIDS)."""
+    if session_id in _UNCACHEABLE_SIDS:
+        return None
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
     try:
         with open(cache_path, 'r') as f:
@@ -2099,7 +2114,10 @@ def cache_get(session_id: str, key: str):
 
 
 def cache_set(session_id: str, key: str, value) -> None:
-    """Write a key to the session cache. Atomic write."""
+    """Write a key to the session cache. Atomic write. No-op for an
+    uncacheable id (see _UNCACHEABLE_SIDS)."""
+    if session_id in _UNCACHEABLE_SIDS:
+        return
     _ensure_secure_dir()
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
     try:
@@ -2126,7 +2144,10 @@ def cache_set(session_id: str, key: str, value) -> None:
 
 
 def cache_invalidate(session_id: str, *keys: str) -> None:
-    """Remove specific keys from cache. No keys = clear all."""
+    """Remove specific keys from cache. No keys = clear all. No-op for an
+    uncacheable id, which never has a cache (see _UNCACHEABLE_SIDS)."""
+    if session_id in _UNCACHEABLE_SIDS:
+        return
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
     if not keys:
         try:
@@ -2306,6 +2327,19 @@ def check_hook_status() -> dict:
     "ok" is False only when the bootstrap file is missing entirely or no
     session files can be found.
     """
+    # A Codex process cannot judge Claude Code's session logging: the resolver
+    # refuses Claude ids there (#362), so every check below would report a
+    # false "run /obsidian-setup" failure. Say what was not checked instead.
+    marker = _foreign_host_marker()
+    if marker is not None:
+        return {
+            "ok": True,
+            "message": f"Codex process ({marker} set) — Claude Code session "
+                       f"logging not checked",
+            "bootstrap_sid": "",
+            "current_sid": "unknown",
+        }
+
     # Cwd-based project name (NOT canonical) — used for CC's path-encoded
     # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
     # see canonical_project_name().
@@ -2424,15 +2458,19 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
         # get_session_context() is called about once per skill invocation, while
         # _get_session_id_fast() runs once per NOTE inside read_note_metadata(),
         # where the same message would arrive hundreds of times (#260 I3).
-        _warn_once(
-            _unknown_sid_warned,
-            cwd_now,
-            f"[obsidian-brain] WARN: could not identify the current session for "
-            f"{cwd_now or '<cwd unavailable>'} (no Claude Code transcript "
-            f"resolves to it); session-scoped evidence and session-note linking "
-            f"are unavailable this run — notes will still be written, filed "
-            f"under project {project!r}",
-        )
+        # Skipped in a Codex process: the resolver already said why it
+        # refused, and "no Claude Code transcript resolves to it" would be
+        # false there — one did resolve, and was refused (#362).
+        if _foreign_host_marker() is None:
+            _warn_once(
+                _unknown_sid_warned,
+                cwd_now,
+                f"[obsidian-brain] WARN: could not identify the current session for "
+                f"{cwd_now or '<cwd unavailable>'} (no Claude Code transcript "
+                f"resolves to it); session-scoped evidence and session-note linking "
+                f"are unavailable this run — notes will still be written, filed "
+                f"under project {project!r}",
+            )
         # Don't cache "unknown" — would pollute cache shared across projects
         return {"session_id": "unknown", "hash": "", "project": project,
                 "session_note_name": "", "cwd": cwd_now}

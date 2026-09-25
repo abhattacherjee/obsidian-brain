@@ -1811,9 +1811,19 @@
       "purpose": "Authoritative layer-0 session id in the SID resolution chain (#330): trusted ahead of every mtime-scan layer, validated by format only, constant for the life of the session. Ignored by _slow_path_newest_sid (allow_env=False) so check_hook_status never validates the env var against itself."
     },
     {
-      "name": "CODEX_THREAD_ID / CODEX_SANDBOX / CODEX_SANDBOX_NETWORK_DISABLED",
-      "default": "(set by Codex in its tool shells)",
-      "purpose": "Foreign-host markers (#362). When any is non-empty, _resolve_session_id returns 'unknown' before every layer, so a Codex-run skill never stamps a Claude session id (inherited CLAUDE_CODE_SESSION_ID or the newest Claude transcript) on a vault note. CODEX_HOME is deliberately not a marker."
+      "name": "CODEX_THREAD_ID",
+      "default": "(set by Codex)",
+      "purpose": "Foreign-host marker. Set by Codex in every tool shell; the only marker in an unsandboxed run. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer (#362), cache_get/cache_set skip the 'unknown' id, and check_hook_status reports Claude logging as not checked. CODEX_HOME is deliberately not a marker."
+    },
+    {
+      "name": "CODEX_SANDBOX",
+      "default": "(set by Codex)",
+      "purpose": "Foreign-host marker. Set by Codex when its sandbox is on. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer (#362), cache_get/cache_set skip the 'unknown' id, and check_hook_status reports Claude logging as not checked. CODEX_HOME is deliberately not a marker."
+    },
+    {
+      "name": "CODEX_SANDBOX_NETWORK_DISABLED",
+      "default": "(set by Codex)",
+      "purpose": "Foreign-host marker. Set by Codex when its sandbox blocks network. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer (#362), cache_get/cache_set skip the 'unknown' id, and check_hook_status reports Claude logging as not checked. CODEX_HOME is deliberately not a marker."
     },
     {
       "name": "OBSIDIAN_BRAIN_DB",
