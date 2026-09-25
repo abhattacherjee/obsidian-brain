@@ -34,6 +34,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from obsidian_utils import (  # noqa: E402
+    _foreign_host_marker,
     RETRO_GATE_TTL_SECONDS,
     clear_retro_classification_pending,
     get_retro_classification_pending,
@@ -58,6 +59,10 @@ _BLOCK_REASON = (
 
 def main() -> None:
     """Read stdin, check sentinel, block or pass through."""
+    marker = _foreign_host_marker()
+    if marker:
+        print(f"[obsidian-brain] Stop outcome=SKIPPED_CODEX_HOST marker={marker}", file=sys.stderr)
+        return
     try:
         raw = sys.stdin.read(1_000_000)
         data = json.loads(raw)

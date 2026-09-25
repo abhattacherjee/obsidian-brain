@@ -57,6 +57,7 @@ class _Outcome:
     SKIPPED_NO_VAULT = "SKIPPED_NO_VAULT"
     SKIPPED_AUTO_LOG_OFF = "SKIPPED_AUTO_LOG_OFF"
     SKIPPED_INVALID_INPUT = "SKIPPED_INVALID_INPUT"
+    SKIPPED_CODEX_HOST = "SKIPPED_CODEX_HOST"
     SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS = "SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS"
     SKIPPED_DEDUP = "SKIPPED_DEDUP"
     WRITE_FAILED = "WRITE_FAILED"
@@ -225,6 +226,22 @@ def _run() -> None:
     session_id = hook_input.get("session_id", "")
     if session_id:
         _LAST_SESSION_ID = session_id
+
+    # Codex currently auto-discovers these Claude lifecycle handlers. Do not
+    # interpret its rollout as a malformed Claude transcript while adapters
+    # and explicit Codex hook selection are being built under #272.
+    marker = obsidian_utils._foreign_host_marker()
+    if marker:
+        cwd = hook_input.get("cwd", "")
+        project = _project_slug_for_log(cwd)
+        print(f"[obsidian-brain] SessionEnd outcome=SKIPPED_CODEX_HOST marker={marker}", file=sys.stderr)
+        _append_sessionend_log(
+            project=project,
+            session_id=session_id,
+            outcome=_Outcome.SKIPPED_CODEX_HOST,
+            detail=marker,
+        )
+        return
 
     try:
         if not hook_input:

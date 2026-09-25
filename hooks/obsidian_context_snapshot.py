@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from obsidian_utils import (  # noqa: E402
+    _foreign_host_marker,
     claim_hook_run,
     extract_assistant_messages,
     extract_session_metadata,
@@ -175,6 +176,10 @@ def _build_snapshot_note(
 
 
 def main() -> None:
+    marker = _foreign_host_marker()
+    if marker:
+        print(f"[obsidian-brain] PreCompact outcome=SKIPPED_CODEX_HOST marker={marker}", file=sys.stderr)
+        return
     try:
         _run()
     except Exception as exc:
