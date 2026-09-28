@@ -19,18 +19,25 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from obsidian_utils import (  # noqa: E402
-    _hook_payload_codex_reason,
-    _bootstrap_prefix,
-    _ensure_secure_dir,
-    _HOOK_LOG_MAX_BYTES,
-    _HOOK_LOG_NAME,
-    _sanitize_log_field,
-    claim_hook_run,
-    find_latest_session,
-    get_project_name,
-    load_config,
-)
+# An import failure must still exit 0 and leave a hook-log line (#371).
+try:
+    from obsidian_utils import (  # noqa: E402
+        _hook_payload_codex_reason,
+        _bootstrap_prefix,
+        _ensure_secure_dir,
+        _HOOK_LOG_MAX_BYTES,
+        _HOOK_LOG_NAME,
+        _sanitize_log_field,
+        claim_hook_run,
+        find_latest_session,
+        get_project_name,
+        load_config,
+    )
+except Exception as _exc:  # noqa: BLE001
+    import hook_bootstrap as _boot  # noqa: E402
+    _detail = _boot.log_import_failure("SessionStart", _exc)
+    print(_boot.session_start_notice(_detail))
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------------------

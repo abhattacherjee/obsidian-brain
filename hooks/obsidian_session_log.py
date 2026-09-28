@@ -22,25 +22,31 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import obsidian_utils  # noqa: E402  — used for _first_seen_date qualified call
-from obsidian_utils import (  # noqa: E402
-    _append_sessionend_log,
-    build_raw_fallback,
-    claim_hook_run,
-    extract_assistant_messages,
-    extract_session_metadata,
-    extract_tool_uses,
-    extract_user_messages,
-    find_snapshots_for_session,
-    is_resumed_session,
-    load_config,
-    make_filename,
-    read_transcript,
-    release_hook_run,
-    should_skip_session,
-    slugify,
-    write_vault_note,
-)
+# An import failure must still exit 0 and leave a hook-log line (#371).
+try:
+    import obsidian_utils  # noqa: E402  — used for _first_seen_date qualified call
+    from obsidian_utils import (  # noqa: E402
+        _append_sessionend_log,
+        build_raw_fallback,
+        claim_hook_run,
+        extract_assistant_messages,
+        extract_session_metadata,
+        extract_tool_uses,
+        extract_user_messages,
+        find_snapshots_for_session,
+        is_resumed_session,
+        load_config,
+        make_filename,
+        read_transcript,
+        release_hook_run,
+        should_skip_session,
+        slugify,
+        write_vault_note,
+    )
+except Exception as _exc:  # noqa: BLE001
+    import hook_bootstrap as _boot  # noqa: E402
+    _boot.log_import_failure("SessionEnd", _exc)
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------------------
