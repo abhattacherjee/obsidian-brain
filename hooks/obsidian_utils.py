@@ -2967,12 +2967,13 @@ def read_note_metadata(file_path: str) -> dict | None:
 # ``malformed`` carries snapshots whose frontmatter would not parse, so the
 # "log malformed to stderr and skip" contract survives the memo.
 #
-# The key is ``str | None``, NOT ``str``: a snapshot with no ``session_id:`` key
-# at all yields None from ``meta.get()``, and the uncached path compares
-# ``meta.get("session_id") == session_id`` — so such a note matches a None query
-# and never matches an empty-string one. Defaulting the key to "" here would
+# The key is optional (``Optional[str]``), NOT ``str``: a snapshot with no
+# ``session_id:`` key at all yields None from ``meta.get()``, and the uncached
+# path compares ``meta.get("session_id") == session_id`` — so such a note
+# matches a None query and never matches an empty-string one. Defaulting the key to "" here would
 # diverge in BOTH directions (a "" query would wrongly collect key-absent
 # snapshots; a None query would wrongly return nothing).
+#
 # ``Optional[str]``, not ``str | None``: this alias is a runtime assignment,
 # so ``from __future__ import annotations`` does not defer it, and PEP 604
 # unions raise TypeError at import on Python 3.9 (#371).

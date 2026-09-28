@@ -72,7 +72,7 @@ jobs:
 
   # ── Python 3.9 floor — macOS system python3 is 3.9 (GH #371) ─
   # hooks.json and the skill snippets run bare `python3`, so the plugin must
-  # import and pass on the oldest interpreter users actually have. No coverage
+  # import and pass on the macOS system python3 (3.9). No coverage
   # gate here; the 3.12 job above owns that.
   python-tests-py39:
     if: github.event_name == 'pull_request'

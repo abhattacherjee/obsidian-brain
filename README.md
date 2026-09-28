@@ -65,7 +65,7 @@ marketplace, switching is seamless — your config and vault are untouched, so
 
 - **Obsidian** with the [Dataview](https://github.com/blacksmithgu/obsidian-dataview) community plugin installed
 - **Claude Code** CLI available on PATH
-- **Python 3.9 or newer** as `python3` on PATH (the macOS system `python3` is 3.9 and works). Hooks and skills use only the standard library.
+- **Python 3.9 or newer** as `python3` on PATH (the macOS system `python3` is 3.9 and works). Hooks and skills need only the standard library (numpy/scipy are optional speed-ups for clustering).
 - Dataview settings: enable **JavaScript Queries** and **Inline Queries**
 
 ## Setup
@@ -329,7 +329,7 @@ Replace `/Users/you` with your actual home directory (run `echo $HOME` to find i
 
 **Cause:** v3.6.0 used Python 3.10+ syntax, and your `python3` is 3.9 ([#371](https://github.com/abhattacherjee/obsidian-brain/issues/371)).
 
-**Fix:** Update the plugin (`/plugin marketplace update`). 3.9 is supported again from the next release, and CI now runs the suite on 3.9.
+**Fix:** Update the plugin (`/plugin marketplace update`). The release after 3.6.0 works on Python 3.9 again. Until you can update, put a Python 3.10 or newer first on your PATH as `python3` (for example Homebrew's `python3`), or stay on v3.5.0, which runs on 3.9.
 
 ### Vault path not writable
 

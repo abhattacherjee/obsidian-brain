@@ -3,11 +3,18 @@
 macOS system ``python3`` is 3.9, and ``hooks/hooks.json`` and the skill
 snippets run bare ``python3``. A PEP 604 union (``str | None``) that is
 evaluated at runtime raises ``TypeError`` at import on 3.9 — which took down
-every lifecycle hook in v3.6.0. CI and preflight run 3.12+, where the same
-line is legal, so only a static check catches it on every interpreter.
+every lifecycle hook in v3.6.0. Local preflight runs 3.12+, where the same
+line is legal, so this static check is what catches it before a PR. The
+``python-tests-py39`` CI job then runs the whole suite on 3.9.
 
 A union is evaluated at runtime when it sits outside an annotation, or inside
 an annotation in a module without ``from __future__ import annotations``.
+
+Scope: a ``|`` is flagged only when one operand is ``None``, a builtin type,
+``Path``, or a subscript of one (``list[int]``). A union of two user classes
+(``Foo | Bar``) is NOT detected; that is indistinguishable from a bitwise or
+without type information. The 3.9 CI job covers such cases in any module the
+suite imports.
 """
 
 from __future__ import annotations
@@ -25,6 +32,8 @@ SHIPPED = sorted(
 )
 
 # Operands that make ``a | b`` a type union rather than an int/set/flag ``|``.
+# Only these (plus ``None`` and subscripts of these) are recognised: a union
+# of two user classes such as ``Foo | Bar`` is not detected (see docstring).
 _TYPE_NAMES = {
     "str", "int", "float", "bool", "bytes", "complex", "object", "type",
     "dict", "list", "tuple", "set", "frozenset", "Path",
@@ -75,6 +84,12 @@ def runtime_unions(source: str) -> list[int]:
     })
 
 
+def test_shipped_set_is_not_empty():
+    """An empty SHIPPED would make the parametrized check below pass vacuously."""
+    assert ROOT / "hooks" / "obsidian_utils.py" in SHIPPED
+    assert ROOT / ".claude" / "hooks" / "require-preflight.py" in SHIPPED
+
+
 @pytest.mark.parametrize("path", SHIPPED, ids=lambda p: str(p.relative_to(ROOT)))
 def test_no_runtime_pep604_union(path):
     lines = runtime_unions(path.read_text(encoding="utf-8"))
@@ -96,6 +111,18 @@ def test_no_runtime_pep604_union(path):
     ("from __future__ import annotations\nx: str | None = None\n", []),
     # Runtime type unions outside annotations.
     ("isinstance(v, int | str)\n", [1]),
+    # With the future import, only annotations are deferred: a default value
+    # and a function body still run.
+    ("from __future__ import annotations\ndef f(x=int | None): pass\n", [2]),
+    ("from __future__ import annotations\ndef f():\n    return isinstance(v, str | None)\n", [3]),
+    # A subscripted builtin is a type operand even next to a user class.
+    ("A = Foo | list[int]\n", [1]),
+    # *args / **kwargs annotations are annotations too...
+    ("from __future__ import annotations\ndef f(*a: int | None, **k: str | None): pass\n", []),
+    # ...and run at def time without the future import.
+    ("def f(*a: int | None): pass\n", [1]),
+    # Known gap: two user classes are not recognised (see module docstring).
+    ("A = Foo | Bar\n", []),
     # Plain bitwise / set / flag ors are not unions.
     ("a = 1 | 2\nb = s | t\nc = re.I | re.M\n", []),
 ])
