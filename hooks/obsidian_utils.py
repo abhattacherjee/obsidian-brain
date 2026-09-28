@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import Optional
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -2972,7 +2973,10 @@ def read_note_metadata(file_path: str) -> dict | None:
 # and never matches an empty-string one. Defaulting the key to "" here would
 # diverge in BOTH directions (a "" query would wrongly collect key-absent
 # snapshots; a None query would wrongly return nothing).
-_SnapshotIndex = tuple[dict[str | None, list[tuple[str, str]]], list[tuple[str, str]]]
+# ``Optional[str]``, not ``str | None``: this alias is a runtime assignment,
+# so ``from __future__ import annotations`` does not defer it, and PEP 604
+# unions raise TypeError at import on Python 3.9 (#371).
+_SnapshotIndex = tuple[dict[Optional[str], list[tuple[str, str]]], list[tuple[str, str]]]
 _snapshot_index_cache: dict[str, tuple[int, _SnapshotIndex]] = {}
 
 

@@ -1,6 +1,8 @@
 # tests/test_obsidian_utils.py
 """Tests for obsidian_utils.py — config, metadata, messages, I/O, upgrade, sampling."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os

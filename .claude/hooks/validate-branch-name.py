@@ -116,6 +116,8 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
 
     try:
         project_dir = os.path.realpath(project_dir)
+        if "\x00" in project_dir:  # Python 3.9 realpath returns NUL paths instead of raising (#371)
+            raise ValueError("embedded null byte")
     except (ValueError, OSError):
         return True  # Unresolvable project dir — can't scope, be safe
 
@@ -197,6 +199,8 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
                 try:
                     target = os.path.realpath(
                         os.path.expandvars(os.path.expanduser(target)))
+                    if "\x00" in target:  # Python 3.9 realpath returns NUL paths instead of raising (#371)
+                        raise ValueError("embedded null byte")
                 except (ValueError, OSError):
                     return True
                 if not (target == project_dir
@@ -223,6 +227,8 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
             target = os.path.expanduser(target)
             target = os.path.expandvars(target)
             target = os.path.realpath(target)
+            if "\x00" in target:  # Python 3.9 realpath returns NUL paths instead of raising (#371)
+                raise ValueError("embedded null byte")
         except (ValueError, OSError):
             return True  # Unresolvable target — assume it is this project
         # os.sep matters: without it "/x/proj-evil" reads as inside "/x/proj".

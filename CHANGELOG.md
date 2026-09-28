@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Python 3.9 support restored (#371):** v3.6.0 added `_SnapshotIndex = tuple[dict[str | None, ...], ...]` to `hooks/obsidian_utils.py`. `str | None` needs Python 3.10+, and because the line is a runtime assignment, the module's `from __future__ import annotations` does not defer it. On a 3.9 `python3` (the macOS system default) every module that imports `obsidian_utils` failed with `TypeError` — 12 modules, including all four lifecycle hooks, so the Stop hook errored on every turn and SessionEnd wrote no note. The alias now uses `Optional[str]`.
+- **Repo guard hooks fail closed on Python 3.9 (#371):** `os.path.realpath` on 3.9 returns a path containing NUL instead of raising `ValueError` like 3.10+ does. The five `.claude/hooks/` gates treated such a `cd` target as outside the project and allowed the command. Each resolved path is now checked for NUL inside the same `try`, so 3.9 denies like 3.10+.
+
+### Added
+- **Python 3.9 regression guards (#371):** a new CI job, `python-tests-py39`, runs the whole suite on 3.9. `tests/test_py39_compat.py` fails on any 3.10-only union that runs at import in `hooks/`, `scripts/` or `.claude/hooks/`, on any interpreter, so local preflight catches it too. Three test files gained `from __future__ import annotations` so the suite collects on 3.9. The README now states the 3.9 minimum.
+
 ## [3.6.0] - 2026-09-25
 
 ### Added

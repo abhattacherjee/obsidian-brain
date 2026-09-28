@@ -1,4 +1,6 @@
 """Integration tests for check_items_cli.run_classifier() with L2 prefilter wired in."""
+
+from __future__ import annotations
 import json
 import os
 import sys

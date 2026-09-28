@@ -65,6 +65,7 @@ marketplace, switching is seamless — your config and vault are untouched, so
 
 - **Obsidian** with the [Dataview](https://github.com/blacksmithgu/obsidian-dataview) community plugin installed
 - **Claude Code** CLI available on PATH
+- **Python 3.9 or newer** as `python3` on PATH (the macOS system `python3` is 3.9 and works). Hooks and skills use only the standard library.
 - Dataview settings: enable **JavaScript Queries** and **Inline Queries**
 
 ## Setup
@@ -321,6 +322,14 @@ Replace `/Users/you` with your actual home directory (run `echo $HOME` to find i
 **Cause:** macOS ships `python3`, not `python`.
 
 **Fix:** The hooks use `python3` by default. If you see this error, check that `python3` is on your PATH (`which python3`). Install via Xcode Command Line Tools (`xcode-select --install`) or Homebrew (`brew install python`).
+
+### `TypeError: unsupported operand type(s) for |` on every turn
+
+**Symptom:** A "Stop hook error" after every response, or `/recall` failing, with `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'` from `obsidian_utils.py`.
+
+**Cause:** v3.6.0 used Python 3.10+ syntax, and your `python3` is 3.9 ([#371](https://github.com/abhattacherjee/obsidian-brain/issues/371)).
+
+**Fix:** Update the plugin (`/plugin marketplace update`). 3.9 is supported again from the next release, and CI now runs the suite on 3.9.
 
 ### Vault path not writable
 
