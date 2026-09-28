@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.6.1] - 2026-09-28
+
 ### Added
 - **Python 3.9 regression guards (#371):** a new CI job, `python-tests-py39`, runs the whole suite on 3.9. `tests/test_py39_compat.py` is a static check that runs on any interpreter, so local preflight on 3.12+ catches the problem too. It scans `hooks/`, `scripts/` and `.claude/hooks/`, and `tests/test_skill_snippets.py` now runs it on the SKILL.md `python3 -c` snippets and `python3 <<` heredocs. It flags a union that runs at import when one side is `None`, a builtin type, `Path`, or a subscript of one. It does not flag a union of two user classes (`Foo | Bar`); the 3.9 CI job covers those in any module the suite imports. Three test files gained `from __future__ import annotations` so the suite collects on 3.9. The README now states the 3.9 minimum.
 - **Lifecycle hooks record an import failure (#371):** the four lifecycle hooks used to die at `import obsidian_utils` with exit 1 and no hook-log line, because the log writer lives in that module. Each hook now catches the failure, calls the new stdlib-only `hooks/hook_bootstrap.py`, and exits 0. It appends one `outcome=IMPORT_FAILED` line to `~/.claude/obsidian-brain-hook.log`, with the Python version and the exception. The line uses the same fields, 100 KB rotation and `0600` mode as the SessionEnd log. SessionStart also tells the model that obsidian-brain did not load.
