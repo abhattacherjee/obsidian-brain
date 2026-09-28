@@ -2854,8 +2854,10 @@ class TestScopeGuardCannotBeBypassed:
     def test_nul_byte_in_cd_target_denies_instead_of_crashing(self, probe, hook):
         """A NUL in the `cd` target raised ValueError out of os.path.realpath.
 
-        Uncaught, that is a traceback and rc 1 — a NON-blocking error, so the
-        gated command ran. An unresolvable target must read as IN scope.
+        That is 3.10+ behaviour. Python 3.9's realpath does not raise: it
+        returns the path with the NUL still in it (#371). Uncaught, the 3.10+
+        error is a traceback and rc 1 — a NON-blocking error, so the gated
+        command ran. An unresolvable target must read as IN scope.
         _decide() rejects any rc but 0 and 2, which is the assertion that
         matters here.
         """
@@ -2864,6 +2866,54 @@ class TestScopeGuardCannotBeBypassed:
         assert self._decide(work, env, hook, command) == "deny", (
             f"{hook} did not deny an unresolvable cd target"
         )
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_nul_byte_popped_by_dotdot_still_denies(self, probe, hook):
+        """`/x/\\x00/..` must deny on every interpreter (#371).
+
+        On 3.9, realpath returns "/x" for it: the `..` pops the NUL
+        component, so a NUL check AFTER realpath never fires and the command
+        reads as aimed elsewhere. The check has to run on the raw string.
+        `<elsewhere>/\\x00/..` is the sharp case — without the NUL it is the
+        exact target that test_legitimate_descoping_still_allows ALLOWS.
+        """
+        work, env, elsewhere = probe
+        for command in (
+            "cd /tmp/\x00/.. && " + self.VERBS[hook],
+            f"cd {elsewhere}/\x00/.. && " + self.VERBS[hook],
+        ):
+            assert self._decide(work, env, hook, command) == "deny", (
+                f"{hook} allowed a NUL-bearing cd target: {command!r}"
+            )
+
+    @staticmethod
+    def _with_c(verb, path):
+        """`git push ...` -> `git -C <path> push ...` (same for `gh`)."""
+        exe, rest = verb.split(" ", 1)
+        return f"{exe} -C {path} {rest}"
+
+    @pytest.mark.parametrize("hook", HOOKS)
+    def test_nul_byte_in_dash_c_target_denies(self, probe, hook):
+        """The `-C <path>` branch needs the same NUL check as `cd` (#371).
+
+        `gh` has no `-C`, but the gh hooks' global-option pattern accepts one
+        and the guard descopes on it like `git -C`, so the branch is live for
+        all five hooks. The control proves each shape reaches that branch:
+        `-C <elsewhere>` must ALLOW, or the NUL cases would deny for some
+        other reason and prove nothing.
+        """
+        work, env, elsewhere = probe
+        verb = self.VERBS[hook]
+        control = self._with_c(verb, elsewhere)
+        assert self._decide(work, env, hook, control) == "allow", (
+            f"{hook} did not descope on {control!r}; the NUL cases cannot "
+            f"discriminate"
+        )
+        for path in ("/tmp/\x00x", "/tmp/\x00/..", f"{elsewhere}/\x00/.."):
+            command = self._with_c(verb, path)
+            assert self._decide(work, env, hook, command) == "deny", (
+                f"{hook} allowed a NUL-bearing -C target: {command!r}"
+            )
 
     @pytest.mark.parametrize("hook", HOOKS)
     def test_prefix_sibling_directory_is_out_of_scope(self, probe, hook):
@@ -3024,10 +3074,13 @@ class TestScopeGuardFailsClosedWhenScopeIsUnknowable:
         helper = self._helper()
         assert helper(f"cd {tmp_path} && git com" + "mit", r"git com" + "mit") is True
 
-    def test_unresolvable_project_dir_is_in_scope(self, tmp_path):
-        """os.path.realpath raises ValueError on an embedded NUL — on the
-        PROJECT dir as readily as on the cd target, and this one is evaluated
-        for every command the hook sees.
+    # "/\x00/.." is the 3.9 shape: realpath pops the NUL component (#371).
+    @pytest.mark.parametrize("suffix", ["/\x00x", "/\x00/.."], ids=["nul", "nul-dotdot"])
+    def test_unresolvable_project_dir_is_in_scope(self, tmp_path, suffix):
+        """On 3.10+ os.path.realpath raises ValueError on an embedded NUL; on
+        3.9 it returns the NUL path (#371). Either way the guard must treat
+        it as unresolvable — on the PROJECT dir as readily as on the cd
+        target, and this one is evaluated for every command the hook sees.
 
         Injected through an os shim, not monkeypatch.setenv: os.environ itself
         rejects a NUL, so setenv raises before the helper is ever called. That
@@ -3036,7 +3089,7 @@ class TestScopeGuardFailsClosedWhenScopeIsUnknowable:
         non-blocking error on EVERY command the hook sees.
         """
         shim = types.SimpleNamespace(
-            environ={"CLAUDE_PROJECT_DIR": f"{tmp_path}/\x00x"},
+            environ={"CLAUDE_PROJECT_DIR": f"{tmp_path}{suffix}"},
             path=os.path,
             sep=os.sep,
         )
