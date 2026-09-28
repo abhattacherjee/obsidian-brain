@@ -1,15 +1,15 @@
 {
   "name": "obsidian-brain",
   "displayName": "Obsidian Brain",
-  "version": "3.6.0",
+  "version": "3.6.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-09-25",
+  "lastUpdated": "2026-09-28",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
     "language": {
       "name": "Python",
-      "version": "3.12",
+      "version": "3.9+",
       "strict": true,
       "notes": "stdlib only — no pip dependencies; deterministic hooks safe to run at session boundaries"
     },
@@ -20,7 +20,7 @@
     },
     "runtime": {
       "name": "Python",
-      "minVersion": "3.12"
+      "minVersion": "3.9"
     },
     "ui": {
       "library": "Obsidian Dataview",
@@ -50,9 +50,10 @@
     "tests": {
       "unit": {
         "runner": "pytest",
-        "count": 2300,
+        "count": 4333,
         "environments": [
-          "python3.12"
+          "python3.12",
+          "python3.9"
         ],
         "coverage": {
           "lines": 92
@@ -348,6 +349,15 @@
             "hooks/obsidian_utils.py"
           ],
           "purpose": "Writes one-line key=value outcome records to the hook telemetry log, rotating at 100 KB, 0600, sanitizing newlines/tabs. Primary diagnostic surface for sessions that did not produce a vault note."
+        },
+        {
+          "id": "hook-import-guard",
+          "name": "hook_bootstrap.py",
+          "kind": "module",
+          "files": [
+            "hooks/hook_bootstrap.py"
+          ],
+          "purpose": "Import-failure fallback for the four lifecycle hooks (#371). Each hook wraps its top-level obsidian_utils import in try/except; on failure it calls log_import_failure(), which appends one outcome=IMPORT_FAILED line (python version + exception type/message) to the hook telemetry log with the same field order, 100 KB rotation and 0600 mode, then the hook exits 0. SessionStart also emits additionalContext telling the model the plugin did not load. Stdlib only, 3.9-safe, never imports obsidian_utils."
         },
         {
           "id": "frontmatter-splitter",
@@ -1040,7 +1050,7 @@
           "files": [
             ".github/workflows/ci.yml"
           ],
-          "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), no-default-db AST guard, security-tests, and an advisory detect-release-merge check."
+          "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), python-tests-py39 (whole suite on 3.9, the macOS system python3; no coverage gate, #371), no-default-db AST guard, security-tests, and an advisory detect-release-merge check."
         },
         {
           "id": "ops-no-default-db",
@@ -1208,6 +1218,33 @@
           "from": "sk-retro",
           "to": "retro-gate-sentinel",
           "label": "clear_retro_classification_pending once Step 7.5 is filed"
+        }
+      ]
+    },
+    {
+      "id": "hook-import-failure",
+      "name": "Lifecycle hook import failure",
+      "description": "If obsidian_utils fails to import (as on Python 3.9 in v3.6.0, #371), a lifecycle hook still records the failure and exits 0 instead of dying with a traceback and no log line.",
+      "steps": [
+        {
+          "from": "hooks-registration",
+          "to": "hook-session-log",
+          "label": "any lifecycle event (SessionEnd/SessionStart/PreCompact/Stop)"
+        },
+        {
+          "from": "hook-session-log",
+          "to": "hook-import-guard",
+          "label": "top-level obsidian_utils import raised"
+        },
+        {
+          "from": "hook-import-guard",
+          "to": "db-hook-log",
+          "label": "outcome=IMPORT_FAILED detail=python=<ver> <Exc>: <msg>"
+        },
+        {
+          "from": "hook-session-hint",
+          "to": "hook-import-guard",
+          "label": "SessionStart only: additionalContext notice to the model"
         }
       ]
     },
@@ -1959,10 +1996,11 @@
   "testing": {
     "unitSuite": {
       "tool": "pytest",
-      "fileCount": 84,
+      "fileCount": 99,
       "duration": "fast (stdlib, no network)",
       "environments": {
-        "python": "3.12"
+        "python": "3.12",
+        "pythonFloor": "3.9"
       },
       "coverage": {
         "lines": 90,

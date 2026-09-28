@@ -70,6 +70,23 @@ jobs:
       - name: Run tests with coverage
         run: pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90
 
+  # ── Python 3.9 floor — macOS system python3 is 3.9 (GH #371) ─
+  # hooks.json and the skill snippets run bare `python3`, so the plugin must
+  # import and pass on the macOS system python3 (3.9). No coverage
+  # gate here; the 3.12 job above owns that.
+  python-tests-py39:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.9'
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run tests on Python 3.9
+        run: pytest tests/ -q --tb=short
+
   # ── DB-pollution guard — blocks bare ensure_index() in tests (GH #46) ─
   no-default-db-check:
     if: github.event_name == 'pull_request'

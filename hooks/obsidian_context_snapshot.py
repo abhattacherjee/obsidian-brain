@@ -20,20 +20,26 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from obsidian_utils import (  # noqa: E402
-    _hook_payload_codex_reason,
-    claim_hook_run,
-    extract_assistant_messages,
-    extract_session_metadata,
-    extract_user_messages,
-    load_config,
-    make_filename,
-    read_transcript,
-    release_hook_run,
-    scrub_secrets,
-    slugify,
-    write_vault_note,
-)
+# An import failure must still exit 0 and leave a hook-log line (#371).
+try:
+    from obsidian_utils import (  # noqa: E402
+        _hook_payload_codex_reason,
+        claim_hook_run,
+        extract_assistant_messages,
+        extract_session_metadata,
+        extract_user_messages,
+        load_config,
+        make_filename,
+        read_transcript,
+        release_hook_run,
+        scrub_secrets,
+        slugify,
+        write_vault_note,
+    )
+except Exception as _exc:  # noqa: BLE001
+    import hook_bootstrap as _boot  # noqa: E402
+    _boot.log_import_failure("PreCompact", _exc)
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------------------

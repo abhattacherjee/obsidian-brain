@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 from scripts.vault_doctor_checks import Issue, snapshot_integrity

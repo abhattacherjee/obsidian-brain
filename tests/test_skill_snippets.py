@@ -53,6 +53,53 @@ def test_python_snippet_syntax(name, code):
     compile(code, f"<{name}>", "exec")
 
 
+# `python3 << 'PYEOF'` / `python3 - <<'PY'` heredoc bodies. The delimiter is
+# quoted in every SKILL.md site, so the body reaches python3 verbatim.
+_HEREDOC_RE = re.compile(
+    r"python3\s+(?:-\s+)?<<\s*'(\w+)'\n(.*?)\n[ \t]*\1\n", re.DOTALL
+)
+
+
+def _extract_heredoc_snippets():
+    snippets = []
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill_name = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as f:
+            content = f.read()
+        for i, match in enumerate(_HEREDOC_RE.finditer(content)):
+            snippets.append((f"{skill_name}-heredoc-{i}", textwrap.dedent(match.group(2))))
+    return snippets
+
+
+_HEREDOCS = _extract_heredoc_snippets()
+
+
+@pytest.mark.parametrize("name,code", _SNIPPETS + _HEREDOCS,
+                         ids=[s[0] for s in _SNIPPETS + _HEREDOCS])
+def test_snippet_has_no_runtime_pep604_union(name, code):
+    """Skill snippets run under bare `python3`, which is 3.9 on macOS (#371).
+
+    compile() on 3.12+ accepts `str | None`; 3.9 raises TypeError when the
+    line runs. See test_py39_compat for what the detector does and does not
+    catch.
+    """
+    from test_py39_compat import runtime_unions
+
+    lines = runtime_unions(code)
+    assert not lines, (
+        f"{name} lines {lines}: `X | None` raises TypeError on Python 3.9. "
+        "Use typing.Optional / typing.Union."
+    )
+
+
+def test_heredoc_snippets_found():
+    """Guard the extractor: check-items has eight `python3 << 'PYEOF'`
+    blocks and obsidian-setup one `python3 - <<'PY'`."""
+    names = [n for n, _ in _HEREDOCS]
+    assert sum(n.startswith("check-items-") for n in names) >= 8, names
+    assert any(n.startswith("obsidian-setup-") for n in names), names
+
+
 def test_at_least_one_snippet_found():
     """Sanity check: we should find at least 10 snippets across all skills."""
     assert len(_SNIPPETS) >= 10, (

@@ -33,12 +33,18 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from obsidian_utils import (  # noqa: E402
-    _hook_payload_codex_reason,
-    RETRO_GATE_TTL_SECONDS,
-    clear_retro_classification_pending,
-    get_retro_classification_pending,
-)
+# An import failure must still exit 0 and leave a hook-log line (#371).
+try:
+    from obsidian_utils import (  # noqa: E402
+        _hook_payload_codex_reason,
+        RETRO_GATE_TTL_SECONDS,
+        clear_retro_classification_pending,
+        get_retro_classification_pending,
+    )
+except Exception as _exc:  # noqa: BLE001
+    import hook_bootstrap as _boot  # noqa: E402
+    _boot.log_import_failure("Stop", _exc)
+    sys.exit(0)
 
 _BLOCK_REASON = (
     "You wrote a retro this session but Step 7.5 classification is not yet complete. "
