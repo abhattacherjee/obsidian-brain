@@ -413,6 +413,8 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         return True  # Can't determine scope, be safe
 
     try:
+        if "\x00" in project_dir:  # before realpath: 3.9 resolves /x/\x00/.. to /x (#371)
+            raise ValueError("embedded null byte")
         project_dir = os.path.realpath(project_dir)
     except (ValueError, OSError):
         return True  # Unresolvable project dir — can't scope, be safe
@@ -493,8 +495,10 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
             target = next((t for t in c_dirs[0].groups() if t), None)
             if target is not None:
                 try:
-                    target = os.path.realpath(
-                        os.path.expandvars(os.path.expanduser(target)))
+                    target = os.path.expandvars(os.path.expanduser(target))
+                    if "\x00" in target:  # before realpath: 3.9 resolves /x/\x00/.. to /x (#371)
+                        raise ValueError("embedded null byte")
+                    target = os.path.realpath(target)
                 except (ValueError, OSError):
                     return True
                 if not (target == project_dir
@@ -520,6 +524,8 @@ def _targets_this_project(cmd: str, verb: str) -> bool:
         try:
             target = os.path.expanduser(target)
             target = os.path.expandvars(target)
+            if "\x00" in target:  # before realpath: 3.9 resolves /x/\x00/.. to /x (#371)
+                raise ValueError("embedded null byte")
             target = os.path.realpath(target)
         except (ValueError, OSError):
             return True  # Unresolvable target — assume it is this project
