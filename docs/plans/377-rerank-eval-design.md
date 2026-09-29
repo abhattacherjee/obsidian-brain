@@ -2,7 +2,7 @@
 
 - **Issue:** abhattacherjee/obsidian-brain#377
 - **Date:** 2026-09-28
-- **Status:** draft, awaiting review
+- **Status:** approved 2026-09-28
 - **Related:** #376 (missing note types in `_TYPE_SCORES_BY_CONTEXT`), #54 (retrieval refinements)
 
 ## Goal
@@ -11,7 +11,7 @@ Improve **recall quality**: get the notes that answer a question into context mo
 
 Before changing any ranking, measure whether a decision model does better than today's ranking. The candidates are Jev (TypeSafe's cloud System One model) and laya (an open, local model with the same interface).
 
-**Phase 1 (this spec) changes no ranking.** It adds a citation log, a seed eval set and an eval harness. Phase 2, which reranks vault-ask candidates, has its own spec and only happens if a backend passes the go gate below.
+**Phase 1 (this spec) changes no ranking weights.** The one ordering change is that vault-ask's Step 5 rule table moves from the model into a script (see Citation log). Phase 1 adds a citation log, a seed eval set and an eval harness. Phase 2, which reranks vault-ask candidates, has its own spec and only happens if a backend passes the go gate below.
 
 ## Why measure first
 
@@ -31,7 +31,7 @@ Out of scope:
 - `memory_inject.py`. It lives in the global `~/.claude` setup, not this repo.
 - check-items. Swapping its classifier for Jev is a cost goal, not a recall goal.
 - Grounding checks on answers. That is answer quality, not recall.
-- Any change to `search_vault`, `/recall` or `/compress` ranking.
+- Any change to the default ranking of `search_vault`, `/recall` or `/compress`. The new `search_vault` parameters (`log_access`, `task_context`) and the `rerank_results` extra signal default to today's behaviour.
 
 ## Components
 
@@ -39,9 +39,10 @@ Out of scope:
 
 The candidate list is not passed by the model, which could drop entries. Instead:
 
-1. Step 3's search call writes every candidate (path, FTS rank, rerank score) to `~/.claude/obsidian-brain-ask-pending/<session_id>.json`. Step 5's rule scoring adds `rule_score` and `read` to the same file, from a script rather than from the model.
-2. A new last step calls `ask_log.py record --session <id>` and pipes in only the answer text.
-3. `ask_log.py` parses the cited wikilinks from the answer's Sources section, merges them with the pending file, appends the line and deletes the pending file.
+1. Every candidate goes to `~/.claude/obsidian-brain-ask-pending/<session_id>.json`, whichever path produced it. On the fast path, Step 3's search call writes each candidate's path, FTS rank and rerank score. On the fallback path (Step 3 returned fewer than 5 results), Step 4's deduplicated Grep union is written by the same script, with `fts_rank` and `rerank_score` set to null.
+2. Step 5's rule scoring moves from the model into a script (`ask_rank.py`). It applies the same rule table, sorts by rule score, breaks ties by `rerank_score` (then path), and adds `rule_score` and `read` to the pending file. This is a behaviour change: today the model applies the table by hand, so the order can differ from what the model would have picked. The rules themselves do not change, and this script is the `current` baseline in the harness.
+3. A new last step calls `ask_log.py record --session <id>` and pipes in only the answer text.
+4. `ask_log.py` parses the cited wikilinks from the answer's Sources section, merges them with the pending file, appends the line and deletes the pending file.
 
 This matches the note-writer pattern: the model passes text, and code builds the record. It appends one line to `~/.claude/obsidian-brain-ask-log.jsonl`. It follows `summarizer_metrics.py`: local only, rotates at 1 MB, and never raises into the skill.
 
@@ -89,14 +90,16 @@ Backends:
 
 | Backend | How | Notes |
 |---|---|---|
-| `current` | `rerank_results` plus the Step 5 rule table | the baseline |
-| `haiku` | one `claude -p --model haiku` call per question, returning JSON scores | subscription, no API key |
+| `current` | the `ask_rank.py` script: Step 5 rule score, ties broken by `rerank_score` | the baseline |
+| `haiku` | one `claude -p --model haiku` call per question, returning JSON scores | subscription, no API key; a quality reference only (see Go gate) |
 | `jev` | HTTP to `TYPESAFE_BASE_URL` with model pinned to `jev-1.13.0`; one `Score` question per candidate, all in one call | **opt-in** with `OB_JEV=1`; text goes through the cc-token-router phase A scrubber first; key from `TYPESAFE_API_KEY` |
 | `laya` | subprocess to a separate Python ≥ 3.10 venv (`~/.cache/obsidian-brain/laya-venv`) running a small `laya_score.py` over stdin/stdout JSON; checkpoint `laya` (English) | local, no key; snippets trimmed to fit 512 tokens |
 
 The plugin must keep Python 3.9 working (`tests/test_py39_compat.py`). So laya is never imported by plugin code. Only the harness calls it, as a separate process.
 
-**Question-type test.** The same harness scores a question-type Choice: past decision / error or debugging / how-to or general / status. It compares a keyword rule, `jev` and `laya` against Opus labels. It also measures the nDCG@5 change when the chosen type feeds `search_vault`'s `note_types` weights. #376's missing types (`claude-snapshot`, `claude-stats`, `claude-emerge`, `claude-memory`) get weights as part of this work.
+**Question-type test.** The same harness scores a question-type Choice: past decision / error or debugging / how-to or general / status. It compares a keyword rule, `jev` and `laya` against Opus labels. It also measures the nDCG@5 change when the chosen type sets the note-type weights.
+
+Today the only route to those weights is `caller` → `detect_task_context`. That route has five contexts (`debugging`, `standup`, `emerge`, `search`, `general`), not the four question types. It also returns `debugging` on any `fix/*`, `bug/*` or `hotfix/*` branch, so a harness run would depend on the branch it runs from. This spec adds a `task_context: str | None = None` parameter to `search_vault`. When set, it is used as is and `detect_task_context` is not called. The question types map to contexts like this: past decision → `search`, error or debugging → `debugging`, how-to or general → `general`, status → `standup`. #376's missing types (`claude-snapshot`, `claude-stats`, `claude-emerge`, `claude-memory`) get weights in every context row as part of this work. The harness always passes `task_context` (default `search`), so results never depend on the git branch.
 
 ## Metrics
 
@@ -113,8 +116,10 @@ Per backend, on the seed set. The citation log is also scored once it has at lea
 A backend passes only if all three hold **on the seed set**, each judged with a 95% bootstrap CI:
 
 1. nDCG@5 is at least **+0.05** over `current`, with the lower CI bound above 0.
-2. Recall@5 is **no worse** than `current`.
+2. Recall@5 is **no worse** than `current`: the lower 95% CI bound of the paired difference (backend − `current`) is at least **−0.02**.
 3. p95 latency is at most **1.5 s** for 20 candidates.
+
+`haiku` cannot meet the latency bound, because `claude -p` takes several seconds just to start. It is scored as a quality reference and can never be chosen.
 
 Ties go to the cheaper and more private backend, in this order: `current` → `laya` → `jev` → `haiku`.
 
@@ -140,8 +145,10 @@ The Friston layer and a decision model answer different questions, so they combi
    - `replace`: order by the model's probability alone.
    - `blend`: add the probability to `rerank_results` as an eighth signal. The existing seven signals are scaled down to make room, and the model's weight is swept (0.2, 0.35, 0.5).
 
+   To compute `blend`, `rerank_results` gains an optional `extra_signal: dict[str, float] | None = None` (path → score) and `extra_weight: float = 0.0`. When `extra_weight` is 0, the output is unchanged; a test pins this. Phase 1 never passes a non-zero weight outside the harness, so live ranking is unchanged.
+
    The gate applies to the best mode. If `blend` wins, activation, recency and importance keep a say, and a model error is damped.
-2. **Protect activation from the eval.** `search_vault` writes an `access_log` row for every result it returns (`_batch_log_access`, `vault_index.py:1837` and `:2065`), and there is no way to turn that off. Replaying about 60 questions × 20 candidates would inflate the activation of whatever the replays return, and corrupt the prior being compared against. This spec adds a `log_access: bool = True` parameter to `search_vault`. The seed builder and harness always pass `False`. A test checks that `access_log` row counts are unchanged after a harness run.
+2. **Protect activation from the eval.** `search_vault` writes an `access_log` row for every result it returns (`_batch_log_access` at `vault_index.py:1837`; `query_related_notes` does the same at `:2065`, but the harness never calls it), and there is no way to turn that off. Replaying about 60 questions × 20 candidates would inflate the activation of whatever the replays return, and corrupt the prior being compared against. This spec adds a `log_access: bool = True` parameter to `search_vault`. The seed builder and harness always pass `False`. A test checks that `access_log` row counts are unchanged after a harness run.
 3. **Surprise stays separate.** #54 (surprise-boosted retrieval) can be scored in the same harness as a `current+surprise` variant once #54 fixes the 0.0-ambiguity in `detect_surprise`. It is not built here.
 
 **Not in this spec, but made possible by it:**
@@ -177,6 +184,9 @@ The Friston layer and a decision model answer different questions, so they combi
 - `test_py39_compat.py` stays green. No laya import anywhere in `hooks/`.
 - `search_vault(..., log_access=False)` writes no `access_log` rows, and the default still does.
 - A harness run leaves the `access_log` row count unchanged.
+- `search_vault(..., task_context=X)` uses X on a `fix/*` branch; the default still calls `detect_task_context`.
+- `rerank_results` with `extra_weight=0` returns the same order and scores as before.
+- `ask_rank.py`: the rule table, the tie-break, and the fallback path with null `fts_rank`.
 
 ## Out of scope for this spec
 
