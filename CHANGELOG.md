@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+- Design spec for the rerank eval: citation log, seed eval set and a 4-backend harness (current, Haiku, Jev, laya) before any ranking change (#377).
+
 ## [3.6.1] - 2026-09-28
 
 ### Added
