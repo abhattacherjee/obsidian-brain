@@ -37,7 +37,13 @@ Out of scope:
 
 ### 1. Citation log: `hooks/ask_log.py`
 
-vault-ask gets a new last step that calls `ask_log.py record`, passing JSON on stdin. It appends one line to `~/.claude/obsidian-brain-ask-log.jsonl`. It follows `summarizer_metrics.py`: local only, rotates at 1 MB, and never raises into the skill.
+The candidate list is not passed by the model, which could drop entries. Instead:
+
+1. Step 3's search call writes every candidate (path, FTS rank, rerank score) to `~/.claude/obsidian-brain-ask-pending/<session_id>.json`. Step 5's rule scoring adds `rule_score` and `read` to the same file, from a script rather than from the model.
+2. A new last step calls `ask_log.py record --session <id>` and pipes in only the answer text.
+3. `ask_log.py` parses the cited wikilinks from the answer's Sources section, merges them with the pending file, appends the line and deletes the pending file.
+
+This matches the note-writer pattern: the model passes text, and code builds the record. It appends one line to `~/.claude/obsidian-brain-ask-log.jsonl`. It follows `summarizer_metrics.py`: local only, rotates at 1 MB, and never raises into the skill.
 
 Each line holds:
 
@@ -61,9 +67,11 @@ Unread candidates are not treated as negatives. That would bias the eval toward 
 
 The citation log starts empty, so a seed set provides labels from day one:
 
-1. Collect past `/vault-ask` questions from the session notes. Look for `/vault-ask` or `obsidian-brain:vault-ask` invocations in the raw conversation sections. Target 40–60 distinct questions.
-2. Re-run today's retrieval (`search_vault` plus the Step 5 rules) for each question and keep the top 20 candidates.
-3. Opus labels each question and candidate pair from 0 to 2: 0 = not relevant, 1 = related, 2 = answers the question. It uses `claude -p --model opus` with the question plus the note's title, summary and first 60 lines.
+1. **Questions, from two sources:**
+   - **History.** Past `/vault-ask` questions from the session notes' raw conversation sections. A rough count on 2026-09-28 found only about 11 distinct questions, though 73 session notes mention vault-ask.
+   - **Known-item questions.** Sample notes across types, projects and ages. For each, Opus writes one question that the note answers, the way you would ask it months later without the note's exact words. The source note is a known relevant result. Target 50, for a total of about 60 questions.
+2. Re-run today's retrieval (`search_vault` plus the Step 5 rules) for each question with **`log_access=False`** (see Friston below) and keep the top 20 candidates. If a known-item question's source note isn't in the top 20, it is still recorded, which counts as a recall miss for every backend.
+3. Opus labels each question and candidate pair from 0 to 2: 0 = not relevant, 1 = related, 2 = answers the question. It uses `claude -p --model opus` with the question plus the note's title, summary and first 60 lines. In the same call, Opus also labels the **question type** (past decision / error or debugging / how-to or general / status), which the question-type test needs.
 4. A person spot-checks 20 labels. If agreement is below 85%, the seed set is marked INCONCLUSIVE and the prompt is fixed before any backend is scored. This is the same rule as phase A.
 
 The seed set is written to `~/.claude/obsidian-brain-rerank-seed.jsonl`. It is never committed, because it contains vault text.
@@ -92,7 +100,7 @@ The plugin must keep Python 3.9 working (`tests/test_py39_compat.py`). So laya i
 
 ## Metrics
 
-Per backend, first on the seed set, then on the citation log once it has at least 100 questions:
+Per backend, on the seed set. The citation log is also scored once it has at least 100 questions, but only to watch trends. **It never decides the gate.** Only notes the current ranking put near the top get read, so only they can be cited, and the log favours `current`.
 
 - **nDCG@5** (primary). vault-ask reads about 5–10 notes, so the order of the first five matters most.
 - **Recall@5** of notes labelled 2 (seed set) or cited (log).
@@ -102,7 +110,7 @@ Per backend, first on the seed set, then on the citation log once it has at leas
 
 ## Go gate for phase 2
 
-A backend passes only if all three hold, each judged with a 95% bootstrap CI:
+A backend passes only if all three hold **on the seed set**, each judged with a 95% bootstrap CI:
 
 1. nDCG@5 is at least **+0.05** over `current`, with the lower CI bound above 0.
 2. Recall@5 is **no worse** than `current`.
@@ -113,6 +121,33 @@ Ties go to the cheaper and more private backend, in this order: `current` → `l
 If nothing passes, phase 2 is dropped and the result is recorded, as with cc-token-router#143.
 
 **Fine-tuning laya** starts only if zero-shot laya fails the gate, Jev passes it, and the cloud route is rejected. The citation log is then the training set. Training runs locally, or on Kaggle's free GPUs (the README's notebook) with the upload explicitly accepted.
+
+## Relationship to the Friston memory layer
+
+The Friston layer and a decision model answer different questions, so they combine rather than compete.
+
+| | Friston layer (today) | Decision model (Jev or laya) |
+|---|---|---|
+| Asks | Which notes matter to me in general? | Does this note answer this question? |
+| Signals | ACT-R activation from `access_log` (0.20 weight), recency, importance, note type, themes and `surprise` | a relevance probability per candidate |
+| Query-aware | only lexically: BM25 (0.20) and proximity (0.25) | yes, by meaning |
+
+`rerank_results` has no semantic signal today. The decision model adds that signal; the Friston priors stay.
+
+**What this spec does about it:**
+
+1. **Two ways to use a model score.** The harness scores each model in two modes:
+   - `replace`: order by the model's probability alone.
+   - `blend`: add the probability to `rerank_results` as an eighth signal. The existing seven signals are scaled down to make room, and the model's weight is swept (0.2, 0.35, 0.5).
+
+   The gate applies to the best mode. If `blend` wins, activation, recency and importance keep a say, and a model error is damped.
+2. **Protect activation from the eval.** `search_vault` writes an `access_log` row for every result it returns (`_batch_log_access`, `vault_index.py:1837` and `:2065`), and there is no way to turn that off. Replaying about 60 questions × 20 candidates would inflate the activation of whatever the replays return, and corrupt the prior being compared against. This spec adds a `log_access: bool = True` parameter to `search_vault`. The seed builder and harness always pass `False`. A test checks that `access_log` row counts are unchanged after a harness run.
+3. **Surprise stays separate.** #54 (surprise-boosted retrieval) can be scored in the same harness as a `current+surprise` variant once #54 fixes the 0.0-ambiguity in `detect_surprise`. It is not built here.
+
+**Not in this spec, but made possible by it:**
+
+- **A cleaner activation signal.** Today every returned result counts as an access, so notes that are shown get stronger whether or not they were useful. The citation log records which notes were actually cited. Weighting ACT-R by cited accesses is a change to the Friston layer and needs its own design.
+- **Clustering.** Themes come from TF-IDF cosine (`cluster_vectors` at 0.5, `assign_to_theme` at 0.3), and names come from Haiku. A decision model could assign each new note to a theme with a Choice over theme names plus "new". That is about vault structure, not recall, so it is out of scope. The same harness could measure it later.
 
 ## Phase 2 outline (not built here)
 
@@ -140,6 +175,8 @@ If nothing passes, phase 2 is dropped and the result is recorded, as with cc-tok
 - `ask_log.py`: pytest cases for the rotation boundary, a Sources section with no citations, wikilinks that match no candidate, and a malformed stdin payload. It is covered by the 90% gate on `hooks/`.
 - `rerank_eval.py`: backends faked with `monkeypatch`, the same way `subprocess.run` is faked elsewhere. nDCG@5, recall@5 and the bootstrap are checked against hand-computed examples.
 - `test_py39_compat.py` stays green. No laya import anywhere in `hooks/`.
+- `search_vault(..., log_access=False)` writes no `access_log` rows, and the default still does.
+- A harness run leaves the `access_log` row count unchanged.
 
 ## Out of scope for this spec
 
