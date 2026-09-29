@@ -92,7 +92,7 @@ Backends:
 |---|---|---|
 | `current` | the `ask_rank.py` script: Step 5 rule score, ties broken by `rerank_score` | the baseline |
 | `haiku` | one `claude -p --model haiku` call per question, returning JSON scores | subscription, no API key; a quality reference only (see Go gate) |
-| `jev` | HTTP to `TYPESAFE_BASE_URL` with model pinned to `jev-1.13.0`; one `Score` question per candidate, all in one call | **opt-in** with `OB_JEV=1`; text goes through the cc-token-router phase A scrubber first; key from `TYPESAFE_API_KEY` |
+| `jev` | HTTP to `TYPESAFE_BASE_URL` with model pinned to `jev-1.13.0`; one yes/no (`noul`) question per candidate, all in one call; its answer is p(relevant) | **opt-in** with `OB_JEV=1`; text goes through the cc-token-router phase A scrubber first; key from `TYPESAFE_API_KEY` |
 | `laya` | subprocess to a separate Python ≥ 3.10 venv (`~/.cache/obsidian-brain/laya-venv`) running a small `laya_score.py` over stdin/stdout JSON; checkpoint `laya` (English) | local, no key; snippets trimmed to fit 512 tokens |
 
 The plugin must keep Python 3.9 working (`tests/test_py39_compat.py`). So laya is never imported by plugin code. Only the harness calls it, as a separate process.
