@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `hooks/vault_scan.py`, a read-only CLI for `/vault-ask` and `/vault-search`. `grep` lists the `*.md` files under vault folders that match a regex, one line at a time like the Grep tool, and `--frontmatter-only` limits the search to the frontmatter block. `meta` prints each note's `date`, `type`, `project`, `session_id`, `source_session_note`, `tags`, `title` and `snippet` as JSON Lines, reading the whole frontmatter. Both check every file stays inside the vault after resolving symlinks (#375, #312).
 
 ### Fixed
-- Search ranking now has a type weight for `claude-snapshot`, `claude-memory`, `claude-emerge`, `claude-stats` and `claude-check-items-report` in every context. They used to fall back to 0.5, which ranked health reports above decisions. `tests/test_type_scores.py` fails if a writer adds a type with no weight (#376).
-- `/vault-ask` and `/vault-search` no longer read only the first 30 or 40 lines of a note to find its frontmatter fields. Frontmatter can close as deep as line 460, so tags past that limit were missed. Tag search and metadata reads now go through `vault_scan.py` (#312).
+- Search ranking now has a type weight for `claude-snapshot`, `claude-memory`, `claude-emerge`, `claude-stats` and `claude-check-items-report` in every context. They used to fall back to 0.5, which ranked health reports above standup notes in every context and above retro notes in every context but `standup`, and level with decisions in `debugging`. `tests/test_type_scores.py` fails if a writer adds a type with no weight (#376).
+- `/vault-ask` and `/vault-search` no longer read only the first 30 or 40 lines of a note to find its frontmatter fields. Frontmatter can run past line 40 (/emerge notes close their fence as deep as line 461), so tags below line 30 or 40 were missed. Tag search and metadata reads now go through `vault_scan.py` (#312).
 - `/vault-ask` and `/vault-search` now say what to run when the Grep tool is missing: `vault_scan.py grep` (#375).
 
 ### Changed

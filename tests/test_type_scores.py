@@ -1,8 +1,10 @@
 """Every note type the plugin writes has an explicit rerank weight (#376).
 
 ``vault_index`` scores a note's type through ``_TYPE_SCORES_BY_CONTEXT``.
-A type missing from a context falls back to 0.5, which ranks a health report
-(``claude-stats``) above a curated decision in some contexts. This test scans
+A type missing from a context falls back to 0.5. Before #376 that ranked a
+health report (``claude-stats``) above standup notes in every context, above
+retro notes in every context but ``standup``, and level with decisions in
+``debugging``. This test scans
 the writers for every ``type: claude-*`` they emit and requires each one to
 have a weight in every context.
 """
@@ -22,7 +24,7 @@ REPO = Path(__file__).resolve().parent.parent
 # It does not match folder names such as ``claude-sessions`` because those
 # never follow a ``type`` key. No leading word boundary: f-strings in hooks
 # write ``"---\ntype: claude-emerge"``, where ``type`` follows a literal ``n``.
-_TYPE_RE = re.compile(r"""["']?type["']?\s*[:=]\s*["']?(claude-[a-z][a-z-]*[a-z])""")
+_TYPE_RE = re.compile(r"""["']?type["']?\s*[:=]\s*["']?(claude-[a-z0-9][a-z0-9-]*[a-z0-9])""")
 
 # Written outside this repo (migrated memory notes) but present in live vaults.
 _EXTERNAL_TYPES = {"claude-memory"}
@@ -35,7 +37,8 @@ _ORIGINAL_TYPES = {
 
 def _writer_files() -> list[Path]:
     files = sorted((REPO / "hooks").glob("*.py"))
-    files += sorted((REPO / "skills").glob("*/SKILL.md"))
+    files += sorted((REPO / "scripts").glob("**/*.py"))
+    files += sorted((REPO / "skills").glob("**/*.md"))
     files += sorted((REPO / "templates").glob("*.md"))
     return files
 
@@ -61,6 +64,24 @@ def test_scan_finds_the_newer_writers():
         assert t in found, t
 
 
+def test_scan_finds_exactly_the_known_types():
+    # Widening the scan (scripts/, skills/**) or the character class must not
+    # quietly pull in a new type; a real new writer updates this list on purpose.
+    assert collect_written_types() == _ORIGINAL_TYPES | {
+        "claude-snapshot", "claude-memory", "claude-emerge", "claude-stats",
+        "claude-check-items-report",
+    }
+
+
+def test_scan_covers_nested_scripts():
+    # scripts/**/*.py must recurse: writers live in scripts/dev-test/ and
+    # scripts/vault_doctor_checks/. (skills/**/*.md has no nested files today;
+    # the recursive glob is there for future references/ folders.)
+    files = {p.relative_to(REPO).as_posix() for p in _writer_files()}
+    assert any(f.startswith("scripts/dev-test/") and f.endswith(".py") for f in files)
+    assert "skills/vault-ask/SKILL.md" in files
+
+
 def test_regex_ignores_folder_names():
     assert _TYPE_RE.findall("folder: claude-sessions\nsessions_folder: claude-sessions") == []
 
@@ -68,10 +89,10 @@ def test_regex_ignores_folder_names():
 def test_regex_matches_all_writer_shapes():
     text = (
         'type: claude-aa\n"type": "claude-bb"\ntype="claude-cc"\n'
-        'type: "claude-dd"\n' + r'"---\ntype: claude-ee\ndate: "'
+        'type: "claude-dd"\n' + r'"---\ntype: claude-ee\ndate: "' + "\ntype: claude-v2-note\n"
     )
     assert _TYPE_RE.findall(text) == [
-        "claude-aa", "claude-bb", "claude-cc", "claude-dd", "claude-ee",
+        "claude-aa", "claude-bb", "claude-cc", "claude-dd", "claude-ee", "claude-v2-note",
     ]
 
 
@@ -99,5 +120,12 @@ def test_weights_are_in_unit_range():
 
 def test_reports_rank_below_curated_notes():
     for ctx, scores in vault_index._TYPE_SCORES_BY_CONTEXT.items():
+        curated = min(scores["claude-insight"], scores["claude-decision"],
+                      scores["claude-error-fix"])
         for report in ("claude-stats", "claude-check-items-report"):
-            assert scores[report] < scores["claude-insight"], (ctx, report)
+            assert scores[report] == 0.0, (ctx, report)
+            assert scores[report] < curated, (ctx, report)
+
+
+def test_emerge_does_not_weight_its_own_output():
+    assert vault_index._TYPE_SCORES_BY_CONTEXT["emerge"]["claude-emerge"] == 0.0

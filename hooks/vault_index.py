@@ -1481,10 +1481,17 @@ def detect_task_context(caller_skill: str | None = None) -> str:
 
 # Weight of each note type per task context. A type missing here scores 0.5
 # (see rerank_results), so tests/test_type_scores.py requires every type a
-# writer emits to be listed in every context (#376). Reports (stats,
-# check-items) score 0.0: they describe the vault, they are not knowledge.
-# claude-emerge scores 0.0 in "emerge" so /emerge does not re-ingest its own
-# output.
+# writer emits to be listed in every context (#376).
+#
+# Only the "general" column is used in production today: search_vault picks a
+# context only when a caller passes caller=, and no caller does. The other
+# columns apply only once a caller passes caller=.
+#
+# A weight down-weights a note; it never excludes one. Type is 0.10 of the
+# final rerank score, so a 0.0 type lowers a note's score by at most 0.05
+# against the 0.5 default (0.10 against a 1.0 type). Reports (claude-stats,
+# claude-check-items-report) score 0.0: they describe the vault, they are not
+# knowledge. claude-emerge scores 0.0 in "emerge".
 _TYPE_SCORES_BY_CONTEXT = {
     "debugging": {
         "claude-error-fix": 1.0, "claude-session": 0.8, "claude-snapshot": 0.7,

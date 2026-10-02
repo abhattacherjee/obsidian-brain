@@ -655,7 +655,7 @@ def test_every_resolver_site_is_byte_identical_to_a_canonical_form():
 def test_canonical_form_family_counts_are_exact():
     """Each family's population is pinned, so moving a site between families —
     e.g. flipping one site's internal quote character — fails here even though
-    the total stays at 71."""
+    the total stays at 77."""
     observed = collections.Counter(s.text for s in _SITES)
     names = FORM_NAMES
     # Aggregated, not a dict comprehension: several drifted families all map to
@@ -668,7 +668,7 @@ def test_canonical_form_family_counts_are_exact():
     want = {names[text]: n for text, n in EXPECTED_FORM_COUNTS.items()}
     assert got == want, (
         f"resolver family populations changed: expected {want}, got {got}. "
-        "56 = double-quoted sys.path.insert sites, 2 = /check-items' "
+        "57 = double-quoted sys.path.insert sites, 2 = /check-items' "
         "single-quoted sys.path.insert sites, 14 = FORM B print sites, "
         "1 = /vault-doctor's FORM C dispatcher, 3 = /dev-test's FORM D "
         "repo-root sites."

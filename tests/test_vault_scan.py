@@ -111,7 +111,10 @@ def test_grep_zero_matches_still_prints_summary(capsys, vault):
     rc, out, err = _main(capsys, "grep", vault, "claude-sessions", "--pattern", "zzzz-none")
     assert rc == 0
     assert out == ""
-    assert err.strip() == "vault_scan: 0 match(es), 1 file(s) scanned, 0 skipped"
+    assert err.strip() == (
+        "vault_scan: 0 match(es), 1 file(s) scanned, 0 skipped "
+        "(too_large=0, unreadable=0, outside_vault=0, bad_frontmatter=0, symlinked_dirs=0)"
+    )
 
 
 def test_grep_invalid_regex_exits_2(vault):
@@ -157,7 +160,7 @@ def test_grep_skips_symlinked_file_outside_vault(capsys, vault, tmp_path):
     assert rc == 0
     assert "link.md" not in out
     assert out.splitlines() == [str(vault / "claude-sessions" / "s1.md")]
-    assert "1 skipped" in err
+    assert "1 skipped (too_large=0, unreadable=0, outside_vault=1," in err
 
 
 def test_grep_rejects_symlinked_folder_outside_vault(capsys, vault, tmp_path):
@@ -179,9 +182,13 @@ def test_grep_does_not_descend_symlinked_subdir(capsys, vault, tmp_path):
     rc, out, err = _main(capsys, "grep", vault, "claude-sessions", "--pattern", "Redis")
     assert rc == 0
     assert "x.md" not in out
-    # Not descended at all, so not even counted as a skipped file. (The file
-    # containment check would also hide x.md; this tells the two guards apart.)
-    assert err.strip().endswith("1 file(s) scanned, 0 skipped")
+    # Not descended, and counted as a symlinked dir, not as an outside-vault
+    # file. (The file containment check would also hide x.md; the counter
+    # tells the two guards apart.)
+    assert err.strip().endswith(
+        "1 file(s) scanned, 1 skipped (too_large=0, unreadable=0, "
+        "outside_vault=0, bad_frontmatter=0, symlinked_dirs=1)"
+    )
 
 
 def test_grep_skips_oversized_file(capsys, vault, monkeypatch):
@@ -189,7 +196,7 @@ def test_grep_skips_oversized_file(capsys, vault, monkeypatch):
     rc, out, err = _main(capsys, "grep", vault, "claude-sessions", "--pattern", "Redis")
     assert rc == 0
     assert out == ""
-    assert "1 skipped" in err
+    assert "1 skipped (too_large=1, unreadable=0," in err
 
 
 def test_grep_skips_unreadable_file(capsys, vault, monkeypatch):
@@ -199,7 +206,7 @@ def test_grep_skips_unreadable_file(capsys, vault, monkeypatch):
     rc, out, err = _main(capsys, "grep", vault, "claude-sessions", "--pattern", "Redis")
     assert rc == 0
     assert out == ""
-    assert "0 file(s) scanned, 1 skipped" in err
+    assert "0 file(s) scanned, 1 skipped (too_large=0, unreadable=1," in err
 
 
 def test_grep_dedups_overlapping_folders(capsys, vault):
@@ -254,7 +261,12 @@ def test_frontmatter_only_skips_broken_fence(capsys, tmp_path):
                          "--frontmatter-only")
     assert rc == 0
     assert out.splitlines() == [str(v / "ins" / "ok.md")]
-    assert err.strip() == "vault_scan: 1 match(es), 1 file(s) scanned, 2 skipped"
+    # broken.md has a fence that does not close: skipped. nofm.md has no
+    # frontmatter at all: scanned (it simply cannot match), not skipped.
+    assert err.strip() == (
+        "vault_scan: 1 match(es), 2 file(s) scanned, 1 skipped "
+        "(too_large=0, unreadable=0, outside_vault=0, bad_frontmatter=1, symlinked_dirs=0)"
+    )
 
 
 def test_grep_unexpected_error_exits_1(capsys, vault, monkeypatch):
@@ -448,14 +460,18 @@ def test_parse_fields_shapes():
         "  - 'claude/b'\n",
         "nested:\n",
         "  inner: not-top-level\n",
-        "type: second-value-ignored\n",
+        "type: second-value-wins\n",
         "plain line without colon\n",
     ]
     fields = vault_scan._parse_fields(fm)
     assert fields["tags"] == ["claude/a", "claude/b"]
-    assert fields["type"] == "claude-insight"
+    # Last wins, like vault_index._parse_note_detailed (the index behind the
+    # Step 3 fast path), so the fast path and the fallback agree.
+    assert fields["type"] == "second-value-wins"
     assert "inner" not in fields
     assert vault_scan._parse_fields(["tags: claude/solo\n"])["tags"] == ["claude/solo"]
+    # An unclosed quote keeps the text, minus the stray quote.
+    assert vault_scan._scalar('"open # not a comment') == "open # not a comment"
 
 
 def test_grep_invalid_regex_in_process(capsys, vault):
@@ -480,3 +496,144 @@ def test_is_inside_handles_resolve_errors(monkeypatch, tmp_path):
         raise RuntimeError("symlink loop")
     monkeypatch.setattr(Path, "resolve", boom)
     assert vault_scan._is_inside(tmp_path / "x.md", tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# Review fix wave (#375, #312)
+# ---------------------------------------------------------------------------
+
+
+def test_pattern_equals_form_accepts_leading_dash(vault):
+    (vault / "claude-sessions" / "d.md").write_text(
+        _note("type: claude-session\n", "# D\n\nran the tool with --no-verify\n"))
+    r = _run("grep", vault, "claude-sessions", "--pattern=--no-verify")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == [str(vault / "claude-sessions" / "d.md")]
+    # Control: the space form is what broke; argparse reads the value as a flag.
+    r = _run("grep", vault, "claude-sessions", "--pattern", "--no-verify")
+    assert r.returncode == 2
+    assert "expected one argument" in r.stderr
+
+
+def test_import_failure_prints_error_not_traceback(tmp_path):
+    # vault_scan.py alone, without frontmatter.py / note_writer.py beside it.
+    lone = tmp_path / "lone"
+    lone.mkdir()
+    (lone / "vault_scan.py").write_text(VAULT_SCAN.read_text())
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    r = subprocess.run(
+        [sys.executable, str(lone / "vault_scan.py"), "grep", str(tmp_path), "x",
+         "--pattern=x"],
+        capture_output=True, text=True, timeout=60, cwd=str(tmp_path), env=env,
+    )
+    assert r.returncode == 1
+    assert r.stdout == ""
+    assert r.stderr.startswith("ERROR: cannot import vault_scan dependencies:"), r.stderr
+    assert "Traceback" not in r.stderr
+
+
+def test_skip_counter_outside_vault_and_bad_frontmatter(capsys, vault, tmp_path):
+    outside = tmp_path / "outside.md"
+    outside.write_text(_note("tags:\n  - claude/topic/x\n"))
+    (vault / "claude-sessions" / "link.md").symlink_to(outside)
+    (vault / "claude-sessions" / "broken.md").write_text("---\ntags:\n  - x\n# no fence\n")
+    rc, _, err = _main(capsys, "grep", vault, "claude-sessions", "--pattern", "zzz",
+                       "--frontmatter-only")
+    assert rc == 0
+    assert err.strip() == (
+        "vault_scan: 0 match(es), 1 file(s) scanned, 2 skipped "
+        "(too_large=0, unreadable=0, outside_vault=1, bad_frontmatter=1, symlinked_dirs=0)"
+    )
+
+
+def test_symlinked_dir_inside_vault_is_counted_once(capsys, vault):
+    # A symlinked subdir pointing back inside the vault is still not descended,
+    # and overlapping folder arguments do not count it twice.
+    (vault / "claude-insights" / "loop").symlink_to(vault / "claude-sessions",
+                                                    target_is_directory=True)
+    rc, out, err = _main(capsys, "grep", vault, "claude-insights", "claude-insights",
+                         "--pattern", "Redis")
+    assert rc == 0
+    assert out == ""
+    assert "symlinked_dirs=1)" in err
+    assert ", 1 skipped (" in err
+
+
+def _meta_row(capsys, tmp_path, fm, body="# T\n\nb\n"):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True, exist_ok=True)
+    note = v / "ins" / "n.md"
+    note.write_text(_note(fm, body))
+    rc, out, err = _main(capsys, "meta", v, note)
+    assert rc == 0
+    return json.loads(out), err
+
+
+def test_meta_strips_inline_comment_from_unquoted_scalars(capsys, tmp_path):
+    row, _ = _meta_row(capsys, tmp_path, (
+        "date: 2026-01-01 # written by hand\n"
+        'project: "has # inside"\n'
+        "session_id: 'a # b' # trailing\n"
+        "type: claude-insight#not-a-comment\n"
+        "source_session_note: # only a comment\n"
+        "tags:\n  - claude/a # why\n"
+    ))
+    assert row["date"] == "2026-01-01"
+    assert row["project"] == "has # inside"
+    assert row["session_id"] == "a # b"
+    assert row["type"] == "claude-insight#not-a-comment"
+    assert row["tags"] == ["claude/a"]
+    assert row["source_session_note"] is None
+
+
+def test_meta_flow_tags_are_quote_aware(capsys, tmp_path):
+    row, _ = _meta_row(capsys, tmp_path, "tags: [a, \"b, c\", 'd,e', f] # note\n")
+    assert row["tags"] == ["a", "b, c", "d,e", "f"]
+    row, _ = _meta_row(capsys, tmp_path, "tags: [a, \"b #c\"]\n")
+    assert row["tags"] == ["a", "b #c"]
+    row, _ = _meta_row(capsys, tmp_path, "tags: []\n")
+    assert row["tags"] == []
+
+
+def test_meta_warns_once_when_obsidian_utils_missing(capsys, vault, monkeypatch):
+    monkeypatch.setitem(sys.modules, "obsidian_utils", None)  # import -> ImportError
+    monkeypatch.setattr(vault_scan, "_UTILS_WARNED", False)
+    for name in ("b1.md", "b2.md"):
+        (vault / "claude-sessions" / name).write_text("---\ntype: x\nprose line\n")
+    rc, out, err = _main(capsys, "meta", vault, vault / "claude-sessions" / "b1.md",
+                         vault / "claude-sessions" / "b2.md")
+    assert rc == 0
+    rows = [json.loads(line) for line in out.splitlines()]
+    assert [r["error"] for r in rows] == ["unparsable frontmatter: unknown"] * 2
+    assert err.count("vault_scan: obsidian_utils unavailable: ") == 1
+
+
+def test_meta_parse_failure_bug_is_not_swallowed(monkeypatch):
+    # Only ImportError degrades; a bug inside the categorizer still surfaces.
+    import obsidian_utils
+
+    def boom(_reason):
+        raise ValueError("bug")
+    monkeypatch.setattr(obsidian_utils, "_describe_note_parse_failure", boom)
+    with pytest.raises(ValueError):
+        vault_scan._describe_parse_failure("x")
+
+    # An import that fails with something other than ImportError is a bug too.
+    class _Broken:
+        def __getattr__(self, name):
+            raise RuntimeError("broken module")
+    monkeypatch.setitem(sys.modules, "obsidian_utils", _Broken())
+    with pytest.raises(RuntimeError):
+        vault_scan._describe_parse_failure("x")
+
+
+def test_meta_duplicate_keys_last_wins(capsys, tmp_path):
+    row, _ = _meta_row(capsys, tmp_path, "type: claude-session\ntype: claude-insight\n")
+    assert row["type"] == "claude-insight"
+
+
+def test_meta_title_skips_h2_before_h1(capsys, tmp_path):
+    row, _ = _meta_row(capsys, tmp_path, "type: claude-insight\n",
+                       "## Context\n\ntext\n\n# Real Title\n")
+    assert row["title"] == "Real Title"

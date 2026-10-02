@@ -8,23 +8,29 @@ Two commands:
   which the Grep tool cannot do (#312).
 - ``meta``: print the frontmatter fields the skills rank and display by, as
   JSON Lines. It replaces fixed ``Read(limit=40)`` reads, which silently drop
-  fields in notes whose frontmatter runs past line 400 (/emerge and /standup
-  notes close their fence as deep as line 460).
+  fields: frontmatter can run past line 40, and /emerge notes close their
+  fence as deep as line 461 (/standup notes as deep as line 272).
 
 Usage::
 
-    python3 vault_scan.py grep <vault> <folder> [<folder> ...] --pattern <regex>
+    python3 vault_scan.py grep <vault> <folder> [<folder> ...] --pattern=<regex>
                           [--ignore-case] [--frontmatter-only]
     python3 vault_scan.py meta <vault> <file> [<file> ...]
 
 ``grep`` matches one line at a time, like ripgrep behind the Grep tool, so
-``^key:.*value`` anchors per line and a pattern never spans two lines. Stdout
-is the sorted list of matching paths. Stderr always carries one summary line
-(``vault_scan: N match(es), M file(s) scanned, K skipped``), so an empty
-stdout is never ambiguous.
+``^key:.*value`` anchors per line and a pattern never spans two lines. Use the
+``--pattern=<regex>`` form: with a space, a pattern that starts with ``-`` is
+read as a flag. Stdout is the sorted list of matching paths. On success
+(exit 0) stderr carries one summary line, ``vault_scan: N match(es), M file(s)
+scanned, K skipped (too_large=a, unreadable=b, outside_vault=c,
+bad_frontmatter=d, symlinked_dirs=e)``, so an empty stdout is never
+ambiguous. K is the sum of the five counters. Under ``--frontmatter-only`` a
+note with no frontmatter at all is scanned (it cannot match), not skipped;
+only a fence that does not close counts as ``bad_frontmatter``.
 
-Exit codes: 0 on success (with or without matches), 2 for bad arguments
-(``ERROR: <reason>`` on stderr), 1 for an unexpected error.
+Exit codes: 0 on success (with or without matches); 2 for bad arguments and
+1 for an unexpected error or a missing dependency module. On exit 2 or 1,
+stderr carries only an ``ERROR: <reason>`` line and there is no summary line.
 
 Read-only. Every file is checked with ``resolve()`` + ``is_relative_to()``
 against the resolved vault root, so a symlink cannot pull in a file from
@@ -39,12 +45,20 @@ import re
 import sys
 from pathlib import Path
 
-from frontmatter import split_frontmatter, split_lines_lf_crlf
-from note_writer import _validate_folder, _validate_vault_path
+try:
+    from frontmatter import NO_OPENING_FENCE_REASON, split_frontmatter, split_lines_lf_crlf
+    from note_writer import _validate_folder, _validate_vault_path
+except ImportError as _exc:  # reported by main() as ERROR:, exit 1
+    _IMPORT_ERROR: ImportError | None = _exc
+else:
+    _IMPORT_ERROR = None
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 SNIPPET_CHARS = 200
 META_FIELDS = ("date", "type", "project", "session_id", "source_session_note")
+SKIP_KINDS = ("too_large", "unreadable", "outside_vault", "bad_frontmatter",
+              "symlinked_dirs")
+_UTILS_WARNED = False
 
 
 class _UsageError(Exception):
@@ -107,17 +121,25 @@ def _folder_dirs(vault: str, root: Path, folders: list[str]) -> list[Path]:
     return dirs
 
 
-def _iter_md(folder: Path):
-    # followlinks=False: a symlinked subdirectory is never descended.
+def _iter_md(folder: Path, symlinked_dirs: set[str]):
+    # followlinks=False: a symlinked subdirectory is never descended. Each one
+    # is recorded in ``symlinked_dirs`` so the summary can count it.
     for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
         dirnames.sort()
+        for name in dirnames:
+            sub = os.path.join(dirpath, name)
+            if os.path.islink(sub):
+                symlinked_dirs.add(os.path.normpath(sub))
         for name in sorted(filenames):
             if name.endswith(".md"):
                 yield Path(dirpath) / name
 
 
 def _frontmatter_lines(text: str):
+    """Frontmatter lines; ``[]`` when there is none; None when the fence is broken."""
     _open, fm, _close, _body, err = split_frontmatter(split_lines_lf_crlf(text))
+    if err == NO_OPENING_FENCE_REASON:
+        return []
     return None if err else fm
 
 
@@ -127,41 +149,94 @@ def _line_matches(regex: re.Pattern, lines) -> bool:
 
 def grep_files(vault: str, folders: list[str], regex: re.Pattern,
                frontmatter_only: bool = False):
-    """Return ``(matches, scanned, skipped)``; ``matches`` is sorted."""
+    """Return ``(matches, scanned, skipped)``.
+
+    ``matches`` is sorted. ``skipped`` maps each name in ``SKIP_KINDS`` to a
+    count; ``symlinked_dirs`` counts subdirectories that were not descended.
+    """
     root = _check_vault(vault)
     dirs = _folder_dirs(vault, root, folders)
     seen: set[str] = set()
+    symlinked_dirs: set[str] = set()
     matches: list[str] = []
-    scanned = skipped = 0
+    scanned = 0
+    skipped = dict.fromkeys(SKIP_KINDS, 0)
     for d in dirs:
-        for path in _iter_md(d):
+        for path in _iter_md(d, symlinked_dirs):
             key = os.path.normpath(str(path))
             if key in seen:
                 continue
             seen.add(key)
+            if not _is_inside(path, root):
+                skipped["outside_vault"] += 1
+                continue
             try:
-                if not _is_inside(path, root) or path.stat().st_size > MAX_FILE_BYTES:
-                    skipped += 1
+                if path.stat().st_size > MAX_FILE_BYTES:
+                    skipped["too_large"] += 1
                     continue
                 text = _read_text(path)
             except OSError:
-                skipped += 1
+                skipped["unreadable"] += 1
                 continue
             if frontmatter_only:
                 lines = _frontmatter_lines(text)
                 if lines is None:
-                    skipped += 1
+                    skipped["bad_frontmatter"] += 1
                     continue
             else:
                 lines = split_lines_lf_crlf(text)
             scanned += 1
             if _line_matches(regex, lines):
                 matches.append(key)
+    skipped["symlinked_dirs"] = len(symlinked_dirs)
     return sorted(matches), scanned, skipped
 
 
+_COMMENT_RE = re.compile(r"\s+#.*$")
+
+
+def _scalar(val: str) -> str:
+    """A YAML scalar: a quoted value keeps everything inside its quotes; an
+    unquoted value loses a trailing `` # comment``."""
+    val = val.strip()
+    if val[:1] in ("'", '"'):
+        end = val.find(val[0], 1)
+        if end != -1:
+            return val[1:end]
+        return val.strip("\"'")
+    if val.startswith("#"):
+        return ""
+    return _COMMENT_RE.sub("", val)
+
+
+def _flow_items(inner: str) -> list[str]:
+    """Split the inside of a ``[a, "b, c"]`` flow list on commas outside quotes."""
+    items: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    for ch in inner:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+        elif ch == ",":
+            items.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    items.append("".join(buf))
+    return [_scalar(t) for t in items if t.strip()]
+
+
 def _parse_fields(fm_lines: list[str]) -> dict:
-    """Top-level ``key: value`` scalars plus ``tags`` (block or flow list)."""
+    """Top-level ``key: value`` scalars plus ``tags`` (block or flow list).
+
+    A repeated key: the last value wins, as in vault_index._parse_note_detailed,
+    the index behind the skills' FTS fast path.
+    """
     meta: dict = {}
     tags: list[str] = []
     in_tags = False
@@ -169,7 +244,7 @@ def _parse_fields(fm_lines: list[str]) -> dict:
         line = raw.rstrip("\r\n")
         stripped = line.strip()
         if in_tags and stripped.startswith("- "):
-            tags.append(stripped[2:].strip().strip("\"'"))
+            tags.append(_scalar(stripped[2:]))
             continue
         if in_tags and not stripped:
             continue
@@ -179,16 +254,18 @@ def _parse_fields(fm_lines: list[str]) -> dict:
         key, _, val = stripped.partition(":")
         key, val = key.strip(), val.strip()
         if key == "tags":
-            if val.startswith("[") and val.endswith("]"):
-                tags.extend(
-                    t.strip().strip("\"'") for t in val[1:-1].split(",") if t.strip()
-                )
-            elif val:
-                tags.append(val.strip("\"'"))
+            close = val.rfind("]")
+            tail = val[close + 1:].strip() if close != -1 else ""
+            if val.startswith("[") and close != -1 and (not tail or tail.startswith("#")):
+                tags.extend(_flow_items(val[1:close]))
+                continue
+            val = _scalar(val)
+            if val:
+                tags.append(val)
             else:
                 in_tags = True
             continue
-        meta.setdefault(key, val.strip("\"'"))
+        meta[key] = _scalar(val)
     meta["tags"] = tags
     return meta
 
@@ -202,11 +279,15 @@ def _empty_row(path: str, error: str | None) -> dict:
 
 def _describe_parse_failure(reason: str) -> str:
     # Content-free category only: the raw reason can quote note text.
+    global _UTILS_WARNED
     try:
         from obsidian_utils import _describe_note_parse_failure
-        return _describe_note_parse_failure(reason)
-    except Exception:  # pragma: no cover - degraded import
+    except ImportError as exc:
+        if not _UTILS_WARNED:
+            _UTILS_WARNED = True
+            print(f"vault_scan: obsidian_utils unavailable: {exc}", file=sys.stderr)
         return "unknown"
+    return _describe_note_parse_failure(reason)
 
 
 def note_meta(vault_root: Path, vault: str, file_arg: str) -> dict:
@@ -256,8 +337,10 @@ def _run_grep(args) -> int:
     )
     for m in matches:
         print(m)
+    breakdown = ", ".join(f"{k}={skipped[k]}" for k in SKIP_KINDS)
     print(
-        f"vault_scan: {len(matches)} match(es), {scanned} file(s) scanned, {skipped} skipped",
+        f"vault_scan: {len(matches)} match(es), {scanned} file(s) scanned, "
+        f"{sum(skipped.values())} skipped ({breakdown})",
         file=sys.stderr,
     )
     return 0
@@ -276,6 +359,10 @@ def main(argv: list[str] | None = None) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
+    if _IMPORT_ERROR is not None:
+        print(f"ERROR: cannot import vault_scan dependencies: {_IMPORT_ERROR}",
+              file=sys.stderr)
+        return 1
     parser = _build_parser()
     try:
         args = parser.parse_args(argv)

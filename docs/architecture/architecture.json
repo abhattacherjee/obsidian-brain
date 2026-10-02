@@ -384,7 +384,7 @@
           "files": [
             "hooks/vault_scan.py"
           ],
-          "purpose": "Read-only CLI for /vault-ask and /vault-search (#375, #312). grep lists the *.md files under one or more vault folders that match a regex, one line at a time like the ripgrep behind the Grep tool; it is the fallback when a session has no Grep tool, and with --frontmatter-only it searches only the frontmatter block, which the Grep tool cannot do. Stdout is the sorted path list; stderr always ends with 'vault_scan: N match(es), M file(s) scanned, K skipped'. meta prints date, type, project, session_id, source_session_note, tags, title, snippet and error per file as JSON Lines, parsing the whole frontmatter via split_frontmatter() instead of a fixed Read(limit=40) that dropped fields in notes whose fence closes as deep as line 460. Reuses note_writer's _validate_vault_path/_validate_folder, checks every file with resolve() + is_relative_to() against the vault, never descends a symlinked folder, skips files over 5 MB, and reports a parse failure as a content-free category. Exit 0 on success, 2 for bad arguments (ERROR: on stderr), 1 for an unexpected error."
+          "purpose": "Read-only CLI for /vault-ask and /vault-search (#375, #312). grep lists the *.md files under one or more vault folders that match a regex. It matches one line at a time, like the ripgrep behind the Grep tool. It is the fallback when a session has no Grep tool. With --frontmatter-only it searches only the frontmatter block, which the Grep tool cannot do. Skills pass the pattern as --pattern=<regex>, so a pattern that starts with '-' is not read as a flag. Stdout is the sorted path list. On success (exit 0), stderr ends with 'vault_scan: N match(es), M file(s) scanned, K skipped (too_large=a, unreadable=b, outside_vault=c, bad_frontmatter=d, symlinked_dirs=e)'. meta prints date, type, project, session_id, source_session_note, tags, title, snippet and error per file as JSON Lines. It parses the whole frontmatter with split_frontmatter(). The fixed Read(limit=40) it replaces dropped fields: frontmatter can run past line 40, and /emerge fences close as deep as line 461. It reuses note_writer's _validate_vault_path/_validate_folder. It checks every file with resolve() + is_relative_to() against the vault. It never descends a symlinked subfolder, and counts each one it skips. It skips files over 5 MB. It reports a parse failure as a content-free category. Exit 0 on success, 2 for bad arguments, 1 for an unexpected error or a missing dependency module; on 2 or 1 stderr has only an ERROR: line."
         },
         {
           "id": "plugin-install-divergence",
@@ -438,7 +438,7 @@
           "files": [
             "hooks/vault_index.py"
           ],
-          "purpose": "Weighted sum: proximity 0.25, bm25 0.20, activation 0.20, type 0.10, recency 0.10, importance 0.10, density 0.05. Type score is context-adaptive (debugging/standup/emerge/search/general). Every note type a writer emits has an explicit weight in every context (tests/test_type_scores.py scans hooks/, skills/ and templates/ for them, #376); a missing type would fall back to 0.5. claude-stats and claude-check-items-report score 0.0, and claude-emerge scores 0.0 in the emerge context."
+          "purpose": "Weighted sum: proximity 0.25, bm25 0.20, activation 0.20, type 0.10, recency 0.10, importance 0.10, density 0.05. Type score has a column per context (debugging/standup/emerge/search/general). Only the general column is used in production today: search_vault picks another context only when a caller passes caller=, and no caller does. Every note type a writer emits has an explicit weight in every context (tests/test_type_scores.py scans hooks/, scripts/, skills/ and templates/ for them, #376); a missing type would fall back to 0.5. claude-stats and claude-check-items-report score 0.0, and claude-emerge scores 0.0 in the emerge context. 0.0 is a down-weight, not an exclusion: it lowers the final score by at most 0.05 against the 0.5 default."
         },
         {
           "id": "access-log",
@@ -1715,7 +1715,7 @@
         {
           "from": "vault-scan-cli",
           "to": "frontmatter-splitter",
-          "label": "split_frontmatter() over the whole block (fences seen at line 460)"
+          "label": "split_frontmatter() over the whole block (fences seen at line 461)"
         },
         {
           "from": "vault-scan-cli",

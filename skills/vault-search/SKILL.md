@@ -72,8 +72,8 @@ The user provides a query after `/vault-search`. Determine the search mode:
 **Tag mode** — query starts with `#` (e.g. `#claude/topic/auth`):
 - Strip the leading `#`
 - The search target is frontmatter `tags` fields
-- Pattern: the tag string as a literal grep pattern
-- Search only the frontmatter, not the body. Step 4 does this with `vault_scan.py grep --frontmatter-only`, because the Grep tool cannot limit a search to frontmatter and the `tags:` block can sit past line 400 (/emerge and /standup notes close their fence as deep as line 460)
+- Pattern: the tag string, used as a regex (escape `.`, `+` and other regex characters)
+- Search only the frontmatter, not the body. Step 4 does this with `vault_scan.py grep --frontmatter-only`, because the Grep tool cannot limit a search to frontmatter and the `tags:` block can sit past line 40 (/emerge notes close their fence as deep as line 461)
 
 **Structured mode** — query contains `key:value` pairs (e.g. `project:api-service type:decision`):
 - Parse each `key:value` pair
@@ -129,10 +129,10 @@ If the output is `[]` or the command fails: print a note that the vault index re
 
 ### Step 4 — Search both folders in parallel
 
-Use the Grep tool (never Bash grep) for structured and keyword searches. Tag mode uses `vault_scan.py` instead (see below). Launch searches across both `SESSIONS_DIR` and `INSIGHTS_DIR` in parallel.
+Use the Grep tool (never Bash grep) for structured and keyword searches. Tag mode uses `vault_scan.py` instead (see below). If the Grep tool is not in your tool list, go straight to vault_scan.py grep — do not call Grep first. See the fallback below. Launch searches across both `SESSIONS_DIR` and `INSIGHTS_DIR` in parallel.
 
 **For tag mode:**
-Run one `vault_scan.py grep --frontmatter-only` call over both folders (not the Grep tool). It searches only each note's frontmatter, however long, and skips notes whose frontmatter does not parse (counted in the stderr summary line). Stdout is one matching path per line; an empty stdout means no match. A line starting `ERROR:` means the call failed: show it to the user and stop. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+Run one `vault_scan.py grep --frontmatter-only` call over both folders (not the Grep tool). It searches only each note's frontmatter, however long. A note with no frontmatter cannot match; a note whose frontmatter fence does not close is skipped and counted as `bad_frontmatter` in the stderr summary line. Stdout is one matching path per line. Always write `--pattern=` with the equals sign: with a space, a term that starts with `-` (such as `--no-verify`) is read as a flag and the call fails. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`. The success check below applies to this call too.
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -157,7 +157,7 @@ def _ob_hooks():
 print(_ob_hooks())
 ")
 test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' --pattern '<tag>' --frontmatter-only
+python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' --pattern='<tag>' --frontmatter-only
 ```
 
 **For structured mode:**
@@ -173,7 +173,9 @@ Run two parallel Grep calls:
 
 If zero results and query has multiple words, retry by grepping each word separately and intersecting the file lists.
 
-**If the Grep tool is not available in this session** (structured and keyword mode), run each search above with `vault_scan.py grep` instead (#375): one call per pattern, both folder names as arguments, `--ignore-case` for `-i=true`. Use stdout as the file list and intersect exactly as above. Stderr always ends with a `vault_scan: N match(es), M file(s) scanned, K skipped` line, so an empty stdout means no match, not a failure. A line starting `ERROR:` means the call failed: show it to the user and stop. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+**If the Grep tool is not available in this session** (structured and keyword mode), run each search above with `vault_scan.py grep` instead (#375): one call per pattern, both folder names as arguments, `--pattern='<pattern>'`, `--ignore-case` for `-i=true`. Use stdout as the file list and intersect exactly as above. Always write `--pattern=` with the equals sign: with a space, a term that starts with `-` (such as `--no-verify`) is read as a flag and the call fails. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+
+Check each call before you use its output. It succeeded only if it exited 0 and stderr has the `vault_scan: N match(es), M file(s) scanned, K skipped (...)` summary line; then stdout is the file list, and an empty stdout means no match. Anything else is a failure, not "no match": show the `ERROR:` line (or the whole stderr if there is none) to the user and stop. If K is more than 0, add this line to what you show the user: "K note(s) were not searched (see the breakdown) — run /vault-doctor".
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -198,14 +200,14 @@ def _ob_hooks():
 print(_ob_hooks())
 ")
 test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' --pattern '<pattern>' --ignore-case
+python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' --pattern='<pattern>' --ignore-case
 ```
 
 ### Step 5 — Extract metadata from matches
 
 If there are more than 20 matched files, sort by filename (which contains the date in YYYY-MM-DD format) descending and keep only the 20 most recent.
 
-Read the metadata of all kept files with one `vault_scan.py meta` call (one quoted path per file). Do not use a fixed-line `Read`: frontmatter can run past line 400, so a fixed line limit silently drops fields. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+Read the metadata of all kept files with one `vault_scan.py meta` call (one quoted path per file). Do not use a fixed-line `Read`: frontmatter can run past line 40 (/emerge notes close their fence as deep as line 461), so a fixed line limit silently drops fields. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -233,7 +235,7 @@ test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $
 python3 "$HOOKS/vault_scan.py" meta '<vault_path>' '<file_1>' '<file_2>'
 ```
 
-It prints one JSON object per file, one per line. Take these fields from it:
+It prints one JSON object per file, one per line. The call succeeded only if it exited 0 and printed one JSON row per file you passed. Otherwise show the `ERROR:` line (or the whole stderr) to the user and stop. A `vault_scan: obsidian_utils unavailable: ...` line on stderr is a warning, not a failure. Take these fields from it:
 
 - **date** — the `date:` field
 - **type** — the `type:` field (e.g. `claude-session`, `claude-insight`, `claude-decision`, `claude-error-fix`, `claude-snapshot`)
@@ -243,7 +245,7 @@ It prints one JSON object per file, one per line. Take these fields from it:
 - **title** — the first `# ` heading, or the filename without extension
 - **snippet** — the first 200 characters of the body after the frontmatter, with whitespace collapsed
 
-A missing field is `null`. If a row has a non-null `error` (for example `unparsable frontmatter: no_closing_fence`), still list the file, using its filename as the title and `note` as its type.
+A missing `date`, `type`, `project`, `session_id` or `source_session_note` is `null`; missing or empty `tags` is `[]`; `title` falls back to the filename. If a row has a non-null `error` (for example `unparsable frontmatter: no_closing_fence`), still list the file, using its filename as the title and `note` as its type.
 
 ### Step 5b — Augment session hits with snapshot data
 
