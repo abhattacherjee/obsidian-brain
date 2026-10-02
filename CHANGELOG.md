@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `/retro` runs its save steps (5 to 8) inline in the main session and never in a subagent. Step 8 now confirms with the path `note_writer.py` printed and an `ls -l` of it, and prints no "saved" message without that check (#384).
+
 ### Docs
 - Design spec for the rerank eval: citation log, seed eval set and a 4-backend harness (current, Haiku, Jev, laya) before any ranking change (#377).
 

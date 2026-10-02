@@ -299,6 +299,10 @@ Draft the note body using this exact structure:
 
 **Important:** "What Didn't Work" should have MORE items than "What Went Well." If the session went smoothly with no obvious failures, still find at least one improvement opportunity — there is always something.
 
+### Steps 5 to 8 run inline
+
+Steps 5 to 8 (session ID, preview, write, classification, confirm) save the note. Run them yourself, inline in the main session. They **must not** be delegated to a subagent or the Agent tool. A subagent's write is invisible to this transcript: when one did the save, the session ended with no proof the note existed (#384). Analysis in Steps 1 to 4 may use helpers; the save may not.
+
 ### Step 5 — Derive session ID and backlinks
 
 The Step 3a bundle already carries the cached session context as `bundle["_ctx"]`. Read these fields directly:
@@ -426,7 +430,7 @@ type: claude-retro
 OB_NOTE_EOF_<eof4>
 ```
 
-On success this prints `OK: <absolute path>` — that is the file at `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here (do not proceed to arming the classification gate below on a failed write).
+On success this prints `OK: <absolute path>`. Keep that absolute path, exactly as printed, as `NOTE_PATH` — Step 8 confirms against it, not against a path rebuilt from config. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here (do not proceed to arming the classification gate below on a failed write).
 
 If the error is `note already exists`, the 4-hex filename hash collided with a note written in the same second. Regenerate the hash (Step 7's command), rebuild the filename, and retry the write **once**. If it fails again for any reason, surface the error and stop — do not loop.
 
@@ -507,10 +511,19 @@ The retro is **not done** when the file is written. The literal next action afte
 
 ### Step 8 — Confirm
 
-Print:
+First prove the note exists. Run this in the main session, with `NOTE_PATH` set to the path `note_writer.py` printed after `OK:` in Step 7:
+
+```bash
+ls -l "$NOTE_PATH"
+```
+
+If `ls` fails, or Step 7 never printed an `OK:` line, the note was not saved. Say so, show the error, and do **not** print the confirmation below. Never print "saved" without this check.
+
+Otherwise print:
 
 > **Retrospective saved!**
-> - File: `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`
+> - File: `$NOTE_PATH` (the path from note_writer's `OK:` line)
+> - Exists: `<the ls -l output line>`
 > - Tags: `claude/retro`, `claude/project/<name>`
 > - Filed from Process Improvements / Key Learnings: `<N>` GH issue(s), `<M>` memory entr(ies) (or "none — no actionable items")
 > - Open in Obsidian to review and track process improvements over time.
