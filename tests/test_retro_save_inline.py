@@ -24,9 +24,8 @@ def _section(text, heading):
 def test_save_steps_must_run_inline():
     text = SKILL_PATH.read_text(encoding="utf-8")
     body = _section(text, "Steps 5 to 8 run inline")
-    assert "main session" in body
-    assert "subagent" in body
-    assert "must not" in body.lower()
+    assert "inline in the main session" in body
+    assert "**must not** be delegated to a subagent" in body
 
 
 def test_inline_rule_precedes_step_5():
@@ -40,13 +39,22 @@ def test_step_7_keeps_the_path_note_writer_printed():
     body = _section(
         SKILL_PATH.read_text(encoding="utf-8"), "Step 7 — Generate filename and write"
     )
-    assert "NOTE_PATH" in body
+    assert "<NOTE_PATH>" in body
+    # The gate is armed with the returned path, not one rebuilt from config.
+    assert '"<current-session-id>" "<NOTE_PATH>"' in body
+    assert "$VAULT_PATH/$INSIGHTS_FOLDER/<filename>" not in body
 
 
-def test_step_8_confirms_with_returned_path_and_existence_check():
+def test_note_path_is_never_a_shell_variable():
+    # Shell state does not persist between Bash calls, so "$NOTE_PATH" would
+    # expand to an empty string and ls -l would fail on a good save.
+    assert "$NOTE_PATH" not in SKILL_PATH.read_text(encoding="utf-8")
+
+
+def test_step_8_checks_existence_before_saying_saved():
     body = _section(SKILL_PATH.read_text(encoding="utf-8"), "Step 8 — Confirm")
-    assert 'ls -l "$NOTE_PATH"' in body
-    assert "`$NOTE_PATH`" in body
-    # The old confirmation rebuilt the path from config instead of using
-    # the one note_writer returned.
+    assert 'ls -l "<NOTE_PATH>"' in body
+    assert "`<NOTE_PATH>`" in body
+    assert 'Never print "saved" without this check' in body
+    assert body.index('ls -l "<NOTE_PATH>"') < body.index("Retrospective saved!")
     assert "$VAULT_PATH/$INSIGHTS_FOLDER/<filename>" not in body
