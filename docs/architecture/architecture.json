@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.6.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-09-28",
+  "lastUpdated": "2026-10-02",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -378,6 +378,15 @@
           "purpose": "CLI backing deterministic vault note persistence for skills (#269): two subcommands, both reading note content from stdin (1 MB cap) and validating path safety before any filesystem side effect. write validates folder/filename (rejects absolute/home/'..'/dot-segment paths and non-bare-.md filenames, e.g. blocking a write into .obsidian/plugins/**) then delegates the write itself entirely to write_vault_note() for the atomic mkstemp+chmod 0600+rename. append-update (used by /compress's update-existing path) resolves and validates an EXISTING note path (containment + dot-segment reject + must-already-exist), then applies the update-text insertion (before the first trailing marker like '## Tool Usage'), an optional last_updated bump, and an optional tag merge (block- or flow-style tags:) in ONE atomic rewrite — never touching date/source_session/source_session_note/type, and preserving the note's own CRLF/LF line ending for every line it adds. Invoked via subprocess by 7 SKILL.md files (compress, decide, error-log, retro, standup, vault-import, vault-stats) instead of a Write tool call, so note persistence no longer depends on a context-blind helper sub-agent choosing to save. Both subcommands also validate the CONTENT they are handed, not just their arguments: empty/whitespace-only stdin, a note body without a '---' frontmatter fence pair, oversize stdin (rejected, never truncated), an empty or non-YYYY-MM-DD --last-updated, and a tag containing whitespace/':'/'#'/quotes (which would inject a frontmatter key or break tag indexing) are all ERROR + exit 1 with no filesystem side effect. write additionally refuses to replace an existing note unless --overwrite is passed (only /standup's in-place session-note upgrade passes it), restoring the collision loudness the Write tool used to provide."
         },
         {
+          "id": "vault-scan-cli",
+          "name": "vault_scan.py",
+          "kind": "module",
+          "files": [
+            "hooks/vault_scan.py"
+          ],
+          "purpose": "Read-only CLI for /vault-ask and /vault-search (#375, #312). grep lists the *.md files under one or more vault folders that match a regex, one line at a time like the ripgrep behind the Grep tool; it is the fallback when a session has no Grep tool, and with --frontmatter-only it searches only the frontmatter block, which the Grep tool cannot do. Stdout is the sorted path list; stderr always ends with 'vault_scan: N match(es), M file(s) scanned, K skipped'. meta prints date, type, project, session_id, source_session_note, tags, title, snippet and error per file as JSON Lines, parsing the whole frontmatter via split_frontmatter() instead of a fixed Read(limit=40) that dropped fields in notes whose fence closes as deep as line 460. Reuses note_writer's _validate_vault_path/_validate_folder, checks every file with resolve() + is_relative_to() against the vault, never descends a symlinked folder, skips files over 5 MB, and reports a parse failure as a content-free category. Exit 0 on success, 2 for bad arguments (ERROR: on stderr), 1 for an unexpected error."
+        },
+        {
           "id": "plugin-install-divergence",
           "name": "describe_plugin_install_divergence() / _read_plugin_version()",
           "kind": "function",
@@ -429,7 +438,7 @@
           "files": [
             "hooks/vault_index.py"
           ],
-          "purpose": "Weighted sum: proximity 0.25, bm25 0.20, activation 0.20, type 0.10, recency 0.10, importance 0.10, density 0.05. Type score is context-adaptive (debugging/standup/emerge/search/general)."
+          "purpose": "Weighted sum: proximity 0.25, bm25 0.20, activation 0.20, type 0.10, recency 0.10, importance 0.10, density 0.05. Type score is context-adaptive (debugging/standup/emerge/search/general). Every note type a writer emits has an explicit weight in every context (tests/test_type_scores.py scans hooks/, skills/ and templates/ for them, #376); a missing type would fall back to 0.5. claude-stats and claude-check-items-report score 0.0, and claude-emerge scores 0.0 in the emerge context."
         },
         {
           "id": "access-log",
@@ -816,7 +825,7 @@
           "files": [
             "skills/vault-ask/SKILL.md"
           ],
-          "purpose": "RECALL. Synthesized, source-cited answer grounded in vault notes; FTS fast-path + 3 parallel Grep agents + per-file context-shield sub-agents + snapshot summaries."
+          "purpose": "RECALL. Synthesized, source-cited answer grounded in vault notes; FTS fast-path + 3 parallel Grep agents (vault_scan.py grep when the Grep tool is missing) + vault_scan.py meta for type/date ranking + per-file context-shield sub-agents + snapshot summaries."
         },
         {
           "id": "sk-vault-search",
@@ -825,7 +834,7 @@
           "files": [
             "skills/vault-search/SKILL.md"
           ],
-          "purpose": "RECALL. Ranked keyword/tag/structured search with snippets and snapshot markers via ensure_index + search_vault."
+          "purpose": "RECALL. Ranked keyword/tag/structured search with snippets and snapshot markers via ensure_index + search_vault; Grep fallback, tag mode (frontmatter-only) and Step 5 metadata go through vault_scan.py."
         },
         {
           "id": "sk-standup",
@@ -1682,6 +1691,38 @@
           "label": "AST guard: no live-DB pollution in tests"
         }
       ]
+    },
+    {
+      "id": "vault-scan-fallback",
+      "name": "Grep fallback & full-frontmatter metadata",
+      "description": "/vault-ask and /vault-search read note metadata and, when the Grep tool is missing, search the vault through vault_scan.py instead of fixed-line Reads (#375, #312).",
+      "steps": [
+        {
+          "from": "sk-vault-ask",
+          "to": "vault-scan-cli",
+          "label": "Step 4 grep fallback; Step 5 meta for type/date"
+        },
+        {
+          "from": "sk-vault-search",
+          "to": "vault-scan-cli",
+          "label": "tag mode grep --frontmatter-only; Grep fallback; Step 5 meta"
+        },
+        {
+          "from": "vault-scan-cli",
+          "to": "note-writer-cli",
+          "label": "reuse _validate_vault_path/_validate_folder"
+        },
+        {
+          "from": "vault-scan-cli",
+          "to": "frontmatter-splitter",
+          "label": "split_frontmatter() over the whole block (fences seen at line 460)"
+        },
+        {
+          "from": "vault-scan-cli",
+          "to": "db-vault",
+          "label": "read-only walk, resolve() + is_relative_to() containment"
+        }
+      ]
     }
   ],
   "types": [
@@ -1996,7 +2037,7 @@
   "testing": {
     "unitSuite": {
       "tool": "pytest",
-      "fileCount": 99,
+      "fileCount": 103,
       "duration": "fast (stdlib, no network)",
       "environments": {
         "python": "3.12",
