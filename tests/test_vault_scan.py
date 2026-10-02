@@ -113,7 +113,7 @@ def test_grep_zero_matches_still_prints_summary(capsys, vault):
     assert out == ""
     assert err.strip() == (
         "vault_scan: 0 match(es), 1 file(s) scanned, 0 skipped "
-        "(too_large=0, unreadable=0, outside_vault=0, bad_frontmatter=0, symlinked_dirs=0)"
+        "(too_large=0, unreadable=0, outside_vault=0, bad_frontmatter=0, symlinked_dirs=0, unreadable_dirs=0)"
     )
 
 
@@ -187,7 +187,7 @@ def test_grep_does_not_descend_symlinked_subdir(capsys, vault, tmp_path):
     # tells the two guards apart.)
     assert err.strip().endswith(
         "1 file(s) scanned, 1 skipped (too_large=0, unreadable=0, "
-        "outside_vault=0, bad_frontmatter=0, symlinked_dirs=1)"
+        "outside_vault=0, bad_frontmatter=0, symlinked_dirs=1, unreadable_dirs=0)"
     )
 
 
@@ -265,7 +265,7 @@ def test_frontmatter_only_skips_broken_fence(capsys, tmp_path):
     # frontmatter at all: scanned (it simply cannot match), not skipped.
     assert err.strip() == (
         "vault_scan: 1 match(es), 2 file(s) scanned, 1 skipped "
-        "(too_large=0, unreadable=0, outside_vault=0, bad_frontmatter=1, symlinked_dirs=0)"
+        "(too_large=0, unreadable=0, outside_vault=0, bad_frontmatter=1, symlinked_dirs=0, unreadable_dirs=0)"
     )
 
 
@@ -543,7 +543,7 @@ def test_skip_counter_outside_vault_and_bad_frontmatter(capsys, vault, tmp_path)
     assert rc == 0
     assert err.strip() == (
         "vault_scan: 0 match(es), 1 file(s) scanned, 2 skipped "
-        "(too_large=0, unreadable=0, outside_vault=1, bad_frontmatter=1, symlinked_dirs=0)"
+        "(too_large=0, unreadable=0, outside_vault=1, bad_frontmatter=1, symlinked_dirs=0, unreadable_dirs=0)"
     )
 
 
@@ -556,7 +556,7 @@ def test_symlinked_dir_inside_vault_is_counted_once(capsys, vault):
                          "--pattern", "Redis")
     assert rc == 0
     assert out == ""
-    assert "symlinked_dirs=1)" in err
+    assert "symlinked_dirs=1, unreadable_dirs=0)" in err
     assert ", 1 skipped (" in err
 
 
@@ -637,3 +637,74 @@ def test_meta_title_skips_h2_before_h1(capsys, tmp_path):
     row, _ = _meta_row(capsys, tmp_path, "type: claude-insight\n",
                        "## Context\n\ntext\n\n# Real Title\n")
     assert row["title"] == "Real Title"
+
+
+# ---------------------------------------------------------------------------
+# unreadable directories (X-001) and YAML quote escapes (X-002)
+# ---------------------------------------------------------------------------
+
+_NOT_ROOT = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores directory permissions",
+)
+
+
+@pytest.fixture
+def locked(request):
+    paths: list[Path] = []
+    yield paths
+    for p in paths:
+        p.chmod(0o755)
+
+
+@_NOT_ROOT
+def test_grep_counts_unreadable_subdir(capsys, vault, locked):
+    sub = vault / "claude-insights" / "sub"
+    sub.chmod(0)
+    locked.append(sub)
+    rc, out, err = _main(capsys, "grep", vault, "claude-insights", "--pattern", "nomatch")
+    assert rc == 0
+    assert "unreadable_dirs=1)" in err
+    assert ", 1 skipped (" in err
+
+
+@_NOT_ROOT
+def test_grep_counts_unreadable_passed_folder(capsys, vault, locked):
+    folder = vault / "claude-insights"
+    folder.chmod(0)
+    locked.append(folder)
+    rc, out, err = _main(capsys, "grep", vault, "claude-insights", "--pattern", "nomatch")
+    assert rc == 0
+    assert out == ""
+    assert "0 file(s) scanned, 1 skipped (" in err
+    assert "unreadable_dirs=1)" in err
+
+
+def test_scalar_single_quote_escape():
+    assert vault_scan._scalar("'Bob''s app'") == "Bob's app"
+    assert vault_scan._scalar("'it''s' # note") == "it's"
+    assert vault_scan._scalar("'a # b'") == "a # b"
+
+
+def test_scalar_double_quote_escape():
+    assert vault_scan._scalar('"[[a \\"q\\" b]]"') == '[[a "q" b]]'
+    assert vault_scan._scalar('"back\\\\slash"') == "back\\slash"
+    assert vault_scan._scalar('"x \\" # still inside" # c') == 'x " # still inside'
+
+
+def test_flow_items_quote_escapes():
+    assert vault_scan._flow_items("'it''s', b") == ["it's", "b"]
+    assert vault_scan._flow_items('"a \\"b, c\\"", d') == ['a "b, c"', "d"]
+    assert vault_scan._flow_items('"a\\\\", e') == ["a\\", "e"]
+    assert vault_scan._flow_items("'a'',b', c") == ["a',b", "c"]
+
+
+def test_meta_quote_escapes_end_to_end(capsys, tmp_path):
+    row, _ = _meta_row(capsys, tmp_path, (
+        "project: 'Bob''s app'\n"
+        'source_session_note: "[[a \\"q\\" b]]"\n'
+        "tags: ['it''s', \"a \\\"b\\\"\"]\n"
+    ))
+    assert row["project"] == "Bob's app"
+    assert row["source_session_note"] == '[[a "q" b]]'
+    assert row["tags"] == ["it's", 'a "b"']

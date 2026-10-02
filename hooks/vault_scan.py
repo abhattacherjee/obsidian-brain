@@ -23,8 +23,10 @@ Usage::
 read as a flag. Stdout is the sorted list of matching paths. On success
 (exit 0) stderr carries one summary line, ``vault_scan: N match(es), M file(s)
 scanned, K skipped (too_large=a, unreadable=b, outside_vault=c,
-bad_frontmatter=d, symlinked_dirs=e)``, so an empty stdout is never
-ambiguous. K is the sum of the five counters. Under ``--frontmatter-only`` a
+bad_frontmatter=d, symlinked_dirs=e, unreadable_dirs=f)``, so an empty stdout
+is never ambiguous. K is the sum of the six counters. ``unreadable_dirs``
+counts directories that could not be listed (permissions), including a folder
+named on the command line; their notes are not scanned. Under ``--frontmatter-only`` a
 note with no frontmatter at all is scanned (it cannot match), not skipped;
 only a fence that does not close counts as ``bad_frontmatter``.
 
@@ -57,7 +59,7 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 SNIPPET_CHARS = 200
 META_FIELDS = ("date", "type", "project", "session_id", "source_session_note")
 SKIP_KINDS = ("too_large", "unreadable", "outside_vault", "bad_frontmatter",
-              "symlinked_dirs")
+              "symlinked_dirs", "unreadable_dirs")
 _UTILS_WARNED = False
 
 
@@ -121,10 +123,16 @@ def _folder_dirs(vault: str, root: Path, folders: list[str]) -> list[Path]:
     return dirs
 
 
-def _iter_md(folder: Path, symlinked_dirs: set[str]):
+def _iter_md(folder: Path, symlinked_dirs: set[str], unreadable_dirs: set[str]):
     # followlinks=False: a symlinked subdirectory is never descended. Each one
-    # is recorded in ``symlinked_dirs`` so the summary can count it.
-    for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
+    # is recorded in ``symlinked_dirs`` so the summary can count it. A directory
+    # that cannot be listed is recorded in ``unreadable_dirs``: os.walk drops it
+    # silently unless ``onerror`` is given.
+    def _on_error(exc: OSError) -> None:
+        unreadable_dirs.add(os.path.normpath(str(exc.filename or folder)))
+
+    for dirpath, dirnames, filenames in os.walk(folder, followlinks=False,
+                                                onerror=_on_error):
         dirnames.sort()
         for name in dirnames:
             sub = os.path.join(dirpath, name)
@@ -152,17 +160,19 @@ def grep_files(vault: str, folders: list[str], regex: re.Pattern,
     """Return ``(matches, scanned, skipped)``.
 
     ``matches`` is sorted. ``skipped`` maps each name in ``SKIP_KINDS`` to a
-    count; ``symlinked_dirs`` counts subdirectories that were not descended.
+    count; ``symlinked_dirs`` counts subdirectories that were not descended and
+    ``unreadable_dirs`` counts directories that could not be listed.
     """
     root = _check_vault(vault)
     dirs = _folder_dirs(vault, root, folders)
     seen: set[str] = set()
     symlinked_dirs: set[str] = set()
+    unreadable_dirs: set[str] = set()
     matches: list[str] = []
     scanned = 0
     skipped = dict.fromkeys(SKIP_KINDS, 0)
     for d in dirs:
-        for path in _iter_md(d, symlinked_dirs):
+        for path in _iter_md(d, symlinked_dirs, unreadable_dirs):
             key = os.path.normpath(str(path))
             if key in seen:
                 continue
@@ -189,10 +199,39 @@ def grep_files(vault: str, folders: list[str], regex: re.Pattern,
             if _line_matches(regex, lines):
                 matches.append(key)
     skipped["symlinked_dirs"] = len(symlinked_dirs)
+    skipped["unreadable_dirs"] = len(unreadable_dirs)
     return sorted(matches), scanned, skipped
 
 
 _COMMENT_RE = re.compile(r"\s+#.*$")
+
+
+def _quote_end(val: str, start: int = 0) -> int:
+    """Index of the quote closing the one at ``val[start]``; -1 if unclosed.
+
+    YAML escapes: in ``'...'`` a doubled ``''`` is a literal quote; in
+    ``"..."`` a backslash escapes the next character.
+    """
+    quote = val[start]
+    i = start + 1
+    while i < len(val):
+        ch = val[i]
+        if quote == '"' and ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            if quote == "'" and val[i + 1:i + 2] == "'":
+                i += 2
+                continue
+            return i
+        i += 1
+    return -1
+
+
+def _unescape(inner: str, quote: str) -> str:
+    if quote == "'":
+        return inner.replace("''", "'")
+    return re.sub(r'\\(["\\])', r"\1", inner)
 
 
 def _scalar(val: str) -> str:
@@ -200,9 +239,9 @@ def _scalar(val: str) -> str:
     unquoted value loses a trailing `` # comment``."""
     val = val.strip()
     if val[:1] in ("'", '"'):
-        end = val.find(val[0], 1)
+        end = _quote_end(val)
         if end != -1:
-            return val[1:end]
+            return _unescape(val[1:end], val[0])
         return val.strip("\"'")
     if val.startswith("#"):
         return ""
@@ -213,20 +252,22 @@ def _flow_items(inner: str) -> list[str]:
     """Split the inside of a ``[a, "b, c"]`` flow list on commas outside quotes."""
     items: list[str] = []
     buf: list[str] = []
-    quote = ""
-    for ch in inner:
-        if quote:
-            buf.append(ch)
-            if ch == quote:
-                quote = ""
-        elif ch in ("'", '"'):
-            quote = ch
-            buf.append(ch)
-        elif ch == ",":
+    i = 0
+    while i < len(inner):
+        ch = inner[i]
+        if ch in ("'", '"'):
+            end = _quote_end(inner, i)
+            if end == -1:  # unclosed: the quote runs to the end of the list
+                end = len(inner) - 1
+            buf.append(inner[i:end + 1])
+            i = end + 1
+            continue
+        if ch == ",":
             items.append("".join(buf))
             buf = []
         else:
             buf.append(ch)
+        i += 1
     items.append("".join(buf))
     return [_scalar(t) for t in items if t.strip()]
 
