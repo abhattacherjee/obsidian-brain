@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `/retro` now tells the model to run its save steps (5 to 8) inline in the main session, never in a subagent. Step 8 confirms with the path `note_writer.py` printed and an `ls -l` of it, and says not to print "saved" without that check. These are skill instructions; no hook enforces them (#384).
+- `/retro` now points at `/github-board:triage-issues` for labelling filed issues. The bare `github-issue-triage` skill moved into the `github-board` plugin (claude-code-skills#146). (#388)
 
 ### Docs
 - Design spec for the rerank eval: citation log, seed eval set and a 4-backend harness (current, Haiku, Jev, laya) before any ranking change (#377).
