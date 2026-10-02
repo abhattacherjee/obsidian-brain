@@ -41,7 +41,8 @@ def test_step_7_keeps_the_path_note_writer_printed():
     )
     assert "<NOTE_PATH>" in body
     # The gate is armed with the returned path, not one rebuilt from config.
-    assert '"<current-session-id>" "<NOTE_PATH>"' in body
+    assert "\"<current-session-id>\" '<NOTE_PATH>'" in body
+    assert "'\\''" in body
     assert "$VAULT_PATH/$INSIGHTS_FOLDER/<filename>" not in body
 
 
@@ -53,8 +54,13 @@ def test_note_path_is_never_a_shell_variable():
 
 def test_step_8_checks_existence_before_saying_saved():
     body = _section(SKILL_PATH.read_text(encoding="utf-8"), "Step 8 — Confirm")
-    assert 'ls -l "<NOTE_PATH>"' in body
+    assert "ls -l '<NOTE_PATH>'" in body
     assert "`<NOTE_PATH>`" in body
     assert 'Never print "saved" without this check' in body
-    assert body.index('ls -l "<NOTE_PATH>"') < body.index("Retrospective saved!")
+    assert body.index("ls -l '<NOTE_PATH>'") < body.index("Retrospective saved!")
     assert "$VAULT_PATH/$INSIGHTS_FOLDER/<filename>" not in body
+
+
+def test_note_path_is_single_quoted():
+    # Double quotes would let the shell expand a $ or backtick in the path.
+    assert '"<NOTE_PATH>"' not in SKILL_PATH.read_text(encoding="utf-8")

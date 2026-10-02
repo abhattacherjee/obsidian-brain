@@ -430,7 +430,7 @@ type: claude-retro
 OB_NOTE_EOF_<eof4>
 ```
 
-On success this prints `OK: <absolute path>`. Keep that absolute path exactly as printed; the steps below call it `<NOTE_PATH>`. Shell variables do not survive between Bash calls, so wherever `<NOTE_PATH>` appears, paste the literal path in its place. Step 8 confirms against it, not against a path rebuilt from config. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here (do not proceed to arming the classification gate below on a failed write).
+On success this prints `OK: <absolute path>`. Keep that absolute path exactly as printed; the steps below call it `<NOTE_PATH>`. Shell variables do not survive between Bash calls, so wherever `<NOTE_PATH>` appears, paste the literal path in its place. It always sits inside single quotes, so the shell does not expand a `$` or backtick in it; if the path itself contains a `'`, write each one as `'\''`. Step 8 confirms against it, not against a path rebuilt from config. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here (do not proceed to arming the classification gate below on a failed write).
 
 If the error is `note already exists`, the 4-hex filename hash collided with a note written in the same second. Regenerate the hash (Step 7's command), rebuild the filename, and retry the write **once**. If it fails again for any reason, surface the error and stop — do not loop.
 
@@ -460,7 +460,7 @@ def _ob_hooks():
 sys.path.insert(0, _ob_hooks())
 from obsidian_utils import mark_retro_classification_pending
 print(mark_retro_classification_pending(sys.argv[1], sys.argv[2]))
-' "<current-session-id>" "<NOTE_PATH>"
+' "<current-session-id>" '<NOTE_PATH>'
 ```
 
 (`<current-session-id>` is the value derived in Step 5. `<NOTE_PATH>` is the path from the `OK:` line above. The gate is keyed on the session id and fails open on an unusable id: if `session_id` is empty or `"unknown"` the gate stays inactive — never blocking the session.)
@@ -514,7 +514,7 @@ The retro is **not done** when the file is written. The literal next action afte
 First prove the note exists. Run this in the main session, replacing `<NOTE_PATH>` with the literal path `note_writer.py` printed after `OK:` in Step 7:
 
 ```bash
-ls -l "<NOTE_PATH>"
+ls -l '<NOTE_PATH>'
 ```
 
 If `ls` fails, or Step 7 never printed an `OK:` line, the note was not saved. Say so, show the error, and do **not** print the confirmation below. Never print "saved" without this check.
