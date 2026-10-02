@@ -174,3 +174,11 @@ def test_pattern_uses_the_equals_form(skill):
     assert grep_calls, skill
     for ln in grep_calls:
         assert "--pattern='" in ln, ln
+
+
+def test_vault_import_reads_whole_frontmatter_for_session_ids():
+    """#312: vault-import used `head -20` to collect session ids, which
+    silently misses a session_id below line 20 and re-imports the session."""
+    text = (REPO / "skills" / "vault-import" / "SKILL.md").read_text(encoding="utf-8")
+    assert "head -20" not in text
+    assert """awk 'NR==1 { if ($0 != "---") exit; next } $0 == "---" { exit } { print }'""" in text

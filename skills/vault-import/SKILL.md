@@ -140,11 +140,11 @@ More efficiently, build a single grep command:
 
 ```bash
 for f in "$VAULT_PATH/$SESSIONS_FOLDER/"*.md; do
-  head -20 "$f" 2>/dev/null
-done | grep "session_id:" | awk '{print $2}'
+  awk 'NR==1 { if ($0 != "---") exit; next } $0 == "---" { exit } { print }' "$f" 2>/dev/null
+done | grep "^session_id:" | awk '{print $2}'
 ```
 
-Collect all session IDs already in the vault into a set called `EXISTING_IDS`. Remove any session from the discovered list whose `session_id` is in `EXISTING_IDS`.
+The `awk` reads each note's whole frontmatter, from the opening `---` to the closing one, so `session_id` is found however deep it sits (#312). Collect all session IDs already in the vault into a set called `EXISTING_IDS`. Remove any session from the discovered list whose `session_id` is in `EXISTING_IDS`.
 
 Store the remaining sessions as `PENDING_SESSIONS` and the count of skipped sessions as `SKIPPED_COUNT`.
 
