@@ -73,7 +73,7 @@ The user provides a query after `/vault-search`. Determine the search mode:
 - Strip the leading `#`
 - The search target is frontmatter `tags` fields
 - Pattern: the tag string as a literal grep pattern
-- Search only within the first 30 lines of each file (frontmatter region)
+- Search only the frontmatter, not the body. Step 4 does this with `vault_scan.py grep --frontmatter-only`, because the Grep tool cannot limit a search to frontmatter and the `tags:` block can sit past line 400 (/emerge and /standup notes close their fence as deep as line 460)
 
 **Structured mode** — query contains `key:value` pairs (e.g. `project:api-service type:decision`):
 - Parse each `key:value` pair
@@ -129,12 +129,36 @@ If the output is `[]` or the command fails: print a note that the vault index re
 
 ### Step 4 — Search both folders in parallel
 
-Use the Grep tool (never Bash grep) for all searching. Launch searches across both `SESSIONS_DIR` and `INSIGHTS_DIR` in parallel.
+Use the Grep tool (never Bash grep) for structured and keyword searches. Tag mode uses `vault_scan.py` instead (see below). Launch searches across both `SESSIONS_DIR` and `INSIGHTS_DIR` in parallel.
 
 **For tag mode:**
-Run two parallel Grep calls:
-- `Grep(pattern="<tag>", path=SESSIONS_DIR, glob="*.md", output_mode="files_with_matches")`
-- `Grep(pattern="<tag>", path=INSIGHTS_DIR, glob="*.md", output_mode="files_with_matches")`
+Run one `vault_scan.py grep --frontmatter-only` call over both folders (not the Grep tool). It searches only each note's frontmatter, however long, and skips notes whose frontmatter does not parse (counted in the stderr summary line). Stdout is one matching path per line; an empty stdout means no match. A line starting `ERROR:` means the call failed: show it to the user and stop. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' --pattern '<tag>' --frontmatter-only
+```
 
 **For structured mode:**
 For each `key:value` pair, run two parallel Grep calls (one per folder):
@@ -149,9 +173,67 @@ Run two parallel Grep calls:
 
 If zero results and query has multiple words, retry by grepping each word separately and intersecting the file lists.
 
+**If the Grep tool is not available in this session** (structured and keyword mode), run each search above with `vault_scan.py grep` instead (#375): one call per pattern, both folder names as arguments, `--ignore-case` for `-i=true`. Use stdout as the file list and intersect exactly as above. Stderr always ends with a `vault_scan: N match(es), M file(s) scanned, K skipped` line, so an empty stdout means no match, not a failure. A line starting `ERROR:` means the call failed: show it to the user and stop. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' --pattern '<pattern>' --ignore-case
+```
+
 ### Step 5 — Extract metadata from matches
 
-For each matched file (up to 20 files), use Read to read the first 40 lines. Extract from frontmatter:
+If there are more than 20 matched files, sort by filename (which contains the date in YYYY-MM-DD format) descending and keep only the 20 most recent.
+
+Read the metadata of all kept files with one `vault_scan.py meta` call (one quoted path per file). Do not use a fixed-line `Read`: frontmatter can run past line 400, so a fixed line limit silently drops fields. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+python3 "$HOOKS/vault_scan.py" meta '<vault_path>' '<file_1>' '<file_2>'
+```
+
+It prints one JSON object per file, one per line. Take these fields from it:
 
 - **date** — the `date:` field
 - **type** — the `type:` field (e.g. `claude-session`, `claude-insight`, `claude-decision`, `claude-error-fix`, `claude-snapshot`)
@@ -159,12 +241,9 @@ For each matched file (up to 20 files), use Read to read the first 40 lines. Ext
 - **session_id** — the `session_id:` field (used below to attach snapshots to session hits)
 - **source_session_note** — the `source_session_note:` wikilink on snapshots (the parent session stem, enclosed in `[[...]]`)
 - **title** — the first `# ` heading, or the filename without extension
+- **snippet** — the first 200 characters of the body after the frontmatter, with whitespace collapsed
 
-Also extract a **snippet**: the first 200 characters of content after the frontmatter closing `---`.
-
-If there are more than 20 matched files, sort by filename (which contains the date in YYYY-MM-DD format) descending and take only the 20 most recent.
-
-**Performance note:** If there are 10 or fewer matches, read all files in parallel. If there are 11-20, read in two parallel batches.
+A missing field is `null`. If a row has a non-null `error` (for example `unparsable frontmatter: no_closing_fence`), still list the file, using its filename as the title and `note` as its type.
 
 ### Step 5b — Augment session hits with snapshot data
 
@@ -198,7 +277,7 @@ print(json.dumps([{"hhmmss": s["hhmmss"], "trigger": s["trigger"]} for s in snap
 ' "$SESSIONS_DIR" "$SESSION_ID" "$DATE" "$PROJECT"
 ```
 
-If the returned JSON array is non-empty, remember the snapshot count `N` and each snapshot's `hhmmss` + `trigger` for that result. If batching many sessions, run these queries in parallel (same pattern as Step 5's metadata reads).
+If the returned JSON array is non-empty, remember the snapshot count `N` and each snapshot's `hhmmss` + `trigger` for that result. If batching many sessions, run these queries in parallel.
 
 For results whose `type` is `claude-snapshot`, remember the `source_session_note` wikilink stem (strip `[[...]]`) as the parent pointer.
 
