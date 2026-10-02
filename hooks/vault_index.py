@@ -1479,26 +1479,42 @@ def detect_task_context(caller_skill: str | None = None) -> str:
     return "general"
 
 
+# Weight of each note type per task context. A type missing here scores 0.5
+# (see rerank_results), so tests/test_type_scores.py requires every type a
+# writer emits to be listed in every context (#376). Reports (stats,
+# check-items) score 0.0: they describe the vault, they are not knowledge.
+# claude-emerge scores 0.0 in "emerge" so /emerge does not re-ingest its own
+# output.
 _TYPE_SCORES_BY_CONTEXT = {
     "debugging": {
-        "claude-error-fix": 1.0, "claude-session": 0.8, "claude-insight": 0.6,
-        "claude-decision": 0.5, "claude-retro": 0.3, "claude-standup": 0.3,
+        "claude-error-fix": 1.0, "claude-session": 0.8, "claude-snapshot": 0.7,
+        "claude-insight": 0.6, "claude-memory": 0.6, "claude-decision": 0.5,
+        "claude-retro": 0.3, "claude-standup": 0.3, "claude-emerge": 0.1,
+        "claude-stats": 0.0, "claude-check-items-report": 0.0,
     },
     "standup": {
         "claude-session": 1.0, "claude-decision": 0.8, "claude-insight": 0.7,
-        "claude-retro": 0.6, "claude-error-fix": 0.5, "claude-standup": 0.3,
+        "claude-retro": 0.6, "claude-snapshot": 0.6, "claude-error-fix": 0.5,
+        "claude-emerge": 0.4, "claude-standup": 0.3, "claude-memory": 0.3,
+        "claude-stats": 0.0, "claude-check-items-report": 0.0,
     },
     "search": {
-        "claude-insight": 1.0, "claude-decision": 0.9, "claude-error-fix": 0.8,
-        "claude-session": 0.5, "claude-retro": 0.4, "claude-standup": 0.3,
+        "claude-insight": 1.0, "claude-decision": 0.9, "claude-memory": 0.9,
+        "claude-error-fix": 0.8, "claude-session": 0.5, "claude-retro": 0.4,
+        "claude-snapshot": 0.4, "claude-standup": 0.3, "claude-emerge": 0.3,
+        "claude-stats": 0.0, "claude-check-items-report": 0.0,
     },
     "emerge": {
         "claude-insight": 1.0, "claude-decision": 0.9, "claude-error-fix": 0.8,
-        "claude-session": 0.5, "claude-retro": 0.4, "claude-standup": 0.3,
+        "claude-memory": 0.8, "claude-session": 0.5, "claude-retro": 0.4,
+        "claude-snapshot": 0.4, "claude-standup": 0.3, "claude-emerge": 0.0,
+        "claude-stats": 0.0, "claude-check-items-report": 0.0,
     },
     "general": {
         "claude-insight": 1.0, "claude-decision": 1.0, "claude-error-fix": 0.9,
-        "claude-session": 0.5, "claude-retro": 0.4, "claude-standup": 0.3,
+        "claude-memory": 0.9, "claude-session": 0.5, "claude-retro": 0.4,
+        "claude-snapshot": 0.4, "claude-standup": 0.3, "claude-emerge": 0.3,
+        "claude-stats": 0.0, "claude-check-items-report": 0.0,
     },
 }
 
