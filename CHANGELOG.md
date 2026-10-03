@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.7.0] - 2026-10-03
+
 ### Added
 - `hooks/vault_scan.py`, a read-only CLI for `/vault-ask` and `/vault-search`. `grep` lists the `*.md` files under vault folders that match a regex, one line at a time like the Grep tool, and `--frontmatter-only` limits the search to the frontmatter block. `meta` prints each note's `date`, `type`, `project`, `session_id`, `source_session_note`, `tags`, `title` and `snippet` as JSON Lines, reading the whole frontmatter. Both check every file stays inside the vault after resolving symlinks. The `grep` summary line counts directories it could not list (`unreadable_dirs=`, included in K), so a permissions failure no longer reads as "no match". Quoted frontmatter values honour YAML escapes (`'it''s'`, `"a \"q\""`) (#375, #312).
 
