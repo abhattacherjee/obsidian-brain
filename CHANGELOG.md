@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.7.0] - 2026-10-03
+
+### Added
+- `hooks/vault_scan.py`, a read-only CLI for `/vault-ask` and `/vault-search`. `grep` lists the `*.md` files under vault folders that match a regex, one line at a time like the Grep tool, and `--frontmatter-only` limits the search to the frontmatter block. `meta` prints each note's `date`, `type`, `project`, `session_id`, `source_session_note`, `tags`, `title` and `snippet` as JSON Lines, reading the whole frontmatter. Both check every file stays inside the vault after resolving symlinks. The `grep` summary line counts directories it could not list (`unreadable_dirs=`, included in K), so a permissions failure no longer reads as "no match". Quoted frontmatter values honour YAML escapes (`'it''s'`, `"a \"q\""`) (#375, #312).
+
+### Fixed
+- Search ranking now has a type weight for `claude-snapshot`, `claude-memory`, `claude-emerge`, `claude-stats` and `claude-check-items-report` in every context. They used to fall back to 0.5, which ranked health reports above standup notes in every context and above retro notes in every context but `standup`, and level with decisions in `debugging`. `tests/test_type_scores.py` fails if a writer adds a type with no weight (#376).
+- `/vault-ask` and `/vault-search` no longer read only the first 30 or 40 lines of a note to find its frontmatter fields. Frontmatter can run past line 40 (/emerge notes close their fence as deep as line 461), so tags below line 30 or 40 were missed. Tag search and metadata reads now go through `vault_scan.py`. `/vault-import` now reads each session note's whole frontmatter for `session_id` instead of its first 20 lines (#312).
+- `/vault-ask` and `/vault-search` now say what to run when the Grep tool is missing: `vault_scan.py grep` (#375).
+
+### Changed
+- `/retro` now tells the model to run its save steps (5 to 8) inline in the main session, never in a subagent. Step 8 confirms with the path `note_writer.py` printed and an `ls -l` of it, and says not to print "saved" without that check. These are skill instructions; no hook enforces them (#384).
+- `/retro` now points at `/github-board:triage-issues` for labelling filed issues. The bare `github-issue-triage` skill moved into the `github-board` plugin (claude-code-skills#146). (#388)
+
+### Docs
+- Design spec for the rerank eval: citation log, seed eval set and a 4-backend harness (current, Haiku, Jev, laya) before any ranking change (#377).
+
 ## [3.6.1] - 2026-09-28
 
 ### Added

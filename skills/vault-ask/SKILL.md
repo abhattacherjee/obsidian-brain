@@ -134,7 +134,7 @@ If fewer than 5 results or the command fails (non-zero exit, invalid JSON, impor
 
 ### Step 4 — Search vault (3 parallel agents)
 
-Launch three Grep searches in parallel — one per agent below. Use the Grep tool (never Bash grep).
+Launch three Grep searches in parallel — one per agent below. Use the Grep tool (never Bash grep). If the Grep tool is not in your tool list, go straight to vault_scan.py grep — do not call Grep first. See the fallback below.
 
 **Agent 1 — Session content:**
 For each term in `SEARCH_TERMS`, run:
@@ -158,6 +158,36 @@ Grep(pattern="claude/topic/.*<term>", path=INSIGHTS_DIR, glob="*.md", output_mod
 ```
 Collect all file paths returned.
 
+**If the Grep tool is not available in this session**, run the same searches with `vault_scan.py grep` instead (#375). It walks the folders recursively, matches one line at a time like the Grep tool, and prints one matching path per line. Run one call per pattern, passing both folder names (`<sessions_folder>` and `<insights_folder>` from Step 1). Use `--pattern='<term>'` for Agents 1 and 2 and `--pattern='claude/topic/.*<term>'` for Agent 3; `--ignore-case` stands for `-i=true`. Always write `--pattern=` with the equals sign: with a space, a term that starts with `-` (such as `--no-verify`) is read as a flag and the call fails. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+
+Check each call before you use its output. It succeeded only if it exited 0 and stderr has the `vault_scan: N match(es), M file(s) scanned, K skipped (...)` summary line; then stdout is the file list, and an empty stdout means no match. Anything else is a failure, not "no match": show the `ERROR:` line (or the whole stderr if there is none) to the user and stop. If K is more than 0, add this line to what you show the user: "K note(s) were not searched (see the breakdown) — run /vault-doctor".
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' --pattern='<term>' --ignore-case
+```
+
 Combine results from all three agents. Deduplicate by file path. Store as `CANDIDATE_FILES`.
 
 If `CANDIDATE_FILES` is empty, tell the user:
@@ -178,11 +208,35 @@ Score each file in `CANDIDATE_FILES` using these rules:
 | File date is within the last 30 days (relative to today) | +1 |
 | Matching tag found (Agent 3 match) | +2 |
 
-To determine note type and date without reading the full file, run:
+To get each note's `type` and `date` without reading the full file, run one `vault_scan.py meta` call over all of `CANDIDATE_FILES` (one quoted path per file):
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+python3 "$HOOKS/vault_scan.py" meta '<vault_path>' '<file_1>' '<file_2>'
 ```
-Read(file_path="<path>", limit=40)
-```
-to get frontmatter fields (`type:`, `date:`). Use 40 lines because some notes (e.g., standups with large `source_notes` arrays) have frontmatter exceeding 20 lines. If `type:` or `date:` is not found within the first 40 lines, read the full frontmatter.
+
+It prints one JSON object per file, one per line, with `path`, `type`, `date`, `project`, `session_id`, `source_session_note`, `tags`, `title`, `snippet` and `error`. Read `type` and `date` from it. The call succeeded only if it exited 0 and printed one JSON row per file you passed. Otherwise show the `ERROR:` line (or the whole stderr) to the user and stop. A `vault_scan: obsidian_utils unavailable: ...` line on stderr is a warning, not a failure. Do not use a fixed-line `Read` for this: frontmatter can run past line 40 (/emerge notes close their fence as deep as line 461), so a fixed line limit silently drops fields. `meta` parses the whole frontmatter block. If a row has a non-null `error`, keep the file but give it no type or recency points. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
 
 Sort `CANDIDATE_FILES` by score descending. Take the top 10. Store as `RANKED_FILES`.
 
