@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `wiki_folder` config key (default `claude-wiki`) and `indexed_folders(config)` helper. Every config-driven index call (`/vault-ask`, `/vault-search`, `/compress`, `/vault-stats`, `/vault-reindex`, `/obsidian-setup`) now indexes the wiki folder; `/recall`'s context brief and `/check-items` still index sessions and insights only, which never removes wiki rows. `/vault-reindex` and `/obsidian-setup` read the config fresh, refuse an invalid `wiki_folder` or an unreadable config instead of dropping rows, and report rows dropped for being outside the scanned folders (`foreign_deleted`) and any scanned folder that is missing. `/obsidian-setup` creates it and `/vault-config` can change it. Notes typed `claude-wiki-index` stay out of the index, and `claude-wiki` notes rank like insights. Groundwork for the LLM wiki (#383).
+
 ## [3.7.0] - 2026-10-03
 
 ### Added

@@ -62,18 +62,19 @@ Obsidian Brain Configuration
 1. vault_path             <value>
 2. sessions_folder        <value>
 3. insights_folder        <value>
-4. log_raw_messages       <value>      <- controls raw conversation logging
-5. min_turns              <value>      <- minimum turns to log a session
-6. min_duration_minutes   <value>      <- minimum duration to log
-7. snapshot_on_compact    <value>      <- checkpoint note on /compact
-8. snapshot_on_clear      <value>      <- checkpoint note on /clear
+4. wiki_folder            <value>      <- wiki pages from /vault-ask (#383; empty = off)
+5. log_raw_messages       <value>      <- controls raw conversation logging
+6. min_turns              <value>      <- minimum turns to log a session
+7. min_duration_minutes   <value>      <- minimum duration to log
+8. snapshot_on_compact    <value>      <- checkpoint note on /compact
+9. snapshot_on_clear      <value>      <- checkpoint note on /clear
 
 Enter a number to change, or 'done' to exit.
 ```
 
-For any key not present in the config, show its default value: `log_raw_messages` defaults to `true`, `min_turns` defaults to `3`, `min_duration_minutes` defaults to `2`, `snapshot_on_compact` defaults to `true`, `snapshot_on_clear` defaults to `true`.
+For any key not present in the config, show its default value: `wiki_folder` defaults to `claude-wiki`, `log_raw_messages` defaults to `true`, `min_turns` defaults to `3`, `min_duration_minutes` defaults to `2`, `snapshot_on_compact` defaults to `true`, `snapshot_on_clear` defaults to `true`.
 
-When rendering rows 7 or 8, if the value is `False`, append this warning inline on the same row:
+When rendering rows 8 or 9, if the value is `False`, append this warning inline on the same row:
 
 > ⚠ Disables pre-clear/compact checkpoint. Recommended: True.
 
@@ -93,7 +94,7 @@ Wait for user input.
   > ⚠ Disabling this removes the pre-compact/clear checkpoint safety net. You will lose in-flight context on accidental `/clear`. Proceed? (y/N)
 
   Only toggle after explicit confirmation.
-- **String settings** (`vault_path`, `sessions_folder`, `insights_folder`): Show current value, ask for new value.
+- **String settings** (`vault_path`, `sessions_folder`, `insights_folder`, `wiki_folder`): Show current value, ask for new value.
 - **Number settings** (`min_turns`, `min_duration_minutes`): Show current value, ask for new value. Validate it's a positive integer.
 
 ### Step 5 — Write updated config
@@ -119,5 +120,7 @@ print("OK")
 ```
 
 Where `$KEY` is the setting name and `$JSON_VALUE` is the new value as a JSON literal (e.g., `"false"`, `"3"`, `'"/path/to/vault"'`).
+
+If the changed key is `sessions_folder`, `insights_folder` or `wiki_folder`: other skills in this session read a cached copy of the config, so tell the user to run `/vault-reindex`, which reads the config fresh and re-indexes the new folders. For `wiki_folder`, first check the value: it must be a relative folder name with no `..`, `~` or dot-prefixed segment (an empty value turns the wiki folder off). `/vault-reindex` refuses an invalid value and names it.
 
 Confirm the change, then go back to Step 2 to redisplay the table.

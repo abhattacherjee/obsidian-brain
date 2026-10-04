@@ -26,8 +26,10 @@ REPO = Path(__file__).resolve().parent.parent
 # write ``"---\ntype: claude-emerge"``, where ``type`` follows a literal ``n``.
 _TYPE_RE = re.compile(r"""["']?type["']?\s*[:=]\s*["']?(claude-[a-z0-9][a-z0-9-]*[a-z0-9])""")
 
-# Written outside this repo (migrated memory notes) but present in live vaults.
-_EXTERNAL_TYPES = {"claude-memory"}
+# Present in live vaults but written outside this file set: migrated memory
+# notes, and claude-wiki, whose writer (hooks/wiki.py) lands in #383 PR 2.
+# PR 2 removes "claude-wiki" from this set once the scan finds the writer.
+_EXTERNAL_TYPES = {"claude-memory", "claude-wiki"}
 
 _ORIGINAL_TYPES = {
     "claude-session", "claude-insight", "claude-decision",
@@ -69,7 +71,7 @@ def test_scan_finds_exactly_the_known_types():
     # quietly pull in a new type; a real new writer updates this list on purpose.
     assert collect_written_types() == _ORIGINAL_TYPES | {
         "claude-snapshot", "claude-memory", "claude-emerge", "claude-stats",
-        "claude-check-items-report",
+        "claude-check-items-report", "claude-wiki",
     }
 
 
@@ -97,7 +99,8 @@ def test_regex_matches_all_writer_shapes():
 
 
 def test_every_written_type_has_a_weight_in_every_context():
-    written = collect_written_types()
+    # Unindexed types (the wiki's own index/log files) never get a score.
+    written = collect_written_types() - vault_index._UNINDEXED_TYPES
     missing = {
         ctx: sorted(written - set(scores))
         for ctx, scores in vault_index._TYPE_SCORES_BY_CONTEXT.items()
@@ -129,3 +132,15 @@ def test_reports_rank_below_curated_notes():
 
 def test_emerge_does_not_weight_its_own_output():
     assert vault_index._TYPE_SCORES_BY_CONTEXT["emerge"]["claude-emerge"] == 0.0
+
+
+def test_wiki_pages_weigh_like_insights():
+    for ctx in vault_index._TYPE_SCORES_BY_CONTEXT:
+        scores = vault_index.get_type_scores(ctx)
+        assert scores["claude-wiki"] == scores["claude-insight"], ctx
+
+
+def test_unindexed_types_need_no_weight():
+    # claude-wiki-index notes never reach the index, so they never get a score.
+    for ctx in vault_index._TYPE_SCORES_BY_CONTEXT:
+        assert not (vault_index._UNINDEXED_TYPES & set(vault_index.get_type_scores(ctx))), ctx
