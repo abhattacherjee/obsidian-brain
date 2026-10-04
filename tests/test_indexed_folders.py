@@ -273,3 +273,10 @@ def test_vault_root_aliases_are_rejected(alias, capsys):
     with pytest.raises(ValueError, match="wiki_folder"):
         indexed_folders({"wiki_folder": alias}, strict=True)
     assert indexed_folders({"wiki_folder": alias}) == ["claude-sessions", "claude-insights"]
+
+
+@pytest.mark.parametrize("raw", ["claude-wiki/../other", ".obsidian/../other", "~/../other"])
+def test_forbidden_segments_rejected_before_normalising(raw):
+    # Normalising alone would erase the ".." / "~" / dot segment (X-006).
+    with pytest.raises(ValueError, match="wiki_folder"):
+        indexed_folders({"wiki_folder": raw}, strict=True)

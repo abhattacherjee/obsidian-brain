@@ -2347,10 +2347,12 @@ def indexed_folders(config: dict, strict: bool = False) -> list:
     if wiki is not None and not isinstance(wiki, str):
         err = f"non-string wiki_folder {wiki!r}"
     elif wiki:
-        # Validate the normalised form: "./" or "././" would otherwise pass
-        # and collapse to "." (the vault root) after normalising.
+        # Validate both forms: the raw value keeps "..", "~" and dot
+        # segments that normalising would erase ("a/../b" -> "b"), and the
+        # normalised value catches "./" or "././", which collapse to "."
+        # (the vault root).
         norm = os.path.normpath(wiki)
-        bad = _validate_folder(norm)
+        bad = _validate_folder(wiki) or _validate_folder(norm)
         if bad:
             err = f"invalid wiki_folder {wiki!r}: {bad}"
     if err:
