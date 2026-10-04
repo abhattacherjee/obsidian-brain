@@ -345,7 +345,8 @@ def _write(ctx: dict, rel_folder: str, filename: str, content: str) -> None:
 
 
 def _index_header(title: str) -> str:
-    return f'---\ntype: "{INDEX_TYPE}"\n---\n# {title}\n'
+    # Literal type (see file_page): the writer scan needs to see it.
+    return '---\ntype: "claude-wiki-index"\n---\n# ' + title + '\n'
 
 
 def rebuild_wiki_index(ctx: dict) -> list:
@@ -422,6 +423,8 @@ def file_page(ctx: dict, payload: dict, today) -> dict:
     if counted["count"] < THRESHOLD:
         raise WikiRefusal(f"only {counted['count']} qualifying sources (need {THRESHOLD})")
 
+    # Scrub first: the question also feeds the file name, index and log.
+    question = scrub_secrets(p["question"])
     root = _wiki_root(ctx)
     queries = root / "queries"
     created = today.isoformat()
@@ -441,17 +444,18 @@ def file_page(ctx: dict, payload: dict, today) -> dict:
         filename = target.name
     else:
         rel_folder = f"{ctx['wiki_folder']}/queries/{today.year:04d}"
-        stem = f"{today.month:02d}-{today.day:02d}-{slugify(p['question'])}"
+        stem = f"{today.month:02d}-{today.day:02d}-{slugify(question)}"
         filename, n = f"{stem}.md", 1
         while (Path(ctx["vault"]) / rel_folder / filename).exists():
             n += 1
             filename = f"{stem}-{n}.md"
 
-    question = scrub_secrets(p["question"])
     resolved = counted["resolved"]
     projects = sorted({r["project"] for r in resolved if r["project"]})
     meta = {
-        "type": PAGE_TYPE, "title": question, "question": question,
+        # Literal type, not PAGE_TYPE: tests/test_type_scores.py finds
+        # writers by scanning for `"type": "claude-..."`.
+        "type": "claude-wiki", "title": question, "question": question,
         "date": today.isoformat(), "created": created, "updated": today.isoformat(),
         "projects": projects,
         "sources": [f"[[{r['name']}]]" for r in resolved],

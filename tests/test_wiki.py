@@ -323,8 +323,14 @@ def test_file_refusals_write_nothing(ctx, kw, msg):
 
 
 def test_update_outside_queries_or_non_wiki_refused(ctx):
-    with pytest.raises(wiki.WikiRefusal, match="queries"):
-        wiki.file_page(ctx, _payload(update=str(Path(ctx["vault"]) / "claude-insights" / "i1.md")), D)
+    # A wiki-typed page outside queries/: only the containment check refuses
+    # it. (The tmp path itself contains "queries", so match the full message.)
+    outside = Path(ctx["vault"]) / "claude-insights" / "fake-wiki.md"
+    outside.write_text(wiki.render_page({"type": "claude-wiki", "question": "q"}, "x\n"))
+    before = outside.read_text()
+    with pytest.raises(wiki.WikiRefusal, match="update must name a page under"):
+        wiki.file_page(ctx, _payload(update=str(outside)), D)
+    assert outside.read_text() == before
     bogus = _wiki(ctx) / "queries" / "2026" / "x.md"
     bogus.parent.mkdir(parents=True)
     bogus.write_text("---\ntype: claude-insight\n---\nx\n")
@@ -431,3 +437,18 @@ def test_hostile_question_keeps_one_frontmatter_block(ctx):
     assert stats["malformed"] == 0
     meta, _ = wiki.read_page(out["path"])
     assert meta["question"] == " ".join(q.split()) or meta["question"] == q
+
+
+def test_secret_never_reaches_the_filename(ctx):
+    # The slug is built from the scrubbed question (security review on c919292).
+    tok = "ghp_" + "a1b2" * 9
+    out = wiki.file_page(ctx, _payload(question=f"Why {tok} zebracorn?"), D)
+    name = Path(out["path"]).name
+    assert wiki.slugify(tok) not in name and "a1b2a1b2" not in name
+    for f in ("index.md", "log-2026.md"):
+        assert "a1b2a1b2" not in (_wiki(ctx) / f).read_text()
+
+
+def test_type_constants_match_the_indexer():
+    assert wiki.INDEX_TYPE in vault_index._UNINDEXED_TYPES
+    assert wiki.PAGE_TYPE in vault_index._TYPE_SCORES_BY_CONTEXT["general"]

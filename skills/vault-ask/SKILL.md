@@ -7,9 +7,11 @@ metadata:
 
 # Vault Ask
 
-Synthesizes a reasoned answer to the user's question by searching session and insight notes in the Obsidian vault and citing sources. Returns a grounded answer, not a list of matches.
+Synthesizes a reasoned answer to the user's question by searching session, insight and wiki notes in the Obsidian vault and citing sources. Returns a grounded answer, not a list of matches. Answers that draw on 3 or more notes can be saved as wiki pages (#383), which later asks find first.
 
-**Tools needed:** Grep, Read, Bash
+**Tools needed:** Grep, Read, Bash, Write, AskUserQuestion
+
+**Arguments:** `/vault-ask <question>` or `/vault-ask --caller <name> <question>`. Workflows and sub-agents that run vault-ask mid-task pass `--caller` with their own name. `<name>` must match `^[a-z0-9][a-z0-9_.-]{0,63}$`; anything else stays part of the question, and the run counts as user-typed. Store `CALLER` (empty when user-typed).
 
 ## Procedure
 
@@ -51,10 +53,12 @@ print("VAULT=" + c["vault_path"])
 print("SESS=" + c.get("sessions_folder", "claude-sessions"))
 print("INS=" + c.get("insights_folder", "claude-insights"))
 print("PROJECT=" + project)
+print("WIKI=" + (c.get("wiki_folder") or ""))
+print("HOOKS=" + _ob_hooks())
 '
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`.
+Parse each output line as KEY=VALUE, splitting on the first `=`. An empty `WIKI` means the wiki is turned off: skip Step 2b and the filing gate in Step 8. `HOOKS` is the plugin's hooks directory; paste it literally where later commands say `<hooks_dir>`.
 
 If the command exits non-zero or prints ERROR, tell the user:
 
@@ -62,10 +66,11 @@ If the command exits non-zero or prints ERROR, tell the user:
 
 Stop here if config is missing.
 
-Construct the two search directories:
+Construct the search directories (`WIKI_DIR` only when `WIKI` is not empty):
 
 - `SESSIONS_DIR` = `<vault_path>/<sessions_folder>`
 - `INSIGHTS_DIR` = `<vault_path>/<insights_folder>`
+- `WIKI_DIR` = `<vault_path>/<wiki_folder>` (it may not exist yet; that is fine)
 
 Validate vault access:
 
@@ -87,7 +92,28 @@ The user provides a question after `/vault-ask`. Extract 3–6 key search terms 
 - **Concept keywords** — e.g. `error handling`, `rate limiting`, `caching`
 - **Action words indicating note types** — e.g. `decided` → look for decision notes, `fixed` → look for error-fix notes
 
-Store the extracted terms as `SEARCH_TERMS`. Keep the original question for use in Step 7.
+Store the extracted terms as `SEARCH_TERMS`. Keep the original question for use in Steps 2b and 7.
+
+### Step 2b — Check the wiki first
+
+Skip this step when `WIKI` is empty.
+
+**How to call `wiki.py`.** Every call takes a JSON payload. Write it with the Write tool to `~/.claude/obsidian-brain/wiki-payload-<8 random hex>.json` (that directory is private to the user), run the command with the file on stdin, then delete the file. Never build the JSON in a shell string: questions and answers contain quotes.
+
+```bash
+python3 '<hooks_dir>/wiki.py' lookup < ~/.claude/obsidian-brain/wiki-payload-<hex>.json; rm -f ~/.claude/obsidian-brain/wiki-payload-<hex>.json
+```
+
+`wiki.py` prints one JSON object. Exit 1 means it refused: show its `ERROR:` line and do not say anything was saved. Exit 2 is a crash: show stderr. The commands below are written as `python3 "<hooks_dir>/wiki.py" <command>`, always with a payload file on stdin.
+
+1. Run `python3 "<hooks_dir>/wiki.py" lookup` with `{"question": "<original question>"}`. It returns up to 3 `candidates` (`path`, `question`, `updated`).
+2. Decide whether a candidate asks the **same question** as the user (same intent, not just shared words). If none does, continue with Step 3.
+3. If one does, run `python3 "<hooks_dir>/wiki.py" stale` with `{"page": "<its path>"}`. It returns `stale` and `reasons`.
+   - **Fresh:** read the page and present its answer. Cite it as `[[<page file name>]]` and say "From the wiki (updated `<updated>`)". Skip Steps 3–7. In Step 8, save nothing.
+   - **Stale, and the page is not marked reviewed:** continue with Steps 3–7. Add the page's `sources` to `CANDIDATE_FILES`. Step 8 refreshes the page without asking and tells the user why, using `reasons`.
+   - **Stale, and the page is marked reviewed** (its frontmatter has `reviewed:` set to anything other than empty, `false`, `no`, `off` or `0`): answer from the page and warn that its sources changed, listing `reasons`.
+     - User-typed run: ask with AskUserQuestion. Options: "Keep my page" (save nothing), "Refresh and overwrite my edits" (run Steps 3–7, then in Step 8 file with `update` and `"override_reviewed": true`), "Save the fresh answer as a new page" (run Steps 3–7, then in Step 8 file a new page).
+     - `--caller` run: add one line that the page is reviewed and stale, and save nothing.
 
 ### Step 3 — FTS pre-filter (fast path)
 
@@ -130,9 +156,13 @@ print(json.dumps(results))
 
 If the output is a non-empty JSON array with 5+ results: extract the `path` field from each result and use those file paths as `CANDIDATE_FILES`. Skip Step 4 entirely and proceed directly to Step 5.
 
+In `CANDIDATE_FILES` (here and after Step 4), keep at most 3 notes of type `claude-wiki`, and drop any note of type `claude-wiki-index` (the wiki's own index and log files). Wiki pages are syntheses; the cap keeps raw notes in the top 10.
+
 If fewer than 5 results or the command fails (non-zero exit, invalid JSON, import error): fall through to Step 4 to cast a wider net with parallel Grep agents.
 
 ### Step 4 — Search vault (3 parallel agents)
+
+When `WIKI_DIR` exists, every search below also covers it: run each Grep call once more with `path=WIKI_DIR`, and pass `<wiki_folder>` as a third folder to `vault_scan.py grep`.
 
 Launch three Grep searches in parallel — one per agent below. Use the Grep tool (never Bash grep). If the Grep tool is not in your tool list, go straight to vault_scan.py grep — do not call Grep first. See the fallback below.
 
@@ -185,7 +215,7 @@ def _ob_hooks():
 print(_ob_hooks())
 ")
 test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' --pattern='<term>' --ignore-case
+python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' '<wiki_folder>' --pattern='<term>' --ignore-case
 ```
 
 Combine results from all three agents. Deduplicate by file path. Store as `CANDIDATE_FILES`.
@@ -203,7 +233,7 @@ Score each file in `CANDIDATE_FILES` using these rules:
 | Condition | Points |
 |-----------|--------|
 | Each search term found in content (Agent 1 or 2 match) | +2 per term |
-| Note type is `claude-insight`, `claude-decision`, or `claude-error-fix` | +3 |
+| Note type is `claude-insight`, `claude-decision`, `claude-error-fix` or `claude-wiki` | +3 |
 | Note type is `claude-session` | +1 |
 | File date is within the last 30 days (relative to today) | +1 |
 | Matching tag found (Agent 3 match) | +2 |
@@ -314,11 +344,28 @@ Using `NOTE_SUMMARIES`, synthesize a comprehensive answer to the user's question
 If the notes contain contradictory information (e.g. a decision was changed later), surface that explicitly:
 > "You initially chose X ([[older-note]]), but later switched to Y ([[newer-note]])."
 
-### Step 8 — Present answer
+### Step 8 — Present answer, then the filing gate
 
-Display the synthesized answer from Step 7 in the conversation.
+Display the synthesized answer from Step 7 in the conversation first. A failed save never loses the answer.
 
-Do NOT write anything to the vault — this skill is read-only.
+Then decide whether to save it as a wiki page. Skip all of this when `WIKI` is empty, or when Step 2b answered from a fresh page.
+
+1. **Count.** Run `python3 "<hooks_dir>/wiki.py" count` with `{"sources": [<every note cited in Sources, by file name>], "memory_sources": []}`. If `count` is below 3, save nothing and say nothing about the wiki. Only insights, error-fixes, decisions, retros, sessions and migrated memory notes count; a snapshot counts as its parent session.
+2. **Write the page body.** Run `python3 "<hooks_dir>/wiki.py" rule` and rewrite the answer under that rule. Keep the `### Sources` section and every `[[wikilink]]` exactly. The chat answer keeps its normal style; only the page uses the rule.
+3. **Choose the action:**
+   - **Stale refresh** (from Step 2b, page not reviewed, or the user chose "Refresh and overwrite my edits"): file with `"update": "<page path>"` (plus `"override_reviewed": true` only when the user chose to overwrite). Do not ask. Tell the user the page was refreshed and why.
+   - **`--caller` run:** run `lookup` with the question. If a candidate asks the same question and is not reviewed, file with `update`; if that candidate is reviewed, save nothing and name the page. Otherwise file a new page with `"filed_by": "auto"` and `"caller": "<CALLER>"`. Do not ask. Print one line naming the page saved or updated.
+   - **User-typed run:** ask with AskUserQuestion. Options: "Save as a new wiki page", "Update existing page [[…]]" (only when `lookup` found a same-question candidate that is not reviewed), "Skip". Skip saves nothing.
+4. **File.** Run `python3 "<hooks_dir>/wiki.py" file` with:
+
+   ```json
+   {"question": "<original question>", "body": "<page body from step 2>",
+    "sources": ["<note>", "..."], "memory_sources": [], "topics": ["<topic>", "..."],
+    "confidence": "high|medium|low", "filed_by": "user|auto", "caller": "<only when auto>",
+    "update": "<page path, only when updating>"}
+   ```
+
+   `confidence` follows your certainty wording from Step 7: "You explicitly decided" → `high`, "it appears" → `medium`, "Limited context" → `low`. `topics` are up to 8 short lowercase slugs (`[a-z0-9-]`) for the main subjects. On exit 0, name the page (`path`). On exit 1, show the `ERROR:` line and do not say the page was saved.
 
 If the user asks a follow-up question, return to Step 2 with the new question.
 
@@ -328,6 +375,8 @@ If the user asks a follow-up question, return to Step 2 with the new question.
 `/vault-ask` returns a reasoned, cited answer synthesized from note content.
 
 Use `/vault-ask` when the user wants to know _what_ their notes say, not _which_ notes match.
+
+`/vault-ask` can also write: it saves an answer as a wiki page in `<wiki_folder>/queries/` when the answer draws on 3 or more notes, after asking (or automatically with `--caller`). It never saves an answer drawn from fewer than 3 notes.
 
 ## Edge Cases
 

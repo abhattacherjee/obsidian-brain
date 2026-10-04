@@ -22,7 +22,7 @@ _FALLBACK_HEAD = "**If the Grep tool is not available in this session**"
 _FALLBACK_CMD = {
     "vault-ask": (
         "python3 \"$HOOKS/vault_scan.py\" grep '<vault_path>' '<sessions_folder>' "
-        "'<insights_folder>' --pattern='<term>' --ignore-case"
+        "'<insights_folder>' '<wiki_folder>' --pattern='<term>' --ignore-case"
     ),
     "vault-search": (
         "python3 \"$HOOKS/vault_scan.py\" grep '<vault_path>' '<sessions_folder>' "
