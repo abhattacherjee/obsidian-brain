@@ -344,12 +344,12 @@ Move all upgraded files from `UNSUMMARIZED` into the working set alongside `SUMM
 
 > **Security:** If you need to write temp files during distillation, use `~/.claude/obsidian-brain/` (NOT `/tmp/`). This is a security requirement — predictable `/tmp` paths are vulnerable to symlink attacks.
 
-Collect all matched files (now all summarized). Apply the /context-shield rule:
+Collect all matched files (now all summarized). Apply the /context:shield rule (was `context-shield`):
 
-For each note, check its size using `wc -l`. Apply the context-shield rule **per note** based on size:
+For each note, check its size using `wc -l`. Apply the context:shield rule **per note** based on size:
 
 - **Notes under ~100 lines (~3000 tokens):** Read directly using the Read tool.
-- **Notes over ~100 lines:** Spawn a `/context-shield` sub-agent to read in isolation and return a distilled summary.
+- **Notes over ~100 lines:** Spawn a `/context:shield` sub-agent to read in isolation and return a distilled summary.
 
 When multiple notes need sub-agent reads, spawn them in parallel (one sub-agent per note).
 

@@ -297,7 +297,7 @@ Sort `CANDIDATE_FILES` by score descending. Take the top 10. Store as `RANKED_FI
 Read the top 5–10 files from `RANKED_FILES`. Apply the following size-based strategy:
 
 - **Files under ~100 lines:** Read directly with the Read tool.
-- **Files over ~100 lines:** Use the `/context-shield` skill (parallel, one sub-agent per file). Each sub-agent reads the file in isolation and returns a distilled summary relevant to the question.
+- **Files over ~100 lines:** Use the `/context:shield` skill (parallel, one sub-agent per file). Each sub-agent reads the file in isolation and returns a distilled summary relevant to the question.
 
 For each file, extract:
 - Note type (session, insight, decision, error-fix, snapshot, memory)
