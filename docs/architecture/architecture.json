@@ -222,7 +222,7 @@
           "files": [
             "hooks/obsidian_utils.py"
           ],
-          "purpose": "Reads the machine-local config JSON over deepcopy(_DEFAULTS), session-scoped cached by cwd-derived SID. Side-effect: auto-chmods the config to 0600 if group/world bits are set. indexed_folders(config) (#383) returns the folders user-facing search indexes, [sessions_folder, insights_folder, wiki_folder] (wiki_folder default claude-wiki; empty disables it; an invalid value is dropped with a warning). Every skill/script ensure_index/rebuild_index call uses it; tests/test_indexed_folders.py parses each call's folder argument and fails on a literal list. build_context_brief and open_item_dedup keep explicit lists because they receive folders as parameters; _sync deletes only under scanned folders, so wiki rows survive those calls."
+          "purpose": "Reads the machine-local config JSON over deepcopy(_DEFAULTS), session-scoped cached by cwd-derived SID. Side-effect: auto-chmods the config to 0600 if group/world bits are set. indexed_folders(config) (#383) returns the folders user-facing search indexes, [sessions_folder, insights_folder, wiki_folder] (wiki_folder default claude-wiki; empty disables it; an invalid value is dropped with a warning). Every skill and top-level scripts/ ensure_index/rebuild_index call uses it (scripts/dev-test/ exempt); tests/test_indexed_folders.py parses each call's folder argument and fails unless it is the helper call, with a per-call allow-list for build_context_brief and open_item_dedup, which receive folders as parameters. _sync deletes only under scanned folders, so wiki rows survive those calls, except when ensure_index recreates a corrupt or legacy DB from the folders it was given. strict=True (used by /vault-reindex and /obsidian-setup, whose rebuild prunes rows outside its folders) raises on an invalid wiki_folder instead of dropping it. load_config(fresh=True) skips the per-session config cache."
         },
         {
           "id": "session-context",
@@ -474,7 +474,7 @@
           "files": [
             "hooks/vault_index.py"
           ],
-          "purpose": "Default non-destructive rebuild preserves access_log, themes and theme_members (activation/centroid/surprise), with an absolute-path safety guard that skips orphan-prune on path-format drift. Also runs _backfill_missing_tfidf_vectors() to populate tfidf_vector for any notes that still have it NULL (notes indexed before the vector-storage migration), so the /compress cosine gate applies to all candidates rather than fail-opening on vectorless notes (#255). full=True is the legacy total wipe for corrupt schema."
+          "purpose": "Default non-destructive rebuild preserves access_log, themes and theme_members (activation/centroid/surprise), with an absolute-path safety guard that skips orphan-prune on path-format drift. Also runs _backfill_missing_tfidf_vectors() to populate tfidf_vector for any notes that still have it NULL (notes indexed before the vector-storage migration), so the /compress cosine gate applies to all candidates rather than fail-opening on vectorless notes (#255). full=True is the legacy total wipe for corrupt schema. Preserve mode reports foreign_deleted: rows dropped for being outside every scanned folder (#383)."
         },
         {
           "id": "upsert-note",

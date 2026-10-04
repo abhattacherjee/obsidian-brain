@@ -53,8 +53,6 @@ if not c.get("vault_path"):
     print("ERROR: vault_path not configured", file=sys.stderr)
     sys.exit(1)
 print("VAULT=" + c["vault_path"])
-print("SESS=" + c.get("sessions_folder", "claude-sessions"))
-print("INS=" + c.get("insights_folder", "claude-insights"))
 '
 ```
 
@@ -78,7 +76,7 @@ Wait for confirmation. Abort if the user does not reply `yes`. If cancelled, tel
 
 ### Step 3 — Rebuild
 
-Run, passing the config values and `FULL_MODE` as command-line arguments:
+Run, passing `VAULT_PATH` and `FULL_MODE` as command-line arguments. The folders come from a fresh read of the config (`indexed_folders(load_config(fresh=True), strict=True)`), not the session cache:
 
 ```bash
 python3 -c '
@@ -105,7 +103,15 @@ from obsidian_utils import load_config, indexed_folders
 from vault_index import rebuild_index
 t0 = time.time()
 full = sys.argv[2].lower() == "true"
-stats = rebuild_index(sys.argv[1], indexed_folders(load_config()), full=full)
+try:
+    folders = indexed_folders(load_config(fresh=True), strict=True)
+except ValueError as exc:
+    # A rebuild prunes rows outside the scanned folders; refuse rather than
+    # silently drop the wiki folder and its rows (#393).
+    print(f"ERROR: {exc}. Fix it with /vault-config, then re-run.", file=sys.stderr)
+    sys.exit(1)
+stats = rebuild_index(sys.argv[1], folders, full=full)
+stats["folders"] = [{"name": f, "exists": os.path.isdir(os.path.join(sys.argv[1], f))} for f in folders]
 stats["elapsed"] = round(time.time() - t0, 1)
 # Derive mode from the returned stats, not the CLI flag — rebuild_index()
 # can fall through to a full rebuild internally (missing DB, legacy schema)
@@ -131,6 +137,8 @@ Parse the JSON output from Step 3. Extract:
 - `unchanged` — notes whose mtime matched the index; nothing to do, the healthy common case
 - `malformed` — notes whose frontmatter failed to parse (true total, not capped): dropped from the index if never indexed before, or, if already indexed, left at its last-good indexed content
 - `malformed_files` — list of `{"file": <sanitized basename>, "reason": <classifier>}`, capped (currently 20 entries) even when `malformed` is larger
+- `foreign_deleted` — rows dropped because their path is outside every scanned folder (non-destructive mode only)
+- `folders` — list of `{"name", "exists"}` for each folder scanned
 - `excluded` — notes skipped on purpose because their type is never indexed (the wiki's own `index.md` and `log-*.md` files, typed `claude-wiki-index`, #383); not a problem
 - `elapsed` — time in seconds
 - `by_type` — dict mapping note type to count
@@ -150,7 +158,7 @@ Present this report:
 >
 > Unchanged: `<unchanged>` file(s) already indexed (nothing to do). Malformed: `<malformed>` file(s) with frontmatter that failed to parse.
 
-The index covers the folders from `indexed_folders(config)`: sessions, insights and the wiki folder (`wiki_folder`, default `claude-wiki`). If `excluded` is greater than 0, add: "Skipped `<excluded>` wiki index/log file(s) (not knowledge, never indexed)."
+Add a line naming the scanned folders from `folders`, marking each one whose `exists` is false as "(missing — nothing indexed)". A missing `wiki_folder` usually means a typo in the config or that `/obsidian-setup` has not been re-run. If `excluded` is greater than 0, add: "Skipped `<excluded>` wiki index/log file(s) (not knowledge, never indexed)." If `foreign_deleted` is greater than 0, add: "Dropped `<foreign_deleted>` row(s) for notes outside the scanned folders (a folder was renamed or removed from the config, or old test data)."
 
 Only include rows in the table for types that appear in `by_type` (omit zero-count types). Sort rows by count descending.
 

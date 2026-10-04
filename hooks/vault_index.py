@@ -1187,9 +1187,11 @@ def rebuild_index(
     or when the derivable tables need a clean-slate rebuild.
 
     Returns ``{"inserted": N, "skipped": M, "unchanged": U, "malformed": F,
-    "malformed_files": [...], "by_type": {...}}`` (``skipped == unchanged +
-    malformed``; see ``_sync``) plus, in non-destructive mode, ``"preserved":
-    {...}`` and ``"pruned_orphans": {...}`` reporting the Friston-table delta.
+    "malformed_files": [...], "excluded": E, "deleted": D, "by_type": {...}}``
+    (every ``_sync`` stat; ``skipped == unchanged + malformed``) plus, in
+    non-destructive mode, ``"foreign_deleted"`` (rows dropped because their
+    path is outside every scanned folder), ``"preserved": {...}`` and
+    ``"pruned_orphans": {...}`` reporting the Friston-table delta.
     """
     if db_path is None:
         db_path = _default_db_path()
@@ -1285,6 +1287,9 @@ def rebuild_index(
             # failure leaves access_log (which we haven't touched) and
             # the preserved rows from Step 1 intact.
             stats = _sync(conn, vault_path, folders)
+            # Rows dropped in Step 1 for being outside every scanned folder.
+            # Counted so a dropped folder is visible in the report (#393).
+            stats["foreign_deleted"] = len(foreign)
 
             # Step 3: Orphan prune for access_log / theme_members. Path-
             # format invariant: note_path columns and notes.path must all

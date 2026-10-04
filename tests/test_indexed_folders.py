@@ -58,17 +58,22 @@ def test_does_not_mutate_input():
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Files that legitimately pass explicit folder lists, with the reason.
+# Exact (file, folder-argument) pairs that may pass an explicit list, with
+# the reason. Per call, not per file: a new literal call in these files is
+# still flagged.
 _ALLOWED = {
-    # Receive sessions/insights as parameters from callers, not a config.
-    # Safe: _sync deletes only under scanned folders, so wiki rows survive.
-    "hooks/obsidian_utils.py": "build_context_brief takes folder params",
-    "hooks/open_item_dedup.py": "deep_analysis_pipeline takes folder params",
-    # Defines the functions; rebuild_index recurses with its own argument.
-    "hooks/vault_index.py": "definition site",
+    # Receive sessions/insights as parameters, not a config. Safe for wiki
+    # rows: _sync deletes only under the folders it scans (pinned by
+    # test_two_folder_ensure_index_keeps_wiki_rows). Exception: ensure_index
+    # recreates a corrupt or pre-body-column DB from only these folders; the
+    # next helper-driven sync re-adds the wiki rows.
+    ("hooks/obsidian_utils.py", "[sessions_folder, insights_folder]"),
+    ("hooks/open_item_dedup.py", "folders"),
+    # rebuild_index's own fallback recursion passes its parameter through.
+    ("hooks/vault_index.py", "folders"),
 }
 
-_CALL_RE = re.compile(r"\b(ensure_index|rebuild_index)\(")
+_CALLEES = ("ensure_index", "rebuild_index")
 
 
 def _scanned_files(root: Path) -> list:
@@ -79,10 +84,11 @@ def _scanned_files(root: Path) -> list:
     return sorted(files)
 
 
-def _second_arg(text: str, open_paren: int) -> str:
-    """Source text of the call's second positional argument ('' if none)."""
+def _call_args(text: str, open_paren: int):
+    """(list of argument source strings, index after the closing paren)."""
     depth, args, cur = 0, [], []
-    for ch in text[open_paren:]:
+    for i in range(open_paren, len(text)):
+        ch = text[i]
         if ch in "([{":
             depth += 1
             if depth > 1:
@@ -91,39 +97,61 @@ def _second_arg(text: str, open_paren: int) -> str:
             depth -= 1
             if depth == 0:
                 args.append("".join(cur).strip())
-                break
+                return args, i + 1
             cur.append(ch)
         elif ch == "," and depth == 1:
             args.append("".join(cur).strip())
             cur = []
         else:
             cur.append(ch)
-    return args[1] if len(args) > 1 else ""
+    return args, len(text)
+
+
+def _is_whole_helper_call(expr: str) -> bool:
+    """True only for ``indexed_folders(...)`` with nothing after its paren."""
+    if not expr.startswith("indexed_folders("):
+        return False
+    _, end = _call_args(expr, len("indexed_folders"))
+    return end == len(expr)
+
+
+def _names(text: str) -> list:
+    names = list(_CALLEES)
+    for m in re.finditer(r"\b(?:ensure_index|rebuild_index)\s+as\s+(\w+)", text):
+        names.append(m.group(1))
+    return names
+
+
+def _violations_text(text: str, rel: str) -> list:
+    out = []
+    call_re = re.compile(r"\b(" + "|".join(map(re.escape, _names(text))) + r")\(")
+    for m in call_re.finditer(text):
+        before = text[text.rfind("\n", 0, m.start()) + 1:m.start()]
+        if re.search(r"\bdef\s+$", before) or re.search(r"\bimport\s+$|\bas\s+$", before):
+            continue  # the definition itself, or an import line
+        args, _ = _call_args(text, m.end() - 1)
+        arg = args[1] if len(args) > 1 else ""
+        if not arg or _is_whole_helper_call(arg):
+            continue
+        if re.fullmatch(r"[A-Za-z_]\w*", arg):
+            assigns = list(re.finditer(rf"\b{arg}\s*=(?!=)\s*(.*)", text[:m.start()]))
+            if assigns and _is_whole_helper_call(assigns[-1].group(1).strip()):
+                continue
+        if (rel, arg) in _ALLOWED:
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        out.append(f"{rel}:{line}: {arg}")
+    return out
 
 
 def _violations(path: Path, root: Path) -> list:
     text = path.read_text(encoding="utf-8", errors="replace")
-    out = []
-    for m in _CALL_RE.finditer(text):
-        line_start = text.rfind("\n", 0, m.start()) + 1
-        before = text[line_start:m.start()]
-        if before.lstrip().startswith(("def ", "#")) or "``" in before:
-            continue
-        arg = _second_arg(text, m.end() - 1)
-        if not arg or arg.startswith("indexed_folders("):
-            continue
-        if re.fullmatch(r"[A-Za-z_]\w*", arg) and re.search(rf"\b{arg}\s*=\s*indexed_folders\(", text):
-            continue
-        line = text.count("\n", 0, m.start()) + 1
-        out.append(f"{path.relative_to(root)}:{line}: {arg}")
-    return out
+    return _violations_text(text, str(path.relative_to(root)))
 
 
 def test_every_index_call_uses_indexed_folders():
     bad = []
     for p in _scanned_files(REPO):
-        if str(p.relative_to(REPO)) in _ALLOWED:
-            continue
         bad += _violations(p, REPO)
     assert not bad, "pass folders via indexed_folders(config):\n" + "\n".join(bad)
 
@@ -146,3 +174,82 @@ def test_guard_accepts_the_helper(tmp_path):
     p.write_text("folders = indexed_folders(c)\ndb = ensure_index(vp, folders)\n"
                  "rebuild_index(v, indexed_folders(c), full=True)\n")
     assert not _violations(p, tmp_path)
+
+
+# --- review fix wave (#393) -------------------------------------------------
+
+import pytest
+
+
+def test_strict_raises_on_invalid_wiki_folder():
+    # /vault-reindex and /obsidian-setup prune rows outside the folders they
+    # scan; silently dropping a bad wiki_folder there deletes the wiki rows.
+    with pytest.raises(ValueError, match="wiki_folder"):
+        indexed_folders({"wiki_folder": "~/claude-wiki"}, strict=True)
+    with pytest.raises(ValueError, match="wiki_folder"):
+        indexed_folders({"wiki_folder": 5}, strict=True)
+
+
+def test_strict_accepts_valid_and_empty():
+    assert indexed_folders({"wiki_folder": "w"}, strict=True)[-1] == "w"
+    assert indexed_folders({"wiki_folder": ""}, strict=True) == ["claude-sessions", "claude-insights"]
+
+
+def test_wiki_folder_is_normalised_before_dedup():
+    assert indexed_folders({"wiki_folder": "./claude-wiki/"})[-1] == "claude-wiki"
+    assert indexed_folders({"wiki_folder": "claude-sessions/"}) == ["claude-sessions", "claude-insights"]
+
+
+def test_load_config_fresh_bypasses_session_cache(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text('{"vault_path": "/v", "wiki_folder": "new-wiki"}')
+    monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", cfg)
+    monkeypatch.setattr(obsidian_utils, "cache_get", lambda sid, key: {"vault_path": "/v", "wiki_folder": "old"})
+    monkeypatch.setattr(obsidian_utils, "cache_set", lambda sid, key, val: None)
+    assert obsidian_utils.load_config()["wiki_folder"] == "old"
+    assert obsidian_utils.load_config(fresh=True)["wiki_folder"] == "new-wiki"
+
+
+def test_guard_catches_sliced_helper(tmp_path):
+    p = tmp_path / "x.py"
+    p.write_text("db = ensure_index(vp, indexed_folders(c)[:2])\n")
+    assert _violations(p, tmp_path)
+
+
+def test_guard_catches_reassigned_name(tmp_path):
+    p = tmp_path / "x.py"
+    p.write_text("folders = indexed_folders(c)\nfolders = folders[:2]\ndb = ensure_index(vp, folders)\n")
+    assert _violations(p, tmp_path)
+
+
+def test_guard_catches_one_line_def(tmp_path):
+    p = tmp_path / "x.py"
+    p.write_text("def f(c): return ensure_index(c, [a, b])\n")
+    assert _violations(p, tmp_path)
+
+
+def test_guard_catches_import_alias(tmp_path):
+    p = tmp_path / "x.py"
+    p.write_text("from vault_index import rebuild_index as ri\nri(v, [a, b])\n")
+    assert _violations(p, tmp_path)
+
+
+def test_guard_catches_call_after_backticks(tmp_path):
+    p = tmp_path / "x.py"
+    p.write_text("x = '``'; ensure_index(vp, [a, b])\n")
+    assert _violations(p, tmp_path)
+
+
+def test_guard_still_skips_definitions_and_prose(tmp_path):
+    p = tmp_path / "x.py"
+    p.write_text("def ensure_index(vault_path, folders, db_path=None):\n    pass\n"
+                 "# see rebuild_index() for details\n")
+    assert not _violations(p, tmp_path)
+
+
+def test_allow_list_is_per_call_not_per_file():
+    # A new literal call in an allow-listed file must still be flagged.
+    text = (REPO / "hooks" / "obsidian_utils.py").read_text(encoding="utf-8")
+    probe = text + "\n\ndef _probe(v):\n    return ensure_index(v, ['a', 'b'])\n"
+    found = _violations_text(probe, "hooks/obsidian_utils.py")
+    assert any("['a', 'b']" in v for v in found), found

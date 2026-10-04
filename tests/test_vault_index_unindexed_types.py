@@ -87,3 +87,36 @@ def test_rebuild_with_wiki_folder_keeps_wiki_rows(tmp_path):
     assert _paths(db) == {"s.md", "10-03-q.md"}
     vault_index.rebuild_index(str(vault), folders, db_path=db, full=True)  # full
     assert _paths(db) == {"s.md", "10-03-q.md"}
+
+
+def _three(tmp_path):
+    vault = tmp_path / "v"
+    _write(vault / "claude-sessions" / "s.md", "claude-session")
+    _write(vault / "claude-wiki" / "queries" / "2026" / "10-03-q.md", "claude-wiki")
+    db = str(tmp_path / "i.db")
+    vault_index.ensure_index(str(vault), ["claude-sessions", "claude-insights", "claude-wiki"], db_path=db)
+    return vault, db
+
+
+def test_two_folder_ensure_index_keeps_wiki_rows(tmp_path):
+    # Pins the claim behind the guard's allow-list: _sync deletes only under
+    # the folders it scans, so hooks that pass sessions+insights keep wiki rows.
+    vault, db = _three(tmp_path)
+    vault_index.ensure_index(str(vault), ["claude-sessions", "claude-insights"], db_path=db)
+    assert _paths(db) == {"s.md", "10-03-q.md"}
+
+
+def test_two_folder_preserve_rebuild_drops_and_counts_wiki_rows(tmp_path):
+    # Why rebuild_index callers must use indexed_folders: preserve mode prunes
+    # rows outside its folders. The prune is now counted, not silent.
+    vault, db = _three(tmp_path)
+    stats = vault_index.rebuild_index(str(vault), ["claude-sessions", "claude-insights"], db_path=db)
+    assert _paths(db) == {"s.md"}
+    assert stats["foreign_deleted"] == 1
+
+
+def test_preserve_rebuild_reports_zero_foreign_when_nothing_dropped(tmp_path):
+    vault, db = _three(tmp_path)
+    stats = vault_index.rebuild_index(str(vault), ["claude-sessions", "claude-insights", "claude-wiki"], db_path=db)
+    assert stats["foreign_deleted"] == 0
+    assert stats["excluded"] == 0

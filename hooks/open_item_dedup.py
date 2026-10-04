@@ -1279,6 +1279,8 @@ def deep_analysis_pipeline(
     # Explicit list (not indexed_folders): folders arrive as parameters, and
     # the scans below look for open `- [ ]` items, which wiki pages never
     # carry. Safe for wiki rows (#383): _sync deletes only under scanned folders.
+    # Exception: on a corrupt or pre-body-column DB, ensure_index recreates it
+    # from only these folders; the next indexed_folders() sync re-adds them.
     folders = [sessions_folder, insights_folder]
     try:
         actual_db = vault_index.ensure_index(vault_path, folders, db_path=db_path)

@@ -62,7 +62,7 @@ Obsidian Brain Configuration
 1. vault_path             <value>
 2. sessions_folder        <value>
 3. insights_folder        <value>
-4. wiki_folder            <value>      <- /vault-ask wiki pages (empty = off)
+4. wiki_folder            <value>      <- wiki pages from /vault-ask (#383; empty = off)
 5. log_raw_messages       <value>      <- controls raw conversation logging
 6. min_turns              <value>      <- minimum turns to log a session
 7. min_duration_minutes   <value>      <- minimum duration to log
@@ -120,5 +120,7 @@ print("OK")
 ```
 
 Where `$KEY` is the setting name and `$JSON_VALUE` is the new value as a JSON literal (e.g., `"false"`, `"3"`, `'"/path/to/vault"'`).
+
+If the changed key is `sessions_folder`, `insights_folder` or `wiki_folder`: other skills in this session read a cached copy of the config, so tell the user to run `/vault-reindex`, which reads the config fresh and re-indexes the new folders. For `wiki_folder`, first check the value: it must be a relative folder name with no `..`, `~` or dot-prefixed segment (an empty value turns the wiki folder off). `/vault-reindex` refuses an invalid value and names it.
 
 Confirm the change, then go back to Step 2 to redisplay the table.

@@ -563,7 +563,13 @@ def _ob_hooks():
 sys.path.insert(0, _ob_hooks())
 from obsidian_utils import load_config, indexed_folders
 from vault_index import rebuild_index
-counts = rebuild_index(sys.argv[1], indexed_folders(load_config()))
+try:
+    # fresh=True: Step 7 may have just rewritten the config this session.
+    folders = indexed_folders(load_config(fresh=True), strict=True)
+except ValueError as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    sys.exit(1)
+counts = rebuild_index(sys.argv[1], folders)
 print(json.dumps(counts))
 ' "$VAULT_PATH"
 ```
@@ -786,7 +792,7 @@ This is a soft nudge — a non-blocking suggestion, not automatic execution.
 >
 > - Vault path: `<VAULT_PATH>`
 > - Config written to: `~/.claude/obsidian-brain-config.json`
-> - Folders created: `claude-sessions/`, `claude-insights/`, `claude-dashboards/`
+> - Folders created: `claude-sessions/`, `claude-insights/`, `claude-dashboards/`, `claude-wiki/`
 > - Dashboards installed: `sessions-overview.md`, `project-index.md`, `weekly-review.md`, `learning-velocity.md`, `decision-timeline.md`, `open-items.md`
 > - Claudeception nudge: configured (run `/compress` reminder after knowledge extraction)
 > - Vault index: N notes indexed (run `/vault-reindex` to rebuild) — _or omit this line if Step 8.5 failed_
