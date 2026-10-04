@@ -2,13 +2,17 @@
 
 Library + JSON CLI (``python3 hooks/wiki.py rule|lookup|stale|count|file``).
 Every vault write goes through ``write_vault_note`` (atomic, 0o600,
-contained under the vault) while holding one wiki lock. Design:
+contained under the vault) while holding one wiki lock. The one exception:
+``rebuild_wiki_index`` deletes stale ``index-*.md`` files directly (only
+those typed ``claude-wiki-index``). Design:
 ``docs/plans/383-llm-wiki-design.md``.
 
 CLI contract: subcommands that take input read one JSON object on stdin
 (capped at ``STDIN_CAP_CHARS``) and print one JSON object on stdout. Exit 0
-is success; exit 1 is a refusal with an ``ERROR: <reason>`` line on stderr;
-exit 2 is a usage error or a crash.
+is success; ``file`` also exits 0 when the page was saved but the index or
+log update failed, and then adds a ``WARNING: <warning>`` line on stderr.
+Exit 1 is a refusal with an ``ERROR: <reason>`` line on stderr; exit 2 is a
+usage error (no or unknown subcommand) or a crash.
 """
 from __future__ import annotations
 
@@ -219,35 +223,66 @@ def fingerprint(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
 
 
+def _unquote(value) -> str:
+    """Undo the JSON escaping ``render_page`` gave a title.
+
+    The indexer stores the raw frontmatter value with ``.strip('"')``, so
+    ``"He said \\"hi\\""`` arrives as ``He said \\"hi\\`` (outer quotes
+    gone, and a trailing escaped quote loses its ``"``). Re-wrap and decode;
+    a value that does not decode (a hand-edited title) is kept as it is.
+    """
+    s = str(value or "")
+    if "\\" not in s and not (len(s) >= 2 and s[0] == s[-1] == '"'):
+        return s
+    inner = s[1:-1] if len(s) >= 2 and s[0] == s[-1] == '"' else s
+    for candidate in (inner, inner + '"'):
+        try:
+            decoded = json.loads('"' + candidate + '"')
+        except ValueError:
+            continue
+        return " ".join(decoded.split())
+    return s
+
+
 def lookup(db_path: str, question: str, limit: int = 3) -> list:
-    """Top wiki pages for ``question`` by FTS rank on the indexed title."""
+    """Top wiki pages for ``question`` via ``vault_index.search_vault``
+    (BM25 candidates, then reranked; it also logs an access for each hit).
+    Each candidate carries ``path``, ``question`` (unescaped title),
+    ``updated`` and the initial FTS ``rank``."""
     import vault_index
 
     if not str(question or "").strip():
         return []
     hits = vault_index.search_vault(db_path, question, note_type=PAGE_TYPE, limit=limit)
-    return [{"path": h.get("path"), "question": h.get("title") or "",
+    return [{"path": h.get("path"), "question": _unquote(h.get("title")),
              "updated": h.get("date") or "", "rank": h.get("rank", h.get("score"))}
             for h in hits[:limit]]
 
 
 def stale(db_path: str, page_path, roots) -> dict:
-    """Why a page is stale: ``changed:``/``missing:`` per source, ``newer:``
-    per newer counting note in the question's top 5 hits. All reasons are
-    returned. An unreadable source counts as missing, never as fresh."""
-    import vault_index
-
+    """Why a page is stale: ``unverifiable:``/``changed:``/``missing:`` per
+    source, ``newer:`` per newer counting note in the question's top 5 hits.
+    All reasons are returned. An unreadable source counts as missing, and a
+    cited source with no usable fingerprint (field missing, not a mapping, or
+    no non-empty string for it) as unverifiable -- never as fresh."""
     meta, _body = read_page(page_path)
-    fps = meta.get("sources_fingerprint") or {}
-    if not isinstance(fps, dict):
-        fps = {}
+    raw_fps = meta.get("sources_fingerprint")
+    fps = {}
+    if isinstance(raw_fps, dict):
+        fps = {_norm_name(k): v for k, v in raw_fps.items() if isinstance(v, str) and v}
+    sources = meta.get("sources") or []
+    if not isinstance(sources, list):
+        sources = [sources]
     reasons = []
+    for name in dict.fromkeys(_norm_name(x) for x in sources):
+        if name and name not in fps:
+            reasons.append(f"unverifiable: {name}")
     res = resolve_sources(db_path, list(fps), roots)
     found = {r["name"]: r for r in res["resolved"]}
     for name, old in fps.items():
-        r = found.get(_norm_name(name))
+        r = found.get(name)
         if r is None:
-            reasons.append(f"missing: {_norm_name(name)}")
+            reasons.append(f"missing: {name}")
             continue
         try:
             now = fingerprint(r["path"])
@@ -256,7 +291,7 @@ def stale(db_path: str, page_path, roots) -> dict:
             continue
         if now != old:
             reasons.append(f"changed: {r['name']}")
-    cited = {_norm_name(x) for x in (meta.get("sources") or [])} | {_norm_name(x) for x in fps}
+    cited = {_norm_name(x) for x in sources} | set(fps)
     updated = str(meta.get("updated") or "")
     question = str(meta.get("question") or "")
     for base in _newer_notes(db_path, question, updated, cited, roots):
@@ -313,27 +348,38 @@ def _validate_payload(p: dict) -> dict:
     sources = _list_field(p, "sources")
     memory = _list_field(p, "memory_sources")
     topics = _list_field(p, "topics")
-    if len(topics) > TOPICS_MAX or not all(isinstance(t, str) and TOPIC_RE.match(t) for t in topics):
+    if len(topics) > TOPICS_MAX or not all(isinstance(t, str) and TOPIC_RE.fullmatch(t) for t in topics):
         raise WikiRefusal(f"each topic must match {TOPIC_RE.pattern} (at most {TOPICS_MAX})")
     if p.get("confidence") not in CONFIDENCE:
         raise WikiRefusal(f"confidence must be one of {', '.join(CONFIDENCE)}")
     filed_by = p.get("filed_by")
     if filed_by not in ("user", "auto"):
         raise WikiRefusal("filed_by must be 'user' or 'auto'")
+    update = p.get("update")
+    if update is not None and not isinstance(update, str):
+        raise WikiRefusal("update must be a string path")
     caller = p.get("caller") or ""
     if filed_by == "auto":
-        if not (isinstance(caller, str) and CALLER_RE.match(caller)):
+        if not (isinstance(caller, str) and CALLER_RE.fullmatch(caller)):
             raise WikiRefusal(f"an auto filing needs a caller matching {CALLER_RE.pattern}")
     elif caller:
         raise WikiRefusal("caller is only allowed when filed_by is 'auto'")
     return {"question": question, "body": body, "sources": sources, "memory": memory,
             "topics": topics, "confidence": p["confidence"], "filed_by": filed_by,
-            "caller": caller, "update": p.get("update") or "",
+            "caller": caller, "update": update or "",
             "override_reviewed": p.get("override_reviewed") is True}
 
 
 def _wiki_root(ctx: dict) -> Path:
-    return Path(ctx["vault"]) / ctx["wiki_folder"]
+    """``<vault>/<wiki_folder>``; refused unless it resolves (symlinks
+    followed) to a folder strictly inside the vault."""
+    root = Path(ctx["vault"]) / ctx["wiki_folder"]
+    vault = Path(ctx["vault"]).resolve()
+    real = root.resolve()
+    if real == vault or not real.is_relative_to(vault):
+        raise WikiRefusal(f"wiki_folder {ctx['wiki_folder']!r} must resolve to a folder "
+                          f"inside the vault {vault}")
+    return root
 
 
 def _write(ctx: dict, rel_folder: str, filename: str, content: str) -> None:
@@ -368,7 +414,7 @@ def rebuild_wiki_index(ctx: dict) -> list:
     def line(r) -> str:
         tags = (r["tags"] or "").split(",")
         conf = next((t.rsplit("-", 1)[1] for t in tags if t.startswith("claude/wiki/confidence-")), "?")
-        return f"- [[{Path(r['path']).stem}]] — {r['title']} (updated {r['date']}, {conf})"
+        return f"- [[{Path(r['path']).stem}]] — {_unquote(r['title'])} (updated {r['date']}, {conf})"
 
     written, keep = [], set()
     if len(rows) <= INDEX_SPLIT:
@@ -392,8 +438,14 @@ def rebuild_wiki_index(ctx: dict) -> list:
                    _index_header(f"Wiki index: {proj}") + "\n" + "\n".join(line(r) for r in rs) + "\n")
             written.append(str(root / name))
     for old in root.glob("index-*.md"):
-        if old.name not in keep:
-            old.unlink()
+        if old.name in keep:
+            continue
+        # Only delete our own index files: a user note may share the name.
+        try:
+            if read_page(old)[0].get("type") == INDEX_TYPE:
+                old.unlink()
+        except (OSError, ValueError, WikiRefusal):
+            continue
     return written
 
 
@@ -401,7 +453,9 @@ def append_log(ctx: dict, op: str, caller: str, question: str, basename: str, to
     root = _wiki_root(ctx)
     name = f"log-{today.year:04d}.md"
     path = root / name
-    text = path.read_text(encoding="utf-8") if path.exists() else _index_header("Wiki log")
+    # errors="replace": a corrupt byte in the log must never block filing.
+    text = (path.read_text(encoding="utf-8", errors="replace") if path.exists()
+            else _index_header("Wiki log"))
     verb = "Updated" if op == "update" else "Created"
     text = text.rstrip("\n") + (f"\n\n## [{today.isoformat()}] {op} | {caller or '-'} | {question}\n"
                                 f"- {verb}: [[{basename}]]\n")
@@ -409,12 +463,21 @@ def append_log(ctx: dict, op: str, caller: str, question: str, basename: str, to
 
 
 def file_page(ctx: dict, payload: dict, today) -> dict:
-    """Validate, count, then write the page, index and log under one lock."""
+    """Validate and count, then, under one lock, pick the target, write the
+    page, and update the index and log.
+
+    The target checks (update containment, type, reviewed flag) and the new
+    page's name choice run inside the lock, so two filers cannot pick the
+    same name and a page marked reviewed after validation is still refused.
+    Once the page is written, an index or log failure does not raise: the
+    result gets a ``warning`` naming the stage instead.
+    """
     import vault_index
     from note_writer import _acquire_lock, _release_lock
     from obsidian_utils import scrub_secrets
 
     p = _validate_payload(payload)
+    root = _wiki_root(ctx)
     vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
     counted = count_sources(ctx["db"], p["sources"], p["memory"], _roots(ctx))
     if counted["rejected"]:
@@ -425,59 +488,61 @@ def file_page(ctx: dict, payload: dict, today) -> dict:
 
     # Scrub first: the question also feeds the file name, index and log.
     question = scrub_secrets(p["question"])
-    root = _wiki_root(ctx)
+    body = scrub_secrets(p["body"])
     queries = root / "queries"
-    created = today.isoformat()
-    if p["update"]:
-        target = Path(p["update"]).resolve()
-        if not target.is_relative_to(queries.resolve()):
-            raise WikiRefusal(f"update must name a page under {queries}")
-        if not target.is_file():
-            raise WikiRefusal(f"update page not found: {target}")
-        old, _ = read_page(target)
-        if old.get("type") != PAGE_TYPE:
-            raise WikiRefusal(f"{target} is not a wiki page")
-        if is_reviewed(old.get("reviewed")) and not p["override_reviewed"]:
-            raise WikiRefusal(f"{target.name} is marked reviewed; refusing to overwrite it")
-        created = str(old.get("created") or created)
-        rel_folder = str(target.parent.relative_to(Path(ctx["vault"]).resolve()))
-        filename = target.name
-    else:
-        rel_folder = f"{ctx['wiki_folder']}/queries/{today.year:04d}"
-        stem = f"{today.month:02d}-{today.day:02d}-{slugify(question)}"
-        filename, n = f"{stem}.md", 1
-        while (Path(ctx["vault"]) / rel_folder / filename).exists():
-            n += 1
-            filename = f"{stem}-{n}.md"
-
     resolved = counted["resolved"]
     projects = sorted({r["project"] for r in resolved if r["project"]})
-    meta = {
-        # Literal type, not PAGE_TYPE: tests/test_type_scores.py finds
-        # writers by scanning for `"type": "claude-..."`.
-        "type": "claude-wiki", "title": question, "question": question,
-        "date": today.isoformat(), "created": created, "updated": today.isoformat(),
-        "projects": projects,
-        "sources": [f"[[{r['name']}]]" for r in resolved],
-        "memory_sources": [],
-        "sources_fingerprint": {r["name"]: fingerprint(r["path"]) for r in resolved},
-        "confidence": p["confidence"], "filed_by": p["filed_by"],
-    }
-    if p["filed_by"] == "auto":
-        meta["caller"] = p["caller"]
-    meta["tags"] = (["claude/wiki", f"claude/wiki/confidence-{p['confidence']}"]
-                    + [f"claude/project/{x}" for x in projects]
-                    + [f"claude/topic/{t}" for t in p["topics"]])
-    text = render_page(meta, scrub_secrets(p["body"]))
+    action = "update" if p["update"] else ("file-auto" if p["filed_by"] == "auto" else "file")
 
     root.mkdir(parents=True, exist_ok=True)
     lock, err = _acquire_lock(root / ".wiki")
     if err:
         raise WikiRefusal(err)
     try:
-        _write(ctx, rel_folder, filename, text)
+        created = today.isoformat()
+        if p["update"]:
+            target = Path(p["update"]).resolve()
+            if not target.is_relative_to(queries.resolve()):
+                raise WikiRefusal(f"update must name a page under {queries}")
+            if not target.is_file():
+                raise WikiRefusal(f"update page not found: {target}")
+            old, _ = read_page(target)
+            if old.get("type") != PAGE_TYPE:
+                raise WikiRefusal(f"{target} is not a wiki page")
+            if is_reviewed(old.get("reviewed")) and not p["override_reviewed"]:
+                raise WikiRefusal(f"{target.name} is marked reviewed; refusing to overwrite it")
+            created = str(old.get("created") or created)
+            rel_folder = str(target.parent.relative_to(Path(ctx["vault"]).resolve()))
+            filename = target.name
+        else:
+            rel_folder = f"{ctx['wiki_folder']}/queries/{today.year:04d}"
+            stem = f"{today.month:02d}-{today.day:02d}-{slugify(question)}"
+            filename, n = f"{stem}.md", 1
+            while (Path(ctx["vault"]) / rel_folder / filename).exists():
+                n += 1
+                filename = f"{stem}-{n}.md"
+
+        meta = {
+            # Literal type, not PAGE_TYPE: tests/test_type_scores.py finds
+            # writers by scanning for `"type": "claude-..."`.
+            "type": "claude-wiki", "title": question, "question": question,
+            "date": today.isoformat(), "created": created, "updated": today.isoformat(),
+            "projects": projects,
+            "sources": [f"[[{r['name']}]]" for r in resolved],
+            "memory_sources": [],
+            "sources_fingerprint": {r["name"]: fingerprint(r["path"]) for r in resolved},
+            "confidence": p["confidence"], "filed_by": p["filed_by"],
+        }
+        if p["filed_by"] == "auto":
+            meta["caller"] = p["caller"]
+        meta["tags"] = (["claude/wiki", f"claude/wiki/confidence-{p['confidence']}"]
+                        + [f"claude/project/{x}" for x in projects]
+                        + [f"claude/topic/{t}" for t in p["topics"]])
+        _write(ctx, rel_folder, filename, render_page(meta, body))
         page = Path(ctx["vault"]) / rel_folder / filename
-        action = "update" if p["update"] else ("file-auto" if p["filed_by"] == "auto" else "file")
+        out = {"path": str(page), "action": action, "count": counted["count"]}
+
+        # The page is saved: from here a failure is a warning, not a refusal.
         stage = "index"
         try:
             vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
@@ -485,11 +550,12 @@ def file_page(ctx: dict, payload: dict, today) -> dict:
             stage = "log"
             append_log(ctx, action, p["caller"], question, page.stem, today)
         except Exception as exc:
-            raise WikiRefusal(f"page written at {page}, but the {stage} update failed: {exc}; "
-                              "the next write repairs the index")
+            then = ("the next filing rebuilds the index" if stage == "index"
+                    else "this filing is missing from the log")
+            out["warning"] = f"page saved, but the {stage} update failed: {exc}; {then}"
     finally:
         _release_lock(lock)
-    return {"path": str(page), "action": action, "count": counted["count"]}
+    return out
 
 
 def _roots(ctx: dict) -> list:
@@ -582,7 +648,11 @@ def _cmd_stale() -> dict:
 def _cmd_file() -> dict:
     payload = _read_stdin()
     ctx = _context()
-    return file_page(ctx, payload, _dt.datetime.now(_dt.timezone.utc).date())
+    # Local date: page date/updated, file name and log line match the user's day.
+    out = file_page(ctx, payload, _dt.date.today())
+    if out.get("warning"):
+        print(f"WARNING: {out['warning']}", file=sys.stderr)
+    return out
 
 
 _COMMANDS: dict = {

@@ -80,7 +80,7 @@ def test_cli_refusal_exits_1(tmp_path):
 def test_cli_stale_outside_wiki_exits_1(tmp_path):
     home, vault, db = _setup(tmp_path)
     r = run(["stale"], stdin=json.dumps({"page": str(vault / "claude-insights" / "i1.md")}), home=home, db=db)
-    assert r.returncode == 1 and "ERROR:" in r.stderr
+    assert r.returncode == 1 and "under" in r.stderr
 
 
 def test_cli_wiki_off_or_invalid_exits_1(tmp_path):

@@ -7,7 +7,7 @@ metadata:
 
 # Vault Ask
 
-Synthesizes a reasoned answer to the user's question by searching session, insight and wiki notes in the Obsidian vault and citing sources. Returns a grounded answer, not a list of matches. Answers that draw on 3 or more notes can be saved as wiki pages (#383), which later asks find first.
+Synthesizes a reasoned answer to the user's question by searching session, insight and wiki notes in the Obsidian vault and citing sources. Returns a grounded answer, not a list of matches. Answers that draw on 3 or more qualifying notes can be saved as wiki pages (#383), which later asks find first.
 
 **Tools needed:** Grep, Read, Bash, Write, AskUserQuestion
 
@@ -43,22 +43,39 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config
+from obsidian_utils import load_config, indexed_folders
 c = load_config()
 if not c.get("vault_path"):
     print("ERROR: vault_path not configured", file=sys.stderr)
     sys.exit(1)
 project = os.path.basename(os.getcwd()).lower().replace(" ", "-")
+# WIKI comes from the validated folder list, never the raw config key.
+try:
+    folders = indexed_folders(c, strict=True)
+    norm = os.path.normpath(c["wiki_folder"]) if c.get("wiki_folder") else ""
+    wiki = norm if norm in folders else ""
+except Exception as exc:
+    print("WARNING: wiki turned off: " + str(exc), file=sys.stderr)
+    wiki = ""
 print("VAULT=" + c["vault_path"])
 print("SESS=" + c.get("sessions_folder", "claude-sessions"))
 print("INS=" + c.get("insights_folder", "claude-insights"))
 print("PROJECT=" + project)
-print("WIKI=" + (c.get("wiki_folder") or ""))
+print("WIKI=" + wiki)
 print("HOOKS=" + _ob_hooks())
 '
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`. An empty `WIKI` means the wiki is turned off: skip Step 2b and the filing gate in Step 8. `HOOKS` is the plugin's hooks directory; paste it literally where later commands say `<hooks_dir>`.
+Parse each output line as KEY=VALUE, splitting on the first `=`. An empty `WIKI` means the wiki is turned off: skip Step 2b and the filing gate in Step 8. `WIKI` comes from `indexed_folders(config, strict=True)`; when that raises (an invalid `wiki_folder`), WIKI= is printed empty with a `WARNING: wiki turned off` line on stderr, and the wiki steps are skipped. `HOOKS` is the plugin's hooks directory; paste it literally where later commands say `<hooks_dir>`.
+
+When `WIKI` is not empty, check that `wiki.py` is installed:
+
+```bash
+HOOKS='<hooks_dir>'
+test -f "$HOOKS/wiki.py" && echo "WIKI_OK" || echo "WIKI_MISSING"
+```
+
+On `WIKI_MISSING`, treat `WIKI` as empty: skip Step 2b and the filing gate in Step 8.
 
 If the command exits non-zero or prints ERROR, tell the user:
 
@@ -98,20 +115,22 @@ Store the extracted terms as `SEARCH_TERMS`. Keep the original question for use 
 
 Skip this step when `WIKI` is empty.
 
-**How to call `wiki.py`.** Every call takes a JSON payload. Write it with the Write tool to `~/.claude/obsidian-brain/wiki-payload-<8 random hex>.json` (that directory is private to the user), run the command with the file on stdin, then delete the file. Never build the JSON in a shell string: questions and answers contain quotes.
+**How to call `wiki.py`.** Every call takes a JSON payload. First make sure the private directory exists: run `mkdir -m 700 -p ~/.claude/obsidian-brain`. Then write the payload with the Write tool to `~/.claude/obsidian-brain/wiki-payload-<8 random hex>.json`, run the command with the file on stdin, then delete the file. Never build the JSON in a shell string: questions and answers contain quotes.
 
 ```bash
+mkdir -m 700 -p ~/.claude/obsidian-brain
 python3 '<hooks_dir>/wiki.py' lookup < ~/.claude/obsidian-brain/wiki-payload-<hex>.json; rm -f ~/.claude/obsidian-brain/wiki-payload-<hex>.json
 ```
 
-`wiki.py` prints one JSON object. Exit 1 means it refused: show its `ERROR:` line and do not say anything was saved. Exit 2 is a crash: show stderr. The commands below are written as `python3 "<hooks_dir>/wiki.py" <command>`, always with a payload file on stdin.
+`wiki.py` prints one JSON object. Exit 0 is success. Exit 1 means it refused: show its `ERROR:` line. Exit 2 is a usage error or a crash: show stderr. The commands below are written as `python3 "<hooks_dir>/wiki.py" <command>`, always with a payload file on stdin.
 
-1. Run `python3 "<hooks_dir>/wiki.py" lookup` with `{"question": "<original question>"}`. It returns up to 3 `candidates` (`path`, `question`, `updated`).
+1. Run `python3 "<hooks_dir>/wiki.py" lookup` with `{"question": "<original question>"}`. It searches wiki pages with `search_vault` (reranked; the hits are logged as accesses) and returns up to 3 `candidates` (`path`, `question`, `updated`, `rank`).
 2. Decide whether a candidate asks the **same question** as the user (same intent, not just shared words). If none does, continue with Step 3.
-3. If one does, run `python3 "<hooks_dir>/wiki.py" stale` with `{"page": "<its path>"}`. It returns `stale` and `reasons`.
+3. If one does, run `python3 "<hooks_dir>/wiki.py" stale` with `{"page": "<its path>"}`. It returns `stale` and `reasons`. Each reason is `changed: <note>` (a source's content changed), `missing: <note>` (a source is gone or unreadable), `newer: <note>` (a newer note matches the question) or `unverifiable: <page>` (the page's fingerprint is missing or bad, so it counts as stale).
+   - **`stale` itself fails** (exit 1 or 2, or no JSON): treat the page as not fresh. Do not answer from it. Continue with Step 3 as if no candidate matched, and in Step 8 do not update that page.
    - **Fresh:** read the page and present its answer. Cite it as `[[<page file name>]]` and say "From the wiki (updated `<updated>`)". Skip Steps 3–7. In Step 8, save nothing.
    - **Stale, and the page is not marked reviewed:** continue with Steps 3–7. Add the page's `sources` to `CANDIDATE_FILES`. Step 8 refreshes the page without asking and tells the user why, using `reasons`.
-   - **Stale, and the page is marked reviewed** (its frontmatter has `reviewed:` set to anything other than empty, `false`, `no`, `off` or `0`): answer from the page and warn that its sources changed, listing `reasons`.
+   - **Stale, and the page is marked reviewed** (Read the page; its frontmatter has `reviewed:` set to anything other than empty, `false`, `no`, `off` or `0`): answer from the page and warn that its sources changed, listing `reasons`.
      - User-typed run: ask with AskUserQuestion. Options: "Keep my page" (save nothing), "Refresh and overwrite my edits" (run Steps 3–7, then in Step 8 file with `update` and `"override_reviewed": true`), "Save the fresh answer as a new page" (run Steps 3–7, then in Step 8 file a new page).
      - `--caller` run: add one line that the page is reviewed and stale, and save nothing.
 
@@ -350,10 +369,13 @@ Display the synthesized answer from Step 7 in the conversation first. A failed s
 
 Then decide whether to save it as a wiki page. Skip all of this when `WIKI` is empty, or when Step 2b answered from a fresh page.
 
-1. **Count.** Run `python3 "<hooks_dir>/wiki.py" count` with `{"sources": [<every note cited in Sources, by file name>], "memory_sources": []}`. If `count` is below 3, save nothing and say nothing about the wiki. Only insights, error-fixes, decisions, retros, sessions and migrated memory notes count; a snapshot counts as its parent session.
+1. **Count.** Run `python3 "<hooks_dir>/wiki.py" count` with `{"sources": [<every note cited in Sources, by file name>], "memory_sources": []}`. It returns `count`, `qualifying`, `other` and `rejected`. Only 3 or more qualifying notes can be filed: insights, error-fixes, decisions, retros, sessions and migrated memory notes count; a snapshot counts as its parent session.
+   - **Rejected names:** `file` refuses a payload that lists any name from `rejected` (unresolved or ambiguous). Drop every rejected name from the `sources` list before filing, and tell the user which names were dropped and why. Never file with a rejected name in `sources`.
+   - **Below 3:** save nothing and say nothing about the wiki. Exception: on a stale refresh from Step 2b, tell the user the page could not be refreshed because the fresh answer has fewer than 3 qualifying sources (give the count); the old page stays as is.
 2. **Write the page body.** Run `python3 "<hooks_dir>/wiki.py" rule` and rewrite the answer under that rule. Keep the `### Sources` section and every `[[wikilink]]` exactly. The chat answer keeps its normal style; only the page uses the rule.
-3. **Choose the action:**
+3. **Choose the action.** Before you choose an update path for a candidate page, Read the candidate page and check `reviewed:` in its frontmatter. It is reviewed unless the value is absent, empty, `false`, `no`, `off` or `0`.
    - **Stale refresh** (from Step 2b, page not reviewed, or the user chose "Refresh and overwrite my edits"): file with `"update": "<page path>"` (plus `"override_reviewed": true` only when the user chose to overwrite). Do not ask. Tell the user the page was refreshed and why.
+   - **Reviewed page, user chose "Save the fresh answer as a new page":** file a new page, without `update` and without `override_reviewed`. The reviewed page stays untouched.
    - **`--caller` run:** run `lookup` with the question. If a candidate asks the same question and is not reviewed, file with `update`; if that candidate is reviewed, save nothing and name the page. Otherwise file a new page with `"filed_by": "auto"` and `"caller": "<CALLER>"`. Do not ask. Print one line naming the page saved or updated.
    - **User-typed run:** ask with AskUserQuestion. Options: "Save as a new wiki page", "Update existing page [[…]]" (only when `lookup` found a same-question candidate that is not reviewed), "Skip". Skip saves nothing.
 4. **File.** Run `python3 "<hooks_dir>/wiki.py" file` with:
@@ -365,7 +387,13 @@ Then decide whether to save it as a wiki page. Skip all of this when `WIKI` is e
     "update": "<page path, only when updating>"}
    ```
 
-   `confidence` follows your certainty wording from Step 7: "You explicitly decided" → `high`, "it appears" → `medium`, "Limited context" → `low`. `topics` are up to 8 short lowercase slugs (`[a-z0-9-]`) for the main subjects. On exit 0, name the page (`path`). On exit 1, show the `ERROR:` line and do not say the page was saved.
+   `confidence` follows your certainty wording from Step 7: "You explicitly decided" → `high`, "it appears" → `medium`, "Limited context" → `low`. `topics` are up to 8 short lowercase slugs (`[a-z0-9-]`) for the main subjects. Projects come from the cited sources; there is no `projects` field. A new page whose file name is taken gets `-2`, `-3` and so on.
+
+   Report the outcome by exit code:
+   - **Exit 0, no `warning` key:** name the page (`path`).
+   - **Exit 0 with a `warning` key:** tell the user the page was saved (name `path`) and quote the warning. The index or log update failed; the next write repairs it.
+   - **Exit 1:** quote the `ERROR:` line and say nothing was saved.
+   - **Exit 2:** report the failure and quote stderr. Do not say the page was saved.
 
 If the user asks a follow-up question, return to Step 2 with the new question.
 
@@ -376,7 +404,7 @@ If the user asks a follow-up question, return to Step 2 with the new question.
 
 Use `/vault-ask` when the user wants to know _what_ their notes say, not _which_ notes match.
 
-`/vault-ask` can also write: it saves an answer as a wiki page in `<wiki_folder>/queries/` when the answer draws on 3 or more notes, after asking (or automatically with `--caller`). It never saves an answer drawn from fewer than 3 notes.
+`/vault-ask` can also write: it saves an answer as a wiki page in `<wiki_folder>/queries/` when the answer draws on 3 or more qualifying notes, after asking (or automatically with `--caller`). It never saves an answer drawn from fewer than 3 qualifying notes.
 
 ## Edge Cases
 

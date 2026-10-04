@@ -342,7 +342,7 @@ def test_reviewed_page_needs_override(ctx):
     first = Path(wiki.file_page(ctx, _payload(), D)["path"])
     first.write_text(first.read_text().replace('filed_by: "user"\n', 'filed_by: "user"\nreviewed: yes\n'))
     before = first.read_text()
-    with pytest.raises(wiki.WikiRefusal, match="reviewed"):
+    with pytest.raises(wiki.WikiRefusal, match="is marked reviewed; refusing"):
         wiki.file_page(ctx, _payload(update=str(first)), D + dt.timedelta(days=1))
     assert first.read_text() == before
     out = wiki.file_page(ctx, _payload(update=str(first), override_reviewed=True), D + dt.timedelta(days=1))
@@ -386,7 +386,7 @@ def test_held_lock_refuses_and_writes_nothing(ctx):
     _wiki(ctx).mkdir(parents=True)
     lock = _wiki(ctx) / "..wiki.ob-lock"
     lock.write_text("held")
-    with pytest.raises(wiki.WikiRefusal, match="lock"):
+    with pytest.raises(wiki.WikiRefusal, match="another process is updating"):
         wiki.file_page(ctx, _payload(), D)
     assert _all_files(ctx) == ["..wiki.ob-lock"]
 
@@ -436,7 +436,7 @@ def test_hostile_question_keeps_one_frontmatter_block(ctx):
     stats = vault_index.rebuild_index(ctx["vault"], FOLDERS, db_path=ctx["db"], full=True)
     assert stats["malformed"] == 0
     meta, _ = wiki.read_page(out["path"])
-    assert meta["question"] == " ".join(q.split()) or meta["question"] == q
+    assert meta["question"] == " ".join(q.split())
 
 
 def test_secret_never_reaches_the_filename(ctx):
@@ -452,3 +452,156 @@ def test_secret_never_reaches_the_filename(ctx):
 def test_type_constants_match_the_indexer():
     assert wiki.INDEX_TYPE in vault_index._UNINDEXED_TYPES
     assert wiki.PAGE_TYPE in vault_index._TYPE_SCORES_BY_CONTEXT["general"]
+
+
+# --- review fix wave (#397) --------------------------------------------------
+
+
+@pytest.mark.parametrize("fp_line", [
+    None, "sources_fingerprint: {}", 'sources_fingerprint: "oops"', "sources_fingerprint: [1, 2]",
+    "sources_fingerprint:\n  i1: abc",
+])
+def test_malformed_fingerprint_is_unverifiable_not_fresh(paged, fp_line):
+    vault, page = paged
+    lines = [l for l in page.read_text().split("\n") if not l.startswith("sources_fingerprint:")]
+    if fp_line:
+        lines.insert(3, fp_line)
+    page.write_text("\n".join(lines))
+    r = wiki.stale(vault["db"], page, vault["roots"])
+    assert r["stale"] is True
+    assert any(x.startswith("unverifiable:") for x in r["reasons"])
+
+
+def test_fingerprint_missing_one_cited_source_is_unverifiable(paged):
+    vault, page = paged
+    meta, body = wiki.read_page(page)
+    meta["sources_fingerprint"].pop("d1")
+    page.write_text(wiki.render_page(meta, body))
+    r = wiki.stale(vault["db"], page, vault["roots"])
+    assert "unverifiable: d1" in r["reasons"]
+
+
+def test_same_day_note_is_not_newer(paged):
+    vault, page = paged
+    _note(Path(vault["vault"]), "claude-insights", "i8", "claude-insight",
+          body="zebracorn ranking work details", date="2026-10-02")
+    vault_index.ensure_index(vault["vault"], FOLDERS, db_path=vault["db"])
+    assert not any(x == "newer: i8" for x in wiki.stale(vault["db"], page, vault["roots"])["reasons"])
+
+
+def test_later_note_already_cited_is_not_newer(vault):
+    _note(Path(vault["vault"]), "claude-insights", "i7", "claude-insight",
+          body="zebracorn ranking work details", date="2026-10-05")
+    vault_index.ensure_index(vault["vault"], FOLDERS, db_path=vault["db"])
+    fps = {n: wiki.fingerprint(_src(vault, n)) for n in ("i1", "i2", "i7")}
+    page = _page(vault, "10-02-zebracorn-ranking", "How does zebracorn ranking work?", ["i1", "i2", "i7"], fps)
+    assert not any(x.startswith("newer: i7") for x in wiki.stale(vault["db"], page, vault["roots"])["reasons"])
+
+
+@pytest.mark.parametrize("bad", ["yes", 1, "false", "true"])
+def test_override_reviewed_must_be_literal_true(ctx, bad):
+    first = Path(wiki.file_page(ctx, _payload(), D)["path"])
+    first.write_text(first.read_text().replace('filed_by: "user"\n', 'filed_by: "user"\nreviewed: true\n'))
+    with pytest.raises(wiki.WikiRefusal, match="is marked reviewed; refusing"):
+        wiki.file_page(ctx, _payload(update=str(first), override_reviewed=bad), D)
+
+
+def test_refresh_below_threshold_with_resolving_sources_names_the_count(ctx):
+    v = Path(ctx["vault"])
+    first = Path(wiki.file_page(ctx, _payload(), D)["path"])
+    for n in ("i2", "d1"):
+        p = v / "claude-insights" / f"{n}.md"
+        p.write_text(p.read_text().replace("type: claude-insight", "type: claude-standup")
+                     .replace("type: claude-decision", "type: claude-standup"))
+    with pytest.raises(wiki.WikiRefusal, match=r"only 1 qualifying sources \(need 3\)"):
+        wiki.file_page(ctx, _payload(update=str(first)), D + dt.timedelta(days=1))
+
+
+@pytest.mark.parametrize("kw", [
+    {"topics": ["ranking\n"]}, {"filed_by": "auto", "caller": "ship\n"},
+    {"topics": [f"t{i}" for i in range(9)]}, {"update": 5},
+])
+def test_more_validation_refusals(ctx, kw):
+    with pytest.raises(wiki.WikiRefusal):
+        wiki.file_page(ctx, _payload(**kw), D)
+    assert _all_files(ctx) == []
+
+
+def test_question_of_exactly_500_chars_is_accepted(ctx):
+    q = ("zebracorn " * 60)[:500]
+    assert len(q.strip()) <= 500
+    wiki.file_page(ctx, _payload(question=q.strip()), D)
+
+
+def test_update_target_missing_is_a_refusal(ctx):
+    missing = _wiki(ctx) / "queries" / "2026" / "gone.md"
+    with pytest.raises(wiki.WikiRefusal, match="update page not found"):
+        wiki.file_page(ctx, _payload(update=str(missing)), D)
+
+
+def test_index_at_exactly_the_split_stays_single(ctx, monkeypatch):
+    monkeypatch.setattr(wiki, "INDEX_SPLIT", 2)
+    wiki.file_page(ctx, _payload(question="alpha zebracorn?"), D)
+    wiki.file_page(ctx, _payload(question="beta zebracorn?"), D)
+    assert not list(_wiki(ctx).glob("index-*.md"))
+
+
+def test_user_index_named_file_is_not_deleted(ctx):
+    _wiki(ctx).mkdir(parents=True)
+    mine = _wiki(ctx) / "index-ideas.md"
+    mine.write_text("---\ntype: claude-insight\n---\nmy ideas\n")
+    wiki.file_page(ctx, _payload(), D)
+    assert mine.exists()
+
+
+def test_wiki_note_outside_queries_is_not_indexed(ctx):
+    stray = _wiki(ctx) / "drafts" / "x.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(wiki.render_page({"type": "claude-wiki", "title": "stray zebracorn", "date": "2026-10-01"}, "x\n"))
+    wiki.file_page(ctx, _payload(), D)
+    assert "[[x]]" not in (_wiki(ctx) / "index.md").read_text()
+
+
+@pytest.mark.parametrize("stage", ["index", "log"])
+def test_post_write_failure_returns_warning_and_releases_lock(ctx, monkeypatch, stage):
+    target = "rebuild_wiki_index" if stage == "index" else "append_log"
+    real = getattr(wiki, target)
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(wiki, target, boom)
+    out = wiki.file_page(ctx, _payload(), D)
+    assert Path(out["path"]).is_file()
+    assert out["warning"].startswith(f"page saved, but the {stage} update failed: disk full")
+    monkeypatch.setattr(wiki, target, real)
+    wiki.file_page(ctx, _payload(question="second zebracorn?"), D)  # lock was released
+
+
+def test_corrupt_log_does_not_block_filing(ctx):
+    _wiki(ctx).mkdir(parents=True)
+    (_wiki(ctx) / "log-2026.md").write_bytes(b"---\ntype: \"claude-wiki-index\"\n---\n\xff\xfe bad\n")
+    out = wiki.file_page(ctx, _payload(), D)
+    assert "warning" not in out
+    assert "## [2026-10-04] file" in (_wiki(ctx) / "log-2026.md").read_text(encoding="utf-8")
+
+
+def test_index_and_lookup_show_unescaped_question(ctx):
+    q = 'He said "hi" about zebracorn'
+    wiki.file_page(ctx, _payload(question=q), D)
+    assert q in (_wiki(ctx) / "index.md").read_text()
+    assert wiki.lookup(ctx["db"], "zebracorn hi")[0]["question"] == q
+
+
+def test_is_reviewed_strips_single_quotes():
+    assert wiki.is_reviewed("'no'") is False
+
+
+@pytest.mark.parametrize("kind", ["symlink-out", "dot"])
+def test_wiki_root_outside_or_at_vault_is_a_refusal(ctx, tmp_path_factory, kind):
+    if kind == "symlink-out":
+        outside = tmp_path_factory.mktemp("elsewhere")
+        (Path(ctx["vault"]) / "claude-wiki").symlink_to(outside)
+    else:
+        ctx = {**ctx, "wiki_folder": "."}
+    with pytest.raises(wiki.WikiRefusal):
+        wiki.file_page(ctx, _payload(), D)

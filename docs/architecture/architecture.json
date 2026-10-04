@@ -393,7 +393,7 @@
           "files": [
             "hooks/wiki.py"
           ],
-          "purpose": "LLM wiki for /vault-ask answers (#383, #395). JSON CLI: rule (the 80% ASD-STE100 writing rule), lookup (FTS on page titles, note_type claude-wiki, top 3), stale (per-source content-hash changed/missing, plus newer counting notes from a direct OR FTS query), count (resolves cited names in the notes table; snapshots count as their parent; unresolved or ambiguous names refused; threshold 3), file (validation, reviewed-page refusal, scrub_secrets on question and body before the slug, one lock around page + index + log, index.md rebuilt from the notes table and split by project above 500 pages, log-YYYY.md). Pages live in <wiki_folder>/queries/YYYY/; index and log files carry type claude-wiki-index so the indexer skips them. Exit 0 ok, 1 refused (ERROR: line), 2 crash."
+          "purpose": "LLM wiki for /vault-ask answers (#383, #395). JSON CLI: rule (the 80% ASD-STE100 writing rule), lookup (search_vault with note_type claude-wiki, reranked, logs access; top 3 as path/question/updated/rank), stale (per-source content-hash changed/missing, unverifiable when the page's fingerprint is missing or bad, plus newer counting notes from a direct OR FTS query), count (resolves cited names in the notes table; snapshots count as their parent; unresolved or ambiguous names returned as rejected; memory sources refused until #396), file (threshold: 3 qualifying notes - insight, error-fix, decision, retro, session or migrated claude-memory; validation, reviewed-page refusal, scrub_secrets on question and body before the slug, projects taken from the sources (a payload projects field is ignored), name collisions get -2, -3...; one lock file <wiki_folder>/..wiki.ob-lock around page + index + log, no waiting (a second filer is refused), a lock older than 60 s is reclaimed; index.md rebuilt from the notes table and split into index-<project>.md files above 500 pages, log-YYYY.md; every write goes through write_vault_note except deletes of stale index-*.md files; an index or log failure after the page is written exits 0 with a warning key). Pages live in <wiki_folder>/queries/YYYY/; index and log files carry type claude-wiki-index so the indexer skips them. Dates are the local date. Exit 0 ok, 1 refused (ERROR: line), 2 usage error or crash."
         },
         {
           "id": "plugin-install-divergence",
@@ -834,7 +834,7 @@
           "files": [
             "skills/vault-ask/SKILL.md"
           ],
-          "purpose": "RECALL. Synthesized, source-cited answer grounded in vault notes; FTS fast-path + 3 parallel Grep agents (vault_scan.py grep when the Grep tool is missing) + vault_scan.py meta for type/date ranking + per-file context-shield sub-agents + snapshot summaries. Since #395 it checks the wiki first (wiki.py lookup + stale; a fresh same-question page answers directly), caps candidates at 3 wiki pages, and ends with a filing gate: wiki.py count >= 3, rewrite under wiki.py rule, then ask (user-typed) or auto-file (--caller), with reviewed pages never rewritten automatically. Payloads go through a private file, never a shell string."
+          "purpose": "RECALL. Synthesized, source-cited answer grounded in vault notes; FTS fast-path + 3 parallel Grep agents (vault_scan.py grep when the Grep tool is missing) + vault_scan.py meta for type/date ranking + per-file context-shield sub-agents + snapshot summaries. Since #395 it checks the wiki first (wiki.py lookup + stale; a fresh same-question page answers directly), caps candidates at 3 wiki pages, and ends with a filing gate: wiki.py count of 3+ qualifying notes (rejected names dropped), rewrite under wiki.py rule, then ask (user-typed) or auto-file (--caller), with reviewed pages never rewritten automatically. Payloads go through a private file, never a shell string."
         },
         {
           "id": "sk-vault-search",
@@ -993,7 +993,7 @@
           "name": "Markdown Vault",
           "kind": "datastore",
           "files": [],
-          "purpose": "The Obsidian vault (live config: a local claude-code-vault folder). Folders claude-sessions/, claude-insights/, claude-check-items/, claude-dashboards/, claude-wiki/ (#383: queries/YYYY/ pages filed by /vault-ask, plus index.md and log-YYYY.md). The source of truth; works when Obsidian is closed."
+          "purpose": "The Obsidian vault (live config: a local claude-code-vault folder). Folders claude-sessions/, claude-insights/, claude-check-items/, claude-dashboards/, claude-wiki/ (#383: queries/YYYY/ pages filed by /vault-ask, plus index.md, index-<project>.md split files above 500 pages, and log-YYYY.md). The source of truth; works when Obsidian is closed."
         },
         {
           "id": "db-index",
@@ -1746,7 +1746,7 @@
         {
           "from": "wiki-cli",
           "to": "search-vault",
-          "label": "FTS on page titles; OR query for newer notes"
+          "label": "search_vault (reranked) for pages; OR FTS query for newer notes"
         },
         {
           "from": "sk-vault-ask",
@@ -1756,7 +1756,7 @@
         {
           "from": "sk-vault-ask",
           "to": "wiki-cli",
-          "label": "count >= 3, rule, then file (ask or --caller)"
+          "label": "count (3+ qualifying notes), rule, then file (ask or --caller)"
         },
         {
           "from": "wiki-cli",
@@ -1766,7 +1766,7 @@
         {
           "from": "wiki-cli",
           "to": "write-vault-note",
-          "label": "page, index.md, log-YYYY.md under one lock"
+          "label": "page, index files, log-YYYY.md under ..wiki.ob-lock"
         },
         {
           "from": "wiki-cli",
