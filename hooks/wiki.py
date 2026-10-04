@@ -1,6 +1,6 @@
 """LLM wiki for /vault-ask answers (#383, #395).
 
-Library + JSON CLI (``python3 hooks/wiki.py rule|lookup|stale|count|file``).
+Library + JSON CLI (``python3 hooks/wiki.py rule|lookup|stale|count|file|memgrep``).
 Every vault write goes through ``write_vault_note`` (atomic, 0o600,
 contained under the vault) while holding one wiki lock. The one exception:
 ``rebuild_wiki_index`` deletes stale ``index-*.md`` files directly (only
@@ -38,6 +38,11 @@ COUNTING_TYPES = frozenset({
 CALLER_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 CONFIDENCE = ("high", "medium", "low")
+# Memory files (#396) are named "<project-dir>/<file>.md" and fingerprinted
+# under "memory:<name>". Only memory_sources.py knows where they live.
+MEMORY_PREFIX = "memory:"
+MEMORY_NAME_RE = re.compile(r"^[^/\\\x00]{1,255}/[^/\\\x00]{1,252}\.md$")
+MEMGREP_MAX = 200
 INDEX_TYPE = "claude-wiki-index"
 PAGE_TYPE = "claude-wiki"
 
@@ -114,6 +119,37 @@ def _scalar(text: str):
     return s
 
 
+_QUOTED_KEY_RE = re.compile(r'^(?:"((?:[^"\\]|\\.)*)"|\'((?:[^\']|\'\')*)\')\s*:(?:\s(.*))?$')
+
+
+def _split_map_line(stripped: str):
+    """``(key, value text)`` for one block-map line, or None.
+
+    A key may hold a colon (``memory:proj/a.md: 1111``), so the line splits
+    on the first ``": "``, or on a final ``:`` when there is no value. A
+    quoted key ends at its closing quote. A line with neither falls back to
+    the first ``:``, as before."""
+    m = _QUOTED_KEY_RE.match(stripped)
+    if m:
+        if m.group(1) is not None:
+            try:
+                key = json.loads('"' + m.group(1) + '"')
+            except ValueError:
+                key = m.group(1)
+        else:
+            key = m.group(2).replace("''", "'")
+        return key, m.group(3) or ""
+    k, sep, v = stripped.partition(": ")
+    if not sep:
+        if stripped.endswith(":"):
+            k, sep, v = stripped[:-1], ":", ""
+        else:
+            k, sep, v = stripped.partition(":")
+    if not sep:
+        return None
+    return str(_scalar(k)), v
+
+
 def read_page(path) -> tuple:
     """Return ``(meta, body)``. Values are JSON-decoded when they parse,
     else kept as the raw string (a hand-edited page).
@@ -143,12 +179,12 @@ def read_page(path) -> tuple:
                 if isinstance(current, list):
                     current.append(_scalar(stripped[1:]))
                 continue
-            k, sep, v = stripped.partition(":")
-            if sep:
+            kv = _split_map_line(stripped)
+            if kv is not None:
                 if current == "":
                     current = meta[block_key] = {}
                 if isinstance(current, dict):
-                    current[str(_scalar(k))] = _scalar(v)
+                    current[kv[0]] = _scalar(kv[1])
             continue
         block_key = None
         key, sep, val = stripped.partition(":")
@@ -242,8 +278,8 @@ def count_sources(db_path: str, names, memory_sources, roots) -> dict:
     """
     res = resolve_sources(db_path, names, roots)
     rejected = list(res["rejected"])
-    for m in memory_sources or []:
-        rejected.append({"name": str(m), "reason": "memory sources arrive in #396"})
+    mem = resolve_memory(memory_sources)
+    rejected += mem["rejected"]
     parents = [r["key"] for r in res["resolved"] if r["type"] == "claude-snapshot"]
     parent_path = ({p["name"]: p["path"] for p in resolve_sources(db_path, parents, roots)["resolved"]}
                    if parents else {})
@@ -262,8 +298,76 @@ def count_sources(db_path: str, names, memory_sources, roots) -> dict:
             qualifying.append(r["key"] if is_snapshot else r["name"])
         else:
             other.append(r["name"])
+    qualifying += [MEMORY_PREFIX + m["name"] for m in mem["resolved"]]
     return {"count": len(qualifying), "qualifying": qualifying, "other": other,
-            "rejected": rejected, "resolved": resolved}
+            "rejected": rejected, "resolved": resolved, "memory_resolved": mem["resolved"]}
+
+
+def _memory_files() -> list:
+    """This host's memory files (the seam tests replace)."""
+    return _memory_listing()[0]
+
+
+def _memory_listing() -> tuple:
+    """``(files, errors, host)`` for this host: the files from
+    ``memory_sources``, the ``{"path", "error"}`` failures it hit while
+    listing, and the host name. The sibling seam of ``_memory_files`` for
+    callers that must tell "no such file" from "could not look"."""
+    import memory_sources as ms
+
+    host = ms.detect_host()
+    errors: list = []
+    return ms.memory_sources(host, errors=errors), errors, host
+
+
+def resolve_memory(names) -> dict:
+    """Map ``<project-dir>/<file>.md`` names to this host's memory files.
+
+    A name of the wrong shape (not a string, no folder, ``..``) is rejected
+    as ``not a memory file name``; a well-formed name with no such file as
+    ``not a memory file on this host``. Repeats of one file count once.
+    """
+    names = list(names or [])
+    if not names:
+        return {"resolved": [], "rejected": []}
+    import memory_sources as ms
+
+    by_name = {ms.memory_name(f): f for f in _memory_files()}
+    resolved, rejected, seen = [], [], set()
+    for n in names:
+        if (not isinstance(n, str) or not MEMORY_NAME_RE.fullmatch(n)
+                or ".." in n.split("/")):
+            rejected.append({"name": str(n), "reason": "not a memory file name"})
+            continue
+        f = by_name.get(n)
+        if f is None:
+            rejected.append({"name": n, "reason": "not a memory file on this host"})
+            continue
+        if f in seen:
+            continue
+        seen.add(f)
+        resolved.append({"name": n, "path": str(f)})
+    return {"resolved": resolved, "rejected": rejected}
+
+
+def memgrep(pattern: str, files, skipped: list | None = None) -> list:
+    """Memory files whose text holds ``pattern`` (case-insensitive fixed
+    string, never a regex). A file that cannot be read is left out and, when
+    ``skipped`` is a list, appended to it as ``{"path", "error"}``."""
+    import memory_sources as ms
+
+    needle = pattern.casefold()
+    out = []
+    for f in files:
+        try:
+            text = Path(f).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            if skipped is not None:
+                skipped.append({"path": str(f), "error": str(exc)})
+            continue
+        if needle in text.casefold():
+            out.append({"name": ms.memory_name(f), "path": str(f)})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -312,23 +416,38 @@ def lookup(db_path: str, question: str, limit: int = 3) -> list:
             for h in hits[:limit]]
 
 
-def stale(db_path: str, page_path, roots) -> dict:
+def stale(db_path: str, page_path, roots, *, memory_listing=None) -> dict:
     """Why a page is stale: ``unverifiable:``/``changed:``/``missing:`` per
     source, ``newer:`` per newer counting note in the question's top 5 hits.
-    All reasons are returned. An unreadable source counts as missing, and a
-    cited source with no usable fingerprint (field missing, not a mapping, or
-    no non-empty string for it) as unverifiable -- never as fresh. A page
-    whose ``sources`` is not a non-empty list gets ``unverifiable: sources``."""
+    All reasons are returned. An unreadable vault source counts as missing,
+    and a cited source with no usable fingerprint (field missing, not a
+    mapping, or no non-empty string for it) as unverifiable -- never as
+    fresh. A page gets ``unverifiable: sources`` when ``sources`` is not a
+    list, or when neither ``sources`` nor ``memory_sources`` is a non-empty
+    list (memory files count toward the threshold, so a page may cite only
+    memory). Memory sources follow ``_memory_reasons``. ``memory_listing``
+    is a ``_memory_listing()`` result to use instead of listing again (a
+    caller checking many pages lists once). ``memory_paths`` maps each cited
+    memory file found here to its path, so a refresh can re-read it."""
     meta, _body = read_page(page_path)
     raw_fps = meta.get("sources_fingerprint")
     fps = {}
+    mem_fps = {}
     if isinstance(raw_fps, dict):
-        fps = {_norm_name(k): v for k, v in raw_fps.items() if isinstance(v, str) and v}
+        for k, v in raw_fps.items():
+            if not (isinstance(v, str) and v):
+                continue
+            if str(k).startswith(MEMORY_PREFIX):
+                mem_fps[str(k)] = v
+            else:
+                fps[_norm_name(k)] = v
     sources = meta.get("sources")
+    mem_names = meta.get("memory_sources")
     reasons = []
-    if not isinstance(sources, list) or not sources:
-        # Absent, empty or unparseable: the page cannot be checked.
+    if not isinstance(sources, list) or not (sources or (isinstance(mem_names, list) and mem_names)):
+        # Unparseable, or no source of either kind: the page cannot be checked.
         reasons.append("unverifiable: sources")
+    if not isinstance(sources, list):
         sources = []
     for name in dict.fromkeys(_norm_name(x) for x in sources):
         if name and name not in fps:
@@ -347,12 +466,62 @@ def stale(db_path: str, page_path, roots) -> dict:
             continue
         if now != old:
             reasons.append(f"changed: {r['name']}")
+    mem_names = list(dict.fromkeys(mem_names if isinstance(mem_names, list) else []))
+    for n in mem_names:
+        if MEMORY_PREFIX + str(n) not in mem_fps:
+            reasons.append(f"unverifiable: {MEMORY_PREFIX}{n}")
+    memory_paths: dict = {}
+    if mem_fps or mem_names:
+        reasons += _memory_reasons(mem_fps, mem_names, memory_paths, memory_listing)
     cited = {_norm_name(x) for x in sources} | set(fps)
     updated = str(meta.get("updated") or "")
     question = str(meta.get("question") or "")
     for base in _newer_notes(db_path, question, updated, cited, roots):
         reasons.append(f"newer: {base}")
-    return {"stale": bool(reasons), "reasons": reasons}
+    return {"stale": bool(reasons), "reasons": reasons, "memory_paths": memory_paths}
+
+
+def _memory_reasons(mem_fps: dict, mem_names: list, memory_paths: dict,
+                    listing=None) -> list:
+    """Reasons for the page's ``memory:`` fingerprints, and fill
+    ``memory_paths`` with ``{name: path}`` for each cited file found.
+
+    ``unverifiable:`` when this host has no memory files or the listing
+    could not look (root, project folder or the file itself failed), or the
+    listed file cannot be read. ``missing:`` only when a listing that
+    worked does not have the file (or it was deleted since). ``listing`` is
+    a ``_memory_listing()`` result to reuse; None lists now."""
+    import memory_sources as ms
+
+    files, errors, host = listing if listing is not None else _memory_listing()
+    root_failed, bad_projects, bad_names = ms.failed_scopes(errors)
+    by_name = {ms.memory_name(f): f for f in files}
+    cited = [n for n in mem_names if isinstance(n, str)] + [k[len(MEMORY_PREFIX):] for k in mem_fps]
+    memory_paths.update({n: str(by_name[n]) for n in dict.fromkeys(cited) if n in by_name})
+    out = []
+    for key, old in mem_fps.items():
+        name = key[len(MEMORY_PREFIX):]
+        if host != "claude-code" or root_failed:
+            out.append(f"unverifiable: {key}")
+            continue
+        f = by_name.get(name)
+        if f is None:
+            if name.split("/", 1)[0] in bad_projects or name in bad_names:
+                out.append(f"unverifiable: {key}")
+            else:
+                out.append(f"missing: {key}")
+            continue
+        try:
+            now = fingerprint(f)
+        except FileNotFoundError:
+            out.append(f"missing: {key}")  # deleted after the listing
+            continue
+        except OSError:
+            out.append(f"unverifiable: {key}")
+            continue
+        if now != old:
+            out.append(f"changed: {key}")
+    return out
 
 
 # Question-frame verbs that _STOPWORDS keeps but nearly every "how does X
@@ -472,13 +641,14 @@ def _index_header(title: str) -> str:
     return '---\ntype: "claude-wiki-index"\n---\n# ' + title + '\n'
 
 
-def rebuild_wiki_index(ctx: dict) -> list:
-    """Rebuild ``index.md`` (and ``index-<project>.md`` above INDEX_SPLIT
-    pages) from the notes table, never from page files."""
+def render_wiki_index(ctx: dict) -> dict:
+    """The index files as ``{file name: text}``, built from the notes table
+    (never from page files). ``index.md`` alone up to INDEX_SPLIT pages;
+    above that, ``index.md`` lists one ``index-<project>.md`` per project.
+    Writes nothing."""
     import vault_index
 
-    root = _wiki_root(ctx)
-    queries = root / "queries"
+    queries = _wiki_root(ctx) / "queries"
     conn = vault_index._connect(ctx["db"])
     try:
         rows = [r for r in conn.execute(
@@ -493,29 +663,33 @@ def rebuild_wiki_index(ctx: dict) -> list:
         conf = next((t.rsplit("-", 1)[1] for t in tags if t.startswith("claude/wiki/confidence-")), "?")
         return f"- [[{Path(r['path']).stem}]] — {_unquote(r['title'])} (updated {r['date']}, {conf})"
 
-    written, keep = [], set()
     if len(rows) <= INDEX_SPLIT:
-        body = _index_header("Wiki index") + "\n" + "\n".join(line(r) for r in rows) + "\n"
-        _write(ctx, ctx["wiki_folder"], "index.md", body)
-        written.append(str(root / "index.md"))
-    else:
-        groups: dict = {}
-        for r in rows:
-            projects = [t[len("claude/project/"):] for t in (r["tags"] or "").split(",")
-                        if t.startswith("claude/project/")] or ["unassigned"]
-            for proj in projects:
-                groups.setdefault(slugify(proj), []).append(r)
-        top = [f"- [[index-{p}]] — {len(rs)} page(s)" for p, rs in sorted(groups.items())]
-        _write(ctx, ctx["wiki_folder"], "index.md", _index_header("Wiki index") + "\n" + "\n".join(top) + "\n")
-        written.append(str(root / "index.md"))
-        for proj, rs in sorted(groups.items()):
-            name = f"index-{proj}.md"
-            keep.add(name)
-            _write(ctx, ctx["wiki_folder"], name,
-                   _index_header(f"Wiki index: {proj}") + "\n" + "\n".join(line(r) for r in rs) + "\n")
-            written.append(str(root / name))
+        return {"index.md": _index_header("Wiki index") + "\n" + "\n".join(line(r) for r in rows) + "\n"}
+    groups: dict = {}
+    for r in rows:
+        projects = [t[len("claude/project/"):] for t in (r["tags"] or "").split(",")
+                    if t.startswith("claude/project/")] or ["unassigned"]
+        for proj in projects:
+            groups.setdefault(slugify(proj), []).append(r)
+    top = [f"- [[index-{p}]] — {len(rs)} page(s)" for p, rs in sorted(groups.items())]
+    out = {"index.md": _index_header("Wiki index") + "\n" + "\n".join(top) + "\n"}
+    for proj, rs in sorted(groups.items()):
+        out[f"index-{proj}.md"] = (_index_header(f"Wiki index: {proj}") + "\n"
+                                   + "\n".join(line(r) for r in rs) + "\n")
+    return out
+
+
+def rebuild_wiki_index(ctx: dict) -> list:
+    """Write the files from ``render_wiki_index`` and delete any other
+    ``index-*.md`` typed ``claude-wiki-index``. Returns the written paths."""
+    root = _wiki_root(ctx)
+    files = render_wiki_index(ctx)
+    written = []
+    for name, text in files.items():
+        _write(ctx, ctx["wiki_folder"], name, text)
+        written.append(str(root / name))
     for old in root.glob("index-*.md"):
-        if old.name in keep:
+        if old.name in files:
             continue
         # Only delete our own index files: a user note may share the name.
         try:
@@ -609,8 +783,11 @@ def file_page(ctx: dict, payload: dict, today) -> dict:
             "date": today.isoformat(), "created": created, "updated": today.isoformat(),
             "projects": projects,
             "sources": [f"[[{r['name']}]]" for r in resolved],
-            "memory_sources": [],
-            "sources_fingerprint": {r["name"]: fingerprint(r["path"]) for r in resolved},
+            "memory_sources": [m["name"] for m in counted["memory_resolved"]],
+            "sources_fingerprint": {
+                **{r["name"]: fingerprint(r["path"]) for r in resolved},
+                **{MEMORY_PREFIX + m["name"]: fingerprint(m["path"])
+                   for m in counted["memory_resolved"]}},
             "confidence": p["confidence"], "filed_by": p["filed_by"],
         }
         if p["filed_by"] == "auto":
@@ -701,7 +878,19 @@ def _cmd_count() -> dict:
     vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
     out = count_sources(ctx["db"], sources, memory, _roots(ctx))
     out.pop("resolved")
+    out.pop("memory_resolved")
     return out
+
+
+def _cmd_memgrep() -> dict:
+    payload = _read_stdin()
+    pattern = payload.get("pattern")
+    if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > MEMGREP_MAX:
+        raise WikiRefusal(f"pattern must be a non-blank string of at most {MEMGREP_MAX} characters")
+    files, skipped, host = _memory_listing()
+    matches = memgrep(pattern.strip(), files, skipped=skipped)
+    # skipped: listing failures first, then files that could not be read.
+    return {"host": host, "matches": matches, "skipped": skipped}
 
 
 def _cmd_lookup() -> dict:
@@ -740,6 +929,7 @@ _COMMANDS: dict = {
     "lookup": _cmd_lookup,
     "stale": _cmd_stale,
     "file": _cmd_file,
+    "memgrep": _cmd_memgrep,
 }
 
 
