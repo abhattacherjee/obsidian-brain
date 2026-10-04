@@ -67,7 +67,7 @@ def test_cli_file_lookup_stale_round_trip(tmp_path):
     r = run(["lookup"], stdin=json.dumps({"question": "zebracorn work"}), home=home, db=db)
     assert r.returncode == 0 and json.loads(r.stdout)["candidates"][0]["path"] == page
     r = run(["stale"], stdin=json.dumps({"page": page}), home=home, db=db)
-    assert r.returncode == 0 and json.loads(r.stdout) == {"stale": False, "reasons": []}
+    assert r.returncode == 0 and json.loads(r.stdout) == {"stale": False, "reasons": [], "memory_paths": {}}
     r = run(["count"], stdin=json.dumps({"sources": ["i1", "nope"]}), home=home, db=db)
     out = json.loads(r.stdout)
     assert r.returncode == 0 and out["count"] == 1 and out["rejected"][0]["name"] == "nope"
@@ -130,7 +130,7 @@ def test_commands_in_process(tmp_path, monkeypatch, capsys):
     assert rc == 0
     page = out["path"]
     assert call("lookup", {"question": "zebracorn work"})[1]["candidates"][0]["path"] == page
-    assert call("stale", {"page": page})[1] == {"stale": False, "reasons": []}
+    assert call("stale", {"page": page})[1] == {"stale": False, "reasons": [], "memory_paths": {}}
     assert call("count", {"sources": ["i1", "i2"]})[1]["count"] == 2
     rc, err = call("stale", {"page": str(vault / "claude-insights" / "i1.md")})
     assert rc == 1 and "under" in err
@@ -148,7 +148,36 @@ def test_memgrep_cli_prints_matches(monkeypatch, capsys, tmp_path):
     f = tmp_path / "p" / "memory" / "m.md"
     f.parent.mkdir(parents=True)
     f.write_text("needle here")
+    gone = tmp_path / "p" / "memory" / "gone.md"
+    listing_err = {"path": str(tmp_path / "q" / "memory"), "error": "Permission denied"}
     monkeypatch.setattr(wiki, "_read_stdin", lambda: {"pattern": "NEEDLE"})
-    monkeypatch.setattr(wiki, "_memory_files", lambda: [f])
+    monkeypatch.setattr(wiki, "_memory_listing", lambda: ([f, gone], [listing_err], "claude-code"))
     assert wiki.main(["memgrep"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"matches": [{"name": "p/m.md", "path": str(f)}]}
+    out = json.loads(capsys.readouterr().out)
+    assert out["host"] == "claude-code"
+    assert out["matches"] == [{"name": "p/m.md", "path": str(f)}]
+    assert [s["path"] for s in out["skipped"]] == [listing_err["path"], str(gone)]
+
+
+def test_memgrep_cli_names_the_host(monkeypatch, capsys):
+    monkeypatch.setattr(wiki, "_read_stdin", lambda: {"pattern": "x"})
+    monkeypatch.setattr(wiki, "_memory_listing", lambda: ([], [], "codex"))
+    assert wiki.main(["memgrep"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"host": "codex", "matches": [], "skipped": []}
+
+
+def test_count_in_process_hides_memory_resolved(tmp_path, monkeypatch, capsys):
+    home, vault, db = _setup(tmp_path)
+    ctx = {"vault": str(vault), "wiki_folder": "claude-wiki",
+           "folders": ["claude-sessions", "claude-insights", "claude-wiki"], "db": str(db)}
+    m = tmp_path / "home" / ".claude" / "projects" / "proj" / "memory" / "x.md"
+    m.parent.mkdir(parents=True)
+    m.write_text("fact\n")
+    monkeypatch.setattr(wiki, "_context", lambda: ctx)
+    monkeypatch.setattr(wiki, "_memory_files", lambda: [m])
+    monkeypatch.setattr(wiki.sys, "stdin", io.StringIO(json.dumps(
+        {"sources": ["i1"], "memory_sources": ["proj/x.md"]})))
+    assert wiki.main(["count"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["count"] == 2 and "memory:proj/x.md" in out["qualifying"]
+    assert "memory_resolved" not in out and "resolved" not in out

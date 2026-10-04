@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -89,3 +90,124 @@ def test_memory_name_is_project_and_file(home):
     (a / "feedback_y.md").write_text("y")
     [p] = ms.memory_sources("claude-code")
     assert ms.memory_name(p) == "-Users-x-proj/feedback_y.md"
+
+
+# --- review fixes (#399): symlinked projects, dedupe, visible errors ----------
+
+_ROOT_SKIP = pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                                reason="root ignores file permissions")
+
+
+def test_symlinked_project_dir_is_skipped(home, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("outside")
+    (outside / "memory").mkdir()
+    (outside / "memory" / "s.md").write_text("secret")
+    (_store(home, "p1") / "a.md").write_text("a")
+    (home / ".claude" / "projects" / "evil").symlink_to(outside)
+    assert [ms.memory_name(p) for p in ms.memory_sources("claude-code")] == ["p1/a.md"]
+
+
+def test_alias_project_lists_the_real_files_once(home):
+    (_store(home, "p1") / "a.md").write_text("a")
+    root = home / ".claude" / "projects"
+    (root / "alias").symlink_to(root / "p1")
+    assert [ms.memory_name(p) for p in ms.memory_sources("claude-code")] == ["p1/a.md"]
+
+
+def test_output_is_deduped_by_resolved_path(home, monkeypatch):
+    # The symlink skip already stops an alias; this proves the dedupe on its
+    # own by letting every symlink through.
+    (_store(home, "p1") / "a.md").write_text("a")
+    root = home / ".claude" / "projects"
+    (root / "alias").symlink_to(root / "p1")
+    monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+    got = ms.memory_sources("claude-code")
+    assert got == [(root / "p1" / "memory" / "a.md").resolve()]
+
+
+@_ROOT_SKIP
+def test_unreadable_memory_dir_is_an_error_and_the_rest_still_list(home):
+    a = _store(home, "a")
+    b = _store(home, "b")
+    (a / "x.md").write_text("x")
+    (b / "y.md").write_text("y")
+    a.chmod(0o000)
+    errors: list = []
+    try:
+        got = ms.memory_sources("claude-code", errors=errors)
+    finally:
+        a.chmod(0o700)
+    assert [ms.memory_name(p) for p in got] == ["b/y.md"]
+    assert [e["path"] for e in errors] == [str(a)] and errors[0]["error"]
+
+
+@_ROOT_SKIP
+def test_unreadable_project_dir_is_an_error(home):
+    (_store(home, "a") / "x.md").write_text("x")
+    (_store(home, "b") / "y.md").write_text("y")
+    proj = home / ".claude" / "projects" / "a"
+    proj.chmod(0o000)
+    errors: list = []
+    try:
+        got = ms.memory_sources("claude-code", errors=errors)
+    finally:
+        proj.chmod(0o700)
+    assert [ms.memory_name(p) for p in got] == ["b/y.md"]
+    assert [e["path"] for e in errors] == [str(proj / "memory")]
+
+
+@_ROOT_SKIP
+def test_unlistable_projects_root_is_an_error(home):
+    (_store(home, "a") / "x.md").write_text("x")
+    root = home / ".claude" / "projects"
+    root.chmod(0o000)
+    errors: list = []
+    try:
+        assert ms.memory_sources("claude-code", errors=errors) == []
+    finally:
+        root.chmod(0o700)
+    assert [e["path"] for e in errors] == [str(root)]
+    assert ms.failed_scopes(errors) == (True, set(), set())
+
+
+def test_missing_root_is_not_an_error(home):
+    errors: list = []
+    assert ms.memory_sources("claude-code", errors=errors) == [] and errors == []
+
+
+def test_unresolvable_file_is_an_error(home, monkeypatch):
+    a = _store(home, "a")
+    (a / "x.md").write_text("x")
+    (a / "y.md").write_text("y")
+    real_resolve = Path.resolve
+
+    def resolve(self, strict=False):
+        if self.name == "x.md":
+            raise OSError("boom")
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    errors: list = []
+    got = ms.memory_sources("claude-code", errors=errors)
+    assert [ms.memory_name(p) for p in got] == ["a/y.md"]
+    assert errors == [{"path": str(a / "x.md"), "error": "boom"}]
+    assert ms.failed_scopes(errors) == (False, set(), {"a/x.md"})
+
+
+def test_failed_scopes_classifies_project_errors(home):
+    root = ms._projects_root()
+    errs = [{"path": str(root / "p" / "memory"), "error": "x"},
+            {"path": "/somewhere/else", "error": "y"}]
+    assert ms.failed_scopes(errs) == (False, {"p"}, set())
+
+
+def test_symlinked_project_pointing_inside_the_root_is_skipped(home):
+    # Containment and dedupe both pass this one: the target sits under the
+    # projects root and is not listed any other way. Only the skip stops it.
+    p1 = _store(home, "p1")
+    (p1 / "a.md").write_text("a")
+    hidden = p1 / "sub" / "memory"
+    hidden.mkdir(parents=True)
+    (hidden / "s.md").write_text("nested")
+    (home / ".claude" / "projects" / "evil").symlink_to(p1 / "sub")
+    assert [ms.memory_name(p) for p in ms.memory_sources("claude-code")] == ["p1/a.md"]

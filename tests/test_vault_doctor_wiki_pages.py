@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -50,6 +51,7 @@ def env(tmp_path, monkeypatch):
     db = str(tmp_path / "i.db")
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", db)
     monkeypatch.setattr(wiki, "_memory_files", lambda: [])
+    monkeypatch.setattr(wiki, "_memory_listing", lambda: (wiki._memory_files(), [], "claude-code"))
     vault_index.ensure_index(str(vault), FOLDERS, db_path=db)
     ctx = {"vault": str(vault), "wiki_folder": "claude-wiki", "folders": FOLDERS, "db": db}
     return {"vault": vault, "ctx": ctx, "home": home, "cfg": cfg}
@@ -242,17 +244,39 @@ def test_report_only_rows_are_unresolved(env):
 # --- page-unreadable, project filter, wiki off ---------------------------------
 
 
-def test_unparseable_page_is_reported(env):
+_ROOT_SKIP = pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                                reason="root ignores file permissions")
+
+
+@_ROOT_SKIP
+def test_unreadable_page_is_reported(env):
     page = _file(env)
     _link_from_session(env, page)
     bad = page.parent / "broken.md"
-    bad.write_bytes(b"---\ntype: \"claude-wiki\"\n---\n\xff\xfe")
+    bad.write_text('---\ntype: "claude-wiki"\n---\nbody\n')
     bad.chmod(0o000)
     try:
         rows = _scan(env)
     finally:
         bad.chmod(0o600)
-    assert "page-unreadable" in _classes(rows, bad)
+    assert _classes(rows, bad) == ["page-unreadable"]
+
+
+def test_page_with_bad_bytes_is_reported(env):
+    page = _file(env)
+    _link_from_session(env, page)
+    bad = page.parent / "broken.md"
+    bad.write_bytes(b"---\ntype: \"claude-wiki\"\n---\n\xff\xfe")
+    assert _classes(_scan(env), bad) == ["page-unreadable"]
+
+
+def test_unreadable_page_is_shown_even_under_project(env):
+    page = _file(env)
+    _link_from_session(env, page)
+    bad = page.parent / "broken.md"
+    bad.write_bytes(b"---\ntype: \"claude-wiki\"\n---\n\xff\xfe")
+    assert _classes(_scan(env, project="demo"), bad) == ["page-unreadable"]
+    assert _classes(_scan(env, project="nomatch"), bad) == ["page-unreadable"]
 
 
 def test_project_filter_limits_page_rows(env):
@@ -288,6 +312,7 @@ def test_config_is_read_from_home_at_call_time(env, monkeypatch):
     cfg = dict(env["cfg"], wiki_folder="tmp-only-wiki")
     (env["home"] / ".claude" / "obsidian-brain-config.json").write_text(json.dumps(cfg))
     (env["vault"] / "tmp-only-wiki" / "queries").mkdir(parents=True)
+    (env["vault"] / "tmp-only-wiki" / "index.md").write_text("hand-made\n")
     assert _scan(env) and _classes(_scan(env)) == ["index-drift"]
 
 
@@ -307,3 +332,168 @@ def test_a_self_link_does_not_save_a_page_from_orphan(env):
     page.write_text(page.read_text() + f"\nSee also [[{page.stem}]].\n")
     vault_index.ensure_index(str(env["vault"]), FOLDERS, db_path=env["ctx"]["db"])
     assert "orphan" in _classes(_scan(env), page)
+
+
+# --- review fixes (#399) ------------------------------------------------------
+
+
+def test_empty_wiki_reports_nothing(env):
+    w = env["vault"] / "claude-wiki"
+    w.mkdir()
+    assert _scan(env) == []
+    (w / "queries").mkdir()
+    assert _scan(env) == []
+    # A user's own index-ideas.md is not a wiki index file.
+    (w / "index-ideas.md").write_text("---\ntype: claude-insight\n---\nmine\n")
+    assert _scan(env) == []
+
+
+def test_empty_wiki_with_a_leftover_index_file_still_drifts(env):
+    w = env["vault"] / "claude-wiki"
+    w.mkdir()
+    (w / "index-old.md").write_text('---\ntype: "claude-wiki-index"\n---\n# old\n')
+    assert _classes(_scan(env)) == ["index-drift"]
+
+
+@_ROOT_SKIP
+def test_unreadable_queries_folder_crashes_the_check(env):
+    page = _file(env)
+    _link_from_session(env, page)
+    q = env["vault"] / "claude-wiki" / "queries"
+    q.chmod(0o000)
+    try:
+        with pytest.raises(OSError):
+            _scan(env)
+    finally:
+        q.chmod(0o700)
+
+
+@_ROOT_SKIP
+def test_queries_folder_without_search_permission_crashes_the_check(env):
+    # Readable but not searchable: scandir lists names, yet nothing inside
+    # can be opened, so the access check must catch it.
+    page = _file(env)
+    _link_from_session(env, page)
+    q = env["vault"] / "claude-wiki" / "queries"
+    q.chmod(0o400)
+    try:
+        with pytest.raises(PermissionError, match="cannot read"):
+            _scan(env)
+    finally:
+        q.chmod(0o700)
+
+
+@_ROOT_SKIP
+def test_unreadable_year_folder_crashes_the_check(env):
+    page = _file(env)
+    _link_from_session(env, page)
+    year = page.parent
+    year.chmod(0o000)
+    try:
+        with pytest.raises(OSError):
+            _scan(env)
+    finally:
+        year.chmod(0o700)
+
+
+@pytest.mark.parametrize("form", ["| [[{stem}\\|alias]] | x |", "[[{stem}.md]]", "[[{stem}.md\\|alias]]"])
+def test_table_alias_and_md_links_count(env, form):
+    page = _file(env)
+    _link_from_session(env, page, form)
+    assert _scan(env) == []
+
+
+def test_odd_backslash_links_do_not_crash(env):
+    page = _file(env)
+    _note(env["vault"], "claude-sessions", "s-odd", "claude-session", body="[[a\\\\b]] [[\\]] [[x\\]]")
+    assert _classes(_scan(env), page) == ["orphan"]
+    links = wp._linked_stems(env["vault"], env["vault"] / "claude-wiki")
+    assert "a\\\\b" in links and "x" in links and "" not in links
+
+
+def test_memory_backed_page_with_deleted_memory_file_is_broken_source(env, tmp_path, monkeypatch):
+    store = tmp_path / "home" / ".claude" / "projects" / "proj" / "memory"
+    store.mkdir(parents=True)
+    x, y = store / "x.md", store / "y.md"
+    x.write_text("zebracorn memory\n")
+    y.write_text("other\n")
+    monkeypatch.setattr(wiki, "_memory_files", lambda: [x, y])
+    page = _file(env, sources=["i1", "i2"], memory_sources=["proj/x.md"])
+    _link_from_session(env, page)
+    assert _scan(env) == []
+    x.unlink()
+    monkeypatch.setattr(wiki, "_memory_files", lambda: [y])
+    rows = _scan(env)
+    assert _classes(rows, page) == ["broken-source"]
+    assert "missing: memory:proj/x.md" in rows[0].reason
+
+
+def test_split_index_links_do_not_save_a_page_from_orphan(env, monkeypatch):
+    monkeypatch.setattr(wiki, "INDEX_SPLIT", 0)
+    page = _file(env)
+    w = env["vault"] / "claude-wiki"
+    assert f"[[{page.stem}]]" in (w / "index-demo.md").read_text()
+    assert "[[index-demo]]" in (w / "index.md").read_text()
+    assert _classes(_scan(env)) == ["orphan"]
+
+
+def test_stale_crash_on_one_page_does_not_hide_the_next(env, monkeypatch):
+    a = _file(env, question="alpha zebracorn question?")
+    b = _file(env, question="beta zebracorn question?")
+    real = wiki.stale
+
+    def flaky(db, page, roots):
+        if Path(page) == a:
+            raise RuntimeError("kaput")
+        return real(db, page, roots)
+
+    monkeypatch.setattr(wiki, "stale", flaky)
+    rows = _scan(env)
+    assert "page-unreadable" in _classes(rows, a) and "kaput" in [r for r in rows if r.note_path == str(a)][0].reason
+    assert _classes(rows, b) == ["orphan"]
+
+
+def test_session_note_named_index_still_counts_as_a_link(env):
+    page = _file(env)
+    _note(env["vault"], "claude-sessions", "index", "claude-session", body=f"see [[{page.stem}]]")
+    assert _scan(env) == []
+
+
+def test_apply_backs_up_and_removes_a_leftover_index_file(env, tmp_path):
+    page = _file(env)
+    _link_from_session(env, page)
+    old = env["vault"] / "claude-wiki" / "index-old.md"
+    old.write_text('---\ntype: "claude-wiki-index"\n---\n# old\n')
+    results = wp.apply(_scan(env), str(tmp_path / "backup"))
+    assert [r.status for r in results] == ["applied"]
+    assert not old.exists()
+    assert "# old" in (Path(results[0].backup_path) / "index-old.md").read_text()
+
+
+def test_apply_twice_in_a_row_releases_the_lock(env, tmp_path):
+    page = _file(env)
+    _link_from_session(env, page)
+    idx = env["vault"] / "claude-wiki" / "index.md"
+    idx.write_text(idx.read_text() + "- [[hand-added]]\n")
+    rows = _scan(env)
+    assert [r.status for r in wp.apply(rows, str(tmp_path / "b1"))] == ["applied"]
+    assert [r.status for r in wp.apply(rows, str(tmp_path / "b2"))] == ["applied"]
+
+
+def test_apply_error_keeps_the_backup_path_and_releases_the_lock(env, tmp_path, monkeypatch):
+    page = _file(env)
+    _link_from_session(env, page)
+    idx = env["vault"] / "claude-wiki" / "index.md"
+    idx.write_text(idx.read_text() + "- [[hand-added]]\n")
+    rows = _scan(env)
+
+    def boom(ctx):
+        raise RuntimeError("disk full")
+
+    real = wiki.rebuild_wiki_index
+    monkeypatch.setattr(wiki, "rebuild_wiki_index", boom)
+    [r] = wp.apply(rows, str(tmp_path / "backup"))
+    assert r.status == "error" and "disk full" in r.error
+    assert r.backup_path and "hand-added" in (Path(r.backup_path) / "index.md").read_text()
+    monkeypatch.setattr(wiki, "rebuild_wiki_index", real)
+    assert [x.status for x in wp.apply(rows, str(tmp_path / "backup2"))] == ["applied"]

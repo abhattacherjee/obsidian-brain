@@ -11,15 +11,19 @@
   reason. ``/vault-ask`` never refreshes these on its own.
 - ``auto-filed``: ``filed_by: auto``, listed so a person can review it.
 - ``orphan``: no vault note links ``[[<page>]]`` except the page itself and
-  the wiki's own index and log files. Only pages whose ``updated`` date is
-  inside ``--days`` are checked (default: all).
+  the wiki's own ``index.md``, ``index-<project>.md`` and ``log-<year>.md``
+  at the wiki root. Only pages whose ``updated`` date is inside ``--days``
+  are checked (default: all).
 - ``page-unreadable``: the page or its staleness check could not be read.
+  An unreadable page is shown even under ``--project`` (its project is
+  unknown).
 
 and once for the wiki:
 
 - ``index-drift``: the index files on disk differ from a fresh
   ``wiki.render_wiki_index``. This is the only row ``--apply`` fixes: it backs
-  up the current index files and rebuilds them under the wiki lock.
+  up the current index files and rebuilds them under the wiki lock. A
+  freshly set-up wiki (no pages, no index files) has no drift.
 
 Every other row is report-only (``unresolved``, confidence 0.0).
 
@@ -27,8 +31,9 @@ The wiki folder comes from the config file, because ``scan`` receives only
 the sessions and insights folders. The file is read at call time from
 ``Path.home()``, like the dispatcher's own config read; a missing file means
 the default folder. A wiki that is turned off, or a folder that does not
-exist yet, reports nothing. A corrupt config or an invalid ``wiki_folder``
-raises, so the dispatcher shows a crashed check instead of a clean one.
+exist yet, reports nothing. A corrupt config, an invalid ``wiki_folder``, or
+a ``queries/`` folder (or subfolder) that cannot be read raises, so the
+dispatcher shows a crashed check instead of a clean one.
 
 The check syncs the vault index first (like ``/vault-ask``): index lines come
 from the notes table, and a stale table would invent drift.
@@ -126,10 +131,15 @@ def _linked_stems(vault: Path, wiki_root: Path) -> dict:
         except OSError:
             continue
         for target in _WIKILINK_RE.findall(text):
-            stem = target.strip().rsplit("/", 1)[-1]
+            target = target.strip()
+            if target.endswith("\\"):
+                # A table cell escapes the alias pipe: [[stem\|alias]].
+                target = target[:-1]
+            stem = target.rsplit("/", 1)[-1]
             if stem.endswith(".md"):
                 stem = stem[:-3]
-            links.setdefault(stem, set()).add(f)
+            if stem:
+                links.setdefault(stem, set()).add(f)
     return links
 
 
@@ -140,9 +150,57 @@ def _parse_date(value) -> _dt.date | None:
         return None
 
 
+def _is_wiki_index(f: Path) -> bool:
+    import wiki
+
+    try:
+        return wiki.read_page(f)[0].get("type") == wiki.INDEX_TYPE
+    except (OSError, ValueError, wiki.WikiRefusal):
+        return False
+
+
+def _empty_wiki(ctx: dict, wiki_root: Path) -> bool:
+    """True for a freshly set-up wiki: no indexed pages under ``queries/``,
+    no ``index.md`` and no ``index-*.md`` typed as a wiki index."""
+    import vault_index
+    import wiki
+
+    if (wiki_root / "index.md").exists():
+        return False
+    if any(_is_wiki_index(f) for f in wiki_root.glob("index-*.md")):
+        return False
+    queries = wiki_root / "queries"
+    conn = vault_index._connect(ctx["db"])
+    try:
+        rows = conn.execute("SELECT path FROM notes WHERE type = ?", (wiki.PAGE_TYPE,)).fetchall()
+    finally:
+        conn.close()
+    return not any(vault_index._is_under(Path(r["path"]), queries) for r in rows)
+
+
+def _pages(queries: Path) -> list:
+    """Every ``*.md`` under ``queries/``, sorted. A folder that cannot be
+    read raises (the dispatcher then shows a crashed check): skipping it
+    would hide its pages and make the index look drifted."""
+    if not queries.exists():
+        return []
+    if not os.access(queries, os.R_OK | os.X_OK):
+        raise PermissionError(f"cannot read {queries}")
+
+    def fail(exc: OSError) -> None:
+        raise exc
+
+    out = []
+    for folder, _dirs, files in os.walk(queries, onerror=fail):
+        out += [Path(folder) / n for n in files if n.endswith(".md")]
+    return sorted(out)
+
+
 def _index_drift(ctx: dict, wiki_root: Path) -> dict:
     import wiki
 
+    if _empty_wiki(ctx, wiki_root):
+        return {"missing": [], "different": [], "extra": []}
     want = wiki.render_wiki_index(ctx)
     missing, different = [], []
     for name, text in want.items():
@@ -156,13 +214,8 @@ def _index_drift(ctx: dict, wiki_root: Path) -> dict:
             different.append(name)
     extra = []
     for f in wiki_root.glob("index-*.md"):
-        if f.name in want:
-            continue
-        try:
-            if wiki.read_page(f)[0].get("type") == wiki.INDEX_TYPE:
-                extra.append(f.name)
-        except (OSError, ValueError, wiki.WikiRefusal):
-            continue
+        if f.name not in want and _is_wiki_index(f):
+            extra.append(f.name)
     return {"missing": sorted(missing), "different": sorted(different), "extra": sorted(extra)}
 
 
@@ -188,12 +241,12 @@ def scan(
     links = None
     issues: list = []
 
-    for page in sorted((wiki_root / "queries").rglob("*.md")):
+    for page in _pages(wiki_root / "queries"):
         try:
             meta, _body = wiki.read_page(page)
         except (OSError, ValueError, wiki.WikiRefusal) as exc:
-            if not needle:
-                issues.append(_row(page, "", "page-unreadable", f"cannot read the page: {exc}"))
+            # Always shown, even under --project: its project is unknown.
+            issues.append(_row(page, "", "page-unreadable", f"cannot read the page: {exc}"))
             continue
         if meta.get("type") != wiki.PAGE_TYPE:
             continue
@@ -258,6 +311,7 @@ def apply(issues: list, backup_root: str) -> list:
         if err:
             results.append(Result(check=NAME, note_path=i.note_path, status="skipped", error=err))
             continue
+        backed_up = None
         try:
             stamp = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
             backup = Path(os.path.expanduser(backup_root)) / NAME / stamp
@@ -265,11 +319,13 @@ def apply(issues: list, backup_root: str) -> list:
             for f in [wiki_root / "index.md", *wiki_root.glob("index-*.md")]:
                 if f.is_file():
                     shutil.copy2(f, backup / f.name)
+            backed_up = str(backup)
             wiki.rebuild_wiki_index(ctx)
             results.append(Result(check=NAME, note_path=i.note_path, status="applied",
-                                  backup_path=str(backup)))
+                                  backup_path=backed_up))
         except Exception as exc:  # noqa: BLE001
-            results.append(Result(check=NAME, note_path=i.note_path, status="error", error=str(exc)))
+            results.append(Result(check=NAME, note_path=i.note_path, status="error",
+                                  backup_path=backed_up, error=str(exc)))
         finally:
             _release_lock(lock)
     return results

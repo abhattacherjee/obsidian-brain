@@ -119,6 +119,37 @@ def _scalar(text: str):
     return s
 
 
+_QUOTED_KEY_RE = re.compile(r'^(?:"((?:[^"\\]|\\.)*)"|\'((?:[^\']|\'\')*)\')\s*:(?:\s(.*))?$')
+
+
+def _split_map_line(stripped: str):
+    """``(key, value text)`` for one block-map line, or None.
+
+    A key may hold a colon (``memory:proj/a.md: 1111``), so the line splits
+    on the first ``": "``, or on a final ``:`` when there is no value. A
+    quoted key ends at its closing quote. A line with neither falls back to
+    the first ``:``, as before."""
+    m = _QUOTED_KEY_RE.match(stripped)
+    if m:
+        if m.group(1) is not None:
+            try:
+                key = json.loads('"' + m.group(1) + '"')
+            except ValueError:
+                key = m.group(1)
+        else:
+            key = m.group(2).replace("''", "'")
+        return key, m.group(3) or ""
+    k, sep, v = stripped.partition(": ")
+    if not sep:
+        if stripped.endswith(":"):
+            k, sep, v = stripped[:-1], ":", ""
+        else:
+            k, sep, v = stripped.partition(":")
+    if not sep:
+        return None
+    return str(_scalar(k)), v
+
+
 def read_page(path) -> tuple:
     """Return ``(meta, body)``. Values are JSON-decoded when they parse,
     else kept as the raw string (a hand-edited page).
@@ -148,12 +179,12 @@ def read_page(path) -> tuple:
                 if isinstance(current, list):
                     current.append(_scalar(stripped[1:]))
                 continue
-            k, sep, v = stripped.partition(":")
-            if sep:
+            kv = _split_map_line(stripped)
+            if kv is not None:
                 if current == "":
                     current = meta[block_key] = {}
                 if isinstance(current, dict):
-                    current[str(_scalar(k))] = _scalar(v)
+                    current[kv[0]] = _scalar(kv[1])
             continue
         block_key = None
         key, sep, val = stripped.partition(":")
@@ -274,14 +305,19 @@ def count_sources(db_path: str, names, memory_sources, roots) -> dict:
 
 def _memory_files() -> list:
     """This host's memory files (the seam tests replace)."""
+    return _memory_listing()[0]
+
+
+def _memory_listing() -> tuple:
+    """``(files, errors, host)`` for this host: the files from
+    ``memory_sources``, the ``{"path", "error"}`` failures it hit while
+    listing, and the host name. The sibling seam of ``_memory_files`` for
+    callers that must tell "no such file" from "could not look"."""
     import memory_sources as ms
 
-    return ms.memory_sources(ms.detect_host())
-
-
-def _memory_name(path) -> str:
-    p = Path(path)
-    return f"{p.parent.parent.name}/{p.name}"
+    host = ms.detect_host()
+    errors: list = []
+    return ms.memory_sources(host, errors=errors), errors, host
 
 
 def resolve_memory(names) -> dict:
@@ -294,7 +330,9 @@ def resolve_memory(names) -> dict:
     names = list(names or [])
     if not names:
         return {"resolved": [], "rejected": []}
-    by_name = {_memory_name(f): f for f in _memory_files()}
+    import memory_sources as ms
+
+    by_name = {ms.memory_name(f): f for f in _memory_files()}
     resolved, rejected, seen = [], [], set()
     for n in names:
         if (not isinstance(n, str) or not MEMORY_NAME_RE.fullmatch(n)
@@ -312,18 +350,23 @@ def resolve_memory(names) -> dict:
     return {"resolved": resolved, "rejected": rejected}
 
 
-def memgrep(pattern: str, files) -> list:
+def memgrep(pattern: str, files, skipped: list | None = None) -> list:
     """Memory files whose text holds ``pattern`` (case-insensitive fixed
-    string, never a regex). Unreadable files are skipped."""
+    string, never a regex). A file that cannot be read is left out and, when
+    ``skipped`` is a list, appended to it as ``{"path", "error"}``."""
+    import memory_sources as ms
+
     needle = pattern.casefold()
     out = []
     for f in files:
         try:
             text = Path(f).read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except OSError as exc:
+            if skipped is not None:
+                skipped.append({"path": str(f), "error": str(exc)})
             continue
         if needle in text.casefold():
-            out.append({"name": _memory_name(f), "path": str(f)})
+            out.append({"name": ms.memory_name(f), "path": str(f)})
     return out
 
 
@@ -376,10 +419,13 @@ def lookup(db_path: str, question: str, limit: int = 3) -> list:
 def stale(db_path: str, page_path, roots) -> dict:
     """Why a page is stale: ``unverifiable:``/``changed:``/``missing:`` per
     source, ``newer:`` per newer counting note in the question's top 5 hits.
-    All reasons are returned. An unreadable source counts as missing, and a
-    cited source with no usable fingerprint (field missing, not a mapping, or
-    no non-empty string for it) as unverifiable -- never as fresh. A page
-    whose ``sources`` is not a non-empty list gets ``unverifiable: sources``."""
+    All reasons are returned. An unreadable vault source counts as missing,
+    and a cited source with no usable fingerprint (field missing, not a
+    mapping, or no non-empty string for it) as unverifiable -- never as
+    fresh. A page whose ``sources`` is not a non-empty list gets
+    ``unverifiable: sources``. Memory sources follow ``_memory_reasons``.
+    ``memory_paths`` maps each cited memory file found here to its path, so
+    a refresh can re-read it."""
     meta, _body = read_page(page_path)
     raw_fps = meta.get("sources_fingerprint")
     fps = {}
@@ -416,27 +462,60 @@ def stale(db_path: str, page_path, roots) -> dict:
         if now != old:
             reasons.append(f"changed: {r['name']}")
     mem_names = meta.get("memory_sources")
-    for n in dict.fromkeys(mem_names if isinstance(mem_names, list) else []):
+    mem_names = list(dict.fromkeys(mem_names if isinstance(mem_names, list) else []))
+    for n in mem_names:
         if MEMORY_PREFIX + str(n) not in mem_fps:
             reasons.append(f"unverifiable: {MEMORY_PREFIX}{n}")
-    if mem_fps:
-        by_name = {_memory_name(f): f for f in _memory_files()}
-        for key, old in mem_fps.items():
-            f = by_name.get(key[len(MEMORY_PREFIX):])
-            try:
-                now = fingerprint(f) if f is not None else None
-            except OSError:
-                now = None
-            if now is None:
-                reasons.append(f"missing: {key}")
-            elif now != old:
-                reasons.append(f"changed: {key}")
+    memory_paths: dict = {}
+    if mem_fps or mem_names:
+        reasons += _memory_reasons(mem_fps, mem_names, memory_paths)
     cited = {_norm_name(x) for x in sources} | set(fps)
     updated = str(meta.get("updated") or "")
     question = str(meta.get("question") or "")
     for base in _newer_notes(db_path, question, updated, cited, roots):
         reasons.append(f"newer: {base}")
-    return {"stale": bool(reasons), "reasons": reasons}
+    return {"stale": bool(reasons), "reasons": reasons, "memory_paths": memory_paths}
+
+
+def _memory_reasons(mem_fps: dict, mem_names: list, memory_paths: dict) -> list:
+    """Reasons for the page's ``memory:`` fingerprints, and fill
+    ``memory_paths`` with ``{name: path}`` for each cited file found.
+
+    ``unverifiable:`` when this host has no memory files or the listing
+    could not look (root, project folder or the file itself failed), or the
+    listed file cannot be read. ``missing:`` only when a listing that
+    worked does not have the file (or it was deleted since)."""
+    import memory_sources as ms
+
+    files, errors, host = _memory_listing()
+    root_failed, bad_projects, bad_names = ms.failed_scopes(errors)
+    by_name = {ms.memory_name(f): f for f in files}
+    cited = [n for n in mem_names if isinstance(n, str)] + [k[len(MEMORY_PREFIX):] for k in mem_fps]
+    memory_paths.update({n: str(by_name[n]) for n in dict.fromkeys(cited) if n in by_name})
+    out = []
+    for key, old in mem_fps.items():
+        name = key[len(MEMORY_PREFIX):]
+        if host != "claude-code" or root_failed:
+            out.append(f"unverifiable: {key}")
+            continue
+        f = by_name.get(name)
+        if f is None:
+            if name.split("/", 1)[0] in bad_projects or name in bad_names:
+                out.append(f"unverifiable: {key}")
+            else:
+                out.append(f"missing: {key}")
+            continue
+        try:
+            now = fingerprint(f)
+        except FileNotFoundError:
+            out.append(f"missing: {key}")  # deleted after the listing
+            continue
+        except OSError:
+            out.append(f"unverifiable: {key}")
+            continue
+        if now != old:
+            out.append(f"changed: {key}")
+    return out
 
 
 # Question-frame verbs that _STOPWORDS keeps but nearly every "how does X
@@ -802,7 +881,10 @@ def _cmd_memgrep() -> dict:
     pattern = payload.get("pattern")
     if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > MEMGREP_MAX:
         raise WikiRefusal(f"pattern must be a non-blank string of at most {MEMGREP_MAX} characters")
-    return {"matches": memgrep(pattern.strip(), _memory_files())}
+    files, skipped, host = _memory_listing()
+    matches = memgrep(pattern.strip(), files, skipped=skipped)
+    # skipped: listing failures first, then files that could not be read.
+    return {"host": host, "matches": matches, "skipped": skipped}
 
 
 def _cmd_lookup() -> dict:

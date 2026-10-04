@@ -105,3 +105,27 @@ def test_memory_files_stay_out_of_vault_scan_meta():
 
 def test_skill_has_no_claude_only_memory_path():
     assert "~/.claude/projects" not in SKILL and "/memory/" not in SKILL
+
+
+# --- review fixes (#399) ------------------------------------------------------
+
+
+def test_refresh_adds_the_pages_memory_files_from_memory_paths():
+    assert "`memory_paths`" in SKILL
+    assert "Add each path in `memory_paths` to `CANDIDATE_FILES` as type `claude-memory`" in SKILL
+
+
+def test_memory_reason_forms_are_listed():
+    for form in ("`changed: memory:<project-dir>/<file>.md`", "`missing: memory:<project-dir>/<file>.md`",
+                 "`unverifiable: memory:<project-dir>/<file>.md`"):
+        assert form in SKILL
+
+
+def test_memgrep_skipped_and_host_are_reported():
+    assert '"host"' in SKILL and '"skipped"' in SKILL
+    assert "N memory file(s) could not be read" in SKILL
+    assert "this host has no memory files" in SKILL
+
+
+def test_rejected_names_bullet_covers_memory_sources():
+    assert "Never file with a rejected name in `sources` or `memory_sources`." in SKILL
