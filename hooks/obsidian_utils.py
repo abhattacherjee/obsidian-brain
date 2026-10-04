@@ -2232,6 +2232,7 @@ _DEFAULTS: dict = {
     "insights_folder": "claude-insights",
     "dashboards_folder": "claude-dashboards",
     "check_items_folder": "claude-check-items",
+    "wiki_folder": "claude-wiki",  # #383: /vault-ask answers filed as wiki pages; indexed via indexed_folders()
     "min_messages": 3,
     "min_duration_minutes": 2,
     "summary_model": "haiku",
@@ -2305,6 +2306,45 @@ def load_config() -> dict:
 
     cache_set(sid, "config", config)
     return config
+
+
+def indexed_folders(config: dict) -> list:
+    """Vault folders that user-facing search indexes, in a fixed order (#383).
+
+    Returns ``[sessions_folder, insights_folder, wiki_folder]`` with defaults
+    for missing keys. Empty or None values and duplicates are dropped, so an
+    empty ``wiki_folder`` turns the wiki folder off. An invalid
+    ``wiki_folder`` (not a string, absolute, ``~``, a ``..`` or dot-prefixed
+    segment) is dropped with a stderr warning, so ``_sync`` never walks
+    outside the vault. Sessions and insights pass through unchanged, as
+    before.
+
+    Every skill and script that passes a folder list to ``ensure_index`` or
+    ``rebuild_index`` must call this. ``tests/test_indexed_folders.py``
+    enforces it.
+    """
+    # Imported here: note_writer imports obsidian_utils at module level.
+    from note_writer import _validate_folder
+
+    names = [
+        config.get("sessions_folder") or _DEFAULTS["sessions_folder"],
+        config.get("insights_folder") or _DEFAULTS["insights_folder"],
+    ]
+    wiki = config.get("wiki_folder", _DEFAULTS["wiki_folder"])
+    if wiki and not isinstance(wiki, str):
+        print(f"[obsidian-brain] ignoring non-string wiki_folder {wiki!r}", file=sys.stderr)
+        wiki = None
+    if wiki:
+        err = _validate_folder(wiki)
+        if err:
+            print(f"[obsidian-brain] ignoring invalid wiki_folder {wiki!r}: {err}", file=sys.stderr)
+        else:
+            names.append(wiki)
+    out = []
+    for n in names:
+        if n not in out:
+            out.append(n)
+    return out
 
 
 def get_workspace_roots() -> list[str]:
