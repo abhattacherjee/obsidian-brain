@@ -124,19 +124,24 @@ PY
 if [ -z "$SEARCH" ]; then
   echo "vault-import: search-conversations.sh not found. Install the context plugin (context@claude-code-skills) and retry." >&2
 else
-  bash "$SEARCH" --days <TIME_RANGE_NUMBER> --format jsonl
+  AFTER=$(python3 -c 'import datetime,sys; print((datetime.date.today()-datetime.timedelta(days=int(sys.argv[1]))).isoformat())' <TIME_RANGE_NUMBER>)
+  bash "$SEARCH" list --after "$AFTER" --limit 100000 --json <PROJECT_ARGS> | python3 -c '
+import glob, json, os, sys
+for e in json.load(sys.stdin):
+    sid = e["sessionId"]
+    hits = glob.glob(os.path.expanduser("~/.claude/projects/*/" + sid + ".jsonl"))
+    print(json.dumps({"session_id": sid, "session_path": hits[0] if hits else "",
+                      "project": e.get("projectPath", ""), "date": (e.get("created") or e.get("modified") or "")[:10],
+                      "git_branch": e.get("gitBranch", ""), "message_count": e.get("messageCount", 0)}))
+'
 fi
 ```
 
-If a project filter is specified, add `--project <PROJECT_FILTER>` to the `bash "$SEARCH"` line.
+Replace `<TIME_RANGE_NUMBER>` with the number of days (`7d` becomes `7`). Replace `<PROJECT_ARGS>` with `--project <PROJECT_FILTER>` when a project filter is set, else remove it. The script can take a few minutes on a large history, so give the call a long timeout.
 
 If the block prints the "not found" message, stop and show it to the user. Do not scan `~/.claude/projects/` by hand and do not skip this step.
 
-Parse the output to build a list of sessions. Each session needs:
-- `session_id` — extracted from the filename or JSONL content
-- `session_path` — absolute path to the JSONL file
-- `project` — extracted from the directory path or JSONL content
-- `date` — file modification date
+The block prints one JSON object per line. Each is a session with `session_id`, `session_path` (empty if the transcript file is gone, so skip those), `project` (a path; use its last component as the project name), `date`, `git_branch` and `message_count`.
 
 If no sessions are found, tell the user:
 
