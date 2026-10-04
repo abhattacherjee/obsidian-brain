@@ -649,6 +649,11 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
 # apart. `stats["malformed"]` always reports the TRUE, uncapped count.
 _MALFORMED_FILES_CAP = 20
 
+# Note types written into indexed folders that are not knowledge: the LLM
+# wiki's own index and log files (#383). _sync skips them, and removes a row
+# whose note changed to one of these types.
+_UNINDEXED_TYPES = frozenset({"claude-wiki-index"})
+
 # Cap on the length of a filename recorded in `stats["malformed_files"]`.
 # 120 chars is generous headroom over any realistic vault filename.
 _MALFORMED_FILENAME_CAP = 120
@@ -729,7 +734,9 @@ def _sanitize_report_filename(name: str) -> str:
 def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict:
     """Incremental sync: add new/changed files, remove deleted ones.
 
-    Returns {"inserted": N, "skipped": M, "deleted": D, "by_type": {...}}.
+    Returns {"inserted": N, "skipped": M, "deleted": D, "excluded": E,
+    "by_type": {...}}. ``excluded`` counts notes whose type is in
+    ``_UNINDEXED_TYPES`` (#383); they are never indexed.
     ``skipped`` is the sum of two semantically distinct outcomes, also
     reported separately: ``unchanged`` (mtime matched the index — nothing
     to do, the healthy common case) and ``malformed`` (frontmatter failed
@@ -753,6 +760,7 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
         "unchanged": 0,
         "malformed": 0,
         "malformed_files": [],
+        "excluded": 0,
         "deleted": 0,
         "recomputed": 0,
         "by_type": {},
@@ -820,6 +828,15 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
                             "reason": _classify_parse_failure(reason),
                         }
                     )
+                continue
+
+            if parsed.get("type") in _UNINDEXED_TYPES:
+                # Never inserted, so the mtime short-circuit never applies and
+                # the file is re-parsed each sync: a handful of small files.
+                stats["excluded"] += 1
+                if abs_path_str in indexed:
+                    _delete_note(conn, abs_path_str)
+                    stats["deleted"] += 1
                 continue
 
             _upsert_note(conn, abs_path_str, parsed, file_mtime, file_size)
