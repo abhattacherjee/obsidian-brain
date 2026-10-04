@@ -18,7 +18,7 @@
 | 2 Wiki core | `feature/383-wiki-core` | `hooks/wiki.py` and its CLI, vault-ask Step 2b (wiki first) and Step 8 (filing gate), `--caller` auto-filing, dedupe, stale refresh, the STE writing rule | PR 1 |
 | 3 Memory + doctor | `feature/383-wiki-memory-doctor` | `memory_sources(host, config)`, memory grep in vault-ask, the `wiki-pages` vault-doctor check, global CLAUDE.md `--caller` update | PR 2 |
 
-Each PR goes through `/ship` on its own and closes its own child issue: #394 (PR 1, merged in #393), #395 (PR 2), #396 (PR 3). #383 is the epic; it closes when all three children are closed. Until PR 3 lands, the filing threshold counts vault notes only, and `count`/`file` refuse a non-empty `memory_sources`.
+Each PR goes through `/ship` on its own and closes its own child issue: #394 (PR 1, merged in #393), #395 (PR 2), #396 (PR 3). #383 is the epic; it closes when all three children are closed. Before PR 3, the filing threshold counted vault notes only, and `count`/`file` refused a non-empty `memory_sources`. PR 3 lifted that refusal.
 
 ## Facts from the code that shape the design
 
@@ -57,9 +57,10 @@ The two `open_item_dedup` filesystem scans (`:1292`, `:1743`) look for open `- [
 | `lookup` | `{"question"}` | `search_vault` over indexed notes with `type='claude-wiki'` (BM25 weights `title`, which holds the question, highest; results are reranked, and the hits are logged as accesses). Returns the top 3. | `{"candidates": [{"path", "question", "updated", "rank"}]}` |
 | `stale` | `{"page"}` | Re-hashes the page's sources, checks the page's fingerprint field, and runs the newer-note check | `{"stale": bool, "reasons": [...]}` |
 | `count` | `{"sources", "memory_sources"}` | Resolves and counts qualifying sources (see "Threshold") | `{"count": N, "qualifying": [...], "other": [...], "rejected": [...]}` |
+| `memgrep` (PR 3) | `{"pattern"}` | Finds memory files whose text holds the pattern: a case-insensitive fixed string (not a regex), at most 200 characters | `{"matches": [{"name", "path"}]}` |
 | `file` | page payload (below) | Validates, scrubs, writes the page, rebuilds the index, appends the log | `{"path", "action": "file"\|"update"\|"file-auto", "count"}`, plus `warning` when the index or log update failed |
 
-`file` payload: `question`, `body` (markdown, already written under the rule), `sources` (note basenames), `memory_sources` (PR 3; empty before), `topics`, `confidence`, `filed_by` (`user` or `auto`), `caller` (required when `filed_by` is `auto`), optional `update` (an existing page path), and optional `override_reviewed` (bool, default false). A `projects` field is ignored: projects come from the cited sources. Without `update`, a name collision gets `-2`, `-3` and so on (see "Page path").
+`file` payload: `question`, `body` (markdown, already written under the rule), `sources` (note basenames), `memory_sources` (PR 3; memory file names, `<project-dir>/<file>.md`), `topics`, `confidence`, `filed_by` (`user` or `auto`), `caller` (required when `filed_by` is `auto`), optional `update` (an existing page path), and optional `override_reviewed` (bool, default false). A `projects` field is ignored: projects come from the cited sources. Without `update`, a name collision gets `-2`, `-3` and so on (see "Page path").
 
 `file` refuses (exit 1) when: fewer than 3 qualifying notes are cited (see "Threshold"); a source does not resolve to an existing file under an indexed folder; `confidence` is not one of `high`, `medium`, `low`; `filed_by` is `auto` without a `caller`; `update` points outside `<vault>/<wiki_folder>/queries/` or at a file whose frontmatter `type` is not `claude-wiki`; the resolved write path fails `is_relative_to(<vault>/<wiki_folder>)`; `update` targets a page with `reviewed: true` and the payload does not carry `override_reviewed: true` (see "Reviewed pages"); `update` names a page that is also in `sources` (a page cannot cite itself: its fingerprint would be of the old bytes, so it would stay stale forever).
 
@@ -86,20 +87,23 @@ To build the page body, fetch `wiki.py rule` and rewrite the answer under it. Th
 
 **`memory_sources(host, config) -> list[Path]`** in a new `hooks/memory_sources.py`. On host `claude-code` it returns `~/.claude/projects/*/memory/*.md` (not `MEMORY.md`, which is an index), each resolved and checked with `is_relative_to(~/.claude/projects)`, skipping symlinks. On any other host it returns `[]` until #272 adds Codex. `detect_host()` in the same module returns `codex` when any `_CODEX_HOST_MARKERS` env var is set, else `claude-code`. This is the one place a Claude-only path lives.
 
-**Memory search in vault-ask.** Step 4 gains a fourth search: `wiki.py memgrep --pattern <term>` greps the files from `memory_sources` and prints matching paths. Hits join `CANDIDATE_FILES` with type `claude-memory`. They are cited in the answer and on the page as plain text, `memory: <project-dir>/<file>.md`, never as wikilinks. The FTS fast path in Step 3 does not see memory files; Step 3's "5+ results skips Step 4" rule changes so the memory grep always runs.
+**Memory names.** A memory file is named `<project-dir>/<file>.md` (`memory_name(path)`). `count` and `file` resolve these names through `memory_sources`; a name of the wrong shape is rejected as `not a memory file name`, and a well-formed name with no such file as `not a memory file on this host`. `qualifying` lists each resolved file as `memory:<name>`, the page fingerprint keys it as `memory:<name>`, and `stale` reports `changed:`, `missing:` or `unverifiable: memory:<name>`.
 
-**`wiki-pages` vault-doctor check.** New `scripts/vault_doctor_checks/wiki_pages.py`, in the default sweep. It reads `wiki_folder` from config (the doctor `scan` signature passes sessions and insights only). Issues:
+**Memory search in vault-ask.** Step 4 gains a fourth search: for each term, `wiki.py memgrep` reads `{"pattern": "<term>"}` on stdin, matches it as a case-insensitive fixed string against the files from `memory_sources`, and prints `{"matches": [{"name", "path"}]}`. Hits join `CANDIDATE_FILES` with type `claude-memory`. They are cited in the answer and on the page as plain text, `memory: <project-dir>/<file>.md`, never as wikilinks. The FTS fast path in Step 3 does not see memory files; Step 3's "5+ results skips Step 4" rule changes so the memory grep always runs. Memory files get the `claude-memory` type score (+3) and are kept out of `vault_scan.py meta`, because they are outside the vault.
+
+**`wiki-pages` vault-doctor check.** New `scripts/vault_doctor_checks/wiki_pages.py`, in the default sweep. It reads `wiki_folder` from the config file at call time (the doctor `scan` signature passes sessions and insights only). A missing file means the defaults. A corrupt config or an invalid `wiki_folder` raises, so the dispatcher shows a crashed check (exit 2). A wiki that is turned off, or a folder that does not exist yet, reports nothing. The check syncs the vault index first. Issues:
 
 | Reason | Fix on `--apply` |
 |---|---|
-| `stale` (same rules as `wiki.py stale`) | none; reported for the next `/vault-ask` to refresh |
-| `broken-source` (a cited source is missing) | none; reported |
-| `orphan` (no inbound wikilink from any vault note other than the wiki's own index and log files) | none; reported |
-| `index-drift` (the index files do not match a fresh rebuild) | rebuild the index files |
+| `stale` (any `wiki.py stale` reason except `missing:`; unreviewed pages only) | none; reported for the next `/vault-ask` to refresh |
+| `broken-source` (a `missing:` reason: a cited source is gone) | none; reported |
+| `orphan` (no inbound wikilink from any vault note other than the page itself and the wiki's own index and log files) | none; reported |
+| `page-unreadable` (the page or its staleness check could not be read) | none; reported |
+| `index-drift` (the index files do not match a fresh `render_wiki_index`) | back up the index files under `<backup_root>/wiki-pages/<stamp>/`, then rebuild them under the wiki lock; skipped if the lock is held |
 | `auto-filed` (`filed_by: auto`, listed for review) | none; reported |
-| `reviewed-stale` (`reviewed: true` and stale; never auto-refreshed) | none; reported so the user can re-check their edits |
+| `reviewed-stale` (`reviewed: true` and stale for any reason; replaces `stale` for reviewed pages; never auto-refreshed) | none; reported so the user can re-check their edits |
 
-The orphan scan respects `--days` like the other checks. Each reason has a positive and a negative fixture, and each detector is mutation-tested on its own.
+`index-drift` is the only row `--apply` fixes (confidence 1.0). Every other row is report-only (`unresolved`, confidence 0.0). The orphan scan checks only pages whose `updated` date is inside `--days` (`DEFAULT_WINDOW_DAYS` is 9999, so all pages by default). Each reason has a positive and a negative fixture, and each detector is mutation-tested on its own.
 
 **Global CLAUDE.md.** The vault-ask rule in `~/.claude/CLAUDE.md` changes to tell callers to run `/vault-ask --caller <workflow-name> <question>`. That file is outside this repo; the PR body records the exact diff applied.
 
@@ -187,7 +191,7 @@ Pages are LLM-owned by default. A user who edits a page by hand marks it `review
 - **Stale reviewed page, user-typed `/vault-ask`:** answer from the page, then warn that its sources changed, with the `stale` reasons. Ask with AskUserQuestion: "Keep my page" (default; writes nothing), "Refresh and overwrite my edits" (files with `update` and `override_reviewed: true`; the rewritten page drops the flag), or "Save the fresh answer as a new page" (files new; the reviewed page is untouched).
 - **Stale reviewed page, `--caller` run:** answer from the page, add one line saying it is reviewed and stale with the reasons, and write nothing.
 - **Dedupe:** when `--caller` auto-filing matches a reviewed page, it does not update it. It writes nothing and names the reviewed page in its output line, so repeated research does not fork the page into near-copies.
-- **Doctor:** the `reviewed-stale` reason lists reviewed pages whose sources changed.
+- **Doctor:** the `reviewed-stale` reason lists reviewed pages that `stale` reports for any reason.
 - **Fingerprint:** unchanged by the flag. A hand edit changes the page, not its sources, so it never marks the page stale by itself.
 
 ## Error handling

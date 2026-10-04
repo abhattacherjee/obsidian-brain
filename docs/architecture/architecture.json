@@ -128,7 +128,7 @@
           },
           {
             "label": "vault-doctor",
-            "sub": "9 pluggable checks",
+            "sub": "13 pluggable checks",
             "color": "#EC4899"
           },
           {
@@ -393,7 +393,16 @@
           "files": [
             "hooks/wiki.py"
           ],
-          "purpose": "LLM wiki for /vault-ask answers (#383, #395). JSON CLI: rule (the 80% ASD-STE100 writing rule), lookup (search_vault with note_type claude-wiki, reranked, logs access; top 3 as path/question/updated/rank), stale (per-source content-hash changed/missing, unverifiable when the page's fingerprint is missing or bad or its sources is not a non-empty list; block-style YAML lists and maps are read too; plus newer counting notes from a direct OR FTS query over the question's non-stopword terms, skipped when none remain), count (resolves cited names in the notes table; distinct notes by resolved file path; snapshots count as their parent; unresolved or ambiguous names returned as rejected; memory sources refused until #396), file (threshold: 3 qualifying notes - insight, error-fix, decision, retro, session or migrated claude-memory; validation, reviewed-page refusal, refusal of an update that cites the page itself, every write path checked against the resolved wiki root (a symlinked queries/ is refused), scrub_secrets on question and body before the slug, projects taken from the sources (a payload projects field is ignored), name collisions get -2, -3...; one lock file <wiki_folder>/..wiki.ob-lock around page + index + log, no waiting (a second filer is refused), a lock older than 60 s is reclaimed; index.md rebuilt from the notes table and split into index-<project>.md files above 500 pages, log-YYYY.md; every write goes through write_vault_note except deletes of stale index-*.md files; an index or log failure after the page is written exits 0 with a warning key). Pages live in <wiki_folder>/queries/YYYY/; index and log files carry type claude-wiki-index so the indexer skips them. Dates are the local date. Exit 0 ok, 1 refused (ERROR: line), 2 usage error or crash."
+          "purpose": "LLM wiki for /vault-ask answers (#383, #395, #396). JSON CLI: rule (the 80% ASD-STE100 writing rule), lookup (search_vault with note_type claude-wiki, reranked, logs access; top 3 as path/question/updated/rank), stale (per-source content-hash changed/missing, unverifiable when the page's fingerprint is missing or bad or its sources is not a non-empty list; block-style YAML lists and maps are read too; plus newer counting notes from a direct OR FTS query over the question's non-stopword terms, skipped when none remain), count (resolves cited names in the notes table; distinct notes by resolved file path; snapshots count as their parent; unresolved or ambiguous names returned as rejected; since #396 memory_sources named <project-dir>/<file>.md are resolved through memory_sources.py, a bad shape rejected as 'not a memory file name' and an unknown file as 'not a memory file on this host', and qualifying lists them as memory:<name>), file (threshold: 3 qualifying notes - insight, error-fix, decision, retro, session or migrated claude-memory; validation, reviewed-page refusal, refusal of an update that cites the page itself, every write path checked against the resolved wiki root (a symlinked queries/ is refused), scrub_secrets on question and body before the slug, projects taken from the sources (a payload projects field is ignored), name collisions get -2, -3...; one lock file <wiki_folder>/..wiki.ob-lock around page + index + log, no waiting (a second filer is refused), a lock older than 60 s is reclaimed; index.md rebuilt from the notes table and split into index-<project>.md files above 500 pages, log-YYYY.md; every write goes through write_vault_note except deletes of stale index-*.md files; an index or log failure after the page is written exits 0 with a warning key). memgrep (#396): reads {\"pattern\"} on stdin (non-blank, at most 200 characters), matches it as a case-insensitive fixed string against the files from memory_sources(detect_host()), prints {\"matches\":[{\"name\",\"path\"}]}. Memory files are fingerprinted under memory:<name>, and stale reports changed:/missing:/unverifiable: memory:<name>. render_wiki_index(ctx) returns {file name: text} from the notes table and writes nothing; rebuild_wiki_index writes it, and the wiki-pages doctor check compares against it. Pages live in <wiki_folder>/queries/YYYY/; index and log files carry type claude-wiki-index so the indexer skips them. Dates are the local date. Exit 0 ok, 1 refused (ERROR: line), 2 usage error or crash."
+        },
+        {
+          "id": "memory-sources",
+          "name": "memory_sources.py",
+          "kind": "module",
+          "files": [
+            "hooks/memory_sources.py"
+          ],
+          "purpose": "The one place that knows where a host keeps its memory files (#396). detect_host() returns codex when any _CODEX_HOST_MARKERS env var is set (not blank), else claude-code. memory_sources(host, config=None) returns sorted, resolved paths: on claude-code every regular, non-symlinked *.md directly inside a non-symlinked ~/.claude/projects/<project-dir>/memory/ folder, skipping MEMORY.md (an index) and checked with is_relative_to(~/.claude/projects); on any other host [] until #272 adds Codex. config is unused today. memory_name(path) returns <project-dir>/<file>.md, the name pages and payloads use. An unreadable project is skipped, not fatal. Skills never name these paths; they call wiki.py memgrep."
         },
         {
           "id": "plugin-install-divergence",
@@ -755,6 +764,15 @@
             "scripts/vault_doctor_checks/memory_index.py"
           ],
           "purpose": "Detects drift between ~/.claude/projects/<project>/memory/*.md and that store's MEMORY.md — the only entry point loaded into context each session, so an entry missing its pointer line is silently unrecallable forever (#308). Reports orphans (transitive BFS from MEMORY.md; orphan-isolated when nothing links the entry at all, orphan-unreachable when only another orphan does), dangling index pointers, case-only pointer mismatches (index-case-mismatch: resolves on a case-insensitive filesystem, breaks on a case-sensitive one), stores with entries but no MEMORY.md, an index that names no file at all over a store that has entries (index-names-nothing: a summary row alongside the per-entry orphan rows, not instead of them), unreadable and undecodable entries, unreadable stores, and MEMORY.md size against the ~17 KB compaction threshold / ~24 KB read budget. Link matching is deliberately asymmetric: reachability counts markdown links, [[wikilinks]] and bare name.md mentions (under-counting invents orphans — markdown-links-only over-reported 98 vs 92, measured 2026-08-12), while dangling counts markdown links ONLY and only ones naming a direct child of the store — every CommonMark form that names one (](name.md), ](./name.md), ](name.md 'Title'), ](<name.md>)) — because MEMORY.md legitimately wikilinks Obsidian vault notes, prose cites CLAUDE.md, and a reference memory line may link a URL ending in .md. The index is decoded strictly: bad bytes there would silently report the whole store as orphaned. Entries are decoded leniently with an entry-undecodable row, and any entry that could not be read in full downgrades that store's orphan-isolated rows to orphan-unreachable. Report-only: every issue is unresolved/confidence 0.0, so --apply never writes to a memory store (and --min-confidence > 0 hides every row). One unreadable store is dropped from the report and gets a store-unreadable row; scan() raises only when every selected store fails, which the dispatcher turns into exit 2. A --project value matching no store at all emits a project-filter-matched-nothing row carrying stores_scanned/stores_filtered_out, so a filter typo cannot pass as a clean machine. Case folding applies to all three link kinds when deciding reachability (index-case-mismatch stays a markdown-link-only warning). vault_doctor.py's _issue_row surfaces this check's extras (entry_count, indexed_count, index_size_bytes, soft_limit_bytes, hard_limit_bytes, index_path, entry_names, byte_offset, read_error) conditionally, so --json consumers get the numbers without re-parsing reason and no other check's row shape moved. OPT_IN: a full run produced 92 rows across 7 projects (measured 2026-08-12), which would drown the default sweep."
+        },
+        {
+          "id": "check-wiki-pages",
+          "name": "wiki-pages",
+          "kind": "module",
+          "files": [
+            "scripts/vault_doctor_checks/wiki_pages.py"
+          ],
+          "purpose": "Health of the LLM wiki's pages under <wiki_folder>/queries/ (#396). Default sweep (OPT_IN False); DEFAULT_WINDOW_DAYS 9999. Reads the config file at call time from Path.home(): a missing file means the defaults; a corrupt config or an invalid wiki_folder raises (crashed check, exit 2); a wiki that is turned off or a folder that does not exist reports nothing. Syncs the vault index first (ensure_index on indexed_folders(strict=True)). Per page: stale (any wiki.stale reason except missing:), broken-source (missing: reasons), reviewed-stale (replaces stale for reviewed pages), auto-filed (filed_by: auto), orphan (no vault note links [[page]] except the page itself and the wiki's index*.md and log-YYYY.md; only pages whose updated date is inside --days) and page-unreadable. These rows are report-only: extra.unresolved, confidence 0.0. Once for the wiki: index-drift (confidence 1.0) when the index files differ from wiki.render_wiki_index; apply backs up index.md and index-*.md under <backup_root>/wiki-pages/<stamp>/ and calls rebuild_wiki_index under the note_writer lock (<wiki_folder>/..wiki.ob-lock), skipped if the lock is held."
         }
       ]
     },
@@ -834,7 +852,7 @@
           "files": [
             "skills/vault-ask/SKILL.md"
           ],
-          "purpose": "RECALL. Synthesized, source-cited answer grounded in vault notes; FTS fast-path + 3 parallel Grep agents (vault_scan.py grep when the Grep tool is missing) + vault_scan.py meta for type/date ranking + per-file context-shield sub-agents + snapshot summaries. Since #395 it checks the wiki first (wiki.py lookup + stale; a fresh same-question page answers directly), caps candidates at 3 wiki pages, and ends with a filing gate: wiki.py count of 3+ qualifying notes (rejected names dropped), rewrite under wiki.py rule, then ask (user-typed) or auto-file (--caller), with reviewed pages never rewritten automatically. Payloads go through a private file, never a shell string."
+          "purpose": "RECALL. Synthesized, source-cited answer grounded in vault notes; FTS fast-path + 3 parallel Grep agents (vault_scan.py grep when the Grep tool is missing) + vault_scan.py meta for type/date ranking + per-file context-shield sub-agents + snapshot summaries. Since #395 it checks the wiki first (wiki.py lookup + stale; a fresh same-question page answers directly), caps candidates at 3 wiki pages, and ends with a filing gate: wiki.py count of 3+ qualifying notes (rejected names dropped), rewrite under wiki.py rule, then ask (user-typed) or auto-file (--caller), with reviewed pages never rewritten automatically. Payloads go through a private file, never a shell string. Since #396 it also runs a memory search on every ask (even when the FTS fast path skips Grep): wiki.py memgrep per search term; matches join CANDIDATE_FILES as type claude-memory (+3), stay out of vault_scan.py meta, and are cited as plain text 'memory: <project-dir>/<file>.md', and count passes them as memory_sources."
         },
         {
           "id": "sk-vault-search",
@@ -870,7 +888,7 @@
           "files": [
             "skills/vault-doctor/SKILL.md"
           ],
-          "purpose": "MAINTENANCE. Orchestrates scripts/vault_doctor.py; dry-run unless fix; documents the exit-code/crashed_checks contract and the crash-vs-apply-error remediation branch."
+          "purpose": "MAINTENANCE. Orchestrates scripts/vault_doctor.py; dry-run unless fix; documents the exit-code/crashed_checks contract and the crash-vs-apply-error remediation branch. Lists each check with its reasons, including wiki-pages (#396: only index-drift is fixed)."
         },
         {
           "id": "sk-vault-reindex",
@@ -1779,6 +1797,75 @@
           "label": "claude-wiki/queries/YYYY/MM-DD-slug.md (0o600)"
         }
       ]
+    },
+    {
+      "id": "vault-ask-memory-search",
+      "name": "/vault-ask memory search",
+      "description": "Every ask searches this host's memory files, even when the FTS fast path skips the Grep searches; matches are cited as plain text and count toward the wiki filing threshold (#396).",
+      "steps": [
+        {
+          "from": "sk-vault-ask",
+          "to": "wiki-cli",
+          "label": "memgrep per term ({\"pattern\"} payload file on stdin)"
+        },
+        {
+          "from": "wiki-cli",
+          "to": "memory-sources",
+          "label": "memory_sources(detect_host())"
+        },
+        {
+          "from": "wiki-cli",
+          "to": "sk-vault-ask",
+          "label": "{\"matches\":[{name, path}]} -> CANDIDATE_FILES as claude-memory"
+        },
+        {
+          "from": "sk-vault-ask",
+          "to": "wiki-cli",
+          "label": "count/file with memory_sources; fingerprints keyed memory:<name>"
+        }
+      ]
+    },
+    {
+      "id": "doctor-wiki-pages",
+      "name": "/vault-doctor wiki-pages check",
+      "description": "Reports stale, broken, orphan, auto-filed and reviewed-stale wiki pages; rebuilds a drifted wiki index on fix (#396).",
+      "steps": [
+        {
+          "from": "sk-vault-doctor",
+          "to": "doctor-dispatcher",
+          "label": "default sweep or --check wiki-pages"
+        },
+        {
+          "from": "doctor-dispatcher",
+          "to": "check-wiki-pages",
+          "label": "scan(); config read at call time"
+        },
+        {
+          "from": "check-wiki-pages",
+          "to": "ensure-index",
+          "label": "sync indexed_folders(strict=True) first"
+        },
+        {
+          "from": "check-wiki-pages",
+          "to": "wiki-cli",
+          "label": "stale per page; render_wiki_index for drift"
+        },
+        {
+          "from": "wiki-cli",
+          "to": "db-index",
+          "label": "read notes table"
+        },
+        {
+          "from": "doctor-dispatcher",
+          "to": "check-wiki-pages",
+          "label": "apply(): index-drift only, backup + note_writer lock"
+        },
+        {
+          "from": "wiki-cli",
+          "to": "db-vault",
+          "label": "rebuild_wiki_index writes index files"
+        }
+      ]
     }
   ],
   "types": [
@@ -2093,7 +2180,7 @@
   "testing": {
     "unitSuite": {
       "tool": "pytest",
-      "fileCount": 103,
+      "fileCount": 111,
       "duration": "fast (stdlib, no network)",
       "environments": {
         "python": "3.12",
