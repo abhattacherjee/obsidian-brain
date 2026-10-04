@@ -2,7 +2,7 @@
 
 - **Issue:** abhattacherjee/obsidian-brain#383
 - **Date:** 2026-10-03
-- **Status:** draft, sections 1-3 approved in chat 2026-10-03
+- **Status:** draft, sections 1-3 approved in chat 2026-10-03; reviewed-page flag added 2026-10-03
 - **Milestone:** v3.8
 - **Related:** #377 (rerank eval, also edits vault-ask Steps 5 and 8), #376 (type-weight guard test), #272 (Codex parity, v3.11)
 
@@ -59,13 +59,14 @@ The two `open_item_dedup` filesystem scans (`:1292`, `:1743`) look for open `- [
 | `count` | `{"sources", "memory_sources"}` | Resolves and counts qualifying sources (see "Threshold") | `{"count": N, "qualifying": [...], "rejected": [...]}` |
 | `file` | page payload (below) | Validates, scrubs, writes the page, rebuilds the index, appends the log | `{"path", "action": "file"\|"update"\|"file-auto"}` |
 
-`file` payload: `question`, `body` (markdown, already written under the rule), `sources` (note basenames), `memory_sources` (PR 3; empty before), `projects`, `topics`, `confidence`, `filed_by` (`user` or `auto`), `caller` (required when `filed_by` is `auto`), and optional `update` (an existing page path). Without `update`, `file` refuses when the target path exists.
+`file` payload: `question`, `body` (markdown, already written under the rule), `sources` (note basenames), `memory_sources` (PR 3; empty before), `projects`, `topics`, `confidence`, `filed_by` (`user` or `auto`), `caller` (required when `filed_by` is `auto`), optional `update` (an existing page path), and optional `override_reviewed` (bool, default false). Without `update`, `file` refuses when the target path exists.
 
-`file` refuses (exit 1) when: the count is below 3; a source does not resolve to an existing file under an indexed folder; `confidence` is not one of `high`, `medium`, `low`; `filed_by` is `auto` without a `caller`; `update` points outside `<vault>/<wiki_folder>/queries/` or at a file whose frontmatter `type` is not `claude-wiki`; the resolved write path fails `is_relative_to(<vault>/<wiki_folder>)`.
+`file` refuses (exit 1) when: the count is below 3; a source does not resolve to an existing file under an indexed folder; `confidence` is not one of `high`, `medium`, `low`; `filed_by` is `auto` without a `caller`; `update` points outside `<vault>/<wiki_folder>/queries/` or at a file whose frontmatter `type` is not `claude-wiki`; the resolved write path fails `is_relative_to(<vault>/<wiki_folder>)`; `update` targets a page with `reviewed: true` and the payload does not carry `override_reviewed: true` (see "Reviewed pages").
 
 **vault-ask Step 2b: wiki first.** After parsing the question, run `wiki.py lookup`. The model judges whether the top candidate asks the same question (not a fixed similarity threshold: there is no live data to calibrate one). If it does:
 
 - Run `wiki.py stale`. Fresh: read the page, present its answer, cite the page, and say it came from the wiki with its `updated` date. Stop after Step 8's display (no filing prompt).
+- Stale and `reviewed: true`: see "Reviewed pages".
 - Stale: carry on through Steps 3-7, adding the page's sources to `CANDIDATE_FILES`. Step 8 then rewrites the page with `update` set, without asking (Decision 3), and tells the user the page was refreshed and why (the `reasons` from `stale`).
 
 **Candidate cap.** In Steps 3-5, at most 3 `claude-wiki` notes stay in `CANDIDATE_FILES`; extra wiki hits are dropped before ranking. This stops a large wiki from crowding raw notes out of the top 10.
@@ -96,6 +97,7 @@ To build the page body, fetch `wiki.py rule` and rewrite the answer under it. Th
 | `orphan` (no inbound wikilink from any vault note other than the wiki's own index and log files) | none; reported |
 | `index-drift` (the index files do not match a fresh rebuild) | rebuild the index files |
 | `auto-filed` (`filed_by: auto`, listed for review) | none; reported |
+| `reviewed-stale` (`reviewed: true` and stale; never auto-refreshed) | none; reported so the user can re-check their edits |
 
 The orphan scan respects `--days` like the other checks. Each reason has a positive and a negative fixture, and each detector is mutation-tested on its own.
 
@@ -122,10 +124,11 @@ created: 2026-10-03
 updated: 2026-10-03
 filed_by: user
 caller: <name>
+reviewed: true
 ---
 ```
 
-`title` duplicates `question` so the FTS `title` column holds the question for `lookup`. `caller` is present only when `filed_by: auto`. `projects` and the project tags come from the `project:` field of the cited notes, deduplicated and sorted. `confidence` maps from vault-ask's certainty wording: "You explicitly decided" is `high`, "it appears" is `medium`, "Limited context" is `low`.
+`title` duplicates `question` so the FTS `title` column holds the question for `lookup`. `caller` is present only when `filed_by: auto`. `reviewed` is absent on pages the wiki writes; the user adds `reviewed: true` by hand after editing a page. The value is read leniently, because a miss would overwrite the user's edits: after stripping whitespace and quotes and lowercasing, `true`, `yes`, `on` and `1` all mean reviewed. Absent, `false`, `no`, `off`, `0` or empty means not reviewed. Any other value also counts as reviewed (fail closed toward keeping edits). `projects` and the project tags come from the `project:` field of the cited notes, deduplicated and sorted. `confidence` maps from vault-ask's certainty wording: "You explicitly decided" is `high`, "it appears" is `medium`, "Limited context" is `low`.
 
 **Body:** the answer rewritten under the writing rule, then a `### Sources` section with one line per source, as vault-ask writes it today. `scrub_secrets` runs on the body and on `question` before writing.
 
@@ -143,7 +146,7 @@ caller: <name>
 
 **Index files:**
 
-- Up to 500 pages: one `<wiki_folder>/index.md`, one line per page, `- [[<slug>]] — <question> (updated <date>, <confidence>)`, sorted by `updated` descending.
+- Up to 500 pages: one `<wiki_folder>/index.md`, one line per page, `- [[<slug>]] — <question> (updated <date>, <confidence>[, reviewed])`, sorted by `updated` descending.
 - Above 500 pages: `index.md` lists one line per project linking to `index-<project>.md`, and each project file lists its pages. A page with several projects appears in each.
 - Rebuilt in full on every write, from the SQLite `notes` table (`type='claude-wiki'`), not by reading page files. A full rebuild cannot drift, and reading the table costs one query.
 - `lookup` never reads the index files. They exist for people browsing in Obsidian.
@@ -168,6 +171,17 @@ One constant, `WRITING_RULE` in `hooks/wiki.py`, printed by `wiki.py rule`. It t
 - citations and `[[wikilinks]]` are never reworded.
 
 Diagram, HTML and video page formats are out of scope. A page may contain a Mermaid diagram when the synthesis needs one.
+
+## Reviewed pages
+
+Pages are LLM-owned by default. A user who edits a page by hand marks it `reviewed: true` in its frontmatter. That flag protects the edits:
+
+- **No automatic rewrite, ever.** `file` refuses an `update` of a reviewed page unless the payload carries `override_reviewed: true`. Stale refresh and `--caller` auto-filing never set it.
+- **Stale reviewed page, user-typed `/vault-ask`:** answer from the page, then warn that its sources changed, with the `stale` reasons. Ask with AskUserQuestion: "Keep my page" (default; writes nothing), "Refresh and overwrite my edits" (files with `update` and `override_reviewed: true`; the rewritten page drops the flag), or "Save the fresh answer as a new page" (files new; the reviewed page is untouched).
+- **Stale reviewed page, `--caller` run:** answer from the page, add one line saying it is reviewed and stale with the reasons, and write nothing.
+- **Dedupe:** when `--caller` auto-filing matches a reviewed page, it does not update it. It writes nothing and names the reviewed page in its output line, so repeated research does not fork the page into near-copies.
+- **Doctor:** the `reviewed-stale` reason lists reviewed pages whose sources changed.
+- **Fingerprint:** unchanged by the flag. A hand edit changes the page, not its sources, so it never marks the page stale by itself.
 
 ## Error handling
 
@@ -201,6 +215,7 @@ Growth is bounded by the 3-source threshold and by dedupe: a repeat question upd
 - **Staleness:** each of the 3 triggers fires alone; an mtime-only touch does not mark a page stale; an unreadable source reports missing.
 - **Index and log:** the index rebuilds after a page is deleted by hand; the split at 501 pages; the log is append-only across 2 writes and rolls at a year boundary (Dec 31 to Jan 1 UTC); index and log files are not in FTS; a session note named `index.md` elsewhere still is.
 - **Lock:** a held lock makes `file` refuse with exit 1 and leaves no partial page.
+- **Reviewed pages:** `update` of a reviewed page refuses without `override_reviewed` and succeeds with it; stale refresh and `--caller` filing never pass it (skill-text test); a `--caller` dedupe hit on a reviewed page writes nothing; `"true "`, `yes`, `On`, `1` and an unknown value such as `maybe` all count as reviewed, while absent, `false` and `no` do not; the doctor's `reviewed-stale` fires only when both conditions hold.
 - **`indexed_folders`:** the literal-list grep guard; the helper's order and dedupe; a config without `wiki_folder` gets the default.
 - **Secrets:** a fake token in `body` and in `question` comes out redacted on disk.
 - **Writing rule:** `rule` output carries the key phrases; the vault-ask skill text tells the model to fetch `wiki.py rule` before writing a page.
@@ -217,7 +232,6 @@ Growth is bounded by the 3-source threshold and by dedupe: a repeat question upd
 - Codex memory sources (#272, v3.11).
 - Diagram, HTML or video page formats.
 - An `obsidian-wiki` page-format convergence beyond what Decision 4 already takes.
-- Editing wiki pages by hand: they are LLM-owned. A hand edit is overwritten on the next stale refresh.
 
 ## Acceptance criteria
 
