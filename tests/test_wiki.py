@@ -752,3 +752,19 @@ def test_path_spellings_of_one_note_count_once(vault):
 def test_snapshot_and_parent_by_path_count_once(vault):
     assert _count(vault, ["s1-snap", "claude-sessions/s1"])["count"] == 1
     assert _count(vault, ["claude-sessions/s1", "s1-snap"])["qualifying"] == ["claude-sessions/s1"]
+
+
+def test_single_letter_topic_still_finds_newer_note(vault):
+    page = _page(vault, "10-02-c", "How does C handle zebracorn?", ["i1"], {"i1": wiki.fingerprint(_src(vault, "i1"))})
+    _note(Path(vault["vault"]), "claude-sessions", "s-c", "claude-session",
+          body="notes on C pointers", date="2026-10-03")
+    vault_index.ensure_index(vault["vault"], FOLDERS, db_path=vault["db"])
+    assert "newer: s-c" in wiki.stale(vault["db"], page, vault["roots"])["reasons"]
+
+
+def test_contraction_fragments_do_not_match_newer_notes(vault):
+    page = _page(vault, "10-02-whats", "What's it's role?", ["i1"], {"i1": wiki.fingerprint(_src(vault, "i1"))})
+    _note(Path(vault["vault"]), "claude-sessions", "s-s", "claude-session",
+          body="it's what's s t", date="2026-10-03")
+    vault_index.ensure_index(vault["vault"], FOLDERS, db_path=vault["db"])
+    assert not any(r.startswith("newer:") for r in wiki.stale(vault["db"], page, vault["roots"])["reasons"])

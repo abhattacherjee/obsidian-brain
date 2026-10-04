@@ -356,8 +356,11 @@ def stale(db_path: str, page_path, roots) -> dict:
 
 
 # Question-frame verbs that _STOPWORDS keeps but nearly every "how does X
-# work?" question contains. Matching on them alone flags unrelated notes.
-_QUESTION_FILLER = frozenset({"work", "works", "working", "worked"})
+# work?" question contains, plus contraction fragments (it's -> "s").
+# Matching on them alone flags unrelated notes. Single letters such as
+# "C" or "R" stay: they can be topics.
+_QUESTION_FILLER = frozenset({"work", "works", "working", "worked",
+                              "s", "t", "d", "ll", "re", "ve", "m"})
 
 
 def _newer_notes(db_path: str, question: str, updated: str, cited: set, roots) -> list:
@@ -372,7 +375,7 @@ def _newer_notes(db_path: str, question: str, updated: str, cited: set, roots) -
     import vault_index
 
     words = [w for w in re.findall(r"[a-zA-Z0-9_/]+", (question or "").replace("-", " "))
-             if len(w) > 1 and w.lower() not in vault_index._STOPWORDS
+             if w.lower() not in vault_index._STOPWORDS
              and w.lower() not in _QUESTION_FILLER]
     if not words:
         return []  # nothing topical to match on: skip the newer check
