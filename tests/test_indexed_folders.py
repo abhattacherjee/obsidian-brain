@@ -253,3 +253,23 @@ def test_allow_list_is_per_call_not_per_file():
     probe = text + "\n\ndef _probe(v):\n    return ensure_index(v, ['a', 'b'])\n"
     found = _violations_text(probe, "hooks/obsidian_utils.py")
     assert any("['a', 'b']" in v for v in found), found
+
+
+# --- cross-model fix wave (#393 R1-R3) ---------------------------------------
+
+
+@pytest.mark.parametrize("bad", [False, 0, [], {}])
+def test_falsy_non_string_wiki_folder_is_invalid(bad, capsys):
+    # Only "" and None mean "off"; any other non-string is invalid (X-001).
+    with pytest.raises(ValueError, match="wiki_folder"):
+        indexed_folders({"wiki_folder": bad}, strict=True)
+    assert indexed_folders({"wiki_folder": bad}) == ["claude-sessions", "claude-insights"]
+    assert "wiki_folder" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("alias", ["./", "././", "a/..", "./."])
+def test_vault_root_aliases_are_rejected(alias, capsys):
+    # Validated after normalising, so nothing collapses to the vault root (X-002).
+    with pytest.raises(ValueError, match="wiki_folder"):
+        indexed_folders({"wiki_folder": alias}, strict=True)
+    assert indexed_folders({"wiki_folder": alias}) == ["claude-sessions", "claude-insights"]

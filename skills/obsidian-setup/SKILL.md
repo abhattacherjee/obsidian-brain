@@ -565,7 +565,12 @@ from obsidian_utils import load_config, indexed_folders
 from vault_index import rebuild_index
 try:
     # fresh=True: Step 7 may have just rewritten the config this session.
-    folders = indexed_folders(load_config(fresh=True), strict=True)
+    cfg = load_config(fresh=True)
+    # An unreadable config falls back to defaults (vault_path ""); its
+    # default folders would make the rebuild prune every custom folder.
+    if cfg.get("vault_path") != sys.argv[1]:
+        raise ValueError("config vault_path %r does not match %r (config unreadable or changed)" % (cfg.get("vault_path"), sys.argv[1]))
+    folders = indexed_folders(cfg, strict=True)
 except ValueError as exc:
     print(f"ERROR: {exc}", file=sys.stderr)
     sys.exit(1)

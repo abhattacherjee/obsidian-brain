@@ -2315,8 +2315,8 @@ def indexed_folders(config: dict, strict: bool = False) -> list:
     """Vault folders that user-facing search indexes, in a fixed order (#383).
 
     Returns ``[sessions_folder, insights_folder, wiki_folder]`` with defaults
-    for missing keys. Empty or None values and duplicates are dropped, so an
-    empty ``wiki_folder`` turns the wiki folder off. An invalid
+    for missing keys. Duplicates are dropped, and an empty or None
+    ``wiki_folder`` turns the wiki folder off (no other value does). An invalid
     ``wiki_folder`` (not a string, absolute, ``~``, a ``..`` or dot-prefixed
     segment) is dropped with a stderr warning, so ``_sync`` never walks
     outside the vault. With ``strict=True`` it raises ``ValueError``
@@ -2340,19 +2340,25 @@ def indexed_folders(config: dict, strict: bool = False) -> list:
         config.get("insights_folder") or _DEFAULTS["insights_folder"],
     ]
     wiki = config.get("wiki_folder", _DEFAULTS["wiki_folder"])
+    # Only None and "" mean "wiki off". Any other non-string (False, 0, [],
+    # {}) is invalid, not "off": a rebuild would drop the wiki rows for it.
     err = None
-    if wiki and not isinstance(wiki, str):
+    norm = None
+    if wiki is not None and not isinstance(wiki, str):
         err = f"non-string wiki_folder {wiki!r}"
     elif wiki:
-        bad = _validate_folder(wiki)
+        # Validate the normalised form: "./" or "././" would otherwise pass
+        # and collapse to "." (the vault root) after normalising.
+        norm = os.path.normpath(wiki)
+        bad = _validate_folder(norm)
         if bad:
             err = f"invalid wiki_folder {wiki!r}: {bad}"
     if err:
         if strict:
             raise ValueError(err)
         print(f"[obsidian-brain] ignoring {err}", file=sys.stderr)
-    elif wiki:
-        names.append(os.path.normpath(wiki))
+    elif norm:
+        names.append(norm)
     out = []
     for n in names:
         if n not in out:

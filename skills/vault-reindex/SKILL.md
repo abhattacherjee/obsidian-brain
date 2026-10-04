@@ -76,7 +76,7 @@ Wait for confirmation. Abort if the user does not reply `yes`. If cancelled, tel
 
 ### Step 3 — Rebuild
 
-Run, passing `VAULT_PATH` and `FULL_MODE` as command-line arguments. The folders come from a fresh read of the config (`indexed_folders(load_config(fresh=True), strict=True)`), not the session cache:
+Run, passing `VAULT_PATH` and `FULL_MODE` as command-line arguments. The folders come from a fresh read of the config, not the session cache. The snippet refuses (exit 1) when that read's `vault_path` does not match `VAULT_PATH` (an unreadable config falls back to defaults) or when `wiki_folder` is invalid:
 
 ```bash
 python3 -c '
@@ -104,7 +104,12 @@ from vault_index import rebuild_index
 t0 = time.time()
 full = sys.argv[2].lower() == "true"
 try:
-    folders = indexed_folders(load_config(fresh=True), strict=True)
+    cfg = load_config(fresh=True)
+    # An unreadable config falls back to defaults (vault_path ""); its
+    # default folders would make the rebuild prune every custom folder.
+    if cfg.get("vault_path") != sys.argv[1]:
+        raise ValueError("config vault_path %r does not match %r (config unreadable or changed)" % (cfg.get("vault_path"), sys.argv[1]))
+    folders = indexed_folders(cfg, strict=True)
 except ValueError as exc:
     # A rebuild prunes rows outside the scanned folders; refuse rather than
     # silently drop the wiki folder and its rows (#393).
@@ -189,4 +194,4 @@ If both pruned counts are 0, replace the pruning line with `No orphan rows to pr
 
 If `inserted` is 0 and `skipped` is 0, also tell the user:
 
-> No notes found. Verify that `<VAULT>/<SESS>` and `<VAULT>/<INS>` exist and contain markdown files.
+> No notes found. Verify that the folders listed in `folders` (under `<VAULT>`) exist and contain markdown files.

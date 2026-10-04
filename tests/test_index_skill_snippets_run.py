@@ -94,3 +94,19 @@ def test_rebuild_snippet_refuses_invalid_wiki_folder_and_keeps_rows(skill, env):
     assert r.returncode != 0
     assert "wiki_folder" in r.stderr
     assert _paths(db) == {"s.md", "10-03-q.md"}
+
+
+@pytest.mark.parametrize("skill", ["vault-reindex", "obsidian-setup"])
+def test_rebuild_snippet_refuses_unreadable_config_and_keeps_rows(skill, env):
+    # A broken config makes load_config fall back to defaults; the rebuild
+    # must refuse instead of pruning rows outside the default folders (C-001).
+    home, vault, db, e = env
+    assert _run(skill, home, vault, db, e).returncode == 0
+    (home / ".claude" / "obsidian-brain-config.json").write_text('{"vault_path": "x",}')
+    code, names = _rebuild_snippet(skill)
+    argv = [{"VAULT_PATH": str(vault), "FULL_MODE": "false"}[n] for n in names]
+    r = subprocess.run([sys.executable, "-c", code, *argv], cwd=REPO, env=e,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0
+    assert "vault_path" in r.stderr
+    assert _paths(db) == {"s.md", "10-03-q.md"}
