@@ -330,30 +330,30 @@ Skip to Step 10 (offer follow-up). Do NOT proceed through Steps 5-9 (those are t
 
 ### Step 4B — Multi-insight suggestion
 
-**First, check for claudeception output** using layered detection:
+**First, check for skill-extraction output** (`skill-kit:extract`, was `claudeception`; old transcripts still carry the old names) using layered detection:
 
 **Layer 1 — High-confidence structured markers** (check first):
 
 Scan the current conversation for these patterns. If found, extract the skill/knowledge name and a one-line summary:
 
-- The `MANDATORY SKILL EVALUATION REQUIRED` banner (from the claudeception activator hook)
-- `Result: PASS` or `Result: FAIL` (from the claudeception skill validator)
+- The `MANDATORY SKILL EVALUATION REQUIRED` banner or the `Skill(skill-kit:extract)` / `skill-kit:extract` reminder (from the activator hook, still named `claudeception-activator.sh`; older transcripts show `Skill(claudeception)`)
+- `Result: PASS` or `Result: FAIL` (from the `skill-kit:extract` skill validator; older transcripts: the claudeception validator)
 - Skill file paths matching `~/.claude/skills/*/SKILL.md` or `.claude/skills/*/SKILL.md`
 
-If any Layer 1 markers are found, create a candidate for each and label it `[from claudeception]`.
+If any Layer 1 markers are found, create a candidate for each and label it `[from skill-kit:extract]` (`[from claudeception]` for old transcripts).
 
 **Layer 2 — Broad phrase scanning** (fallback, only if Layer 1 found nothing):
 
 Scan the conversation for these phrases:
 - "created skill", "new skill at", "skill file written"
 - "extracted knowledge", "pattern identified", "reusable insight"
-- Output from a `/claudeception` invocation
+- Output from a `skill-kit:extract` invocation (or `/claudeception` in old transcripts)
 
-If any Layer 2 phrases are found, create a candidate for each and label it `[possibly from claudeception]`.
+If any Layer 2 phrases are found, create a candidate for each and label it `[possibly from skill-kit:extract]`.
 
 **Then, perform standard insight discovery:**
 
-Analyze the full conversation and identify 3-5 additional candidate insights (beyond any claudeception candidates). Each candidate should be one of these types:
+Analyze the full conversation and identify 3-5 additional candidate insights (beyond any skill-kit:extract candidates). Each candidate should be one of these types:
 
 - **Decision** — an architectural or design choice made during the session
 - **Pattern** — a reusable approach, technique, or workflow discovered
@@ -361,20 +361,20 @@ Analyze the full conversation and identify 3-5 additional candidate insights (be
 - **Error Fix** — a bug or error diagnosed and resolved
 - **Discovery** — a new finding about a tool, API, library, or system behavior
 
-**Present all candidates** as a numbered list, with claudeception candidates first:
+**Present all candidates** as a numbered list, with skill-kit:extract candidates first:
 
 > **Insights found in this session:**
 >
-> 1. [from claudeception] [Discovery] Rate limiter pattern — extracted as reusable skill
-> 2. [possibly from claudeception] [Pattern] Retry with exponential backoff — identified across 3 sessions
+> 1. [from skill-kit:extract] [Discovery] Rate limiter pattern — extracted as reusable skill
+> 2. [possibly from skill-kit:extract] [Pattern] Retry with exponential backoff — identified across 3 sessions
 > 3. [Decision] Chose Redis for session store — trade-off analysis
 > 4. [Solution] Fixed CORS issue with Safari — root cause in preflight handling
 >
 > Which would you like to save? (e.g. `1,3` or `all`)
 
-If no claudeception output was detected, present only the standard candidates (same as before — no labels).
+If no skill-kit:extract output was detected, present only the standard candidates (same as before — no labels).
 
-When the user says `all`, all candidates (including claudeception ones) are saved. When the user picks specific numbers, only those are saved — standard selection behavior.
+When the user says `all`, all candidates (including skill-kit:extract ones) are saved. When the user picks specific numbers, only those are saved — standard selection behavior.
 
 Wait for the user to pick. For each selected insight, draft the note content and continue to Step 5. Process selected insights one at a time.
 

@@ -79,7 +79,7 @@ If **upgrade**: store `MODE=upgrade`. Store `VAULT_PATH` from the existing confi
 - Step 8 (Verify vault access): runs normally
 - Step 8.5 (Build vault index): runs normally (idempotent ensure_index call)
 - Step 8.7 (Performance Dependencies): runs normally — has its own idempotency check via `optional_deps_prompted`/`optional_deps_declined` config fields; users with declined deps are NOT re-prompted unless they explicitly run `/obsidian-setup --deps`
-- Step 9 (Configure claudeception nudge): runs normally (has its own idempotency check)
+- Step 9 (Configure skill-kit:extract nudge): runs normally (has its own idempotency check)
 - Step 10 (Print success message): show upgrade-specific message
 
 If **reconfigure**: store `MODE=reconfigure`. Proceed to Step 2 (Ask for vault path) as normal — full setup flow.
@@ -747,9 +747,9 @@ PY
 
 - **Not now:** write neither flag. The next `/obsidian-setup` run will re-prompt.
 
-### Step 9 — Configure claudeception nudge (idempotent)
+### Step 9 — Configure skill-kit:extract nudge (idempotent)
 
-Check if the claudeception-to-compress nudge is already configured **globally** (in `~/.claude/`, not the project `.claude/`):
+Check if the skill-kit:extract-to-compress nudge (rule file and name keep the old `claudeception` spelling) is already configured **globally** (in `~/.claude/`, not the project `.claude/`):
 
 ```bash
 test -f ~/.claude/hookify.claudeception-compress-nudge.local.md && echo "EXISTS" || echo "MISSING"
@@ -770,10 +770,10 @@ pattern: Result:\s*PASS|\.claude/skills/[^/]+/SKILL\.md|created skill|skill file
 action: warn
 ---
 
-💡 **Claudeception extracted knowledge from this session.** Run `/compress` to save it to your Obsidian vault.
+💡 **skill-kit:extract (was claudeception) extracted knowledge from this session.** Run `/compress` to save it to your Obsidian vault.
 ```
 
-**Important:** This rule MUST be in `~/.claude/` (global), not the project's `.claude/` directory. The nudge should trigger in any project where claudeception runs, not just obsidian-brain.
+**Important:** This rule MUST be in `~/.claude/` (global), not the project's `.claude/` directory. The nudge should trigger in any project where skill-kit:extract runs, not just obsidian-brain.
 
 This is a soft nudge — a non-blocking suggestion, not automatic execution.
 
@@ -786,7 +786,7 @@ This is a soft nudge — a non-blocking suggestion, not automatic execution.
 > - Vault path: `<VAULT_PATH>` (unchanged)
 > - Config: preserved (unchanged)
 > - New dashboards: installed (existing dashboards preserved)
-> - Claudeception nudge: configured
+> - skill-kit:extract nudge: configured
 > - Vault index: N notes indexed (run `/vault-reindex` to rebuild) — _or omit this line if Step 8.5 failed_
 >
 > Re-run `/obsidian-setup` anytime to pick up new features.
@@ -799,7 +799,7 @@ This is a soft nudge — a non-blocking suggestion, not automatic execution.
 > - Config written to: `~/.claude/obsidian-brain-config.json`
 > - Folders created: `claude-sessions/`, `claude-insights/`, `claude-dashboards/`, `claude-wiki/`
 > - Dashboards installed: `sessions-overview.md`, `project-index.md`, `weekly-review.md`, `learning-velocity.md`, `decision-timeline.md`, `open-items.md`
-> - Claudeception nudge: configured (run `/compress` reminder after knowledge extraction)
+> - skill-kit:extract nudge: configured (run `/compress` reminder after knowledge extraction)
 > - Vault index: N notes indexed (run `/vault-reindex` to rebuild) — _or omit this line if Step 8.5 failed_
 >
 > **Next step — install the Dataview plugin in Obsidian:**
