@@ -768,3 +768,11 @@ def test_contraction_fragments_do_not_match_newer_notes(vault):
           body="it's what's s t", date="2026-10-03")
     vault_index.ensure_index(vault["vault"], FOLDERS, db_path=vault["db"])
     assert not any(r.startswith("newer:") for r in wiki.stale(vault["db"], page, vault["roots"])["reasons"])
+
+
+def test_standalone_re_is_a_topic_not_a_contraction(vault):
+    page = _page(vault, "10-02-re", "How does re handle groups?", ["i1"], {"i1": wiki.fingerprint(_src(vault, "i1"))})
+    _note(Path(vault["vault"]), "claude-sessions", "s-re", "claude-session",
+          body="python re module notes", date="2026-10-03")
+    vault_index.ensure_index(vault["vault"], FOLDERS, db_path=vault["db"])
+    assert "newer: s-re" in wiki.stale(vault["db"], page, vault["roots"])["reasons"]
