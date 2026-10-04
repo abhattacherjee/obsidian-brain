@@ -1,6 +1,6 @@
 """LLM wiki for /vault-ask answers (#383, #395).
 
-Library + JSON CLI (``python3 hooks/wiki.py rule|lookup|stale|count|file``).
+Library + JSON CLI (``python3 hooks/wiki.py rule|lookup|stale|count|file|memgrep``).
 Every vault write goes through ``write_vault_note`` (atomic, 0o600,
 contained under the vault) while holding one wiki lock. The one exception:
 ``rebuild_wiki_index`` deletes stale ``index-*.md`` files directly (only
@@ -38,6 +38,11 @@ COUNTING_TYPES = frozenset({
 CALLER_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 CONFIDENCE = ("high", "medium", "low")
+# Memory files (#396) are named "<project-dir>/<file>.md" and fingerprinted
+# under "memory:<name>". Only memory_sources.py knows where they live.
+MEMORY_PREFIX = "memory:"
+MEMORY_NAME_RE = re.compile(r"^[^/\\\x00]{1,255}/[^/\\\x00]{1,252}\.md$")
+MEMGREP_MAX = 200
 INDEX_TYPE = "claude-wiki-index"
 PAGE_TYPE = "claude-wiki"
 
@@ -242,8 +247,8 @@ def count_sources(db_path: str, names, memory_sources, roots) -> dict:
     """
     res = resolve_sources(db_path, names, roots)
     rejected = list(res["rejected"])
-    for m in memory_sources or []:
-        rejected.append({"name": str(m), "reason": "memory sources arrive in #396"})
+    mem = resolve_memory(memory_sources)
+    rejected += mem["rejected"]
     parents = [r["key"] for r in res["resolved"] if r["type"] == "claude-snapshot"]
     parent_path = ({p["name"]: p["path"] for p in resolve_sources(db_path, parents, roots)["resolved"]}
                    if parents else {})
@@ -262,8 +267,64 @@ def count_sources(db_path: str, names, memory_sources, roots) -> dict:
             qualifying.append(r["key"] if is_snapshot else r["name"])
         else:
             other.append(r["name"])
+    qualifying += [MEMORY_PREFIX + m["name"] for m in mem["resolved"]]
     return {"count": len(qualifying), "qualifying": qualifying, "other": other,
-            "rejected": rejected, "resolved": resolved}
+            "rejected": rejected, "resolved": resolved, "memory_resolved": mem["resolved"]}
+
+
+def _memory_files() -> list:
+    """This host's memory files (the seam tests replace)."""
+    import memory_sources as ms
+
+    return ms.memory_sources(ms.detect_host())
+
+
+def _memory_name(path) -> str:
+    p = Path(path)
+    return f"{p.parent.parent.name}/{p.name}"
+
+
+def resolve_memory(names) -> dict:
+    """Map ``<project-dir>/<file>.md`` names to this host's memory files.
+
+    A name of the wrong shape (not a string, no folder, ``..``) is rejected
+    as ``not a memory file name``; a well-formed name with no such file as
+    ``not a memory file on this host``. Repeats of one file count once.
+    """
+    names = list(names or [])
+    if not names:
+        return {"resolved": [], "rejected": []}
+    by_name = {_memory_name(f): f for f in _memory_files()}
+    resolved, rejected, seen = [], [], set()
+    for n in names:
+        if (not isinstance(n, str) or not MEMORY_NAME_RE.fullmatch(n)
+                or ".." in n.split("/")):
+            rejected.append({"name": str(n), "reason": "not a memory file name"})
+            continue
+        f = by_name.get(n)
+        if f is None:
+            rejected.append({"name": n, "reason": "not a memory file on this host"})
+            continue
+        if f in seen:
+            continue
+        seen.add(f)
+        resolved.append({"name": n, "path": str(f)})
+    return {"resolved": resolved, "rejected": rejected}
+
+
+def memgrep(pattern: str, files) -> list:
+    """Memory files whose text holds ``pattern`` (case-insensitive fixed
+    string, never a regex). Unreadable files are skipped."""
+    needle = pattern.casefold()
+    out = []
+    for f in files:
+        try:
+            text = Path(f).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if needle in text.casefold():
+            out.append({"name": _memory_name(f), "path": str(f)})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +383,15 @@ def stale(db_path: str, page_path, roots) -> dict:
     meta, _body = read_page(page_path)
     raw_fps = meta.get("sources_fingerprint")
     fps = {}
+    mem_fps = {}
     if isinstance(raw_fps, dict):
-        fps = {_norm_name(k): v for k, v in raw_fps.items() if isinstance(v, str) and v}
+        for k, v in raw_fps.items():
+            if not (isinstance(v, str) and v):
+                continue
+            if str(k).startswith(MEMORY_PREFIX):
+                mem_fps[str(k)] = v
+            else:
+                fps[_norm_name(k)] = v
     sources = meta.get("sources")
     reasons = []
     if not isinstance(sources, list) or not sources:
@@ -347,6 +415,22 @@ def stale(db_path: str, page_path, roots) -> dict:
             continue
         if now != old:
             reasons.append(f"changed: {r['name']}")
+    mem_names = meta.get("memory_sources")
+    for n in dict.fromkeys(mem_names if isinstance(mem_names, list) else []):
+        if MEMORY_PREFIX + str(n) not in mem_fps:
+            reasons.append(f"unverifiable: {MEMORY_PREFIX}{n}")
+    if mem_fps:
+        by_name = {_memory_name(f): f for f in _memory_files()}
+        for key, old in mem_fps.items():
+            f = by_name.get(key[len(MEMORY_PREFIX):])
+            try:
+                now = fingerprint(f) if f is not None else None
+            except OSError:
+                now = None
+            if now is None:
+                reasons.append(f"missing: {key}")
+            elif now != old:
+                reasons.append(f"changed: {key}")
     cited = {_norm_name(x) for x in sources} | set(fps)
     updated = str(meta.get("updated") or "")
     question = str(meta.get("question") or "")
@@ -609,8 +693,11 @@ def file_page(ctx: dict, payload: dict, today) -> dict:
             "date": today.isoformat(), "created": created, "updated": today.isoformat(),
             "projects": projects,
             "sources": [f"[[{r['name']}]]" for r in resolved],
-            "memory_sources": [],
-            "sources_fingerprint": {r["name"]: fingerprint(r["path"]) for r in resolved},
+            "memory_sources": [m["name"] for m in counted["memory_resolved"]],
+            "sources_fingerprint": {
+                **{r["name"]: fingerprint(r["path"]) for r in resolved},
+                **{MEMORY_PREFIX + m["name"]: fingerprint(m["path"])
+                   for m in counted["memory_resolved"]}},
             "confidence": p["confidence"], "filed_by": p["filed_by"],
         }
         if p["filed_by"] == "auto":
@@ -701,7 +788,16 @@ def _cmd_count() -> dict:
     vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
     out = count_sources(ctx["db"], sources, memory, _roots(ctx))
     out.pop("resolved")
+    out.pop("memory_resolved")
     return out
+
+
+def _cmd_memgrep() -> dict:
+    payload = _read_stdin()
+    pattern = payload.get("pattern")
+    if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > MEMGREP_MAX:
+        raise WikiRefusal(f"pattern must be a non-blank string of at most {MEMGREP_MAX} characters")
+    return {"matches": memgrep(pattern.strip(), _memory_files())}
 
 
 def _cmd_lookup() -> dict:
@@ -740,6 +836,7 @@ _COMMANDS: dict = {
     "lookup": _cmd_lookup,
     "stale": _cmd_stale,
     "file": _cmd_file,
+    "memgrep": _cmd_memgrep,
 }
 
 

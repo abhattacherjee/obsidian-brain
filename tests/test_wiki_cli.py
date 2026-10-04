@@ -1,5 +1,7 @@
 from __future__ import annotations
 import json, os, subprocess, sys
+
+import pytest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -132,3 +134,21 @@ def test_commands_in_process(tmp_path, monkeypatch, capsys):
     assert call("count", {"sources": ["i1", "i2"]})[1]["count"] == 2
     rc, err = call("stale", {"page": str(vault / "claude-insights" / "i1.md")})
     assert rc == 1 and "under" in err
+
+
+@pytest.mark.parametrize("payload,code", [({"pattern": ""}, 1), ({"pattern": "  "}, 1), ({"pattern": 5}, 1),
+                                          ({"pattern": "x" * 201}, 1)])
+def test_memgrep_refuses_bad_patterns(payload, code, monkeypatch, capsys):
+    monkeypatch.setattr(wiki, "_read_stdin", lambda: payload)
+    assert wiki.main(["memgrep"]) == code
+    assert "ERROR: pattern must be" in capsys.readouterr().err
+
+
+def test_memgrep_cli_prints_matches(monkeypatch, capsys, tmp_path):
+    f = tmp_path / "p" / "memory" / "m.md"
+    f.parent.mkdir(parents=True)
+    f.write_text("needle here")
+    monkeypatch.setattr(wiki, "_read_stdin", lambda: {"pattern": "NEEDLE"})
+    monkeypatch.setattr(wiki, "_memory_files", lambda: [f])
+    assert wiki.main(["memgrep"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"matches": [{"name": "p/m.md", "path": str(f)}]}

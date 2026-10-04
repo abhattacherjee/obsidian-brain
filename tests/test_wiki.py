@@ -61,6 +61,12 @@ def _note(vault, folder, name, ntype, extra="", body="zebracorn body", date="202
     return p
 
 
+@pytest.fixture(autouse=True)
+def _no_live_memory(monkeypatch):
+    """Tests never read the real ~/.claude/projects; the mem fixture opts in."""
+    monkeypatch.setattr(wiki, "_memory_files", lambda: [])
+
+
 @pytest.fixture
 def vault(tmp_path):
     v = tmp_path / "v"
@@ -111,9 +117,43 @@ def test_unresolved_and_ambiguous_are_rejected(vault):
     assert "claude-sessions/dup.md" in reasons["dup"] and "claude-insights/dup.md" in reasons["dup"]
 
 
-def test_memory_sources_refused_until_396(vault):
-    r = _count(vault, ["i1"], mem=["x/y.md"])
-    assert any("#396" in x["reason"] for x in r["rejected"])
+@pytest.fixture
+def mem(tmp_path, monkeypatch):
+    """Two fake memory files; wiki._memory_files is the host seam."""
+    store = tmp_path / "home" / ".claude" / "projects" / "proj" / "memory"
+    store.mkdir(parents=True)
+    x = store / "x.md"
+    y = store / "y.md"
+    x.write_text("zebracorn memory fact\n")
+    y.write_text("other fact\n")
+    monkeypatch.setattr(wiki, "_memory_files", lambda: [x, y])
+    return {"x": x, "y": y}
+
+
+def test_memory_source_counts_toward_the_threshold(vault, mem):
+    r = _count(vault, ["i1", "i2"], mem=["proj/x.md"])
+    assert r["count"] == 3 and "memory:proj/x.md" in r["qualifying"] and r["rejected"] == []
+
+
+def test_memory_source_counts_once(vault, mem):
+    assert _count(vault, ["i1"], mem=["proj/x.md", "proj/x.md"])["count"] == 2
+
+
+@pytest.mark.parametrize("name,reason", [
+    ("proj/nope.md", "not a memory file on this host"),
+    ("../proj/x.md", "not a memory file name"),
+    ("proj/x", "not a memory file name"),
+    (5, "not a memory file name"),
+])
+def test_bad_memory_source_is_rejected(vault, mem, name, reason):
+    r = _count(vault, ["i1"], mem=[name])
+    assert [x["reason"] for x in r["rejected"]] == [reason]
+
+
+def test_memory_name_never_resolves_to_a_vault_note(vault, mem):
+    # "i1" is a vault note; as a memory name it is not a memory file.
+    r = _count(vault, ["i2"], mem=["proj/i1.md"])
+    assert r["count"] == 1 and r["rejected"][0]["reason"] == "not a memory file on this host"
 
 
 def test_note_outside_roots_is_unresolved(vault, tmp_path):
@@ -313,7 +353,7 @@ def test_file_golden_page(ctx):
     ({"body": "  "}, "body"),
     ({"question": "q" * 501}, "question"),
     ({"question": ""}, "question"),
-    ({"memory_sources": ["a/b.md"]}, "#396"),
+    ({"memory_sources": ["a/b.md"]}, "not a memory file on this host"),
     ({"filed_by": "robot"}, "filed_by"),
 ])
 def test_file_refusals_write_nothing(ctx, kw, msg):
@@ -776,3 +816,44 @@ def test_standalone_re_is_a_topic_not_a_contraction(vault):
           body="python re module notes", date="2026-10-03")
     vault_index.ensure_index(vault["vault"], FOLDERS, db_path=vault["db"])
     assert "newer: s-re" in wiki.stale(vault["db"], page, vault["roots"])["reasons"]
+
+
+# --- memory sources (#396) ---------------------------------------------------
+
+
+def test_file_records_memory_sources_and_fingerprints(ctx, mem):
+    body = "Ranking uses bm25.\n\n### Sources\n- [[i1]]\n- memory: proj/x.md\n"
+    page = Path(wiki.file_page(ctx, _payload(sources=["i1", "i2"], memory_sources=["proj/x.md"], body=body), D)["path"])
+    meta, got = wiki.read_page(page)
+    assert meta["memory_sources"] == ["proj/x.md"]
+    assert meta["sources_fingerprint"]["memory:proj/x.md"] == wiki.fingerprint(mem["x"])
+    assert "- memory: proj/x.md" in got and "[[proj/x.md]]" not in got
+
+
+def test_stale_sees_a_changed_or_deleted_memory_file(ctx, mem):
+    page = Path(wiki.file_page(ctx, _payload(sources=["i1", "i2"], memory_sources=["proj/x.md"]), D)["path"])
+    roots = [str(Path(ctx["vault"]) / f) for f in FOLDERS]
+    assert wiki.stale(ctx["db"], page, roots) == {"stale": False, "reasons": []}
+    mem["x"].write_text("changed\n")
+    assert "changed: memory:proj/x.md" in wiki.stale(ctx["db"], page, roots)["reasons"]
+    mem["x"].unlink()
+    assert "missing: memory:proj/x.md" in wiki.stale(ctx["db"], page, roots)["reasons"]
+
+
+def test_memory_source_without_fingerprint_is_unverifiable(ctx, mem):
+    page = Path(wiki.file_page(ctx, _payload(sources=["i1", "i2"], memory_sources=["proj/x.md"]), D)["path"])
+    meta, body = wiki.read_page(page)
+    meta["sources_fingerprint"].pop("memory:proj/x.md")
+    page.write_text(wiki.render_page(meta, body))
+    roots = [str(Path(ctx["vault"]) / f) for f in FOLDERS]
+    assert "unverifiable: memory:proj/x.md" in wiki.stale(ctx["db"], page, roots)["reasons"]
+
+
+def test_memgrep_is_a_case_insensitive_fixed_string(mem):
+    assert [m["name"] for m in wiki.memgrep("ZebraCorn", [mem["x"], mem["y"]])] == ["proj/x.md"]
+    assert wiki.memgrep("z.bracorn", [mem["x"]]) == []
+    assert wiki.memgrep("fact", [mem["x"], mem["y"]])[1]["path"] == str(mem["y"])
+
+
+def test_memgrep_skips_unreadable_files(mem, tmp_path):
+    assert [m["name"] for m in wiki.memgrep("fact", [tmp_path / "gone.md", mem["y"]])] == ["proj/y.md"]
