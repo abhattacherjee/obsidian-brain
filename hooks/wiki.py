@@ -556,13 +556,14 @@ def _index_header(title: str) -> str:
     return '---\ntype: "claude-wiki-index"\n---\n# ' + title + '\n'
 
 
-def rebuild_wiki_index(ctx: dict) -> list:
-    """Rebuild ``index.md`` (and ``index-<project>.md`` above INDEX_SPLIT
-    pages) from the notes table, never from page files."""
+def render_wiki_index(ctx: dict) -> dict:
+    """The index files as ``{file name: text}``, built from the notes table
+    (never from page files). ``index.md`` alone up to INDEX_SPLIT pages;
+    above that, ``index.md`` lists one ``index-<project>.md`` per project.
+    Writes nothing."""
     import vault_index
 
-    root = _wiki_root(ctx)
-    queries = root / "queries"
+    queries = _wiki_root(ctx) / "queries"
     conn = vault_index._connect(ctx["db"])
     try:
         rows = [r for r in conn.execute(
@@ -577,29 +578,33 @@ def rebuild_wiki_index(ctx: dict) -> list:
         conf = next((t.rsplit("-", 1)[1] for t in tags if t.startswith("claude/wiki/confidence-")), "?")
         return f"- [[{Path(r['path']).stem}]] — {_unquote(r['title'])} (updated {r['date']}, {conf})"
 
-    written, keep = [], set()
     if len(rows) <= INDEX_SPLIT:
-        body = _index_header("Wiki index") + "\n" + "\n".join(line(r) for r in rows) + "\n"
-        _write(ctx, ctx["wiki_folder"], "index.md", body)
-        written.append(str(root / "index.md"))
-    else:
-        groups: dict = {}
-        for r in rows:
-            projects = [t[len("claude/project/"):] for t in (r["tags"] or "").split(",")
-                        if t.startswith("claude/project/")] or ["unassigned"]
-            for proj in projects:
-                groups.setdefault(slugify(proj), []).append(r)
-        top = [f"- [[index-{p}]] — {len(rs)} page(s)" for p, rs in sorted(groups.items())]
-        _write(ctx, ctx["wiki_folder"], "index.md", _index_header("Wiki index") + "\n" + "\n".join(top) + "\n")
-        written.append(str(root / "index.md"))
-        for proj, rs in sorted(groups.items()):
-            name = f"index-{proj}.md"
-            keep.add(name)
-            _write(ctx, ctx["wiki_folder"], name,
-                   _index_header(f"Wiki index: {proj}") + "\n" + "\n".join(line(r) for r in rs) + "\n")
-            written.append(str(root / name))
+        return {"index.md": _index_header("Wiki index") + "\n" + "\n".join(line(r) for r in rows) + "\n"}
+    groups: dict = {}
+    for r in rows:
+        projects = [t[len("claude/project/"):] for t in (r["tags"] or "").split(",")
+                    if t.startswith("claude/project/")] or ["unassigned"]
+        for proj in projects:
+            groups.setdefault(slugify(proj), []).append(r)
+    top = [f"- [[index-{p}]] — {len(rs)} page(s)" for p, rs in sorted(groups.items())]
+    out = {"index.md": _index_header("Wiki index") + "\n" + "\n".join(top) + "\n"}
+    for proj, rs in sorted(groups.items()):
+        out[f"index-{proj}.md"] = (_index_header(f"Wiki index: {proj}") + "\n"
+                                   + "\n".join(line(r) for r in rs) + "\n")
+    return out
+
+
+def rebuild_wiki_index(ctx: dict) -> list:
+    """Write the files from ``render_wiki_index`` and delete any other
+    ``index-*.md`` typed ``claude-wiki-index``. Returns the written paths."""
+    root = _wiki_root(ctx)
+    files = render_wiki_index(ctx)
+    written = []
+    for name, text in files.items():
+        _write(ctx, ctx["wiki_folder"], name, text)
+        written.append(str(root / name))
     for old in root.glob("index-*.md"):
-        if old.name in keep:
+        if old.name in files:
             continue
         # Only delete our own index files: a user note may share the name.
         try:

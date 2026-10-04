@@ -34,7 +34,7 @@ def test_file_outcomes_by_exit_code():
 
 
 def test_rejected_sources_are_dropped_before_filing():
-    assert "Drop every rejected name from the `sources` list before filing" in SKILL
+    assert "Drop every rejected name from the `sources` or `memory_sources` list before filing" in SKILL
     assert "Never file with a rejected name in `sources`" in SKILL
 
 
@@ -79,3 +79,29 @@ def test_unverifiable_is_a_stale_reason():
 
 def test_refresh_leaves_the_page_out_of_sources():
     assert "leave the page being refreshed out of `sources`" in SKILL
+
+
+# --- memory sources (#396) ---------------------------------------------------
+
+
+def test_memory_search_uses_memgrep_on_every_ask():
+    assert 'wiki.py" memgrep' in SKILL
+    assert "The memory search runs on every ask" in SKILL
+
+
+def test_memory_citation_is_plain_text():
+    assert "memory: <project-dir>/<file>.md" in SKILL
+    assert "never as a wikilink" in SKILL
+
+
+def test_memory_names_go_to_count_and_file():
+    assert '"memory_sources": [<every memory file cited in Sources, by its memgrep name>]' in SKILL
+    assert '"memory_sources": ["<project-dir>/<file>.md", "..."]' in SKILL
+
+
+def test_memory_files_stay_out_of_vault_scan_meta():
+    assert "Do not pass memory files to `vault_scan.py meta`" in SKILL
+
+
+def test_skill_has_no_claude_only_memory_path():
+    assert "~/.claude/projects" not in SKILL and "/memory/" not in SKILL

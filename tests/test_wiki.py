@@ -857,3 +857,21 @@ def test_memgrep_is_a_case_insensitive_fixed_string(mem):
 
 def test_memgrep_skips_unreadable_files(mem, tmp_path):
     assert [m["name"] for m in wiki.memgrep("fact", [tmp_path / "gone.md", mem["y"]])] == ["proj/y.md"]
+
+
+def test_render_wiki_index_matches_the_written_file_and_writes_nothing(ctx):
+    wiki.file_page(ctx, _payload(), D)
+    before = {p: p.read_bytes() for p in _wiki(ctx).rglob("*") if p.is_file()}
+    out = wiki.render_wiki_index(ctx)
+    assert out == {"index.md": (_wiki(ctx) / "index.md").read_text()}
+    assert {p: p.read_bytes() for p in _wiki(ctx).rglob("*") if p.is_file()} == before
+
+
+def test_render_wiki_index_splits_by_project(ctx, monkeypatch):
+    monkeypatch.setattr(wiki, "INDEX_SPLIT", 1)
+    wiki.file_page(ctx, _payload(question="alpha zebracorn?"), D)
+    wiki.file_page(ctx, _payload(question="beta zebracorn?"), D)
+    out = wiki.render_wiki_index(ctx)
+    assert "index.md" in out and len([k for k in out if k.startswith("index-")]) >= 1
+    for name, text in out.items():
+        assert (_wiki(ctx) / name).read_text() == text
