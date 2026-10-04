@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `wiki_folder` config key (default `claude-wiki`) and `indexed_folders(config)` helper. Every config-driven index call (`/vault-ask`, `/vault-search`, `/compress`, `/vault-stats`, `/vault-reindex`, `/obsidian-setup`) now indexes the wiki folder; `/recall`'s context brief and `/check-items` still index sessions and insights only, which never removes wiki rows. `/vault-reindex` and `/obsidian-setup` read the config fresh, refuse an invalid `wiki_folder` or an unreadable config instead of dropping rows, and report rows dropped for being outside the scanned folders (`foreign_deleted`) and any scanned folder that is missing. `/obsidian-setup` creates it and `/vault-config` can change it. Notes typed `claude-wiki-index` stay out of the index, and `claude-wiki` notes rank like insights. Groundwork for the LLM wiki (#383).
 - `/vault-ask` can save an answer as a wiki page when it cites 3 or more qualifying notes (insights, error-fixes, decisions, retros or sessions; a snapshot counts as its parent session). It asks first; with `--caller <name>` it saves without asking. Later asks find the page first, a page whose sources changed is refreshed, and a page you mark `reviewed: true` is never rewritten without your OK. Pages are written in a plain, controlled style (80% of ASD-STE100). New `hooks/wiki.py` holds the logic (#395, #383).
 
+### Changed
+- `/compress` Layer 1 and Layer 2 now also match `skill-kit:extract` and `Skill(skill-kit:extract)` (the old claudeception skill moved into the `skill-kit` plugin), and still match the old claudeception markers so old transcripts work. Candidate labels are now `[from skill-kit:extract]`. The `/obsidian-setup` nudge text uses the new name; the hookify rule file name is unchanged (abhattacherjee/claude-code-skills#161).
+
 ## [3.7.0] - 2026-10-03
 
 ### Added
