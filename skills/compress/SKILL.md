@@ -109,7 +109,7 @@ def _ob_hooks():
 sys.path.insert(0, _ob_hooks())
 try:
     from vault_index import ensure_index, search_vault, compute_query_vector
-    from obsidian_utils import load_config
+    from obsidian_utils import load_config, indexed_folders
     # Pure predicate: top rank must pass absolute-strength gate AND |top|-|#2| delta gate.
     # MIN_RANK_DELTA tuned against scripts/compress_rank_gap_corpus.json (issue #45).
     # Cosine gate: query_vec threads through when non-empty; {} (stopword/empty query only)
@@ -119,7 +119,7 @@ try:
     from compress_guard import is_high_confidence_match, summarize_match_evidence, topic_snippet
     c = load_config()
     vp = c["vault_path"]
-    folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
+    folders = indexed_folders(c)
     db = ensure_index(vp, folders)
     query_vec = compute_query_vector(db, sys.argv[1])
     results = search_vault(db, sys.argv[1], note_type="claude-insight", limit=3, include_vectors=True)
@@ -305,10 +305,10 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
 from vault_index import ensure_index
-from obsidian_utils import load_config
+from obsidian_utils import load_config, indexed_folders
 c = load_config()
 vp = c["vault_path"]
-folders = [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")]
+folders = indexed_folders(c)
 try:
     ensure_index(vp, folders)
     print("OK")

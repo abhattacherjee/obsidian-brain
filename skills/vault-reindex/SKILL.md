@@ -101,10 +101,11 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
+from obsidian_utils import load_config, indexed_folders
 from vault_index import rebuild_index
 t0 = time.time()
-full = sys.argv[4].lower() == "true"
-stats = rebuild_index(sys.argv[1], [sys.argv[2], sys.argv[3]], full=full)
+full = sys.argv[2].lower() == "true"
+stats = rebuild_index(sys.argv[1], indexed_folders(load_config()), full=full)
 stats["elapsed"] = round(time.time() - t0, 1)
 # Derive mode from the returned stats, not the CLI flag — rebuild_index()
 # can fall through to a full rebuild internally (missing DB, legacy schema)
@@ -112,7 +113,7 @@ stats["elapsed"] = round(time.time() - t0, 1)
 # in the stats dict is the single source of truth.
 stats["mode"] = "preserve" if "preserved" in stats else "full"
 print(json.dumps(stats))
-' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER" "$FULL_MODE"
+' "$VAULT_PATH" "$FULL_MODE"
 ```
 
 If the command fails (non-zero exit or exception in output), tell the user:
@@ -130,6 +131,7 @@ Parse the JSON output from Step 3. Extract:
 - `unchanged` — notes whose mtime matched the index; nothing to do, the healthy common case
 - `malformed` — notes whose frontmatter failed to parse (true total, not capped): dropped from the index if never indexed before, or, if already indexed, left at its last-good indexed content
 - `malformed_files` — list of `{"file": <sanitized basename>, "reason": <classifier>}`, capped (currently 20 entries) even when `malformed` is larger
+- `excluded` — notes skipped on purpose because their type is never indexed (the wiki's own `index.md` and `log-*.md` files, typed `claude-wiki-index`, #383); not a problem
 - `elapsed` — time in seconds
 - `by_type` — dict mapping note type to count
 - `mode` — `"preserve"` or `"full"`
@@ -147,6 +149,8 @@ Present this report:
 > | ... | ... |
 >
 > Unchanged: `<unchanged>` file(s) already indexed (nothing to do). Malformed: `<malformed>` file(s) with frontmatter that failed to parse.
+
+The index covers the folders from `indexed_folders(config)`: sessions, insights and the wiki folder (`wiki_folder`, default `claude-wiki`). If `excluded` is greater than 0, add: "Skipped `<excluded>` wiki index/log file(s) (not knowledge, never indexed)."
 
 Only include rows in the table for types that appear in `by_type` (omit zero-count types). Sort rows by count descending.
 

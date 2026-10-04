@@ -109,10 +109,10 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config
+from obsidian_utils import load_config, indexed_folders
 from vault_index import ensure_index, search_vault
 c = load_config()
-db = ensure_index(c["vault_path"], [c.get("sessions_folder", "claude-sessions"), c.get("insights_folder", "claude-insights")])
+db = ensure_index(c["vault_path"], indexed_folders(c))
 results = search_vault(
     db,
     sys.argv[1],

@@ -1276,6 +1276,9 @@ def deep_analysis_pipeline(
     import vault_index
 
     # 1. Warm vault index
+    # Explicit list (not indexed_folders): folders arrive as parameters, and
+    # the scans below look for open `- [ ]` items, which wiki pages never
+    # carry. Safe for wiki rows (#383): _sync deletes only under scanned folders.
     folders = [sessions_folder, insights_folder]
     try:
         actual_db = vault_index.ensure_index(vault_path, folders, db_path=db_path)

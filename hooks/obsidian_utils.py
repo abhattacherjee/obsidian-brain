@@ -5182,6 +5182,9 @@ def build_context_brief(
 
     if _use_vault_index:
         try:
+            # Explicit list (not indexed_folders): this function receives the
+            # folders as parameters. Safe for the wiki folder (#383): _sync
+            # deletes only under scanned folders, so wiki rows are untouched.
             db_path = ensure_index(vault_path, [sessions_folder, insights_folder])
             ranked_notes = query_related_notes(
                 db_path=db_path,
