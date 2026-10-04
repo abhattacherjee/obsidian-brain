@@ -26,10 +26,8 @@ REPO = Path(__file__).resolve().parent.parent
 # write ``"---\ntype: claude-emerge"``, where ``type`` follows a literal ``n``.
 _TYPE_RE = re.compile(r"""["']?type["']?\s*[:=]\s*["']?(claude-[a-z0-9][a-z0-9-]*[a-z0-9])""")
 
-# Present in live vaults but written outside this file set: migrated memory
-# notes, and claude-wiki, whose writer (hooks/wiki.py) lands in #383 PR 2.
-# PR 2 removes "claude-wiki" from this set once the scan finds the writer.
-_EXTERNAL_TYPES = {"claude-memory", "claude-wiki"}
+# Written outside this repo (migrated memory notes) but present in live vaults.
+_EXTERNAL_TYPES = {"claude-memory"}
 
 _ORIGINAL_TYPES = {
     "claude-session", "claude-insight", "claude-decision",
@@ -71,7 +69,7 @@ def test_scan_finds_exactly_the_known_types():
     # quietly pull in a new type; a real new writer updates this list on purpose.
     assert collect_written_types() == _ORIGINAL_TYPES | {
         "claude-snapshot", "claude-memory", "claude-emerge", "claude-stats",
-        "claude-check-items-report", "claude-wiki",
+        "claude-check-items-report", "claude-wiki", "claude-wiki-index",
     }
 
 

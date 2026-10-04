@@ -18,7 +18,7 @@
 | 2 Wiki core | `feature/383-wiki-core` | `hooks/wiki.py` and its CLI, vault-ask Step 2b (wiki first) and Step 8 (filing gate), `--caller` auto-filing, dedupe, stale refresh, the STE writing rule | PR 1 |
 | 3 Memory + doctor | `feature/383-wiki-memory-doctor` | `memory_sources(host, config)`, memory grep in vault-ask, the `wiki-pages` vault-doctor check, global CLAUDE.md `--caller` update | PR 2 |
 
-Each PR goes through `/ship` on its own. #383 closes with PR 3; PRs 1 and 2 use `Refs #383`. Until PR 3 lands, the filing threshold counts vault notes only.
+Each PR goes through `/ship` on its own and closes its own child issue: #394 (PR 1, merged in #393), #395 (PR 2), #396 (PR 3). #383 is the epic; it closes when all three children are closed. Until PR 3 lands, the filing threshold counts vault notes only, and `count`/`file` refuse a non-empty `memory_sources`.
 
 ## Facts from the code that shape the design
 
@@ -49,19 +49,19 @@ The two `open_item_dedup` filesystem scans (`:1292`, `:1743`) look for open `- [
 
 ### PR 2: Wiki core
 
-**`hooks/wiki.py`** (new; stdlib only; inside the coverage gate). Library functions plus a CLI, `python3 hooks/wiki.py <subcommand>`. Every subcommand reads JSON on stdin where it takes input (capped at 1,000,000 characters; oversized input is refused, not truncated) and prints JSON on stdout. Exit 0 is success, 1 is a refusal with an `ERROR: <reason>` line on stderr, 2 is a crash.
+**`hooks/wiki.py`** (new; stdlib only; inside the coverage gate). Library functions plus a CLI, `python3 hooks/wiki.py <subcommand>`. Every subcommand reads JSON on stdin where it takes input (capped at 1,000,000 characters; oversized input is refused, not truncated) and prints JSON on stdout. Exit 0 is success, 1 is a refusal with an `ERROR: <reason>` line on stderr, 2 is a usage error or a crash.
 
 | Subcommand | Input | Does | Output |
 |---|---|---|---|
 | `rule` | none | Prints the writing rule (see "Writing rule") | `{"rule": "..."}` |
-| `lookup` | `{"question"}` | FTS query over indexed notes with `type='claude-wiki'`, matching on `title` (which holds the question). Returns the top 3 by FTS rank. | `{"candidates": [{"path", "question", "score", "updated"}]}` |
-| `stale` | `{"page"}` | Re-hashes the page's sources and runs the newer-note check | `{"stale": bool, "reasons": [...]}` |
-| `count` | `{"sources", "memory_sources"}` | Resolves and counts qualifying sources (see "Threshold") | `{"count": N, "qualifying": [...], "rejected": [...]}` |
-| `file` | page payload (below) | Validates, scrubs, writes the page, rebuilds the index, appends the log | `{"path", "action": "file"\|"update"\|"file-auto"}` |
+| `lookup` | `{"question"}` | `search_vault` over indexed notes with `type='claude-wiki'` (BM25 weights `title`, which holds the question, highest; results are reranked, and the hits are logged as accesses). Returns the top 3. | `{"candidates": [{"path", "question", "updated", "rank"}]}` |
+| `stale` | `{"page"}` | Re-hashes the page's sources, checks the page's fingerprint field, and runs the newer-note check | `{"stale": bool, "reasons": [...]}` |
+| `count` | `{"sources", "memory_sources"}` | Resolves and counts qualifying sources (see "Threshold") | `{"count": N, "qualifying": [...], "other": [...], "rejected": [...]}` |
+| `file` | page payload (below) | Validates, scrubs, writes the page, rebuilds the index, appends the log | `{"path", "action": "file"\|"update"\|"file-auto", "count"}`, plus `warning` when the index or log update failed |
 
-`file` payload: `question`, `body` (markdown, already written under the rule), `sources` (note basenames), `memory_sources` (PR 3; empty before), `projects`, `topics`, `confidence`, `filed_by` (`user` or `auto`), `caller` (required when `filed_by` is `auto`), optional `update` (an existing page path), and optional `override_reviewed` (bool, default false). Without `update`, `file` refuses when the target path exists.
+`file` payload: `question`, `body` (markdown, already written under the rule), `sources` (note basenames), `memory_sources` (PR 3; empty before), `topics`, `confidence`, `filed_by` (`user` or `auto`), `caller` (required when `filed_by` is `auto`), optional `update` (an existing page path), and optional `override_reviewed` (bool, default false). A `projects` field is ignored: projects come from the cited sources. Without `update`, a name collision gets `-2`, `-3` and so on (see "Page path").
 
-`file` refuses (exit 1) when: the count is below 3; a source does not resolve to an existing file under an indexed folder; `confidence` is not one of `high`, `medium`, `low`; `filed_by` is `auto` without a `caller`; `update` points outside `<vault>/<wiki_folder>/queries/` or at a file whose frontmatter `type` is not `claude-wiki`; the resolved write path fails `is_relative_to(<vault>/<wiki_folder>)`; `update` targets a page with `reviewed: true` and the payload does not carry `override_reviewed: true` (see "Reviewed pages").
+`file` refuses (exit 1) when: fewer than 3 qualifying notes are cited (see "Threshold"); a source does not resolve to an existing file under an indexed folder; `confidence` is not one of `high`, `medium`, `low`; `filed_by` is `auto` without a `caller`; `update` points outside `<vault>/<wiki_folder>/queries/` or at a file whose frontmatter `type` is not `claude-wiki`; the resolved write path fails `is_relative_to(<vault>/<wiki_folder>)`; `update` targets a page with `reviewed: true` and the payload does not carry `override_reviewed: true` (see "Reviewed pages"); `update` names a page that is also in `sources` (a page cannot cite itself: its fingerprint would be of the old bytes, so it would stay stale forever).
 
 **vault-ask Step 2b: wiki first.** After parsing the question, run `wiki.py lookup`. The model judges whether the top candidate asks the same question (not a fixed similarity threshold: there is no live data to calibrate one). If it does:
 
@@ -114,6 +114,7 @@ The orphan scan respects `--days` like the other checks. Each reason has a posit
 type: claude-wiki
 title: "<question, verbatim>"
 question: "<question, verbatim>"
+date: 2026-10-03
 projects: [obsidian-brain]
 tags: [claude/wiki, claude/project/obsidian-brain, claude/topic/<t>]
 sources: ["[[note-a]]", "[[note-b]]"]
@@ -132,27 +133,32 @@ reviewed: true
 
 **Body:** the answer rewritten under the writing rule, then a `### Sources` section with one line per source, as vault-ask writes it today. `scrub_secrets` runs on the body and on `question` before writing.
 
+**`date`:** each write sets `date:` to the `updated` date (the local date), so `date` always carries `updated`, not `created`. The indexer stores `date`, not `updated`, so the index sort, `lookup`'s `updated` field and the newer-note check read it from the table (PR 2).
+
+**Newer-note check:** stale trigger 3 runs its own FTS query (the question's words OR-joined after dropping stopwords, restricted to counting types; a question with no words left skips the check), not `search_vault`: `search_vault`'s AND query matches the page itself and then never falls back to OR (PR 2).
+
 **Fingerprint:** SHA-256 of each source file's bytes, first 16 hex characters. A content hash, not mtime: `/recall` and `/check-items` change mtimes without changing meaning, and mtime would trigger false refreshes.
 
 **Stale** means any one of:
 
 1. a source's hash differs from `sources_fingerprint`;
 2. a source file no longer exists;
-3. a note dated after the page's `updated` is in the top 5 FTS hits for the question and is not already a source.
+3. a note dated after the page's `updated` is in the top 5 FTS hits for the question and is not already a source;
+4. the page's `sources_fingerprint` is missing or bad (reason `unverifiable: <page>`), or its `sources` is not a non-empty list (reason `unverifiable: sources`): the page cannot be checked, so it counts as stale. Block-style YAML lists and maps (as Obsidian's Properties panel saves them) are read like the one-line JSON form.
 
 `stale` returns every reason that fired, not only the first.
 
-**Threshold:** `count` counts distinct sources of type `claude-insight`, `claude-error-fix`, `claude-decision`, `claude-retro`, `claude-session`, `claude-memory` (migrated memory notes already in the vault), plus memory files (PR 3). A `claude-snapshot` counts as its parent session (resolved via `source_session_note`), so a snapshot and its parent count once. Other types (`claude-wiki`, `claude-standup`, `claude-emerge`, `claude-stats`, `claude-check-items-report`) do not count. The gate is `count >= 3`. The count is computed by code from the cited source list, so the skill cannot argue past it.
+**Threshold:** `count` counts distinct sources of type `claude-insight`, `claude-error-fix`, `claude-decision`, `claude-retro`, `claude-session`, `claude-memory` (migrated memory notes already in the vault), plus memory files (PR 3). A `claude-snapshot` counts as its parent session (resolved via `source_session_note`), so a snapshot and its parent count once. Sources are told apart by resolved file path, so `i1` and `claude-insights/i1` count once. Other types (`claude-wiki`, `claude-standup`, `claude-emerge`, `claude-stats`, `claude-check-items-report`) do not count. The gate is `count >= 3`. The count is computed by code from the cited source list, so the skill cannot argue past it.
 
 **Index files:**
 
 - Each index file starts with a frontmatter block carrying `type: claude-wiki-index`, so the indexer skips it (PR 1).
-- Up to 500 pages: one `<wiki_folder>/index.md`, one line per page, `- [[<slug>]] — <question> (updated <date>, <confidence>[, reviewed])`, sorted by `updated` descending.
+- Up to 500 pages: one `<wiki_folder>/index.md`, one line per page, `- [[<slug>]] — <question> (updated <date>, <confidence>)`, sorted by `updated` descending. (Changed in PR 2: the index is rebuilt from the `notes` table, which has no `reviewed` column, and reading every page to find it is the per-page cost the Scale section rules out. `confidence` is carried as the tag `claude/wiki/confidence-<level>` so the table has it.)
 - Above 500 pages: `index.md` lists one line per project linking to `index-<project>.md`, and each project file lists its pages. A page with several projects appears in each.
 - Rebuilt in full on every write, from the SQLite `notes` table (`type='claude-wiki'`), not by reading page files. A full rebuild cannot drift, and reading the table costs one query.
 - `lookup` never reads the index files. They exist for people browsing in Obsidian.
 
-**Log files:** `<wiki_folder>/log-YYYY.md`, append-only, one file per calendar year (UTC). Each log file starts with a frontmatter block carrying `type: claude-wiki-index`; entries are appended below it. Each entry:
+**Log files:** `<wiki_folder>/log-YYYY.md`, append-only, one file per calendar year (local date). Each log file starts with a frontmatter block carrying `type: claude-wiki-index`; entries are appended below it. Each entry:
 
 ```markdown
 ## [2026-10-03] file-auto | <caller> | <question>
@@ -187,8 +193,8 @@ Pages are LLM-owned by default. A user who edits a page by hand marks it `review
 ## Error handling
 
 - A failed write never loses the answer: the chat answer is displayed before Step 8.
-- Write order: page, then index files, then log, each atomic (temp file in the same directory, `0o600`, `os.rename`). If the index or log write fails after the page is written, `file` exits 1 and names what is missing. The next write repairs the index (full rebuild), and the doctor's `index-drift` reason reports it in between.
-- A lock file `<wiki_folder>/.wiki.lock`, using the same acquire pattern as `note_writer._acquire_lock`, wraps page write + index rebuild + log append, so two auto-filing sub-agents cannot interleave log entries or rebuild the index on top of each other. Lock timeout: refuse with exit 1, never write without the lock.
+- Write order: page, then index files, then log. Every write goes through `write_vault_note` (atomic: temp file in the same directory, `0o600`, `os.rename`). The one exception is deleting stale `index-*.md` files when the index shrinks back below the split. If the index or log update fails after the page is written, `file` still exits 0: it prints the JSON result with a `warning` key, and `WARNING: page saved, but the index|log update failed: ...` on stderr. The next write repairs the index (full rebuild), and the doctor's `index-drift` reason reports it in between.
+- A lock file `<wiki_folder>/..wiki.ob-lock`, taken with `note_writer._acquire_lock`, wraps page write + index rebuild + log append, so two auto-filing sub-agents cannot interleave log entries or rebuild the index on top of each other. There is no waiting: a second filer is refused with exit 1 and writes nothing. A lock older than 60 s is treated as abandoned and reclaimed.
 - Folder names go through `note_writer._validate_folder`. Every write path is resolved and checked with `is_relative_to(<vault>/<wiki_folder>)`. Memory paths are checked with `is_relative_to(~/.claude/projects)`.
 - Every refusal prints `ERROR: <reason>` and the skill shows it. A refusal is never reported as "filed".
 - A stale check that cannot read a source reports it as missing (reason 2), never as fresh.
@@ -199,7 +205,7 @@ Pages are LLM-owned by default. A user who edits a page by hand marks it `review
 | Load | Behaviour | Notes |
 |---|---|---|
 | 10k vault notes | `ensure_index` sync about 0.7 s per ask, FTS search tens of ms, DB about 220 MB | Linear estimates from the 2026-10-03 measurement (68 µs per note sync, 22 KB per note). Sync cost predates #383; the wiki adds one folder. Known limit, not fixed here. |
-| 10k wiki pages | `lookup` is one FTS query; `file` is one page write plus one table query for the index | No per-page file reads on any hot path |
+| 10k wiki pages | `lookup` is one `search_vault` call; `file` is one page write plus one table query for the index | No per-page file reads on any hot path |
 | Index files | Split by project above 500 pages | Karpathy reports one index works up to about hundreds of pages |
 | Log | One file per year | Bounded per file |
 | Ranking | At most 3 wiki notes in vault-ask candidates | Keeps raw notes in the top 10 |
@@ -214,7 +220,7 @@ Growth is bounded by the 3-source threshold and by dedupe: a repeat question upd
 - **Threshold boundary:** exactly 2 and exactly 3 sources; a snapshot plus its parent counted once; duplicate cites collapsed; non-counting types ignored.
 - **Refusals, both directions:** each refusal fires on its bad input, and the matching good input writes a page byte-identical to a golden file. Each guard is mutation-tested alone (with `PYTHONDONTWRITEBYTECODE=1`), and the new tests are run against the parent commit to show they fail there.
 - **Staleness:** each of the 3 triggers fires alone; an mtime-only touch does not mark a page stale; an unreadable source reports missing.
-- **Index and log:** the index rebuilds after a page is deleted by hand; the split at 501 pages; the log is append-only across 2 writes and rolls at a year boundary (Dec 31 to Jan 1 UTC); index and log files are not in FTS; a session note named `index.md` elsewhere still is.
+- **Index and log:** the index rebuilds after a page is deleted by hand; the split at 501 pages; the log is append-only across 2 writes and rolls at a year boundary (Dec 31 to Jan 1, local date); index and log files are not in FTS; a session note named `index.md` elsewhere still is.
 - **Lock:** a held lock makes `file` refuse with exit 1 and leaves no partial page.
 - **Reviewed pages:** `update` of a reviewed page refuses without `override_reviewed` and succeeds with it; stale refresh and `--caller` filing never pass it (skill-text test); a `--caller` dedupe hit on a reviewed page writes nothing; `"true "`, `yes`, `On`, `1` and an unknown value such as `maybe` all count as reviewed, while absent, `false` and `no` do not; the doctor's `reviewed-stale` fires only when both conditions hold.
 - **`indexed_folders`:** the literal-list grep guard; the helper's order and dedupe; a config without `wiki_folder` gets the default.

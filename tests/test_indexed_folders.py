@@ -71,6 +71,9 @@ _ALLOWED = {
     ("hooks/open_item_dedup.py", "folders"),
     # rebuild_index's own fallback recursion passes its parameter through.
     ("hooks/vault_index.py", "folders"),
+    # The wiki CLI context: _context() sets ctx["folders"] from
+    # indexed_folders(cfg, strict=True) (#395).
+    ("hooks/wiki.py", 'ctx["folders"]'),
 }
 
 _CALLEES = ("ensure_index", "rebuild_index")
