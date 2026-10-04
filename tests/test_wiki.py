@@ -142,6 +142,7 @@ def test_memory_source_counts_once(vault, mem):
 @pytest.mark.parametrize("name,reason", [
     ("proj/nope.md", "not a memory file on this host"),
     ("../proj/x.md", "not a memory file name"),
+    ("../x.md", "not a memory file name"),
     ("proj/x", "not a memory file name"),
     (5, "not a memory file name"),
 ])
