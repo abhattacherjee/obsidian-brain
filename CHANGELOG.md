@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `/compress` Layer 1 and Layer 2 now also match `skill-kit:extract` and `Skill(skill-kit:extract)` (the old claudeception skill moved into the `skill-kit` plugin), and still match the old claudeception markers so old transcripts work. Candidate labels are now `[from skill-kit:extract]`. The `/obsidian-setup` nudge text uses the new name; the hookify rule file name is unchanged (abhattacherjee/claude-code-skills#161).
+- `/vault-import`, `/standup`, `/vault-ask` and the README now use `context:shield` and `context:search` (the old `context-shield` and `conversation-search` skills merged into the `context` plugin). `/vault-import` finds `search-conversations.sh` through `~/.claude/plugins/installed_plugins.json` (`context@claude-code-skills`), falls back to the old `~/.claude/skills/conversation-search/` path, and stops with a message if neither exists. It no longer scans `~/.claude/projects/` by hand (abhattacherjee/claude-code-skills#163).
 
 ## [3.7.0] - 2026-10-03
 

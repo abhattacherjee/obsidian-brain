@@ -9,11 +9,11 @@ metadata:
 
 Discover historical Claude Code sessions, summarize them via parallel sub-agents, and write structured session notes to the Obsidian vault. Skips sessions already present in the vault.
 
-**Tools needed:** Bash, Read, Skill (for /context-shield sub-agents)
+**Tools needed:** Bash, Read, Skill (for /context:shield sub-agents)
 
 **Prerequisites:**
-- `/conversation-search` skill must be installed
-- `/context-shield` skill must be installed
+- `/context:search` skill must be installed (plugin `context@claude-code-skills`; was `conversation-search`)
+- `/context:shield` skill must be installed (same plugin; was `context-shield`)
 - Obsidian Brain must be configured (run `/obsidian-setup` if not)
 
 ## Procedure
@@ -98,21 +98,39 @@ Store as `TIME_RANGE` and `PROJECT_FILTER` (empty string if no filter).
 
 ### Step 4 — Discover sessions
 
-Use the `/conversation-search` skill's underlying search script to find sessions matching the time range and project filter.
+Use the `/context:search` skill's underlying search script (was `conversation-search`) to find sessions matching the time range and project filter.
 
-Run:
-
-```bash
-bash ~/.claude/skills/conversation-search/scripts/search-conversations.sh --days <TIME_RANGE_NUMBER> --format jsonl
-```
-
-If a project filter is specified, add `--project <PROJECT_FILTER>` to the command.
-
-If the script is not found, fall back to manually scanning `~/.claude/projects/` for session JSONL files modified within the time range:
+The script lives in the `context@claude-code-skills` plugin. Run this as one block. It finds the script from `~/.claude/plugins/installed_plugins.json`, falls back to the old `~/.claude/skills/conversation-search/` path, and stops if neither exists:
 
 ```bash
-find ~/.claude/projects/ -name "*.jsonl" -mtime -<TIME_RANGE_NUMBER> -type f 2>/dev/null
+SEARCH=$(python3 - <<'PY'
+import json, os
+home = os.path.expanduser("~")
+cands = []
+try:
+    with open(os.path.join(home, ".claude/plugins/installed_plugins.json")) as f:
+        for e in json.load(f).get("plugins", {}).get("context@claude-code-skills", []):
+            if e.get("installPath"):
+                cands.append(os.path.join(e["installPath"], "skills/search/scripts/search-conversations.sh"))
+except (OSError, ValueError):
+    pass
+cands.append(os.path.join(home, ".claude/skills/conversation-search/scripts/search-conversations.sh"))
+for c in cands:
+    if os.path.isfile(c):
+        print(c)
+        break
+PY
+)
+if [ -z "$SEARCH" ]; then
+  echo "vault-import: search-conversations.sh not found. Install the context plugin (context@claude-code-skills) and retry." >&2
+else
+  bash "$SEARCH" --days <TIME_RANGE_NUMBER> --format jsonl
+fi
 ```
+
+If a project filter is specified, add `--project <PROJECT_FILTER>` to the `bash "$SEARCH"` line.
+
+If the block prints the "not found" message, stop and show it to the user. Do not scan `~/.claude/projects/` by hand and do not skip this step.
 
 Parse the output to build a list of sessions. Each session needs:
 - `session_id` — extracted from the filename or JSONL content
@@ -162,7 +180,7 @@ Otherwise, report:
 
 **This is the performance-critical step. Use parallel sub-agents to maximize throughput.**
 
-For each session in `PENDING_SESSIONS`, delegate to a `/context-shield` sub-agent with this prompt:
+For each session in `PENDING_SESSIONS`, delegate to a `/context:shield` sub-agent with this prompt:
 
 > Read the Claude Code session transcript at `<SESSION_PATH>`. Extract and return a structured summary with these exact sections:
 >
