@@ -18,7 +18,7 @@
 | 2 Wiki core | `feature/383-wiki-core` | `hooks/wiki.py` and its CLI, vault-ask Step 2b (wiki first) and Step 8 (filing gate), `--caller` auto-filing, dedupe, stale refresh, the STE writing rule | PR 1 |
 | 3 Memory + doctor | `feature/383-wiki-memory-doctor` | `memory_sources(host, config)`, memory grep in vault-ask, the `wiki-pages` vault-doctor check, global CLAUDE.md `--caller` update | PR 2 |
 
-Each PR goes through `/ship` on its own. #383 closes with PR 3; PRs 1 and 2 use `Refs #383`. Until PR 3 lands, the filing threshold counts vault notes only.
+Each PR goes through `/ship` on its own and closes its own child issue: #394 (PR 1, merged in #393), #395 (PR 2), #396 (PR 3). #383 is the epic; it closes when all three children are closed. Until PR 3 lands, the filing threshold counts vault notes only, and `count`/`file` refuse a non-empty `memory_sources`.
 
 ## Facts from the code that shape the design
 
@@ -132,6 +132,10 @@ reviewed: true
 
 **Body:** the answer rewritten under the writing rule, then a `### Sources` section with one line per source, as vault-ask writes it today. `scrub_secrets` runs on the body and on `question` before writing.
 
+**`date`:** each write sets `date:` to the `updated` date. The indexer stores `date`, not `updated`, so the index sort, `lookup`'s `updated` field and the newer-note check read it from the table (PR 2).
+
+**Newer-note check:** stale trigger 3 runs its own FTS query (the question's words OR-joined, restricted to counting types), not `search_vault`: `search_vault`'s AND query matches the page itself and then never falls back to OR (PR 2).
+
 **Fingerprint:** SHA-256 of each source file's bytes, first 16 hex characters. A content hash, not mtime: `/recall` and `/check-items` change mtimes without changing meaning, and mtime would trigger false refreshes.
 
 **Stale** means any one of:
@@ -147,7 +151,7 @@ reviewed: true
 **Index files:**
 
 - Each index file starts with a frontmatter block carrying `type: claude-wiki-index`, so the indexer skips it (PR 1).
-- Up to 500 pages: one `<wiki_folder>/index.md`, one line per page, `- [[<slug>]] — <question> (updated <date>, <confidence>[, reviewed])`, sorted by `updated` descending.
+- Up to 500 pages: one `<wiki_folder>/index.md`, one line per page, `- [[<slug>]] — <question> (updated <date>, <confidence>)`, sorted by `updated` descending. (Changed in PR 2: the index is rebuilt from the `notes` table, which has no `reviewed` column, and reading every page to find it is the per-page cost the Scale section rules out. `confidence` is carried as the tag `claude/wiki/confidence-<level>` so the table has it.)
 - Above 500 pages: `index.md` lists one line per project linking to `index-<project>.md`, and each project file lists its pages. A page with several projects appears in each.
 - Rebuilt in full on every write, from the SQLite `notes` table (`type='claude-wiki'`), not by reading page files. A full rebuild cannot drift, and reading the table costs one query.
 - `lookup` never reads the index files. They exist for people browsing in Obsidian.
