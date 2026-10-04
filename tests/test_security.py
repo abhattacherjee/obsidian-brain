@@ -522,18 +522,20 @@ class TestStdinCap:
             # #371: reads the payload for sid/cwd when obsidian_utils fails
             # to import.
             "hooks/hook_bootstrap.py",
+            # #395: the wiki CLI reads its JSON payload from stdin.
+            "hooks/wiki.py",
         ):
             assert expected in paths, f"stdin read in {expected} no longer discovered"
         # Exact, not >=. What >= permits is SUBSTITUTION: an existing read
         # reformatted past the AST extractor at the same moment a new entry
-        # point lands keeps the total at 14 and the suite green, while the
+        # point lands keeps the total at 15 and the suite green, while the
         # reformatted file's cap silently stops being verified. Every one of
-        # the 14 is named above, so a new entry point should fail here and be
+        # the 15 is named above, so a new entry point should fail here and be
         # added deliberately. (tests/test_hooks_resolver_drift.py makes the
         # same call for the same reason.)
         found = self._all_stdin_reads()
-        assert len(found) == 14, (
-            f"expected exactly 14 stdin read sites, found {len(found)}: "
+        assert len(found) == 15, (
+            f"expected exactly 15 stdin read sites, found {len(found)}: "
             + ", ".join(f"{path}:{lineno}" for path, lineno, _, _ in sorted(found)[:5])
             + " ... . A RISE means a new stdin entry point landed — name it in the "
             "list above, deliberately, because a new place the process reads "

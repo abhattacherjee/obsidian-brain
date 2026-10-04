@@ -649,6 +649,11 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
 # apart. `stats["malformed"]` always reports the TRUE, uncapped count.
 _MALFORMED_FILES_CAP = 20
 
+# Note types written into indexed folders that are not knowledge: the LLM
+# wiki's own index and log files (#383). _sync skips them, and removes a row
+# whose note changed to one of these types.
+_UNINDEXED_TYPES = frozenset({"claude-wiki-index"})
+
 # Cap on the length of a filename recorded in `stats["malformed_files"]`.
 # 120 chars is generous headroom over any realistic vault filename.
 _MALFORMED_FILENAME_CAP = 120
@@ -729,7 +734,9 @@ def _sanitize_report_filename(name: str) -> str:
 def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict:
     """Incremental sync: add new/changed files, remove deleted ones.
 
-    Returns {"inserted": N, "skipped": M, "deleted": D, "by_type": {...}}.
+    Returns {"inserted": N, "skipped": M, "deleted": D, "excluded": E,
+    "by_type": {...}}. ``excluded`` counts notes whose type is in
+    ``_UNINDEXED_TYPES`` (#383); they are never indexed.
     ``skipped`` is the sum of two semantically distinct outcomes, also
     reported separately: ``unchanged`` (mtime matched the index — nothing
     to do, the healthy common case) and ``malformed`` (frontmatter failed
@@ -753,6 +760,7 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
         "unchanged": 0,
         "malformed": 0,
         "malformed_files": [],
+        "excluded": 0,
         "deleted": 0,
         "recomputed": 0,
         "by_type": {},
@@ -820,6 +828,15 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
                             "reason": _classify_parse_failure(reason),
                         }
                     )
+                continue
+
+            if parsed.get("type") in _UNINDEXED_TYPES:
+                # Never inserted, so the mtime short-circuit never applies and
+                # the file is re-parsed each sync: a handful of small files.
+                stats["excluded"] += 1
+                if abs_path_str in indexed:
+                    _delete_note(conn, abs_path_str)
+                    stats["deleted"] += 1
                 continue
 
             _upsert_note(conn, abs_path_str, parsed, file_mtime, file_size)
@@ -1170,9 +1187,11 @@ def rebuild_index(
     or when the derivable tables need a clean-slate rebuild.
 
     Returns ``{"inserted": N, "skipped": M, "unchanged": U, "malformed": F,
-    "malformed_files": [...], "by_type": {...}}`` (``skipped == unchanged +
-    malformed``; see ``_sync``) plus, in non-destructive mode, ``"preserved":
-    {...}`` and ``"pruned_orphans": {...}`` reporting the Friston-table delta.
+    "malformed_files": [...], "excluded": E, "deleted": D, "by_type": {...}}``
+    (every ``_sync`` stat; ``skipped == unchanged + malformed``) plus, in
+    non-destructive mode, ``"foreign_deleted"`` (rows dropped because their
+    path is outside every scanned folder), ``"preserved": {...}`` and
+    ``"pruned_orphans": {...}`` reporting the Friston-table delta.
     """
     if db_path is None:
         db_path = _default_db_path()
@@ -1268,6 +1287,9 @@ def rebuild_index(
             # failure leaves access_log (which we haven't touched) and
             # the preserved rows from Step 1 intact.
             stats = _sync(conn, vault_path, folders)
+            # Rows dropped in Step 1 for being outside every scanned folder.
+            # Counted so a dropped folder is visible in the report (#393).
+            stats["foreign_deleted"] = len(foreign)
 
             # Step 3: Orphan prune for access_log / theme_members. Path-
             # format invariant: note_path columns and notes.path must all
@@ -1492,35 +1514,42 @@ def detect_task_context(caller_skill: str | None = None) -> str:
 # against the 0.5 default (0.10 against a 1.0 type). Reports (claude-stats,
 # claude-check-items-report) score 0.0: they describe the vault, they are not
 # knowledge. claude-emerge scores 0.0 in "emerge".
+# claude-wiki (#383) weighs the same as claude-insight; the wiki-first step in
+# /vault-ask, not the weight, is what puts wiki pages first.
 _TYPE_SCORES_BY_CONTEXT = {
     "debugging": {
         "claude-error-fix": 1.0, "claude-session": 0.8, "claude-snapshot": 0.7,
         "claude-insight": 0.6, "claude-memory": 0.6, "claude-decision": 0.5,
         "claude-retro": 0.3, "claude-standup": 0.3, "claude-emerge": 0.1,
+        "claude-wiki": 0.6,
         "claude-stats": 0.0, "claude-check-items-report": 0.0,
     },
     "standup": {
         "claude-session": 1.0, "claude-decision": 0.8, "claude-insight": 0.7,
         "claude-retro": 0.6, "claude-snapshot": 0.6, "claude-error-fix": 0.5,
         "claude-emerge": 0.4, "claude-standup": 0.3, "claude-memory": 0.3,
+        "claude-wiki": 0.7,
         "claude-stats": 0.0, "claude-check-items-report": 0.0,
     },
     "search": {
         "claude-insight": 1.0, "claude-decision": 0.9, "claude-memory": 0.9,
         "claude-error-fix": 0.8, "claude-session": 0.5, "claude-retro": 0.4,
         "claude-snapshot": 0.4, "claude-standup": 0.3, "claude-emerge": 0.3,
+        "claude-wiki": 1.0,
         "claude-stats": 0.0, "claude-check-items-report": 0.0,
     },
     "emerge": {
         "claude-insight": 1.0, "claude-decision": 0.9, "claude-error-fix": 0.8,
         "claude-memory": 0.8, "claude-session": 0.5, "claude-retro": 0.4,
         "claude-snapshot": 0.4, "claude-standup": 0.3, "claude-emerge": 0.0,
+        "claude-wiki": 1.0,
         "claude-stats": 0.0, "claude-check-items-report": 0.0,
     },
     "general": {
         "claude-insight": 1.0, "claude-decision": 1.0, "claude-error-fix": 0.9,
         "claude-memory": 0.9, "claude-session": 0.5, "claude-retro": 0.4,
         "claude-snapshot": 0.4, "claude-standup": 0.3, "claude-emerge": 0.3,
+        "claude-wiki": 1.0,
         "claude-stats": 0.0, "claude-check-items-report": 0.0,
     },
 }

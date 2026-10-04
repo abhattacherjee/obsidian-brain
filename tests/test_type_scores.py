@@ -69,7 +69,7 @@ def test_scan_finds_exactly_the_known_types():
     # quietly pull in a new type; a real new writer updates this list on purpose.
     assert collect_written_types() == _ORIGINAL_TYPES | {
         "claude-snapshot", "claude-memory", "claude-emerge", "claude-stats",
-        "claude-check-items-report",
+        "claude-check-items-report", "claude-wiki", "claude-wiki-index",
     }
 
 
@@ -97,7 +97,8 @@ def test_regex_matches_all_writer_shapes():
 
 
 def test_every_written_type_has_a_weight_in_every_context():
-    written = collect_written_types()
+    # Unindexed types (the wiki's own index/log files) never get a score.
+    written = collect_written_types() - vault_index._UNINDEXED_TYPES
     missing = {
         ctx: sorted(written - set(scores))
         for ctx, scores in vault_index._TYPE_SCORES_BY_CONTEXT.items()
@@ -129,3 +130,15 @@ def test_reports_rank_below_curated_notes():
 
 def test_emerge_does_not_weight_its_own_output():
     assert vault_index._TYPE_SCORES_BY_CONTEXT["emerge"]["claude-emerge"] == 0.0
+
+
+def test_wiki_pages_weigh_like_insights():
+    for ctx in vault_index._TYPE_SCORES_BY_CONTEXT:
+        scores = vault_index.get_type_scores(ctx)
+        assert scores["claude-wiki"] == scores["claude-insight"], ctx
+
+
+def test_unindexed_types_need_no_weight():
+    # claude-wiki-index notes never reach the index, so they never get a score.
+    for ctx in vault_index._TYPE_SCORES_BY_CONTEXT:
+        assert not (vault_index._UNINDEXED_TYPES & set(vault_index.get_type_scores(ctx))), ctx

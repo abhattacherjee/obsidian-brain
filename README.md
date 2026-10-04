@@ -90,7 +90,7 @@ Run `/obsidian-setup` after installation. It will:
 | `/vault-search` | Search across all sessions & insights by keyword, tag, or metadata |
 | `/decide` | Log architectural decisions (ADR-lite format) |
 | `/error-log` | Capture error + root cause + fix for future reference |
-| `/vault-import` | Backfill historical sessions (requires `/conversation-search` and `/context-shield`) |
+| `/vault-import` | Backfill historical sessions (requires `/context:search` and `/context:shield`) |
 | `/standup` | Generate daily/weekly summary across projects |
 | `/standup deep` | Evidence-based open-item consolidation — dedup, classify (COMPLETED/REDUNDANT/STALE/ACTIVE) using git log, GitHub releases, changelogs, and FTS5 search |
 | `/emerge` | Cross-project pattern discovery — scans vault notes within a time window and surfaces technical patterns, process patterns, knowledge gaps, and unnamed habits |
@@ -272,6 +272,7 @@ Machine-local config at `~/.claude/obsidian-brain-config.json`:
   "insights_folder": "claude-insights",
   "dashboards_folder": "claude-dashboards",
   "check_items_folder": "claude-check-items",
+  "wiki_folder": "claude-wiki",
   "min_messages": 3,
   "min_duration_minutes": 2,
   "summary_model": "haiku",

@@ -2232,6 +2232,7 @@ _DEFAULTS: dict = {
     "insights_folder": "claude-insights",
     "dashboards_folder": "claude-dashboards",
     "check_items_folder": "claude-check-items",
+    "wiki_folder": "claude-wiki",  # #383: LLM wiki pages (written by /vault-ask from #383 PR 2); indexed via indexed_folders()
     "min_messages": 3,
     "min_duration_minutes": 2,
     "summary_model": "haiku",
@@ -2257,14 +2258,17 @@ _DEFAULTS: dict = {
 # ---------------------------------------------------------------------------
 
 
-def load_config() -> dict:
+def load_config(fresh: bool = False) -> dict:
     """Read ~/.claude/obsidian-brain-config.json, returning defaults for missing keys.
 
     Session-scoped caching: first call loads from disk and writes to cache;
-    subsequent calls within the same session hit the cache.
+    subsequent calls within the same session hit the cache. ``fresh=True``
+    skips the cache read and refreshes the cache from disk: callers that
+    prune the index by folder (``/vault-reindex``, ``/obsidian-setup``) use
+    it so a config written earlier in the session is not ignored (#393).
     """
     sid = _get_session_id_fast()
-    cached = cache_get(sid, "config")
+    cached = None if fresh else cache_get(sid, "config")
     if cached is not None:
         return cached
 
@@ -2305,6 +2309,63 @@ def load_config() -> dict:
 
     cache_set(sid, "config", config)
     return config
+
+
+def indexed_folders(config: dict, strict: bool = False) -> list:
+    """Vault folders that user-facing search indexes, in a fixed order (#383).
+
+    Returns ``[sessions_folder, insights_folder, wiki_folder]`` with defaults
+    for missing keys. Duplicates are dropped, and an empty or None
+    ``wiki_folder`` turns the wiki folder off (no other value does). An invalid
+    ``wiki_folder`` (not a string, absolute, ``~``, a ``..`` or dot-prefixed
+    segment) is dropped with a stderr warning, so ``_sync`` never walks
+    outside the vault. With ``strict=True`` it raises ``ValueError``
+    instead: ``rebuild_index`` prunes rows outside the folders it scans, so
+    its callers must fail rather than silently drop the wiki folder and its
+    rows. A valid ``wiki_folder`` is normalised (``./w/`` becomes ``w``)
+    before duplicates are removed. Sessions and insights pass through
+    unchanged, as before.
+
+    Every skill and every top-level ``scripts/`` file that passes a folder
+    list to ``ensure_index`` or ``rebuild_index`` must call this;
+    ``tests/test_indexed_folders.py`` enforces it. Exempt: ``scripts/dev-test/``
+    and two hook calls that receive their folders as parameters
+    (``build_context_brief``, ``deep_analysis_pipeline``).
+    """
+    # Imported here: note_writer imports obsidian_utils at module level.
+    from note_writer import _validate_folder
+
+    names = [
+        config.get("sessions_folder") or _DEFAULTS["sessions_folder"],
+        config.get("insights_folder") or _DEFAULTS["insights_folder"],
+    ]
+    wiki = config.get("wiki_folder", _DEFAULTS["wiki_folder"])
+    # Only None and "" mean "wiki off". Any other non-string (False, 0, [],
+    # {}) is invalid, not "off": a rebuild would drop the wiki rows for it.
+    err = None
+    norm = None
+    if wiki is not None and not isinstance(wiki, str):
+        err = f"non-string wiki_folder {wiki!r}"
+    elif wiki:
+        # Validate both forms: the raw value keeps "..", "~" and dot
+        # segments that normalising would erase ("a/../b" -> "b"), and the
+        # normalised value catches "./" or "././", which collapse to "."
+        # (the vault root).
+        norm = os.path.normpath(wiki)
+        bad = _validate_folder(wiki) or _validate_folder(norm)
+        if bad:
+            err = f"invalid wiki_folder {wiki!r}: {bad}"
+    if err:
+        if strict:
+            raise ValueError(err)
+        print(f"[obsidian-brain] ignoring {err}", file=sys.stderr)
+    elif norm:
+        names.append(norm)
+    out = []
+    for n in names:
+        if n not in out:
+            out.append(n)
+    return out
 
 
 def get_workspace_roots() -> list[str]:
@@ -5142,6 +5203,12 @@ def build_context_brief(
 
     if _use_vault_index:
         try:
+            # Explicit list (not indexed_folders): this function receives the
+            # folders as parameters. Safe for the wiki folder (#383): _sync
+            # deletes only under scanned folders, so wiki rows are untouched.
+            # Exception: on a corrupt or pre-body-column DB, ensure_index
+            # recreates it from only these folders; the next indexed_folders()
+            # sync re-adds the wiki rows.
             db_path = ensure_index(vault_path, [sessions_folder, insights_folder])
             ranked_notes = query_related_notes(
                 db_path=db_path,

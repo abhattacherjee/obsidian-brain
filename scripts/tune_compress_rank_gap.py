@@ -27,7 +27,7 @@ HOOKS_DIR = REPO_ROOT / "hooks"
 sys.path.insert(0, str(HOOKS_DIR))
 
 from compress_guard import is_high_confidence_match  # noqa: E402
-from obsidian_utils import load_config  # noqa: E402
+from obsidian_utils import indexed_folders, load_config  # noqa: E402
 from vault_index import ensure_index, search_vault  # noqa: E402
 
 
@@ -89,10 +89,7 @@ def main():
         return 0
 
     # Open the vault index
-    folders = [
-        config.get("sessions_folder", "claude-sessions"),
-        config.get("insights_folder", "claude-insights"),
-    ]
+    folders = indexed_folders(config)
     db = ensure_index(vault_path, folders)
 
     # Run each query once, cache results
