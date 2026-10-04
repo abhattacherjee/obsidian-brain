@@ -209,6 +209,285 @@ def count_sources(db_path: str, names, memory_sources, roots) -> dict:
             "rejected": rejected, "resolved": res["resolved"]}
 
 
+# ---------------------------------------------------------------------------
+# Lookup and staleness
+# ---------------------------------------------------------------------------
+
+
+def fingerprint(path) -> str:
+    """First 16 hex chars of the SHA-256 of the file's bytes (not its mtime)."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+
+
+def lookup(db_path: str, question: str, limit: int = 3) -> list:
+    """Top wiki pages for ``question`` by FTS rank on the indexed title."""
+    import vault_index
+
+    if not str(question or "").strip():
+        return []
+    hits = vault_index.search_vault(db_path, question, note_type=PAGE_TYPE, limit=limit)
+    return [{"path": h.get("path"), "question": h.get("title") or "",
+             "updated": h.get("date") or "", "rank": h.get("rank", h.get("score"))}
+            for h in hits[:limit]]
+
+
+def stale(db_path: str, page_path, roots) -> dict:
+    """Why a page is stale: ``changed:``/``missing:`` per source, ``newer:``
+    per newer counting note in the question's top 5 hits. All reasons are
+    returned. An unreadable source counts as missing, never as fresh."""
+    import vault_index
+
+    meta, _body = read_page(page_path)
+    fps = meta.get("sources_fingerprint") or {}
+    if not isinstance(fps, dict):
+        fps = {}
+    reasons = []
+    res = resolve_sources(db_path, list(fps), roots)
+    found = {r["name"]: r for r in res["resolved"]}
+    for name, old in fps.items():
+        r = found.get(_norm_name(name))
+        if r is None:
+            reasons.append(f"missing: {_norm_name(name)}")
+            continue
+        try:
+            now = fingerprint(r["path"])
+        except OSError:
+            reasons.append(f"missing: {r['name']}")
+            continue
+        if now != old:
+            reasons.append(f"changed: {r['name']}")
+    cited = {_norm_name(x) for x in (meta.get("sources") or [])} | {_norm_name(x) for x in fps}
+    updated = str(meta.get("updated") or "")
+    question = str(meta.get("question") or "")
+    for base in _newer_notes(db_path, question, updated, cited, roots):
+        reasons.append(f"newer: {base}")
+    return {"stale": bool(reasons), "reasons": reasons}
+
+
+def _newer_notes(db_path: str, question: str, updated: str, cited: set, roots) -> list:
+    """Counting notes among the question's top 5 OR-matched hits that are
+    dated after ``updated`` and not already cited.
+
+    Queries FTS directly, restricted to counting types: search_vault's AND
+    query matches the page itself first and then never falls back to OR, so
+    a newer note sharing only some of the words would be missed.
+    """
+    import vault_index
+
+    fts = vault_index._sanitize_fts_query_or(question or "")
+    if not fts:
+        return []
+    marks = ",".join("?" * len(COUNTING_TYPES))
+    root_paths = [Path(r) for r in roots]
+    conn = vault_index._connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT n.path, n.date FROM notes_fts f JOIN notes n ON n.rowid = f.rowid "
+            f"WHERE notes_fts MATCH ? AND n.type IN ({marks}) "
+            "ORDER BY bm25(notes_fts, 10.0, 1.0, 5.0) LIMIT 5",
+            (fts, *sorted(COUNTING_TYPES)),
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        base = Path(r["path"]).stem
+        if (str(r["date"] or "") > updated and base not in cited
+                and any(vault_index._is_under(Path(r["path"]), root) for root in root_paths)):
+            out.append(base)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Filing: page, index, log
+# ---------------------------------------------------------------------------
+
+
+def _validate_payload(p: dict) -> dict:
+    question = " ".join(str(p.get("question") or "").split())
+    if not question or len(question) > QUESTION_MAX:
+        raise WikiRefusal(f"question must be 1-{QUESTION_MAX} characters")
+    body = p.get("body")
+    if not isinstance(body, str) or not body.strip():
+        raise WikiRefusal("body must be a non-empty string")
+    sources = _list_field(p, "sources")
+    memory = _list_field(p, "memory_sources")
+    topics = _list_field(p, "topics")
+    if len(topics) > TOPICS_MAX or not all(isinstance(t, str) and TOPIC_RE.match(t) for t in topics):
+        raise WikiRefusal(f"each topic must match {TOPIC_RE.pattern} (at most {TOPICS_MAX})")
+    if p.get("confidence") not in CONFIDENCE:
+        raise WikiRefusal(f"confidence must be one of {', '.join(CONFIDENCE)}")
+    filed_by = p.get("filed_by")
+    if filed_by not in ("user", "auto"):
+        raise WikiRefusal("filed_by must be 'user' or 'auto'")
+    caller = p.get("caller") or ""
+    if filed_by == "auto":
+        if not (isinstance(caller, str) and CALLER_RE.match(caller)):
+            raise WikiRefusal(f"an auto filing needs a caller matching {CALLER_RE.pattern}")
+    elif caller:
+        raise WikiRefusal("caller is only allowed when filed_by is 'auto'")
+    return {"question": question, "body": body, "sources": sources, "memory": memory,
+            "topics": topics, "confidence": p["confidence"], "filed_by": filed_by,
+            "caller": caller, "update": p.get("update") or "",
+            "override_reviewed": p.get("override_reviewed") is True}
+
+
+def _wiki_root(ctx: dict) -> Path:
+    return Path(ctx["vault"]) / ctx["wiki_folder"]
+
+
+def _write(ctx: dict, rel_folder: str, filename: str, content: str) -> None:
+    from obsidian_utils import write_vault_note
+
+    err = write_vault_note(ctx["vault"], rel_folder, filename, content)
+    if err:
+        raise WikiRefusal(err)
+
+
+def _index_header(title: str) -> str:
+    return f'---\ntype: "{INDEX_TYPE}"\n---\n# {title}\n'
+
+
+def rebuild_wiki_index(ctx: dict) -> list:
+    """Rebuild ``index.md`` (and ``index-<project>.md`` above INDEX_SPLIT
+    pages) from the notes table, never from page files."""
+    import vault_index
+
+    root = _wiki_root(ctx)
+    queries = root / "queries"
+    conn = vault_index._connect(ctx["db"])
+    try:
+        rows = [r for r in conn.execute(
+            "SELECT path, title, date, tags FROM notes WHERE type = ? ORDER BY date DESC, path",
+            (PAGE_TYPE,)).fetchall()
+            if vault_index._is_under(Path(r["path"]), queries)]
+    finally:
+        conn.close()
+
+    def line(r) -> str:
+        tags = (r["tags"] or "").split(",")
+        conf = next((t.rsplit("-", 1)[1] for t in tags if t.startswith("claude/wiki/confidence-")), "?")
+        return f"- [[{Path(r['path']).stem}]] — {r['title']} (updated {r['date']}, {conf})"
+
+    written, keep = [], set()
+    if len(rows) <= INDEX_SPLIT:
+        body = _index_header("Wiki index") + "\n" + "\n".join(line(r) for r in rows) + "\n"
+        _write(ctx, ctx["wiki_folder"], "index.md", body)
+        written.append(str(root / "index.md"))
+    else:
+        groups: dict = {}
+        for r in rows:
+            projects = [t[len("claude/project/"):] for t in (r["tags"] or "").split(",")
+                        if t.startswith("claude/project/")] or ["unassigned"]
+            for proj in projects:
+                groups.setdefault(slugify(proj), []).append(r)
+        top = [f"- [[index-{p}]] — {len(rs)} page(s)" for p, rs in sorted(groups.items())]
+        _write(ctx, ctx["wiki_folder"], "index.md", _index_header("Wiki index") + "\n" + "\n".join(top) + "\n")
+        written.append(str(root / "index.md"))
+        for proj, rs in sorted(groups.items()):
+            name = f"index-{proj}.md"
+            keep.add(name)
+            _write(ctx, ctx["wiki_folder"], name,
+                   _index_header(f"Wiki index: {proj}") + "\n" + "\n".join(line(r) for r in rs) + "\n")
+            written.append(str(root / name))
+    for old in root.glob("index-*.md"):
+        if old.name not in keep:
+            old.unlink()
+    return written
+
+
+def append_log(ctx: dict, op: str, caller: str, question: str, basename: str, today) -> None:
+    root = _wiki_root(ctx)
+    name = f"log-{today.year:04d}.md"
+    path = root / name
+    text = path.read_text(encoding="utf-8") if path.exists() else _index_header("Wiki log")
+    verb = "Updated" if op == "update" else "Created"
+    text = text.rstrip("\n") + (f"\n\n## [{today.isoformat()}] {op} | {caller or '-'} | {question}\n"
+                                f"- {verb}: [[{basename}]]\n")
+    _write(ctx, ctx["wiki_folder"], name, text)
+
+
+def file_page(ctx: dict, payload: dict, today) -> dict:
+    """Validate, count, then write the page, index and log under one lock."""
+    import vault_index
+    from note_writer import _acquire_lock, _release_lock
+    from obsidian_utils import scrub_secrets
+
+    p = _validate_payload(payload)
+    vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
+    counted = count_sources(ctx["db"], p["sources"], p["memory"], _roots(ctx))
+    if counted["rejected"]:
+        raise WikiRefusal("sources refused: " + "; ".join(
+            f"{r['name']} ({r['reason']})" for r in counted["rejected"]))
+    if counted["count"] < THRESHOLD:
+        raise WikiRefusal(f"only {counted['count']} qualifying sources (need {THRESHOLD})")
+
+    root = _wiki_root(ctx)
+    queries = root / "queries"
+    created = today.isoformat()
+    if p["update"]:
+        target = Path(p["update"]).resolve()
+        if not target.is_relative_to(queries.resolve()):
+            raise WikiRefusal(f"update must name a page under {queries}")
+        if not target.is_file():
+            raise WikiRefusal(f"update page not found: {target}")
+        old, _ = read_page(target)
+        if old.get("type") != PAGE_TYPE:
+            raise WikiRefusal(f"{target} is not a wiki page")
+        if is_reviewed(old.get("reviewed")) and not p["override_reviewed"]:
+            raise WikiRefusal(f"{target.name} is marked reviewed; refusing to overwrite it")
+        created = str(old.get("created") or created)
+        rel_folder = str(target.parent.relative_to(Path(ctx["vault"]).resolve()))
+        filename = target.name
+    else:
+        rel_folder = f"{ctx['wiki_folder']}/queries/{today.year:04d}"
+        stem = f"{today.month:02d}-{today.day:02d}-{slugify(p['question'])}"
+        filename, n = f"{stem}.md", 1
+        while (Path(ctx["vault"]) / rel_folder / filename).exists():
+            n += 1
+            filename = f"{stem}-{n}.md"
+
+    question = scrub_secrets(p["question"])
+    resolved = counted["resolved"]
+    projects = sorted({r["project"] for r in resolved if r["project"]})
+    meta = {
+        "type": PAGE_TYPE, "title": question, "question": question,
+        "date": today.isoformat(), "created": created, "updated": today.isoformat(),
+        "projects": projects,
+        "sources": [f"[[{r['name']}]]" for r in resolved],
+        "memory_sources": [],
+        "sources_fingerprint": {r["name"]: fingerprint(r["path"]) for r in resolved},
+        "confidence": p["confidence"], "filed_by": p["filed_by"],
+    }
+    if p["filed_by"] == "auto":
+        meta["caller"] = p["caller"]
+    meta["tags"] = (["claude/wiki", f"claude/wiki/confidence-{p['confidence']}"]
+                    + [f"claude/project/{x}" for x in projects]
+                    + [f"claude/topic/{t}" for t in p["topics"]])
+    text = render_page(meta, scrub_secrets(p["body"]))
+
+    root.mkdir(parents=True, exist_ok=True)
+    lock, err = _acquire_lock(root / ".wiki")
+    if err:
+        raise WikiRefusal(err)
+    try:
+        _write(ctx, rel_folder, filename, text)
+        page = Path(ctx["vault"]) / rel_folder / filename
+        action = "update" if p["update"] else ("file-auto" if p["filed_by"] == "auto" else "file")
+        stage = "index"
+        try:
+            vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
+            rebuild_wiki_index(ctx)
+            stage = "log"
+            append_log(ctx, action, p["caller"], question, page.stem, today)
+        except Exception as exc:
+            raise WikiRefusal(f"page written at {page}, but the {stage} update failed: {exc}; "
+                              "the next write repairs the index")
+    finally:
+        _release_lock(lock)
+    return {"path": str(page), "action": action, "count": counted["count"]}
+
+
 def _roots(ctx: dict) -> list:
     return [str(Path(ctx["vault"]) / f) for f in ctx["folders"]]
 
@@ -275,8 +554,38 @@ def _cmd_count() -> dict:
     return out
 
 
+def _cmd_lookup() -> dict:
+    import vault_index
+
+    payload = _read_stdin()
+    ctx = _context()
+    vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
+    return {"candidates": lookup(ctx["db"], str(payload.get("question") or ""))}
+
+
+def _cmd_stale() -> dict:
+    import vault_index
+
+    payload = _read_stdin()
+    ctx = _context()
+    page = Path(str(payload.get("page") or "")).resolve()
+    if not page.is_relative_to(_wiki_root(ctx).resolve()) or not page.is_file():
+        raise WikiRefusal(f"page must be an existing file under {_wiki_root(ctx)}")
+    vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
+    return stale(ctx["db"], page, _roots(ctx))
+
+
+def _cmd_file() -> dict:
+    payload = _read_stdin()
+    ctx = _context()
+    return file_page(ctx, payload, _dt.datetime.now(_dt.timezone.utc).date())
+
+
 _COMMANDS: dict = {
     "count": _cmd_count,
+    "lookup": _cmd_lookup,
+    "stale": _cmd_stale,
+    "file": _cmd_file,
 }
 
 
