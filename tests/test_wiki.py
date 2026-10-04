@@ -1013,3 +1013,60 @@ def test_memory_paths_cover_fingerprint_keys_missing_from_the_list(ctx, mem):
     meta["memory_sources"] = []  # a hand edit dropped the list, not the fingerprint
     page.write_text(wiki.render_page(meta, body))
     assert wiki.stale(ctx["db"], page, _roots_of(ctx))["memory_paths"] == {"proj/x.md": str(mem["x"])}
+
+
+# --- review fixes, round 2 (#399) --------------------------------------------
+
+
+def _three_mem(mem, monkeypatch):
+    z = mem["x"].parent / "z.md"
+    z.write_text("third fact\n")
+    monkeypatch.setattr(wiki, "_memory_files", lambda: [mem["x"], mem["y"], z])
+    return ["proj/x.md", "proj/y.md", "proj/z.md"]
+
+
+def test_memory_only_page_is_fresh_then_changed(ctx, mem, monkeypatch):
+    names = _three_mem(mem, monkeypatch)
+    page = Path(wiki.file_page(ctx, _payload(sources=[], memory_sources=names), D)["path"])
+    assert wiki.read_page(page)[0]["sources"] == []
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == []
+    mem["y"].write_text("edited\n")
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["changed: memory:proj/y.md"]
+
+
+@pytest.mark.parametrize("sources_line,memory_line", [
+    ("sources: []", "memory_sources: []"),   # both empty
+    ("sources: []", None),                   # memory_sources missing
+    ("sources: []", "memory_sources: proj/x.md"),  # memory_sources not a list
+    ("sources: i1", "memory_sources:\n  - proj/x.md"),  # sources not a list
+    (None, "memory_sources:\n  - proj/x.md"),  # sources missing
+])
+def test_page_with_no_usable_source_list_is_unverifiable(ctx, mem, sources_line, memory_line):
+    page = _mem_page(ctx)
+    text = page.read_text()
+    text = re.sub(r"(?m)^sources:.*\n(?:  - .*\n)*", "" if sources_line is None else sources_line + "\n", text)
+    text = re.sub(r"(?m)^memory_sources:.*\n(?:  - .*\n)*", "" if memory_line is None else memory_line + "\n", text)
+    page.write_text(text)
+    assert "unverifiable: sources" in wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"]
+
+
+@pytest.mark.parametrize("bad", ["x.md", "../proj/x.md", "5"])
+def test_memory_only_page_with_malformed_names_is_never_fresh(ctx, mem, monkeypatch, bad):
+    names = _three_mem(mem, monkeypatch)
+    page = Path(wiki.file_page(ctx, _payload(sources=[], memory_sources=names), D)["path"])
+    meta, body = wiki.read_page(page)
+    meta["memory_sources"] = [bad]
+    meta["sources_fingerprint"] = {}
+    page.write_text(wiki.render_page(meta, body))
+    r = wiki.stale(ctx["db"], page, _roots_of(ctx))
+    assert r["stale"] and r["reasons"][0] == f"unverifiable: memory:{bad}"
+
+
+def test_stale_uses_a_given_memory_listing(ctx, mem, monkeypatch):
+    page = _mem_page(ctx)
+    calls = []
+    monkeypatch.setattr(wiki, "_memory_listing", lambda: calls.append(1) or ([mem["x"]], [], "claude-code"))
+    listing = ([mem["y"]], [], "claude-code")  # x is not in the given listing
+    r = wiki.stale(ctx["db"], page, _roots_of(ctx), memory_listing=listing)
+    assert calls == [] and r["reasons"] == ["missing: memory:proj/x.md"]
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == [] and calls == [1]

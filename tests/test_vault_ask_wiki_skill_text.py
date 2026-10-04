@@ -84,9 +84,12 @@ def test_refresh_leaves_the_page_out_of_sources():
 # --- memory sources (#396) ---------------------------------------------------
 
 
-def test_memory_search_uses_memgrep_on_every_ask():
+def test_memory_search_uses_memgrep_on_every_ask_that_reaches_step_3():
     assert 'wiki.py" memgrep' in SKILL
-    assert "The memory search runs on every ask" in SKILL
+    assert "The memory search runs on every ask that reaches Step 3" in SKILL
+    # Step 3's fast path must not skip it; only a fresh wiki answer does.
+    assert "even when Step 3 skipped the Grep searches" in SKILL
+    assert "a fresh wiki answer from Step 2b stops before it, by design" in SKILL
 
 
 def test_memory_citation_is_plain_text():

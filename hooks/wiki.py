@@ -416,16 +416,19 @@ def lookup(db_path: str, question: str, limit: int = 3) -> list:
             for h in hits[:limit]]
 
 
-def stale(db_path: str, page_path, roots) -> dict:
+def stale(db_path: str, page_path, roots, *, memory_listing=None) -> dict:
     """Why a page is stale: ``unverifiable:``/``changed:``/``missing:`` per
     source, ``newer:`` per newer counting note in the question's top 5 hits.
     All reasons are returned. An unreadable vault source counts as missing,
     and a cited source with no usable fingerprint (field missing, not a
     mapping, or no non-empty string for it) as unverifiable -- never as
-    fresh. A page whose ``sources`` is not a non-empty list gets
-    ``unverifiable: sources``. Memory sources follow ``_memory_reasons``.
-    ``memory_paths`` maps each cited memory file found here to its path, so
-    a refresh can re-read it."""
+    fresh. A page gets ``unverifiable: sources`` when ``sources`` is not a
+    list, or when neither ``sources`` nor ``memory_sources`` is a non-empty
+    list (memory files count toward the threshold, so a page may cite only
+    memory). Memory sources follow ``_memory_reasons``. ``memory_listing``
+    is a ``_memory_listing()`` result to use instead of listing again (a
+    caller checking many pages lists once). ``memory_paths`` maps each cited
+    memory file found here to its path, so a refresh can re-read it."""
     meta, _body = read_page(page_path)
     raw_fps = meta.get("sources_fingerprint")
     fps = {}
@@ -439,10 +442,12 @@ def stale(db_path: str, page_path, roots) -> dict:
             else:
                 fps[_norm_name(k)] = v
     sources = meta.get("sources")
+    mem_names = meta.get("memory_sources")
     reasons = []
-    if not isinstance(sources, list) or not sources:
-        # Absent, empty or unparseable: the page cannot be checked.
+    if not isinstance(sources, list) or not (sources or (isinstance(mem_names, list) and mem_names)):
+        # Unparseable, or no source of either kind: the page cannot be checked.
         reasons.append("unverifiable: sources")
+    if not isinstance(sources, list):
         sources = []
     for name in dict.fromkeys(_norm_name(x) for x in sources):
         if name and name not in fps:
@@ -461,14 +466,13 @@ def stale(db_path: str, page_path, roots) -> dict:
             continue
         if now != old:
             reasons.append(f"changed: {r['name']}")
-    mem_names = meta.get("memory_sources")
     mem_names = list(dict.fromkeys(mem_names if isinstance(mem_names, list) else []))
     for n in mem_names:
         if MEMORY_PREFIX + str(n) not in mem_fps:
             reasons.append(f"unverifiable: {MEMORY_PREFIX}{n}")
     memory_paths: dict = {}
     if mem_fps or mem_names:
-        reasons += _memory_reasons(mem_fps, mem_names, memory_paths)
+        reasons += _memory_reasons(mem_fps, mem_names, memory_paths, memory_listing)
     cited = {_norm_name(x) for x in sources} | set(fps)
     updated = str(meta.get("updated") or "")
     question = str(meta.get("question") or "")
@@ -477,17 +481,19 @@ def stale(db_path: str, page_path, roots) -> dict:
     return {"stale": bool(reasons), "reasons": reasons, "memory_paths": memory_paths}
 
 
-def _memory_reasons(mem_fps: dict, mem_names: list, memory_paths: dict) -> list:
+def _memory_reasons(mem_fps: dict, mem_names: list, memory_paths: dict,
+                    listing=None) -> list:
     """Reasons for the page's ``memory:`` fingerprints, and fill
     ``memory_paths`` with ``{name: path}`` for each cited file found.
 
     ``unverifiable:`` when this host has no memory files or the listing
     could not look (root, project folder or the file itself failed), or the
     listed file cannot be read. ``missing:`` only when a listing that
-    worked does not have the file (or it was deleted since)."""
+    worked does not have the file (or it was deleted since). ``listing`` is
+    a ``_memory_listing()`` result to reuse; None lists now."""
     import memory_sources as ms
 
-    files, errors, host = _memory_listing()
+    files, errors, host = listing if listing is not None else _memory_listing()
     root_failed, bad_projects, bad_names = ms.failed_scopes(errors)
     by_name = {ms.memory_name(f): f for f in files}
     cited = [n for n in mem_names if isinstance(n, str)] + [k[len(MEMORY_PREFIX):] for k in mem_fps]

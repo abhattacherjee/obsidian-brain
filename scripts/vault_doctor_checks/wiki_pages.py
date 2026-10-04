@@ -35,8 +35,13 @@ exist yet, reports nothing. A corrupt config, an invalid ``wiki_folder``, or
 a ``queries/`` folder (or subfolder) that cannot be read raises, so the
 dispatcher shows a crashed check instead of a clean one.
 
-The check syncs the vault index first (like ``/vault-ask``): index lines come
-from the notes table, and a stale table would invent drift.
+The check lists the pages first, so an unreadable folder raises before the
+index sync can drop the rows of the pages it hides. Then it syncs the vault
+index (like ``/vault-ask``): index lines come from the notes table, and a
+stale table would invent drift. The index is shared and belongs to the
+configured ``vault_path``, so a ``--vault`` (or ``OBSIDIAN_BRAIN_VAULT``)
+that names another folder is skipped with one stderr line instead of being
+synced into it. Memory files are listed at most once per scan.
 """
 
 from __future__ import annotations
@@ -90,12 +95,25 @@ def _read_config() -> dict:
     return cfg
 
 
+def _same_path(a, b) -> bool:
+    """True when two vault paths name one folder (``~``, symlinks, ``..``
+    and a trailing slash do not matter)."""
+    return Path(os.path.expanduser(str(a))).resolve() == Path(os.path.expanduser(str(b))).resolve()
+
+
 def _context(vault_path: str, sessions_folder: str, insights_folder: str):
     """The wiki context, or None when the wiki is off or not created yet."""
     from obsidian_utils import indexed_folders
     import vault_index
 
     cfg = _read_config()
+    configured = cfg.get("vault_path")
+    if configured and _same_path(configured, vault_path) is False:
+        # The check reads and syncs the shared index, which belongs to the
+        # configured vault. Syncing another vault into it would mix the two.
+        print(f"[{NAME}] skipped: --vault {vault_path} is not the configured vault {configured}; "
+              "the wiki check uses the shared index of the configured vault", file=sys.stderr)
+        return None
     cfg.update(vault_path=vault_path, sessions_folder=sessions_folder,
                insights_folder=insights_folder)
     folders = indexed_folders(cfg, strict=True)  # raises on an invalid wiki_folder
@@ -196,6 +214,17 @@ def _pages(queries: Path) -> list:
     return sorted(out)
 
 
+def _cites_memory(meta: dict) -> bool:
+    """True when ``wiki.stale`` would list memory files for this page: it has
+    ``memory_sources`` entries or ``memory:`` fingerprint keys."""
+    import wiki
+
+    names = meta.get("memory_sources")
+    fps = meta.get("sources_fingerprint")
+    return bool(isinstance(names, list) and names) or (
+        isinstance(fps, dict) and any(str(k).startswith(wiki.MEMORY_PREFIX) for k in fps))
+
+
 def _index_drift(ctx: dict, wiki_root: Path) -> dict:
     import wiki
 
@@ -232,16 +261,20 @@ def scan(
     ctx = _context(vault_path, sessions_folder, insights_folder)
     if ctx is None:
         return []
-    vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
     vault = Path(ctx["vault"])
     wiki_root = vault / ctx["wiki_folder"]
+    # List the pages before the sync: an unreadable folder must raise here,
+    # before the sync drops the index rows of the pages it cannot see.
+    pages = _pages(wiki_root / "queries")
+    vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
     roots = [str(vault / f) for f in ctx["folders"]]
     cutoff = _dt.date.today() - _dt.timedelta(days=days)
     needle = (project or "").strip().lower()
     links = None
+    memory_listing = None  # listed once, when the first page cites memory
     issues: list = []
 
-    for page in _pages(wiki_root / "queries"):
+    for page in pages:
         try:
             meta, _body = wiki.read_page(page)
         except (OSError, ValueError, wiki.WikiRefusal) as exc:
@@ -254,8 +287,10 @@ def scan(
         proj = ",".join(str(p) for p in projects)
         if needle and not any(needle in str(p).lower() for p in projects):
             continue
+        if memory_listing is None and _cites_memory(meta):
+            memory_listing = wiki._memory_listing()
         try:
-            reasons = wiki.stale(ctx["db"], page, roots)["reasons"]
+            reasons = wiki.stale(ctx["db"], page, roots, memory_listing=memory_listing)["reasons"]
         except Exception as exc:  # noqa: BLE001 -- one bad page must not hide the rest
             issues.append(_row(page, proj, "page-unreadable", f"staleness check failed: {exc}"))
             reasons = []

@@ -442,10 +442,10 @@ def test_stale_crash_on_one_page_does_not_hide_the_next(env, monkeypatch):
     b = _file(env, question="beta zebracorn question?")
     real = wiki.stale
 
-    def flaky(db, page, roots):
+    def flaky(db, page, roots, **kw):
         if Path(page) == a:
             raise RuntimeError("kaput")
-        return real(db, page, roots)
+        return real(db, page, roots, **kw)
 
     monkeypatch.setattr(wiki, "stale", flaky)
     rows = _scan(env)
@@ -497,3 +497,110 @@ def test_apply_error_keeps_the_backup_path_and_releases_the_lock(env, tmp_path, 
     assert r.backup_path and "hand-added" in (Path(r.backup_path) / "index.md").read_text()
     monkeypatch.setattr(wiki, "rebuild_wiki_index", real)
     assert [x.status for x in wp.apply(rows, str(tmp_path / "backup2"))] == ["applied"]
+
+
+# --- review fixes, round 2 (#399) --------------------------------------------
+
+
+def _note_paths(db):
+    conn = vault_index._connect(db)
+    try:
+        return sorted(r["path"] for r in conn.execute("SELECT path FROM notes"))
+    finally:
+        conn.close()
+
+
+@_ROOT_SKIP
+def test_unreadable_year_folder_raises_before_the_index_sync(env):
+    page = _file(env)
+    db = env["ctx"]["db"]
+    assert str(page) in _note_paths(db)
+    page.parent.chmod(0o000)
+    try:
+        with pytest.raises(OSError):
+            _scan(env)
+        # The sync never ran, so it could not drop the hidden page's row.
+        assert str(page) in _note_paths(db)
+    finally:
+        page.parent.chmod(0o700)
+
+
+def _other_vault(tmp_path):
+    other = tmp_path / "other"
+    _note(other, "claude-insights", "o1", "claude-insight")
+    (other / "claude-sessions").mkdir(parents=True)
+    (other / "claude-wiki" / "queries").mkdir(parents=True)
+    return other
+
+
+def test_a_vault_that_is_not_the_configured_one_is_skipped(env, tmp_path, capsys):
+    page = _file(env)
+    db = env["ctx"]["db"]
+    before = _note_paths(db)
+    assert str(page) in before
+    other = _other_vault(tmp_path)
+    got = wp.scan(str(other), "claude-sessions", "claude-insights", 9999)
+    assert got == [] and _note_paths(db) == before
+    err = capsys.readouterr().err
+    assert (f"[wiki-pages] skipped: --vault {other} is not the configured vault {env['vault']}; "
+            "the wiki check uses the shared index of the configured vault") in err
+
+
+@pytest.mark.parametrize("form", ["symlink", "trailing-slash", "tilde"])
+def test_the_configured_vault_by_another_spelling_is_not_skipped(env, tmp_path, monkeypatch, form):
+    page = _file(env)
+    _note(env["vault"], "claude-insights", "i1", "claude-insight", body="changed body")
+    vault = str(env["vault"])
+    if form == "symlink":
+        link = tmp_path / "vault-link"
+        link.symlink_to(env["vault"])
+        passed = str(link)
+    elif form == "trailing-slash":
+        passed = vault + "/"
+    else:
+        # The config holds "~/..." and the doctor passes the absolute path.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".claude").mkdir(exist_ok=True)
+        rel = env["vault"].relative_to(tmp_path)
+        cfg = dict(env["cfg"], vault_path=f"~/{rel}")
+        (tmp_path / ".claude" / "obsidian-brain-config.json").write_text(json.dumps(cfg))
+        passed = vault
+    rows = wp.scan(passed, "claude-sessions", "claude-insights", 9999)
+    assert "stale" in [i.extra["signal_class"] for i in rows]
+
+
+def test_a_config_without_vault_path_scans_the_given_vault(env, capsys):
+    cfg = {k: v for k, v in env["cfg"].items() if k != "vault_path"}
+    (env["home"] / ".claude" / "obsidian-brain-config.json").write_text(json.dumps(cfg))
+    page = _file(env)
+    assert _classes(_scan(env), page) == ["orphan"]
+    assert "skipped" not in capsys.readouterr().err
+
+
+def test_memory_listing_runs_once_per_scan(env, tmp_path, monkeypatch):
+    store = tmp_path / "home" / ".claude" / "projects" / "proj" / "memory"
+    store.mkdir(parents=True)
+    files = [store / f"{n}.md" for n in "xyz"]
+    for f in files:
+        f.write_text(f"fact {f.stem}\n")
+    calls = []
+
+    def listing():
+        calls.append(1)
+        return files, [], "claude-code"
+
+    monkeypatch.setattr(wiki, "_memory_files", lambda: files)
+    pages = [_file(env, question=f"{w} zebracorn question?", sources=["i1", "i2"],
+                   memory_sources=[f"proj/{f.name}"]) for w, f in zip(("alpha", "beta", "gamma"), files)]
+    monkeypatch.setattr(wiki, "_memory_listing", listing)
+    files[0].write_text("edited\n")
+    rows = _scan(env)
+    assert calls == [1]
+    assert "stale" in _classes(rows, pages[0]) and "stale" not in _classes(rows, pages[1])
+
+
+def test_no_memory_listing_when_no_page_cites_memory(env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(wiki, "_memory_listing", lambda: calls.append(1) or ([], [], "claude-code"))
+    _link_from_session(env, _file(env))
+    assert _scan(env) == [] and calls == []
