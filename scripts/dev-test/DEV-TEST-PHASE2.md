@@ -58,7 +58,7 @@ When prompted for mode, choose **upgrade**. Expected flow:
 4. Step 8: vault access check
 5. Step 8.5: `rebuild_index()` drops + recreates all tables → "Indexed N notes across M folders"
 6. Step 8.7: first-time deps prompt (skip it here — Step 5 below covers all three branches)
-7. Step 9: claudeception nudge (idempotent)
+7. Step 9: skill-kit:extract nudge (idempotent)
 8. Step 10: success message
 
 This single invocation replaces both `/vault-reindex` AND the first-time-deps case of the old Step 5. No separate `/vault-reindex` call needed.
