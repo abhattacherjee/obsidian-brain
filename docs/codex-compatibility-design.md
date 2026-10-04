@@ -1,7 +1,9 @@
 # Codex Compatibility Design
 
 Date: 2026-07-06
-Status: superseded pending approval of [Claude Code and Codex parity design](codex-claude-parity-design.md)
+Status: superseded by [Claude Code and Codex parity design](codex-claude-parity-design.md)
+
+This July proposal is historical. The active specification preserves full parity across both hosts and includes the current wiki contracts. Its shared runtime and lifecycle adapters have not shipped. Do not revive this proposal's partial-parity release plan.
 
 ## Summary
 
