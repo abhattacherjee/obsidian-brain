@@ -56,12 +56,12 @@ The two `open_item_dedup` filesystem scans (`:1292`, `:1743`) look for open `- [
 | `rule` | none | Prints the writing rule (see "Writing rule") | `{"rule": "..."}` |
 | `lookup` | `{"question"}` | `search_vault` over indexed notes with `type='claude-wiki'` (BM25 weights `title`, which holds the question, highest; results are reranked, and the hits are logged as accesses). Returns the top 3. | `{"candidates": [{"path", "question", "updated", "rank"}]}` |
 | `stale` | `{"page"}` | Re-hashes the page's sources, checks the page's fingerprint field, and runs the newer-note check | `{"stale": bool, "reasons": [...]}` |
-| `count` | `{"sources", "memory_sources"}` | Resolves and counts qualifying sources (see "Threshold") | `{"count": N, "qualifying": [...], "rejected": [...]}` |
+| `count` | `{"sources", "memory_sources"}` | Resolves and counts qualifying sources (see "Threshold") | `{"count": N, "qualifying": [...], "other": [...], "rejected": [...]}` |
 | `file` | page payload (below) | Validates, scrubs, writes the page, rebuilds the index, appends the log | `{"path", "action": "file"\|"update"\|"file-auto", "count"}`, plus `warning` when the index or log update failed |
 
 `file` payload: `question`, `body` (markdown, already written under the rule), `sources` (note basenames), `memory_sources` (PR 3; empty before), `topics`, `confidence`, `filed_by` (`user` or `auto`), `caller` (required when `filed_by` is `auto`), optional `update` (an existing page path), and optional `override_reviewed` (bool, default false). A `projects` field is ignored: projects come from the cited sources. Without `update`, a name collision gets `-2`, `-3` and so on (see "Page path").
 
-`file` refuses (exit 1) when: fewer than 3 qualifying notes are cited (see "Threshold"); a source does not resolve to an existing file under an indexed folder; `confidence` is not one of `high`, `medium`, `low`; `filed_by` is `auto` without a `caller`; `update` points outside `<vault>/<wiki_folder>/queries/` or at a file whose frontmatter `type` is not `claude-wiki`; the resolved write path fails `is_relative_to(<vault>/<wiki_folder>)`; `update` targets a page with `reviewed: true` and the payload does not carry `override_reviewed: true` (see "Reviewed pages").
+`file` refuses (exit 1) when: fewer than 3 qualifying notes are cited (see "Threshold"); a source does not resolve to an existing file under an indexed folder; `confidence` is not one of `high`, `medium`, `low`; `filed_by` is `auto` without a `caller`; `update` points outside `<vault>/<wiki_folder>/queries/` or at a file whose frontmatter `type` is not `claude-wiki`; the resolved write path fails `is_relative_to(<vault>/<wiki_folder>)`; `update` targets a page with `reviewed: true` and the payload does not carry `override_reviewed: true` (see "Reviewed pages"); `update` names a page that is also in `sources` (a page cannot cite itself: its fingerprint would be of the old bytes, so it would stay stale forever).
 
 **vault-ask Step 2b: wiki first.** After parsing the question, run `wiki.py lookup`. The model judges whether the top candidate asks the same question (not a fixed similarity threshold: there is no live data to calibrate one). If it does:
 
@@ -135,7 +135,7 @@ reviewed: true
 
 **`date`:** each write sets `date:` to the `updated` date (the local date), so `date` always carries `updated`, not `created`. The indexer stores `date`, not `updated`, so the index sort, `lookup`'s `updated` field and the newer-note check read it from the table (PR 2).
 
-**Newer-note check:** stale trigger 3 runs its own FTS query (the question's words OR-joined, restricted to counting types), not `search_vault`: `search_vault`'s AND query matches the page itself and then never falls back to OR (PR 2).
+**Newer-note check:** stale trigger 3 runs its own FTS query (the question's words OR-joined after dropping stopwords, restricted to counting types; a question with no words left skips the check), not `search_vault`: `search_vault`'s AND query matches the page itself and then never falls back to OR (PR 2).
 
 **Fingerprint:** SHA-256 of each source file's bytes, first 16 hex characters. A content hash, not mtime: `/recall` and `/check-items` change mtimes without changing meaning, and mtime would trigger false refreshes.
 
@@ -144,11 +144,11 @@ reviewed: true
 1. a source's hash differs from `sources_fingerprint`;
 2. a source file no longer exists;
 3. a note dated after the page's `updated` is in the top 5 FTS hits for the question and is not already a source;
-4. the page's `sources_fingerprint` is missing or bad (reason `unverifiable: <page>`): the page cannot be checked, so it counts as stale.
+4. the page's `sources_fingerprint` is missing or bad (reason `unverifiable: <page>`), or its `sources` is not a non-empty list (reason `unverifiable: sources`): the page cannot be checked, so it counts as stale. Block-style YAML lists and maps (as Obsidian's Properties panel saves them) are read like the one-line JSON form.
 
 `stale` returns every reason that fired, not only the first.
 
-**Threshold:** `count` counts distinct sources of type `claude-insight`, `claude-error-fix`, `claude-decision`, `claude-retro`, `claude-session`, `claude-memory` (migrated memory notes already in the vault), plus memory files (PR 3). A `claude-snapshot` counts as its parent session (resolved via `source_session_note`), so a snapshot and its parent count once. Other types (`claude-wiki`, `claude-standup`, `claude-emerge`, `claude-stats`, `claude-check-items-report`) do not count. The gate is `count >= 3`. The count is computed by code from the cited source list, so the skill cannot argue past it.
+**Threshold:** `count` counts distinct sources of type `claude-insight`, `claude-error-fix`, `claude-decision`, `claude-retro`, `claude-session`, `claude-memory` (migrated memory notes already in the vault), plus memory files (PR 3). A `claude-snapshot` counts as its parent session (resolved via `source_session_note`), so a snapshot and its parent count once. Sources are told apart by resolved file path, so `i1` and `claude-insights/i1` count once. Other types (`claude-wiki`, `claude-standup`, `claude-emerge`, `claude-stats`, `claude-check-items-report`) do not count. The gate is `count >= 3`. The count is computed by code from the cited source list, so the skill cannot argue past it.
 
 **Index files:**
 

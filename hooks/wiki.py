@@ -98,9 +98,30 @@ def render_page(meta: dict, body: str) -> str:
     return "\n".join(lines) + "\n" + body.rstrip("\n") + "\n"
 
 
+def _scalar(text: str):
+    """One block item or map value: JSON when it parses, else the text with
+    one pair of matching outer quotes removed. A number stays text: a
+    fingerprint such as ``12e4567890123456`` must not turn into a float."""
+    s = text.strip()
+    try:
+        value = json.loads(s)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return value
+    except ValueError:
+        pass
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    return s
+
+
 def read_page(path) -> tuple:
     """Return ``(meta, body)``. Values are JSON-decoded when they parse,
-    else kept as the raw string (a hand-edited page)."""
+    else kept as the raw string (a hand-edited page).
+
+    A key with an empty value followed by indented lines takes them as a
+    block: ``- item`` lines make a list and ``k: v`` lines make a dict.
+    Obsidian's Properties panel saves lists and maps in this form.
+    """
     from frontmatter import split_frontmatter, split_lines_lf_crlf
 
     text = Path(path).read_text(encoding="utf-8")
@@ -108,27 +129,40 @@ def read_page(path) -> tuple:
     if err:
         raise WikiRefusal(f"{path}: {err}")
     meta: dict = {}
-    tags: list = []
-    in_tags = False
+    block_key = None  # the empty-valued key whose indented block we are reading
     for raw in fm_lines:
-        stripped = raw.strip()
-        if in_tags and stripped.startswith("- "):
-            tags.append(stripped[2:].strip())
+        line = raw.rstrip("\r\n")
+        stripped = line.strip()
+        if not stripped:
             continue
-        in_tags = False
+        if block_key is not None and line[:1] in (" ", "\t"):
+            current = meta[block_key]
+            if stripped == "-" or stripped.startswith("- "):
+                if current == "":
+                    current = meta[block_key] = []
+                if isinstance(current, list):
+                    current.append(_scalar(stripped[1:]))
+                continue
+            k, sep, v = stripped.partition(":")
+            if sep:
+                if current == "":
+                    current = meta[block_key] = {}
+                if isinstance(current, dict):
+                    current[str(_scalar(k))] = _scalar(v)
+            continue
+        block_key = None
         key, sep, val = stripped.partition(":")
         if not sep:
             continue
         key, val = key.strip(), val.strip()
-        if key == "tags" and not val:
-            in_tags = True
+        if not val:
+            meta[key] = ""
+            block_key = key
             continue
         try:
             meta[key] = json.loads(val)
         except ValueError:
             meta[key] = val
-    if tags:
-        meta["tags"] = tags
     return meta, "".join(body_lines)
 
 
@@ -197,20 +231,39 @@ def resolve_sources(db_path: str, names, roots) -> dict:
 
 
 def count_sources(db_path: str, names, memory_sources, roots) -> dict:
-    """Count distinct qualifying sources (the filing threshold input)."""
+    """Count distinct qualifying sources (the filing threshold input).
+
+    Notes are told apart by resolved file path, not by spelling: ``i1``,
+    ``claude-insights/i1`` and ``<vault>/claude-insights/i1`` are one note.
+    A snapshot is identified by its parent session's path. The lists keep
+    the caller's spelling of the first occurrence. ``resolved`` drops later
+    spellings of the same file but keeps a snapshot and its parent, so the
+    page fingerprints both.
+    """
     res = resolve_sources(db_path, names, roots)
     rejected = list(res["rejected"])
     for m in memory_sources or []:
         rejected.append({"name": str(m), "reason": "memory sources arrive in #396"})
-    qualifying, other = [], []
+    parents = [r["key"] for r in res["resolved"] if r["type"] == "claude-snapshot"]
+    parent_path = ({p["name"]: p["path"] for p in resolve_sources(db_path, parents, roots)["resolved"]}
+                   if parents else {})
+    qualifying, other, resolved, paths, seen = [], [], [], set(), set()
     for r in res["resolved"]:
+        if r["path"] in paths:
+            continue  # another spelling of a note already listed
+        paths.add(r["path"])
+        resolved.append(r)
+        is_snapshot = r["type"] == "claude-snapshot"
+        ident = parent_path.get(r["key"], "key:" + r["key"]) if is_snapshot else r["path"]
+        if ident in seen:
+            continue
+        seen.add(ident)
         if r["count_type"] in COUNTING_TYPES:
-            if r["key"] not in qualifying:
-                qualifying.append(r["key"])
+            qualifying.append(r["key"] if is_snapshot else r["name"])
         else:
             other.append(r["name"])
     return {"count": len(qualifying), "qualifying": qualifying, "other": other,
-            "rejected": rejected, "resolved": res["resolved"]}
+            "rejected": rejected, "resolved": resolved}
 
 
 # ---------------------------------------------------------------------------
@@ -264,16 +317,19 @@ def stale(db_path: str, page_path, roots) -> dict:
     source, ``newer:`` per newer counting note in the question's top 5 hits.
     All reasons are returned. An unreadable source counts as missing, and a
     cited source with no usable fingerprint (field missing, not a mapping, or
-    no non-empty string for it) as unverifiable -- never as fresh."""
+    no non-empty string for it) as unverifiable -- never as fresh. A page
+    whose ``sources`` is not a non-empty list gets ``unverifiable: sources``."""
     meta, _body = read_page(page_path)
     raw_fps = meta.get("sources_fingerprint")
     fps = {}
     if isinstance(raw_fps, dict):
         fps = {_norm_name(k): v for k, v in raw_fps.items() if isinstance(v, str) and v}
-    sources = meta.get("sources") or []
-    if not isinstance(sources, list):
-        sources = [sources]
+    sources = meta.get("sources")
     reasons = []
+    if not isinstance(sources, list) or not sources:
+        # Absent, empty or unparseable: the page cannot be checked.
+        reasons.append("unverifiable: sources")
+        sources = []
     for name in dict.fromkeys(_norm_name(x) for x in sources):
         if name and name not in fps:
             reasons.append(f"unverifiable: {name}")
@@ -299,9 +355,15 @@ def stale(db_path: str, page_path, roots) -> dict:
     return {"stale": bool(reasons), "reasons": reasons}
 
 
+# Question-frame verbs that _STOPWORDS keeps but nearly every "how does X
+# work?" question contains. Matching on them alone flags unrelated notes.
+_QUESTION_FILLER = frozenset({"work", "works", "working", "worked"})
+
+
 def _newer_notes(db_path: str, question: str, updated: str, cited: set, roots) -> list:
     """Counting notes among the question's top 5 OR-matched hits that are
-    dated after ``updated`` and not already cited.
+    dated after ``updated`` and not already cited. Stopwords are dropped
+    from the question first; with no words left the check is skipped.
 
     Queries FTS directly, restricted to counting types: search_vault's AND
     query matches the page itself first and then never falls back to OR, so
@@ -309,9 +371,12 @@ def _newer_notes(db_path: str, question: str, updated: str, cited: set, roots) -
     """
     import vault_index
 
-    fts = vault_index._sanitize_fts_query_or(question or "")
-    if not fts:
-        return []
+    words = [w for w in re.findall(r"[a-zA-Z0-9_/]+", (question or "").replace("-", " "))
+             if len(w) > 1 and w.lower() not in vault_index._STOPWORDS
+             and w.lower() not in _QUESTION_FILLER]
+    if not words:
+        return []  # nothing topical to match on: skip the newer check
+    fts = vault_index._sanitize_fts_query_or(" ".join(words))
     marks = ",".join("?" * len(COUNTING_TYPES))
     root_paths = [Path(r) for r in roots]
     conn = vault_index._connect(db_path)
@@ -383,8 +448,16 @@ def _wiki_root(ctx: dict) -> Path:
 
 
 def _write(ctx: dict, rel_folder: str, filename: str, content: str) -> None:
+    """Write one wiki file. Refused unless the folder, symlinks followed,
+    is inside the resolved wiki root (a symlinked ``queries/`` could
+    otherwise put a page elsewhere in the vault)."""
     from obsidian_utils import write_vault_note
 
+    final = Path(ctx["vault"]) / rel_folder / filename
+    real = final.parent.resolve() / final.name
+    if not real.is_relative_to(_wiki_root(ctx).resolve()):
+        raise WikiRefusal(f"{real} is outside the wiki folder {_wiki_root(ctx).resolve()}; "
+                          "refusing to write it")
     err = write_vault_note(ctx["vault"], rel_folder, filename, content)
     if err:
         raise WikiRefusal(err)
@@ -466,9 +539,10 @@ def file_page(ctx: dict, payload: dict, today) -> dict:
     """Validate and count, then, under one lock, pick the target, write the
     page, and update the index and log.
 
-    The target checks (update containment, type, reviewed flag) and the new
-    page's name choice run inside the lock, so two filers cannot pick the
-    same name and a page marked reviewed after validation is still refused.
+    The target checks (update containment, type, self-citation, reviewed
+    flag) and the new page's name choice run inside the lock, so two filers
+    cannot pick the same name and a page marked reviewed after validation is
+    still refused. Every write is checked against the resolved wiki root.
     Once the page is written, an index or log failure does not raise: the
     result gets a ``warning`` naming the stage instead.
     """
@@ -506,6 +580,8 @@ def file_page(ctx: dict, payload: dict, today) -> dict:
                 raise WikiRefusal(f"update must name a page under {queries}")
             if not target.is_file():
                 raise WikiRefusal(f"update page not found: {target}")
+            if any(Path(r["path"]).resolve() == target for r in resolved):
+                raise WikiRefusal(f"a page cannot cite itself; drop [[{target.stem}]] from sources")
             old, _ = read_page(target)
             if old.get("type") != PAGE_TYPE:
                 raise WikiRefusal(f"{target} is not a wiki page")

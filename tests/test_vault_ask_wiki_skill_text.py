@@ -75,3 +75,7 @@ def test_missing_wiki_py_skips_wiki_steps():
 
 def test_unverifiable_is_a_stale_reason():
     assert "`unverifiable: <page>`" in SKILL
+
+
+def test_refresh_leaves_the_page_out_of_sources():
+    assert "leave the page being refreshed out of `sources`" in SKILL

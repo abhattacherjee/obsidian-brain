@@ -389,6 +389,8 @@ Then decide whether to save it as a wiki page. Skip all of this when `WIKI` is e
 
    `confidence` follows your certainty wording from Step 7: "You explicitly decided" → `high`, "it appears" → `medium`, "Limited context" → `low`. `topics` are up to 8 short lowercase slugs (`[a-z0-9-]`) for the main subjects. Projects come from the cited sources; there is no `projects` field. A new page whose file name is taken gets `-2`, `-3` and so on.
 
+   With `update`, leave the page being refreshed out of `sources`. A page cannot cite itself, and `file` refuses it.
+
    Report the outcome by exit code:
    - **Exit 0, no `warning` key:** name the page (`path`).
    - **Exit 0 with a `warning` key:** tell the user the page was saved (name `path`) and quote the warning. The index or log update failed; the next write repairs it.

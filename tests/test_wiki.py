@@ -605,3 +605,150 @@ def test_wiki_root_outside_or_at_vault_is_a_refusal(ctx, tmp_path_factory, kind)
         ctx = {**ctx, "wiki_folder": "."}
     with pytest.raises(wiki.WikiRefusal):
         wiki.file_page(ctx, _payload(), D)
+
+
+# --- Review fixes: block YAML, stopwords, self-cite, write containment, dedupe ---
+
+
+def _to_block_style(page, sources_lines=None, fp_lines=None):
+    """Rewrite a page the way Obsidian's Properties panel saves it: plain
+    scalars and block lists/maps instead of one-line JSON values."""
+    meta, body = wiki.read_page(page)
+    if sources_lines is None:
+        sources_lines = ["sources:"] + [f'  - "{s}"' for s in meta["sources"]]
+    if fp_lines is None:
+        fp_lines = ["sources_fingerprint:"] + [f"  {k}: {v}" for k, v in meta["sources_fingerprint"].items()]
+    fm = ["---", "type: claude-wiki", f"title: {meta['title']}", f"question: {meta['question']}",
+          f"date: {meta['date']}", f"created: {meta['created']}", f"updated: {meta['updated']}",
+          "projects:", "  - demo", *sources_lines, "memory_sources: []", *fp_lines,
+          "confidence: high", "filed_by: user", "tags:", *[f"  - {t}" for t in meta["tags"]], "---"]
+    page.write_text("\n".join(fm) + "\n" + body, encoding="utf-8")
+
+
+def test_read_page_parses_block_lists_and_maps(tmp_path):
+    p = tmp_path / "p.md"
+    p.write_text('---\ntype: claude-wiki\nsources:\n  - "[[i1]]"\n  - [[i2]]\n  - \'d1\'\n'
+                 'sources_fingerprint:\n  i1: abc\n  "i2": "def"\nempty:\nupdated: 2026-10-02\n---\nbody\n')
+    meta, body = wiki.read_page(p)
+    assert meta["sources"] == ["[[i1]]", "[[i2]]", "d1"]
+    assert meta["sources_fingerprint"] == {"i1": "abc", "i2": "def"}
+    assert meta["empty"] == "" and meta["updated"] == "2026-10-02" and body == "body\n"
+
+
+def test_block_style_page_with_same_sources_is_fresh(paged):
+    vault, page = paged
+    _to_block_style(page)
+    assert wiki.stale(vault["db"], page, vault["roots"]) == {"stale": False, "reasons": []}
+
+
+def test_block_style_page_with_changed_source_is_stale(paged):
+    vault, page = paged
+    _to_block_style(page)
+    _src(vault, "i2").write_text(_src(vault, "i2").read_text() + "\nedited\n")
+    assert wiki.stale(vault["db"], page, vault["roots"])["reasons"] == ["changed: i2"]
+
+
+@pytest.mark.parametrize("sources_lines", [
+    [], ["sources: []"], ["sources:"], ['sources: "[[i1]]"'], ["sources: [[i1]], [[i2]], [[d1]]"],
+], ids=["absent", "empty-list", "empty-value", "scalar", "flow-not-json"])
+def test_unparseable_sources_are_unverifiable(paged, sources_lines):
+    vault, page = paged
+    _to_block_style(page, sources_lines=sources_lines)
+    r = wiki.stale(vault["db"], page, vault["roots"])
+    assert r["stale"] and "unverifiable: sources" in r["reasons"]
+
+
+def test_later_note_sharing_only_stopwords_is_not_newer(paged):
+    vault, page = paged
+    _note(Path(vault["vault"]), "claude-sessions", "s-deploy", "claude-session",
+          body="How does the deploy pipeline work? It does work now.", date="2026-10-03")
+    vault_index.ensure_index(vault["vault"], FOLDERS, db_path=vault["db"])
+    assert wiki.stale(vault["db"], page, vault["roots"]) == {"stale": False, "reasons": []}
+
+
+def test_later_note_sharing_a_topic_word_is_newer(paged):
+    vault, page = paged
+    _note(Path(vault["vault"]), "claude-sessions", "s-rank", "claude-session",
+          body="How does the ranking change now?", date="2026-10-03")
+    vault_index.ensure_index(vault["vault"], FOLDERS, db_path=vault["db"])
+    assert "newer: s-rank" in wiki.stale(vault["db"], page, vault["roots"])["reasons"]
+
+
+def test_question_of_only_stopwords_skips_newer_check(vault):
+    page = _page(vault, "10-02-how", "How does it work?", ["i1"], {"i1": wiki.fingerprint(_src(vault, "i1"))})
+    _note(Path(vault["vault"]), "claude-sessions", "s-late", "claude-session",
+          body="how does it work", date="2026-10-03")
+    vault_index.ensure_index(vault["vault"], FOLDERS, db_path=vault["db"])
+    assert wiki.stale(vault["db"], page, vault["roots"]) == {"stale": False, "reasons": []}
+
+
+def test_refresh_citing_the_page_itself_is_refused(ctx):
+    page = Path(wiki.file_page(ctx, _payload(), D)["path"])
+    before = page.read_text()
+    with pytest.raises(wiki.WikiRefusal, match=re.escape(f"a page cannot cite itself; drop [[{page.stem}]] from sources")):
+        wiki.file_page(ctx, _payload(update=str(page), sources=["i1", "i2", "d1", page.stem]),
+                       D + dt.timedelta(days=1))
+    assert page.read_text() == before
+
+
+def test_new_page_through_symlinked_queries_is_refused(ctx):
+    insights = Path(ctx["vault"]) / "claude-insights"
+    before = sorted(p for p in insights.rglob("*"))
+    _wiki(ctx).mkdir(parents=True)
+    (_wiki(ctx) / "queries").symlink_to(insights)
+    with pytest.raises(wiki.WikiRefusal, match="outside the wiki folder"):
+        wiki.file_page(ctx, _payload(), D)
+    assert sorted(p for p in insights.rglob("*")) == before
+
+
+def test_new_page_through_symlinked_year_folder_is_refused(ctx):
+    insights = Path(ctx["vault"]) / "claude-insights"
+    before = sorted(p for p in insights.rglob("*"))
+    (_wiki(ctx) / "queries").mkdir(parents=True)
+    (_wiki(ctx) / "queries" / "2026").symlink_to(insights)
+    with pytest.raises(wiki.WikiRefusal, match="outside the wiki folder"):
+        wiki.file_page(ctx, _payload(), D)
+    assert sorted(p for p in insights.rglob("*")) == before
+
+
+def test_update_through_symlinked_queries_is_refused(ctx):
+    insights = Path(ctx["vault"]) / "claude-insights"
+    fake = insights / "fake-wiki.md"
+    fake.write_text(wiki.render_page({"type": "claude-wiki", "question": "q"}, "x\n"))
+    before = fake.read_text()
+    _wiki(ctx).mkdir(parents=True)
+    (_wiki(ctx) / "queries").symlink_to(insights)
+    with pytest.raises(wiki.WikiRefusal, match="outside the wiki folder"):
+        wiki.file_page(ctx, _payload(update=str(_wiki(ctx) / "queries" / "fake-wiki.md")), D)
+    assert fake.read_text() == before
+
+
+def test_index_and_log_writes_are_contained(ctx):
+    calls = []
+    real = wiki._write
+
+    def spy(c, rel, name, content):
+        calls.append(name)
+        return real(c, rel, name, content)
+
+    wiki._write = spy
+    try:
+        wiki.file_page(ctx, _payload(), D)
+        with pytest.raises(wiki.WikiRefusal, match="outside the wiki folder"):
+            wiki._write(ctx, "claude-insights", "index.md", "x")
+    finally:
+        wiki._write = real
+    assert {"index.md", "log-2026.md"} <= set(calls)
+    assert not (Path(ctx["vault"]) / "claude-insights" / "index.md").exists()
+
+
+def test_path_spellings_of_one_note_count_once(vault):
+    vault_name = Path(vault["vault"]).name
+    r = _count(vault, ["i1", "claude-insights/i1", f"{vault_name}/claude-insights/i1"])
+    assert r["count"] == 1 and r["qualifying"] == ["i1"] and r["rejected"] == []
+    assert [x["name"] for x in r["resolved"]] == ["i1"]
+
+
+def test_snapshot_and_parent_by_path_count_once(vault):
+    assert _count(vault, ["s1-snap", "claude-sessions/s1"])["count"] == 1
+    assert _count(vault, ["claude-sessions/s1", "s1-snap"])["qualifying"] == ["claude-sessions/s1"]
