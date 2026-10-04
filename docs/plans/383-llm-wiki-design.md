@@ -35,17 +35,17 @@ Each PR goes through `/ship` on its own. #383 closes with PR 3; PRs 1 and 2 use 
 
 ### PR 1: Foundation
 
-**`indexed_folders(config) -> list[str]`** in `hooks/obsidian_utils.py`, next to `load_config`. Returns `[sessions_folder, insights_folder, wiki_folder]` from config with the defaults applied, in that order, with duplicates removed. Every site listed above calls it instead of building a literal. The skills call it inside their existing python snippets. `open_item_dedup` includes the wiki folder in its cache key, so adding the folder invalidates old cache entries once.
+**`indexed_folders(config) -> list[str]`** in `hooks/obsidian_utils.py`, next to `load_config`. Returns `[sessions_folder, insights_folder, wiki_folder]` from config with the defaults applied, in that order, with duplicates removed. An empty `wiki_folder` turns the wiki folder off; an invalid one (not a string, absolute, `~`, `..` or a dot segment) is dropped with a stderr warning. Every skill and script call site uses it, inside the skills' existing python snippets. `build_context_brief` (`hooks/obsidian_utils.py:5145`) and `deep_analysis_pipeline` (`hooks/open_item_dedup.py:1279`) keep explicit lists, because they receive their folders as parameters rather than a config. That is safe: `_sync` deletes only rows under the folders it scans, so those calls never remove wiki rows; they only skip refreshing them. Only `rebuild_index` prunes rows outside its scanned folders, and both of its callers (`/vault-reindex`, `/obsidian-setup`) use the helper.
 
-The two `open_item_dedup` filesystem scans (`:1292`, `:1743`) look for open `- [ ]` items in sessions and insights. Wiki pages carry no open items, so those two scans keep the sessions and insights folders only; a code comment says why. The indexer call at `:1281` uses the helper.
+The two `open_item_dedup` filesystem scans (`:1292`, `:1743`) look for open `- [ ]` items in sessions and insights. Wiki pages carry no open items, so those two scans keep the sessions and insights folders only. The indexer call at `:1281` keeps its explicit list too (see above); a code comment says why.
 
 **`wiki_folder` config key.** Default `claude-wiki` in `_DEFAULTS` (`hooks/obsidian_utils.py:2229`). `/obsidian-setup` Step 5 creates the folder and Step 7 writes the key. `/vault-config` lists it as an editable folder setting. An existing config without the key gets the default from `_DEFAULTS`, so no migration is needed.
 
-**Indexer exclusion.** `_sync` skips any file directly under `<vault>/<wiki_folder>/` whose name is `index.md`, or matches `index-*.md` or `log-*.md`. The rule is "these names, at that folder's root" only, so a session note named `index.md` elsewhere is still indexed. `_sync` gets the wiki folder name as a new optional `exclude_root_files` argument mapping folder to a set of glob patterns, passed by `indexed_folders`' callers through a second helper `index_exclusions(config)`. Existing callers that do not pass it behave as today.
+**Indexer exclusion.** `_sync` skips any note whose frontmatter `type` is in `vault_index._UNINDEXED_TYPES` (`{"claude-wiki-index"}`), counts it as `excluded`, and deletes its row if it was indexed before. PR 2 writes `type: claude-wiki-index` into every index and log file. A user note named `index.md` is indexed as usual because it lacks the type. (Changed in PR 1 from a filename rule: no signature change to `_sync`/`ensure_index`/`rebuild_index`, and no name collisions.)
 
 **`claude-wiki` type weight.** Added to all 5 contexts in `_TYPE_SCORES_BY_CONTEXT` at the same weight as `claude-insight`. `tests/test_type_scores.py` gets `claude-wiki` in its pinned set. No extra ranking boost in PR 1; the wiki-first path in PR 2 is what makes pages win.
 
-**Guard test.** `tests/test_indexed_folders.py` greps `skills/**/*.md`, `hooks/*.py` and `scripts/**/*` for an `ensure_index(` or `rebuild_index(` call whose folder argument is a list literal, and fails if it finds one. Dev-only scripts under `scripts/dev-test/` and plan docs under `docs/` are exempt and listed by name in the test.
+**Guard test.** `tests/test_indexed_folders.py` finds every `ensure_index(`/`rebuild_index(` call in `skills/*/SKILL.md`, `hooks/*.py`, `scripts/*.py` and `scripts/*.sh`, parses its second argument, and fails unless it is an `indexed_folders(...)` call or a name assigned from one. `hooks/obsidian_utils.py`, `hooks/open_item_dedup.py` and `hooks/vault_index.py` (the definition site) are allow-listed by name with a reason. `scripts/dev-test/` and `docs/` are not scanned. Three positive controls prove the guard flags a literal list and a named list and accepts the helper.
 
 ### PR 2: Wiki core
 
@@ -146,12 +146,13 @@ reviewed: true
 
 **Index files:**
 
+- Each index file starts with a frontmatter block carrying `type: claude-wiki-index`, so the indexer skips it (PR 1).
 - Up to 500 pages: one `<wiki_folder>/index.md`, one line per page, `- [[<slug>]] — <question> (updated <date>, <confidence>[, reviewed])`, sorted by `updated` descending.
 - Above 500 pages: `index.md` lists one line per project linking to `index-<project>.md`, and each project file lists its pages. A page with several projects appears in each.
 - Rebuilt in full on every write, from the SQLite `notes` table (`type='claude-wiki'`), not by reading page files. A full rebuild cannot drift, and reading the table costs one query.
 - `lookup` never reads the index files. They exist for people browsing in Obsidian.
 
-**Log files:** `<wiki_folder>/log-YYYY.md`, append-only, one file per calendar year (UTC). Each entry:
+**Log files:** `<wiki_folder>/log-YYYY.md`, append-only, one file per calendar year (UTC). Each log file starts with a frontmatter block carrying `type: claude-wiki-index`; entries are appended below it. Each entry:
 
 ```markdown
 ## [2026-10-03] file-auto | <caller> | <question>
