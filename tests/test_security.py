@@ -4606,3 +4606,421 @@ class TestBashTruthDifferential:
         assert req["redirection"]("VERB >out")
         assert req["background &"]("VERB &")
         assert req["single pipe"]("VERB | cat")
+
+
+
+
+class TestPreflightTokenSurvivesADeniedCall:
+    """#408: the token was deleted the moment require-preflight approved a
+    commit. Another PreToolUse hook could still deny the same Bash call, so
+    the command never ran but the token was gone. The token now records the
+    HEAD it was made at, and a commit is allowed only while HEAD still
+    matches. When the commit provably runs in the project's own checkout the
+    token is kept, so a denied call does not spend it; anywhere else it is
+    spent on approval, as before."""
+
+    C = "com" + "mit"
+    REG = "git " + C + " -m wip"
+    AMEND = "git " + C + " --amend --no-edit"
+
+    @staticmethod
+    def _token_path(work):
+        import hashlib
+        h = hashlib.md5(os.path.realpath(str(work)).encode()).hexdigest()[:8]
+        return Path(f"/tmp/.preflight-token-{h}")
+
+    @staticmethod
+    def _git(work, env, *args):
+        return subprocess.run(
+            ["git", "-C", str(work), "-c", "user.email=t@example.invalid",
+             "-c", "user.name=t", *args],
+            env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        token = self._token_path(work)
+        yield work, env, token
+        token.unlink(missing_ok=True)
+
+    def _write_token(self, work, env, token, with_head=True, **override):
+        """A token as the preflight writes it, at the current HEAD.
+        ``override`` replaces fields, e.g. ``head="HEAD~0"``."""
+        now = int(time.time())
+        data = {"created": now, "expires": now + 300, "staged_files": 1,
+                "checks_run": "tests"}
+        if with_head:
+            data["head"] = self._git(work, env, "rev-parse", "HEAD")
+        data.update(override)
+        token.write_text(json.dumps(data))
+
+    def _decide(self, work, env, command, cwd="project"):
+        """Run the hook with Claude Code's payload, including `cwd` (the
+        shell's directory). cwd="project" means the project root; None
+        leaves the key out."""
+        payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+        if cwd == "project":
+            payload["cwd"] = str(work)
+        elif cwd is not None:
+            payload["cwd"] = str(cwd)
+        proc = subprocess.run(
+            [sys.executable, str(work / ".claude/hooks/require-preflight.py")],
+            input=json.dumps(payload), capture_output=True, text=True,
+            timeout=60, cwd=work, env=env,
+        )
+        # Exit 1 is a NON-blocking error: the command would run.
+        assert proc.returncode == 0, proc.stderr[-400:]
+        try:
+            return json.loads(proc.stdout)["hookSpecificOutput"].get(
+                "permissionDecision", "allow")
+        except (ValueError, KeyError, TypeError):
+            return "allow"
+
+    def _worktree(self, work, env):
+        wt = work / ".claude" / "worktrees" / "wt"
+        self._git(work, env, "worktree", "add", "-q", "-b", "feature/wt", str(wt))
+        return wt
+
+    # --- the #408 behaviour -------------------------------------------------
+
+    def test_a_call_that_never_ran_leaves_the_token_usable(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        # Approved, then denied by another hook: nothing ran, HEAD is unchanged.
+        assert self._decide(work, env, self.REG) == "allow"
+        assert token.exists()
+        assert self._decide(work, env, self.REG) == "allow"
+
+    def test_a_real_commit_spends_the_token(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        assert self._decide(work, env, self.REG) == "allow"
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "real")
+        assert self._decide(work, env, self.REG) == "deny"
+        assert not token.exists()
+
+    def test_amend_may_reuse_the_token_but_a_regular_commit_may_not(self, repo):
+        work, env, token = repo
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token)
+        self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "amended")
+        assert self._decide(work, env, self.AMEND) == "allow"
+        assert self._decide(work, env, self.REG) == "deny"
+
+    def test_amend_after_a_regular_commit_is_denied(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "real")
+        assert self._decide(work, env, self.AMEND) == "deny"
+
+    def test_a_second_amend_of_a_root_commit_is_allowed(self, repo):
+        """Both commits have no parent, so they are siblings."""
+        work, env, token = repo
+        self._write_token(work, env, token)  # at the seed, a root commit
+        self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "seed 2")
+        assert self._decide(work, env, self.AMEND) == "allow"
+        assert self._decide(work, env, self.REG) == "deny"
+
+    @pytest.mark.parametrize("msg", ["drop the --amend flag", "--amend"])
+    def test_amend_text_inside_a_message_is_not_an_amend(self, repo, msg):
+        work, env, token = repo
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token)
+        self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "amended")
+        cmd = f"git {self.C} -m {shlex.quote(msg)}"
+        assert self._decide(work, env, cmd) == "deny"
+
+    def test_an_abbreviated_amend_flag_is_an_amend(self, repo):
+        work, env, token = repo
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token)
+        self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "amended")
+        assert self._decide(work, env, f"git {self.C} --amen --no-edit") == "allow"
+
+    def test_command_parsing_is_capped_and_fast(self, repo):
+        """A command over the 100,000-character cap is not read at all, so it
+        is not an amend (the stricter rule), and one just under it still
+        decides quickly."""
+        work, env, token = repo
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token)
+        self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "amended")
+        under = f"git {self.C} --amend -m " + "x" * 99_000
+        start = time.perf_counter()
+        assert self._decide(work, env, under) == "allow"
+        assert time.perf_counter() - start < 2
+        over = f"git {self.C} --amend -m " + "x" * 101_000
+        assert self._decide(work, env, over) == "deny"
+
+    def test_resetting_back_to_the_token_head_makes_it_usable_again(self, repo):
+        """A stated limit, pinned so a change to it is deliberate: HEAD is
+        all the hook sees, so undoing the commit restores the token until it
+        expires."""
+        work, env, token = repo
+        self._write_token(work, env, token)
+        start = self._git(work, env, "rev-parse", "HEAD")
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "real")
+        self._git(work, env, "reset", "-q", "--soft", start)
+        assert self._decide(work, env, self.REG) == "allow"
+
+    # --- where the commit runs ----------------------------------------------
+
+    @pytest.mark.parametrize("shape", ["git -C", "cd &&", "shell cwd"])
+    def test_a_commit_in_a_worktree_spends_the_token_on_approval(self, repo, shape):
+        """A worktree commit moves the worktree's HEAD, never the project's,
+        so keeping the token would let it cover any number of commits."""
+        work, env, token = repo
+        wt = self._worktree(work, env)
+        self._write_token(work, env, token)
+        cwd = "project"
+        if shape == "git -C":
+            cmd = f"git -C {wt} {self.C} -m wip"
+        elif shape == "cd &&":
+            cmd = f"cd {wt} && git {self.C} -m wip"
+        else:
+            cmd, cwd = self.REG, wt
+        assert self._decide(work, env, cmd, cwd=cwd) == "allow"
+        assert not token.exists()
+        assert self._decide(work, env, cmd, cwd=cwd) == "deny"
+
+    def test_a_payload_without_cwd_spends_the_token_on_approval(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        assert self._decide(work, env, self.REG, cwd=None) == "allow"
+        assert not token.exists()
+
+    def test_a_subdirectory_of_the_project_keeps_the_token(self, repo):
+        work, env, token = repo
+        (work / "sub").mkdir()
+        self._write_token(work, env, token)
+        assert self._decide(work, env, self.REG, cwd=work / "sub") == "allow"
+        assert token.exists()
+
+    def test_a_nested_repo_spends_the_token_on_approval(self, repo):
+        work, env, token = repo
+        nested = work / "vendor"
+        nested.mkdir()
+        subprocess.run(["git", "-C", str(nested), "init", "-q"], env=env, check=True)
+        self._write_token(work, env, token)
+        assert self._decide(work, env, self.REG, cwd=nested) == "allow"
+        assert not token.exists()
+
+    def test_the_408_shape_keeps_the_token(self, repo):
+        """The case #408 is about: a commit chained with a PR create that the
+        changelog hook denies. Nothing ran, so the token must survive."""
+        work, env, token = repo
+        self._write_token(work, env, token)
+        cmd = (f"git {self.C} -q -F msg.txt && "
+               "gh pr create --base develop --title 't' --body-file b.md")
+        assert self._decide(work, env, cmd) == "allow"
+        assert token.exists()
+
+    @pytest.mark.parametrize("cmd", [
+        # Each was measured landing commits on one kept token (#410 review).
+        "git submodule foreach -q 'git COMMIT -qam s'",
+        "c''d .claude/worktrees/wt && git COMMIT -qam w",
+        'c""d .claude/worktrees/wt && git COMMIT -qam w',
+        'git "-C" .claude/worktrees/wt COMMIT -m w',
+        "git checkout -q -b hop && git COMMIT -qam h && git checkout -q -",
+        "git switch -c hop && git COMMIT -qam h && git switch -",
+        "git COMMIT --amend --no-edit && git -C .claude/worktrees/wt COMMIT -m x",
+        "find .claude/worktrees -execdir git COMMIT -m x ;",
+        "env --chdir=.claude/worktrees/wt git COMMIT -m x",
+        "GIT_DIR=elsewhere git COMMIT -m x",
+        "git -c core.worktree=x COMMIT -m x",
+        "sh -c 'git COMMIT -m x'",
+        "git COMMIT -m x; git COMMIT -m y",
+        "git COMMIT -m $(cat msg)",
+        "git COMMIT -m x | cat",
+        "/usr/bin/git COMMIT -m x",
+        "git COMMIT -m x\\ y",
+        "git COMMIT -m 'unbalanced",
+        # A redirection does not split commands, so a leading one hides the
+        # command name: refused, the stricter reading.
+        "> out.txt git COMMIT -m wip",
+        # A redirection can plant a hook that commits elsewhere, and its
+        # target is not an argument (`> --amend` is no amend flag).
+        "echo 'git -C .claude/worktrees/wt COMMIT -m x' > .git/hooks/post-COMMIT && git COMMIT -m y",
+        "git COMMIT -m x > --amend",
+        "git COMMIT -m x 2>/dev/null",
+        # push runs a program; diff/log/show write files.
+        "git COMMIT --amend --no-edit && git push --receive-pack='git -C wt COMMIT -m h; false' . HEAD",
+        "git push -q origin HEAD && git COMMIT -m x",
+        "git diff --output=.git/hooks/post-COMMIT && git COMMIT -m x",
+        "git log --output=x && git COMMIT -m x",
+        "git COMMIT -m wip && gh pr checkout 5",
+        "git COMMIT -m wip\ncd .claude/worktrees/wt\ngit COMMIT -qam w",
+        # Quoted text bash still runs: the $, backtick and backslash guards
+        # are what refuse these. Each hides a cd and a second commit.
+        'git COMMIT -m "$(cd .claude/worktrees/wt && git COMMIT -qam w)"',
+        'git COMMIT -m "`cd .claude/worktrees/wt && git COMMIT -qam w`"',
+        "git COMMIT -m a \\'; cd .claude/worktrees/wt && git COMMIT -qam w; echo \\'",
+    ])
+    def test_a_command_not_proven_harmless_spends_the_token(self, repo, cmd):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        cmd = cmd.replace("COMMIT", self.C).replace("\\n", "\n")
+        assert self._decide(work, env, cmd) == "allow"
+        assert not token.exists()
+
+    @pytest.mark.parametrize("cmd", [
+        "git add -A && git COMMIT -m 'fix: x; y (z) #1 | w'",
+        "git COMMIT -m wip # ; cd .claude/worktrees/wt",
+        "(git COMMIT -m wip) && git status --short",
+        "echo ok && git COMMIT -m wip",
+        "git COMMIT -m wip\ngh issue comment 1 --body x",
+    ])
+    def test_a_harmless_command_keeps_the_token(self, repo, cmd):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        cmd = cmd.replace("COMMIT", self.C).replace("\\n", "\n")
+        assert self._decide(work, env, cmd) == "allow"
+        assert token.exists()
+
+    def test_an_amend_outside_the_project_spends_the_token(self, repo):
+        work, env, token = repo
+        wt = self._worktree(work, env)
+        self._write_token(work, env, token)
+        assert self._decide(work, env, self.AMEND, cwd=wt) == "allow"
+        assert not token.exists()
+
+    def test_a_quoted_pipe_in_the_message_does_not_hide_the_amend(self, repo):
+        work, env, token = repo
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token)
+        self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "amended")
+        cmd = f'git {self.C} -m "|" --amend'
+        assert self._decide(work, env, cmd) == "allow"
+
+    def test_amend_after_a_double_dash_is_a_path_not_a_flag(self, repo):
+        work, env, token = repo
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token)
+        self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "amended")
+        assert self._decide(work, env, f"git {self.C} -m x -- --amend") == "deny"
+
+    # --- tokens that cannot be trusted --------------------------------------
+
+    def test_a_token_without_head_is_still_spent_on_approval(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token, with_head=False)
+        assert self._decide(work, env, self.REG) == "allow"
+        assert not token.exists()
+        assert self._decide(work, env, self.REG) == "deny"
+
+    def test_an_empty_head_from_a_repo_with_no_commits_is_spent_on_approval(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token, head="")
+        assert self._decide(work, env, self.REG) == "allow"
+        assert not token.exists()
+
+    def test_an_expired_token_is_still_denied(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token, expires=int(time.time()) - 1)
+        assert self._decide(work, env, self.REG) == "deny"
+
+    @pytest.mark.parametrize("raw", [
+        "[1, 2]", '"abc"', "null", '{"expires": "9"}', '{"expires": null}',
+        '{"expires": NaN}', '{"expires": Infinity}', '{"expires": true}',
+        '{"expires": 1.5e99}', b"\xff\xfe\x00",
+        # A short id: pytest puts the test id in PYTEST_CURRENT_TEST, and
+        # Linux refuses an env string over 128 KB (E2BIG) when git starts.
+        pytest.param("[" * 100_000 + "]" * 100_000, id="deep-nesting"),
+    ])
+    def test_a_malformed_token_is_denied_not_crashed_on(self, repo, raw):
+        """A crash exits 1, a non-blocking error, and the commit runs. These
+        were each measured crashing (or, for NaN/Infinity, never expiring)
+        before the shape check."""
+        work, env, token = repo
+        if isinstance(raw, bytes):
+            token.write_bytes(raw)
+        else:
+            token.write_text(raw)
+        assert self._decide(work, env, self.REG) == "deny"
+
+    @pytest.mark.parametrize("bad", ["--output=/tmp/x", "HEAD", "HEAD~0", "abc", 7,
+                                     "A" * 40])
+    @pytest.mark.parametrize("amend", [False, True])
+    def test_a_malformed_head_is_denied_and_never_reaches_git(self, repo, bad, amend):
+        """Only a full lowercase hex SHA is read. Without that check, `HEAD~0`
+        names a commit whose parent is always HEAD's parent, so every amend
+        passed. A logging `git` shim proves the value is never an argument."""
+        work, env, token = repo
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token, head=bad)
+        log = work.parent / "git-argv.log"
+        shim = work.parent / "shim"
+        shim.mkdir()
+        (shim / "git").write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$*" >> "{log}"\n'
+            f'exec "{shutil.which("git")}" "$@"\n')
+        (shim / "git").chmod(0o755)
+        env = dict(env, PATH=f"{shim}{os.pathsep}{env.get('PATH', '')}")
+        cmd = self.AMEND if amend else self.REG
+        assert self._decide(work, env, cmd) == "deny"
+        assert not token.exists()
+        calls = log.read_text().splitlines() if log.exists() else []
+        # No git argument is, or is built from, the bad value.
+        assert not any(arg == str(bad) or arg.startswith(str(bad) + "^")
+                       for call in calls for arg in call.split()), calls
+
+    def test_a_git_failure_denies_and_keeps_the_token(self, repo):
+        """git failing says nothing about whether the token was used, so the
+        commit is refused (fail closed) but the token is not thrown away."""
+        work, env, token = repo
+        self._write_token(work, env, token)
+        shim = work.parent / "broken"
+        shim.mkdir()
+        (shim / "git").write_text("#!/bin/sh\nexit 1\n")
+        (shim / "git").chmod(0o755)
+        env = dict(env, PATH=f"{shim}{os.pathsep}{env.get('PATH', '')}")
+        assert self._decide(work, env, self.REG) == "deny"
+        assert token.exists()
+
+    def test_a_sha256_head_is_accepted(self, tmp_path):
+        work = tmp_path / "s256"
+        shutil.copytree(Path(".claude/hooks"), work / ".claude/hooks")
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX"))}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                   CLAUDE_PROJECT_DIR=str(work))
+        init = subprocess.run(["git", "-C", str(work), "init", "-q",
+                               "--object-format=sha256", "-b", "feature/probe"],
+                              env=env, capture_output=True)
+        if init.returncode != 0:
+            pytest.skip("this git cannot make a SHA-256 repo")
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "seed")
+        token = self._token_path(work)
+        try:
+            self._write_token(work, env, token)
+            assert len(json.loads(token.read_text())["head"]) == 64
+            assert self._decide(work, env, self.REG) == "allow"
+            assert token.exists()
+        finally:
+            token.unlink(missing_ok=True)
+
+    # --- the producer ---------------------------------------------------------
+
+    def test_preflight_writes_head_into_every_token(self):
+        src = Path("scripts/commit-preflight.sh").read_text(encoding="utf-8")
+        assert src.count("TOKEN_DATA=$(cat <<EOF") == 2
+        assert src.count('"head": "$TOKEN_HEAD"') == 2
+
+    def test_the_real_preflight_records_head_and_the_hook_accepts_it(self, repo):
+        """End to end through the script's skip-tests path (the full path
+        runs this suite): the token it writes names HEAD, and the hook keeps
+        it for a commit in the project."""
+        work, env, token = repo
+        (work / "scripts").mkdir()
+        shutil.copy("scripts/commit-preflight.sh", work / "scripts")
+        (work / "f.txt").write_text("x")
+        self._git(work, env, "add", "f.txt")
+        proc = subprocess.run(
+            ["bash", "scripts/commit-preflight.sh", "--skip-tests", "probe"],
+            cwd=work, env=env, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stdout[-400:] + proc.stderr[-400:]
+        assert json.loads(token.read_text())["head"] == self._git(
+            work, env, "rev-parse", "HEAD")
+        assert self._decide(work, env, self.REG) == "allow"
+        assert token.exists()
