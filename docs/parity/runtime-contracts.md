@@ -43,16 +43,47 @@ evidence.
 | --- | --- | --- |
 | No-auth installation | Observed | Both isolated native binaries installed the package |
 | Explicit Codex manifest selection | Observed | Both selected the probe hook file and its timeout |
-| Hook trust | Pending | Native review UI reached; execution approval pending |
-| Start and resume | Pending | Capture native payload and rollout identity |
-| Stop and loop protection | Pending | Exercise JSON blocking output and `stop_hook_active` |
-| Compaction | Pending | Capture native event and transcript layout |
-| End and deadline | Pending | Measure native dispatch and bounded handler exit |
-| Fork and interruption | Pending | Record identity and interrupted transcript behavior |
-| Skill resource handoff | Pending | Run an installed skill and resolve its package root |
-| Native AI execution | Pending | Use the client's normal authentication and model |
-| Desktop lifecycle | Pending | Computer-use access to the desktop app was denied; a temporary test task requires the user's explicit request |
-| Cold startup and bounded recovery | Pending | Measure the installed handler after native trust |
+| Hook trust | Observed in CLI | User approved four temporary probe handlers; native `/hooks` trusted only those handlers |
+| Start and resume | Observed in CLI | Native `source` values `startup`, `resume`, and `fork`; event IDs match rollout metadata |
+| Stop and loop protection | Observed in CLI | Block JSON caused one `PROBE_CONTINUED` response, followed by `stop_hook_active=true` and `{}` |
+| Compaction | Observed in CLI | Native `trigger=manual`; rollout contains a `compacted` record |
+| End and deadline | Partly observed in CLI | `reason=other` on exit; a four-second handler did not reach its completion marker with the native three-second timeout. Exact cutoff time was not measured |
+| Fork and interruption | Observed in CLI | Fork created a different thread ID; interrupted tool output retained the fork ID and native UI reported interruption |
+| Skill resource handoff | Observed in CLI | Installed skill resolved its adjacent `probe.py` and package descriptor independently of cwd |
+| Native AI execution | Observed | CLI used the user's configured `gpt-6.1-sol`; desktop used its existing task settings. Both ran synthetic identity checks |
+| Desktop lifecycle | Partly observed | Authorized temporary desktop task's tool ID matched rollout metadata; task archived after the check. Desktop hook-manager access remains denied by computer-use tooling |
+| Nested Claude inside Codex | Startup observed | Claude Code `2.1.289` emitted a different native session ID while inheriting the Codex thread ID; the isolated probe timed out after 45 seconds without completion |
+| Cold startup and bounded recovery | Pending | Final runtime handlers do not exist yet; measure their interpreter startup, writer work, recovery bounds, and end deadline after implementation |
+
+## CLI execution evidence
+
+`tests/fixtures/hosts/codex-cli-0.159.0-alpha.12.1-lifecycle.jsonl` records
+allowlisted fields from the disposable observer. Every event's session ID was
+checked against the referenced rollout's `session_meta.payload.id` before export.
+The Stop block and continuation were also visible in the native CLI.
+
+Native hook commands had `PLUGIN_ROOT` and `PLUGIN_DATA`, but no
+`CODEX_THREAD_ID`. The installed skill's tool shell had the matching
+`CODEX_THREAD_ID`, but neither plugin environment variable. Skill resource paths
+must therefore resolve from the installed skill location; hook paths can use
+the hook-specific resource handoff.
+
+The nested Claude startup fixture records only allowlisted metadata. Its native
+Claude session ID differs from the inherited Codex ID. This establishes why
+explicit host selection must take precedence over an inherited thread variable.
+The probe's 45-second timeout does not establish Claude AI completion, End hook
+dispatch, or a reason for the timeout.
+
+SessionStart on resume was observed when the resumed thread began its next
+turn. Opening the resume UI alone did not establish dispatch. Fork history
+retained the parent's old tool output; the new tool invocation returned the
+fork's ID. An adapter must use current native identity, not inherited messages.
+
+The timeout probe logged its entry, slept for four seconds, and would have
+written `timeout-completed` afterward. Native exit completed without that
+marker. The logged `handler_elapsed_ms` covers handler work before log writing;
+it excludes interpreter startup, fsync, and the deliberate sleep. It is not a
+measurement of the final capture implementation's deadline.
 
 ## Sources
 

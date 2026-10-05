@@ -1,0 +1,106 @@
+{
+  "recorded_at": "2026-10-05",
+  "desktop_hook_dispatch_verified": false,
+  "candidates": [
+    {
+      "client": "codex-cli",
+      "client_version": "0.159.0-alpha.12.1",
+      "thread_id": "01a10c1b-7f42-7093-855a-2522456861b9",
+      "native_metadata": {
+        "cli_version": "0.159.0-alpha.12.1",
+        "source": "cli",
+        "originator": "codex-tui"
+      },
+      "record_type_counts": {
+        "session_meta": 1,
+        "event_msg": 14,
+        "response_item": 9,
+        "world_state": 1,
+        "turn_context": 1,
+        "token_usage_record": 3,
+        "compacted": 1
+      },
+      "redaction_counts": {
+        "developer_body": 5,
+        "user_body": 1,
+        "context_payload": 13,
+        "turn_context": 9,
+        "creator_user_id": 1,
+        "creator_account_id": 1,
+        "base_instructions": 1,
+        "token_usage_record_payload": 3,
+        "token_count_payload": 3
+      },
+      "private_path_assertion": "passed",
+      "fixture_filename": "codex-cli-0.159.0-alpha.12.1-original.jsonl",
+      "fixture_sha256": "9e4e23ad1ec5a04a46d7909b1d7bb62c04eff3a8fa05e6aacbcb0b02a688cde8"
+    },
+    {
+      "client": "codex-cli",
+      "client_version": "0.159.0-alpha.12.1",
+      "thread_id": "01a10ce5-b3ce-79c3-9e67-827b41ab9a7a",
+      "native_metadata": {
+        "cli_version": "0.159.0-alpha.12.1",
+        "source": "cli",
+        "originator": "codex-tui",
+        "forked_from_id": "01a10c1b-7f42-7093-855a-2522456861b9"
+      },
+      "record_type_counts": {
+        "session_meta": 1,
+        "event_msg": 22,
+        "response_item": 20,
+        "world_state": 2,
+        "turn_context": 2,
+        "token_usage_record": 5
+      },
+      "redaction_counts": {
+        "inherited_body": 46,
+        "context_payload": 4,
+        "turn_context": 18,
+        "developer_body": 2,
+        "user_body": 1,
+        "creator_user_id": 1,
+        "creator_account_id": 1,
+        "base_instructions": 1,
+        "token_usage_record_payload": 5,
+        "token_count_payload": 5
+      },
+      "private_path_assertion": "passed",
+      "fixture_filename": "codex-cli-0.159.0-alpha.12.1-fork.jsonl",
+      "fixture_sha256": "9c5b8620219321a063a1869a4b26a1d7210527f0cb7c23dae1879492ced05274"
+    },
+    {
+      "client": "codex-desktop-bundle",
+      "client_version": "0.159.0-alpha.12.1",
+      "thread_id": "01a10ce2-7898-7b01-889f-80c112ac9118",
+      "native_metadata": {
+        "cli_version": "0.159.0-alpha.12.1",
+        "source": "vscode",
+        "originator": "Codex Desktop"
+      },
+      "record_type_counts": {
+        "session_meta": 1,
+        "event_msg": 8,
+        "response_item": 11,
+        "world_state": 1,
+        "turn_context": 1,
+        "token_usage_record": 2
+      },
+      "redaction_counts": {
+        "developer_body": 9,
+        "user_body": 2,
+        "context_payload": 2,
+        "turn_context": 11,
+        "creator_user_id": 1,
+        "creator_account_id": 1,
+        "base_instructions": 1,
+        "token_usage_record_payload": 2,
+        "token_count_payload": 2
+      },
+      "private_path_assertion": "passed",
+      "fixture_filename": "codex-desktop-0.159.0-alpha.12.1-session.jsonl",
+      "fixture_sha256": "5de5e547246d19c3b59d0c968f5c704db252fd45ef76561c6766c09bfb8ba603"
+    }
+  ],
+  "privacy_metadata_assertion": "passed"
+}

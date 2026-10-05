@@ -99,3 +99,56 @@ def test_checked_in_observations_have_pinned_versions_and_no_home_paths(tmp_path
         report = json.loads(result.stdout)
         assert {hook["event"] for hook in report["hooks"]} == {"sessionStart", "preCompact", "sessionEnd", "stop"}
         assert report["runtime_verified"] is False
+
+
+def test_native_cli_lifecycle_preserves_thread_identity_and_stop_loop():
+    path = ROOT / "tests" / "fixtures" / "hosts" / "codex-cli-0.159.0-alpha.12.1-lifecycle.jsonl"
+    assert path.is_file(), "Native lifecycle evidence is missing"
+    raw = path.read_text(encoding="utf-8")
+    assert "/Users/" not in raw and "/private/tmp/" not in raw
+    events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    starts = {event.get("source"): event for event in events if event["hook_event_name"] == "SessionStart"}
+    assert {"startup", "resume", "fork"} <= set(starts)
+    assert starts["startup"]["session_id"] != starts["fork"]["session_id"]
+    assert starts["resume"]["session_id"] == starts["fork"]["session_id"]
+    assert any(event["hook_event_name"] == "PreCompact" and event["trigger"] == "manual" for event in events)
+    assert any(event["hook_event_name"] == "SessionEnd" for event in events)
+    for event in events:
+        assert event["session_id"] in event["transcript_path"]
+        assert event["plugin_root_present"] and event["plugin_data_present"]
+        assert event["native_thread_id"] is None
+    stops = [event for event in events if event["hook_event_name"] == "Stop"]
+    block = next(event for event in stops if event["hook_output"].get("decision") == "block")
+    assert block["stop_hook_active"] is False
+    continuation = [event for event in stops if event["turn_id"] == block["turn_id"] and event["stop_hook_active"]]
+    assert len(continuation) == 1
+    assert continuation[0]["session_id"] == block["session_id"]
+    assert continuation[0]["hook_output"] == {}
+
+
+@pytest.mark.parametrize("name,sid,required", [
+    ("codex-cli-0.159.0-alpha.12.1-original.jsonl", "01a10c1b-7f42-7093-855a-2522456861b9", {"compacted"}),
+    ("codex-cli-0.159.0-alpha.12.1-fork.jsonl", "01a10ce5-b3ce-79c3-9e67-827b41ab9a7a", {"turn_aborted"}),
+    ("codex-desktop-0.159.0-alpha.12.1-session.jsonl", "01a10ce2-7898-7b01-889f-80c112ac9118", {"task_complete"}),
+])
+def test_native_transcript_layouts_keep_metadata_tools_and_mirrors(name, sid, required):
+    path = ROOT / "tests" / "fixtures" / "hosts" / name
+    assert path.is_file(), "Native transcript fixture is missing"
+    raw = path.read_text(encoding="utf-8")
+    assert "/Users/" not in raw and "/private/tmp/" not in raw
+    rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    assert rows[0]["type"] == "session_meta"
+    assert rows[0]["payload"]["id"] == sid
+    assert rows[0]["payload"]["cli_version"] == "0.159.0-alpha.12.1"
+    if "desktop" in name:
+        assert rows[0]["payload"]["originator"] == "Codex Desktop"
+        assert rows[0]["payload"]["source"] == "vscode"
+    else:
+        assert rows[0]["payload"]["source"] == "cli"
+    if "fork" in name:
+        assert rows[0]["payload"]["forked_from_id"] == "01a10c1b-7f42-7093-855a-2522456861b9"
+    envelopes = {row["type"] for row in rows}
+    payload_types = {row.get("payload", {}).get("type") for row in rows}
+    assert {"response_item", "event_msg", "turn_context"} <= envelopes
+    assert {"custom_tool_call", "custom_tool_call_output", "item_completed"} <= payload_types
+    assert required <= envelopes | payload_types

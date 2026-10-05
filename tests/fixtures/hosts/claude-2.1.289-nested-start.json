@@ -1,0 +1,17 @@
+{
+  "client": "claude-code",
+  "version": "2.1.289",
+  "recorded_at": "2026-10-05",
+  "execution_completed": false,
+  "probe_timeout_seconds": 45,
+  "events": [
+    {
+      "hook_event_name": "SessionStart",
+      "session_id": "9fb6a76a-5710-4c74-96b5-d36696c546f5",
+      "transcript_path": "<home>/9fb6a76a-5710-4c74-96b5-d36696c546f5.jsonl",
+      "cwd": "<sandbox>",
+      "source": "startup",
+      "inherited_codex_thread_id": "01a10ce5-b3ce-79c3-9e67-827b41ab9a7a"
+    }
+  ]
+}
