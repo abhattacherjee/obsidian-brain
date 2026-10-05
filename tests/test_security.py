@@ -1768,22 +1768,43 @@ _MATRIX_SIZES_KB = (4, 64, 900)
 # better. A quadratic term is still unmistakable long before an absolute
 # ceiling would fire -- at these sizes the pre-fix hook does not finish a
 # single affected cell.
-_GROWTH_SIZES_KB = (128, 256, 512)
+#
+# #413 moved them up once more, to the largest doubling that fits under the
+# hooks' 1,000,000-byte stdin cap (900 KB is 921,600 bytes). The noise floor
+# below now scales with the baseline, and more work per cell is what keeps a
+# small quadratic above it: at 128/256/512 KB a term costing 6/24/96 ms of
+# work was skipped against a 60 ms baseline (Codex, PR #415).
+_GROWTH_SIZES_KB = (225, 450, 900)
 
 # Best-of-N per cell. `min` picks the least-contended run, which is what makes
 # a wall-clock measurement mean something on a machine running several agents
 # at once -- the condition under which this suite has actually been observed
 # to slow from 4:00 to 6:09.
-_GROWTH_REPS = 3
+_GROWTH_REPS = 5
 
 # Below this, a cell's work time is measurement noise rather than signal, and
 # a ratio computed from it is meaningless. Measured: on the fixed code the
 # smallest cells sit at 0.5-3 ms and produce ratios anywhere from 1.1 to 2.2
 # purely from jitter; on the PRE-fix code two shapes with sub-millisecond work
 # produced 4.60 and 4.06, which would have been false alarms rather than the
-# real quadratic sitting beside them. Cells under the floor are covered by the
-# absolute ceiling in `test_generated_shape_within_budget` instead.
+# real quadratic sitting beside them. A pair under the floor is not compared.
+# The absolute ceiling in `test_generated_shape_within_budget` is no backstop
+# for a mild quadratic: on PR #415 a planted term (command.count run
+# len//1000 times) passed all 27 of its prevent-direct-push cells.
 _GROWTH_MIN_WORK_MS = 3.0
+
+# The floor must also scale with the baseline it is measured against (#413).
+# Under load the baseline (interpreter start-up plus git calls) swung from 56
+# to 84 ms between measurements, while the smaller cells did 14-30 ms of work,
+# so a fixed 3 ms floor let scheduler noise read as growth: 8 of 10 runs
+# failed under 12 CPU burners (load average 66-80), with ratios up to 11.6x on
+# shapes that are plainly linear. A pair is compared only when its smaller
+# cell's work is at least this fraction of the baseline measured beside it.
+# A quadratic term is still caught once the SMALLER cell of a pair clears the
+# floor; PR #415 shows planted terms failing the test. Below that, a quadratic
+# can go unseen, and more so under load, because the floor rises with the
+# baseline. The catastrophic case never finishes a cell at all.
+_GROWTH_MIN_WORK_FRACTION = 0.5
 
 # Linear work doubles when the input doubles, so an honest ratio sits near
 # 2.0; quadratic work quadruples. Measured across all nine shapes on the fixed
@@ -2151,13 +2172,13 @@ class TestDecisionTimeIsBounded:
                 best = elapsed if best is None else min(best, elapsed)
             return best
 
-        # The fixed cost of getting in and out of the hook at all, measured
-        # here rather than assumed, so load moves it with the samples.
-        baseline = measure("git pu" + "sh origin feature/probe")
-        assert baseline is not None, "the baseline command itself timed out"
-
         works = []
         for kb in _GROWTH_SIZES_KB:
+            # The fixed cost of getting in and out of the hook at all,
+            # measured right before each cell rather than once, so the load
+            # the cell sees moves its baseline too (#413).
+            baseline = measure("git pu" + "sh origin feature/probe")
+            assert baseline is not None, "the baseline command itself timed out"
             elapsed = measure(_matrix_command(f"{unit} @ {kb}KB"))
             if elapsed is None:
                 pytest.fail(
@@ -2166,19 +2187,29 @@ class TestDecisionTimeIsBounded:
                     f"growth over separator or quote density (the fixed code "
                     f"costs single-digit milliseconds of work here)"
                 )
-            works.append((kb, max(elapsed - baseline, 0.0)))
+            works.append((kb, max(elapsed - baseline, 0.0), baseline))
 
-        for (kb_a, work_a), (kb_b, work_b) in zip(works, works[1:]):
-            if work_a < _GROWTH_MIN_WORK_MS:
-                continue  # noise, not signal -- see _GROWTH_MIN_WORK_MS
+        compared = 0
+        for (kb_a, work_a, base_a), (kb_b, work_b, baseline) in zip(works, works[1:]):
+            if work_a < max(_GROWTH_MIN_WORK_MS, _GROWTH_MIN_WORK_FRACTION * base_a):
+                continue  # noise, not signal -- see _GROWTH_MIN_WORK_FRACTION
+            compared += 1
             ratio = work_b / work_a
             assert ratio < _GROWTH_MAX_RATIO, (
                 f"prevent-direct-push work grew {ratio:.2f}x for {unit!r} "
                 f"when the input doubled from {kb_a}KB to {kb_b}KB "
-                f"({work_a:.1f}ms -> {work_b:.1f}ms over a {baseline:.1f}ms "
-                f"baseline), past the {_GROWTH_MAX_RATIO}x bound. Linear "
+                f"({work_a:.1f}ms -> {work_b:.1f}ms over baselines of "
+                f"{base_a:.1f}ms and {baseline:.1f}ms), past the "
+                f"{_GROWTH_MAX_RATIO}x bound. Linear "
                 f"work doubles; quadratic work quadruples."
             )
+        if not compared:
+            # Say so rather than pass having compared nothing: the smaller
+            # cell of every pair was under the noise floor, so this run
+            # measured no growth at all.
+            pytest.skip(f"{unit!r}: the smaller cell of every pair was under the "
+                        f"noise floor (kb, work ms, baseline ms): "
+                        f"{[(kb, round(w, 1), round(bs, 1)) for kb, w, bs in works]}")
 
 
 def _hook_regex_constants(hook):
