@@ -1,9 +1,9 @@
 {
   "name": "obsidian-brain",
   "displayName": "Obsidian Brain",
-  "version": "3.8.0",
+  "version": "3.8.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-10-04",
+  "lastUpdated": "2026-10-05",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -1077,7 +1077,7 @@
           "files": [
             "scripts/commit-preflight.sh"
           ],
-          "purpose": "Creates a 5-minute token consumed by the require-preflight hook. Enforces (always-on) manifest version sync, then secret scan, then pytest with cov-fail-under 90. Flags: --docs-only, --skip-tests, --auto."
+          "purpose": "Creates a 5-minute token, tied to the current HEAD, for the require-preflight hook. A commit is allowed only while HEAD still matches (an amend: while HEAD's first parent matches). The hook keeps the token on approval only for an exactly-parsed, allowlisted command run in the project's own checkout, so a call another hook denies does not spend it; any other command spends it on approval (#408). Enforces (always-on) manifest version sync, then secret scan, then pytest with cov-fail-under 90. Flags: --docs-only, --skip-tests, --auto."
         },
         {
           "id": "ops-ci",
