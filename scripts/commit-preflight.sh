@@ -1,7 +1,8 @@
 #!/bin/bash
 # Commit Preflight Check
 # Must be run before git commit to verify tests pass.
-# Creates a one-time token that the require-preflight.py hook validates.
+# Creates a token, tied to the current HEAD, that the require-preflight.py
+# hook checks.
 #
 # Usage:
 #   ./scripts/commit-preflight.sh              # Full verification
@@ -23,6 +24,9 @@ TOKEN_EXPIRY_SECONDS=300  # Token valid for 5 minutes
 # while HEAD still matches, so a call another hook denies does not spend
 # the token (#408). Empty in a repo with no commits yet.
 TOKEN_HEAD=$(git -C "$PROJECT_DIR" rev-parse --verify -q HEAD 2>/dev/null || true)
+if [ -z "$TOKEN_HEAD" ]; then
+    echo "note: no HEAD to record; the token will be spent on the first commit it allows"
+fi
 
 # Parse arguments
 SKIP_TESTS=false

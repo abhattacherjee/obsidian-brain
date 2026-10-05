@@ -1077,7 +1077,7 @@
           "files": [
             "scripts/commit-preflight.sh"
           ],
-          "purpose": "Creates a 5-minute token, tied to the current HEAD, for the require-preflight hook; a commit is allowed only while HEAD still matches, so only a commit that really lands spends it (#408). Enforces (always-on) manifest version sync, then secret scan, then pytest with cov-fail-under 90. Flags: --docs-only, --skip-tests, --auto."
+          "purpose": "Creates a 5-minute token, tied to the current HEAD, for the require-preflight hook. A commit is allowed only while HEAD still matches (an amend: while HEAD's first parent matches); a commit that provably runs in the project's own checkout keeps the token on approval, so a call another hook denies does not spend it, and any other commit spends it on approval (#408). Enforces (always-on) manifest version sync, then secret scan, then pytest with cov-fail-under 90. Flags: --docs-only, --skip-tests, --auto."
         },
         {
           "id": "ops-ci",
