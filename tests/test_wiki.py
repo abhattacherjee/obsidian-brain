@@ -343,7 +343,9 @@ def test_file_golden_page(ctx):
         "---\n"
         "Ranking uses bm25.\n\n### Sources\n- [[i1]]\n"
     )
-    assert text == expected
+    # The retry identity is additive; the existing page format remains exact.
+    assert re.search(r'filing_id: "[0-9a-f]{64}"\n', text)
+    assert re.sub(r'filing_id: "[0-9a-f]{64}"\n', "", text) == expected
 
 
 @pytest.mark.parametrize("kw,msg", [
@@ -625,8 +627,9 @@ def test_corrupt_log_does_not_block_filing(ctx):
     _wiki(ctx).mkdir(parents=True)
     (_wiki(ctx) / "log-2026.md").write_bytes(b"---\ntype: \"claude-wiki-index\"\n---\n\xff\xfe bad\n")
     out = wiki.file_page(ctx, _payload(), D)
-    assert "warning" not in out
-    assert "## [2026-10-04] file" in (_wiki(ctx) / "log-2026.md").read_text(encoding="utf-8")
+    assert Path(out["path"]).is_file()
+    assert out["warning"].startswith("page saved, but the log update failed:")
+    assert (_wiki(ctx) / "log-2026.md").read_bytes().endswith(b"\xff\xfe bad\n")
 
 
 def test_index_and_lookup_show_unescaped_question(ctx):
@@ -771,9 +774,9 @@ def test_index_and_log_writes_are_contained(ctx):
     calls = []
     real = wiki._write
 
-    def spy(c, rel, name, content):
+    def spy(c, rel, name, content, expected_revision="unspecified"):
         calls.append(name)
-        return real(c, rel, name, content)
+        return real(c, rel, name, content, expected_revision)
 
     wiki._write = spy
     try:
@@ -1070,3 +1073,120 @@ def test_stale_uses_a_given_memory_listing(ctx, mem, monkeypatch):
     r = wiki.stale(ctx["db"], page, _roots_of(ctx), memory_listing=listing)
     assert calls == [] and r["reasons"] == ["missing: memory:proj/x.md"]
     assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == [] and calls == [1]
+
+
+def test_filing_owns_vault_before_legacy_wiki_lock(ctx, monkeypatch):
+    import note_transactions as tx
+    import note_writer
+    real = note_writer._acquire_lock
+    seen = []
+
+    def check(path):
+        held = getattr(tx._HELD, "locks", {})
+        assert held, "vault ownership must precede the wiki lock"
+        seen.append(path)
+        return real(path)
+
+    monkeypatch.setattr(note_writer, "_acquire_lock", check)
+    wiki.file_page(ctx, _payload(), D)
+    assert len(seen) == 1
+
+
+def test_index_render_cannot_overwrite_manual_edit(ctx, monkeypatch):
+    wiki.file_page(ctx, _payload(), D)
+    path = _wiki(ctx) / "index.md"
+    original = wiki.render_wiki_index
+
+    def edited(c):
+        result = original(c)
+        path.write_text("my manual index\n")
+        return result
+
+    monkeypatch.setattr(wiki, "render_wiki_index", edited)
+    with pytest.raises(wiki.WikiRefusal, match="conflict"):
+        wiki.rebuild_wiki_index(ctx)
+    assert path.read_text() == "my manual index\n"
+
+
+@pytest.mark.parametrize("stage", ["index", "log"])
+def test_exact_retry_after_stage_failure_keeps_one_page(ctx, monkeypatch, stage):
+    name = "rebuild_wiki_index" if stage == "index" else "append_log"
+    real = getattr(wiki, name)
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(wiki, name, fail)
+    first = wiki.file_page(ctx, _payload(), D)
+    monkeypatch.setattr(wiki, name, real)
+    second = wiki.file_page(ctx, _payload(), D)
+    assert first["path"] == second["path"]
+    assert len(list((_wiki(ctx) / "queries").rglob("*.md"))) == 1
+    third = wiki.file_page(ctx, _payload(), D)
+    assert third["path"] == first["path"]
+    assert (_wiki(ctx) / "log-2026.md").read_text().count("- Created:") == 1
+
+
+def test_stale_index_deletion_preserves_edit_after_revision_read(ctx, monkeypatch):
+    wiki.file_page(ctx, _payload(), D)
+    stale = _wiki(ctx) / "index-unused.md"
+    stale.write_text(wiki._index_header("old index"))
+    original = wiki.read_page
+
+    def edit(path):
+        result = original(path)
+        if Path(path) == stale:
+            stale.write_text("my manual note\n")
+        return result
+
+    monkeypatch.setattr(wiki, "read_page", edit)
+    with pytest.raises(wiki.WikiRefusal, match="index deletion conflict"):
+        wiki.rebuild_wiki_index(ctx)
+    assert stale.read_text() == "my manual note\n"
+
+
+def test_log_append_preserves_edit_after_read(ctx, monkeypatch):
+    import note_transactions as tx
+    wiki.file_page(ctx, _payload(), D)
+    log = _wiki(ctx) / "log-2026.md"
+    original = tx.record_read
+
+    def edit(context, path, text):
+        revision = original(context, path, text)
+        if Path(path) == log:
+            log.write_text("my manual log\n")
+        return revision
+
+    monkeypatch.setattr(tx, "record_read", edit)
+    with pytest.raises(wiki.WikiRefusal, match="conflict"):
+        wiki.append_log(ctx, "file", "", "another question", "another-page", D)
+    assert log.read_text() == "my manual log\n"
+
+
+def test_index_file_symlink_cannot_write_elsewhere_in_vault(ctx):
+    outside = Path(ctx["vault"]) / "claude-insights" / "outside.md"
+    outside.write_text("keep this\n")
+    _wiki(ctx).mkdir(parents=True)
+    (_wiki(ctx) / "index.md").symlink_to(outside)
+    with pytest.raises(wiki.WikiRefusal, match="outside the wiki folder"):
+        wiki.rebuild_wiki_index(ctx)
+    assert outside.read_text() == "keep this\n"
+
+
+def test_obsolete_index_symlink_cannot_delete_elsewhere_in_vault(ctx):
+    wiki.file_page(ctx, _payload(), D)
+    outside = Path(ctx["vault"]) / "claude-insights" / "outside.md"
+    outside.write_text(wiki._index_header("keep this"))
+    (_wiki(ctx) / "index-unused.md").symlink_to(outside)
+    with pytest.raises(wiki.WikiRefusal, match="outside the wiki folder"):
+        wiki.rebuild_wiki_index(ctx)
+    assert outside.is_file()
+
+
+def test_corrupt_name_collision_is_preserved_and_gets_suffix(ctx):
+    path = _wiki(ctx) / "queries" / "2026" / "10-04-how-does-zebracorn-ranking-work.md"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"user note\xff")
+    out = wiki.file_page(ctx, _payload(), D)
+    assert out["path"].endswith("ranking-work-2.md")
+    assert path.read_bytes() == b"user note\xff"

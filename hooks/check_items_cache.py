@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
+import uuid
+import threading
 import hashlib
 import json
 import os
@@ -56,6 +59,15 @@ def canonical_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
+def _cache_path() -> Path:
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        from note_transactions import session_state_path
+        return session_state_path(context) / "cache" / "check-items-classifications.json"
+    return CACHE_PATH
+
+
 def _empty_cache() -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "runs": {}}
 
@@ -88,13 +100,15 @@ def load_cache(*, with_status: bool = False):
     must NOT blindly save over the (empty) result it was handed -- see
     `locked_cache()`, the only caller that currently does (#323 F1).
     """
+    path = _cache_path()
+
     def _ret(data, status):
         return (data, status) if with_status else data
 
-    if not CACHE_PATH.exists():
+    if not path.exists():
         return _ret(_empty_cache(), None)
     try:
-        with CACHE_PATH.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as exc:
         print(f"[check-items-cache] WARNING: cache load failed ({exc}); using empty cache",
@@ -114,9 +128,12 @@ def load_cache(*, with_status: bool = False):
 
 def save_cache(data: dict[str, Any]) -> None:
     """Atomically write the cache with 0o600 permissions."""
-    CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = _cache_path()
+    directory = path.parent
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
     tmp = tempfile.NamedTemporaryFile(
-        mode="w", delete=False, dir=str(CACHE_DIR), suffix=".tmp", encoding="utf-8"
+        mode="w", delete=False, dir=str(directory), suffix=".tmp", encoding="utf-8"
     )
     try:
         json.dump(data, tmp, indent=2, default=str)
@@ -135,24 +152,14 @@ def save_cache(data: dict[str, Any]) -> None:
         raise
     else:
         tmp.close()
-    os.replace(tmp.name, str(CACHE_PATH))
-    os.chmod(str(CACHE_PATH), 0o600)
+    os.replace(tmp.name, str(path))
+    os.chmod(str(path), 0o600)
 
 
-# #306: load_cache() -> save_cache() is an unlocked read-modify-write. Nothing
-# stops a run on project B from loading a stale snapshot, a run on project A
-# completing in between, and B's save overwriting the whole document --
-# silently erasing A's entry. locked_cache() below wraps the cycle in mutual
-# exclusion, following the shape of claim_hook_run() in obsidian_utils.py
-# (O_EXCL create, stale-TTL takeover, fail-open on any filesystem error) but
-# NOT importing from it -- this module has no such dependency today and must
-# keep none. The two differ in one deliberate way: claim_hook_run() is a
-# dedup where a contended loser correctly abandons its own work; this is
-# mutual exclusion where a contended caller's write must still land, so
-# contention here polls until timeout rather than giving up immediately.
-
+# Cache ownership is independent of vault writer ownership. Retain the lock
+# inode; a crashed holder releases its OS lock without an age takeover.
 _LOCK_TIMEOUT_SECONDS = 10.0   # max time locked_cache() waits for a contended lock
-_LOCK_STALE_SECONDS = 30.0     # age past which a lock is presumed abandoned (crashed holder)
+_LOCK_STALE_SECONDS = 30.0     # legacy age helper only; never grants ownership
 _LOCK_POLL_INTERVAL_SECONDS = 0.05
 # #323 F7: _lock_payload() formats its timestamp with `.3f` (millisecond
 # precision), which ROUNDS -- up to ~0.5ms toward the future. A lock read
@@ -171,73 +178,34 @@ _LOCK_POLL_INTERVAL_SECONDS = 0.05
 _LOCK_AGE_ROUNDING_TOLERANCE_SECONDS = 0.01
 
 
+_OWNED_LOCKS = {}
+_OWNERS_GUARD = threading.Lock()
+
+
 def _lock_payload() -> bytes:
-    """Identifies the current holder so a release can verify it still owns
-    the lock (see _release_lock) before unlinking."""
-    return f"{os.getpid()} {time.time():.3f}\n".encode("utf-8")
+    return f"{os.getpid()} {time.time():.3f} {uuid.uuid4().hex}\n".encode()
 
 
 def _try_create_lock(lock_path: Path, payload: bytes) -> None:
-    """O_EXCL create. Raises FileExistsError if already locked, or another
-    OSError for e.g. a permission failure -- both are handled by the caller."""
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    """Acquire the persistent inode; age never grants ownership."""
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise FileExistsError(str(lock_path)) from exc
+        os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
         os.write(fd, payload)
-    finally:
+        with _OWNERS_GUARD:
+            _OWNED_LOCKS[payload] = (fd, lock_path)
+    except BaseException:
         os.close(fd)
+        raise
 
 
 def _lock_age(lock_path: Path, holder: bytes) -> float:
-    """Age of the lock identified by `holder`, in seconds.
-
-    Read from the payload's OWN timestamp whenever it parses, so that a
-    lock's identity and its age come from a SINGLE read. Deriving age from a
-    separate stat() lets the file be replaced in between: a fresh holder's
-    identity then gets paired with the previous holder's age, the lock reads
-    as stale when it is not, and the takeover deletes a live holder's lock.
-    That mis-pairing was reproduced deterministically -- the single-read
-    invariant is the actual fix, not the re-read confirmation below it.
-
-    Falls back to st_mtime for a payload this version cannot parse (an older
-    format, or a hand-created file).
-
-    #323 F7: only a valid PAST time is trusted, from EITHER source. This is
-    a regression #306 (9cfc2bf) introduced when it moved age off st_mtime
-    and onto the payload's own embedded timestamp -- that made age a parsed
-    value from file content, and float() happily accepts "nan"/"inf", while
-    a future-dated stamp (a backward clock step: NTP correction, a suspended
-    VM resuming) yields a negative age. All three compare `> _LOCK_STALE_SECONDS`
-    as False forever, so takeover never fires and nothing ever unlinks the
-    lock again -- every later run stalls the full timeout and then writes
-    UNLOCKED, permanently, which is strictly worse than the pre-#306
-    baseline (that at least never stalled). Verified by execution against
-    the pre-fix 9cfc2bf: a future-ts, NaN-ts, or +inf-ts payload each wedged
-    (age stayed "not stale" and _acquire_lock took the full timeout every
-    time), while a normal stale payload and an unparseable-payload fallback
-    both still recovered via takeover.
-
-    This mirrors a convention this module already applies to
-    classified_ts (_classified_ts_age / partition()'s `0 <= age` range
-    check, guarded by four tests) -- an unusable stamp must never read as
-    "fresh forever". Unlike classified_ts, where an unusable value means
-    "re-derive it", an unusable LOCK timestamp must resolve to STALE, not
-    fresh: "fresh forever" is exactly what wedges the lock, and treating it
-    as fresh is the one choice with no self-healing path. A wrongful
-    takeover this produces is still detectable after the fact --
-    `_release_lock` warns when it finds the lock was taken from under it.
-
-    The acceptance gate is `-_LOCK_AGE_ROUNDING_TOLERANCE_SECONDS <= age`,
-    not the bare `0 <= age` classified_ts uses: `_lock_payload()` formats
-    its timestamp with millisecond precision (`.3f`), which rounds, so a
-    lock read back and aged microseconds after being written can compute
-    as up to ~0.5ms "ahead" of `time.time()` -- a pure formatting artifact.
-    A bare `0 <= age` gate turned that artifact into a real bug: roughly
-    HALF of freshly-written payloads (measured: 956,812 / 2,000,000 trials)
-    failed the gate and fell through to the st_mtime fallback, reintroducing
-    the exact single-read mis-pairing this function exists to prevent. See
-    `_LOCK_AGE_ROUNDING_TOLERANCE_SECONDS`'s own comment for why 10ms is
-    safe on both sides.
-    """
+    """Legacy timestamp diagnostic; OS ownership does not use lock age."""
     try:
         age = time.time() - float(holder.split()[1])
         if -_LOCK_AGE_ROUNDING_TOLERANCE_SECONDS <= age:
@@ -264,272 +232,93 @@ def _lock_age(lock_path: Path, holder: bytes) -> float:
 
 
 def _acquire_lock(lock_path: Path, timeout: float) -> bytes | None:
-    """Acquire the lock, waiting up to `timeout` seconds under contention.
-
-    Returns the payload written on success, or None if the lock could not be
-    acquired -- on a timeout, or on any OSError (e.g. an unwritable lock
-    directory) -- so the caller must proceed WITHOUT the lock (see
-    locked_cache()'s fail-open handling).
-    """
+    """Wait for OS ownership, bounded by a monotonic deadline."""
     try:
         lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    except OSError as exc:
-        print(f"[check-items-cache] WARNING: cache lock directory unavailable "
-              f"({exc}); proceeding without the cache lock", file=sys.stderr)
+    except OSError:
         return None
-
-    # Monotonic, not wall clock: an NTP correction mid-wait would otherwise
-    # stretch or collapse the timeout arbitrarily. Staleness stays on the
-    # wall clock instead -- it compares a stamp WRITTEN BY ANOTHER PROCESS
-    # (the payload, else st_mtime) against time.time(), and two processes
-    # share no monotonic epoch, so the two clocks cannot be unified. (This
-    # comment used to justify the split by st_mtime alone; since the payload
-    # became the primary source in 9cfc2bf, the value being trusted is one
-    # an external writer controls -- which is what made the #323 F7 guard
-    # above necessary.)
     deadline = time.monotonic() + timeout
     while True:
-        # #323 F8: built fresh on EVERY attempt, not once before the loop.
-        # A payload timestamped before the wait began is already up to
-        # `timeout` seconds old the moment a contended winner's create
-        # finally succeeds -- silently cutting its effective stale grace
-        # period from _LOCK_STALE_SECONDS down to
-        # _LOCK_STALE_SECONDS - timeout. Timestamping at the moment of the
-        # attempt that actually succeeds keeps the grace period intact.
         payload = _lock_payload()
         try:
             _try_create_lock(lock_path, payload)
             return payload
         except FileExistsError:
-            try:
-                holder = lock_path.read_bytes()
-            except OSError:
-                # Lock vanished between the failed create and this read (the
-                # holder just released it), or it is unreadable. Fall through
-                # to the bounded poll -- never loop straight back to the
-                # create, which would spin without honouring `timeout`.
-                holder = None
-            if holder is not None and _lock_age(lock_path, holder) > _LOCK_STALE_SECONDS:
-                # Stale lock: a crashed holder must not wedge the cache
-                # permanently unwritable. Takeover is inherently racy --
-                # multiple waiters can all observe staleness at once and
-                # race to unlink + recreate. Losing that race raises
-                # FileExistsError again on the very next loop iteration (a
-                # rival's fresh lock, not our own), which routes back into
-                # this same branch and falls through to ordinary polling --
-                # so the failure direction is always "keep waiting", never
-                # "assume ownership and write unprotected while a
-                # legitimate new holder is mid-write".
-                try:
-                    # Re-read immediately before unlinking and require the
-                    # bytes to be UNCHANGED. Between measuring staleness and
-                    # unlinking, the stale holder can release and a NEW
-                    # holder legitimately take the lock; unlinking then
-                    # deletes a LIVE holder's lock and puts two writers in
-                    # the critical section at once. That is not theoretical
-                    # -- it was reproduced deterministically before this
-                    # check existed.
-                    #
-                    # A residual window remains between this read and the
-                    # unlink. Closing it completely needs rename-based
-                    # claiming, whose failure mode (restoring a lock that a
-                    # third process may already have recreated) is worse
-                    # than the microsecond window it removes. The common
-                    # case -- the lock was replaced while we deliberated --
-                    # is caught here.
-                    if lock_path.read_bytes() == holder:
-                        try:
-                            lock_path.unlink()
-                        except OSError as exc:
-                            # Distinct from the read failure below: we DID
-                            # confirm the lock is stale and ours to take, but
-                            # could not remove it (a foreign owner, a
-                            # read-only volume, a macOS uchg flag, a
-                            # directory sitting at the lock path). Silently
-                            # swallowing this makes every later run pay the
-                            # full timeout and then run unlocked, forever,
-                            # with nothing distinguishing it from ordinary
-                            # contention (#323 F4).
-                            print(
-                                f"[check-items-cache] WARNING: could not "
-                                f"remove the cache lock {lock_path} ({exc}); "
-                                f"later runs will stall {timeout:.0f}s and "
-                                f"run unlocked until it is removed",
-                                file=sys.stderr,
-                            )
-                except OSError:
-                    # Cannot even READ it to confirm staleness: a foreign
-                    # owner, a read-only volume, or a directory sitting at
-                    # the lock path. Fall through to the bounded poll rather
-                    # than retrying forever.
-                    pass
-        except OSError as exc:
-            print(f"[check-items-cache] WARNING: cache lock acquire failed "
-                  f"({exc}); proceeding without the cache lock", file=sys.stderr)
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(min(_LOCK_POLL_INTERVAL_SECONDS, max(0, deadline - time.monotonic())))
+        except OSError:
             return None
-        # EVERY path that does not return lands here, so `timeout` governs
-        # unconditionally. Two branches above used to `continue` straight
-        # back to the create, bypassing this check: with a stale lock that
-        # could not be unlinked, _acquire_lock never returned and pegged a
-        # core -- an unbounded busy loop strictly worse than the fail-safe
-        # race #306 set out to fix. Verified by execution before the fix
-        # (timeout=1.0 still spinning at 5s) and after (returns in ~1s).
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
 
 
 def _read_lock(lock_path: Path) -> bytes | None:
-    """Read the lock file's current payload, or None if it cannot be read.
-
-    ENOENT (the lock is simply gone -- released, or never existed) returns
-    None silently, the ordinary case. Any OTHER OSError (EACCES, EIO, a
-    directory sitting at the path) also returns None but is reported first:
-    that is NOT "cleanly released", it is "could not be verified", and
-    treating the two identically is exactly the swallow that let an
-    un-removable/unreadable lock degrade every future run silently and
-    forever (#323 F4). Shared by `_release_lock` and `locked_cache`'s
-    pre-save ownership check (#323 F2) so the narrowing lives in one place.
-    """
     try:
-        with open(lock_path, "rb") as f:
-            return f.read()
+        return lock_path.read_bytes()
     except OSError as exc:
         if exc.errno != errno.ENOENT:
-            print(
-                f"[check-items-cache] WARNING: could not read the cache "
-                f"lock {lock_path} ({exc}); treating it as unverifiable",
-                file=sys.stderr,
-            )
+            print("[check-items-cache] WARNING: could not read the cache lock", file=sys.stderr)
         return None
 
 
-def _release_lock(lock_path: Path, payload: bytes) -> None:
-    """Release a lock this process still owns.
-
-    Re-reads the on-disk payload first: if another process took the lock
-    over as stale (see _acquire_lock) while we still believed we held it,
-    the on-disk payload no longer matches ours, and unlinking would delete
-    THEIR lock, letting a third writer race in unprotected. Tolerates the
-    file already being gone. Never raises.
-    """
-    current = _read_lock(lock_path)
-    if current is None:
-        return  # already gone, or unreadable -- _read_lock already warned
-    if current != payload:
-        # Our lock was taken over as stale while we still believed we held
-        # it -- meaning another writer was inside the critical section
-        # concurrently with us. Do NOT unlink (that would delete THEIR
-        # lock), and do not stay silent: this is the one observable trace
-        # that mutual exclusion was actually violated, and swallowing it
-        # would leave a real concurrent-write window with no evidence at
-        # all. Reaching this usually means the body outran
-        # _LOCK_STALE_SECONDS, but not always -- the documented residual
-        # window in _acquire_lock's takeover branch, between its
-        # confirm-read and the unlink, can also land a rival's fresh lock
-        # here after a body that ran for microseconds (#323 F9).
-        print(
-            f"[check-items-cache] WARNING: this run's cache lock was taken "
-            f"over by another process while still held ({lock_path}); the "
-            f"cache write may have raced a concurrent writer",
-            file=sys.stderr,
-        )
-        return
+def _owns_lock(lock_path: Path, payload: bytes) -> bool:
+    with _OWNERS_GUARD:
+        held = _OWNED_LOCKS.get(payload)
+    if held is None:
+        return False
     try:
-        lock_path.unlink()
-    except OSError as exc:
-        # Confirmed we still own it, but could not remove it -- same failure
-        # mode as the stale-takeover unlink in _acquire_lock, and the same
-        # reason it must not be silent (#323 F4).
-        print(
-            f"[check-items-cache] WARNING: could not remove the cache lock "
-            f"{lock_path} ({exc}); later runs will stall "
-            f"{_LOCK_TIMEOUT_SECONDS:.0f}s and run unlocked until it is "
-            f"removed",
-            file=sys.stderr,
-        )
+        fd, _ = held
+        actual = lock_path.stat()
+        owned = os.fstat(fd)
+        return (actual.st_dev, actual.st_ino) == (owned.st_dev, owned.st_ino) and _read_lock(lock_path) == payload
+    except OSError:
+        return False
+
+
+def _release_lock(lock_path: Path, payload: bytes) -> None:
+    owned = _owns_lock(lock_path, payload)
+    with _OWNERS_GUARD:
+        held = _OWNED_LOCKS.pop(payload, None)
+    if held is None:
+        return
+    fd, _ = held
+    try:
+        if owned:
+            os.ftruncate(fd, 0)
+        else:
+            print("[check-items-cache] WARNING: lost cache lock ownership; cache publication skipped", file=sys.stderr)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 @contextlib.contextmanager
 def locked_cache(timeout: float = _LOCK_TIMEOUT_SECONDS):
-    """Context manager for the full cache load-mutate-save cycle, under a lock.
+    """Yield mutable cache data, publishing only while OS ownership remains.
 
-    Acquires an O_EXCL lock file derived from CACHE_PATH, loads the cache,
-    yields it for the caller to mutate (typically via update_cache()), and
-    saves + releases once the `with` block exits -- so the whole
-    read-modify-write is one operation a caller cannot half-perform.
-
-    IMPORTANT: the yielded object must be mutated IN PLACE. `save_cache()`
-    below saves THIS function's own `cache` binding -- a caller that does
-    `cache = update_cache(cache=cache, ...)` and relies on the rebind is
-    saving nothing extra today only because `update_cache()` happens to
-    mutate its argument and return that same object; a caller that rebinds
-    the local name inside the `with` block would silently persist the
-    pre-mutation snapshot the day that stops being true (#323 F6).
-
-    The lock path is derived from CACHE_PATH at call time, not a
-    module-level constant: tests monkeypatch CACHE_PATH, and a constant
-    computed at import time would leave every test contending on one real
-    lock file under the user's actual ~/.claude/obsidian-brain/.
-
-    Fail-open: if the lock cannot be acquired within `timeout` (contention)
-    or acquisition hits any OSError, a warning goes to stderr and the body
-    proceeds WITHOUT the lock -- the pre-existing unlocked behaviour, which
-    is the worst acceptable outcome here. #306's race is fail-safe (a lost
-    write just means the entry re-classifies next run), so failing to lock
-    must never raise or block the pipeline.
-
-    The lock is released in a `finally`, so a body that raises still
-    releases it before the exception propagates. The save itself is NOT in
-    that `finally`: it only runs if the body completed without raising,
-    matching the pre-existing behaviour where save_cache(cache) was a
-    separate statement after the caller's work and was never reached on an
-    exception either.
-
-    Two additional guards run just before the save (#323):
-
-    F1 -- `load_cache(with_status=True)` distinguishes WHY the on-disk cache
-    came back empty. A `status` of "corrupt" (the file itself is garbage) is
-    the one case where overwriting it IS the recovery, so it still saves.
-    "unreadable" (a transient OSError -- EACCES, EIO, EMFILE -- reading an
-    otherwise possibly-fine file) or "foreign_schema" (valid JSON written by
-    a newer/different version) means the on-disk data was never proven bad;
-    saving over it would silently erase every other project's cache entries
-    under a lock, with no warning that an overwrite was even happening. Both
-    refuse to save instead -- fail-safe, since a dropped cache update just
-    means everything re-classifies next run.
-
-    F2 -- even when the lock WAS acquired, the body can outrun
-    `_LOCK_STALE_SECONDS` and have it taken over as stale mid-run (see
-    `_acquire_lock`'s takeover branch and `_release_lock`'s post-save check
-    for the existing after-the-fact detection). Checking `_read_lock(lock_path)
-    != payload` HERE, before the save, means the warning describes a race
-    the user can still reason about -- "this save could overwrite it" --
-    rather than reporting a fait accompli after `save_cache()` has already
-    run. This still saves regardless (fail-open is deliberate here too), it
-    only adds a warning.
+    A timeout still permits computation, but drops the cache update. Persistent
+    lock files are never unlinked or taken from a living holder based on age.
     """
-    lock_path = CACHE_PATH.with_suffix(".lock")
+    lock_path = _cache_path().with_suffix(".lock")
     payload = _acquire_lock(lock_path, timeout)
     if payload is None:
         print(
             f"[check-items-cache] WARNING: proceeding without the cache lock "
-            f"({lock_path}); a concurrent writer to a different project could "
-            f"silently drop this run's cache update",
+            f"({lock_path}); cache publication will be skipped",
             file=sys.stderr,
         )
     cache, status = load_cache(with_status=True)
     try:
         yield cache
-        if payload is not None and _read_lock(lock_path) != payload:
+        if payload is not None and not _owns_lock(lock_path, payload):
             print(
                 f"[check-items-cache] WARNING: lost the cache lock mid-run "
-                f"({lock_path}) -- held longer than the stale threshold "
-                f"(e.g. the machine slept); another run may have written "
-                f"since, and this save could overwrite it",
+                f"({lock_path}); cache publication will be skipped",
                 file=sys.stderr,
             )
-        if status in (None, "corrupt"):
+        if payload is None or not _owns_lock(lock_path, payload):
+            print("[check-items-cache] WARNING: refusing to publish without cache ownership",
+                  file=sys.stderr)
+        elif status in (None, "corrupt"):
             save_cache(cache)
         else:
             print(
@@ -607,6 +396,26 @@ def _warn_if_unusable_ts(cached: dict, now: float, h: str, project: str) -> None
         )
 
 
+def _provenance(group, project, extra=None):
+    """Fingerprint all semantic input and the invoking execution configuration."""
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    semantic = {key: value for key, value in group.items() if not key.startswith("_")}
+    values = {
+        "input": semantic,
+        "vault": str(context.vault_path.resolve()) if context else "",
+        "project": str(context.canonical_project_root.resolve()) if context else project,
+        "algorithm": "check-items-v2",
+        "schema": SCHEMA_VERSION,
+        "backend": context.host if context else "unspecified",
+        "model": (context.config.get("codex_model", "default") if context.host == "codex"
+                  else context.config.get("summary_model", "haiku")) if context else "unspecified",
+        "evidence": extra or {},
+    }
+    return hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False).encode()).hexdigest()
+
+
 def partition(
     groups: list[dict],
     cache: dict,
@@ -614,6 +423,7 @@ def partition(
     head_sha: str,
     force: bool = False,
     now: float | None = None,
+    *, provenance: dict | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Apply invalidation rules in spec order (first match wins):
@@ -712,6 +522,10 @@ def partition(
             g["_reason"] = "heuristic_cached"
             needs.append(g)
             continue
+        if cached.get("provenance") != _provenance(g, project, provenance):
+            g["_reason"] = "provenance_changed"
+            needs.append(g)
+            continue
         g["_cached_classification"] = cached.get("classification")
         g["_cached_confidence"] = cached.get("confidence")
         g["_cached_evidence_citation"] = cached.get("evidence_citation")
@@ -728,6 +542,7 @@ def update_cache(
     fresh_classifications: list[dict],
     head_sha: str,
     now: float | None = None,
+    *, provenance: dict | None = None,
 ) -> dict:
     """
     Merge fresh classifications into the cache and GC entries whose
@@ -826,6 +641,15 @@ def update_cache(
         # in this function.
         surviving.append(_freeze_classification(fc, now))
 
+    inputs = {group.get("canonical_hash"): group for group in all_groups}
+    previous = {entry.get("canonical_hash"): entry for entry in existing_groups if isinstance(entry, dict)}
+    for entry in surviving:
+        key = entry.get("canonical_hash")
+        fresh = fresh_by_hash.get(key)
+        if fresh is not None and fresh.get("classifier_source") != "cache":
+            entry["provenance"] = _provenance(inputs[key], project, provenance)
+        elif fresh is not None and key in previous and "provenance" in previous[key]:
+            entry["provenance"] = previous[key]["provenance"]
     run["groups"] = surviving
     run["last_run_ts"] = int(now)
     run["project_head_at_classify"] = head_sha

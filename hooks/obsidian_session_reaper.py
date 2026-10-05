@@ -386,15 +386,21 @@ def _reap_orphaned_sessions(
         # Thread the real JSONL path into metadata so _build_note can substitute
         # it into the reconstructed-note banner instead of literal <slug>/<sid>.
         metadata["transcript_path"] = str(jsonl)
+        date_str = _first_seen_date(sid)
+        filename = make_filename(date_str, slugify(effective_project), sid)
+        from note_transactions import context_for_vault, read_revision
+        write_context = context_for_vault(vault_path)
+        expected_revision = read_revision(
+            write_context, Path(vault_path) / sessions_folder / filename,
+        )
         assistant_msgs = extract_assistant_messages(messages)
         tool_uses = extract_tool_uses(messages)
         body = build_raw_fallback(user_msgs, metadata,
                                   assistant_msgs=assistant_msgs,
                                   tool_uses=tool_uses, config=config)
         content = _build_note(sid, metadata, body, resumed=False, reconstructed=True)
-        date_str = _first_seen_date(sid)
-        filename = make_filename(date_str, slugify(effective_project), sid)
-        err = write_vault_note(vault_path, sessions_folder, filename, content)
+        err = write_vault_note(vault_path, sessions_folder, filename, content,
+                               expected_revision=expected_revision)
         if err is None:
             n_reaped += 1
             _append_reaper_log(project=project, sid=sid_short, event="REAPED_OK")

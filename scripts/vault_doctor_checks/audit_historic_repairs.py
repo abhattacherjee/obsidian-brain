@@ -32,6 +32,8 @@ The backup root can be overridden via ``OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT``
 
 from __future__ import annotations
 
+from . import vault_scan, repair_batch, repair_write, repair_read
+
 import os
 import shutil
 import sys
@@ -139,6 +141,7 @@ def _classify(file_date: str, orig_date: str | None, curr_date: str | None) -> s
     return "D"
 
 
+@vault_scan
 def scan(
     vault_path: str,
     sessions_folder: str,
@@ -243,7 +246,7 @@ def scan(
         try:
             backup_text = backup_path.read_text(encoding="utf-8", errors="replace")
             current_text = current_path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             # Don't silently drop unreadable notes. Emitted UNCONDITIONALLY —
             # even with --project set — because an unreadable note cannot be
             # attributed to a project, and the project filter must not
@@ -361,6 +364,7 @@ def scan(
     return issues
 
 
+@repair_batch
 def apply(issues: list[Issue], backup_root: str) -> list[Result]:
     """Restore category-A notes to their original source_session backlink.
 
@@ -398,8 +402,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
 
         note_path = Path(issue.note_path)
         try:
-            content = note_path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
+            content = note_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
             results.append(Result(
                 check=NAME, note_path=issue.note_path, status="error", error=str(exc),
             ))
@@ -438,18 +442,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
 
         tmp = None
         try:
-            fd, tmp = tempfile.mkstemp(
-                dir=str(note_path.parent), prefix=".vd-audithist-", suffix=".md.tmp",
-            )
-            try:
-                os.write(fd, new_content.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, str(note_path))
-            tmp = None  # consumed by os.replace
-        except OSError as exc:
+            repair_write(note_path, new_content)
+        except (OSError, UnicodeDecodeError) as exc:
             results.append(Result(
                 check=NAME, note_path=issue.note_path, status="error", error=str(exc),
             ))

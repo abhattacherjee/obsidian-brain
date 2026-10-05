@@ -119,6 +119,8 @@ ignored (a stderr notice is emitted when a non-default value is passed).
 
 from __future__ import annotations
 
+from . import vault_scan, repair_batch, repair_write, repair_read
+
 import os
 import re
 import shutil
@@ -326,6 +328,7 @@ def _warn_issue(
     )
 
 
+@vault_scan
 def scan(
     vault_path: str,
     sessions_folder: str,
@@ -404,7 +407,7 @@ def scan(
         for md_file in sorted(sessions_dir.glob("*.md")):
             try:
                 content = md_file.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
+            except (OSError, UnicodeDecodeError) as exc:
                 p1_unreadable += 1
                 print(
                     f"[{NAME}] WARNING: could not read "
@@ -608,7 +611,7 @@ def scan(
         for md_file in sorted(folder_path.glob("*.md")):
             try:
                 content = md_file.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
+            except (OSError, UnicodeDecodeError) as exc:
                 p2_unreadable += 1
                 print(
                     f"[{NAME}] WARNING: could not read "
@@ -751,6 +754,7 @@ def scan(
     return issues
 
 
+@repair_batch
 def apply(issues: list[Issue], backup_root: str) -> list[Result]:
     """Rewrite ``project:`` and the observed ``claude/project/*`` tag lines.
 
@@ -841,7 +845,7 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
                 ),
             ))
             continue
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             results.append(Result(
                 check=NAME,
                 note_path=issue.note_path,
@@ -969,20 +973,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
         new_content = new_fm + body
         tmp = None
         try:
-            fd, tmp = tempfile.mkstemp(
-                dir=str(note_path.parent),
-                prefix=".vd-projcanon-",
-                suffix=".md.tmp",
-            )
-            try:
-                os.write(fd, new_content.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, str(note_path))
-            tmp = None  # consumed by os.replace
-        except OSError as exc:
+            repair_write(note_path, new_content)
+        except (OSError, UnicodeDecodeError) as exc:
             results.append(Result(
                 check=NAME,
                 note_path=issue.note_path,

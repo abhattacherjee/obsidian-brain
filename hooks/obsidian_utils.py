@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 import threading
 import time
 from typing import Optional
@@ -4617,107 +4618,74 @@ def escape_wikilinks(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def write_vault_note(
-    vault_path: str, folder: str, filename: str, content: str
-) -> Optional[str]:
-    """Atomic write: temp file + chmod 0o600 + rename into vault folder.
-
-    Creates the target folder if it does not exist.
-
-    Returns:
-        None on success.
-        A non-empty error string on failure (F2 contract — callers check ``if err:``).
-    """
-    dest_dir = Path(vault_path) / folder
-    dest = dest_dir / filename
-
-    # Path traversal check — BEFORE any filesystem side effects
-    vault_real = Path(vault_path).resolve()
-    if not dest.resolve().is_relative_to(vault_real):
+def write_vault_note(vault_path: str, folder: str, filename: str, content: str,
+                     expected_revision="unspecified") -> Optional[str]:
+    """Publish through the shared writer; return an error for pending/conflict."""
+    from note_transactions import (
+        NoteMutation, apply_mutations, context_for_vault, read_revision,
+    )
+    import uuid
+    dest = Path(vault_path) / folder / filename
+    if not dest.resolve().is_relative_to(Path(vault_path).resolve()):
         msg = f"path traversal blocked: {dest}"
         print(f"[obsidian-brain] {msg}", file=sys.stderr)
         return msg
-
     try:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        msg = f"cannot create vault dir {dest_dir}: {exc}"
-        print(f"[obsidian-brain] {msg}", file=sys.stderr)
-        return msg
-
-    try:
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(dest_dir), prefix=".ob-", suffix=".md.tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            os.chmod(tmp_path, 0o600)
-            os.rename(tmp_path, str(dest))
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except Exception as exc:
+        context = context_for_vault(vault_path)
+        if expected_revision == "unspecified":
+            expected_revision = read_revision(context, dest)
+        result = apply_mutations(context, [NoteMutation(
+            dest, expected_revision, {"document": content}, "write-" + uuid.uuid4().hex, file_mode=0o600,
+        )])
+        if result.status not in {"applied", "unchanged"}:
+            details = "; ".join(result.warnings)
+            msg = f"write {result.status} for {dest}: {details}"
+            print(f"[obsidian-brain] {msg}", file=sys.stderr)
+            return msg
+    except (OSError, ValueError, RuntimeError) as exc:
         msg = f"write failed for {dest}: {exc}"
         print(f"[obsidian-brain] {msg}", file=sys.stderr)
         return msg
-
     print(f"[obsidian-brain] wrote {dest}", file=sys.stderr)
     return None
 
 
-def flip_note_status(path: str, old_status: str, new_status: str) -> bool:
-    """Atomically change a note's frontmatter status field.
+def _note_write_context(path: str, vault_path: str | None = None):
+    from runtime_context import current_runtime_context
+    from note_transactions import context_for_vault
+    context = current_runtime_context()
+    if context is not None:
+        if vault_path is not None:
+            return context_for_vault(vault_path)
+        return context
+    selected = vault_path or load_config().get("vault_path")
+    return context_for_vault(selected or Path(path).resolve().parent)
 
-    Reads the file, replaces 'status: <old>' with 'status: <new>' in the
-    frontmatter, and writes back via temp file + rename.
-    Returns True on success.
-    """
+
+def flip_note_status(path: str, old_status: str, new_status: str,
+                     vault_path: str | None = None) -> bool:
+    """Change frontmatter only if the source read is still current."""
+    from note_transactions import NoteMutation, apply_mutations, record_read
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-    except OSError as exc:
-        print(f"[obsidian-brain] cannot read {path}: {exc}", file=sys.stderr)
-        return False
-
-    old_line = f"status: {old_status}"
-    new_line = f"status: {new_status}"
-
-    # Constrain replacement to the frontmatter block (between --- delimiters)
-    if not content.startswith("---"):
-        return False
-    end_idx = content.index("\n---", 3) + 1 if "\n---" in content[3:] else -1
-    if end_idx < 0:
-        return False
-    frontmatter = content[:end_idx]
-    if old_line not in frontmatter:
-        return False
-
-    new_content = frontmatter.replace(old_line, new_line, 1) + content[end_idx:]
-
-    dir_path = os.path.dirname(path)
-    try:
-        fd, tmp_path = tempfile.mkstemp(dir=dir_path, prefix=".ob-flip-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(new_content)
-            orig_mode = stat.S_IMODE(os.stat(path).st_mode)
-            os.chmod(tmp_path, orig_mode)
-            os.rename(tmp_path, path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except Exception as exc:
+        context = _note_write_context(path, vault_path)
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            content = handle.read()
+        revision = record_read(context, Path(path), content)
+        match = re.match(r"---\r?\n(.*?)\r?\n---(?:\r?\n|$)", content, re.DOTALL)
+        if match is None:
+            return False
+        old_line = f"status: {old_status}"
+        if old_line not in match.group(1):
+            return False
+        new_frontmatter = match.group(1).replace(old_line, f"status: {new_status}", 1)
+        updated = content[:match.start(1)] + new_frontmatter + content[match.end(1):]
+        result = apply_mutations(context, [NoteMutation(
+            Path(path), revision, {"document": updated}, uuid.uuid4().hex,
+        )])
+        return result.status in {"applied", "unchanged"}
+    except (OSError, ValueError) as exc:
         print(f"[obsidian-brain] flip_note_status failed for {path}: {exc}", file=sys.stderr)
         return False
-
-    return True
 
 
 def find_latest_session(
@@ -4928,8 +4896,8 @@ def find_unsummarized_notes(
         # Read ENTIRE file from disk — DO NOT use read_note_metadata() which
         # has a persistent cache that may be stale after status changes.
         try:
-            content = f.read_text(encoding='utf-8', errors='replace')
-        except OSError as exc:
+            content = f.read_bytes().decode('utf-8')
+        except (OSError, UnicodeDecodeError) as exc:
             print(f"[obsidian-brain] cannot read {f.name}: {exc}", file=sys.stderr)
             continue
 
@@ -4967,6 +4935,9 @@ def find_unsummarized_notes(
         if has_summary and not has_unavailable:
             # Already summarized by legacy code path — fix status on disk
             try:
+                from note_transactions import NoteMutation, apply_mutations, record_read
+                context = _note_write_context(str(f), vault_path)
+                revision = record_read(context, f, content)
                 fixed = re.sub(
                     r'^status: auto-logged',
                     'status: summarized',
@@ -4974,26 +4945,17 @@ def find_unsummarized_notes(
                     count=1,
                     flags=re.MULTILINE,
                 )
-                # Atomic write: temp file + rename (per CLAUDE.md convention)
-                fd, tmp = tempfile.mkstemp(
-                    prefix='.ob-fix-', suffix='.md.tmp', dir=str(f.parent)
-                )
-                try:
-                    with os.fdopen(fd, 'w', encoding='utf-8') as fw:
-                        fw.write(fixed)
-                    os.replace(tmp, str(f))
-                except Exception:
-                    try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
+                result = apply_mutations(context, [NoteMutation(
+                    f, revision, {"document": fixed}, uuid.uuid4().hex,
+                )])
+                if result.status not in {"applied", "unchanged"}:
                     continue
                 # Invalidate cache for this file
                 sid = _get_session_id_fast()
                 cache_key = f"metadata:{os.path.realpath(str(f))}"
                 cache_set(sid, cache_key, None)
                 auto_fixed += 1
-            except OSError:
+            except (OSError, ValueError):
                 pass
             continue
 
@@ -6093,12 +6055,14 @@ def upgrade_note_with_summary(
     project: str,
     source: str = "sub-agent fallback",
     warnings: list[str] | None = None,
+    expected_revision: str | None = None,
 ) -> str:
     """Apply a pre-generated summary to a raw session note.
 
     Handles the pipeline finish: read raw note, validate summary has
     ## Summary, rebuild note (frontmatter with status: summarized, title,
-    summary sections, audit trail), run dedup, atomic write.
+    summary sections, audit trail), run dedup, and publish conditionally.
+    Pass the pre-model ``expected_revision`` when generation runs separately.
 
     Returns a one-line status string.
 
@@ -6117,9 +6081,15 @@ def upgrade_note_with_summary(
 
     # Read the raw note
     try:
-        with open(note_path, 'r', encoding='utf-8') as f:
-            raw_lines = f.readlines()
-    except OSError as exc:
+        from note_transactions import NoteMutation, apply_mutations, record_read
+        context = _note_write_context(note_path, vault_path)
+        with open(note_path, 'r', encoding='utf-8', newline='') as f:
+            raw_text = f.read()
+        raw_lines = raw_text.splitlines(keepends=True)
+        source_revision = record_read(context, Path(note_path), raw_text)
+        if expected_revision is None:
+            expected_revision = source_revision
+    except (OSError, ValueError) as exc:
         return f"Failed: cannot read {os.path.basename(note_path)}: {exc}"
 
     # Build upgraded note: original frontmatter + new summary + original audit trail
@@ -6232,49 +6202,14 @@ def upgrade_note_with_summary(
 
     importance = parse_importance(summary_text)
 
-    # Atomic write with fsync + post-write verification.
-    # Guarantees the summary actually landed on disk before returning success.
-    # `or "."` handles the case where note_path is a bare filename (no
-    # directory component), which would otherwise produce `dir=""` and
-    # crash tempfile.mkstemp on every platform.
-    note_dir = os.path.dirname(note_path) or "."
     try:
-        fd, tmp_path = tempfile.mkstemp(prefix='.ob-upgrade-', suffix='.md.tmp', dir=note_dir)
-    except OSError as exc:
-        return f"Failed: cannot create temp file in {note_dir}: {exc}"
-    try:
-        try:
-            orig_mode = os.stat(note_path).st_mode
-        except OSError:
-            orig_mode = 0o600
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp_path, orig_mode)
-        os.replace(tmp_path, note_path)
-        # fsync the containing directory so the rename itself is durable
-        # across a crash, not just the file contents.
-        try:
-            dir_fd = os.open(note_dir, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            # Directory fsync is best-effort on filesystems that don't
-            # support it (e.g. some network mounts). The in-process
-            # verification below is the real guarantee for non-crash
-            # failure modes.
-            pass
-    except OSError as exc:
-        try:
-            os.unlink(tmp_path)
-        except OSError as cleanup_exc:
-            print(
-                f"[obsidian-brain] failed to clean up temp file {tmp_path}: {cleanup_exc}",
-                file=sys.stderr,
-            )
+        result = apply_mutations(context, [NoteMutation(
+            Path(note_path), expected_revision, {"document": "".join(new_lines)},
+            uuid.uuid4().hex,
+        )])
+        if result.status not in {"applied", "unchanged"}:
+            return f"Failed: summary publication {result.status} for {os.path.basename(note_path)}"
+    except (OSError, ValueError) as exc:
         return f"Failed: atomic write error for {os.path.basename(note_path)}: {exc}"
 
     # Post-write verification: re-read the target file and confirm the
@@ -6581,13 +6516,17 @@ def _prepare_note_for_summary(
     "note_type": str, "source": str, "warnings": [...]}.
 
     Extracted from upgrade_unsummarized_note (#166) so the multi-note batch path
-    can reuse identical preparation. Pure: no model calls, no writes.
+    can reuse identical preparation. No model calls or vault writes; records the source revision.
     """
     # Read the raw note
     try:
-        with open(note_path, 'r', encoding='utf-8') as f:
-            raw_lines = f.readlines()
-    except (OSError, UnicodeDecodeError) as exc:
+        from note_transactions import record_read
+        context = _note_write_context(note_path, vault_path)
+        with open(note_path, 'r', encoding='utf-8', newline='') as f:
+            raw_text = f.read()
+        raw_lines = raw_text.splitlines(keepends=True)
+        expected_revision = record_read(context, Path(note_path), raw_text)
+    except (OSError, ValueError) as exc:
         return {
             "ok": False,
             "status": f"Failed: cannot read {os.path.basename(note_path)}: {exc}",
@@ -6723,6 +6662,7 @@ def _prepare_note_for_summary(
     return {
         "ok": True,
         "raw_lines": raw_lines,
+        "expected_revision": expected_revision,
         "session_id": session_id,
         "user_msgs": user_msgs,
         "assistant_msgs": assistant_msgs,
@@ -6852,7 +6792,7 @@ def upgrade_unsummarized_note(
 
     status = upgrade_note_with_summary(
         note_path, summary_text, vault_path, sessions_folder, project,
-        source=source, warnings=warnings,
+        source=source, warnings=warnings, expected_revision=prep.get("expected_revision"),
     )
     # model_used is the CLI alias of the model that produced the accepted
     # summary — "haiku" on the common path, "sonnet"/"opus" when escalated (#165).
@@ -7336,6 +7276,7 @@ def upgrade_batch(
                     write_status = upgrade_note_with_summary(
                         p, summary_text, vault_path, sessions_folder, project,
                         source=prep["source"], warnings=prep["warnings"],
+                        expected_revision=prep.get("expected_revision"),
                     )
                     if write_status.startswith("Upgraded "):
                         results_by_path[p] = {

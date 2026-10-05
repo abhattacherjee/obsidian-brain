@@ -9,6 +9,8 @@ replacement (U+FFFD for invalid bytes).
 
 from __future__ import annotations
 
+from . import vault_scan, repair_batch, repair_write, repair_read
+
 import os
 import tempfile
 from pathlib import Path
@@ -20,6 +22,7 @@ DESCRIPTION = "Detect vault notes with invalid UTF-8 bytes that cause binary fil
 DEFAULT_WINDOW_DAYS = 9999  # unbounded — scan all notes
 
 
+@vault_scan
 def scan(
     vault_path: str,
     sessions_folder: str,
@@ -76,6 +79,7 @@ def scan(
     return issues
 
 
+@repair_batch
 def apply(issues: list[Issue], backup_root: str) -> list[Result]:
     """Re-encode notes with errors='replace' to fix invalid bytes."""
     results: list[Result] = []
@@ -92,18 +96,7 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             backup_path = str(backup_dir / Path(note_path).name)
             Path(backup_path).write_bytes(raw)
 
-            # Atomic write
-            parent = os.path.dirname(note_path)
-            fd, tmp = tempfile.mkstemp(dir=parent, suffix=".md")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(clean)
-                os.chmod(tmp, 0o600)
-                os.replace(tmp, note_path)
-            except Exception:
-                if os.path.exists(tmp):
-                    os.unlink(tmp)
-                raise
+            repair_write(note_path, clean, encoding_repair=True)
 
             results.append(Result(
                 check=NAME,

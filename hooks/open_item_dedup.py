@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from obsidian_utils import get_workspace_roots, match_items_against_evidence
@@ -658,10 +659,15 @@ def dedup_note_open_items(
 
     Returns list of removed item texts (empty if no duplicates).
     """
+    from obsidian_utils import _note_write_context
+    from note_transactions import NoteMutation, apply_mutations, record_read
     try:
-        with open(note_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-    except OSError as exc:
+        context = _note_write_context(note_path, vault_path)
+        with open(note_path, 'r', encoding='utf-8', newline='') as f:
+            content = f.read()
+        revision = record_read(context, Path(note_path), content)
+        lines = content.splitlines(keepends=True)
+    except (OSError, ValueError) as exc:
         print(f"[obsidian-brain] dedup: cannot read {note_path}: {exc}", file=sys.stderr)
         return []
 
@@ -700,27 +706,15 @@ def dedup_note_open_items(
     # Remove duplicate lines
     new_lines = [line for i, line in enumerate(lines) if i not in lines_to_remove]
 
-    # Atomic rewrite: temp file + rename
-    note_dir = os.path.dirname(note_path)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix='.ob-dedup-', suffix='.md.tmp', dir=note_dir,
-    )
     try:
-        # Preserve original file permissions
-        try:
-            orig_mode = os.stat(note_path).st_mode
-        except OSError:
-            orig_mode = 0o644
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
-        os.chmod(tmp_path, orig_mode)
-        os.replace(tmp_path, note_path)
-    except OSError as exc:
+        result = apply_mutations(context, [NoteMutation(
+            Path(note_path), revision, {"document": "".join(new_lines)}, uuid.uuid4().hex,
+        )])
+        if result.status not in {"applied", "unchanged"}:
+            print(f"[obsidian-brain] dedup: atomic write failed for {note_path}: {result.status}", file=sys.stderr)
+            return []
+    except (OSError, ValueError) as exc:
         print(f"[obsidian-brain] dedup: atomic write failed for {note_path}: {exc}", file=sys.stderr)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
         return []
 
     return removed_texts
@@ -738,6 +732,8 @@ def batch_cascade_checkoff(
     auto-checks high-confidence matches, reports fuzzy-only suggestions.
     Returns a compact summary string.
     """
+    from obsidian_utils import _note_write_context
+    from note_transactions import NoteMutation, apply_mutations, record_read
     existing = collect_open_items(vault_path, sessions_folder, project)
     if not existing:
         return "No open items found for cascading."
@@ -807,9 +803,12 @@ def batch_cascade_checkoff(
 
     for fpath, line_refs in files_to_edit.items():
         try:
-            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
-        except OSError as exc:
+            context = _note_write_context(fpath, vault_path)
+            with open(fpath, 'r', encoding='utf-8', newline='') as f:
+                content = f.read()
+            revision = record_read(context, Path(fpath), content)
+            lines = content.splitlines(keepends=True)
+        except (OSError, ValueError) as exc:
             print(f"[obsidian-brain] cascade: cannot read {os.path.basename(fpath)}: {exc}", file=sys.stderr)
             continue
 
@@ -850,32 +849,20 @@ def batch_cascade_checkoff(
                 )
 
         if file_edit_count > 0:
-            note_dir = os.path.dirname(fpath)
-            fd, tmp_path = tempfile.mkstemp(
-                prefix='.ob-cascade-', suffix='.md.tmp', dir=note_dir,
-            )
             try:
-                # Preserve original file permissions
-                try:
-                    orig_mode = os.stat(fpath).st_mode
-                except OSError:
-                    orig_mode = 0o644
-                with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                    f.writelines(lines)
-                os.chmod(tmp_path, orig_mode)
-                os.replace(tmp_path, fpath)
+                result = apply_mutations(context, [NoteMutation(
+                    Path(fpath), revision, {"document": "".join(lines)}, uuid.uuid4().hex,
+                )])
+                if result.status not in {"applied", "unchanged"}:
+                    raise OSError(f"publication {result.status}")
                 edited_files.add(os.path.basename(fpath))
                 edited_count += file_edit_count  # count only after successful write
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 print(f"[obsidian-brain] cascade: write failed for {os.path.basename(fpath)}: {exc}", file=sys.stderr)
                 # #320 F2: file_edit_count verified flips were computed but
                 # never reached disk. Name the loss instead of letting it
                 # silently collapse into "nothing to cascade".
                 write_failures.append((fpath, file_edit_count))
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
 
     # Build summary. #320 F3: once ANY high-confidence target existed, never
     # collapse "every one of them was refused or lost" down to the same
@@ -928,6 +915,7 @@ def batch_cascade_checkoff(
 def cascade_group_members(
     groups: list,
     source_skips: "set[tuple[str, int]] | None" = None,
+    vault_path: str | None = None,
 ) -> str:
     """Flip checkbox on every member of each group, atomically per file.
 
@@ -957,6 +945,8 @@ def cascade_group_members(
     text-verification skips (drifted or unverifiable) are appended as an
     additional line so a hook caller sees them even without stderr.
     """
+    from obsidian_utils import _note_write_context
+    from note_transactions import NoteMutation, apply_mutations, record_read
     if source_skips is None:
         source_skips = set()
 
@@ -1025,9 +1015,12 @@ def cascade_group_members(
 
     for fpath, line_refs in files_to_lines.items():
         try:
-            with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
-                lines = fh.readlines()
-        except OSError as exc:
+            context = _note_write_context(fpath, vault_path)
+            with open(fpath, "r", encoding="utf-8", newline="") as fh:
+                content = fh.read()
+            revision = record_read(context, Path(fpath), content)
+            lines = content.splitlines(keepends=True)
+        except (OSError, ValueError) as exc:
             print(
                 f"[obsidian-brain] cascade_group_members: cannot read "
                 f"{os.path.basename(fpath)}: {exc}",
@@ -1076,22 +1069,15 @@ def cascade_group_members(
         if file_flipped == 0:
             continue
 
-        note_dir = os.path.dirname(fpath)
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".ob-cascade-", suffix=".md.tmp", dir=note_dir,
-        )
         try:
-            try:
-                orig_mode = os.stat(fpath).st_mode
-            except OSError:
-                orig_mode = 0o644
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.writelines(lines)
-            os.chmod(tmp_path, orig_mode)
-            os.replace(tmp_path, fpath)
+            result = apply_mutations(context, [NoteMutation(
+                Path(fpath), revision, {"document": "".join(lines)}, uuid.uuid4().hex,
+            )])
+            if result.status not in {"applied", "unchanged"}:
+                raise OSError(f"publication {result.status}")
             files_edited.add(os.path.basename(fpath))
             total_flipped += file_flipped
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             print(
                 f"[obsidian-brain] cascade_group_members: write failed for "
                 f"{os.path.basename(fpath)}: {exc}",
@@ -1101,10 +1087,6 @@ def cascade_group_members(
             # reached disk. Name the loss instead of letting it silently
             # collapse into "nothing to cascade".
             write_failures.append((fpath, file_flipped))
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
     # #320 F3: once ANY target existed, never collapse "every one of them
     # was refused or lost" down to the same "No member lines to cascade."

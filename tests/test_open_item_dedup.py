@@ -26,6 +26,13 @@ from open_item_dedup import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_native_config(monkeypatch):
+    """Legacy path-only APIs must not read the developer's live vault config."""
+    import obsidian_utils
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {})
+
+
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
@@ -520,8 +527,9 @@ def test_dedup_note_stat_oserror_fallback(tmp_vault, monkeypatch):
     removed = dedup_note_open_items(
         str(tmp_vault), "claude-sessions", "myproject", str(newer_note)
     )
-    # Should still remove the duplicate even without stat
-    assert len(removed) >= 1
+    # Without source metadata, preserve the note and report no published removal.
+    assert removed == []
+    assert "- [ ] Fix hooks/obsidian_utils.py import error" in newer_note.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +550,7 @@ def test_dedup_note_atomic_write_oserror(tmp_vault, monkeypatch, capsys):
     original_replace = os.replace
 
     def patched_replace(src, dst):
-        if ".ob-dedup-" in src:
+        if str(dst) == str(newer_note):
             raise OSError("replace failed")
         return original_replace(src, dst)
 
@@ -713,7 +721,7 @@ def test_batch_cascade_checkoff_write_oserror(tmp_vault, monkeypatch, capsys):
     original_replace = os.replace
 
     def patched_replace(src, dst):
-        if ".ob-cascade-" in src:
+        if str(dst) == str(note):
             raise OSError("cascade write failed")
         return original_replace(src, dst)
 
@@ -1496,7 +1504,7 @@ def test_batch_cascade_checkoff_write_failure_surfaced_not_silent(tmp_vault, mon
     original_replace = os.replace
 
     def patched_replace(src, dst):
-        if ".ob-cascade-" in src:
+        if str(dst) == str(note):
             raise OSError("cascade write failed")
         return original_replace(src, dst)
 

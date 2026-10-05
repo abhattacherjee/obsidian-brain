@@ -802,6 +802,7 @@ def _apply_add_tags(fm_lines: list[str], add_tags: list[str], eol: str = "\n"):
 # append-update (milliseconds) and short enough that a user retrying after a
 # crash is not left stuck.
 _STALE_LOCK_SECONDS = 60
+_LOCK_OWNERS = {}
 
 
 def _lock_path(dest: Path) -> Path:
@@ -836,7 +837,17 @@ def _acquire_lock(dest: Path):
                 age = time.time() - lock.stat().st_mtime
             except OSError:
                 continue  # vanished between the two calls -- retry the claim
-            if attempt == 0 and age > _STALE_LOCK_SECONDS:
+            parts = lock.read_text().split() if lock.exists() else []
+            holder = parts[0] if parts else ""
+            alive = True
+            if holder.isdigit():
+                try:
+                    os.kill(int(holder), 0)
+                except ProcessLookupError:
+                    alive = False
+                except PermissionError:
+                    pass
+            if attempt == 0 and age > _STALE_LOCK_SECONDS and not alive:
                 try:
                     lock.unlink()
                 except OSError:
@@ -849,8 +860,11 @@ def _acquire_lock(dest: Path):
         except OSError as exc:
             return None, f"cannot create lock file {lock}: {exc}"
         else:
+            import uuid
+            payload = f"{os.getpid()} {uuid.uuid4().hex}\n".encode()
             try:
-                os.write(fd, f"{os.getpid()}\n".encode())
+                os.write(fd, payload)
+                _LOCK_OWNERS[str(lock)] = payload
             finally:
                 os.close(fd)
             return lock, None
@@ -860,68 +874,35 @@ def _acquire_lock(dest: Path):
 def _release_lock(lock):
     if lock is None:
         return
+    payload = _LOCK_OWNERS.pop(str(lock), None)
+    if payload is None:
+        return
     try:
-        Path(lock).unlink()
+        if Path(lock).read_bytes() == payload:
+            Path(lock).unlink()
     except OSError:
         pass
 
 
-def _atomic_rewrite(dest: Path, content: str, expect_stat=None):
-    """Rewrite an EXISTING file at ``dest`` with ``content``, atomically.
-
-    Mirrors obsidian_utils.write_vault_note()'s temp-file + chmod 0o600 +
-    rename idiom exactly, adapted to rewriting a known destination in place
-    rather than creating one fresh under a vault/folder/filename triple: the
-    temp file is created as a sibling of ``dest`` (same directory, so
-    ``os.rename`` is an atomic same-filesystem move) and is only renamed
-    over ``dest`` after both the write and the chmod succeed. On any
-    failure the temp file is unlinked and ``dest`` is left byte-identical --
-    the rename is the only step that can touch ``dest``, and it happens
-    last.
-
-    ``expect_stat`` is the ``(st_mtime_ns, st_size)`` observed when the
-    caller READ ``dest``. Re-checked immediately before the rename: this is
-    an unlocked read-modify-write, and ``os.rename`` makes each write atomic
-    without doing anything about interleaving -- two concurrent
-    ``append-update`` runs both exited 0 while one writer's update section
-    and tag vanished entirely. That silent loss is precisely what this CLI
-    exists to eliminate, and /compress's prose tells the model not to
-    re-read the note afterwards, so nothing else would catch it.
-
-    This narrows the window to the microseconds between the stat and the
-    rename rather than closing it -- a lockfile would be needed for that --
-    but it converts the common case (two sessions running /compress on the
-    same note) from silent loss into a loud, retryable error.
-
-    Returns None on success, a non-empty error string on failure.
-
-    Opens with ``newline=""`` -- ``content`` already carries whatever line
-    endings it was built with (see ``run_append_update``'s CRLF handling),
-    so no newline translation should happen on the way out either.
-    """
-    dest_dir = dest.parent
+def _atomic_rewrite(dest: Path, content: str, expect_stat=None,
+                    expected_revision=None, context=None):
+    """Publish an exact source revision through the shared transaction service."""
+    from note_transactions import NoteMutation, apply_mutations, context_for_vault, read_revision
+    import uuid
     try:
-        fd, tmp_path = tempfile.mkstemp(dir=str(dest_dir), prefix=".ob-", suffix=".md.tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-                fh.write(content)
-            os.chmod(tmp_path, 0o600)
-            if expect_stat is not None:
-                current = os.stat(str(dest))
-                if (current.st_mtime_ns, current.st_size) != expect_stat:
-                    raise RuntimeError(
-                        "note changed on disk after it was read (concurrent "
-                        "update?); nothing written -- re-run to pick up the "
-                        "other change"
-                    )
-            os.rename(tmp_path, str(dest))
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except Exception as exc:
+        if expect_stat is not None:
+            current = dest.stat()
+            if (current.st_mtime_ns, current.st_size) != expect_stat:
+                return f"note changed on disk after it was read: {dest}"
+        context = context or context_for_vault(dest.parent)
+        if expected_revision is None:
+            expected_revision = read_revision(context, dest)
+        result = apply_mutations(context, [NoteMutation(
+            dest, expected_revision, {"document": content}, "append-" + uuid.uuid4().hex, file_mode=0o600,
+        )])
+        if result.status not in {"applied", "unchanged"}:
+            return f"write {result.status} for {dest}: {'; '.join(result.warnings)}"
+    except (OSError, ValueError, RuntimeError) as exc:
         return f"write failed for {dest}: {exc}"
     return None
 
@@ -1028,16 +1009,24 @@ def run_append_update(
         print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
-    lock, lock_err = _acquire_lock(resolved)
-    if lock_err:
-        print(f"ERROR: {lock_err}", file=sys.stderr)
-        return 1
+    from note_transactions import context_for_vault, ownership_lock, LockBusy
     try:
-        return _append_update_locked(
-            resolved, note_path, update_text, last_updated, add_tags
-        )
-    finally:
-        _release_lock(lock)
+        context = context_for_vault(vault_path)
+        with ownership_lock(context):
+            lock, lock_err = _acquire_lock(resolved)
+            if lock_err:
+                print(f"ERROR: {lock_err}", file=sys.stderr)
+                return 1
+            try:
+                return _append_update_locked(
+                    resolved, note_path, update_text, last_updated, add_tags, context=context
+                )
+            finally:
+                _release_lock(lock)
+
+    except (LockBusy, OSError, ValueError) as exc:
+        print(f"ERROR: shared vault lock held or unavailable: {exc}", file=sys.stderr)
+        return 1
 
 
 def _append_update_locked(
@@ -1046,6 +1035,7 @@ def _append_update_locked(
     update_text: str,
     last_updated,
     add_tags: list[str],
+    context=None,
 ) -> int:
     """The read-modify-write half of run_append_update, run while holding the
     note's lock. Split out purely so the lock has one obvious scope and one
@@ -1059,6 +1049,9 @@ def _append_update_locked(
         # between (see its docstring).
         read_st = os.stat(resolved)
         read_stat = (read_st.st_mtime_ns, read_st.st_size)
+        from note_transactions import context_for_vault, record_read
+        context = context or context_for_vault(resolved.parent)
+        read_revision = record_read(context, resolved, original_text)
     except OSError as exc:
         print(f"ERROR: cannot read {note_path}: {exc}", file=sys.stderr)
         return 1
@@ -1117,7 +1110,8 @@ def _append_update_locked(
 
     new_text = open_fence + "".join(fm_lines) + close_fence + "".join(new_body_lines)
 
-    write_err = _atomic_rewrite(resolved, new_text, expect_stat=read_stat)
+    write_err = _atomic_rewrite(resolved, new_text, expect_stat=read_stat,
+                                expected_revision=read_revision, context=context)
     if write_err:
         print(f"ERROR: {write_err}", file=sys.stderr)
         return 1

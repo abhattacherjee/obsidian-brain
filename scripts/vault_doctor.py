@@ -35,6 +35,8 @@ from pathlib import Path
 # Make the check package importable
 _SCRIPTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
+sys.path.insert(0, str(_SCRIPTS_DIR.parent))
+sys.path.insert(0, str(_SCRIPTS_DIR.parent / "hooks"))
 
 import vault_doctor_checks  # noqa: E402
 
@@ -488,61 +490,68 @@ def main() -> int:
     )
     print(f"\nBackup root: {backup_root}", file=sys.stderr)
 
-    any_errors = False
-    for mod in modules:
-        issues = issues_by_check.get(mod.NAME, [])
-        if not issues:
-            continue
-        by_project: dict[str, list] = {}
-        for i in issues:
-            by_project.setdefault(i.project, []).append(i)
-        for proj, proj_issues in sorted(by_project.items()):
-            resolvable = [i for i in proj_issues if not i.extra.get("unresolved")]
-            if not resolvable:
-                continue
-            if not args.yes:
-                sys.stderr.write(
-                    f"Apply {len(resolvable)} fix(es) for project '{proj}' "
-                    f"in check '{mod.NAME}'? [y/N] "
-                )
-                sys.stderr.flush()
-                # readline() with no size is unbounded: input containing no
-                # newline is consumed to EOF. 1024 is far beyond any real
-                # y/N answer, so behaviour is identical for every sane input.
-                answer = sys.stdin.readline(1024).strip().lower()
-                if answer not in ("y", "yes"):
-                    print(f"  skipped {proj}", file=sys.stderr)
+    pending = [issue for rows in issues_by_check.values() for issue in rows]
+    try:
+        with vault_doctor_checks.repair_scope(pending):
+            any_errors = False
+            for mod in modules:
+                issues = issues_by_check.get(mod.NAME, [])
+                if not issues:
                     continue
-            try:
-                results = mod.apply(resolvable, backup_root)
-            except Exception as exc:  # noqa: BLE001 — per-check crash containment
-                print(
-                    f"[vault_doctor] APPLY CRASHED: {mod.NAME}: "
-                    f"{type(exc).__name__}: {exc} — apply for this check "
-                    f"aborted mid-run; some fixes may already be applied "
-                    f"(check the backup root: {backup_root})",
-                    file=sys.stderr,
-                )
-                traceback.print_exc(file=sys.stderr)
-                if mod.NAME not in crashed_checks:
-                    crashed_checks.append(mod.NAME)
-                any_errors = True
-                # Skip this check's remaining projects (the next apply() call
-                # would most likely crash the same way) and move on to the
-                # next check.
-                break
-            for r in results:
-                status_mark = {"applied": "+", "unresolved": "!", "error": "x", "skipped": "-"}.get(
-                    r.status, "?"
-                )
-                print(f"  {status_mark} {r.status}  {Path(r.note_path).name}", file=sys.stderr)
-                if r.status == "error":
-                    any_errors = True
-                # Print the detail message whenever present, regardless of
-                # status — e.g. session-coverage's "skipped" Results carry the
-                # replay skip reason (SKIPPED_BELOW_THRESHOLD etc.) in error.
-                if r.error:
-                    print(f"      {r.error}", file=sys.stderr)
+                by_project: dict[str, list] = {}
+                for i in issues:
+                    by_project.setdefault(i.project, []).append(i)
+                for proj, proj_issues in sorted(by_project.items()):
+                    resolvable = [i for i in proj_issues if not i.extra.get("unresolved")]
+                    if not resolvable:
+                        continue
+                    if not args.yes:
+                        sys.stderr.write(
+                            f"Apply {len(resolvable)} fix(es) for project '{proj}' "
+                            f"in check '{mod.NAME}'? [y/N] "
+                        )
+                        sys.stderr.flush()
+                        # readline() with no size is unbounded: input containing no
+                        # newline is consumed to EOF. 1024 is far beyond any real
+                        # y/N answer, so behaviour is identical for every sane input.
+                        answer = sys.stdin.readline(1024).strip().lower()
+                        if answer not in ("y", "yes"):
+                            print(f"  skipped {proj}", file=sys.stderr)
+                            continue
+                    try:
+                        results = mod.apply(resolvable, backup_root)
+                    except Exception as exc:  # noqa: BLE001 — per-check crash containment
+                        print(
+                            f"[vault_doctor] APPLY CRASHED: {mod.NAME}: "
+                            f"{type(exc).__name__}: {exc} — apply for this check "
+                            f"aborted mid-run; some fixes may already be applied "
+                            f"(check the backup root: {backup_root})",
+                            file=sys.stderr,
+                        )
+                        traceback.print_exc(file=sys.stderr)
+                        if mod.NAME not in crashed_checks:
+                            crashed_checks.append(mod.NAME)
+                        any_errors = True
+                        # Skip this check's remaining projects (the next apply() call
+                        # would most likely crash the same way) and move on to the
+                        # next check.
+                        break
+                    for r in results:
+                        status_mark = {"applied": "+", "unresolved": "!", "error": "x", "skipped": "-"}.get(
+                            r.status, "?"
+                        )
+                        print(f"  {status_mark} {r.status}  {Path(r.note_path).name}", file=sys.stderr)
+                        if r.status == "error":
+                            any_errors = True
+                        # Print the detail message whenever present, regardless of
+                        # status — e.g. session-coverage's "skipped" Results carry the
+                        # replay skip reason (SKIPPED_BELOW_THRESHOLD etc.) in error.
+                        if r.error:
+                            print(f"      {r.error}", file=sys.stderr)
+
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"[vault_doctor] repair scope failed: {exc}", file=sys.stderr)
+        return 2
 
     return 2 if (any_errors or crashed_checks) else 1
 

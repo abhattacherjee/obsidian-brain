@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+from pathlib import Path
 import sys
 
 # ---------------------------------------------------------------------------
@@ -229,10 +230,6 @@ def _run(context=None, payload=None) -> None:
         print("[obsidian-brain] missing session_id or transcript_path, skipping", file=sys.stderr)
         return
 
-    if not claim_hook_run("PreCompact", session_id):
-        print("[obsidian-brain] snapshot skipped: sibling plugin already handled this compact", file=sys.stderr)
-        return
-
     # 2. Load config
     config = load_config()
     vault_path = config.get("vault_path", "")
@@ -275,17 +272,25 @@ def _run(context=None, payload=None) -> None:
     hhmmss = now.strftime("%H%M%S")
     project_slug = slugify(metadata.get("project", "session"))
 
-    body = _build_snapshot_body(user_msgs, metadata, trigger,
-                                assistant_msgs=assistant_msgs)
-    content = _build_snapshot_note(session_id, metadata, body, trigger, date_str=date_str)
-
-    # 6. Write to vault with -snapshot-<HHMMSS> suffix (seconds-resolution avoids
-    # collisions between multiple /compact invocations in the same day).
     filename = make_filename(date_str, project_slug, session_id, suffix=f"-snapshot-{hhmmss}")
+    from note_transactions import context_for_vault, read_revision
+    write_context = context_for_vault(vault_path)
+    expected_revision = read_revision(
+        write_context, Path(vault_path) / sessions_folder / filename,
+    )
 
+    if not claim_hook_run("PreCompact", session_id):
+        print("[obsidian-brain] snapshot skipped: sibling plugin already handled this compact", file=sys.stderr)
+        return
+
+    # Seconds-resolution suffix preserves the legacy snapshot filename.
     snapshot_written = False
     try:
-        result = write_vault_note(vault_path, sessions_folder, filename, content)
+        body = _build_snapshot_body(user_msgs, metadata, trigger,
+                                    assistant_msgs=assistant_msgs)
+        content = _build_snapshot_note(session_id, metadata, body, trigger, date_str=date_str)
+        result = write_vault_note(vault_path, sessions_folder, filename, content,
+                                  expected_revision=expected_revision)
         if result is None:
             snapshot_written = True
             print(f"[obsidian-brain] snapshot written: {filename}", file=sys.stderr)

@@ -15,6 +15,8 @@ Five integrity checks emitted by ``scan()``:
 """
 from __future__ import annotations
 
+from . import vault_scan, repair_batch, repair_write, repair_read
+
 import os
 import re
 import sys
@@ -97,6 +99,7 @@ def _replace_in_frontmatter(text: str, pattern: str, replacement: str,
     return new_text, n
 
 
+@vault_scan
 def scan(vault_path: str, sessions_folder: str, insights_folder: str,
          days: int, project: str | None = None) -> list:
     """Return Issue objects for all five check kinds."""
@@ -329,20 +332,11 @@ def _write_atomic(path: str, text: str, backup_root: str, check_name: str) -> st
         bdir.mkdir(parents=True, exist_ok=True)
         backup_path = bdir / p.name
         shutil.copy2(p, backup_path)
-    fd, tmp = tempfile.mkstemp(prefix=".ob-doctor-", suffix=".md.tmp", dir=str(p.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, str(p))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    repair_write(path, text)
     return str(backup_path) if backup_path is not None else None
 
 
+@repair_batch
 def apply(issues, backup_root: str) -> list:
     results: list[Result] = []
     for issue in issues:
@@ -355,7 +349,7 @@ def apply(issues, backup_root: str) -> list:
         try:
             backup: str | None = None
             if issue.check == "snapshot-broken-backlink":
-                text = _read_text(issue.note_path) or ""
+                text = repair_read(issue.note_path)
                 new_text, n = _replace_in_frontmatter(
                     text,
                     r'(?m)^source_session_note:.*$',
@@ -377,7 +371,7 @@ def apply(issues, backup_root: str) -> list:
                 backup = _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "snapshot-summary-status-mismatch":
                 new_status = "summarized" if "status=summarized" in issue.proposed_source else "auto-logged"
-                text = _read_text(issue.note_path) or ""
+                text = repair_read(issue.note_path)
                 new_text, n = _replace_in_frontmatter(
                     text,
                     r"(?m)^status:\s*\S+",
@@ -397,7 +391,7 @@ def apply(issues, backup_root: str) -> list:
                     continue
                 backup = _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "session-snapshot-list-missing":
-                text = _read_text(issue.note_path) or ""
+                text = repair_read(issue.note_path)
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
                     raise RuntimeError(
@@ -438,7 +432,7 @@ def apply(issues, backup_root: str) -> list:
                     continue
                 backup = _write_atomic(issue.note_path, new_text, backup_root, issue.check)
             elif issue.check == "session-snapshot-list-stale":
-                text = _read_text(issue.note_path) or ""
+                text = repair_read(issue.note_path)
                 stale = issue.extra.get("stale", [])
                 # Restrict stale-entry pruning to the frontmatter block.
                 # A body bullet list matching ``- "[[stale-stem]]"`` (e.g.

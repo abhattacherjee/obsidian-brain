@@ -109,6 +109,7 @@ def _make_cached_entry(canonical_hash, classification="DONE", classified_ts=None
         "confidence": "HIGH",
         "evidence_citation": "test",
         "classified_ts": classified_ts if classified_ts is not None else int(time.time()) - 60,
+        "provenance": __import__("check_items_cache")._provenance(_make_group(canonical_hash, members=members), "obsidian-brain"),
     }
 
 
@@ -215,8 +216,8 @@ def test_mtime_bump_triggers_partial_reclassify():
     assert needs[0]["_reason"] == "mtime_changed"
 
 
-def test_mtime_one_second_tolerance():
-    """+/- 1s mtime tolerance per spec; FS noise must not invalidate."""
+def test_semantic_fingerprint_rejects_mtime_drift_even_within_tolerance():
+    """Complete input provenance invalidates even subsecond source drift."""
     from check_items_cache import partition
     groups = [_make_group("h1", members=[{"file": "a.md", "line": 1, "mtime": 1735000000.5}])]
     cache = {
@@ -232,8 +233,8 @@ def test_mtime_one_second_tolerance():
         },
     }
     known, needs = partition(groups, cache, project="obsidian-brain", head_sha="abc1234")
-    assert len(known) == 1
-    assert len(needs) == 0
+    assert len(known) == 0
+    assert needs[0]["_reason"] == "provenance_changed"
 
 
 def test_ttl_expires_for_done_at_24h():
@@ -829,6 +830,7 @@ def test_partition_skips_corrupted_cache_entries():
         },
     }
     groups = [_make_group("h1")]
+    cache["runs"]["p"]["groups"][1]["provenance"] = __import__("check_items_cache")._provenance(groups[0], "p")
     # Should not raise KeyError; corrupted entry is silently skipped
     known, needs = partition(groups, cache, project="p", head_sha="h")
     assert len(known) == 1
@@ -1779,7 +1781,7 @@ def test_locked_cache_releases_on_exception(tmp_path, monkeypatch):
             cache["runs"]["p"] = {"groups": []}
             raise _Boom("kaboom")
 
-    assert not lock_path.exists(), "lock file must be released even when the body raises"
+    assert lock_path.read_bytes() == b"", "OS ownership must be released even when the body raises"
     assert not fake_cache.exists(), "save_cache must not run when the body raised"
 
 
@@ -1837,70 +1839,34 @@ def test_locked_cache_does_not_delete_a_lock_it_no_longer_owns(tmp_path, monkeyp
 
     assert lock_path.exists(), "must not delete a lock another process now owns"
     assert lock_path.read_bytes() == rival_payload
-    data = json.loads(fake_cache.read_text())
-    assert data["runs"]["p"]["groups"] == []
+    assert not fake_cache.exists()
 
 
 def test_locked_cache_fails_open_when_the_lock_cannot_be_acquired(tmp_path, monkeypatch, capsys):
-    """Test 5 (#306) -- fail-open is the whole safety story: if the lock
-    truly cannot be acquired, the cache must STILL be written (unprotected,
-    matching the pre-existing behaviour) and a warning must reach stderr.
-    Forces the acquire path to fail by making _try_create_lock always
-    raise, rather than patching the global os.open (which would also break
-    save_cache's own tempfile-based writes and invalidate the test).
-    """
     import check_items_cache as cic
-    fake_cache = tmp_path / "check-items-classifications.json"
-    monkeypatch.setattr(cic, "CACHE_PATH", fake_cache)
-    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
-
-    def _boom(lock_path, payload):
-        raise OSError("simulated: cache lock directory is unwritable")
-
-    monkeypatch.setattr(cic, "_try_create_lock", _boom)
-
-    with cic.locked_cache(timeout=1.0) as cache:
-        cache["runs"]["p"] = {"groups": []}
-
-    err = capsys.readouterr().err
-    # Assert locked_cache's OWN message, not merely "a warning mentioning a
-    # lock". _acquire_lock already prints its own warning on this path, so a
-    # generic `"WARNING" in err and "lock" in err.lower()` is satisfied by
-    # that other function's output -- deleting locked_cache's warning
-    # entirely left this test green (vacuity audit, #306).
-    assert "could silently drop this run's cache update" in err
-    data = json.loads(fake_cache.read_text())
-    assert data["runs"]["p"]["groups"] == []
+    path = tmp_path / "cache.json"
+    monkeypatch.setattr(cic, "CACHE_PATH", path)
+    monkeypatch.setattr(cic, "_acquire_lock", lambda *args: None)
+    with cic.locked_cache(timeout=0) as cache:
+        cache["runs"]["p"] = {}
+    assert not path.exists()
+    assert "refusing to publish without cache ownership" in capsys.readouterr().err
 
 
 def test_locked_cache_warns_when_contention_times_out(tmp_path, monkeypatch, capsys):
-    """The timeout path is where locked_cache's own warning is the ONLY
-    signal: _acquire_lock prints on an OSError but returns None SILENTLY
-    when it simply runs out of time under contention. Without this test the
-    fail-open warning is only ever exercised on the path where another
-    function happens to be shouting too.
-    """
     import check_items_cache as cic
-    fake_cache = tmp_path / "check-items-classifications.json"
-    monkeypatch.setattr(cic, "CACHE_PATH", fake_cache)
-    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
-
-    # A rival holds a FRESH lock, so takeover never triggers and the acquire
-    # can only time out.
-    lock_path = fake_cache.with_suffix(".lock")
-    lock_path.write_bytes(b"99999 rival\n")
-
-    with cic.locked_cache(timeout=0.2) as cache:
-        cache["runs"]["p"] = {"groups": []}
-
-    err = capsys.readouterr().err
-    assert "could silently drop this run's cache update" in err, (
-        "a contention timeout must still warn -- _acquire_lock is silent here"
-    )
-    # Fail-open still means the write happens.
-    assert json.loads(fake_cache.read_text())["runs"]["p"]["groups"] == []
-    # The rival's lock is untouched.
-    assert lock_path.read_bytes() == b"99999 rival\n"
+    path = tmp_path / "cache.json"
+    monkeypatch.setattr(cic, "CACHE_PATH", path)
+    lock = path.with_suffix(".lock")
+    owner = cic._acquire_lock(lock, 0)
+    try:
+        with cic.locked_cache(timeout=0.01) as cache:
+            cache["runs"]["p"] = {}
+        assert not path.exists()
+        assert cic._owns_lock(lock, owner)
+        assert "refusing to publish" in capsys.readouterr().err
+    finally:
+        cic._release_lock(lock, owner)
 
 
 def test_locked_cache_warning_is_silent_on_the_happy_path(tmp_path, monkeypatch, capsys):
@@ -1920,7 +1886,7 @@ def test_locked_cache_warning_is_silent_on_the_happy_path(tmp_path, monkeypatch,
         cache["runs"]["p"] = {"groups": []}
 
     assert capsys.readouterr().err == ""
-    assert not lock_path.exists(), "lock must be released on the happy path"
+    assert lock_path.read_bytes() == b"", "OS ownership must be released on the happy path"
     data = json.loads(fake_cache.read_text())
     assert data["runs"]["p"]["groups"] == []
     assert "unusable classified_ts" not in capsys.readouterr().err
@@ -2253,7 +2219,7 @@ def test_locked_cache_warns_before_save_when_lock_lost_mid_run(tmp_path, monkeyp
 
     err = capsys.readouterr().err
     assert "lost the cache lock mid-run" in err
-    assert json.loads(fake_cache.read_text())["runs"]["p"]["groups"] == []
+    assert not fake_cache.exists()
 
 
 # test_locked_cache_warning_is_silent_on_the_happy_path (above) is the
@@ -2291,77 +2257,41 @@ def test_read_lock_warns_on_a_non_enoent_error(tmp_path, capsys):
     assert "could not read the cache lock" in capsys.readouterr().err
 
 
-def test_release_lock_warns_on_a_failed_unlink(tmp_path, monkeypatch, capsys):
-    """_release_lock confirms it still owns the lock (read succeeds, bytes
-    match) but the unlink() call itself fails: this must be reported by
-    name and exception, not silently swallowed the way the pre-#323 code
-    did -- the lock is left behind, wedging every later run's acquire for
-    the full timeout with no clue why."""
-    from pathlib import Path
-    from check_items_cache import _release_lock
-
-    lock_path = tmp_path / "cache.lock"
-    payload = b"123 999.000\n"
-    lock_path.write_bytes(payload)
-
-    original_unlink = Path.unlink
-
-    def _boom(self, *a, **kw):
-        if self == lock_path:
-            raise OSError("simulated: read-only volume")
-        return original_unlink(self, *a, **kw)
-
-    monkeypatch.setattr(Path, "unlink", _boom)
-
-    _release_lock(lock_path, payload)  # must not raise
-
-    err = capsys.readouterr().err
-    assert "could not remove the cache lock" in err
-    assert lock_path.exists(), "the lock is still there since removal failed"
-
-
-def test_release_lock_silent_when_unlink_succeeds(tmp_path, capsys):
-    """Negative control: an ordinary successful release emits no warning
-    and actually removes the file."""
-    from check_items_cache import _release_lock
-
-    lock_path = tmp_path / "cache.lock"
-    payload = b"123 999.000\n"
-    lock_path.write_bytes(payload)
-
-    _release_lock(lock_path, payload)
-
-    assert capsys.readouterr().err == ""
-    assert not lock_path.exists()
-
-
-def test_acquire_lock_warns_on_failed_stale_takeover_unlink(tmp_path, monkeypatch, capsys):
-    """The OTHER unlink-failure site: _acquire_lock's stale-takeover
-    branch. Fully confirmed stale (read succeeds, re-read still matches)
-    but unlink() itself fails -- distinct from
-    test_acquire_lock_is_bounded_when_a_stale_lock_cannot_be_removed, which
-    never reaches the unlink call at all because read_bytes() fails first
-    on a directory. Here the lock is a real, readable FILE, so only the
-    unlink is broken."""
-    from pathlib import Path
+def test_release_lock_never_unlinks_persistent_inode(tmp_path, monkeypatch):
     import check_items_cache as cic
+    from pathlib import Path
+    lock = tmp_path / "cache.lock"
+    payload = cic._acquire_lock(lock, 0)
+    inode = lock.stat().st_ino
+    monkeypatch.setattr(Path, "unlink", lambda *args, **kwargs: pytest.fail("lock must not unlink"))
+    cic._release_lock(lock, payload)
+    assert lock.stat().st_ino == inode
+    assert lock.read_bytes() == b""
 
-    lock_path = tmp_path / "cache.lock"
-    stale_payload = f"424242 {time.time() - 10_000:.3f}\n".encode()
-    lock_path.write_bytes(stale_payload)
 
-    original_unlink = Path.unlink
+def test_release_lock_silent_when_owned(tmp_path, capsys):
+    import check_items_cache as cic
+    lock = tmp_path / "cache.lock"
+    payload = cic._acquire_lock(lock, 0)
+    cic._release_lock(lock, payload)
+    assert capsys.readouterr().err == ""
+    assert lock.read_bytes() == b""
+    next_owner = cic._acquire_lock(lock, 0)
+    assert next_owner is not None
+    cic._release_lock(lock, next_owner)
 
-    def _boom(self, *a, **kw):
-        if self == lock_path:
-            raise OSError("simulated: foreign owner")
-        return original_unlink(self, *a, **kw)
 
-    monkeypatch.setattr(Path, "unlink", _boom)
-
-    result = cic._acquire_lock(lock_path, timeout=0.3)
-    assert result is None, "an unremovable stale lock must fall open, not be claimed"
-    assert "could not remove the cache lock" in capsys.readouterr().err
+def test_released_old_metadata_does_not_require_unlink(tmp_path, monkeypatch):
+    import check_items_cache as cic
+    from pathlib import Path
+    lock = tmp_path / "cache.lock"
+    lock.write_bytes(b"old metadata")
+    inode = lock.stat().st_ino
+    monkeypatch.setattr(Path, "unlink", lambda *args, **kwargs: pytest.fail("lock must not unlink"))
+    payload = cic._acquire_lock(lock, 0)
+    assert payload is not None
+    assert lock.stat().st_ino == inode
+    cic._release_lock(lock, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -2587,76 +2517,40 @@ def test_acquire_lock_takes_over_a_nan_dated_stale_lock(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_acquire_lock_generates_a_fresh_payload_per_retry(tmp_path, monkeypatch):
-    """Mocks _lock_payload to return a distinguishable, incrementing value
-    per call. Under the pre-#323-F8 code (payload built once before the
-    loop), _lock_payload is called exactly ONCE no matter how many times
-    the loop retries -- this test's `calls['n'] >= 2` assertion alone kills
-    that mutation. The returned payload must also be the LAST one
-    generated (the attempt that actually succeeded), not the first."""
     import check_items_cache as cic
-    lock_path = tmp_path / "cache.lock"
-    # A rival, FRESH lock (not stale) so ordinary contention -- not
-    # takeover -- is what drives the retries.
-    lock_path.write_bytes(f"1 {time.time():.3f}\n".encode())
-
-    calls = {"n": 0}
-
-    def _counting_payload():
-        calls["n"] += 1
-        return f"COUNTER-{calls['n']}\n".encode()
-
-    monkeypatch.setattr(cic, "_lock_payload", _counting_payload)
-
-    import threading
-    def _release_rival():
-        time.sleep(0.2)
-        lock_path.unlink(missing_ok=True)
-    threading.Thread(target=_release_rival, daemon=True).start()
-
-    payload = cic._acquire_lock(lock_path, timeout=5.0)
-
-    assert payload is not None
-    assert calls["n"] >= 2, (
-        "test setup did not exercise multiple attempts, or _lock_payload "
-        "is only being called once (the F8 regression)"
-    )
-    assert payload == f"COUNTER-{calls['n']}\n".encode(), (
-        "the returned payload must be the one generated on the attempt "
-        "that actually succeeded, not a stale one built before the wait"
-    )
+    lock = tmp_path / "cache.lock"
+    calls = []
+    original = cic._try_create_lock
+    def contender(path, payload):
+        calls.append(payload)
+        if len(calls) == 1:
+            raise FileExistsError()
+        original(path, payload)
+    monkeypatch.setattr(cic, "_try_create_lock", contender)
+    payload = cic._acquire_lock(lock, 1)
+    try:
+        assert len(calls) == 2
+        assert calls[0] != calls[1]
+        assert payload == calls[-1]
+    finally:
+        cic._release_lock(lock, payload)
 
 
 def test_acquire_lock_payload_is_timestamped_at_the_winning_attempt(tmp_path):
-    """#323 F8 — the payload was minted once before the wait loop, so a
-    contended winner's lock was born up to `timeout` seconds old, silently
-    cutting its stale grace from _LOCK_STALE_SECONDS to
-    (_LOCK_STALE_SECONDS - timeout) and coupling two constants that read as
-    independent. The winning attempt's payload must be stamped when it
-    actually succeeds."""
-    from check_items_cache import _acquire_lock
-
-    lock = tmp_path / "cache.lock"
-    rival = f"999 {time.time():.3f}\n".encode()
-    lock.write_bytes(rival)
-
+    import check_items_cache as cic
     import threading
-    def release_after(delay):
-        time.sleep(delay)
-        lock.unlink()
-    t = threading.Thread(target=release_after, args=(0.4,))
-    t.start()
+    lock = tmp_path / "cache.lock"
+    first = cic._acquire_lock(lock, 0)
+    thread = threading.Thread(target=lambda: (time.sleep(0.1), cic._release_lock(lock, first)))
+    thread.start()
     started = time.time()
-    payload = _acquire_lock(lock, timeout=5.0)
-    t.join()
-
-    assert payload is not None
-    stamp = float(payload.split()[1])
-    waited = time.time() - started
-    assert waited > 0.3, "the test did not actually contend"
-    assert stamp - started > 0.3, (
-        f"payload stamp {stamp - started:.2f}s after start, but the acquire "
-        f"waited {waited:.2f}s — the payload was minted before the wait"
-    )
+    payload = cic._acquire_lock(lock, 1)
+    thread.join()
+    try:
+        assert payload is not None
+        assert float(payload.split()[1]) - started > 0.08
+    finally:
+        cic._release_lock(lock, payload)
 
 
 def test_lock_age_tolerates_the_payload_rounding_artifact_deterministically(tmp_path):
@@ -2688,3 +2582,139 @@ def test_lock_age_tolerates_the_payload_rounding_artifact_deterministically(tmp_
             f"iteration {i}: fresh payload read as age {age:.0f}s — the gate "
             "rejected a rounding-negative age and fell through to st_mtime"
         )
+
+
+@pytest.mark.parametrize("lost", [False, True])
+def test_unowned_cache_update_never_publishes(tmp_path, monkeypatch, lost):
+    import check_items_cache as cic
+    cache_path = tmp_path / "cache.json"
+    original = {"schema_version": cic.SCHEMA_VERSION, "runs": {"existing": {}}}
+    cache_path.write_text(json.dumps(original))
+    monkeypatch.setattr(cic, "CACHE_PATH", cache_path)
+    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path)
+    if not lost:
+        monkeypatch.setattr(cic, "_acquire_lock", lambda *args: None)
+    with cic.locked_cache(timeout=0) as cache:
+        cache["runs"]["new"] = {}
+        if lost:
+            cache_path.with_suffix(".lock").write_bytes(b"other owner")
+    assert json.loads(cache_path.read_text()) == original
+
+
+def test_bound_native_cache_uses_private_state(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import check_items_cache as cic
+    from runtime_context import using_runtime_context
+    monkeypatch.setattr(cic, "CACHE_PATH", tmp_path / "legacy" / "cache.json")
+    monkeypatch.setattr(cic, "CACHE_DIR", tmp_path / "legacy")
+    state = tmp_path / "native state"
+    selected = SimpleNamespace(state_path=state, vault_path=tmp_path / "vault", host="codex",
+                               session_key="session", canonical_project_root=tmp_path / "project")
+    with using_runtime_context(selected):
+        cic.save_cache({"schema_version": cic.SCHEMA_VERSION, "runs": {"native": {}}})
+        assert cic.load_cache()["runs"] == {"native": {}}
+    assert list(state.glob("v1/*/codex/session/*/cache/check-items-classifications.json"))
+
+
+@pytest.mark.parametrize("field", ["text", "vault", "project", "algorithm", "backend", "model", "evidence"])
+def test_cache_provenance_rejects_semantic_changes(tmp_path, field):
+    from types import SimpleNamespace
+    from runtime_context import using_runtime_context
+    import check_items_cache as cic
+    context = SimpleNamespace(vault_path=tmp_path / "vault", canonical_project_root=tmp_path / "project",
+                              host="codex", config={"codex_model": "model-a"})
+    group = _make_group("same-hash")
+    fresh = {**_make_cached_entry("same-hash", classified_ts=100), "classifier_source": "agent"}
+    evidence = {"algorithm": "algorithm-a", "backend": "codex", "evidence": "input-a"}
+    with using_runtime_context(context):
+        cache = cic.update_cache({}, "p", [group], [fresh], "head", now=100, provenance=evidence)
+        assert len(cic.partition([dict(group)], cache, "p", "head", now=101, provenance=evidence)[0]) == 1
+        if field == "text":
+            group["canonical_text"] = "different semantic input"
+        elif field == "vault":
+            context.vault_path = tmp_path / "other vault"
+        elif field == "project":
+            context.canonical_project_root = tmp_path / "other project"
+        elif field == "model":
+            context.config["codex_model"] = "model-b"
+        else:
+            evidence[field] = "changed"
+        known, needs = cic.partition([group], cache, "p", "head", now=101, provenance=evidence)
+    assert not known
+    assert needs[0]["_reason"] == "provenance_changed"
+
+
+def test_legacy_cache_without_provenance_is_not_replayed():
+    import check_items_cache as cic
+    group = _make_group("h")
+    entry = _make_cached_entry("h")
+    entry.pop("provenance")
+    cache = {"runs": {"p": {"groups": [entry], "project_head_at_classify": "head"}}}
+    known, needs = cic.partition([group], cache, "p", "head")
+    assert not known
+    assert needs[0]["_reason"] == "provenance_changed"
+
+
+def test_live_os_lock_cannot_be_stolen_by_age(tmp_path):
+    import check_items_cache as cic
+    lock = tmp_path / "cache.lock"
+    payload = cic._acquire_lock(lock, 0)
+    assert payload is not None
+    try:
+        os.utime(lock, (0, 0))
+        assert cic._acquire_lock(lock, 0.01) is None
+        assert cic._owns_lock(lock, payload)
+    finally:
+        cic._release_lock(lock, payload)
+    assert lock.exists()
+    assert lock.read_bytes() == b""
+
+
+def test_cache_os_lock_releases_when_holder_process_dies(tmp_path):
+    import check_items_cache as cic
+    lock = tmp_path / "cache.lock"
+    code = """
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from check_items_cache import _acquire_lock
+payload = _acquire_lock(Path(sys.argv[2]), 1)
+assert payload is not None
+print('owned', flush=True)
+time.sleep(10)
+"""
+    child = subprocess.Popen([sys.executable, "-c", code, os.path.abspath(HOOKS_DIR), str(lock)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "owned"
+        inode = lock.stat().st_ino
+        assert cic._acquire_lock(lock, 0.01) is None
+        child.kill()
+        child.wait(timeout=5)
+        payload = cic._acquire_lock(lock, 1)
+        assert payload is not None
+        try:
+            assert lock.stat().st_ino == inode
+            assert cic._owns_lock(lock, payload)
+        finally:
+            cic._release_lock(lock, payload)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.communicate(timeout=5)
+
+
+def test_cache_replaced_lock_inode_cannot_authorize_publication(tmp_path, monkeypatch):
+    import check_items_cache as cic
+    path = tmp_path / "cache.json"
+    monkeypatch.setattr(cic, "CACHE_PATH", path)
+    lock = path.with_suffix(".lock")
+    with cic.locked_cache(timeout=0) as cache:
+        owner_bytes = lock.read_bytes()
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(owner_bytes)
+        os.replace(replacement, lock)
+        cache["runs"]["unowned"] = {}
+    assert not path.exists()
+    assert lock.read_bytes() == owner_bytes

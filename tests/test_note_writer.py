@@ -1652,11 +1652,7 @@ def test_run_append_update_in_process_inserts_before_marker_hitting_loop_break(
 def test_atomic_rewrite_forces_inner_and_outer_exception_branches(
     tmp_path, monkeypatch, capsys
 ):
-    """Forces os.rename to fail AFTER the temp file has already been written
-    and chmod'd, driving _atomic_rewrite through its inner except (unlink
-    the temp file, re-raise) and outer except (format the error string) in
-    one call -- the forced-error test above only fakes _atomic_rewrite's
-    return value wholesale and never actually runs its body."""
+    """A failed replacement preserves the note and removes its temporary file."""
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
     before = note.read_bytes()
@@ -1664,7 +1660,8 @@ def test_atomic_rewrite_forces_inner_and_outer_exception_branches(
     def _boom_rename(*a, **k):
         raise OSError("forced rename failure for test")
 
-    monkeypatch.setattr(note_writer.os, "rename", _boom_rename)
+    import note_transactions
+    monkeypatch.setattr(note_transactions.os, "replace", _boom_rename)
 
     err = note_writer._atomic_rewrite(note, "new content\n")
 
@@ -1672,8 +1669,9 @@ def test_atomic_rewrite_forces_inner_and_outer_exception_branches(
     assert "forced rename failure" in err
     assert note.read_bytes() == before
     # the temp file was cleaned up, not left behind
-    leftover = list(note.parent.glob(".ob-*.md.tmp"))
+    leftover = list(note.parent.glob(".ob-*.tmp"))
     assert leftover == []
+
 
 
 # ===========================================================================
@@ -3561,7 +3559,13 @@ def test_append_update_takes_over_a_stale_lock(tmp_path):
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
     lock = note.parent / f".{note.name}.ob-lock"
-    lock.write_text("1\n", encoding="utf-8")
+    import subprocess
+    import sys
+    ended = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.getpid())"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=True,
+    )
+    lock.write_text(ended.stdout, encoding="utf-8")
     stale = time.time() - (note_writer._STALE_LOCK_SECONDS + 5)
     os.utime(lock, (stale, stale))
 

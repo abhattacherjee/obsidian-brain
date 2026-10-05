@@ -152,3 +152,43 @@ def test_native_transcript_layouts_keep_metadata_tools_and_mirrors(name, sid, re
     assert {"response_item", "event_msg", "turn_context"} <= envelopes
     assert {"custom_tool_call", "custom_tool_call_output", "item_completed"} <= payload_types
     assert required <= envelopes | payload_types
+
+
+@pytest.mark.parametrize("name", [
+    "codex-cli-0.159.0-alpha.12.1-original.jsonl",
+    "codex-cli-0.159.0-alpha.12.1-fork.jsonl",
+    "codex-desktop-0.159.0-alpha.12.1-session.jsonl",
+])
+def test_native_fixtures_exclude_account_and_instruction_metadata(name):
+    import hashlib
+    fixtures = ROOT / "tests" / "fixtures" / "hosts"
+    path = fixtures / name
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    forbidden = {"creator_user_id", "creator_account_id", "base_instructions", "rate_limits",
+                 "plan_type", "credits", "usage", "turn_token_usage", "thread_token_usage",
+                 "total_token_usage", "last_token_usage"}
+
+    def check(value):
+        if isinstance(value, dict):
+            if forbidden.intersection(value):
+                pytest.fail("Private native metadata remains", pytrace=False)
+            for child in value.values():
+                check(child)
+        elif isinstance(value, list):
+            for child in value:
+                check(child)
+
+    for row in rows:
+        check(row)
+        payload = row.get("payload", {})
+        if row["type"] == "token_usage_record":
+            assert payload == {}
+        elif row["type"] == "event_msg" and payload.get("type") == "token_count":
+            assert payload == {"type": "token_count"}
+    provenance = json.loads((fixtures / "native-session-provenance.json").read_text())
+    recorded = next(item for item in provenance["candidates"] if item["fixture_filename"] == name)
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == recorded["fixture_sha256"]
+    counts = {}
+    for row in rows:
+        counts[row["type"]] = counts.get(row["type"], 0) + 1
+    assert counts == recorded["record_type_counts"]

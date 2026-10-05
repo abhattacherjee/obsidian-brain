@@ -10,6 +10,8 @@ This check detects and fixes the inconsistency.
 
 from __future__ import annotations
 
+from . import vault_scan, repair_batch, repair_write, repair_read
+
 import os
 import re
 import shutil
@@ -30,6 +32,7 @@ DESCRIPTION = "Detect and fix underscored project names in frontmatter (should u
 DEFAULT_WINDOW_DAYS = 9999  # unbounded — scan all notes
 
 
+@vault_scan
 def scan(
     vault_path: str,
     sessions_folder: str,
@@ -75,6 +78,7 @@ def scan(
     return issues
 
 
+@repair_batch
 def apply(issues: list[Issue], backup_root: str) -> list[Result]:
     """Replace underscored project names with hyphenated versions in frontmatter."""
     results: list[Result] = []
@@ -93,8 +97,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             continue
 
         try:
-            content = Path(note_path).read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
+            content = Path(note_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
             results.append(Result(
                 check=NAME,
                 note_path=note_path,
@@ -148,7 +152,7 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
         backup_path = backup_dir / Path(note_path).name
         try:
             shutil.copy2(note_path, backup_path)
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             results.append(Result(
                 check=NAME,
                 note_path=note_path,
@@ -162,20 +166,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
         dest = Path(note_path)
         tmp = None
         try:
-            fd, tmp = tempfile.mkstemp(
-                dir=str(dest.parent),
-                prefix=".vd-projnorm-",
-                suffix=".tmp",
-            )
-            try:
-                os.write(fd, new_content.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, str(dest))
-            tmp = None  # consumed by os.replace
-        except OSError as exc:
+            repair_write(dest, new_content)
+        except (OSError, UnicodeDecodeError) as exc:
             results.append(Result(
                 check=NAME,
                 note_path=note_path,

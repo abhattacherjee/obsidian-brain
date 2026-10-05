@@ -452,6 +452,11 @@ def _run(context=None, payload=None) -> None:
         date_str = obsidian_utils._first_seen_date(session_id)
         project_slug = slugify(metadata.get("project", "session"))
         filename = make_filename(date_str, project_slug, session_id)
+        from note_transactions import context_for_vault, read_revision
+        write_context = context_for_vault(vault_path)
+        expected_revision = read_revision(
+            write_context, Path(vault_path) / sessions_folder / filename,
+        )
 
         # 9. Cross-plugin dedup guard — if a sibling install already claimed
         # this (SessionEnd, session_id) trigger, skip before doing the
@@ -478,7 +483,8 @@ def _run(context=None, payload=None) -> None:
             tool_uses = extract_tool_uses(messages)
             raw_body = build_raw_fallback(user_msgs, metadata, assistant_msgs=assistant_msgs, tool_uses=tool_uses, config=config)
             raw_content = _build_note(session_id, metadata, raw_body, resumed=resumed)
-            write_err = write_vault_note(vault_path, sessions_folder, filename, raw_content)
+            write_err = write_vault_note(vault_path, sessions_folder, filename, raw_content,
+                                         expected_revision=expected_revision)
             if write_err is not None:
                 print(f"[obsidian-brain] failed to write raw note: {write_err}", file=sys.stderr)
                 _append_sessionend_log(

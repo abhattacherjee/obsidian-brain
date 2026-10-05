@@ -597,7 +597,7 @@ class TestFlipNoteStatus:
         from obsidian_utils import flip_note_status
         note = tmp_path / "test-note.md"
         note.write_text("---\nstatus: auto-logged\nproject: test\n---\nContent here\n")
-        flip_note_status(str(note), "auto-logged", "summarized")
+        assert flip_note_status(str(note), "auto-logged", "summarized", vault_path=str(tmp_path))
         content = note.read_text()
         assert "status: summarized" in content
         assert "status: auto-logged" not in content
@@ -607,7 +607,7 @@ class TestFlipNoteStatus:
         from obsidian_utils import flip_note_status
         note = tmp_path / "test-note.md"
         note.write_text("---\nstatus: auto-logged\nproject: my-project\ntags:\n  - claude/session\n---\n# Title\nBody\n")
-        flip_note_status(str(note), "auto-logged", "summarized")
+        assert flip_note_status(str(note), "auto-logged", "summarized", vault_path=str(tmp_path))
         content = note.read_text()
         assert "project: my-project" in content
         assert "claude/session" in content
@@ -621,7 +621,7 @@ class TestFlipNoteStatus:
             "---\nstatus: auto-logged\nproject: test\n---\n"
             "The old status: auto-logged was changed.\n"
         )
-        flip_note_status(str(note), "auto-logged", "summarized")
+        assert flip_note_status(str(note), "auto-logged", "summarized", vault_path=str(tmp_path))
         content = note.read_text()
         assert "status: summarized" in content.split("---")[1]  # frontmatter
         assert "status: auto-logged was changed" in content  # body preserved
@@ -634,7 +634,7 @@ class TestFlipNoteStatus:
             "---\nstatus: summarized\nproject: test\n---\n"
             "Previously it was status: auto-logged\n"
         )
-        result = flip_note_status(str(note), "auto-logged", "summarized")
+        result = flip_note_status(str(note), "auto-logged", "summarized", vault_path=str(tmp_path))
         assert result is False  # not found in frontmatter
         content = note.read_text()
         assert "Previously it was status: auto-logged" in content  # body untouched
@@ -643,12 +643,12 @@ class TestFlipNoteStatus:
         from obsidian_utils import flip_note_status
         note = tmp_path / "test-note.md"
         note.write_text("---\nstatus: summarized\n---\nContent\n")
-        result = flip_note_status(str(note), "auto-logged", "summarized")
+        result = flip_note_status(str(note), "auto-logged", "summarized", vault_path=str(tmp_path))
         assert result is False
 
     def test_flip_note_status_returns_false_for_missing_file(self, tmp_path):
         from obsidian_utils import flip_note_status
-        result = flip_note_status(str(tmp_path / "nonexistent.md"), "auto-logged", "summarized")
+        result = flip_note_status(str(tmp_path / "nonexistent.md"), "auto-logged", "summarized", vault_path=str(tmp_path))
         assert result is False
 
 

@@ -176,12 +176,15 @@ def run_batch_edit() -> None:
     Prints ``Applied N/M edits``.
     Records acted-on items so they aren't re-recommended on next run.
     """
-    import tempfile
+    import uuid
+    from pathlib import Path
+    from note_transactions import NoteMutation, apply_mutations, context_for_vault, record_read
 
     from obsidian_utils import load_config
 
     c = load_config()
     vault_root = os.path.realpath(c["vault_path"])
+    context = context_for_vault(vault_root)
 
     edits = json.loads(_read_stdin_capped())
     success = 0
@@ -195,8 +198,9 @@ def run_batch_edit() -> None:
                 print(f"[obsidian-brain] path containment violation: {filepath}", file=sys.stderr)
                 continue
 
-            with open(real_path, "r", encoding="utf-8", errors="replace") as f:
+            with open(real_path, "r", encoding="utf-8", newline="") as f:
                 content = f.read()
+            revision = record_read(context, Path(real_path), content)
 
             new_content = None
             if _is_checkbox_flip(old_text, new_text):
@@ -207,7 +211,7 @@ def run_batch_edit() -> None:
                 # merely *contains* the item text is never touched.
                 lines = content.splitlines(keepends=True)
                 for idx, raw_line in enumerate(lines):
-                    stripped = raw_line.rstrip("\n")
+                    stripped = raw_line.rstrip("\r\n")
                     if stripped == old_text and _UNCHECKED_CHECKBOX_RE.match(stripped):
                         ending = raw_line[len(stripped):]  # preserve "\n" / "" / "\r\n"
                         lines[idx] = new_text + ending
@@ -231,26 +235,19 @@ def run_batch_edit() -> None:
                     skipped_other.append(snippet)
 
             if new_content is not None:
-                fd, tmp = tempfile.mkstemp(
-                    dir=os.path.dirname(real_path), suffix=".tmp"
-                )
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        f.write(new_content)
-                    os.chmod(tmp, 0o600)
-                    os.replace(tmp, real_path)
-                except BaseException:
-                    try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
-                    raise
+                result = apply_mutations(context, [NoteMutation(
+                    Path(real_path), revision, {"document": new_content},
+                    uuid.uuid4().hex, file_mode=0o600,
+                )])
+                if result.status not in {"applied", "unchanged"}:
+                    print(f"[obsidian-brain] edit failed {filepath}: {result.status}", file=sys.stderr)
+                    continue
                 success += 1
                 # Track the item text (strip checkbox prefix for matching)
                 item_text = old_text.replace("- [ ] ", "").replace("- [x] ", "").strip()
                 if item_text:
                     acted_texts.add(item_text)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             print(f"[obsidian-brain] edit failed {filepath}: {e}", file=sys.stderr)
     if acted_texts:
         _save_acted_items(acted_texts)

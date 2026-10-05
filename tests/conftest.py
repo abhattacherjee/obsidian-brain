@@ -333,3 +333,15 @@ def _isolate_harness_session_id_globally(monkeypatch):
     import obsidian_utils
     for name in obsidian_utils._CODEX_HOST_MARKERS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _doctor_tests_do_not_read_live_config(request, monkeypatch):
+    """Legacy synthetic doctor issues use test folders, never user config."""
+    module_name = getattr(request.module, "__name__", "")
+    if "vault_doctor" not in module_name:
+        return
+    import obsidian_utils
+    import hooks.obsidian_utils as qualified_utils
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {})
+    monkeypatch.setattr(qualified_utils, "load_config", lambda: {})

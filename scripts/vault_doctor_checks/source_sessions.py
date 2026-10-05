@@ -21,6 +21,8 @@ making `--min-confidence` override-safe.
 
 from __future__ import annotations
 
+from . import vault_scan, repair_batch, repair_write, repair_read
+
 import glob
 import json
 import os
@@ -572,6 +574,7 @@ def _find_matching_session_by_day_overlap(
     return {**session_note_index[best_sid], "sid": best_sid}
 
 
+@vault_scan
 def scan(
     vault_path: str,
     sessions_folder: str,
@@ -999,6 +1002,7 @@ def _rewrite_frontmatter(text: str, new_sid: str, new_basename: str) -> str:
     return "---\n" + "\n".join(new_lines) + "\n---\n" + body
 
 
+@repair_batch
 def apply(issues, backup_root) -> list[Result]:
     """Apply fixes: back up each file, then atomically rewrite frontmatter.
 
@@ -1111,17 +1115,11 @@ def apply(issues, backup_root) -> list[Result]:
         # patched; backup exists so the user can recover)
         tmp = None
         try:
-            with open(issue.note_path, "r", encoding="utf-8") as f:
+            with open(issue.note_path, "r", encoding="utf-8", newline="") as f:
                 text = f.read()
             new_text = _rewrite_frontmatter(text, proposed_sid, proposed_basename)
 
-            fd, tmp = tempfile.mkstemp(
-                prefix=".vd-", suffix=".md.tmp", dir=os.path.dirname(issue.note_path)
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(new_text)
-            os.replace(tmp, issue.note_path)
-            tmp = None  # replaced successfully; nothing to clean up
+            repair_write(issue.note_path, new_text)
 
             # Restore original atime/mtime so future scans see the same
             # capture_time the scan that flagged this note saw.
