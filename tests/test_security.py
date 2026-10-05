@@ -4922,7 +4922,10 @@ class TestPreflightTokenSurvivesADeniedCall:
     @pytest.mark.parametrize("raw", [
         "[1, 2]", '"abc"', "null", '{"expires": "9"}', '{"expires": null}',
         '{"expires": NaN}', '{"expires": Infinity}', '{"expires": true}',
-        '{"expires": 1.5e99}', "[" * 100_000 + "]" * 100_000, b"\xff\xfe\x00",
+        '{"expires": 1.5e99}', b"\xff\xfe\x00",
+        # A short id: pytest puts the test id in PYTEST_CURRENT_TEST, and
+        # Linux refuses an env string over 128 KB (E2BIG) when git starts.
+        pytest.param("[" * 100_000 + "]" * 100_000, id="deep-nesting"),
     ])
     def test_a_malformed_token_is_denied_not_crashed_on(self, repo, raw):
         """A crash exits 1, a non-blocking error, and the commit runs. These
