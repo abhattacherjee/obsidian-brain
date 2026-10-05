@@ -1768,7 +1768,13 @@ _MATRIX_SIZES_KB = (4, 64, 900)
 # better. A quadratic term is still unmistakable long before an absolute
 # ceiling would fire -- at these sizes the pre-fix hook does not finish a
 # single affected cell.
-_GROWTH_SIZES_KB = (128, 256, 512)
+#
+# #413 moved them up once more, to the largest doubling that fits under the
+# hooks' 1,000,000-byte stdin cap (900 KB is 921,600 bytes). The noise floor
+# below now scales with the baseline, and more work per cell is what keeps a
+# small quadratic above it: at 128/256/512 KB a term costing 6/24/96 ms of
+# work was skipped against a 60 ms baseline (Codex, PR #415).
+_GROWTH_SIZES_KB = (225, 450, 900)
 
 # Best-of-N per cell. `min` picks the least-contended run, which is what makes
 # a wall-clock measurement mean something on a machine running several agents
@@ -1781,8 +1787,10 @@ _GROWTH_REPS = 5
 # smallest cells sit at 0.5-3 ms and produce ratios anywhere from 1.1 to 2.2
 # purely from jitter; on the PRE-fix code two shapes with sub-millisecond work
 # produced 4.60 and 4.06, which would have been false alarms rather than the
-# real quadratic sitting beside them. Cells under the floor are covered by the
-# absolute ceiling in `test_generated_shape_within_budget` instead.
+# real quadratic sitting beside them. A pair under the floor is not compared.
+# The absolute ceiling in `test_generated_shape_within_budget` is no backstop
+# for a mild quadratic: on PR #415 a planted term (command.count run
+# len//1000 times) passed all 27 of its prevent-direct-push cells.
 _GROWTH_MIN_WORK_MS = 3.0
 
 # The floor must also scale with the baseline it is measured against (#413).
@@ -1792,10 +1800,10 @@ _GROWTH_MIN_WORK_MS = 3.0
 # failed under 12 CPU burners (load average 66-80), with ratios up to 11.6x on
 # shapes that are plainly linear. A pair is compared only when its smaller
 # cell's work is at least this fraction of the baseline measured beside it.
-# The real regression this test guards against still trips: a quadratic term
-# makes the larger cells' work big, so their pair clears the floor (the
-# mutation in the #413 PR shows it), and the catastrophic case never finishes
-# a cell at all.
+# A quadratic term is still caught once the SMALLER cell of a pair clears the
+# floor; PR #415 shows planted terms failing the test. Below that, a quadratic
+# can go unseen, and more so under load, because the floor rises with the
+# baseline. The catastrophic case never finishes a cell at all.
 _GROWTH_MIN_WORK_FRACTION = 0.5
 
 # Linear work doubles when the input doubles, so an honest ratio sits near
@@ -2190,15 +2198,18 @@ class TestDecisionTimeIsBounded:
             assert ratio < _GROWTH_MAX_RATIO, (
                 f"prevent-direct-push work grew {ratio:.2f}x for {unit!r} "
                 f"when the input doubled from {kb_a}KB to {kb_b}KB "
-                f"({work_a:.1f}ms -> {work_b:.1f}ms over a {baseline:.1f}ms "
-                f"baseline), past the {_GROWTH_MAX_RATIO}x bound. Linear "
+                f"({work_a:.1f}ms -> {work_b:.1f}ms over baselines of "
+                f"{base_a:.1f}ms and {baseline:.1f}ms), past the "
+                f"{_GROWTH_MAX_RATIO}x bound. Linear "
                 f"work doubles; quadratic work quadruples."
             )
         if not compared:
-            # Say so rather than pass having compared nothing: every pair was
-            # under the noise floor, so this run measured no growth at all.
-            pytest.skip(f"{unit!r}: every cell's work was under the noise floor "
-                        f"({[(kb, round(w, 1), round(bs, 1)) for kb, w, bs in works]})")
+            # Say so rather than pass having compared nothing: the smaller
+            # cell of every pair was under the noise floor, so this run
+            # measured no growth at all.
+            pytest.skip(f"{unit!r}: the smaller cell of every pair was under the "
+                        f"noise floor (kb, work ms, baseline ms): "
+                        f"{[(kb, round(w, 1), round(bs, 1)) for kb, w, bs in works]}")
 
 
 def _hook_regex_constants(hook):
