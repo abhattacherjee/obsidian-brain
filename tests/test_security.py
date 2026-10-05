@@ -4737,19 +4737,19 @@ class TestPreflightTokenSurvivesADeniedCall:
         self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "amended")
         assert self._decide(work, env, f"git {self.C} --amen --no-edit") == "allow"
 
-    def test_amend_parsing_is_capped_and_fast(self, repo):
-        """shlex slows sharply on one long word (6 s at 900 KB), so a command
-        over the cap is read as not an amend (the stricter rule), and one
-        just under it still decides quickly."""
+    def test_command_parsing_is_capped_and_fast(self, repo):
+        """A command over the 100,000-character cap is not read at all, so it
+        is not an amend (the stricter rule), and one just under it still
+        decides quickly."""
         work, env, token = repo
         self._git(work, env, self.C, "-q", "--allow-empty", "-m", "base")
         self._write_token(work, env, token)
         self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "amended")
-        under = f"git {self.C} --amend -m " + "x" * 63_000
+        under = f"git {self.C} --amend -m " + "x" * 99_000
         start = time.perf_counter()
         assert self._decide(work, env, under) == "allow"
         assert time.perf_counter() - start < 2
-        over = f"git {self.C} --amend -m " + "x" * 70_000
+        over = f"git {self.C} --amend -m " + "x" * 101_000
         assert self._decide(work, env, over) == "deny"
 
     def test_resetting_back_to_the_token_head_makes_it_usable_again(self, repo):
@@ -4804,6 +4804,90 @@ class TestPreflightTokenSurvivesADeniedCall:
         self._write_token(work, env, token)
         assert self._decide(work, env, self.REG, cwd=nested) == "allow"
         assert not token.exists()
+
+    def test_the_408_shape_keeps_the_token(self, repo):
+        """The case #408 is about: a commit chained with a PR create that the
+        changelog hook denies. Nothing ran, so the token must survive."""
+        work, env, token = repo
+        self._write_token(work, env, token)
+        cmd = (f"git {self.C} -q -F msg.txt 2>/dev/null && "
+               "gh pr create --base develop --title 't' --body-file b.md")
+        assert self._decide(work, env, cmd) == "allow"
+        assert token.exists()
+
+    @pytest.mark.parametrize("cmd", [
+        # Each was measured landing commits on one kept token (#410 review).
+        "git submodule foreach -q 'git COMMIT -qam s'",
+        "c''d .claude/worktrees/wt && git COMMIT -qam w",
+        'c""d .claude/worktrees/wt && git COMMIT -qam w',
+        'git "-C" .claude/worktrees/wt COMMIT -m w',
+        "git checkout -q -b hop && git COMMIT -qam h && git checkout -q -",
+        "git switch -c hop && git COMMIT -qam h && git switch -",
+        "git COMMIT --amend --no-edit && git -C .claude/worktrees/wt COMMIT -m x",
+        "find .claude/worktrees -execdir git COMMIT -m x ;",
+        "env --chdir=.claude/worktrees/wt git COMMIT -m x",
+        "GIT_DIR=elsewhere git COMMIT -m x",
+        "git -c core.worktree=x COMMIT -m x",
+        "sh -c 'git COMMIT -m x'",
+        "git COMMIT -m x; git COMMIT -m y",
+        "git COMMIT -m $(cat msg)",
+        "git COMMIT -m x | cat",
+        "/usr/bin/git COMMIT -m x",
+        "git COMMIT -m x\\ y",
+        "git COMMIT -m 'unbalanced",
+        # A redirection does not split commands, so a leading one hides the
+        # command name: refused, the stricter reading.
+        "> out.txt git COMMIT -m wip",
+        "git COMMIT -m wip && gh pr checkout 5",
+        "git COMMIT -m wip\ncd .claude/worktrees/wt\ngit COMMIT -qam w",
+        # Quoted text bash still runs: the $, backtick and backslash guards
+        # are what refuse these. Each hides a cd and a second commit.
+        'git COMMIT -m "$(cd .claude/worktrees/wt && git COMMIT -qam w)"',
+        'git COMMIT -m "`cd .claude/worktrees/wt && git COMMIT -qam w`"',
+        "git COMMIT -m a \\'; cd .claude/worktrees/wt && git COMMIT -qam w; echo \\'",
+    ])
+    def test_a_command_not_proven_harmless_spends_the_token(self, repo, cmd):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        cmd = cmd.replace("COMMIT", self.C).replace("\\n", "\n")
+        assert self._decide(work, env, cmd) == "allow"
+        assert not token.exists()
+
+    @pytest.mark.parametrize("cmd", [
+        "git add -A && git COMMIT -m 'fix: x; y (z) #1 | w'",
+        "git COMMIT -m wip # ; cd .claude/worktrees/wt",
+        "(git COMMIT -m wip) && git push -q origin HEAD",
+        "echo ok && git COMMIT -m wip > out.txt",
+        "git COMMIT -m wip\ngh issue comment 1 --body x",
+    ])
+    def test_a_harmless_command_keeps_the_token(self, repo, cmd):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        cmd = cmd.replace("COMMIT", self.C).replace("\\n", "\n")
+        assert self._decide(work, env, cmd) == "allow"
+        assert token.exists()
+
+    def test_an_amend_outside_the_project_spends_the_token(self, repo):
+        work, env, token = repo
+        wt = self._worktree(work, env)
+        self._write_token(work, env, token)
+        assert self._decide(work, env, self.AMEND, cwd=wt) == "allow"
+        assert not token.exists()
+
+    def test_a_quoted_pipe_in_the_message_does_not_hide_the_amend(self, repo):
+        work, env, token = repo
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token)
+        self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "amended")
+        cmd = f'git {self.C} -m "|" --amend'
+        assert self._decide(work, env, cmd) == "allow"
+
+    def test_amend_after_a_double_dash_is_a_path_not_a_flag(self, repo):
+        work, env, token = repo
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token)
+        self._git(work, env, self.C, "-q", "--amend", "--allow-empty", "-m", "amended")
+        assert self._decide(work, env, f"git {self.C} -m x -- --amend") == "deny"
 
     # --- tokens that cannot be trusted --------------------------------------
 
@@ -4863,8 +4947,10 @@ class TestPreflightTokenSurvivesADeniedCall:
         cmd = self.AMEND if amend else self.REG
         assert self._decide(work, env, cmd) == "deny"
         assert not token.exists()
-        argv = log.read_text() if log.exists() else ""
-        assert str(bad) not in argv
+        calls = log.read_text().splitlines() if log.exists() else []
+        # No git argument is, or is built from, the bad value.
+        assert not any(arg == str(bad) or arg.startswith(str(bad) + "^")
+                       for call in calls for arg in call.split()), calls
 
     def test_a_git_failure_denies_and_keeps_the_token(self, repo):
         """git failing says nothing about whether the token was used, so the

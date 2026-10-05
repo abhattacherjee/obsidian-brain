@@ -13,11 +13,11 @@ The token is:
 - Tied to the HEAD it was made at (its "head" field). A commit is allowed
   only while HEAD is still that commit; an amend also while HEAD's first
   parent is unchanged. Any HEAD move (a commit, a rebase, a checkout) ends it.
-- Kept across calls only when the commit provably runs in this project's own
-  checkout, so the hook can see HEAD move. Then a call that another hook
-  denies does not spend it (#408). Anywhere else (a `cd`, `-C` or worktree,
-  or no `cwd` in the payload), a regular commit spends it on approval, as
-  before. A token without "head" works the same way.
+- Kept across calls only for a command this hook reads exactly and knows is
+  harmless (see _safe_commit_args), run in the project's own checkout, so a
+  landed commit moves the HEAD it reads. Then a call that another hook denies
+  does not spend it (#408). Any other command spends it on approval, as
+  before, amends included. A token without "head" works the same way.
 """
 
 import hashlib
@@ -42,14 +42,6 @@ TOKEN_FILE = _get_token_path()
 
 
 _HEX_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
-
-# Anything that can make the commit run somewhere other than the project's
-# own checkout. Over-matching is safe: it only falls back to spending the
-# token on approval.
-_DIR_SWITCH = re.compile(
-    r"\b(?:cd|pushd|popd)\b|(?:^|\s)-C|--git-dir|--work-tree|GIT_[A-Z_]*=|worktree"
-)
-
 
 def _git(args, cwd):
     """stdout of ``git -C cwd args``, or None when git fails in any way."""
@@ -87,19 +79,20 @@ def _token_state(token_head, is_amend):
     return "moved"
 
 
-def _commit_runs_in_project(command, cwd):
-    """True only when the commit provably lands in the project's own
-    checkout: no directory or repo switch in the command, and the shell's cwd
-    is inside the project's work tree. Only then does a landed commit move
-    the HEAD this hook reads."""
-    if not isinstance(cwd, str) or not cwd or _DIR_SWITCH.search(command):
-        return False
-    top = _git(["rev-parse", "--show-toplevel"], cwd)
-    return top is not None and os.path.realpath(top) == _project_dir()
+# The token is kept across calls only for a command this hook can read
+# EXACTLY and knows is harmless: a few allowlisted commands, run in the
+# project's own checkout, with one commit. Everything else spends the token on
+# approval, as before #408, so anything missing from the allowlist costs only
+# the convenience, never a second unchecked commit. A denylist of ways to
+# commit elsewhere was tried first and leaked three times in review (a quoted
+# -C, c''d, git submodule foreach, a branch switch and back).
+_SAFE_COMMAND_CAP = 100_000  # the same limit as prevent-direct-push's _SHLEX_MAX
+_SEPARATORS = frozenset(";&|()\n")
+_GIT_SAFE = frozenset({"add", "status", "diff", "log", "show", "push", "rev-parse"})
+_GH_SAFE = frozenset({"create", "view", "edit", "comment", "list", "checks", "status"})
 
-
-# Commit options whose value is the next word (a message, a file, a
-# commit), so that word is never read as a flag.
+# Commit options whose value is the next word (a message, a file, a commit),
+# so that word is never read as a flag.
 _COMMIT_VALUE_OPTS = frozenset({
     "--message", "--file", "--reuse-message", "--reedit-message",
     "--template", "--author", "--date", "--fixup", "--squash", "--cleanup",
@@ -107,41 +100,109 @@ _COMMIT_VALUE_OPTS = frozenset({
 })
 
 
-_AMEND_PARSE_CAP = 64_000
+def _lex(command):
+    """``command`` as bash splits it: ``("w", word)`` and ``("op", char)``
+    items, or None when it uses anything outside the alphabet this reads
+    exactly. That alphabet has no ``$``, backtick or backslash, so there is
+    no expansion, substitution or escape, and a quoted string is literal
+    text. An unquoted ``#`` at the start of a word starts a comment."""
+    if len(command) > _SAFE_COMMAND_CAP or any(c in command for c in "$`\\"):
+        return None
+    items, buf, in_word, i, n = [], [], False, 0, len(command)
+
+    def end_word():
+        if in_word:
+            items.append(("w", "".join(buf)))
+            buf.clear()
+
+    while i < n:
+        c = command[i]
+        if c in "'\"":
+            j = command.find(c, i + 1)
+            if j < 0:
+                return None
+            buf.append(command[i + 1:j])
+            in_word, i = True, j + 1
+        elif c in " \t":
+            end_word()
+            in_word, i = False, i + 1
+        elif c in ";&|()<>\n":
+            end_word()
+            items.append(("op", c))
+            in_word, i = False, i + 1
+        elif c == "#" and not in_word:
+            j = command.find("\n", i)
+            i = n if j < 0 else j
+        else:
+            buf.append(c)
+            in_word, i = True, i + 1
+    end_word()
+    return items
 
 
-def _is_amend(command):
-    """True when the commit in ``command`` carries ``--amend`` (or an
-    abbreviation git accepts) as its own argument, not inside a message.
-    Unparseable text counts as not an amend: the stricter rule. So does a
-    command over ``_AMEND_PARSE_CAP`` characters: shlex is pure Python and
-    slows sharply on one long word (6 s at 900 KB, measured), and this hook
-    runs on every Bash call."""
-    if "--am" not in command or len(command) > _AMEND_PARSE_CAP:
-        return False
-    import shlex
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError:
-        return False
-    seen_git = in_commit = skip_value = False
-    for tok in tokens:
-        if tok and set(tok) <= set(";&|()<>"):
-            seen_git = in_commit = skip_value = False
-        elif skip_value:
-            skip_value = False  # the value of -m, -F, ...: never a flag
-        elif tok == "git":
-            seen_git = True
-        elif seen_git and tok == "commit":
-            in_commit = True
-        elif in_commit and len(tok) >= 4 and "--amend".startswith(tok):
+def _safe_commit_args(command):
+    """The words after ``commit`` when ``command`` is safe to keep the token
+    for, else None. Safe means: it lexes exactly, every command in it is
+    ``git <add|status|diff|log|show|push|rev-parse|commit>``, ``gh <pr|issue>
+    <create|view|edit|comment|list|checks|status>``, ``echo``, ``printf`` or
+    ``true``, the subcommand directly follows ``git`` (no global options such
+    as ``-C``), and exactly one of them is a commit. ``<`` and ``>`` do not
+    split commands, so a redirection target reads as an argument; that can
+    only make a command look less safe, never more."""
+    items = _lex(command)
+    if items is None:
+        return None
+    segments, cur = [], []
+    for kind, text in items:
+        if kind == "op" and text in _SEPARATORS:
+            segments.append(cur)
+            cur = []
+        elif kind == "w":
+            cur.append(text)
+    segments.append(cur)
+    commits = []
+    for words in segments:
+        if not words:
+            continue
+        head = words[0]
+        if head == "git" and len(words) > 1 and words[1] == "commit":
+            commits.append(words[2:])
+        elif head == "git" and len(words) > 1 and words[1] in _GIT_SAFE:
+            pass
+        elif (head == "gh" and len(words) > 2 and words[1] in ("pr", "issue")
+              and words[2] in _GH_SAFE):
+            pass
+        elif head in ("echo", "printf", "true"):
+            pass
+        else:
+            return None
+    return commits[0] if len(commits) == 1 else None
+
+
+def _has_amend(args):
+    """True when the commit ``args`` carry ``--amend`` (or an abbreviation git
+    accepts) as a flag: not as the value of -m/-F/..., and not after ``--``."""
+    skip_value = False
+    for word in args:
+        if skip_value:
+            skip_value = False
+        elif word == "--":
+            return False
+        elif len(word) >= 4 and "--amend".startswith(word):
             return True
-        elif in_commit and (tok in _COMMIT_VALUE_OPTS
-                            or re.fullmatch(r"-[A-Za-z]*[mFCct]", tok)):
+        elif word in _COMMIT_VALUE_OPTS or re.fullmatch(r"-[A-Za-z]*[mFCct]", word):
             skip_value = True
     return False
+
+
+def _cwd_in_project(cwd):
+    """True when the shell's cwd is inside the project's own work tree (not a
+    worktree, submodule or nested repo), so a commit there moves the HEAD
+    this hook reads."""
+    if not isinstance(cwd, str) or not cwd:
+        return False
+    top = _git(["rev-parse", "--show-toplevel"], cwd)
+    return top is not None and os.path.realpath(top) == _project_dir()
 
 
 def _spend_token():
@@ -687,7 +748,6 @@ def main():
     if not is_commit:
         allow()
 
-    is_amend = _is_amend(command)
 
     # Skip this hook if the command targets a repo outside this project
     if not _targets_this_project(command, _COMMIT_VERB):
@@ -764,14 +824,21 @@ Please run preflight again to refresh:
 
 Then retry your commit.""")
 
+    # Whether the token may outlive this call (see _safe_commit_args), and
+    # whether that safe command is an amend. A command that is not safe is
+    # never treated as an amend: the stricter rule.
+    commit_args = _safe_commit_args(command)
+    keep = commit_args is not None and _cwd_in_project(input_data.get("cwd"))
+    is_amend = commit_args is not None and _has_amend(commit_args)
+
     checks_run = token_data.get("checks_run", "none")
     staged_count = token_data.get("staged_files", 0)
     token_head = token_data.get("head")
 
     if token_head in (None, ""):
         # No "head" (an older preflight, or a repo with no commits yet):
-        # a regular commit spends the token on approval, as before.
-        if not is_amend:
+        # spent on approval, except a safe amend in the project, as before.
+        if not (keep and is_amend):
             _spend_token()
     elif not (isinstance(token_head, str) and _HEX_SHA.fullmatch(token_head)):
         # Only a full hex SHA is read, never text git could take as an
@@ -801,10 +868,11 @@ longer covers what you are about to commit. Run preflight again:
     ./scripts/commit-preflight.sh
 
 Then retry your commit.""")
-        if not is_amend and not _commit_runs_in_project(command, input_data.get("cwd")):
-            # This hook only sees the project's HEAD. A commit that may land
-            # elsewhere (a worktree, `cd`, `-C`) would never move it, so the
-            # token is spent on approval, as before.
+        if not keep:
+            # This hook only sees the project's HEAD. A command it cannot
+            # prove harmless may commit where that HEAD never moves (a
+            # worktree, a submodule, a branch switched and back), so the
+            # token is spent on approval, as before. Amends included.
             _spend_token()
 
     # Token valid - allow commit
