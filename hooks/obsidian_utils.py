@@ -2266,9 +2266,17 @@ def load_config(fresh: bool = False) -> dict:
     skips the cache read and refreshes the cache from disk: callers that
     prune the index by folder (``/vault-reindex``, ``/obsidian-setup``) use
     it so a config written earlier in the session is not ignored (#393).
+
+    The cache is valid only for the ``_DEFAULTS`` that wrote it (#409). A
+    plugin update mid-session changes ``_DEFAULTS``; without this check the
+    old cached dict lacks every new default key (``wiki_folder`` after
+    3.8.0), and a raw ``config.get(key)`` reads None until the session ends.
     """
     sid = _get_session_id_fast()
-    cached = None if fresh else cache_get(sid, "config")
+    sig = _defaults_signature()
+    cached = None
+    if not fresh and cache_get(sid, "config_defaults_sig") == sig:
+        cached = cache_get(sid, "config")
     if cached is not None:
         return cached
 
@@ -2308,7 +2316,14 @@ def load_config(fresh: bool = False) -> dict:
                 print(f"[obsidian-brain] WARNING: config is world-readable and chmod failed: {exc}", file=sys.stderr)
 
     cache_set(sid, "config", config)
+    cache_set(sid, "config_defaults_sig", sig)
     return config
+
+
+def _defaults_signature() -> str:
+    """Short hash of ``_DEFAULTS``: names the code that wrote a cached config."""
+    blob = json.dumps(_DEFAULTS, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def indexed_folders(config: dict, strict: bool = False) -> list:
