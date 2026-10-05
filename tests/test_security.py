@@ -4810,7 +4810,7 @@ class TestPreflightTokenSurvivesADeniedCall:
         changelog hook denies. Nothing ran, so the token must survive."""
         work, env, token = repo
         self._write_token(work, env, token)
-        cmd = (f"git {self.C} -q -F msg.txt 2>/dev/null && "
+        cmd = (f"git {self.C} -q -F msg.txt && "
                "gh pr create --base develop --title 't' --body-file b.md")
         assert self._decide(work, env, cmd) == "allow"
         assert token.exists()
@@ -4838,6 +4838,16 @@ class TestPreflightTokenSurvivesADeniedCall:
         # A redirection does not split commands, so a leading one hides the
         # command name: refused, the stricter reading.
         "> out.txt git COMMIT -m wip",
+        # A redirection can plant a hook that commits elsewhere, and its
+        # target is not an argument (`> --amend` is no amend flag).
+        "echo 'git -C .claude/worktrees/wt COMMIT -m x' > .git/hooks/post-COMMIT && git COMMIT -m y",
+        "git COMMIT -m x > --amend",
+        "git COMMIT -m x 2>/dev/null",
+        # push runs a program; diff/log/show write files.
+        "git COMMIT --amend --no-edit && git push --receive-pack='git -C wt COMMIT -m h; false' . HEAD",
+        "git push -q origin HEAD && git COMMIT -m x",
+        "git diff --output=.git/hooks/post-COMMIT && git COMMIT -m x",
+        "git log --output=x && git COMMIT -m x",
         "git COMMIT -m wip && gh pr checkout 5",
         "git COMMIT -m wip\ncd .claude/worktrees/wt\ngit COMMIT -qam w",
         # Quoted text bash still runs: the $, backtick and backslash guards
@@ -4856,8 +4866,8 @@ class TestPreflightTokenSurvivesADeniedCall:
     @pytest.mark.parametrize("cmd", [
         "git add -A && git COMMIT -m 'fix: x; y (z) #1 | w'",
         "git COMMIT -m wip # ; cd .claude/worktrees/wt",
-        "(git COMMIT -m wip) && git push -q origin HEAD",
-        "echo ok && git COMMIT -m wip > out.txt",
+        "(git COMMIT -m wip) && git status --short",
+        "echo ok && git COMMIT -m wip",
         "git COMMIT -m wip\ngh issue comment 1 --body x",
     ])
     def test_a_harmless_command_keeps_the_token(self, repo, cmd):

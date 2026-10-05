@@ -85,10 +85,13 @@ def _token_state(token_head, is_amend):
 # approval, as before #408, so anything missing from the allowlist costs only
 # the convenience, never a second unchecked commit. A denylist of ways to
 # commit elsewhere was tried first and leaked three times in review (a quoted
-# -C, c''d, git submodule foreach, a branch switch and back).
+# -C, c''d, git submodule foreach, a branch switch and back, push
+# --receive-pack, a redirection into .git/hooks).
 _SAFE_COMMAND_CAP = 100_000  # the same limit as prevent-direct-push's _SHLEX_MAX
 _SEPARATORS = frozenset(";&|()\n")
-_GIT_SAFE = frozenset({"add", "status", "diff", "log", "show", "push", "rev-parse"})
+# Only subcommands that cannot run a program or write a file: push runs
+# --receive-pack/--exec, and diff/log/show write files with --output.
+_GIT_SAFE = frozenset({"add", "status"})
 _GH_SAFE = frozenset({"create", "view", "edit", "comment", "list", "checks", "status"})
 
 # Commit options whose value is the next word (a message, a file, a commit),
@@ -143,12 +146,12 @@ def _lex(command):
 def _safe_commit_args(command):
     """The words after ``commit`` when ``command`` is safe to keep the token
     for, else None. Safe means: it lexes exactly, every command in it is
-    ``git <add|status|diff|log|show|push|rev-parse|commit>``, ``gh <pr|issue>
+    ``git <add|status|commit>``, ``gh <pr|issue>
     <create|view|edit|comment|list|checks|status>``, ``echo``, ``printf`` or
     ``true``, the subcommand directly follows ``git`` (no global options such
-    as ``-C``), and exactly one of them is a commit. ``<`` and ``>`` do not
-    split commands, so a redirection target reads as an argument; that can
-    only make a command look less safe, never more."""
+    as ``-C``), exactly one of them is a commit, and there is no ``<`` or
+    ``>`` (a redirection can write into .git/hooks, and its target is not an
+    argument the command sees)."""
     items = _lex(command)
     if items is None:
         return None
@@ -157,7 +160,9 @@ def _safe_commit_args(command):
         if kind == "op" and text in _SEPARATORS:
             segments.append(cur)
             cur = []
-        elif kind == "w":
+        elif kind == "op":
+            return None  # < or >
+        else:
             cur.append(text)
     segments.append(cur)
     commits = []
