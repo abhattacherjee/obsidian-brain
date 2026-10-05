@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - The repo's PR-base hook (`.claude/hooks/enforce-pr-base-branch.py`) now lets a `release/*` or `hotfix/*` PR merge into `develop` as well as `main`. It denied every release back-merge, so each one had to go around the gate. Any other base is still denied. This matches git-flow's `check-pr-base` hook.
+- The preflight token now survives a Bash call that another hook denies (#408). `commit-preflight.sh` records the current `HEAD` in the token, and `require-preflight` allows a commit only while `HEAD` still matches, instead of deleting the token the moment it approves. A commit that really lands moves `HEAD` and so spends the token; a denied call does not, so it no longer costs a second preflight. `--amend` can still reuse the token while `HEAD`'s parent is unchanged. A token without `head` (an older preflight, or a repo with no commits) is spent on approval as before, and a `head` that is not a full hex SHA is refused.
 
 ## [3.8.0] - 2026-10-04
 

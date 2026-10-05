@@ -4606,3 +4606,123 @@ class TestBashTruthDifferential:
         assert req["redirection"]("VERB >out")
         assert req["background &"]("VERB &")
         assert req["single pipe"]("VERB | cat")
+
+
+
+class TestPreflightTokenSurvivesADeniedCall:
+    """#408: the token was deleted the moment require-preflight approved a
+    commit. Another PreToolUse hook could still deny the same Bash call, so
+    the command never ran but the token was gone. The token now records the
+    HEAD it was made at, and a commit is allowed only while HEAD still
+    matches. A real commit moves HEAD and so spends it; a denied call does
+    not."""
+
+    REG = "git " + "com" + "mit -m wip"
+    AMEND = "git " + "com" + "mit --amend --no-edit"
+
+    @staticmethod
+    def _token_path(work):
+        import hashlib
+        h = hashlib.md5(os.path.realpath(str(work)).encode()).hexdigest()[:8]
+        return Path(f"/tmp/.preflight-token-{h}")
+
+    @staticmethod
+    def _git(work, env, *args):
+        return subprocess.run(
+            ["git", "-C", str(work), "-c", "user.email=t@example.invalid",
+             "-c", "user.name=t", *args],
+            env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        token = self._token_path(work)
+        yield work, env, token
+        token.unlink(missing_ok=True)
+
+    def _write_token(self, work, env, token, head=True):
+        now = int(time.time())
+        data = {"created": now, "expires": now + 300, "staged_files": 1,
+                "checks_run": "tests"}
+        if head:
+            data["head"] = self._git(work, env, "rev-parse", "HEAD")
+        token.write_text(json.dumps(data))
+
+    def _decide(self, work, env, command):
+        return TestHookBlockingPathsFire._decide(
+            work, env, "require-preflight", command)
+
+    def test_a_call_that_never_ran_leaves_the_token_usable(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        # Approved, then denied by another hook: nothing ran, HEAD is unchanged.
+        assert self._decide(work, env, self.REG) == "allow"
+        assert token.exists()
+        assert self._decide(work, env, self.REG) == "allow"
+
+    def test_a_real_commit_spends_the_token(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        assert self._decide(work, env, self.REG) == "allow"
+        self._git(work, env, "com" + "mit", "-q", "--allow-empty", "-m", "real")
+        assert self._decide(work, env, self.REG) == "deny"
+        assert not token.exists()
+
+    def test_amend_may_reuse_the_token_but_a_regular_commit_may_not(self, repo):
+        work, env, token = repo
+        self._git(work, env, "com" + "mit", "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token)
+        self._git(work, env, "com" + "mit", "-q", "--amend", "--allow-empty", "-m", "amended")
+        assert self._decide(work, env, self.AMEND) == "allow"
+        assert self._decide(work, env, self.REG) == "deny"
+
+    def test_amend_after_a_regular_commit_is_denied(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        self._git(work, env, "com" + "mit", "-q", "--allow-empty", "-m", "real")
+        assert self._decide(work, env, self.AMEND) == "deny"
+
+    def test_a_token_without_head_is_still_spent_on_approval(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token, head=False)
+        assert self._decide(work, env, self.REG) == "allow"
+        assert not token.exists()
+        assert self._decide(work, env, self.REG) == "deny"
+
+    def test_an_expired_token_is_still_denied(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        data = json.loads(token.read_text())
+        data["expires"] = int(time.time()) - 1
+        token.write_text(json.dumps(data))
+        assert self._decide(work, env, self.REG) == "deny"
+
+    @pytest.mark.parametrize("bad", ["--output=/tmp/x", "HEAD", "HEAD~0", "abc", 7])
+    @pytest.mark.parametrize("amend", [False, True])
+    def test_a_malformed_head_is_denied_not_passed_to_git(self, repo, bad, amend):
+        """Only a full hex SHA is read. Without that check, `HEAD~0` names a
+        commit whose parent is always HEAD's parent, so every amend passed."""
+        work, env, token = repo
+        # A second commit, so HEAD has a parent for the amend rule to compare.
+        self._git(work, env, "com" + "mit", "-q", "--allow-empty", "-m", "base")
+        self._write_token(work, env, token)
+        data = json.loads(token.read_text())
+        data["head"] = bad
+        token.write_text(json.dumps(data))
+        cmd = self.AMEND if amend else self.REG
+        assert self._decide(work, env, cmd) == "deny"
+        assert not token.exists()
+
+    def test_an_empty_head_from_a_repo_with_no_commits_is_spent_on_approval(self, repo):
+        work, env, token = repo
+        self._write_token(work, env, token)
+        data = json.loads(token.read_text())
+        data["head"] = ""
+        token.write_text(json.dumps(data))
+        assert self._decide(work, env, self.REG) == "allow"
+        assert not token.exists()
+
+    def test_preflight_writes_head_into_every_token(self):
+        src = Path("scripts/commit-preflight.sh").read_text(encoding="utf-8")
+        assert src.count("TOKEN_DATA=$(cat <<EOF") == 2
+        assert src.count('"head": "$TOKEN_HEAD"') == 2

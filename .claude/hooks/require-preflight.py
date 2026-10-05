@@ -10,25 +10,64 @@ Claude must run `./scripts/commit-preflight.sh` before committing.
 The token is:
 - Created by commit-preflight.sh after checks pass
 - Valid for 5 minutes
-- One-time use for regular commits (consumed after validation); reusable for --amend
+- Tied to the HEAD it was made at (its "head" field). A regular commit is
+  allowed only while HEAD still matches, so a real commit spends it, but a
+  call that another hook denies does not (#408). --amend may reuse it while
+  HEAD's parent is unchanged. A token without "head" is spent on approval.
 """
 
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
 
+def _project_dir():
+    return os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd()))
+
+
 def _get_token_path():
     """Get project-specific token path using a hash of the project directory."""
-    project_dir = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
-    project_dir = os.path.realpath(project_dir)
-    project_hash = hashlib.md5(project_dir.encode()).hexdigest()[:8]
+    project_hash = hashlib.md5(_project_dir().encode()).hexdigest()[:8]
     return f"/tmp/.preflight-token-{project_hash}"
 
 TOKEN_FILE = _get_token_path()
+
+
+def _rev(ref):
+    """The commit SHA ``ref`` names in the project repo, or None if git cannot
+    resolve it (no repo, no commits, a root commit's parent)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", _project_dir(), "rev-parse", "--verify", "-q", ref + "^{commit}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def _token_still_unspent(token_head, is_amend):
+    """True while no commit has landed since the token was made.
+
+    A regular commit needs HEAD to be the commit the token was made at. An
+    amend replaces HEAD with a sibling, so a later amend is also fine while
+    HEAD's parent is the token commit's parent. After a regular commit,
+    HEAD's parent is the token commit itself, which matches neither."""
+    head = _rev("HEAD")
+    if head is None:
+        return False
+    if head == token_head:
+        return True
+    if is_amend:
+        parent = _rev("HEAD^")
+        return parent is not None and parent == _rev(token_head + "^")
+    return False
 
 
 def _shell_scan(prefix: str):
@@ -631,12 +670,34 @@ Please run preflight again to refresh:
 
 Then retry your commit.""")
 
-    # Token is valid - consume it (one-time use)
     checks_run = token_data.get("checks_run", "none")
     staged_count = token_data.get("staged_files", 0)
+    token_head = token_data.get("head")
 
-    # For amend, we're more lenient — don't consume the token
-    if not is_amend:
+    if token_head not in (None, ""):
+        # The token sits at a predictable /tmp path: accept only a full
+        # hex SHA, never text git could read as an option.
+        if not (isinstance(token_head, str)
+                and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", token_head)):
+            token_head = "invalid"
+        # Spent only by a commit that really landed: HEAD has moved. A call
+        # that another hook denies leaves HEAD alone and the token usable.
+        if token_head == "invalid" or not _token_still_unspent(token_head, is_amend):
+            try:
+                os.remove(TOKEN_FILE)
+            except OSError:
+                pass
+            block("""❌ COMMIT BLOCKED: This preflight token is already used!
+
+A commit has landed since the preflight ran (HEAD moved), so the token
+no longer covers what you are about to commit. Run preflight again:
+
+    ./scripts/commit-preflight.sh
+
+Then retry your commit.""")
+    elif not is_amend:
+        # No "head" (an older preflight, or a repo with no commits yet):
+        # spend the token on approval, as before.
         try:
             os.remove(TOKEN_FILE)
         except OSError:

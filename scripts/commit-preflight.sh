@@ -19,6 +19,10 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_HASH=$(python3 -c "import hashlib, sys; print(hashlib.md5(sys.argv[1].encode()).hexdigest()[:8])" "$(realpath "$PROJECT_DIR")")
 TOKEN_FILE="/tmp/.preflight-token-${PROJECT_HASH}"
 TOKEN_EXPIRY_SECONDS=300  # Token valid for 5 minutes
+# The HEAD this preflight ran at. require-preflight allows a commit only
+# while HEAD still matches, so a call another hook denies does not spend
+# the token (#408). Empty in a repo with no commits yet.
+TOKEN_HEAD=$(git -C "$PROJECT_DIR" rev-parse --verify -q HEAD 2>/dev/null || true)
 
 # Parse arguments
 SKIP_TESTS=false
@@ -195,6 +199,7 @@ if [ "$SKIP_TESTS" = true ]; then
 {
     "created": $TIMESTAMP,
     "expires": $((TIMESTAMP + TOKEN_EXPIRY_SECONDS)),
+    "head": "$TOKEN_HEAD",
     "staged_files": $(echo "$STAGED_FILES" | wc -l | tr -d ' '),
     "checks_run": "$SKIP_CHECKS_RUN",
     "skip_reason": "$(echo "$SKIP_REASON" | sed 's/\\/\\\\/g; s/"/\\"/g')"
@@ -284,6 +289,7 @@ TOKEN_DATA=$(cat <<EOF
 {
     "created": $TIMESTAMP,
     "expires": $((TIMESTAMP + TOKEN_EXPIRY_SECONDS)),
+    "head": "$TOKEN_HEAD",
     "staged_files": $(echo "$STAGED_FILES" | wc -l | tr -d ' '),
     "checks_run": "${CHECKS_RUN%,}"
 }
