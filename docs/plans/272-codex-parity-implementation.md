@@ -1,6 +1,6 @@
 # Codex parity implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. `/ship` uses one implementation pass, followed by one whole-branch review and one independent cross-model review. Do not start implementation before the user approves this plan.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. `/ship` uses one implementation pass, followed by one whole-branch review and one independent cross-model review. The user approved this plan on 2026-10-05; proceed with implementation.
 
 **Goal:** Support Claude Code, Codex CLI, and Codex desktop in one vault, with all 19 skills and automatic capture and recovery.
 
@@ -14,10 +14,10 @@
 
 - Issue: #272. Specification tracker #360 and specification PR #361 are closed/merged; this does not mean parity shipped.
 - Implementation base: `develop` at `ad4a48eee23bbaf7f4be7d73af193af7db71f800`.
-- Branch: `feature/272-codex-parity`; milestone: v3.11.
+- Branch: `feature/272-codex-parity`; milestone: v3.9.
 - Wiki dependency #396 is closed. Use its actual `hooks/memory_sources.py`, `hooks/wiki.py`, and `scripts/vault_doctor_checks/wiki_pages.py` APIs.
 - Installed versions observed during planning: Codex CLI 0.155.1 and Claude Code 2.1.289. Verify the desktop version and installed contracts in Task 1; a version string alone is not acceptance evidence.
-- The acceptance collector did not recognize the issue's `Acceptance gates` section. The seven criteria below require user approval before they are added to the issue and collected again.
+- The acceptance collector did not recognize the issue's `Acceptance gates` section. The user approved the seven criteria below on 2026-10-05. Add them to the issue and collect them again.
 - This plan authorizes no merge or deployment. The shipping workflow still requires merge approval after acceptance and review.
 
 ## Global constraints
@@ -156,4 +156,4 @@
 - Spec coverage: runtime identity/config/resources, all writers, both transcript adapters, every lifecycle/recovery path, six AI sites, all 19 skills, packaging, wiki/memory/doctor, and the full acceptance matrix each have an owning task.
 - Execution order: installed-client evidence first; identity before transactions; transactions before capture; capture before skills; full matrix before review and merge.
 - Review cost: one implementation pass, one whole-branch review, one independent cross-model review. No per-task review loops are planned. This is a substantial runtime rewrite; the plan does not promise completion in one short session.
-- Approval requested: this architecture and sequence, the seven acceptance criteria, and the proposed recovery/deadline limits. Implementation remains pending that approval.
+- Approved on 2026-10-05: this architecture and sequence, the seven acceptance criteria, and the proposed recovery/deadline limits. Implementation may proceed; merge approval remains a later gate.
