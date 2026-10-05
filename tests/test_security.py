@@ -4558,6 +4558,30 @@ class TestBashTruthDifferential:
         assert TestHookBlockingPathsFire._decide(
             work, env, "enforce-pr-base-branch", cmd) == expected, cmd
 
+    @pytest.mark.parametrize("head,base,expected", [
+        # The release PR and the back-merge PR are both Git Flow steps.
+        ("release/3.8.0", "main", "allow"),
+        ("release/3.8.0", "develop", "allow"),
+        ("hotfix/3.8.1", "main", "allow"),
+        ("hotfix/3.8.1", "develop", "allow"),
+        # Any other base is still wrong.
+        ("release/3.8.0", "feature/x", "deny"),
+        ("hotfix/3.8.1", "release/3.8.0", "deny"),
+        # A feature PR still may not merge to main.
+        ("feature/x", "main", "deny"),
+    ])
+    def test_release_and_hotfix_may_back_merge_to_develop(
+            self, tmp_path, head, base, expected):
+        """A release or hotfix lands on main and is then merged back into
+        develop through a second PR. The gate denied that second PR, so every
+        back-merge had to bypass it. Matches git-flow's check-pr-base hook,
+        which allows main or develop for these branches."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        env = dict(env, PATH=self._fake_gh(tmp_path, {"7": f"{base} {head}"}))
+        assert TestHookBlockingPathsFire._decide(
+            work, env, "enforce-pr-base-branch", self.MERGE + " 7 --merge"
+        ) == expected
+
     def test_the_census_fails_when_the_corpus_is_narrowed(self):
         """The alphabet guard must catch a corpus narrowed back to the #327
         shape: single-line commands joined only by `;` or `&&`."""

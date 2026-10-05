@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The repo's PR-base hook (`.claude/hooks/enforce-pr-base-branch.py`) now lets a `release/*` or `hotfix/*` PR merge into `develop` as well as `main`. It denied every release back-merge, so each one had to go around the gate. Any other base is still denied. This matches git-flow's `check-pr-base` hook.
+
 ## [3.8.0] - 2026-10-04
 
 ### Added

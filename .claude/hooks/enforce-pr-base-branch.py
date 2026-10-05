@@ -793,10 +793,12 @@ if _has_merge and _targets_this_project(command, _PR_MERGE_VERB):
                 f"  gh pr create --base develop"
             )
 
-        # Release/hotfix branches merge to main
-        if (head_ref.startswith("release/") or head_ref.startswith("hotfix/")) and base_ref != "main":
+        # Release/hotfix branches merge to main, then back into develop
+        # through a second PR (the back-merge). Same rule as git-flow's
+        # check-pr-base hook.
+        if (head_ref.startswith("release/") or head_ref.startswith("hotfix/")) and base_ref not in ("main", "develop"):
             deny(
-                f"❌ PR #{pr_number} targets '{base_ref}' but {head_ref.split('/')[0]} branches must merge to 'main'!\n\n"
+                f"❌ PR #{pr_number} targets '{base_ref}' but {head_ref.split('/')[0]} branches must merge to 'main' (or back-merge to 'develop')!\n\n"
                 f"PR head: {head_ref}\n"
                 f"PR base: {base_ref}\n\n"
                 f"Fix: close this PR and recreate with --base main:\n"
