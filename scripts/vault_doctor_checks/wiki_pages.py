@@ -80,6 +80,12 @@ def _read_config() -> dict:
     because guessing the wiki folder would make a broken setup look clean."""
     from obsidian_utils import _DEFAULTS
 
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context:
+        from obsidian_utils import load_config
+        return load_config(context=context)
+
     path = Path.home() / ".claude" / "obsidian-brain-config.json"
     cfg = {"wiki_folder": _DEFAULTS.get("wiki_folder", "claude-wiki")}
     try:

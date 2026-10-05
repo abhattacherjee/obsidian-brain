@@ -24,6 +24,10 @@ INDEX_NAME = "MEMORY.md"
 def detect_host() -> str:
     """``codex`` when any Codex marker env var is set (not blank), else
     ``claude-code``."""
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context:
+        return "claude-code" if context.host == "claude" else context.host
     for name in _CODEX_HOST_MARKERS:
         if os.environ.get(name, "").strip():
             return "codex"
@@ -32,7 +36,7 @@ def detect_host() -> str:
 
 def _projects_root() -> Path:
     # Path.home() reads $HOME on POSIX, so tests can point it at a tmp dir.
-    return Path.home() / ".claude" / "projects"
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
 
 
 def memory_sources(host: str, config: dict | None = None, errors: list | None = None) -> list:
@@ -44,8 +48,11 @@ def memory_sources(host: str, config: dict | None = None, errors: list | None = 
     "error"}``: a projects root that exists but cannot be listed, a project
     or ``memory/`` folder that cannot be read, or a file that cannot be
     resolved. A missing root is not an error (no memory yet)."""
-    if host != "claude-code":
-        return []  # Codex memory arrives with #272
+    if host not in {"claude-code", "claude"}:
+        if errors is not None:
+            errors.append({"path": "", "error": "Native memory discovery is unsupported for " + host,
+                           "host": host, "unsupported": True})
+        return []
 
     def fail(path, exc) -> None:
         if errors is not None:
@@ -92,6 +99,9 @@ def failed_scopes(errors) -> tuple:
     root = _projects_root()
     root_failed, projects, names = False, set(), set()
     for e in errors or []:
+        if e.get("unsupported"):
+            root_failed = True
+            continue
         p = Path(str(e.get("path", "")))
         if p == root:
             root_failed = True

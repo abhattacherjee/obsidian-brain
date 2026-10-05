@@ -45,7 +45,7 @@ def failure_detail(exc):
     return text[:_DETAIL_MAX_CHARS]
 
 
-def log_import_failure(event, exc):
+def log_import_failure(event, exc, host="claude"):
     """Append one ``outcome=IMPORT_FAILED`` line to the hook log. Never raises.
 
     Same file, field order, 100 KB rotation and 0o600 mode as
@@ -57,7 +57,9 @@ def log_import_failure(event, exc):
         payload = _payload()
         project = os.path.basename(str(payload.get("cwd") or os.getcwd()).rstrip("/"))
         sid = str(payload.get("session_id") or "unknown")[:8]
-        log_dir = os.path.join(os.path.expanduser("~"), ".claude")
+        if host not in {"claude", "codex"}:
+            raise ValueError("Select a supported diagnostic host explicitly")
+        log_dir = (os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")) if host == "codex" else (os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude"))
         os.makedirs(log_dir, mode=0o700, exist_ok=True)
         log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
         try:
@@ -83,13 +85,14 @@ def log_import_failure(event, exc):
     return detail
 
 
-def session_start_notice(detail):
+def session_start_notice(detail, host="claude"):
     """SessionStart stdout JSON telling the model the plugin did not load."""
+    location = "~/.claude/obsidian-brain-hook.log" if host == "claude" else os.path.join(os.environ.get("CODEX_HOME") or "~/.codex", _HOOK_LOG_NAME)
     return json.dumps({"hookSpecificOutput": {
         "hookEventName": "SessionStart",
         "additionalContext": (
             f"obsidian-brain failed to load ({detail}), so its hooks are off "
-            "this session. Details: ~/.claude/obsidian-brain-hook.log "
+            f"this session. Details: {location} "
             "(outcome=IMPORT_FAILED)."
         ),
     }})

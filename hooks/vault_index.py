@@ -123,13 +123,17 @@ def _is_under(child: Path, parent: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _default_db_path() -> str:
+def _default_db_path(context=None) -> str:
     """Return default DB path: ~/.claude/obsidian-brain-vault.db.
 
     Overridable via the OBSIDIAN_BRAIN_DB env var so tests, dev-test scripts,
     and subprocesses can isolate the index DB without threading db_path through
     every call site (#192).
     """
+    from runtime_context import current_runtime_context
+    context = context or current_runtime_context()
+    if context:
+        return str(context.index_path)
     return os.environ.get("OBSIDIAN_BRAIN_DB") or os.path.join(
         os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db"
     )
@@ -2123,4 +2127,3 @@ def query_related_notes(
         return results[:limit]
     finally:
         conn.close()
-

@@ -46,6 +46,7 @@ def test_upgrade_batch_returns_dicts_with_all_five_fields(monkeypatch, tmp_path,
 
     result = obsidian_utils.upgrade_batch(
         [str(p1), str(p2)], str(tmp_path), "claude-sessions", "obsidian-brain",
+        summary_batch_size=1,
     )
 
     assert isinstance(result, list)
@@ -73,6 +74,7 @@ def test_upgrade_batch_writes_telemetry_record(monkeypatch, tmp_path, fake_note)
     p1 = fake_note("a.md", "s1")
     obsidian_utils.upgrade_batch(
         [str(p1)], str(tmp_path), "claude-sessions", "obsidian-brain",
+        summary_batch_size=1,
     )
 
     assert metrics_path.exists()
@@ -103,6 +105,7 @@ def test_upgrade_batch_per_note_failure_captured_with_reason(monkeypatch, tmp_pa
     p1 = fake_note("a.md", "s1")
     result = obsidian_utils.upgrade_batch(
         [str(p1)], str(tmp_path), "claude-sessions", "obsidian-brain",
+        summary_batch_size=1,
     )
 
     assert len(result) == 1
@@ -126,6 +129,7 @@ def test_single_element_batch_emits_record(monkeypatch, tmp_path, fake_note):
     p1 = fake_note("standup-note.md", "s-standup")
     result = obsidian_utils.upgrade_batch(
         [str(p1)], str(tmp_path), "claude-sessions", "obsidian-brain",
+        summary_batch_size=1,
     )
 
     assert len(result) == 1

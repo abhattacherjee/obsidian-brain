@@ -63,20 +63,28 @@ _BLOCK_REASON = (
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main(context=None, payload=None) -> None:
     """Read stdin, check sentinel, block or pass through."""
+    from runtime_context import current_runtime_context, using_runtime_context
+    if context is not None:
+        with using_runtime_context(context):
+            return main(payload=payload)
+    context = current_runtime_context()
     try:
-        raw = sys.stdin.read(1_000_000)
-        data = json.loads(raw)
+        if payload is None:
+            raw = sys.stdin.read(1_000_000)
+            data = json.loads(raw)
+        else:
+            data = payload
 
         if not isinstance(data, dict):
             return
-        codex_reason = _hook_payload_codex_reason(data)
+        codex_reason = _hook_payload_codex_reason(data) if context is None else None
         if codex_reason:
             print(f"[obsidian-brain] Stop outcome=SKIPPED_CODEX_HOST reason={codex_reason}", file=sys.stderr)
             return
 
-        session_id = data.get("session_id") or ""
+        session_id = context.native_session_id if context else data.get("session_id") or ""
         stop_hook_active = bool(data.get("stop_hook_active", False))
 
         if not session_id:

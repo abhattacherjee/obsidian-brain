@@ -523,7 +523,12 @@ def scan(
     """
     # Path.home() reads $HOME on POSIX (tests monkeypatch it) and falls back
     # to pwd-database lookups when unset — sibling-module convention.
-    projects_root = Path.home() / ".claude" / "projects"
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context and context.host != "claude":
+        print(f"[{NAME}] native memory discovery is unsupported for {context.host}", file=sys.stderr)
+        return []
+    projects_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
     if not projects_root.is_dir():
         print(
             "[memory-index] ~/.claude/projects not found; nothing to scan",

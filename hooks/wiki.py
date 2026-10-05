@@ -844,10 +844,14 @@ def _read_stdin() -> dict:
     return obj
 
 
-def _context() -> dict:
+def _context(context=None) -> dict:
     """Vault, wiki folder, indexed folders and DB from a fresh config read."""
     from obsidian_utils import indexed_folders, load_config
     import vault_index
+    if context is not None:
+        from runtime_context import using_runtime_context
+        with using_runtime_context(context):
+            return _context()
 
     cfg = load_config(fresh=True)
     vault = cfg.get("vault_path") or ""

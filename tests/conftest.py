@@ -250,11 +250,36 @@ def _isolate_secure_dir_globally(tmp_path_factory, monkeypatch):
     _CACHE_PREFIX and _BOOTSTRAP_PREFIX are also patched to consistent tmp-based
     paths so that tests checking `x.startswith(_SECURE_DIR)` still hold."""
     import obsidian_utils
+    import hooks.obsidian_utils as qualified_utils
     secure = tmp_path_factory.mktemp("ob-secure")
-    monkeypatch.setattr(obsidian_utils, "_SECURE_DIR", str(secure))
-    monkeypatch.setattr(obsidian_utils, "_LOCK_DIR", str(secure / "locks"))
-    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(secure / "cache-"))
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(secure / "sid-"))
+    for module in (obsidian_utils, qualified_utils):
+        monkeypatch.setattr(module, "_SECURE_DIR", str(secure))
+        monkeypatch.setattr(module, "_LOCK_DIR", str(secure / "locks"))
+        monkeypatch.setattr(module, "_CACHE_PREFIX", str(secure / "cache-"))
+        monkeypatch.setattr(module, "_BOOTSTRAP_PREFIX", str(secure / "sid-"))
+
+    # Classifier scratch files have an independent state helper. Keep it in
+    # the same sandbox, while preserving tests that explicitly select HOME.
+    import importlib
+    from pathlib import Path
+    original_home = Path.home()
+    for name, helper in (
+        ("check_items_cli", "_safe_workdir"),
+        ("hooks.check_items_cli", "_safe_workdir"),
+        ("open_item_dedup", "_check_items_workdir"),
+        ("hooks.open_item_dedup", "_check_items_workdir"),
+    ):
+        module = importlib.import_module(name)
+        original_workdir = getattr(module, helper)
+
+        def isolated_workdir(original=original_workdir):
+            if Path.home() != original_home:
+                return original()
+            secure.mkdir(mode=0o700, parents=True, exist_ok=True)
+            secure.chmod(0o700)
+            return secure
+
+        monkeypatch.setattr(module, helper, isolated_workdir)
 
 
 @pytest.fixture(autouse=True)

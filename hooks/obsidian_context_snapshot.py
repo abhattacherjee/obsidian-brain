@@ -189,29 +189,37 @@ def main() -> None:
     sys.exit(0)
 
 
-def _run() -> None:
+def _run(context=None, payload=None) -> None:
+    from runtime_context import current_runtime_context, using_runtime_context
+    if context is not None:
+        with using_runtime_context(context):
+            return _run(payload=payload)
+    context = current_runtime_context()
     # 1. Read hook input from stdin
     try:
-        raw = sys.stdin.read(1_000_000)
-        hook_input = json.loads(raw)
+        if payload is None:
+            raw = sys.stdin.read(1_000_000)
+            hook_input = json.loads(raw)
+        else:
+            hook_input = payload
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[obsidian-brain] invalid stdin JSON: {exc}", file=sys.stderr)
         return
 
     if not isinstance(hook_input, dict):
         return
-    codex_reason = _hook_payload_codex_reason(hook_input)
+    codex_reason = _hook_payload_codex_reason(hook_input) if context is None else None
     if codex_reason:
         print(f"[obsidian-brain] PreCompact outcome=SKIPPED_CODEX_HOST reason={codex_reason}", file=sys.stderr)
         return
 
-    session_id = hook_input.get("session_id", "")
-    cwd = hook_input.get("cwd", "")
-    transcript_path = hook_input.get("transcript_path", "")
+    session_id = context.native_session_id if context else hook_input.get("session_id", "")
+    cwd = str(context.worktree) if context else hook_input.get("cwd", "")
+    transcript_path = str(context.transcript_path) if context and context.transcript_path else hook_input.get("transcript_path", "")
     source = hook_input.get("source", "compact")
 
     # Validate transcript_path stays inside ~/.claude/projects/
-    if transcript_path:
+    if transcript_path and context is None:
         allowed_root = os.path.realpath(os.path.expanduser("~/.claude/projects"))
         if not os.path.realpath(transcript_path).startswith(allowed_root + os.sep):
             print("[obsidian-brain] transcript_path outside ~/.claude/projects, skipping", file=sys.stderr)

@@ -201,6 +201,15 @@ def _first_seen_date(sid: str) -> str:
 # Sanitize session_id to safe filename characters.
 _RETRO_SID_SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
+
+def _retro_sentinel_key(session_id):
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context:
+        import hashlib
+        return hashlib.sha256((context.host + "\0" + session_id).encode()).hexdigest()
+    return _RETRO_SID_SAFE.sub("_", session_id)
+
 # Single source of truth for the retro-gate TTL. Imported by
 # hooks/obsidian_retro_gate.py so the value is never duplicated.
 RETRO_GATE_TTL_SECONDS = 7200  # 2 hours
@@ -208,6 +217,10 @@ RETRO_GATE_TTL_SECONDS = 7200  # 2 hours
 
 def _retro_gate_dir() -> Path:
     """Return the retro-gate sentinel directory, computed at call time."""
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context:
+        return context.state_path / "retro-gate"
     return Path.home() / ".claude" / "obsidian-brain" / "retro-gate"
 
 
@@ -275,7 +288,7 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
     if session_id.strip() == "unknown":
         return "Failed: refusing to arm retro gate — session_id is \"unknown\" (unresolved session); gate NOT armed, Stop hook will not enforce classification for this session"
 
-    sanitized = _RETRO_SID_SAFE.sub("_", session_id)
+    sanitized = _retro_sentinel_key(session_id)
     if not sanitized:
         # Unreachable by construction, kept as belt-and-braces: the guards
         # above reject empty/whitespace-only ids, and _RETRO_SID_SAFE.sub()
@@ -353,7 +366,7 @@ def clear_retro_classification_pending(session_id: str) -> bool:
     if not session_id:
         return False
 
-    sanitized = _RETRO_SID_SAFE.sub("_", session_id)
+    sanitized = _retro_sentinel_key(session_id)
     if not sanitized:
         return False
 
@@ -384,7 +397,7 @@ def get_retro_classification_pending(session_id: str) -> dict | None:
     if not session_id:
         return None
 
-    sanitized = _RETRO_SID_SAFE.sub("_", session_id)
+    sanitized = _retro_sentinel_key(session_id)
     if not sanitized:
         return None
 
@@ -996,9 +1009,12 @@ def _lock_path(event_type: str, session_id: str) -> str:
 
     Sanitizes both components so they cannot escape _LOCK_DIR. Shared by
     claim_hook_run() and release_hook_run() so the two never drift."""
-    safe_sid = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)[:64]
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    safe_sid = context.session_key if context else re.sub(r"[^A-Za-z0-9_-]", "_", session_id)[:64]
     safe_event = re.sub(r"[^A-Za-z0-9_-]", "_", event_type)[:32]
-    return os.path.join(_LOCK_DIR, f"{safe_sid}-{safe_event}")
+    lock_dir = str(context.state_path / "locks") if context else _LOCK_DIR
+    return os.path.join(lock_dir, f"{safe_sid}-{safe_event}")
 
 
 def claim_hook_run(event_type: str, session_id: str,
@@ -1022,13 +1038,12 @@ def claim_hook_run(event_type: str, session_id: str,
     """
     if not session_id:
         return True
+    lock_path = _lock_path(event_type, session_id)
     try:
-        os.makedirs(_LOCK_DIR, mode=0o700, exist_ok=True)
+        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
     except OSError as exc:
         print(f"[obsidian-brain] dedup lock dir unavailable, proceeding: {exc}", file=sys.stderr)
         return True
-
-    lock_path = _lock_path(event_type, session_id)
 
     payload = f"{os.getpid()} {time.time():.3f}\n".encode("utf-8")
 
@@ -1038,7 +1053,9 @@ def claim_hook_run(event_type: str, session_id: str,
             os.write(fd, payload)
         finally:
             os.close(fd)
-        _cleanup_stale_locks()  # only the winner scans the locks dir
+        from runtime_context import current_runtime_context
+        if current_runtime_context() is None:
+            _cleanup_stale_locks()  # only the winner scans the legacy locks dir
         return True
 
     try:
@@ -1138,7 +1155,9 @@ def _append_sessionend_log(
     from bad input types, etc.) and prints a stderr warning. Failure to log
     must not block the SessionEnd hook contract — the hook always exits 0.
     """
-    log_dir = os.path.join(os.path.expanduser("~"), ".claude")
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    log_dir = str(context.state_path) if context else os.path.join(os.path.expanduser("~"), ".claude")
     log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
     try:
         os.makedirs(log_dir, exist_ok=True)
@@ -2121,6 +2140,10 @@ def _get_session_id_fast(allow_env: bool = True) -> str:
     `allow_env` is threaded straight through to _resolve_session_id; see its
     docstring for the CLAUDE_CODE_SESSION_ID layer-0 fast path (#330).
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context:
+        return context.native_session_id
     return _resolve_session_id(allow_bootstrap=True, allow_env=allow_env)
 
 
@@ -2134,12 +2157,14 @@ def _get_session_id_fast(allow_env: bool = True) -> str:
 _UNCACHEABLE_SIDS = frozenset({"", "unknown"})
 
 
-def cache_get(session_id: str, key: str):
+def cache_get(session_id: str, key: str, context=None):
     """Read a key from the session cache. Returns None on miss, and always
     for an uncacheable id (see _UNCACHEABLE_SIDS)."""
-    if session_id in _UNCACHEABLE_SIDS:
+    from runtime_context import current_runtime_context
+    context = context or current_runtime_context()
+    if context is None and session_id in _UNCACHEABLE_SIDS:
         return None
-    cache_path = f"{_CACHE_PREFIX}{session_id}.json"
+    cache_path = str(context.state_path / ("cache-" + context.session_key + ".json")) if context else f"{_CACHE_PREFIX}{session_id}.json"
     try:
         with open(cache_path, 'r') as f:
             data = json.load(f)
@@ -2148,13 +2173,29 @@ def cache_get(session_id: str, key: str):
         return None
 
 
-def cache_set(session_id: str, key: str, value) -> None:
+def cache_set(session_id: str, key: str, value, context=None) -> None:
     """Write a key to the session cache. Atomic write. No-op for an
     uncacheable id (see _UNCACHEABLE_SIDS)."""
-    if session_id in _UNCACHEABLE_SIDS:
+    from runtime_context import current_runtime_context
+    context = context or current_runtime_context()
+    if context is None and session_id in _UNCACHEABLE_SIDS:
         return
-    _ensure_secure_dir()
-    cache_path = f"{_CACHE_PREFIX}{session_id}.json"
+    if context:
+        secure_dir = str(context.state_path)
+        try:
+            os.makedirs(secure_dir, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
+            return
+        cache_path = str(context.state_path / ("cache-" + context.session_key + ".json"))
+    else:
+        try:
+            _ensure_secure_dir()
+        except OSError as exc:
+            print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
+            return
+        secure_dir = _SECURE_DIR
+        cache_path = f"{_CACHE_PREFIX}{session_id}.json"
     try:
         with open(cache_path, 'r') as f:
             data = json.load(f)
@@ -2165,7 +2206,11 @@ def cache_set(session_id: str, key: str, value) -> None:
 
     data[key] = value
 
-    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=secure_dir)
+    except OSError as exc:
+        print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
+        return
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(data, f)
@@ -2258,7 +2303,7 @@ _DEFAULTS: dict = {
 # ---------------------------------------------------------------------------
 
 
-def load_config(fresh: bool = False) -> dict:
+def load_config(fresh: bool = False, context=None) -> dict:
     """Read ~/.claude/obsidian-brain-config.json, returning defaults for missing keys.
 
     Session-scoped caching: first call loads from disk and writes to cache;
@@ -2267,6 +2312,15 @@ def load_config(fresh: bool = False) -> dict:
     prune the index by folder (``/vault-reindex``, ``/obsidian-setup``) use
     it so a config written earlier in the session is not ignored (#393).
     """
+    from runtime_context import current_runtime_context
+    context = context or current_runtime_context()
+    if context:
+        import copy as _copy
+        config = _copy.deepcopy(_DEFAULTS)
+        config.update(_copy.deepcopy(dict(context.config)))
+        config["vault_path"] = str(context.vault_path)
+        config["index_path"] = str(context.index_path)
+        return config
     sid = _get_session_id_fast()
     cached = None if fresh else cache_get(sid, "config")
     if cached is not None:

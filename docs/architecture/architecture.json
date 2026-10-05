@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.8.0",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-10-04",
+  "lastUpdated": "2026-10-05",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -216,7 +216,16 @@
       "description": "The ~5.5k-line stdlib spine (4.3k code lines) imported by every hook and many skills: config + session resolution, transcript parsing, deferred summarization (shells out to claude -p), atomic vault writes, secret scrubbing, the cross-plugin dedup lock, and telemetry. Every function self-catches and logs to stderr.",
       "components": [
         {
+          "id": "runtime-context",
+          "name": "RuntimeContext",
+          "kind": "module",
+          "hosts": ["claude", "codex"],
+          "files": ["hooks/runtime_context.py", "hooks/runtime_adapters/claude.py", "hooks/runtime_adapters/codex.py", "hooks/brain_cli.py"],
+          "purpose": "Resolves an explicitly selected host and client. Native payload IDs take precedence over that host's tool environment; another host's IDs are never used. Resolves Git worktree roots, installed resources, config, shared index and separate host state. Config selection is CLI, OBSIDIAN_BRAIN_CONFIG, then native home. Existing shared indexes are preserved; new defaults are qualified by the resolved vault. The context CLI reads bounded JSON. Codex lifecycle dispatch and plugin packaging remain pending under #272."
+        },
+        {
           "id": "load-config",
+          "hosts": ["claude", "codex"],
           "name": "load_config()",
           "kind": "function",
           "files": [
@@ -397,12 +406,13 @@
         },
         {
           "id": "memory-sources",
+          "hosts": ["claude", "codex"],
           "name": "memory_sources.py",
           "kind": "module",
           "files": [
             "hooks/memory_sources.py"
           ],
-          "purpose": "The one place that knows where a host keeps its memory files (#396). detect_host() returns codex when any _CODEX_HOST_MARKERS env var is set (not blank), else claude-code. memory_sources(host, config=None, errors=None) returns sorted, resolved, unique paths: on claude-code every regular, non-symlinked *.md directly inside a non-symlinked memory/ folder of a non-symlinked ~/.claude/projects/<project-dir>/, skipping MEMORY.md (an index) and checked with is_relative_to(~/.claude/projects); on any other host [] until #272 adds Codex. config is unused today. memory_name(path) returns <project-dir>/<file>.md, the name pages and payloads use. An unreadable project is skipped, not fatal; when errors is a list, each failure (an unlistable root, an unreadable project or memory/ folder, an unresolvable file) is appended as {\"path\",\"error\"}, and failed_scopes(errors) classifies them as (root_failed, projects, names) for wiki.stale. Skills never name these paths; they call wiki.py memgrep."
+          "purpose": "The one place that knows where a host keeps its memory files (#396). An explicit runtime context selects the host before inherited environment markers. Legacy detect_host() uses _CODEX_HOST_MARKERS, else claude-code. memory_sources(host, config=None, errors=None) returns sorted, resolved, unique paths: on claude-code or claude every regular, non-symlinked *.md directly inside a non-symlinked memory/ folder of a non-symlinked project folder under CLAUDE_CONFIG_DIR/projects (default ~/.claude/projects), skipping MEMORY.md (an index) and checking resolved containment. Codex native memory discovery is explicitly unsupported: it returns [] and records an unsupported diagnostic in errors. failed_scopes treats that diagnostic as root_failed so wiki cleanup cannot prune unseen sources. config is retained for compatibility. memory_name(path) returns <project-dir>/<file>.md, the name pages and payloads use. An unreadable project is skipped, not fatal; when errors is a list, each failure (an unlistable root, an unreadable project or memory/ folder, an unresolvable file) is appended as {\"path\",\"error\"}, and failed_scopes(errors) classifies them as (root_failed, projects, names) for wiki.stale. Skills never name these paths; they call wiki.py memgrep."
         },
         {
           "id": "plugin-install-divergence",
@@ -1119,6 +1129,16 @@
     }
   ],
   "flows": [
+    {
+      "id": "explicit-host-context",
+      "name": "Explicit host context",
+      "description": "The shared context CLI resolves identity and paths for Claude Code or Codex. Native Codex lifecycle dispatch and packaging remain pending under #272.",
+      "steps": [
+        {"from": "runtime-context", "to": "load-config", "label": "selected native config over shared defaults"},
+        {"from": "runtime-context", "to": "session-context", "label": "native host ID without another host's session scan"},
+        {"from": "runtime-context", "to": "memory-sources", "label": "explicit host; unsupported sources reported"}
+      ]
+    },
     {
       "id": "session-end-autolog",
       "name": "SessionEnd auto-log (write-first)",
@@ -2034,7 +2054,7 @@
     {
       "name": "CODEX_THREAD_ID",
       "default": "(set by Codex)",
-      "purpose": "Foreign-host marker. Set by Codex in every tool shell; the only marker in an unsandboxed run. When any Codex marker is non-empty, _resolve_session_id returns 'unknown' before every layer and check_hook_status reports Claude logging as not checked (#362). Separately, and regardless of host, cache_get/cache_set/cache_invalidate never use the 'unknown' id. CODEX_HOME is deliberately not a marker."
+      "purpose": "Native Codex session ID for an explicitly selected Codex runtime. Legacy Claude-only entry points treat it as a foreign-host marker and do not infer a Claude session from it."
     },
     {
       "name": "CODEX_SANDBOX",
@@ -2048,8 +2068,8 @@
     },
     {
       "name": "OBSIDIAN_BRAIN_DB",
-      "default": "the vault index DB under ~/.claude",
-      "purpose": "Override the SQLite index path (#192); also used by tests to avoid polluting the live DB."
+      "default": "existing ~/.claude/obsidian-brain-vault.db, otherwise a vault-specific index under XDG_DATA_HOME",
+      "purpose": "Override the selected runtime SQLite index path. Existing legacy indexes remain in place. Tests use this override for scratch storage."
     },
     {
       "name": "OBSIDIAN_BRAIN_VAULT",
@@ -2074,7 +2094,32 @@
     {
       "name": "CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE",
       "default": "25",
-      "purpose": "Max groups per classifier sub-agent call — sized to stay on Haiku and under the timeout."
+      "purpose": "Max groups per classifier sub-agent call \u2014 sized to stay on Haiku and under the timeout."
+    },
+    {
+      "name": "OBSIDIAN_BRAIN_CONFIG",
+      "default": "selected host home/obsidian-brain-config.json",
+      "purpose": "Override the selected runtime configuration path. Explicit CLI configuration takes precedence."
+    },
+    {
+      "name": "OBSIDIAN_BRAIN_STATE_DIR",
+      "default": "selected host home/obsidian-brain (Codex: state subdirectory)",
+      "purpose": "Override private operational state for the selected runtime. Explicit CLI state paths take precedence."
+    },
+    {
+      "name": "CODEX_HOME",
+      "default": "~/.codex",
+      "purpose": "Select the native Codex configuration, transcript, and state home. This variable alone does not select a host."
+    },
+    {
+      "name": "CLAUDE_CONFIG_DIR",
+      "default": "~/.claude",
+      "purpose": "Select the native Claude configuration and project transcript home for an explicitly selected Claude runtime."
+    },
+    {
+      "name": "PLUGIN_ROOT",
+      "default": "set by the native hook runner",
+      "purpose": "Installed plugin resource root for explicitly selected runtimes. Explicit CLI resource roots take precedence."
     }
   ],
   "design": {

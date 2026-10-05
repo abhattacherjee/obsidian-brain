@@ -87,7 +87,9 @@ def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool,
     the normal bootstrap record, so a SessionStart suppressed by the cross-plugin
     guard stays visible on the hook-log diagnostic surface (otherwise a deduped
     SessionStart is indistinguishable from the hook never firing)."""
-    log_dir = os.path.join(os.path.expanduser("~"), ".claude")
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    log_dir = str(context.state_path) if context else os.path.join(os.path.expanduser("~"), ".claude")
     log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
     try:
         os.makedirs(log_dir, exist_ok=True)
@@ -133,22 +135,30 @@ def main() -> None:
     sys.exit(0)
 
 
-def _run() -> None:
+def _run(context=None, payload=None) -> None:
+    from runtime_context import current_runtime_context, using_runtime_context
+    if context is not None:
+        with using_runtime_context(context):
+            return _run(payload=payload)
+    context = current_runtime_context()
     # 1. Read hook input from stdin
     try:
-        raw = sys.stdin.read(1_000_000)
-        hook_input = json.loads(raw) if raw.strip() else {}
+        if payload is None:
+            raw = sys.stdin.read(1_000_000)
+            hook_input = json.loads(raw) if raw.strip() else {}
+        else:
+            hook_input = payload
     except (json.JSONDecodeError, ValueError):
         hook_input = {}
 
     if not isinstance(hook_input, dict):
         hook_input = {}
-    codex_reason = _hook_payload_codex_reason(hook_input)
+    codex_reason = _hook_payload_codex_reason(hook_input) if context is None else None
     if codex_reason:
         print(f"[obsidian-brain] SessionStart outcome=SKIPPED_CODEX_HOST reason={codex_reason}", file=sys.stderr)
         return
 
-    cwd = hook_input.get("cwd", os.getcwd())
+    cwd = str(context.worktree) if context else hook_input.get("cwd", os.getcwd())
 
     # 2. Derive project name (needed for bootstrap before vault config).
     # Cwd-based project name (NOT canonical) — used for CC's path-encoded
@@ -158,7 +168,7 @@ def _run() -> None:
 
     # 2a. Guard first: when both the monorepo and standalone plugins are
     # installed, only the winning copy acts on this SessionStart trigger.
-    session_id = hook_input.get("session_id", "")
+    session_id = context.native_session_id if context else hook_input.get("session_id", "")
     if not claim_hook_run("SessionStart", session_id):
         # sibling plugin copy already wrote the bootstrap + emitted the hint;
         # record the suppression so it is visible in the hook log.
@@ -169,7 +179,7 @@ def _run() -> None:
     # configuration so the bootstrap stays current even when obsidian-brain is
     # not fully configured.
     bootstrap_updated = False
-    if session_id:
+    if session_id and context is None:
         bootstrap_updated = _write_bootstrap_atomic(project, session_id)
     _append_hook_log(project, session_id, bootstrap_updated)
 
@@ -182,7 +192,7 @@ def _run() -> None:
     sessions_folder = config.get("sessions_folder", "claude-sessions")
 
     # 3a. Invoke orphan-session reaper (best-effort, non-fatal)
-    if config.get("reaper_enabled", True):
+    if context is None and config.get("reaper_enabled", True):
         try:
             import obsidian_session_reaper as _reaper_mod
             _reaper_mod._reap_orphaned_sessions(project, vault_path, sessions_folder, config)
