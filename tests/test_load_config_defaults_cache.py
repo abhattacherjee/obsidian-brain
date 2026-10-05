@@ -59,3 +59,15 @@ def test_signature_is_not_a_config_key(cfg):
     # so /vault-config never shows it as a setting.
     assert "config_defaults_sig" not in obsidian_utils.load_config()
     assert "config_defaults_sig" not in obsidian_utils.load_config()
+
+
+def test_old_code_rewriting_config_under_a_new_signature_is_not_trusted(cfg):
+    # Review finding on PR #411. Old hooks keep running the pre-update install
+    # for the whole session; an old load_config re-caches "config" without
+    # touching "config_defaults_sig", so the signature alone would bless it.
+    assert obsidian_utils.load_config()["wiki_folder"] == "claude-wiki"  # 1
+    obsidian_utils.cache_invalidate(SID, "config")                       # 2
+    old = {k: v for k, v in obsidian_utils._DEFAULTS.items() if k != "wiki_folder"}
+    old["vault_path"] = "/vault"
+    obsidian_utils.cache_set(SID, "config", old)                         # 3
+    assert obsidian_utils.load_config().get("wiki_folder") == "claude-wiki"  # 4

@@ -2271,12 +2271,19 @@ def load_config(fresh: bool = False) -> dict:
     plugin update mid-session changes ``_DEFAULTS``; without this check the
     old cached dict lacks every new default key (``wiki_folder`` after
     3.8.0), and a raw ``config.get(key)`` reads None until the session ends.
+
+    The signature alone is not enough: hooks registered at session start
+    keep running the old install, and an old ``load_config`` rewrites
+    ``config`` without touching ``config_defaults_sig``. So a cached dict
+    must also carry every current default key.
     """
     sid = _get_session_id_fast()
     sig = _defaults_signature()
     cached = None
     if not fresh and cache_get(sid, "config_defaults_sig") == sig:
         cached = cache_get(sid, "config")
+        if not (isinstance(cached, dict) and _DEFAULTS.keys() <= cached.keys()):
+            cached = None
     if cached is not None:
         return cached
 
