@@ -10,25 +10,219 @@ Claude must run `./scripts/commit-preflight.sh` before committing.
 The token is:
 - Created by commit-preflight.sh after checks pass
 - Valid for 5 minutes
-- One-time use for regular commits (consumed after validation); reusable for --amend
+- Tied to the HEAD it was made at (its "head" field). A commit is allowed
+  only while HEAD is still that commit; an amend also while HEAD's first
+  parent is unchanged. Any HEAD move (a commit, a rebase, a checkout) ends it.
+- Kept across calls only for a command this hook reads exactly and knows is
+  harmless (see _safe_commit_args), run in the project's own checkout, so a
+  landed commit moves the HEAD it reads. Then a call that another hook denies
+  does not spend it (#408). Any other command spends it on approval, as
+  before, amends included. A token without "head" works the same way.
 """
 
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
 
+def _project_dir():
+    return os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd()))
+
+
 def _get_token_path():
     """Get project-specific token path using a hash of the project directory."""
-    project_dir = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
-    project_dir = os.path.realpath(project_dir)
-    project_hash = hashlib.md5(project_dir.encode()).hexdigest()[:8]
+    project_hash = hashlib.md5(_project_dir().encode()).hexdigest()[:8]
     return f"/tmp/.preflight-token-{project_hash}"
 
 TOKEN_FILE = _get_token_path()
+
+
+_HEX_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+def _git(args, cwd):
+    """stdout of ``git -C cwd args``, or None when git fails in any way."""
+    try:
+        out = subprocess.run(["git", "-C", cwd, *args],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def _commit_and_parents(ref):
+    """``[sha, parent, ...]`` for ``ref`` in the project repo (just ``[sha]``
+    for a root commit), or None when git cannot read it."""
+    out = _git(["rev-list", "--parents", "-n", "1", ref], _project_dir())
+    return out.split() if out else None
+
+
+def _token_state(token_head, is_amend):
+    """"ok" while HEAD is still the token's commit, or for an amend a commit
+    with the same first parent (an amend makes a sibling; a regular commit
+    makes a child, which does not match). "git-error" when HEAD cannot be
+    read. "moved" otherwise."""
+    here = _commit_and_parents("HEAD")
+    if here is None:
+        return "git-error"
+    if here[0] == token_head:
+        return "ok"
+    if is_amend:
+        then = _commit_and_parents(token_head)
+        if then is not None and here[1:2] == then[1:2]:
+            return "ok"
+    return "moved"
+
+
+# The token is kept across calls only for a command this hook can read
+# EXACTLY and knows is harmless: a few allowlisted commands, run in the
+# project's own checkout, with one commit. Everything else spends the token on
+# approval, as before #408, so anything missing from the allowlist costs only
+# the convenience, never a second unchecked commit. A denylist of ways to
+# commit elsewhere was tried first and leaked three times in review (a quoted
+# -C, c''d, git submodule foreach, a branch switch and back, push
+# --receive-pack, a redirection into .git/hooks).
+_SAFE_COMMAND_CAP = 100_000  # the same limit as prevent-direct-push's _SHLEX_MAX
+_SEPARATORS = frozenset(";&|()\n")
+# Only subcommands that cannot run a program or write a file: push runs
+# --receive-pack/--exec, and diff/log/show write files with --output.
+_GIT_SAFE = frozenset({"add", "status"})
+_GH_SAFE = frozenset({"create", "view", "edit", "comment", "list", "checks", "status"})
+
+# Commit options whose value is the next word (a message, a file, a commit),
+# so that word is never read as a flag.
+_COMMIT_VALUE_OPTS = frozenset({
+    "--message", "--file", "--reuse-message", "--reedit-message",
+    "--template", "--author", "--date", "--fixup", "--squash", "--cleanup",
+    "--trailer", "--pathspec-from-file",
+})
+
+
+def _lex(command):
+    """``command`` as bash splits it: ``("w", word)`` and ``("op", char)``
+    items, or None when it uses anything outside the alphabet this reads
+    exactly. That alphabet has no ``$``, backtick or backslash, so there is
+    no expansion, substitution or escape, and a quoted string is literal
+    text. An unquoted ``#`` at the start of a word starts a comment."""
+    if len(command) > _SAFE_COMMAND_CAP or any(c in command for c in "$`\\"):
+        return None
+    items, buf, in_word, i, n = [], [], False, 0, len(command)
+
+    def end_word():
+        if in_word:
+            items.append(("w", "".join(buf)))
+            buf.clear()
+
+    while i < n:
+        c = command[i]
+        if c in "'\"":
+            j = command.find(c, i + 1)
+            if j < 0:
+                return None
+            buf.append(command[i + 1:j])
+            in_word, i = True, j + 1
+        elif c in " \t":
+            end_word()
+            in_word, i = False, i + 1
+        elif c in ";&|()<>\n":
+            end_word()
+            items.append(("op", c))
+            in_word, i = False, i + 1
+        elif c == "#" and not in_word:
+            j = command.find("\n", i)
+            i = n if j < 0 else j
+        else:
+            buf.append(c)
+            in_word, i = True, i + 1
+    end_word()
+    return items
+
+
+def _safe_commit_args(command):
+    """The words after ``commit`` when ``command`` is safe to keep the token
+    for, else None. Safe means: it lexes exactly, every command in it is
+    ``git <add|status|commit>``, ``gh <pr|issue>
+    <create|view|edit|comment|list|checks|status>``, ``echo``, ``printf`` or
+    ``true``, the subcommand directly follows ``git`` (no global options such
+    as ``-C``), exactly one of them is a commit, and there is no ``<`` or
+    ``>`` (a redirection can write into .git/hooks, and its target is not an
+    argument the command sees)."""
+    items = _lex(command)
+    if items is None:
+        return None
+    segments, cur = [], []
+    for kind, text in items:
+        if kind == "op" and text in _SEPARATORS:
+            segments.append(cur)
+            cur = []
+        elif kind == "op":
+            return None  # < or >
+        else:
+            cur.append(text)
+    segments.append(cur)
+    commits = []
+    for words in segments:
+        if not words:
+            continue
+        head = words[0]
+        if head == "git" and len(words) > 1 and words[1] == "commit":
+            commits.append(words[2:])
+        elif head == "git" and len(words) > 1 and words[1] in _GIT_SAFE:
+            pass
+        elif (head == "gh" and len(words) > 2 and words[1] in ("pr", "issue")
+              and words[2] in _GH_SAFE):
+            pass
+        elif head in ("echo", "printf", "true"):
+            pass
+        else:
+            return None
+    return commits[0] if len(commits) == 1 else None
+
+
+def _has_amend(args):
+    """True when the commit ``args`` carry ``--amend`` (or an abbreviation git
+    accepts) as a flag: not as the value of -m/-F/..., and not after ``--``."""
+    skip_value = False
+    for word in args:
+        if skip_value:
+            skip_value = False
+        elif word == "--":
+            return False
+        elif len(word) >= 4 and "--amend".startswith(word):
+            return True
+        elif word in _COMMIT_VALUE_OPTS or re.fullmatch(r"-[A-Za-z]*[mFCct]", word):
+            skip_value = True
+    return False
+
+
+def _cwd_in_project(cwd):
+    """True when the shell's cwd is inside the project's own work tree (not a
+    worktree, submodule or nested repo), so a commit there moves the HEAD
+    this hook reads."""
+    if not isinstance(cwd, str) or not cwd:
+        return False
+    top = _git(["rev-parse", "--show-toplevel"], cwd)
+    return top is not None and os.path.realpath(top) == _project_dir()
+
+
+def _spend_token():
+    """Delete the token. A token that cannot be deleted would stay reusable,
+    so that blocks instead."""
+    try:
+        os.remove(TOKEN_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        block(f"""❌ COMMIT BLOCKED: Could not spend the preflight token ({exc}).
+
+Delete {TOKEN_FILE} and run preflight again:
+
+    ./scripts/commit-preflight.sh""")
 
 
 def _shell_scan(prefix: str):
@@ -556,10 +750,9 @@ def main():
 
     # Check if this is a git commit command
     is_commit = re.search(_COMMIT_VERB, command) is not None
-    is_amend = "--amend" in command
-
     if not is_commit:
         allow()
+
 
     # Skip this hook if the command targets a repo outside this project
     if not _targets_this_project(command, _COMMIT_VERB):
@@ -582,7 +775,7 @@ This ensures:
   ✓ Lint passes (if configured)
   ✓ Tests pass (if configured)
 
-The preflight creates a one-time token that allows the next commit.
+The preflight creates a token that covers the next commit at the current HEAD.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Why this exists:
@@ -597,7 +790,13 @@ Then retry your commit.""")
     try:
         with open(TOKEN_FILE, 'r') as f:
             token_data = json.load(f)
-    except (json.JSONDecodeError, IOError):
+        # A token sits at a predictable /tmp path, so its shape is checked:
+        # anything that is not an object with an integer "expires" would
+        # crash below, and a crash (exit 1) lets the commit run.
+        expires = token_data.get("expires") if isinstance(token_data, dict) else None
+        if not isinstance(expires, int) or isinstance(expires, bool):
+            raise ValueError("token has no integer expires")
+    except (ValueError, OSError, RecursionError):
         # Token file corrupted - require new preflight
         try:
             os.remove(TOKEN_FILE)
@@ -612,7 +811,6 @@ The token file is corrupted. Please run preflight again:
 Then retry your commit.""")
 
     # Check token expiry
-    expires = token_data.get("expires", 0)
     current_time = int(time.time())
 
     if current_time > expires:
@@ -631,16 +829,56 @@ Please run preflight again to refresh:
 
 Then retry your commit.""")
 
-    # Token is valid - consume it (one-time use)
+    # Whether the token may outlive this call (see _safe_commit_args), and
+    # whether that safe command is an amend. A command that is not safe is
+    # never treated as an amend: the stricter rule.
+    commit_args = _safe_commit_args(command)
+    keep = commit_args is not None and _cwd_in_project(input_data.get("cwd"))
+    is_amend = commit_args is not None and _has_amend(commit_args)
+
     checks_run = token_data.get("checks_run", "none")
     staged_count = token_data.get("staged_files", 0)
+    token_head = token_data.get("head")
 
-    # For amend, we're more lenient — don't consume the token
-    if not is_amend:
-        try:
-            os.remove(TOKEN_FILE)
-        except OSError:
-            pass
+    if token_head in (None, ""):
+        # No "head" (an older preflight, or a repo with no commits yet):
+        # spent on approval, except a safe amend in the project, as before.
+        if not (keep and is_amend):
+            _spend_token()
+    elif not (isinstance(token_head, str) and _HEX_SHA.fullmatch(token_head)):
+        # Only a full hex SHA is read, never text git could take as an
+        # option or a revision expression.
+        _spend_token()
+        block("""❌ COMMIT BLOCKED: Invalid preflight token!
+
+The token's "head" is not a commit SHA. Run preflight again:
+
+    ./scripts/commit-preflight.sh
+
+Then retry your commit.""")
+    else:
+        state = _token_state(token_head, is_amend)
+        if state == "git-error":
+            # The token is kept: nothing says it was used.
+            block("""❌ COMMIT BLOCKED: Could not read HEAD to check the preflight token.
+
+git failed or timed out in the project. Fix git, then retry the commit.""")
+        if state == "moved":
+            _spend_token()
+            block("""❌ COMMIT BLOCKED: HEAD has moved since the preflight ran.
+
+A commit, rebase or checkout has happened since then, so the token no
+longer covers what you are about to commit. Run preflight again:
+
+    ./scripts/commit-preflight.sh
+
+Then retry your commit.""")
+        if not keep:
+            # This hook only sees the project's HEAD. A command it cannot
+            # prove harmless may commit where that HEAD never moves (a
+            # worktree, a submodule, a branch switched and back), so the
+            # token is spent on approval, as before. Amends included.
+            _spend_token()
 
     # Token valid - allow commit
     # Output verification status for audit trail

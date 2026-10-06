@@ -2355,6 +2355,16 @@ def load_config(fresh: bool = False, context=None) -> dict:
     skips the cache read and refreshes the cache from disk: callers that
     prune the index by folder (``/vault-reindex``, ``/obsidian-setup``) use
     it so a config written earlier in the session is not ignored (#393).
+
+    The cache is valid only for the ``_DEFAULTS`` that wrote it (#409). A
+    plugin update mid-session changes ``_DEFAULTS``; without this check the
+    old cached dict lacks every new default key (``wiki_folder`` after
+    3.8.0), and a raw ``config.get(key)`` reads None until the session ends.
+
+    The signature alone is not enough: hooks registered at session start
+    keep running the old install, and an old ``load_config`` rewrites
+    ``config`` without touching ``config_defaults_sig``. So a cached dict
+    must also carry every current default key.
     """
     from runtime_context import current_runtime_context
     context = context or current_runtime_context()
@@ -2366,7 +2376,12 @@ def load_config(fresh: bool = False, context=None) -> dict:
         config["index_path"] = str(context.index_path)
         return config
     sid = _get_session_id_fast()
-    cached = None if fresh else cache_get(sid, "config")
+    sig = _defaults_signature()
+    cached = None
+    if not fresh and cache_get(sid, "config_defaults_sig") == sig:
+        cached = cache_get(sid, "config")
+        if not (isinstance(cached, dict) and _DEFAULTS.keys() <= cached.keys()):
+            cached = None
     if cached is not None:
         return cached
 
@@ -2406,7 +2421,14 @@ def load_config(fresh: bool = False, context=None) -> dict:
                 print(f"[obsidian-brain] WARNING: config is world-readable and chmod failed: {exc}", file=sys.stderr)
 
     cache_set(sid, "config", config)
+    cache_set(sid, "config_defaults_sig", sig)
     return config
+
+
+def _defaults_signature() -> str:
+    """Short hash of ``_DEFAULTS``: names the code that wrote a cached config."""
+    blob = json.dumps(_DEFAULTS, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def indexed_folders(config: dict, strict: bool = False) -> list:

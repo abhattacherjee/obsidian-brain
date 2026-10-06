@@ -1,6 +1,6 @@
 {
   "name": "obsidian-brain",
-  "version": "3.8.0",
+  "version": "3.8.1",
   "description": "Shared session capture, curated notes, and vault tools. Native CLI/Desktop client binding still requires verification.",
   "hooks": "./hooks/codex-hooks.json",
   "skills": "./skills"
