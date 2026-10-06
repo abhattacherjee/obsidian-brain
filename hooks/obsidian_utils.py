@@ -2,7 +2,7 @@
 obsidian_utils.py — Shared utilities for obsidian-brain hook scripts.
 
 Extracted from the validated spike (spike_session_log.py) with these changes:
-  - No hardcoded config; uses load_config() reading ~/.claude/obsidian-brain-config.json
+  - Native config comes from the selected runtime; legacy defaults live in its adapter
   - All functions take explicit parameters (vault_path, model, etc.) — no global state
   - File extraction uses tool_use blocks instead of regex heuristics
   - Python stdlib only
@@ -52,7 +52,7 @@ from frontmatter import (  # noqa: E402
 )
 
 # Session IDs are CC UUIDs (or test fixtures). Restrict to safe filename chars
-# so the marker path never escapes ~/.claude/obsidian-brain/sessions/.
+# so the legacy marker path never escapes its private session directory.
 _SID_FILENAME_SAFE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
 
 
@@ -133,6 +133,15 @@ def _first_seen_date(sid: str) -> str:
 
     Marker location: ~/.claude/obsidian-brain/sessions/<sid>.json (0o600).
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        from session_auxiliary_state import first_seen_date
+        try:
+            return first_seen_date(context)
+        except (OSError, ValueError):
+            print("[obsidian-brain] first-seen state unavailable; using today's date", file=sys.stderr)
+            return datetime.date.today().isoformat()
     if not _SID_FILENAME_SAFE.fullmatch(sid):
         print(
             f"[obsidian-brain] _first_seen_date: refusing unsafe sid shape; "
@@ -221,7 +230,8 @@ def _retro_gate_dir() -> Path:
     from runtime_context import current_runtime_context
     context = current_runtime_context()
     if context:
-        return context.state_path / "retro-gate"
+        from session_auxiliary_state import directory
+        return directory(context, "retro-gate")
     return Path.home() / ".claude" / "obsidian-brain" / "retro-gate"
 
 
@@ -885,6 +895,10 @@ def _resolve_project_basename_with_source() -> tuple[str | None, str]:
     layers instead of triggering an unscoped cross-project glob (which would
     silently mis-attribute the active session).
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        return context.canonical_project_root.name or None, "context"
     try:
         cwd_base = os.path.basename(os.getcwd())
         return (cwd_base, "cwd") if cwd_base else (None, "none")
@@ -969,10 +983,11 @@ def _recent_bootstrap_sid(window_seconds: int = 600) -> str | None:
 
 
 # --- Secure working directory ---
-# All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
+# Legacy temporary/cache files use the native adapter private directory (0o700).
 # This prevents symlink attacks and cache poisoning on multi-user systems.
 
-_SECURE_DIR = os.path.expanduser("~/.claude/obsidian-brain")
+from runtime_adapters.claude import legacy_private_directory, legacy_config_path, legacy_foreign_host_markers
+_SECURE_DIR = str(legacy_private_directory())
 
 
 def _ensure_secure_dir() -> str:
@@ -1019,7 +1034,11 @@ def _lock_path(event_type: str, session_id: str) -> str:
     context = current_runtime_context()
     safe_sid = context.session_key if context else re.sub(r"[^A-Za-z0-9_-]", "_", session_id)[:64]
     safe_event = re.sub(r"[^A-Za-z0-9_-]", "_", event_type)[:32]
-    lock_dir = str(context.state_path / "locks") if context else _LOCK_DIR
+    if context:
+        from session_auxiliary_state import directory
+        lock_dir = str(directory(context, "locks"))
+    else:
+        lock_dir = _LOCK_DIR
     return os.path.join(lock_dir, f"{safe_sid}-{safe_event}")
 
 
@@ -1163,7 +1182,12 @@ def _append_sessionend_log(
     """
     from runtime_context import current_runtime_context
     context = current_runtime_context()
-    log_dir = str(context.state_path) if context else os.path.join(os.path.expanduser("~"), ".claude")
+    if context:
+        from session_auxiliary_state import directory
+        log_dir = str(directory(context, "logs"))
+    else:
+        from runtime_adapters.claude import selected_home
+        log_dir = str(selected_home())
     log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
     try:
         os.makedirs(log_dir, exist_ok=True)
@@ -1205,7 +1229,14 @@ def _append_reaper_log(project: str, sid: Optional[str], event: str, detail: str
     to stderr so the reaper itself is never interrupted by a log write error.
     """
     try:
-        log_dir = Path.home() / ".claude"
+        from runtime_context import current_runtime_context
+        context = current_runtime_context()
+        if context:
+            from session_auxiliary_state import directory
+            log_dir = directory(context, "logs")
+        else:
+            from runtime_adapters.claude import selected_home
+            log_dir = selected_home()
         log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         log_path = log_dir / _HOOK_LOG_NAME
 
@@ -1372,18 +1403,7 @@ _env_sid_malformed_warned: set[str] = set()
 # Keyed by the Codex marker variable that fired (#362).
 _foreign_host_warned: set[str] = set()
 
-# Environment variables Codex sets in the shells it runs tools in (#362).
-# Checked against the codex-cli 0.155.1 binary. The two sandbox variables are
-# set only when the sandbox is on, so an unsandboxed run is detected by
-# CODEX_THREAD_ID alone. An unsandboxed run of a Codex build older than
-# CODEX_THREAD_ID is therefore not detected. CODEX_HOME is deliberately NOT
-# here: it is user configuration and is often exported in an ordinary shell
-# profile, so its presence says nothing about which host launched this process.
-_CODEX_HOST_MARKERS = (
-    "CODEX_THREAD_ID",
-    "CODEX_SANDBOX",
-    "CODEX_SANDBOX_NETWORK_DISABLED",
-)
+_CODEX_HOST_MARKERS = legacy_foreign_host_markers()
 
 
 def _foreign_host_marker() -> str | None:
@@ -1419,9 +1439,9 @@ def _hook_payload_codex_reason(hook_input: dict) -> str | None:
 
 # Memo for the env-layer transcript check below, keyed by (project, env_sid).
 #
-# WHY: CLAUDE_CODE_SESSION_ID is constant for the life of a process, and the
+# WHY: the native session environment ID is constant for the life of a process, and the
 # resolved project basename is too — but only because nothing in this module
-# calls os.chdir(); it is derived from os.getcwd() (or CLAUDE_PROJECT_DIR)
+# calls os.chdir(); it is derived from os.getcwd() or the native project variable
 # fresh on every call, and would change mid-run if the process's cwd did
 # (#354 review item 5c/6c). Given that, the answer to "does this sid have a
 # transcript yet" cannot change mid-run. Without this cache, the same
@@ -1573,6 +1593,10 @@ def _current_session_cwd() -> str:
     CLAUDE_PROJECT_DIR) so the transcript comparison and the encoding pre-filter
     can never be judging against two different directories.
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        return str(context.worktree)
     cwd = _safe_getcwd()
     if cwd:
         return cwd.rstrip("/") or "/"
@@ -2054,6 +2078,10 @@ def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) ->
     inherits the markers and resolves 'unknown'; the two cases look identical
     from inside the process, and 'unknown' is the answer that is never wrong.
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        return context.native_session_id
     marker = _foreign_host_marker()
     if marker is not None:
         _warn_once(
@@ -2168,9 +2196,12 @@ def cache_get(session_id: str, key: str, context=None):
     for an uncacheable id (see _UNCACHEABLE_SIDS)."""
     from runtime_context import current_runtime_context
     context = context or current_runtime_context()
+    if context is not None:
+        from session_auxiliary_state import cache_get as scoped_cache_get
+        return scoped_cache_get(context, key)
     if context is None and session_id in _UNCACHEABLE_SIDS:
         return None
-    cache_path = str(context.state_path / ("cache-" + context.session_key + ".json")) if context else f"{_CACHE_PREFIX}{session_id}.json"
+    cache_path = f"{_CACHE_PREFIX}{session_id}.json"
     try:
         with open(cache_path, 'r') as f:
             data = json.load(f)
@@ -2184,24 +2215,22 @@ def cache_set(session_id: str, key: str, value, context=None) -> None:
     uncacheable id (see _UNCACHEABLE_SIDS)."""
     from runtime_context import current_runtime_context
     context = context or current_runtime_context()
+    if context is not None:
+        from session_auxiliary_state import cache_update
+        try:
+            cache_update(context, key, value)
+        except (OSError, ValueError):
+            print("[obsidian-brain] session cache write failed", file=sys.stderr)
+        return
     if context is None and session_id in _UNCACHEABLE_SIDS:
         return
-    if context:
-        secure_dir = str(context.state_path)
-        try:
-            os.makedirs(secure_dir, mode=0o700, exist_ok=True)
-        except OSError as exc:
-            print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
-            return
-        cache_path = str(context.state_path / ("cache-" + context.session_key + ".json"))
-    else:
-        try:
-            _ensure_secure_dir()
-        except OSError as exc:
-            print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
-            return
-        secure_dir = _SECURE_DIR
-        cache_path = f"{_CACHE_PREFIX}{session_id}.json"
+    try:
+        _ensure_secure_dir()
+    except OSError as exc:
+        print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
+        return
+    secure_dir = _SECURE_DIR
+    cache_path = f"{_CACHE_PREFIX}{session_id}.json"
     try:
         with open(cache_path, 'r') as f:
             data = json.load(f)
@@ -2232,6 +2261,15 @@ def cache_set(session_id: str, key: str, value, context=None) -> None:
 def cache_invalidate(session_id: str, *keys: str) -> None:
     """Remove specific keys from cache. No keys = clear all. No-op for an
     uncacheable id, which never has a cache (see _UNCACHEABLE_SIDS)."""
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        from session_auxiliary_state import cache_update
+        try:
+            cache_update(context, remove=keys, clear=not keys)
+        except (OSError, ValueError):
+            print("[obsidian-brain] session cache invalidation failed", file=sys.stderr)
+        return
     if session_id in _UNCACHEABLE_SIDS:
         return
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
@@ -2275,7 +2313,7 @@ def cache_invalidate(session_id: str, *keys: str) -> None:
 # message-filtering heuristics.
 RAW_NOTE_MAX_TURNS = 120
 
-_CONFIG_PATH = Path.home() / ".claude" / "obsidian-brain-config.json"
+_CONFIG_PATH = legacy_config_path()
 
 _DEFAULTS: dict = {
     "vault_path": "",
@@ -2287,8 +2325,8 @@ _DEFAULTS: dict = {
     "min_messages": 3,
     "min_duration_minutes": 2,
     "summary_model": "haiku",
-    "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline. Consumed by /recall SKILL.md Step 2 (summarization is deferred to /recall), #84
-    "summary_batch_size": 3,  # notes per claude -p spawn in upgrade_batch (#166); 1 = legacy per-note fan-out
+    "summary_pipeline": "auto",  # "auto" = native analysis + interactive fallback; "subagent" = skip native analysis. Consumed by /recall SKILL.md Step 2; #84
+    "summary_batch_size": 3,  # notes per native analysis request in upgrade_batch (#166); 1 = legacy per-note fan-out
     "summary_recovery": True,  # #167: post-process loose summaries (heading normalization, synth missing sections, default importance) before escalating/falling back. Set false to disable.
     "consolidate_cluster_threshold": 0.5,  # cosine sim for single-linkage edge in /consolidate
     "consolidate_min_cluster_size": 3,  # smallest cluster that becomes a theme
@@ -2560,6 +2598,20 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     `cwd` is the working directory the entry was resolved from. It is a guard,
     not a payload (see below); callers read the other four fields.
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        if vault_path is not None and Path(vault_path).resolve() != context.vault_path.resolve():
+            raise ValueError("Session lookup cannot switch the selected vault")
+        selected_folder = str(context.config.get("sessions_folder", "claude-sessions"))
+        if sessions_folder is not None and sessions_folder != selected_folder:
+            raise ValueError("Session lookup cannot switch the selected sessions folder")
+        from session_lookup import find_existing_session
+        existing = find_existing_session(context, time.monotonic() + 0.1)
+        return {"session_id": context.native_session_id, "hash": context.session_key[:16],
+                "project": context.canonical_project_root.name,
+                "session_note_name": existing.stem if existing is not None else "",
+                "cwd": str(context.worktree)}
     sid = _get_session_id_fast()
     cwd_now = _safe_getcwd()
     # Include args in cache key so different call signatures don't collide
@@ -4098,7 +4150,7 @@ OUTPUT EXACTLY these two sections with no preamble, no commentary:
 # (summary_model, default "haiku") fails with a *quality* reason, retry with a
 # more capable model. Sonnet is the first fallback (~3x cost) before Opus (~5x),
 # replacing the old behavior where the recall Phase-2 sub-agent fell straight to
-# Opus. CLI aliases passed to `claude -p --model`.
+# Opus. Legacy aliases are passed through the native Claude analysis adapter.
 _SUMMARY_FALLBACK_CHAIN = ("sonnet", "opus")
 # Only these generate_summary failure reasons warrant escalating to a more
 # capable model. Timeouts (haiku_timeout) are NOT escalated — a larger model is
@@ -4836,11 +4888,15 @@ def _note_has_inbound_links(basename_stem: str, db_path: str | None = None) -> b
     """
     try:
         if db_path is None:
-            if _vault_index is not None:
+            from runtime_context import current_runtime_context
+            context = current_runtime_context()
+            if context is not None:
+                db_path = str(context.index_path)
+            elif _vault_index is not None:
                 db_path = _vault_index._default_db_path()
             else:
-                # Fall back to the known default path string directly
-                db_path = os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
+                from runtime_adapters.claude import legacy_index_path
+                db_path = str(legacy_index_path())
         if not os.path.exists(db_path):
             return True  # conservative: assume referenced
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)  # noqa: vault-db-connect — opens via uri=True (file:...?mode=ro) which _connect() does not accept (plain-path connect + realpath guard can't parse a URI); read-only, so it cannot pollute
@@ -5704,6 +5760,12 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
     Returns the Path if found, None otherwise. Uses find(1) so it is
     agnostic to project-path encoding (hyphens vs underscores).
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        if session_id != context.native_session_id or context.transcript_path is None:
+            return None
+        return context.transcript_path
     if not session_id or session_id == "unknown":
         return None
     projects_dir = Path.home() / ".claude" / "projects"
@@ -7403,7 +7465,7 @@ def upgrade_batch(
 # from a 3.4.1 cache while hooks resolved from 3.5.0, every step ran, and
 # nothing warned.
 #
-# Ruling R5: the original design gated this probe on CLAUDE_PLUGIN_ROOT,
+# Ruling R5: the original design gated this probe on a hook-only plugin-root variable,
 # verified NOT set in a skill's Bash block (Claude Code interpolates it into
 # hooks.json command strings, not skill shells) -- that guard would never
 # fire. A skill also cannot introspect which copy of its own SKILL.md was
@@ -7424,6 +7486,10 @@ def _default_plugin_install_paths() -> list[str]:
     caller passes ``install_paths`` explicitly to
     :func:`describe_plugin_install_divergence`.
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        return [str(context.resource_root)]
     paths: list[str] = []
     try:
         marketplaces_path = os.path.expanduser("~/.claude/plugins/known_marketplaces.json")

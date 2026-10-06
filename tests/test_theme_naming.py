@@ -64,3 +64,9 @@ def test_generate_theme_names_empty_clusters_short_circuits():
         names, reason = obsidian_utils.generate_theme_names([])
     assert names == []
     assert reason is None
+
+
+# Every scoped operation uses the same selected temporary vault.
+from selected_legacy_vault import selected_host_context, native_ai_frontend  # noqa: F401,E402
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

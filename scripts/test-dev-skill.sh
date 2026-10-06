@@ -13,6 +13,36 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 PLUGIN_NAME="obsidian-brain"
+COMMAND="${1:-status}"
+if [[ $# -gt 0 ]]; then shift; fi
+HOST="claude"
+CACHE_PATH=""
+SOURCE_ROOT="$REPO_ROOT"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --host) HOST="${2:?Missing host}"; shift 2 ;;
+        --source) SOURCE_ROOT="${2:?Missing source}"; shift 2 ;;
+        --cache-path) CACHE_PATH="${2:?Missing cache path}"; shift 2 ;;
+        *) echo "ERROR: Unknown option $1" >&2; exit 1 ;;
+    esac
+done
+case "$HOST" in
+    claude|codex) ;;
+    *) echo "ERROR: Host must be claude or codex" >&2; exit 1 ;;
+esac
+case "$COMMAND" in
+    install|restore|status) ;;
+    *) echo "ERROR: Command must be install, restore or status" >&2; exit 1 ;;
+esac
+SCRIPT_ROOT="$REPO_ROOT"
+REPO_ROOT="$(cd "$SOURCE_ROOT" && pwd -P)"
+if [[ "$HOST" == "codex" ]]; then
+    CODEX_ARGS=("$COMMAND" --source "$REPO_ROOT")
+    if [[ -n "$CACHE_PATH" ]]; then CODEX_ARGS+=(--cache-path "$CACHE_PATH"); fi
+    exec python3 "$SCRIPT_ROOT/scripts/dev-test/codex_install.py" "${CODEX_ARGS[@]}"
+fi
+set -- "$COMMAND"
+
 
 # Guard 1 (sentinel): REPO_ROOT must actually be an obsidian-brain checkout,
 # not just whatever directory happens to be two levels above this script.
@@ -105,8 +135,8 @@ case "${1:-status}" in
         # cannot be entered, the
         # `cd` fails, `set -e` aborts on the assignment, and the run stops before
         # any mutation -- fail closed, as above.
-        if [[ -d "$HOME/.claude/plugins" ]]; then
-            PLUGIN_ROOT_PREFIX="$(cd "$HOME/.claude/plugins" && pwd -P)/"
+        if [[ -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins" ]]; then
+            PLUGIN_ROOT_PREFIX="$(cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins" && pwd -P)/"
             if [[ "$REPO_ROOT/" == "$PLUGIN_ROOT_PREFIX"* ]]; then
                 echo "ERROR: $REPO_ROOT is inside the installed plugin tree ($PLUGIN_ROOT_PREFIX)." >&2
                 echo "That covers both the plugin cache (installing it onto itself is a no-op) and a" >&2
@@ -120,7 +150,7 @@ esac
 
 # Discover the plugin cache dir regardless of which marketplace installed it.
 # Matches ~/.claude/plugins/cache/<marketplace>/obsidian-brain ; newest wins.
-CACHE_BASE="$(ls -dt "${HOME}/.claude/plugins/cache/"*/"${PLUGIN_NAME}" 2>/dev/null | head -1 || true)"
+CACHE_BASE="$(ls -dt "${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/plugins/cache/"*/"${PLUGIN_NAME}" 2>/dev/null | head -1 || true)"
 if [[ -z "$CACHE_BASE" ]]; then
     echo "ERROR: No installed ${PLUGIN_NAME} plugin cache found under ~/.claude/plugins/cache/*/${PLUGIN_NAME}"
     exit 1
@@ -253,60 +283,8 @@ case "$cmd" in
 
         echo "Installing dev versions..."
 
-        # Copy hooks (Python files + registration manifest)
-        cp "$REPO_ROOT/hooks/"*.py "$CACHE_DIR/hooks/"
-        echo "  hooks/*.py -> cache"
-        if [[ -f "$REPO_ROOT/hooks/hooks.json" ]]; then
-            cp "$REPO_ROOT/hooks/hooks.json" "$CACHE_DIR/hooks/"
-            echo "  hooks/hooks.json -> cache"
-        fi
-
-        # Copy plugin manifests so version/metadata changes propagate
-        if [[ -d "$CACHE_DIR/.claude-plugin" ]]; then
-            if [[ -f "$REPO_ROOT/.claude-plugin/plugin.json" ]]; then
-                cp "$REPO_ROOT/.claude-plugin/plugin.json" "$CACHE_DIR/.claude-plugin/"
-                echo "  .claude-plugin/plugin.json -> cache"
-            fi
-            if [[ -f "$REPO_ROOT/.claude-plugin/marketplace.json" ]]; then
-                cp "$REPO_ROOT/.claude-plugin/marketplace.json" "$CACHE_DIR/.claude-plugin/"
-                echo "  .claude-plugin/marketplace.json -> cache"
-            fi
-        fi
-
-        # Copy skills.
-        #
-        # `[[ -d ... ]] || continue` is the residual of guard 1's empty-skills/
-        # case, not redundancy with it. Guard 1 asks whether skills/ has ANY
-        # entry (matching restore's predicate); this loop globs only skills/*/,
-        # so a skills/ holding nothing but files -- a README, a half-finished
-        # rsync -- passes the guard and still leaves the glob unmatched, and an
-        # unmatched glob is literal here (nullglob is off). Without this line
-        # that shape mkdirs a directory named `*` into the plugin cache and
-        # narrates `  skills/*/ -> cache` for a copy that never happened;
-        # reproduced during the #287 adversarial review.
-        for skill_dir in "$REPO_ROOT/skills/"*/; do
-            [[ -d "$skill_dir" ]] || continue
-            skill_name=$(basename "$skill_dir")
-            mkdir -p "$CACHE_DIR/skills/$skill_name"
-            if compgen -G "$skill_dir"* > /dev/null 2>&1; then
-                cp "$skill_dir"* "$CACHE_DIR/skills/$skill_name/"
-            fi
-            echo "  skills/$skill_name/ -> cache"
-        done
-
-        # Copy runtime scripts (whitelist — scripts/ is heterogeneous;
-        # see feedback_plugin_sync_scripts_heterogeneous.md memory).
-        # These are dispatched by skills at runtime and must reflect the
-        # repo state, not the released cache.
-        if [[ -f "$REPO_ROOT/scripts/vault_doctor.py" ]]; then
-            cp "$REPO_ROOT/scripts/vault_doctor.py" "$CACHE_DIR/scripts/"
-            echo "  scripts/vault_doctor.py -> cache"
-        fi
-        if [[ -d "$REPO_ROOT/scripts/vault_doctor_checks" ]]; then
-            mkdir -p "$CACHE_DIR/scripts/vault_doctor_checks"
-            cp "$REPO_ROOT/scripts/vault_doctor_checks/"*.py "$CACHE_DIR/scripts/vault_doctor_checks/"
-            echo "  scripts/vault_doctor_checks/*.py -> cache"
-        fi
+        # Recursive runtime includes transcript/AI packages and skill references.
+        python3 "$SCRIPT_ROOT/scripts/dev-test/package_tree.py" "$REPO_ROOT" "$CACHE_DIR"
 
         trap - ERR
 

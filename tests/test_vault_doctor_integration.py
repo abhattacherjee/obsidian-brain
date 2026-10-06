@@ -84,7 +84,7 @@ def test_end_to_end_scan_apply_verify(tmp_path):
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
     # --- 1. Dry-run → exit 1, file untouched ---
-    r = subprocess.run(
+    r = run_doctor(
         [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "proj1", "--json"],
         capture_output=True, text=True, env=env,
@@ -97,7 +97,7 @@ def test_end_to_end_scan_apply_verify(tmp_path):
     assert insight.read_text(encoding="utf-8") == original_text, "dry-run must not modify the file"
 
     # --- 2. Apply with --yes (non-interactive) ---
-    r = subprocess.run(
+    r = run_doctor(
         [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "proj1", "--apply", "--yes"],
         capture_output=True, text=True, env=env,
@@ -123,7 +123,7 @@ def test_end_to_end_scan_apply_verify(tmp_path):
     assert backup_content == original_text, "backup must match pre-patch content exactly"
 
     # --- 4. Re-scan → exit 0 (clean) ---
-    r = subprocess.run(
+    r = run_doctor(
         [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "proj1", "--json"],
         capture_output=True, text=True, env=env,
@@ -207,7 +207,7 @@ def test_json_payload_has_top_level_signal_and_convergence_keys(tmp_path):
     env["OBSIDIAN_BRAIN_INSIGHTS_FOLDER"] = "claude-insights"
 
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
-    r = subprocess.run(
+    r = run_doctor(
         [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "convproj", "--json"],
         capture_output=True, text=True, env=env,
@@ -236,3 +236,11 @@ def test_json_payload_has_top_level_signal_and_convergence_keys(tmp_path):
             "unresolved",
             "",  # default for any future Issue lacking the field
         ), f"signal_class={issue['signal_class']!r} not in documented taxonomy"
+
+
+import pytest
+from doctor_cli_test_helpers import run_doctor
+
+@pytest.fixture(autouse=True)
+def _selected_doctor_cli_actor(selected_host_context):
+    return selected_host_context

@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/obsidian_session_log.py"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host claude --client claude-code --event session_end"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/obsidian_session_hint.py"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host claude --client claude-code --event session_start"
           }
         ]
       }
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/obsidian_context_snapshot.py"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host claude --client claude-code --event pre_compact"
           }
         ]
       }
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/obsidian_retro_gate.py"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host claude --client claude-code --event stop"
           }
         ]
       }

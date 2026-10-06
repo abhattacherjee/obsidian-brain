@@ -4,7 +4,7 @@ obsidian_session_log.py -- SessionEnd hook for obsidian-brain plugin.
 
 Reads the session transcript and writes a raw note to the Obsidian vault.
 AI summarization is deferred to /recall (SessionEnd hooks are fire-and-forget;
-slow subprocess calls like `claude -p` get killed when the process tree exits).
+slow subprocess calls like native analysis get killed when the process tree exits).
 Always exits 0.
 """
 

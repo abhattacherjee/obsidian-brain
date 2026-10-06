@@ -133,6 +133,19 @@ def _allowed(file, function, node):
         if name == 'stream.write':
             return [ast.unparse(arg) for arg in node.args] == ['text']
         return False
+    if file == 'hooks/session_auxiliary_state.py' and function == '_write':
+        if name == 'os.fdopen':
+            return [ast.unparse(arg) for arg in node.args] == ['descriptor', "'w'"]
+        if name == 'os.replace':
+            return [ast.unparse(arg) for arg in node.args] == ['temporary', 'path']
+        if name == 'os.unlink':
+            return [ast.unparse(arg) for arg in node.args] == ['temporary']
+        return False
+    if file == 'hooks/session_auxiliary_state.py' and function == '_locked':
+        return (name == 'os.open' and not node.keywords and len(node.args) == 3
+                and ast.unparse(node.args[0]) == 'path'
+                and ast.unparse(node.args[1]) == "os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)"
+                and isinstance(node.args[2], ast.Constant) and node.args[2].value == 0o600)
     if file == 'hooks/operation_state.py' and function == '_operation_lock':
         return (name == 'os.open' and len(node.args) == 3
                 and ast.unparse(node.args[0]) == 'path'
@@ -395,3 +408,19 @@ def test_native_rpc_send_exception_is_only_deadline_bounded_stdin():
     assert 'payload = payload[written:]' in source
     assert not _violations(source, 'hooks/ai_adapters/codex.py')
     assert _violations(source + '\n    os.write(note_fd, payload)\n', 'hooks/ai_adapters/codex.py')
+
+
+def test_auxiliary_state_exceptions_require_selected_private_path():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/session_auxiliary_state.py').read_text())
+    functions = {node.name: ast.unparse(node) for node in tree.body if isinstance(node, ast.FunctionDef)}
+    boundary = functions['_private_path']
+    assert 'root = directory(context, kind)' in boundary
+    assert 'path.resolve() != root / path.name' in boundary
+    assert '_no_symlinks(path)' in boundary
+    for name in ('_write', '_locked'):
+        source = functions[name]
+        assert 'path = _private_path(context, path)' in source
+        assert not _violations(source, 'hooks/session_auxiliary_state.py')
+        assert _violations(source + '\n    Path(note_path).write_text("bypass")\n', 'hooks/session_auxiliary_state.py')
+    assert _violations('def _write():\n    os.replace(temporary, vault_note)\n', 'hooks/session_auxiliary_state.py')

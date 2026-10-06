@@ -118,7 +118,7 @@ B still genuinely to-do, they are NOT the same action.
 
 Example 1:
 - A: "Decide text-fallback routing vs. sentinel option to satisfy
-     AskUserQuestion minItems=2"
+     operator choice requires at least two options"
 - B: "Review fuzzy-matched cascade candidate about routing N=1 to
      text-fallback"
 -> MERGE. Both describe the same decision about N=1 text-fallback
@@ -190,8 +190,9 @@ def _read_stdin_capped() -> str:
 
 
 def _safe_workdir() -> Path:
-    """Return ~/.claude/obsidian-brain/, ensure 0o700, no predictable /tmp paths."""
-    workdir = Path.home() / ".claude" / "obsidian-brain"
+    """Return selected private state, with the named legacy compatibility seam."""
+    from runtime_adapters import private_workdir
+    workdir = private_workdir()
     workdir.mkdir(mode=0o700, parents=True, exist_ok=True)
     return workdir
 
@@ -703,13 +704,13 @@ def _dispatch_classifier_chunk(chunk_groups: list, evidence: dict, model: str,
 def run_classifier(stdin_json: str, output_path: str) -> int:
     """
     Stage 4: invoke the classifier sub-agent, with L2 evidence-presence
-    pre-filter applied to all groups before any claude -p dispatch.
+    pre-filter applied to all groups before native analysis dispatch.
 
     Flow:
       1. Parse stdin JSON to extract groups + evidence.
       2. Apply L2 pre-filter (if enabled): items with no evidence go to
          synthetic_classification(); items with evidence go to the sub-agent.
-      3. If to_classify is non-empty, dispatch claude -p. When
+      3. If to_classify is non-empty, dispatch native analysis. When
          len(to_classify) > CLASSIFIER_CHUNK_SIZE, split into sequential
          chunks of <=CLASSIFIER_CHUNK_SIZE groups so a single call stays
          well under SUBAGENT_TIMEOUT_SEC.

@@ -358,9 +358,12 @@ def _snapshot(context, note, first_date, body, trigger, deadline):
     from note_transactions import _contained
     _contained(context, path)
     metadata = {"type": "claude-snapshot", "date": first_date,
+                "status": "auto-logged", "project": context.canonical_project_root.name,
+                "session_id": context.native_session_id,
                 "agent_provider": context.host, "agent_session_id": context.native_session_id,
                 "source_session": context.native_session_id,
                 "parent_session": "[[" + note.stem + "]]", "source_revision": revision,
+                "capture_revision": revision,
                 "trigger": trigger, "tags": ["claude/snapshot"]}
     from note_transactions import _render
     document = _render("", {"metadata": json.dumps(metadata), "capture": body})
@@ -440,7 +443,8 @@ def capture_checkpoint(context, event, deadline):
                                             (scope,)).fetchall()
                 messages = connection.execute("SELECT COUNT(*) FROM native_events WHERE scope=? AND role='user'",
                                               (scope,)).fetchone()[0]
-                selected_note = Path(row[3]) if row and row[3] else None
+                retained_note = bool(row and row[3])
+                selected_note = Path(row[3]) if retained_note else None
                 if event.note_path is not None:
                     if selected_note is not None and selected_note.resolve() != event.note_path.resolve():
                         connection.rollback()
@@ -476,7 +480,10 @@ def capture_checkpoint(context, event, deadline):
                 connection.execute("INSERT OR IGNORE INTO source_owners VALUES (?,?)", (scope, context.host))
                 connection.commit()
                 _fault("after_source_retention")
-                if not messages or messages < threshold or too_short or selected_note is None:
+                # Thresholds decide whether to start a note. Once retained,
+                # that note must receive later facts and lifecycle changes.
+                if selected_note is None or (not retained_note and
+                        (not messages or messages < threshold or too_short)):
                     return CaptureResult("complete" if batch.status == "ok" else "pending",
                                          loss_of_input=batch.loss_of_input, warnings=batch.warnings)
                 if time.monotonic() >= deadline:
@@ -486,6 +493,7 @@ def capture_checkpoint(context, event, deadline):
                             "capture_state": state, "capture_completeness": completeness}
                 if not selected_note.exists():
                     metadata.update({"type": "claude-session", "date": first_date,
+                                      "status": "auto-logged",
                                      "project": context.canonical_project_root.name,
                                      "session_id": context.native_session_id,
                                      "tags": ["claude/session"]})

@@ -10,22 +10,25 @@ from session_lookup import find_existing_session, SessionLookupPending
 
 
 @pytest.fixture
-def lookup(tmp_path):
-    vault = tmp_path / 'vault'
+def lookup(selected_host_context):
+    vault = selected_host_context.vault_path
     (vault / 'claude-sessions').mkdir(parents=True)
-    database = tmp_path / 'index.sqlite3'
+    database = selected_host_context.index_path
+    database.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute('CREATE TABLE notes(path TEXT PRIMARY KEY,type TEXT)')
-    context = SimpleNamespace(host='claude', native_session_id='full-native-id',
+    context = SimpleNamespace(host=selected_host_context.host, native_session_id='full-native-id',
                               vault_path=vault, index_path=database, config={})
-    suffix = hashlib.sha256(context.native_session_id.encode()).hexdigest()[:4]
+    suffix = (hashlib.sha256(context.native_session_id.encode()).hexdigest()[:4]
+              if context.host == 'claude' else context.host + '-' +
+              hashlib.sha256((context.host + '\0' + context.native_session_id).encode()).hexdigest()[:16])
 
     def add(name, identity='full-native-id', provider=None, root=None):
         path = (root or vault / 'claude-sessions') / (name + '-' + suffix + '.md')
         path.parent.mkdir(parents=True, exist_ok=True)
         fields = '---\ntype: claude-session\nstatus: auto-logged\nsession_id: ' + identity + '\n'
-        if provider:
-            fields += 'agent_provider: ' + provider + '\n'
+        if provider or context.host == 'codex':
+            fields += 'agent_provider: ' + (provider or context.host) + '\n'
         path.write_text(fields + '---\nOriginal incomplete legacy note\n')
         with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute('INSERT INTO notes VALUES (?,?)', (str(path), 'claude-session'))
@@ -47,9 +50,10 @@ def test_short_hash_collision_never_adopts_wrong_identity(lookup):
 
 def test_cross_host_same_native_id_excluded(lookup):
     context, add = lookup
-    add('codex', provider='codex')
+    foreign = 'codex' if context.host == 'claude' else 'claude'
+    add('foreign', provider=foreign)
     assert find_existing_session(context, time.monotonic() + 1) is None
-    context.host = 'codex'
+    context.host = foreign
     assert find_existing_session(context, time.monotonic() + 1) is None
 
 
@@ -127,7 +131,7 @@ def test_duplicate_identity_fields_remain_pending(lookup):
 def test_explicit_agent_identity_is_verified(lookup):
     context, add = lookup
     path = add('agent-fields', identity='legacy-id')
-    path.write_text('---\ntype: claude-session\nsession_id: legacy-id\nagent_provider: "claude"\nagent_session_id: "full-native-id"\n---\n')
+    path.write_text('---\ntype: claude-session\nsession_id: legacy-id\nagent_provider: "' + context.host + '"\nagent_session_id: "full-native-id"\n---\n')
     assert find_existing_session(context, time.monotonic() + 1) == path
 
 

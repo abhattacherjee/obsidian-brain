@@ -1,409 +1,104 @@
-"""End-to-end integration test for the snapshot → /recall pipeline (issue #50).
-
-Exercises the full 5-step cycle with real hook subprocess invocations and
-in-process obsidian_utils calls. CI-required.
-
-Pipeline:
-    1. obsidian_context_snapshot.py (subprocess) → snapshot note on disk
-    2. obsidian_session_log.py     (subprocess) → session note with `snapshots:` back-ref
-    3. find_unsummarized_notes()   (in-proc)   → [snapshot, session] in bias-sorted order
-    4. upgrade_unsummarized_note() (in-proc, Haiku monkeypatched) → status: summarized
-       (exercised for BOTH session and snapshot to cover the generate_summary
-       vs generate_snapshot_summary dispatch in upgrade_unsummarized_note)
-    5. build_context_brief()       (in-proc)   → nested `↳ HH:MM:SS` row + snapshot_count: 1
-"""
-
-from __future__ import annotations
-
+"""Real native child capture feeds the invoking host's recall summary pipeline."""
 import json
 import os
-import re
+from pathlib import Path
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
+import ai_backend
+import obsidian_utils
+from runtime_context import resolve_runtime_context, using_runtime_context
 
-import obsidian_utils  # conftest.py inserts hooks/ onto sys.path
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-HOOK_SNAPSHOT = REPO_ROOT / "hooks" / "obsidian_context_snapshot.py"
-HOOK_SESSION_LOG = REPO_ROOT / "hooks" / "obsidian_session_log.py"
-
-SID = "e2e-test-session-12345"
-PROJECT = "fake-cwd"
-SLUG = "fake-cwd"
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def _write_config(home_dir: Path, vault_path: Path) -> Path:
-    """Write obsidian-brain-config.json pointing at the tmp vault."""
-    cfg_dir = home_dir / ".claude"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    cfg = {
-        "vault_path": str(vault_path),
-        "sessions_folder": "claude-sessions",
-        "insights_folder": "claude-insights",
-        "auto_log_enabled": True,
-        "snapshot_on_compact": True,
-        "snapshot_on_clear": True,
-        "min_messages": 0,
-        "min_duration_minutes": 0,
-        "summary_model": "haiku",
-    }
-    cfg_path = cfg_dir / "obsidian-brain-config.json"
-    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
-    cfg_path.chmod(0o600)
-    return cfg_path
+@pytest.fixture
+def selected_host_context(selected_host_context, host):
+    original = selected_host_context
+    directory = original.native_home / ('projects' if host == 'claude' else 'sessions') / 'synthetic'
+    directory.mkdir(parents=True)
+    source = directory / 'synthetic.jsonl'
+    messages = [('user', 'Capture the first synthetic fact.'),
+                ('assistant', 'Synthetic response.'),
+                ('user', 'Capture the second synthetic fact.'),
+                ('user', 'Keep all synthetic facts.')]
+    rows = []
+    if host == 'codex':
+        rows.append({'type': 'session_meta', 'payload': {'id': original.native_session_id}})
+    for index, (role, text) in enumerate(messages):
+        if host == 'claude':
+            rows.append({'type': role, 'sessionId': original.native_session_id,
+                         'uuid': 'synthetic-message-' + str(index),
+                         'message': {'role': role, 'content': text}})
+        else:
+            rows.append({'type': 'response_item', 'payload': {'type': 'message',
+                'id': 'synthetic-message-' + str(index), 'role': role,
+                'content': [{'type': 'input_text' if role == 'user' else 'output_text', 'text': text}],
+                'internal_chat_message_metadata_passthrough': {'turn_id': 'synthetic-turn'}}})
+    source.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    selected = resolve_runtime_context(host, original.client,
+        {'session_id': original.native_session_id, 'cwd': str(original.worktree),
+         'transcript_path': str(source)},
+        {'config_path': original.config_path, 'resource_root': ROOT,
+         'index_path': original.index_path, 'state_path': original.state_path})
+    with using_runtime_context(selected):
+        yield selected
 
 
-def _write_transcript(home_dir: Path, slug: str, session_id: str) -> Path:
-    """Write a 3-line JSONL transcript fixture under ~/.claude/projects/<slug>/.
-
-    Filename is `{session_id}.jsonl` so that `find_transcript_jsonl()` (which
-    globs for `{session_id}.jsonl` under `~/.claude/projects/**/`) discovers
-    the fixture and `upgrade_unsummarized_note()` exercises the JSONL source
-    branch instead of falling through to the raw-note fallback.
-    """
-    proj_dir = home_dir / ".claude" / "projects" / slug
-    proj_dir.mkdir(parents=True, exist_ok=True)
-    transcript = proj_dir / f"{session_id}.jsonl"
-    lines = [
-        {"type": "user", "message": {"content": "Fix the snapshot pipeline."}},
-        {"type": "assistant", "message": {"content": "Writing the test now."}},
-        {"type": "user", "message": {"content": "Looks good — ship it."}},
-    ]
-    transcript.write_text(
-        "\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8"
-    )
-    return transcript
-
-
-def _write_path_shim(bin_dir: Path) -> Path:
-    """Write a `claude` PATH shim emitting a canned summary on any call.
-
-    Defense-in-depth for **hook subprocesses**: neither production hook calls
-    `claude -p` (summarization is deferred to /recall), so this shim is never
-    hit in the hot path — but if a hook ever regresses to shelling out, this
-    keeps the subprocess leg hermetic. In-process `claude -p` calls made by
-    obsidian_utils (e.g. inside `upgrade_unsummarized_note`) are intercepted
-    separately by the monkeypatch on `obsidian_utils.subprocess.run` installed
-    in Stage 4 — not by this shim.
-    """
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    shim = bin_dir / "claude"
-    shim.write_text(
-        "#!/usr/bin/env bash\n"
-        "cat <<'EOF'\n"
-        "## Summary\n"
-        "Canned E2E summary from PATH shim.\n"
-        "\n"
-        "## Key Decisions\n"
-        "- None noted.\n"
-        "\n"
-        "## Changes Made\n"
-        "- None noted.\n"
-        "\n"
-        "## Errors Encountered\n"
-        "- None.\n"
-        "\n"
-        "## Open Questions / Next Steps\n"
-        "- None.\n"
-        "\n"
-        "IMPORTANCE: 5\n"
-        "EOF\n",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    return shim
-
-
-def _hook_env(tmp_path: Path) -> dict:
-    """Env dict for subprocess hook invocations.
-
-    Sandboxes HOME (config lookups, `~/.claude/projects/` transcript search,
-    default vault DB path all route into `tmp_path/home`), prepends the
-    `tmp_path/bin` PATH shim, and sets PYTHONPATH so the hook can import the
-    in-tree `obsidian_utils`.
-    """
-    env = os.environ.copy()
-    env["HOME"] = str(tmp_path / "home")
-    env["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{env.get('PATH', '')}"
-    env["PYTHONPATH"] = f"{REPO_ROOT / 'hooks'}{os.pathsep}{env.get('PYTHONPATH', '')}"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    return env
-
-
-def test_snapshot_e2e_pipeline(tmp_path, monkeypatch, native_ai_frontend):
-    """Fire both hooks, then walk the in-process pipeline, asserting at every boundary."""
-
-    # --- Stage 0: fixtures ---
-    vault = tmp_path / "vault"
-    sessions_dir = vault / "claude-sessions"
-    insights_dir = vault / "claude-insights"
-    sessions_dir.mkdir(parents=True)
-    insights_dir.mkdir(parents=True)
-
-    home = tmp_path / "home"
-    _write_config(home, vault)
-    transcript = _write_transcript(home, SLUG, SID)
-    _write_path_shim(tmp_path / "bin")
-
-    # Redirect HOME for in-process calls so any indirect Path.home() lookup
-    # (e.g. default ensure_index db path) resolves into the sandbox.
-    monkeypatch.setenv("HOME", str(home))
-
-    # --- Stage 1: fire the snapshot hook ---
-    snapshot_payload = {
-        "session_id": SID,
-        "cwd": str(tmp_path / "fake-cwd"),
-        "transcript_path": str(transcript),
-        "source": "compact",
-    }
-    proc = subprocess.run(
-        [sys.executable, str(HOOK_SNAPSHOT)],
-        input=json.dumps(snapshot_payload),
-        env=_hook_env(tmp_path),
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    if proc.returncode != 0:
-        pytest.fail(f"snapshot hook exit={proc.returncode}\nstderr:\n{proc.stderr}")
-
-    snapshot_files = sorted(sessions_dir.glob("*-snapshot-*.md"))
-    assert len(snapshot_files) == 1, (
-        f"expected exactly 1 snapshot file, got {len(snapshot_files)}: "
-        f"{[f.name for f in snapshot_files]}\nhook stderr:\n{proc.stderr}"
-    )
-    snapshot_path = snapshot_files[0]
-
-    snapshot_text = snapshot_path.read_text(encoding="utf-8")
-    assert "type: claude-snapshot" in snapshot_text
-    assert f"session_id: {SID}" in snapshot_text
-    assert f"project: {PROJECT}" in snapshot_text
-    assert "status: auto-logged" in snapshot_text
-    assert "trigger: compact" in snapshot_text
-    assert "# Context Snapshot:" in snapshot_text
-
-    # --- Stage 2: fire the session-log hook ---
-    session_payload = {
-        "session_id": SID,
-        "cwd": str(tmp_path / "fake-cwd"),
-        "transcript_path": str(transcript),
-    }
-    proc = subprocess.run(
-        [sys.executable, str(HOOK_SESSION_LOG)],
-        input=json.dumps(session_payload),
-        env=_hook_env(tmp_path),
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    if proc.returncode != 0:
-        pytest.fail(f"session-log hook exit={proc.returncode}\nstderr:\n{proc.stderr}")
-
-    session_files = [
-        f for f in sessions_dir.glob("*.md")
-        if "-snapshot-" not in f.name
-    ]
-    assert len(session_files) == 1, (
-        f"expected exactly 1 session file, got {len(session_files)}: "
-        f"{[f.name for f in session_files]}\nhook stderr:\n{proc.stderr}"
-    )
-    session_path = session_files[0]
-
-    session_text = session_path.read_text(encoding="utf-8")
-    assert "type: claude-session" in session_text
-    assert f"session_id: {SID}" in session_text
-    assert "status: auto-logged" in session_text
-
-    # Back-reference check: the snapshot wikilink must live INSIDE the
-    # session note's frontmatter `snapshots:` YAML list — not merely somewhere
-    # in the body (which would slip past if, e.g., the wikilink leaked into a
-    # rendered summary while the YAML list was silently emptied).
-    fm_end = session_text.index("\n---", 3)
-    frontmatter = session_text[:fm_end]
-    snapshot_stem = snapshot_path.stem
-    assert re.search(r"^snapshots:", frontmatter, re.MULTILINE), (
-        "session note frontmatter missing `snapshots:` YAML key"
-    )
-    # Producer format at hooks/obsidian_session_log.py:97-98 is
-    # `  - "[[<stem>]]"` (two-space indent, hyphen, quoted wikilink).
-    assert f'  - "[[{snapshot_stem}]]"' in frontmatter, (
-        f'expected `  - "[[{snapshot_stem}]]"` under `snapshots:` in '
-        f"frontmatter:\n{frontmatter}"
-    )
-
-    # --- Stage 3: find_unsummarized_notes returns both session + snapshot ---
-    result = json.loads(
-        obsidian_utils.find_unsummarized_notes(
-            str(vault), "claude-sessions", PROJECT
-        )
-    )
-    assert result["auto_fixed"] == 0, (
-        f"unexpected auto-fix on fresh notes: {result}"
-    )
-    # Order is load-bearing for /recall cohesion: snapshots must sort before
-    # their parent session within the same session_id group so /recall
-    # presents chronologically correct context. find_unsummarized_notes
-    # enforces that via an explicit type-bias key (see obsidian_utils.py
-    # `_bias_key` at lines 1682-1699 — snapshots get rank 0, sessions rank 1
-    # within a session_id group), NOT via a reverse-lexicographic filename
-    # trick on the outer sort.
-    assert result["unsummarized"] == [str(snapshot_path), str(session_path)], (
-        f"expected [snapshot, session] order, got: {result['unsummarized']}"
-    )
-
-    # --- Stage 4: upgrade_unsummarized_note (Haiku monkeypatched) ---
-    CANNED_SUMMARY = (
-        "## Summary\n"
-        "E2E test session exercising the snapshot integration pipeline.\n"
-        "\n"
-        "## Key Decisions\n"
-        "- None noted.\n"
-        "\n"
-        "## Changes Made\n"
-        "- None noted.\n"
-        "\n"
-        "## Errors Encountered\n"
-        "- None.\n"
-        "\n"
-        "## Open Questions / Next Steps\n"
-        "- None.\n"
-        "\n"
-        "IMPORTANCE: 5\n"
-    )
-    _real_run = subprocess.run
-
-    def fake_run(cmd, *args, **kwargs):
-        # Intercept `claude -p ...`; delegate everything else.
-        if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 \
-                and cmd[0] == "claude" and cmd[1] == "-p":
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=CANNED_SUMMARY, stderr=""
-            )
-        return _real_run(cmd, *args, **kwargs)
-
-    import native_ai_test_adapter
-    monkeypatch.setattr(native_ai_test_adapter, "run", fake_run)
-
-    from dataclasses import replace
-    from runtime_context import using_runtime_context
-    from types import MappingProxyType
-    context = replace(native_ai_frontend, vault_path=vault,
-                      config_path=home / '.claude' / 'obsidian-brain-config.json',
-                      config=MappingProxyType(json.loads((home / '.claude' / 'obsidian-brain-config.json').read_text())),
-                      index_path=home / '.claude' / 'obsidian-brain-vault.db',
-                      state_path=tmp_path / 'native-state')
-    with using_runtime_context(context):
-        _status_tuple = obsidian_utils.upgrade_unsummarized_note(
-            str(session_path), str(vault), "claude-sessions", PROJECT
-        )
-        status = _status_tuple[0]
-        assert status.startswith("Upgraded "), (
-            f"upgrade_unsummarized_note did not succeed: {status!r}"
-        )
-
-        session_text_after = session_path.read_text(encoding="utf-8")
-        assert ("status: summarized" in session_text_after or 'status: "summarized"' in session_text_after), (
-            f"expected status: summarized after upgrade, got:\n{session_text_after[:2000]}"
-        )
-        # Summary body present (find the section header and at least one char of content).
-        summary_match = re.search(
-            r"^## Summary\n(.+?)(?=\n^## |\Z)",
-            session_text_after,
-            re.MULTILINE | re.DOTALL,
-        )
-        assert summary_match and summary_match.group(1).strip(), (
-            "expected non-empty `## Summary` section after upgrade"
-        )
-
-        # Also upgrade the SNAPSHOT note. upgrade_unsummarized_note dispatches
-        # snapshots through generate_snapshot_summary (a distinct code path from
-        # the generate_summary used for sessions above). Without this, the
-        # snapshot-type routing branch is never exercised by the E2E test.
-        _snap_status_tuple = obsidian_utils.upgrade_unsummarized_note(
-            str(snapshot_path), str(vault), "claude-sessions", PROJECT
-        )
-        snap_status = _snap_status_tuple[0]
-        assert snap_status.startswith("Upgraded "), (
-            f"upgrade_unsummarized_note on snapshot did not succeed: {snap_status!r}"
-        )
-        snapshot_text_after = snapshot_path.read_text(encoding="utf-8")
-        assert ("status: summarized" in snapshot_text_after or 'status: "summarized"' in snapshot_text_after), (
-            f"expected snapshot `status: summarized` after upgrade, got:\n"
-            f"{snapshot_text_after[:2000]}"
-        )
-
-        # --- Stage 5: build_context_brief nested row + snapshot_count ---
-        brief = obsidian_utils.build_context_brief(
-            str(vault), "claude-sessions", "claude-insights", PROJECT,
-            hook_status_line="[OK] test",
-        )
-
-        # Parse delimited sections.
-        def _section(label: str) -> str:
-            m = re.search(
-                rf"<<<{label}>>>\n(.*?)(?=\n<<<[A-Z_]+>>>|\Z)",
-                brief,
-                re.DOTALL,
-            )
-            assert m, f"missing section <<<{label}>>> in brief:\n{brief[:2000]}"
-            return m.group(1)
-
-        context_brief_section = _section("OB_CONTEXT_BRIEF")
-        load_manifest_section = _section("OB_LOAD_MANIFEST")
-        most_recent_path = _section("OB_MOST_RECENT_SESSION_PATH").strip()
-
-        # Extract the 6-digit HHMMSS tail from our snapshot's stem. The same
-        # value is used both (a) to match the nested `↳ HH:MM:SS` row in the
-        # context-brief table and (b) to match the `snapshot: [HHMMSS]` line in
-        # LOAD_MANIFEST. Tying both assertions to the SAME stem-derived value
-        # catches cross-session contamination that a shape-only regex would miss.
-        stem_hhmmss_match = re.search(r"-snapshot-(\d{6})$", snapshot_path.stem)
-        assert stem_hhmmss_match, (
-            f"snapshot stem missing trailing -snapshot-HHMMSS: {snapshot_path.stem}"
-        )
-        hhmmss = stem_hhmmss_match.group(1)  # e.g. "075610"
-        hhmmss_pretty = f"{hhmmss[:2]}:{hhmmss[2:4]}:{hhmmss[4:6]}"  # "07:56:10"
-
-        # Cross-midnight: build_context_brief() looks up snapshots via
-        # fetch_snapshot_summaries(), which discovers date-agnostically from the
-        # shared snapshot index (#70). If Stage 1 (snapshot hook) and Stage 2
-        # (session-log hook) straddle a calendar day boundary the two files get
-        # different date prefixes, and the snapshot must STILL be found — that is
-        # the whole point of the fix, so these assertions are unconditional. They
-        # used to be guarded by `if snapshot_date_prefix == session_date_prefix`,
-        # with a degraded "the file still exists on disk" branch for the straddle
-        # case; that branch encoded the defect and would have gone on passing
-        # after it was fixed. The straddle window is ~100 ms per year, so the
-        # guard also almost never ran — a mutation that reintroduced the dated
-        # glob would not have been caught here either way.
-        assert f"↳ {hhmmss_pretty}" in context_brief_section, (
-            f"expected nested snapshot row `↳ {hhmmss_pretty}` in context brief "
-            f"(snapshot_date={snapshot_path.stem[:10]}, "
-            f"session_date={session_path.stem[:10]}):\n"
-            f"{context_brief_section[:2000]}"
-        )
-
-        assert re.search(
-            r"^snapshot_count:\s*1\b", load_manifest_section, re.MULTILINE
-        ), (
-            f"expected `snapshot_count: 1` in LOAD_MANIFEST:\n{load_manifest_section}"
-        )
-
-        # Producer emits `snapshot: [{hhmmss}] ({trigger}) {summary}` in
-        # build_context_brief's LOAD_MANIFEST composition — the full filename stem
-        # never appears on the line, only the HHMMSS tail. Match on that substring.
-        assert re.search(
-            rf"^snapshot:\s*\[{hhmmss}\]",
-            load_manifest_section,
-            re.MULTILINE,
-        ), (
-            f"expected `snapshot: [{hhmmss}]` line in LOAD_MANIFEST "
-            f"(stem={snapshot_path.stem}):\n{load_manifest_section}"
-        )
-
-        assert most_recent_path == str(session_path), (
-            f"expected MOST_RECENT_SESSION_PATH={session_path}, got={most_recent_path}"
-        )
+def test_snapshot_e2e_pipeline(selected_host_context, monkeypatch):
+    context = selected_host_context
+    before_source = context.transcript_path.read_bytes()
+    def child(event):
+        command = [sys.executable, str(ROOT / 'hooks' / 'brain_cli.py'),
+            '--host', context.host, '--client', context.client, '--event', event,
+            '--config', str(context.config_path), '--resource-root', str(context.resource_root),
+            '--index', str(context.index_path), '--state', str(context.state_path), 'hook']
+        result = subprocess.run(command, input=json.dumps({
+            'session_id': context.native_session_id, 'cwd': str(context.worktree),
+            'transcript_path': str(context.transcript_path), 'trigger': 'manual'}),
+            env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-inherited-id',
+                     CODEX_THREAD_ID='foreign-inherited-thread'),
+            cwd=context.worktree, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ''
+    child('pre_compact')
+    child('session_end')
+    snapshots = list(context.vault_path.rglob('*snapshot*.md'))
+    sessions = [path for path in context.vault_path.rglob('*.md') if path not in snapshots]
+    assert len(snapshots) == len(sessions) == 1
+    snapshot, session = snapshots[0], sessions[0]
+    for path in (snapshot, session):
+        content = path.read_text()
+        assert obsidian_utils.parse_frontmatter_field(content, 'agent_provider') == context.host
+        assert obsidian_utils.parse_frontmatter_field(content, 'agent_session_id') == context.native_session_id
+        assert obsidian_utils.parse_frontmatter_field(content, 'project') == context.canonical_project_root.name
+        assert 'Keep all synthetic facts.' in content
+        assert 'foreign-inherited' not in content
+    assert obsidian_utils.parse_frontmatter_field(snapshot.read_text(), 'parent_session') == '[[' + session.stem + ']]'
+    queue = json.loads(obsidian_utils.find_unsummarized_notes(str(context.vault_path), 'claude-sessions',
+                                                 context.canonical_project_root.name))
+    assert set(queue['unsummarized']) == {str(snapshot), str(session)}
+    seen = []
+    summary = ('## Summary\nNative pipeline summary.\n\n## Key Decisions\n- Kept facts.\n\n'
+               '## Changes Made\n- Synthetic test.\n\n## Errors Encountered\nNone.\n\n'
+               '## Open Questions / Next Steps\nNone.\n\nIMPORTANCE: 5\n')
+    def execute(ctx, operation, request):
+        assert ctx is context
+        seen.append(operation)
+        return ai_backend.AIResult('ok', summary, request.input_revision,
+                                   backend=context.host, model='actual-synthetic-model')
+    monkeypatch.setattr(ai_backend, 'execute_ai', execute)
+    for path in (snapshot, session):
+        status = obsidian_utils.upgrade_unsummarized_note(str(path), str(context.vault_path),
+                            'claude-sessions', context.canonical_project_root.name)[0]
+        assert status.startswith('Upgraded '), status
+        fields = path.read_text()
+        assert obsidian_utils.parse_frontmatter_field(fields, 'status') == 'summarized'
+        assert obsidian_utils.parse_frontmatter_field(fields, 'summary_revision') == obsidian_utils.parse_frontmatter_field(fields, 'capture_revision')
+        assert 'Keep all synthetic facts.' in fields
+    assert sorted(seen) == ['session_summary', 'snapshot_summary']
+    brief = obsidian_utils.build_context_brief(str(context.vault_path), 'claude-sessions',
+                        'claude-insights', context.canonical_project_root.name)
+    assert 'Native pipeline summary.' in brief
+    assert context.transcript_path.read_bytes() == before_source

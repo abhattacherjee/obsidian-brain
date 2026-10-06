@@ -7,18 +7,45 @@ import time
 
 import pytest
 from runtime_context import RuntimeContext, using_runtime_context
-from test_runtime_context import runtime_case
+from test_runtime_context import runtime_case, runtime_case_data
+
+
+def test_native_publication_failure_retains_checkpoint_and_reports_deferral(selected_host_context, monkeypatch, capsys):
+    from dataclasses import replace
+    from types import MappingProxyType
+    import capture
+    import native_lifecycle
+    import note_transactions
+    import transcripts
+    selected = replace(selected_host_context, config=MappingProxyType(
+        dict(selected_host_context.config, min_messages=1, min_duration_minutes=0)))
+    records = (transcripts.SourceRecord('synthetic-fact', 'user', 'Retained synthetic fact.', 0),)
+    monkeypatch.setattr(transcripts, 'read_records', lambda ctx, cursor, deadline:
+        transcripts.TranscriptBatch('ok', records, 'synthetic-generation', 100,
+            metadata={'native_session_id': ctx.native_session_id},
+            source_identity='synthetic-source', source_complete=True, source_size=100))
+    def disk_full(*args, **kwargs):
+        raise OSError(28, 'No space left on device')
+    monkeypatch.setattr(capture, 'apply_mutations', disk_full)
+    assert native_lifecycle.dispatch(selected, 'session_end', {}, time.monotonic()) is None
+    assert capsys.readouterr().err == '[obsidian-brain] capture failed: OSError\n'
+    connection = note_transactions.connect_coordination(selected)
+    try:
+        assert connection.execute('SELECT COUNT(*) FROM capture_events WHERE scope=?',
+                                  (selected.session_key,)).fetchone()[0] == 1
+        assert connection.execute('SELECT phase FROM checkpoints WHERE scope=?',
+                                  (selected.session_key,)).fetchone()[0] == 'ready'
+        assert connection.execute('SELECT COUNT(*) FROM cursors WHERE scope=?',
+                                  (selected.session_key,)).fetchone()[0] == 0
+    finally:
+        connection.close()
+    assert list(selected.vault_path.rglob('*.md')) == []
 
 
 @pytest.fixture
-def context(tmp_path):
-    project = tmp_path / "project"
-    project.mkdir()
-    vault = tmp_path / "vault"
-    vault.mkdir()
-    return RuntimeContext("codex", "codex-cli", "native-id", project, project, None, vault,
-                          tmp_path / "config.json", MappingProxyType({}), project,
-                          tmp_path / "index.sqlite3", tmp_path / "state")
+def context(selected_host_context):
+    selected_host_context.index_path.parent.mkdir(parents=True, exist_ok=True)
+    yield selected_host_context
 
 
 @pytest.fixture
@@ -125,30 +152,42 @@ def test_native_reaper_uses_registered_sources_without_active_finalization(conte
     assert out.status == "complete"
 
 
-def test_native_wrapper_replays_real_codex_fixture_in_disposable_vault(runtime_case):
+def test_explicit_native_cli_replays_real_fixture_in_disposable_vault(selected_host_context):
     import subprocess
     import sys
-    case = runtime_case
+    context = selected_host_context
     root = Path(__file__).resolve().parents[1]
-    fixture = root / "tests/fixtures/hosts/codex-cli-0.159.0-alpha.12.1-original.jsonl"
-    native_id = json.loads(fixture.read_text().splitlines()[0])["payload"]["id"]
-    source = case["codex_home"] / "sessions" / "fixture.jsonl"
-    source.parent.mkdir()
-    source.write_bytes(fixture.read_bytes())
-    case["config_path"].write_text(json.dumps({"vault_path": str(case["vault"]), "min_messages": 1, "min_duration_minutes": 0}))
-    command = [sys.executable, str(root / ".codex/hooks/lifecycle.py"),
-               "--host", "codex", "--client", "codex-cli", "--event", "session_end",
-               "--config", str(case["config_path"]), "--resource-root", str(case["resource_root"]),
-               "--index", str(case["home"] / "index.sqlite3"), "--state", str(case["home"] / "state")]
+    fixture = (root / "tests/fixtures/hosts/codex-cli-0.159.0-alpha.12.1-original.jsonl"
+               if context.host == 'codex' else root / 'tests/fixtures/dropped-sessions/d2cc7e46-long-617min-full.jsonl')
+    native_id = context.native_session_id
+    rows = [json.loads(line) for line in fixture.read_text().splitlines()]
+    for row in rows:
+        if context.host == 'codex' and row.get('type') == 'session_meta':
+            row['payload']['id'] = native_id
+            if 'session_id' in row['payload']:
+                row['payload']['session_id'] = native_id
+        elif context.host == 'codex' and isinstance(row.get('payload'), dict):
+            if 'thread_id' in row['payload']:
+                row['payload']['thread_id'] = native_id
+        elif context.host == 'claude' and 'sessionId' in row:
+            row['sessionId'] = native_id
+    source = context.native_home / ('sessions' if context.host == 'codex' else 'projects') / "fixture.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    context.config_path.write_text(json.dumps({"vault_path": str(context.vault_path), "min_messages": 1, "min_duration_minutes": 0}))
+    command = [sys.executable, str(root / "hooks/brain_cli.py"),
+               "--host", context.host, "--client", context.client, "--event", "session_end",
+               "--config", str(context.config_path), "--resource-root", str(context.resource_root),
+               "--index", str(context.index_path), "--state", str(context.state_path), 'hook']
     result = subprocess.run(command, input=json.dumps({"session_id": native_id,
-                             "cwd": str(case["worktree"]), "transcript_path": str(source)}),
+                             "cwd": str(context.worktree), "transcript_path": str(source)}),
                             text=True, capture_output=True, timeout=5)
     assert result.returncode == 0, result.stderr
     assert not result.stdout
-    notes = list(case["vault"].rglob("*.md"))
+    notes = list(context.vault_path.rglob("*.md"))
     assert len(notes) == 1, result.stderr
     text = notes[0].read_text()
-    assert 'agent_provider: "codex"' in text
+    assert 'agent_provider: "' + context.host + '"' in text
     assert 'capture_state: "ended"' in text
     assert native_id in text
 
@@ -161,7 +200,7 @@ def test_native_wrapper_argument_errors_fail_open():
                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
     assert result.returncode == 0
     assert not result.stdout
-    assert "--client" in result.stderr
+    assert "native client identity is unavailable" in result.stderr
 
 
 @pytest.mark.parametrize("status,pending,loss", [("pending", 1, False), ("complete", 0, True)])
@@ -215,15 +254,21 @@ def test_turn_specific_retro_sentinel_does_not_block_another_turn(context, captu
     assert dispatch(context, "stop", {"turn_id": "turn-one"}, time.monotonic())["decision"] == "block"
 
 
-def test_same_native_id_in_two_hosts_has_independent_retro_decisions(context, capture_calls):
+def test_same_native_id_in_two_hosts_has_independent_retro_decisions(context, capture_calls, host_identity_scenario):
     from dataclasses import replace
     from native_lifecycle import dispatch
     import obsidian_utils
-    other = replace(context, host="claude", client="claude-code")
-    for current in (context, other):
-        with using_runtime_context(current):
-            obsidian_utils.mark_retro_classification_pending(current.native_session_id, "retro.md")
-        assert dispatch(current, "stop", {"turn_id": "same-turn"}, time.monotonic())["decision"] == "block"
+    other_host = 'codex' if context.host == 'claude' else 'claude'
+    other = replace(context, host=other_host,
+                    client='codex-cli' if other_host == 'codex' else 'claude-code')
+    host_identity_scenario.register(context, other)
+    with using_runtime_context(other):
+        obsidian_utils.mark_retro_classification_pending(other.native_session_id, "retro.md")
+    assert dispatch(context, "stop", {"turn_id": "same-turn"}, time.monotonic()) is None
+    obsidian_utils.mark_retro_classification_pending(context.native_session_id, "retro.md")
+    assert dispatch(context, "stop", {"turn_id": "same-turn"}, time.monotonic())["decision"] == "block"
+    with using_runtime_context(other):
+        assert obsidian_utils.get_retro_classification_pending(other.native_session_id) is not None
 
 
 @pytest.mark.parametrize("boundary", ["vault", "project"])
@@ -261,14 +306,15 @@ def test_precompact_forwards_native_trigger(context, capture_calls, monkeypatch,
     assert seen[0]["trigger"] == trigger
 
 
-def test_recover_cli_serializes_capture_result_and_uses_active_fact_recovery(runtime_case, capture_calls):
+def test_recover_cli_serializes_capture_result_and_uses_active_fact_recovery(context, capture_calls):
     import io
     import brain_cli
     output = io.StringIO()
-    case = runtime_case
-    code = brain_cli.main(["--host", "codex", "--client", "codex-cli", "--session-id", "native",
-                           "--cwd", str(case["worktree"]), "--config", str(case["config_path"]),
-                           "--resource-root", str(case["resource_root"]), "recover"],
+    code = brain_cli.main(["--host", context.host, "--client", context.client,
+                           "--session-id", context.native_session_id,
+                           "--cwd", str(context.worktree), "--config", str(context.config_path),
+                           "--resource-root", str(context.resource_root),
+                           "--index", str(context.index_path), "--state", str(context.state_path), "recover"],
                           stdin=io.StringIO("{}"), stdout=output)
     assert code == 0
     result = json.loads(output.getvalue())

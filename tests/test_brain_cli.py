@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from test_runtime_context import runtime_case
+from test_runtime_context import runtime_case, runtime_case_data, selected_host_context
 
 
 def invoke(case, input_text, *options):
@@ -17,7 +17,7 @@ def invoke(case, input_text, *options):
     output = io.StringIO()
     errors = io.StringIO()
     code = module.main([
-        "--host", "codex", "--client", "codex-cli",
+        "--host", case["host"], "--client", "codex-cli" if case["host"] == "codex" else "claude-code",
         "--config", str(case["config_path"]), "--resource-root", str(case["resource_root"]),
         *options, "context",
     ], stdin=io.StringIO(input_text), stdout=output, stderr=errors)
@@ -32,7 +32,7 @@ def test_context_command_uses_native_payload_and_explicit_paths(runtime_case):
     assert code == 0 and not errors
     resolved = json.loads(output)
     assert resolved["native_session_id"] == "native-cli-thread"
-    assert resolved["host"] == "codex"
+    assert resolved["host"] == case["host"]
     assert resolved["vault_path"] == str(case["vault"])
 
 
@@ -55,7 +55,7 @@ def test_cli_session_override_wins_over_payload(runtime_case):
 
 def test_native_process_rejects_excessive_json_nesting(runtime_case):
     script = Path(__file__).resolve().parents[1] / "hooks" / "brain_cli.py"
-    result = subprocess.run([sys.executable, str(script), "--host", "codex", "--client", "codex-cli", "context"],
+    result = subprocess.run([sys.executable, str(script), "--host", runtime_case["host"], "--client", "codex-cli" if runtime_case["host"] == "codex" else "claude-code", "context"],
                             input="[" * 2000 + "]" * 2000, text=True, capture_output=True,
                             cwd=runtime_case["worktree"], timeout=5)
     assert result.returncode == 2

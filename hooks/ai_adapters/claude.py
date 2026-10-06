@@ -6,6 +6,9 @@ import re
 
 def execute(context, prompt, schema, model, deadline, env):
     from ai_backend import _BackendFailure, _failure_status, _json, _run_bounded
+    if context.native_home is None:
+        raise _BackendFailure("unavailable", "native_home_missing")
+    env = dict(env, CLAUDE_CONFIG_DIR=str(context.native_home))
     binary = context.config.get("claude_executable", "claude")
     if not isinstance(binary, str) or not binary:
         raise _BackendFailure("unavailable", "native_executable_invalid")

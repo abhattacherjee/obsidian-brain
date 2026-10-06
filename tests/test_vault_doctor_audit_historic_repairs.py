@@ -447,9 +447,9 @@ def test_cli_end_to_end_scan_apply_rescan(tmp_path):
     assert r4.returncode == 0, f"step4 exit: expected 0 (clean), got {r4.returncode}:\n{r4.stderr}"
 
 
-def test_apply_errors_on_frontmatterless_note(tmp_path):
+def test_apply_errors_on_frontmatterless_note(tmp_path, selected_host_context):
     """T6: category-A Issue whose note_path has no frontmatter → error result, file unchanged."""
-    note = tmp_path / "2026-04-09-proj1-t6t6.md"
+    note = selected_host_context.vault_path / "2026-04-09-proj1-t6t6.md"
     note.write_text("# just body\nno frontmatter here\n", encoding="utf-8")
     original = note.read_text(encoding="utf-8")
 
@@ -873,3 +873,9 @@ def test_cross_folder_collision_pairs_correctly(audit_env):
         assert i.extra["category"] == "A"
         seen_folders.add(note_folder)
     assert seen_folders == {"claude-insights", "claude-decisions"}
+
+
+@pytest.fixture(autouse=True)
+def _selected_doctor_actor(selected_host_context):
+    """Run each repair contract with the explicit invoking host active."""
+    return selected_host_context

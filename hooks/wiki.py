@@ -848,6 +848,10 @@ def file_page(ctx: dict, payload: dict, today) -> dict:
             "confidence": p["confidence"], "filed_by": p["filed_by"],
             "filing_id": filing_id,
         }
+        from runtime_context import current_runtime_context
+        actor = current_runtime_context()
+        if actor is not None:
+            meta["author_host"] = actor.host
         if p["filed_by"] == "auto":
             meta["caller"] = p["caller"]
         meta["tags"] = (["claude/wiki", f"claude/wiki/confidence-{p['confidence']}"]

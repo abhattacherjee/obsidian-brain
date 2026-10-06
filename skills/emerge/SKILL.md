@@ -10,10 +10,14 @@ metadata:
 Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
 reference for the invoking host when this skill has paired host references.
 Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
-invocation. Use the selected host's own session ID. Keep curated note taxonomy
+invocation. The current client must be explicitly supplied by the invoking runtime.
+If that binding is unavailable, stop and report it. Never label a Desktop
+invocation as a CLI invocation or infer the frontend from transcript creation
+metadata or inherited environment markers. Use the selected host's own session ID. Keep curated note taxonomy
 separate from `agent_provider` and `agent_session_id` provenance.
 
 ```bash
+: "${OB_CLIENT:?Current native client binding is unavailable; stop without choosing a frontend.}"
 OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
 OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
@@ -48,13 +52,13 @@ Before preparing edits or requesting a summary of an existing note, call
 with `note-apply` and that revision. A conflict leaves the current note intact;
 show the pending result and do not count the note as saved. New curated notes
 use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex until its adapter is verified; shared vault retrieval
+is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
 and wiki filing continue without borrowing another host's memory.
 
 Read `references/host-claude.md` or `references/host-codex.md` when present.
 All note writes described below use `note-create` or revision-bound `note-apply`,
 including bidirectional related links. Content is a JSON string, never shell code.
-Keep this rule when a later step uses the word Write or Edit.
+Every later save or edit follows this revision-bound publication rule.
 
 # Emerge — Discover Patterns Across Your Obsidian Vault Themes
 
@@ -62,7 +66,7 @@ Operates on **themes** (clustered by `/consolidate`), not raw notes, so it scale
 to large vaults within one sub-agent's context budget. Reads themes updated in a
 date window, ranks them by activation, and synthesizes cross-cutting patterns.
 
-**Tools needed:** Bash, Agent, Write, Read
+**Tools needed:** native shell, native analysis delegation, trusted publication, native file reading
 
 ## Procedure
 
@@ -101,15 +105,15 @@ Parse the `STATUS=` line:
 If the command errors (config missing / non-zero exit), tell the user to run `/obsidian-setup` first and stop. Mark task #1 `completed`.
 
 ### Step 2 — Pattern synthesis
-Set task #2 to `in_progress`. Spawn one Agent:
+Set task #2 to `in_progress`. Use one native analysis helper:
 ```
 Native analysis helper({
   description: "Analyze vault themes for cross-cutting patterns",
-  prompt: "Read <registered THEMES_PATH>. It contains `themes` (each with name, summary, note_count, activation, project, and a `members` array of {title, excerpt, similarity, surprise, project}) and `unassigned_candidates` ({title, excerpt, project, date}). Analyze and write to <registered ANALYSIS_PATH> with EXACTLY these sections:\n\n## Growing Themes\nThemes with high activation / recent member growth — momentum.\n\n## Decaying Themes\nThemes with low activation / stale members — fading from focus.\n\n## Cross-Project Connections\nThemes whose members span multiple projects, or shared themes between projects. SKIP this section entirely if there is only 1 project.\n\n## Contradictions\nTensions or reversals across themes. Highlight members with high `surprise` values (they diverged from their theme centroid).\n\n## New Candidates\nProto-themes hinted by the `unassigned_candidates` — clusters of related unassigned notes not yet consolidated.\n\nFor each item: a descriptive name, 2-3 references (theme names or note titles), and a confidence (strong/moderate/tentative).\n\nIMPORTANT: Output ONLY the `##` section content as the note body — do NOT add YAML frontmatter, a top-level `#` title, or any `---` delimiter line. The note's frontmatter and title are added separately by run_build_note; any frontmatter you add would be embedded into the body and produce a malformed double-frontmatter note.\n\nWrite using the Write tool. Return ONLY: WRITTEN:<registered ANALYSIS_PATH>"
+  prompt: "Read <registered THEMES_PATH>. It contains `themes` (each with name, summary, note_count, activation, project, and a `members` array of {title, excerpt, similarity, surprise, project}) and `unassigned_candidates` ({title, excerpt, project, date}). Return analysis text with EXACTLY these sections:\n\n## Growing Themes\nThemes with high activation / recent member growth — momentum.\n\n## Decaying Themes\nThemes with low activation / stale members — fading from focus.\n\n## Cross-Project Connections\nThemes whose members span multiple projects, or shared themes between projects. SKIP this section entirely if there is only 1 project.\n\n## Contradictions\nTensions or reversals across themes. Highlight members with high `surprise` values (they diverged from their theme centroid).\n\n## New Candidates\nProto-themes hinted by the `unassigned_candidates` — clusters of related unassigned notes not yet consolidated.\n\nFor each item: a descriptive name, 2-3 references (theme names or note titles), and a confidence (strong/moderate/tentative).\n\nIMPORTANT: Output ONLY the `##` section content as the note body — do NOT add YAML frontmatter, a top-level `#` title, or any `---` delimiter line. The note's frontmatter and title are added separately by run_build_note; any frontmatter you add would be embedded into the body and produce a malformed double-frontmatter note.\n\nReturn the complete analysis text; the parent stores it with `artifact-store` as `emerge-analysis.md`."
 })
 ```
 
-If no `WRITTEN:` response, report failure and stop. Mark task #2 `completed`.
+If the returned sections are missing or invalid, report failure and stop. Store complete text through `artifact-store` using the prepared operation ID and name `emerge-analysis.md`; use the returned registered path as ANALYSIS_PATH. Mark task #2 `completed`.
 
 ### Step 3 — Build output + write note
 Request for `build-note` (substitute the values as data):
@@ -118,7 +122,7 @@ Request for `build-note` (substitute the values as data):
 {
   "operation_id": "<prepared id>",
   "themes_path": "<registered themes.json>",
-  "analysis_path": "<registered analysis.json>"
+  "analysis_path": "<registered emerge-analysis.md>"
 }
 ```
 

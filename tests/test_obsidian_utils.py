@@ -36,6 +36,35 @@ def _unique_sid() -> str:
     return f"test-sid-{uuid.uuid4().hex}"
 
 
+@pytest.fixture
+def selected_host_context(selected_host_context, host, tmp_path, tmp_path_factory, request):
+    from dataclasses import replace
+    from types import MappingProxyType
+    from runtime_context import using_runtime_context
+    selected = selected_host_context
+    if request.cls is not None and request.cls.__name__ in {
+        "TestUpgradeBatchBatching", "TestUpgradeUnsummarizedNoteReturnsTuple",
+        "TestModelEscalationChain"
+    }:
+        private = tmp_path_factory.mktemp("utils-private")
+        config = dict(selected.config, vault_path=str(tmp_path))
+        config_path = private / "config.json"
+        config_path.write_text(json.dumps(config))
+        selected = replace(selected, vault_path=tmp_path, state_path=private / "state",
+                           index_path=private / "index.sqlite3", config_path=config_path,
+                           config=MappingProxyType(config))
+    with using_runtime_context(selected):
+        yield selected
+
+
+@pytest.fixture
+def tmp_vault(selected_host_context):
+    vault = selected_host_context.vault_path
+    for folder in ("claude-sessions", "claude-insights", "claude-dashboards"):
+        (vault / folder).mkdir(parents=True, exist_ok=True)
+    return vault
+
+
 # ===========================================================================
 # Section 1: Config & session context
 # ===========================================================================
@@ -180,6 +209,7 @@ class TestGetWorkspaceRoots:
 # ===========================================================================
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestReadNoteMetadata:
     def test_read_note_metadata_valid(self, sample_session_note, monkeypatch):
         """Parse valid frontmatter and verify fields + tags."""
@@ -228,6 +258,7 @@ class TestReadNoteMetadata:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestReadNoteMetadataFrontmatterBounds:
     def test_tags_block_past_line_40_is_recovered(self, tmp_path, monkeypatch):
         """A `tags:` block starting below line 40 must still parse.
@@ -2482,22 +2513,20 @@ def test_fast_path_underscore_to_hyphen_fallback(tmp_path, monkeypatch):
     assert sid == "sess-fast-123", f"Expected 'sess-fast-123' but got '{sid}'"
 
 
-def test_get_session_context_normalizes_underscores(tmp_path, monkeypatch):
-    """get_session_context normalizes underscores to hyphens in project name."""
-    import obsidian_utils
-
-    proj_dir = tmp_path / "personal_ws"
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    # Stub _get_session_id_fast to return unknown (avoids bootstrap setup)
-    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: "unknown")
-
-    ctx = obsidian_utils.get_session_context()
-    assert ctx["project"] == "personal-ws", (
-        f"Expected 'personal-ws' but got '{ctx['project']}' — underscores not normalized"
-    )
+@pytest.mark.usefixtures("selected_host_context")
+def test_get_session_context_preserves_canonical_project_spelling(tmp_path, monkeypatch, selected_host_context):
+    from runtime_context import resolve_runtime_context, using_runtime_context
+    project = tmp_path / "personal_ws"
+    project.mkdir()
+    actor = resolve_runtime_context(selected_host_context.host, selected_host_context.client,
+        {"session_id": selected_host_context.native_session_id, "cwd": str(project)},
+        {"config_path": selected_host_context.config_path,
+         "resource_root": selected_host_context.resource_root})
+    monkeypatch.chdir(tmp_path)
+    with using_runtime_context(actor):
+        result = obsidian_utils.get_session_context()
+    assert result["project"] == "personal_ws"
+    assert result["cwd"] == str(project)
 
 
 def test_extract_session_metadata_normalizes_underscores():
@@ -2793,6 +2822,7 @@ def test_get_session_id_fast_slow_path_returns_without_writing(tmp_path, monkeyp
 # ===========================================================================
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestUpgradeBatch:
     """Tests for upgrade_batch() — GH #69, instrumentation GH #74.
 
@@ -3150,6 +3180,7 @@ class TestUpgradeBatch:
 # ===========================================================================
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestUpgradeBatchBatching:
     """Tests for the batched (summary_batch_size >= 2) path in upgrade_batch().
 
@@ -3216,7 +3247,7 @@ class TestUpgradeBatchBatching:
 
     # ---- tests ------------------------------------------------------------------
 
-    def test_batch_of_5_one_malformed_routes_to_fallback(self, monkeypatch, tmp_path):
+    def test_batch_of_5_one_malformed_routes_to_fallback(self, monkeypatch, tmp_path, selected_host_context):
         """Mandated fixture: 4 valid summaries + 1 missing_section → malformed goes to solo fallback."""
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
@@ -3271,7 +3302,10 @@ class TestUpgradeBatchBatching:
             assert results[i]["status"].startswith("Upgraded "), (
                 f"note {i} should be Upgraded, got: {results[i]['status']!r}"
             )
-            assert results[i]["model_used"] == "haiku"
+            assert results[i]["model_used"] == (
+                "haiku" if selected_host_context.host == "claude"
+                else selected_host_context.config["codex_summary_model"]
+            )
 
         # Note 4 (malformed) routed to solo fallback
         assert paths[4] in solo_fallback_called, (
@@ -3843,23 +3877,24 @@ def test_git_canonical_project_name_with_reason_distinguishes_failure_modes(
     assert reason == "git-unavailable"
 
 
-@_REQUIRES_GIT
-def test_get_session_context_returns_canonical_project(tmp_path, monkeypatch):
-    """get_session_context's `project` field uses canonical naming."""
+@pytest.mark.usefixtures("selected_host_context")
+def test_get_session_context_returns_canonical_project(tmp_path, monkeypatch, selected_host_context):
+    from runtime_context import resolve_runtime_context, using_runtime_context
     repo = tmp_path / "obsidian-brain"
     repo.mkdir()
     _init_git_repo(repo)
     worktree = tmp_path / "obsidian-brain--issue-93"
-    subprocess.run(
-        ["git", "worktree", "add", "-b", "feature/issue-93", str(worktree)],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
-    monkeypatch.chdir(worktree)
-    # session_id may be 'unknown' in test env — that's fine; we only check project.
-    ctx = obsidian_utils.get_session_context()
-    assert ctx["project"] == "obsidian-brain"
+    subprocess.run(["git", "worktree", "add", "-b", "feature/issue-93", str(worktree)],
+                   cwd=repo, check=True, capture_output=True)
+    actor = resolve_runtime_context(selected_host_context.host, selected_host_context.client,
+        {"session_id": selected_host_context.native_session_id, "cwd": str(worktree)},
+        {"config_path": selected_host_context.config_path,
+         "resource_root": selected_host_context.resource_root})
+    monkeypatch.chdir(tmp_path)
+    with using_runtime_context(actor):
+        result = obsidian_utils.get_session_context()
+    assert result["project"] == "obsidian-brain"
+    assert result["cwd"] == str(worktree)
 
 
 @_REQUIRES_GIT
@@ -3882,77 +3917,34 @@ def test_extract_session_metadata_returns_canonical_project(tmp_path):
     assert meta["project_path"] == str(worktree)
 
 
-@_REQUIRES_GIT
-def test_get_session_context_cache_key_isolates_distinct_worktrees(tmp_path, monkeypatch):
-    """T7: get_session_context's cache must isolate distinct worktrees of
-    the same repo so a call from one worktree doesn't return cached state
-    from a sibling worktree.
-
-    Distinct worktrees have distinct CC session_ids (each owns its own
-    JSONL), so the per-session cache file (~/.claude/obsidian-brain/cache-<sid>.json)
-    is naturally partitioned by session. The cache_key within that file
-    includes (vault_path, sessions_folder) — anything else that varies
-    across worktrees (e.g., note basenames in vault_path) would still
-    collide because vault_path is shared across worktrees.
-
-    This test verifies the realistic case: two sessions with different
-    SIDs from two worktrees produce different cache files, so call 2
-    cannot inherit call 1's value. If a future change moves the cache
-    file to be SID-independent without adding a worktree-discriminator
-    to cache_key, this test will fail.
-    """
-    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(tmp_path / "cache-"))
-
+@pytest.mark.usefixtures("selected_host_context")
+def test_get_session_context_cache_key_isolates_distinct_worktrees(tmp_path, selected_host_context):
+    from runtime_context import resolve_runtime_context, using_runtime_context
     repo = tmp_path / "obsidian-brain"
     repo.mkdir()
     _init_git_repo(repo)
     worktree = tmp_path / "obsidian-brain--issue-93"
-    subprocess.run(
-        ["git", "worktree", "add", "-b", "feature/issue-93", str(worktree)],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
-
-    vault = tmp_path / "vault"
-    sessions_dir = vault / "claude-sessions"
-    sessions_dir.mkdir(parents=True)
-
-    # Simulate two distinct CC sessions: SID1 (from main repo) and SID2 (from worktree)
-    sid1 = "11111111-1111-1111-1111-111111111111"
-    sid2 = "22222222-2222-2222-2222-222222222222"
-
-    # Place a session note matching SID1's hash so the basename lookup
-    # produces a non-default value worth caching/comparing.
-    h1 = hashlib.sha256(sid1.encode()).hexdigest()[:4]
-    h2 = hashlib.sha256(sid2.encode()).hexdigest()[:4]
-    (sessions_dir / f"2026-04-25-obsidian-brain-{h1}.md").write_text(
-        "---\ntype: claude-session\nsession_id: " + sid1 + "\n---\n", encoding="utf-8"
-    )
-    (sessions_dir / f"2026-04-25-obsidian-brain-{h2}.md").write_text(
-        "---\ntype: claude-session\nsession_id: " + sid2 + "\n---\n", encoding="utf-8"
-    )
-
-    # Call 1: from main repo with SID1
-    monkeypatch.chdir(repo)
-    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid1)
-    ctx1 = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-    assert ctx1["session_id"] == sid1
-    assert ctx1["hash"] == h1
-
-    # Call 2: from worktree with SID2 — must NOT return ctx1's hash
-    monkeypatch.chdir(worktree)
-    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid2)
-    ctx2 = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-    assert ctx2["session_id"] == sid2, (
-        f"cache leaked across worktrees: expected SID2 ({sid2}), got "
-        f"{ctx2['session_id']}"
-    )
-    assert ctx2["hash"] == h2, (
-        f"cache leaked across worktrees: expected hash {h2}, got {ctx2['hash']}"
-    )
-    # And canonical project naming must agree on both calls
-    assert ctx1["project"] == ctx2["project"] == "obsidian-brain"
+    subprocess.run(["git", "worktree", "add", "-b", "feature/issue-93", str(worktree)],
+                   cwd=repo, check=True, capture_output=True)
+    results = []
+    for path, sid in [(repo, "11111111-1111-1111-1111-111111111111"),
+                      (worktree, "22222222-2222-2222-2222-222222222222")]:
+        actor = resolve_runtime_context(selected_host_context.host, selected_host_context.client,
+            {"session_id": sid, "cwd": str(path)},
+            {"config_path": selected_host_context.config_path,
+             "resource_root": selected_host_context.resource_root})
+        with using_runtime_context(actor):
+            obsidian_utils.cache_set(sid, "session_context", {"cwd": str(path), "poison": True})
+            result = obsidian_utils.get_session_context()
+            assert result["session_id"] == sid
+            assert result["hash"] == actor.session_key[:16]
+            assert result["cwd"] == str(path)
+            assert result["session_note_name"] == ""
+            assert "poison" not in result
+            results.append(result)
+    assert results[0]["hash"] != results[1]["hash"]
+    assert results[0]["cwd"] != results[1]["cwd"]
+    assert results[0]["project"] == results[1]["project"] == "obsidian-brain"
 
 
 # ===========================================================================
@@ -4292,17 +4284,25 @@ class TestGenerateSnapshotSummaryReturnsFallbackReason:
 # ===========================================================================
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestUpgradeUnsummarizedNoteReturnsTuple:
     """upgrade_unsummarized_note returns (status, elapsed_s, model_used, fallback_reason)."""
 
-    def test_success_returns_full_tuple(self, monkeypatch, tmp_path):
+    @staticmethod
+    def _successful_summary(context):
+        # The generation stub records the model its synthetic native transport used.
+        if context.host == "codex":
+            obsidian_utils._SUMMARY_NATIVE_MODEL.set(context.config["codex_summary_model"])
+        return "## Summary\nOK", None
+
+    def test_success_returns_full_tuple(self, monkeypatch, tmp_path, selected_host_context):
         import obsidian_utils
 
         # Stub the heavy lifting — we're testing wiring, not generation
         monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
         monkeypatch.setattr(
             obsidian_utils, "generate_summary",
-            lambda *a, **kw: ("## Summary\nOK", None),
+            lambda *a, **kw: self._successful_summary(selected_host_context),
         )
         monkeypatch.setattr(
             obsidian_utils, "upgrade_note_with_summary",
@@ -4324,7 +4324,8 @@ class TestUpgradeUnsummarizedNoteReturnsTuple:
         status, elapsed_s, model_used, fallback_reason = result
         assert status.startswith("Upgraded ")
         assert elapsed_s >= 0
-        assert model_used == "haiku"
+        assert model_used == ("haiku" if selected_host_context.host == "claude"
+                              else selected_host_context.config["codex_summary_model"])
         assert fallback_reason is None
 
 
@@ -4333,6 +4334,7 @@ class TestUpgradeUnsummarizedNoteReturnsTuple:
 # ===========================================================================
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestModelEscalationChain:
     """upgrade_unsummarized_note escalates through Haiku→Sonnet→Opus in-process.
 
@@ -4388,7 +4390,7 @@ class TestModelEscalationChain:
     # Tests
     # ------------------------------------------------------------------
 
-    def test_escalates_to_sonnet_on_empty_output(self, monkeypatch, tmp_path):
+    def test_escalates_to_sonnet_on_empty_output(self, monkeypatch, tmp_path, selected_host_context):
         """When haiku returns (None, 'empty_output'), escalate to sonnet."""
         import obsidian_utils
 
@@ -4416,11 +4418,17 @@ class TestModelEscalationChain:
             str(note), str(tmp_path), "claude-sessions", "test-project",
         )
 
+        if selected_host_context.host == "codex":
+            assert not status.startswith("Upgraded ")
+            assert model_used is None
+            assert fallback_reason == "empty_output"
+            return
+
         assert status.startswith("Upgraded "), f"expected success, got: {status}"
         assert model_used == "sonnet"
         assert fallback_reason is None
 
-    def test_escalates_haiku_to_opus_when_sonnet_also_empty(self, monkeypatch, tmp_path):
+    def test_escalates_haiku_to_opus_when_sonnet_also_empty(self, monkeypatch, tmp_path, selected_host_context):
         """When haiku and sonnet both return (None, 'empty_output'), opus is tried."""
         import obsidian_utils
 
@@ -4447,11 +4455,17 @@ class TestModelEscalationChain:
             str(note), str(tmp_path), "claude-sessions", "test-project",
         )
 
+        if selected_host_context.host == "codex":
+            assert not status.startswith("Upgraded ")
+            assert model_used is None
+            assert fallback_reason == "empty_output"
+            return
+
         assert status.startswith("Upgraded "), f"expected success, got: {status}"
         assert model_used == "opus"
         assert fallback_reason is None
 
-    def test_no_escalation_on_timeout(self, monkeypatch, tmp_path):
+    def test_no_escalation_on_timeout(self, monkeypatch, tmp_path, selected_host_context):
         """When haiku returns (None, 'haiku_timeout'), do NOT escalate — timeout
         means the CLI is slow; a bigger model would only make it slower (#84).
         """
@@ -4481,7 +4495,7 @@ class TestModelEscalationChain:
         assert model_used is None
         assert fallback_reason == "haiku_timeout"
 
-    def test_happy_path_uses_primary_model_only(self, monkeypatch, tmp_path):
+    def test_happy_path_uses_primary_model_only(self, monkeypatch, tmp_path, selected_host_context):
         """When haiku succeeds on the first call, no escalation occurs."""
         import obsidian_utils
 
@@ -4493,6 +4507,10 @@ class TestModelEscalationChain:
         def fake_generate_summary(*args, **kwargs):
             model = kwargs.get("model", "haiku")
             models_attempted.append(model)
+            if selected_host_context.host == "codex":
+                obsidian_utils._SUMMARY_NATIVE_MODEL.set(
+                    selected_host_context.config["codex_summary_model"]
+                )
             return (
                 "## Summary\nHaiku success.\n\n"
                 "## Key Decisions\n- None noted.\n\n"
@@ -4512,7 +4530,8 @@ class TestModelEscalationChain:
             f"expected only haiku to be attempted, got: {models_attempted}"
         )
         assert status.startswith("Upgraded "), f"expected success, got: {status}"
-        assert model_used == "haiku"
+        assert model_used == ("haiku" if selected_host_context.host == "claude"
+                              else selected_host_context.config["codex_summary_model"])
         assert fallback_reason is None
 
 
@@ -4749,6 +4768,7 @@ class TestNormalizeSummary:
 # ===========================================================================
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestRecoveryIntegration:
     """Integration tests confirming _normalize_summary is wired into the
     production paths (upgrade_unsummarized_note solo path, generate_summaries_batch
@@ -4918,6 +4938,7 @@ class TestRecoveryIntegration:
 # ===========================================================================
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestBatchRecovery:
     """Tests for _normalize_summary wired into generate_summaries_batch (#167)."""
 

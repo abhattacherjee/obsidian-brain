@@ -3,7 +3,7 @@
 Provides full-text search over Obsidian vault notes, mtime-based incremental
 sync, and layered ranking for context-relevant note discovery.
 
-DB location: ~/.claude/obsidian-brain-vault.db (outside vault, alongside config).
+DB location: the selected runtime index, outside the vault.
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ def _is_under(child: Path, parent: Path) -> bool:
 
 
 def _default_db_path(context=None) -> str:
-    """Return default DB path: ~/.claude/obsidian-brain-vault.db.
+    """Return the bound runtime index or the named Claude compatibility default.
 
     Overridable via the OBSIDIAN_BRAIN_DB env var so tests, dev-test scripts,
     and subprocesses can isolate the index DB without threading db_path through
@@ -136,18 +136,16 @@ def _default_db_path(context=None) -> str:
     context = context or current_runtime_context()
     if context:
         return str(context.index_path)
-    return os.environ.get("OBSIDIAN_BRAIN_DB") or os.path.join(
-        os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db"
-    )
+    from runtime_adapters.claude import legacy_index_path
+    return legacy_index_path()
 
 
 # Hardcoded real production DB path, resolved once at import. The guard in
 # _connect() compares against THIS (not _default_db_path(), which the
 # OBSIDIAN_BRAIN_DB env override redirects), so test isolation cannot defeat
 # the guard (#192).
-_REAL_PROD_DB = os.path.realpath(
-    os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
-)
+from runtime_adapters.claude import legacy_index_path
+_REAL_PROD_DB = os.path.realpath(legacy_index_path(use_override=False))
 
 # When a single _sync batch churns MORE than this fraction of the final corpus
 # (inserts + deletions), the stored IDF has drifted enough to be worth an O(N)
@@ -174,7 +172,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
 
     Guard (#192): under a pytest context, refuse to open the REAL production
     index DB. Any test that reaches this path is leaking; fail loudly instead of
-    silently polluting ~/.claude/obsidian-brain-vault.db. Both path-equality
+    silently polluting the real legacy index. Both path-equality
     (realpath, catching symlinks) and inode-equality (samefile, catching hard
     links) are checked.
     """

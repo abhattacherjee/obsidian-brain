@@ -68,6 +68,8 @@ class ReaperOutcome:
     skipped_permission_blocked: bool
     timeout: bool
     wall_ms: float
+    # Registered recovery does not expose counts; its actual status stays distinct.
+    recovery_status: str = None
 
 
 # ---------------------------------------------------------------------------
@@ -127,23 +129,9 @@ def _permission_canary(vault_path: str) -> bool:
 
 
 def _resolve_project_jsonl_dir(project: str) -> Path:
-    """Map project name to ~/.claude/projects/<slug>/.
-
-    Slug rule mirrors Claude Code's path encoding (full path with - separators).
-    For now we use a heuristic: find the dir whose name ends with -<project>
-    and is the shortest matching dir (i.e., canonical non-worktree path).
-    """
-    base = Path.home() / ".claude" / "projects"
-    if not base.is_dir():
-        return base / f"-NONEXISTENT-{project}"
-    try:
-        candidates = sorted(
-            [d for d in base.iterdir() if d.is_dir() and d.name.endswith(f"-{project}")],
-            key=lambda d: len(d.name),
-        )
-    except OSError:
-        return base / f"-NONEXISTENT-{project}"
-    return candidates[0] if candidates else base / f"-NONEXISTENT-{project}"
+    """Named legacy Claude transcript lookup, outside native registered recovery."""
+    from runtime_adapters.claude import legacy_project_transcript_dir
+    return legacy_project_transcript_dir(project)
 
 
 # ---------------------------------------------------------------------------
@@ -230,10 +218,14 @@ def _reap_orphaned_sessions(
 ) -> ReaperOutcome:
     """Main reaper loop — internal, directly testable.
 
-    Iterates JSONL files in the project's ~/.claude/projects/<slug>/ dir
+    Iterates legacy transcript files selected by the named Claude adapter
     whose mtime > watermark, checks thresholds, deduplicates against vault,
     and writes reconstructed notes for orphaned sessions.
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        return _registered_reaper_outcome(context, vault_path)
     from obsidian_utils import (
         _append_reaper_log,
         _safe_mtime,
@@ -255,7 +247,8 @@ def _reap_orphaned_sessions(
     start_ts = time.monotonic()
     max_runtime = config.get("reaper_max_runtime_seconds", 5)
 
-    watermark_path = Path.home() / ".claude" / "obsidian-brain" / f"reaper-watermark-{project}"
+    from runtime_adapters.claude import legacy_reaper_watermark
+    watermark_path = legacy_reaper_watermark(project)
     watermark = _read_watermark(watermark_path)
 
     project_jsonl_dir = _resolve_project_jsonl_dir(project)
@@ -464,6 +457,10 @@ def reap_orphaned_sessions(
         Summary of the run.  Always returns; never raises.
     """
     try:
+        from runtime_context import current_runtime_context
+        context = current_runtime_context()
+        if context is not None:
+            return _registered_reaper_outcome(context, vault_path)
         return _reap_orphaned_sessions(project, vault_path, sessions_folder, config)
     except Exception as exc:
         from obsidian_utils import _append_reaper_log
@@ -495,3 +492,16 @@ def reap_registered_sessions(context, max_sources=8, deadline=None):
         except Exception as exc:
             print(f"[obsidian-brain] registered-source recovery failed: {exc}", file=sys.stderr)
             return CaptureResult("unavailable", pending_sources=1, warnings=(str(exc),))
+
+
+def _registered_reaper_outcome(context, vault_path):
+    """Keep the legacy response shape without inventing native recovery counts."""
+    if Path(vault_path).resolve() != context.vault_path.resolve():
+        raise ValueError('Recovery cannot switch the selected runtime vault')
+    started = time.monotonic()
+    budget = min(5.0, max(0.0, float(context.config.get('reaper_max_runtime_seconds', 1))))
+    deadline = started + budget
+    result = reap_registered_sessions(context, max_sources=8, deadline=deadline)
+    ended = time.monotonic()
+    return ReaperOutcome(0, 0, 0, False, ended >= deadline,
+                         int((ended - started) * 1000), recovery_status=result.status)

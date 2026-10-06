@@ -508,12 +508,26 @@ def _scan_store(store: Path, project: str) -> list[Issue]:
     return issues
 
 
-def scan(
+def scan(vault_path, sessions_folder, insights_folder, days, project=None):
+    """Select native memory without borrowing another invoking host's store."""
+    from runtime_context import current_runtime_context, historical_source_roots
+    context = current_runtime_context()
+    if context is not None and context.host != 'claude':
+        print(f'[{NAME}] native memory discovery is unsupported for {context.host}: '
+              'no equivalent native memory-file API', file=sys.stderr)
+        return []
+    projects = context.native_home / 'projects' if context is not None else historical_source_roots('claude')[0]
+    return _scan_claude_memory(vault_path, sessions_folder, insights_folder, days,
+                              project=project, projects_root=projects)
+
+
+def _scan_claude_memory(
     vault_path: str,
     sessions_folder: str,
     insights_folder: str,
     days: int,
     project: str | None = None,
+    projects_root: Path | None = None,
 ) -> list[Issue]:
     """Walk ``~/.claude/projects/*/memory/`` and report index drift.
 
@@ -523,12 +537,9 @@ def scan(
     """
     # Path.home() reads $HOME on POSIX (tests monkeypatch it) and falls back
     # to pwd-database lookups when unset — sibling-module convention.
-    from runtime_context import current_runtime_context
-    context = current_runtime_context()
-    if context and context.host != "claude":
-        print(f"[{NAME}] native memory discovery is unsupported for {context.host}", file=sys.stderr)
-        return []
-    projects_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    if projects_root is None:
+        from runtime_context import historical_source_roots
+        projects_root = historical_source_roots('claude')[0]
     if not projects_root.is_dir():
         print(
             "[memory-index] ~/.claude/projects not found; nothing to scan",

@@ -45,7 +45,8 @@ def test_crash_before_checkpoint_has_no_committed_activity(context, monkeypatch)
 
 
 def test_same_native_id_on_two_hosts_is_not_one_checkpoint(context):
-    claude = replace(context, host="claude", client="claude-code")
+    other_host = "claude" if context.host == "codex" else "codex"
+    claude = replace(context, host=other_host, client="claude-code" if other_host == "claude" else "codex-cli")
     codex_note = context.vault_path / "codex.md"
     claude_note = context.vault_path / "claude.md"
     capture.publish_events(context, "source", "generation", 100, [("event", "Codex fact")], codex_note)

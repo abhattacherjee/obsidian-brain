@@ -7,6 +7,24 @@ import consolidate_cli
 import vault_index
 
 
+from dataclasses import replace
+from runtime_context import using_runtime_context
+
+@pytest.fixture
+def selected_host_context(host, selected_host_context):
+    selected = replace(selected_host_context,
+                       index_path=selected_host_context.vault_path / "c.db")
+    with using_runtime_context(selected):
+        yield selected
+
+@pytest.fixture
+def tmp_vault(selected_host_context):
+    vault = selected_host_context.vault_path
+    for folder in ("claude-sessions", "claude-insights"):
+        (vault / folder).mkdir()
+    return vault
+
+
 def _seed_notes(db, specs):
     conn = sqlite3.connect(db)
     for path, project, vec in specs:
@@ -34,7 +52,7 @@ def _fake_names(clusters, model="haiku", timeout=120):
     return ([{"name": f"Theme {i}", "summary": "s"} for i in range(len(clusters))], None)
 
 
-def test_consolidate_seeds_clusters_of_three_plus(db):
+def test_consolidate_seeds_clusters_of_three_plus(selected_host_context, db):
     _seed_notes(db, [
         ("a.md", "proj", {"x": 1.0, "y": 0.9}),
         ("b.md", "proj", {"x": 1.0, "y": 0.8}),
@@ -52,7 +70,7 @@ def test_consolidate_seeds_clusters_of_three_plus(db):
     assert [m[0] for m in members] == ["a.md", "b.md", "c.md"]
 
 
-def test_consolidate_is_incremental_by_default(db):
+def test_consolidate_is_incremental_by_default(selected_host_context, db):
     # Pre-existing theme + member; default run must NOT delete it.
     conn = sqlite3.connect(db)
     conn.execute("INSERT INTO themes (name, summary, centroid, note_count, created_date, updated_date, project) "
@@ -69,7 +87,7 @@ def test_consolidate_is_incremental_by_default(db):
     conn.close()
 
 
-def test_consolidate_full_wipes_then_reclusters(db):
+def test_consolidate_full_wipes_then_reclusters(selected_host_context, db):
     conn = sqlite3.connect(db)
     conn.execute("INSERT INTO themes (name, summary, centroid, note_count, created_date, updated_date, project) "
                  "VALUES ('Stale','s','{}',1,'2026-01-01','2026-01-01','proj')")
@@ -86,7 +104,7 @@ def test_consolidate_full_wipes_then_reclusters(db):
     conn.close()
 
 
-def test_consolidate_per_project_scoping(db):
+def test_consolidate_per_project_scoping(selected_host_context, db):
     _seed_notes(db, [
         ("p1/a.md","proj1",{"x":1.0}),("p1/b.md","proj1",{"x":1.0}),("p1/c.md","proj1",{"x":1.0}),
         ("p2/a.md","proj2",{"x":1.0}),("p2/b.md","proj2",{"x":1.0}),("p2/c.md","proj2",{"x":1.0}),
@@ -99,7 +117,7 @@ def test_consolidate_per_project_scoping(db):
     assert projs == ["proj1", "proj2"]  # two separate themes, never merged across projects
 
 
-def test_consolidate_haiku_failure_uses_deterministic_fallback_name(db):
+def test_consolidate_haiku_failure_uses_deterministic_fallback_name(selected_host_context, db):
     _seed_notes(db, [("a.md","proj",{"alpha":1.0,"beta":0.5,"gamma":0.3}),
                      ("b.md","proj",{"alpha":1.0,"beta":0.6,"gamma":0.2}),
                      ("c.md","proj",{"alpha":0.9,"beta":0.5,"gamma":0.4})])
@@ -111,7 +129,7 @@ def test_consolidate_haiku_failure_uses_deterministic_fallback_name(db):
     assert name == "alpha / beta / gamma"  # top-3 centroid terms by weight, joined by " / "
 
 
-def test_stats_reports_counts(db, capsys):
+def test_stats_reports_counts(selected_host_context, db, capsys):
     _seed_notes(db, [("a.md","proj",{"x":1.0}),("b.md","proj",{"x":1.0}),("c.md","proj",{"x":1.0}),
                      ("u.md","proj",{"q":1.0})])
     with patch("consolidate_cli.generate_theme_names", _fake_names):
@@ -148,7 +166,7 @@ def test_merge_combines_members_and_drops_second(db):
     assert cen == pytest.approx({"x": 0.5, "y": 0.5})
 
 
-def test_split_breaks_theme_into_subclusters(db):
+def test_split_breaks_theme_into_subclusters(selected_host_context, db):
     # one theme holding two clearly-separate groups -> split into two themes
     conn = sqlite3.connect(db)
     conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
@@ -168,7 +186,7 @@ def test_split_breaks_theme_into_subclusters(db):
     conn.close()
 
 
-def test_split_falls_back_on_haiku_failure(db):
+def test_split_falls_back_on_haiku_failure(selected_host_context, db):
     """Split still produces sub-themes with non-empty fallback names when Haiku fails."""
     conn = sqlite3.connect(db)
     conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
@@ -211,7 +229,7 @@ def test_merge_self_is_rejected(db):
     assert member_count == 2, "theme must still have 2 members after self-merge"
 
 
-def test_consolidate_refreshes_activation(db):
+def test_consolidate_refreshes_activation(selected_host_context, db):
     """After seeding a 3-note theme, its activation must be > 0.0 (the refresh
     pass ran). Without recompute_activation in run_consolidate it stays 0.0."""
     _seed_notes(db, [("a.md","proj",{"x":1.0}),("b.md","proj",{"x":1.0}),("c.md","proj",{"x":1.0})])
@@ -255,7 +273,7 @@ def test_merge_not_found_prints_marker_no_crash(db, capsys):
     conn.close()
 
 
-def test_consolidate_rolls_back_on_recompute_failure(db, monkeypatch):
+def test_consolidate_rolls_back_on_recompute_failure(selected_host_context, db, monkeypatch):
     """A sqlite3.Error inside the seed transaction (raised by recompute_activation)
     must roll back the whole transaction: SystemExit(1) AND zero themes committed."""
     _seed_notes(db, [("a.md","proj",{"x":1.0}),("b.md","proj",{"x":1.0}),("c.md","proj",{"x":1.0})])
@@ -275,7 +293,7 @@ def test_consolidate_rolls_back_on_recompute_failure(db, monkeypatch):
     conn.close()
 
 
-def test_split_noop_when_cohesive(db, capsys):
+def test_split_noop_when_cohesive(selected_host_context, db, capsys):
     conn = sqlite3.connect(db)
     conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
                  "VALUES (1,'Tight','s','{}',3,'d','d','proj')")

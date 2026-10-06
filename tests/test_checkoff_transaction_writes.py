@@ -20,7 +20,7 @@ def _race(monkeypatch, note):
     return original + b'Manual addition\n'
 
 
-def test_batch_edit_preserves_concurrent_manual_edit(tmp_vault, monkeypatch, capsys):
+def test_batch_edit_preserves_concurrent_manual_edit(tmp_vault, selected_host_context, monkeypatch, capsys):
     note = tmp_vault / 'claude-sessions' / 'note.md'
     note.write_text('- [ ] Fix importer\n')
     monkeypatch.setattr(obsidian_utils, 'load_config', lambda: {'vault_path': str(tmp_vault)})
@@ -28,8 +28,13 @@ def test_batch_edit_preserves_concurrent_manual_edit(tmp_vault, monkeypatch, cap
     monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps([
         [str(note), '- [ ] Fix importer', '- [x] Fix importer'],
     ])))
-    edited = _race(monkeypatch, note)
-    deep_cli.run_batch_edit()
+    from test_host_deep_edit_revisions import prepared
+    identity, revisions = prepared(selected_host_context, [note])
+    original = note.read_bytes()
+    edited = original + b'Manual addition\n'
+    # The race happens after the protected model-input baseline is retained.
+    note.write_bytes(edited)
+    assert deep_cli.run_batch_edit(expected_revisions=revisions, operation_id=identity) == 1
     assert 'Applied 0/1 edits' in capsys.readouterr().out
     assert note.read_bytes() == edited
 
@@ -78,7 +83,7 @@ def test_batch_cascade_preserves_concurrent_manual_edit(tmp_vault, monkeypatch):
     assert note.read_bytes() == edited
 
 
-def test_batch_edit_preserves_crlf(tmp_vault, monkeypatch, capsys):
+def test_batch_edit_preserves_crlf(tmp_vault, selected_host_context, monkeypatch, capsys):
     note = tmp_vault / 'claude-sessions' / 'note.md'
     note.write_bytes(b'- [ ] Fix importer\r\nUnrelated text\r\n')
     monkeypatch.setattr(obsidian_utils, 'load_config', lambda: {'vault_path': str(tmp_vault)})
@@ -86,6 +91,15 @@ def test_batch_edit_preserves_crlf(tmp_vault, monkeypatch, capsys):
     monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps([
         [str(note), '- [ ] Fix importer', '- [x] Fix importer'],
     ])))
-    deep_cli.run_batch_edit()
+    from test_host_deep_edit_revisions import prepared
+    identity, revisions = prepared(selected_host_context, [note])
+    assert deep_cli.run_batch_edit(expected_revisions=revisions, operation_id=identity) == 0
     assert 'Applied 1/1 edits' in capsys.readouterr().out
     assert note.read_bytes() == b'- [x] Fix importer\r\nUnrelated text\r\n'
+
+
+# Every scoped operation uses the same selected temporary vault.
+from selected_legacy_vault import selected_host_context, native_ai_frontend  # noqa: F401,E402
+import pytest
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

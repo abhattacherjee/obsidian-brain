@@ -16,6 +16,25 @@ import pytest
 import obsidian_utils
 
 
+
+def _native_index_notes(context, entries):
+    """Build an existing index fixture; the lookup must open it read-only."""
+    import sqlite3
+    context.index_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(context.index_path) as connection:
+        connection.execute("CREATE TABLE notes(path TEXT, type TEXT, agent_provider TEXT, agent_session_id TEXT)")
+        for name, provider, sid, kind in entries:
+            note = context.vault_path / "claude-sessions" / name
+            _write_note(note, {"type": kind, "agent_provider": provider,
+                              "agent_session_id": sid, "session_id": sid})
+            connection.execute("INSERT INTO notes VALUES(?,?,?,?)", (str(note), kind, provider, sid))
+    context.index_path.chmod(0o600)
+
+
+def _native_result(context):
+    return obsidian_utils.get_session_context(str(context.vault_path), "claude-sessions")
+
+
 def _unique_sid() -> str:
     return f"test-sid-{uuid.uuid4().hex}"
 
@@ -135,93 +154,21 @@ def test_first_seen_date_chmods_existing_loose_mode_marker(isolated_home):
     assert oct(marker.stat().st_mode)[-3:] == "600"
 
 
-def test_get_session_context_fallback_uses_marker_date(isolated_home, tmp_path, monkeypatch):
-    """get_session_context() fallback must compose its basename from
-    _first_seen_date(sid), not date.today() — so cross-midnight insights
-    and SessionEnd writes agree on the filename. Mock date.today() to a
-    different day than the marker so the test actually exercises the
-    divergence the helper prevents."""
-    sid = _unique_sid()
-    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid)
-    monkeypatch.setattr(obsidian_utils, "canonical_project_name", lambda *a, **kw: "obsidian-brain")
-
-    marker_date = "2026-04-20"  # day-N
-    other_day = datetime.date(2026, 4, 22)  # day-N+2 — different from marker
-
-    # Pre-write a marker pointing at day-N
-    marker_dir = isolated_home / ".claude" / "obsidian-brain" / "sessions"
-    marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (marker_dir / f"{sid}.json").write_text(
-        json.dumps({"first_seen_date": marker_date, "first_seen_iso": "x"}),
-        encoding="utf-8",
-    )
-
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-
-    class _FrozenDate:
-        @staticmethod
-        def today():
-            return other_day
-
-    # With date.today() mocked to day-N+2, the fallback must STILL produce
-    # the day-N basename via the marker. If the fallback ignored the marker
-    # and used date.today(), the basename would start with 2026-04-22.
-    with patch.object(obsidian_utils.datetime, "date", _FrozenDate):
-        ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-
-    assert ctx["session_note_name"].startswith(f"{marker_date}-obsidian-brain-"), (
-        f"expected basename pinned to marker date {marker_date}, got {ctx['session_note_name']}"
-    )
-    # Must be byte-equal to make_filename(marker_date, ...)
-    expected = obsidian_utils.make_filename(marker_date, "obsidian-brain", sid)[:-3]
-    assert ctx["session_note_name"] == expected
+def test_get_session_context_never_invents_a_note_from_marker_date(selected_host_context):
+    context = selected_host_context
+    obsidian_utils._first_seen_date(context.native_session_id)
+    before = list(context.vault_path.rglob("*.md"))
+    assert _native_result(context)["session_note_name"] == ""
+    assert list(context.vault_path.rglob("*.md")) == before
 
 
-def test_helper_and_session_end_produce_byte_identical_basename(isolated_home, monkeypatch):
-    """Project-slug invariant: across many (project, sid) combinations,
-    get_session_context()'s fallback basename and the basename SessionEnd
-    would build via make_filename(_first_seen_date(sid), slugify(project), sid)
-    are byte-for-byte identical. Catches any future regression that
-    reintroduces a hand-composed slug or a different date source."""
-    projects = [
-        "obsidian-brain",
-        "tiny-vacation-agent",
-        "personal-ws",
-        "claude-code-skills",
-        "very-long-project-name-that-might-trip-truncation-logic",
-        "abc",
-        "name with spaces",
-        "name_with_underscores",
-        "obsidian-brain--issue-101-source-session-basename-stability",
-        "Mixed-Case-Project",
-    ]
-    for project in projects:
-        for _ in range(3):
-            sid = _unique_sid()
-            monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda s=sid: s)
-            monkeypatch.setattr(obsidian_utils, "canonical_project_name",
-                                lambda *a, project=project, **kw: project)
-
-            # Helper side
-            ctx = obsidian_utils.get_session_context()
-            helper_basename = ctx["session_note_name"]
-
-            # SessionEnd side — replicate the exact call shape
-            date_str = obsidian_utils._first_seen_date(sid)
-            session_end_filename = obsidian_utils.make_filename(
-                date_str,
-                obsidian_utils.slugify(project),
-                sid,
-            )
-            session_end_basename = session_end_filename[:-3]  # strip .md
-
-            assert helper_basename == session_end_basename, (
-                f"divergence for project={project!r}, sid={sid}:\n"
-                f"  helper:      {helper_basename}\n"
-                f"  session_end: {session_end_basename}"
-            )
+def test_helper_returns_the_exact_existing_session_basename(selected_host_context):
+    context = selected_host_context
+    name = "2026-04-20-project-with_underscores-native-identity.md"
+    _native_index_notes(context, [(name, context.host, context.native_session_id, "claude-session")])
+    result = _native_result(context)
+    assert result["session_note_name"] == name[:-3]
+    assert result["session_id"] == context.native_session_id
 
 
 def test_session_end_filename_uses_marker_date(isolated_home, monkeypatch):
@@ -358,71 +305,21 @@ def test_resolve_no_match_returns_empty(tmp_path):
     assert collisions == []
 
 
-def test_get_session_context_uses_type_aware_resolver(isolated_home, tmp_path, monkeypatch, capsys):
-    """get_session_context with a snapshot+session sharing the hash returns
-    the session, not the snapshot (#101 Fix C)."""
-    sid = "real-session-id"
-    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
-    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid)
-    monkeypatch.setattr(obsidian_utils, "canonical_project_name",
-                        lambda *a, **kw: "obsidian-brain")
-
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-    cwd = str(tmp_path / "obsidian-brain")
-    (tmp_path / "obsidian-brain").mkdir()
-    monkeypatch.chdir(tmp_path / "obsidian-brain")
-
-    _write_note(sessions / f"2026-04-20-obsidian-brain-{h}.md",
-                {"type": "claude-session", "session_id": sid,
-                 "project_path": f'"{cwd}"'})
-    _write_note(sessions / f"2026-04-20-obsidian-brain-{h}-snapshot-101010.md",
-                {"type": "claude-snapshot", "session_id": sid})
-
-    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-    assert ctx["session_note_name"] == f"2026-04-20-obsidian-brain-{h}"
-    # Should NOT be the snapshot
-    assert "snapshot" not in ctx["session_note_name"]
+def test_get_session_context_uses_type_aware_resolver(selected_host_context):
+    context = selected_host_context
+    _native_index_notes(context, [
+        ("existing-session.md", context.host, context.native_session_id, "claude-session"),
+        ("existing-snapshot.md", context.host, context.native_session_id, "claude-snapshot")])
+    assert _native_result(context)["session_note_name"] == "existing-session"
 
 
-def test_get_session_context_disambiguates_cross_project_hash_collision(
-    isolated_home, tmp_path, monkeypatch, capsys
-):
-    """When two session-type notes share the 4-char hash across projects,
-    get_session_context returns the cwd-matching one and emits a WARN
-    listing the other (#101 Fix C)."""
-    sid = "real-session-id"
-    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
-    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid)
-    monkeypatch.setattr(obsidian_utils, "canonical_project_name",
-                        lambda *a, **kw: "obsidian-brain")
-
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-
-    cwd_a = str(tmp_path / "obsidian-brain")
-    (tmp_path / "obsidian-brain").mkdir()
-    monkeypatch.chdir(tmp_path / "obsidian-brain")
-
-    # Two session-type notes with the SAME hash but DIFFERENT project_path —
-    # this is the cross-project hash collision the resolver disambiguates.
-    _write_note(sessions / f"2026-04-20-obsidian-brain-{h}.md",
-                {"type": "claude-session", "session_id": "sid-a",
-                 "project_path": f'"{cwd_a}"'})
-    _write_note(sessions / f"2026-04-21-other-project-{h}.md",
-                {"type": "claude-session", "session_id": "sid-b",
-                 "project_path": '"/some/other/project"'})
-
-    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-    assert ctx["session_note_name"] == f"2026-04-20-obsidian-brain-{h}", (
-        f"expected cwd-matching basename, got {ctx['session_note_name']}"
-    )
-    captured = capsys.readouterr()
-    assert "WARN" in captured.err
-    assert f"hash {h}" in captured.err
-    assert "other-project" in captured.err  # the OTHER session is named in the warning
+def test_get_session_context_rejects_colliding_short_hashes(selected_host_context):
+    context = selected_host_context
+    suffix = context.host + "-" + context.session_key[:16]
+    _native_index_notes(context, [
+        ("2026-04-20-current-" + suffix + ".md", context.host, context.native_session_id, "claude-session"),
+        ("2026-04-21-other-" + suffix + ".md", context.host, "foreign-full-id", "claude-session")])
+    assert _native_result(context)["session_note_name"] == "2026-04-20-current-" + suffix
 
 
 def test_is_resumed_session_filters_snapshot_type(tmp_path, monkeypatch):
@@ -1121,57 +1018,13 @@ def _encoded_project_dir(home: Path, path: str) -> Path:
     return home / ".claude" / "projects" / path.replace("/", "-").replace("_", "-")
 
 
-def test_get_session_context_readable_subdir_never_borrows_other_project_session(
-    isolated_home, tmp_path, monkeypatch, capsys
-):
-    """Headline #260 repro, end to end.
-
-    cwd is a readable, non-git subdirectory with no JSONLs of its own
-    (`.../sonno-tiny-homes-pitch/docs`), and exactly ONE other project has a
-    recent sid-* bootstrap plus a poisoned cache entry (`wealth-management`).
-    get_session_context() must not return ANY of that other session's fields.
-    """
-    other_sid = "0524bab1-1111-2222-3333-444455556666"
-    other_hash = "976b"
-    other_note = "2026-06-28-wealth-management-976b"
-
-    _redirect_secure_paths(monkeypatch, isolated_home)
-
-    # The other project: recent bootstrap + a real JSONL + a cached context.
-    _seed_bootstrap(isolated_home, "wealth-management", other_sid)
-    other_cc = _encoded_project_dir(isolated_home, "/Users/x/dev/wealth-management")
-    other_cc.mkdir(parents=True)
-    (other_cc / f"{other_sid}.jsonl").write_text("{}\n", encoding="utf-8")
-
-    vault = tmp_path / "vault"
-    (vault / "claude-sessions").mkdir(parents=True)
-    cache_key = f"session_context:{vault}:claude-sessions"
-    (isolated_home / ".claude" / "obsidian-brain" / f"cache-{other_sid}.json").write_text(
-        json.dumps({cache_key: {
-            "session_id": other_sid,
-            "hash": other_hash,
-            "project": "wealth-management",
-            "session_note_name": other_note,
-            "cwd": "/Users/x/dev/wealth-management",
-        }}),
-        encoding="utf-8",
-    )
-
-    # This session: a readable subdirectory of a project with no JSONLs.
-    here = tmp_path / "sonno-tiny-homes-pitch" / "docs"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
-
-    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-
-    assert ctx["session_id"] == "unknown", (
-        f"resolved another project's session: {ctx['session_id']}"
-    )
-    assert ctx["hash"] == ""
-    assert ctx["session_note_name"] == ""
-    assert ctx["project"] == "docs"
-    assert other_sid not in json.dumps(ctx)
-    assert "wealth-management" not in json.dumps(ctx)
+def test_get_session_context_never_borrows_other_project_session(selected_host_context):
+    context = selected_host_context
+    _native_index_notes(context, [("wealth-management.md", context.host, "foreign-session", "claude-session")])
+    result = _native_result(context)
+    assert result["session_id"] == context.native_session_id
+    assert result["session_note_name"] == ""
+    assert "wealth-management" not in json.dumps(result)
 
 
 def test_resolve_session_id_readable_cwd_without_jsonl_refuses_bootstrap_scan(
@@ -1234,108 +1087,40 @@ def test_resolve_session_id_cwd_gone_with_env_dir_resolves_via_jsonl(
     assert obsidian_utils._resolve_session_id() == real_sid
 
 
-def test_get_session_context_rejects_cached_context_from_a_different_cwd(
-    isolated_home, tmp_path, monkeypatch, capsys
-):
-    """Fix 2: a cache-<sid>.json entry stamped with another cwd is discarded,
-    recomputed, and the discard is announced on stderr (never silent)."""
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    sid = "11111111-2222-3333-4444-555555555555"
-    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid)
-
-    vault = tmp_path / "vault"
-    (vault / "claude-sessions").mkdir(parents=True)
-    secure = isolated_home / ".claude" / "obsidian-brain"
-    secure.mkdir(parents=True, exist_ok=True)
-    cache_key = f"session_context:{vault}:claude-sessions"
-    (secure / f"cache-{sid}.json").write_text(
-        json.dumps({cache_key: {
-            "session_id": sid,
-            "hash": "dead",
-            "project": "wealth-management",
-            "session_note_name": "2026-06-28-wealth-management-976b",
-            "cwd": "/Users/x/dev/wealth-management",
-        }}),
-        encoding="utf-8",
-    )
-
-    here = tmp_path / "sonno-tiny-homes-pitch"
-    here.mkdir()
-    monkeypatch.chdir(here)
-
-    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-
-    assert ctx["project"] == "sonno-tiny-homes-pitch", (
-        f"returned another cwd's cached context: {ctx}"
-    )
-    assert ctx["session_note_name"] != "2026-06-28-wealth-management-976b"
-    assert ctx["hash"] != "dead"
-    assert ctx["cwd"] == os.getcwd()
-    err = capsys.readouterr().err
-    assert "WARN" in err and "wealth-management" in err, err
+def test_get_session_context_rejects_cached_context_from_a_different_cwd(selected_host_context):
+    context = selected_host_context
+    key = f"session_context:{context.vault_path}:claude-sessions"
+    obsidian_utils.cache_set(context.native_session_id, key,
+        {"session_id": context.native_session_id, "hash": "dead", "project": "wealth-management",
+         "session_note_name": "foreign-note", "cwd": "/foreign/worktree"})
+    result = _native_result(context)
+    assert result["cwd"] == str(context.worktree)
+    assert result["hash"] != "dead"
+    assert result["project"] == context.canonical_project_root.name
+    assert result["session_note_name"] == ""
 
 
-def test_get_session_context_recomputes_pre_260_cache_entry_quietly(
-    isolated_home, tmp_path, monkeypatch, capsys
-):
-    """A cache entry written before the cwd stamp existed has no `cwd` key.
-    That is a format upgrade, not evidence of mis-attribution: recompute, but
-    do not cry wolf on stderr."""
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    sid = "99999999-8888-7777-6666-555555555555"
-    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: sid)
-
-    vault = tmp_path / "vault"
-    (vault / "claude-sessions").mkdir(parents=True)
-    secure = isolated_home / ".claude" / "obsidian-brain"
-    secure.mkdir(parents=True, exist_ok=True)
-    cache_key = f"session_context:{vault}:claude-sessions"
-    (secure / f"cache-{sid}.json").write_text(
-        json.dumps({cache_key: {
-            "session_id": sid, "hash": "abcd", "project": "legacy-proj",
-            "session_note_name": "2026-01-01-legacy-proj-abcd",
-        }}),
-        encoding="utf-8",
-    )
-
-    here = tmp_path / "current-proj"
-    here.mkdir()
-    monkeypatch.chdir(here)
-
-    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-    assert ctx["project"] == "current-proj"
-    assert "WARN" not in capsys.readouterr().err
-
-    # The recomputed entry carries the stamp, so the next call is a clean hit.
-    ctx2 = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-    assert ctx2 == ctx
+def test_get_session_context_ignores_legacy_cache_entry_without_cwd(selected_host_context, capsys):
+    context = selected_host_context
+    obsidian_utils.cache_set(context.native_session_id,
+        f"session_context:{context.vault_path}:claude-sessions",
+        {"session_id": context.native_session_id, "hash": "abcd", "project": "legacy-proj",
+         "session_note_name": "legacy-note"})
+    first = _native_result(context)
+    assert first["project"] == context.canonical_project_root.name
+    assert first["session_note_name"] == ""
+    assert _native_result(context) == first
     assert "WARN" not in capsys.readouterr().err
 
 
-def test_get_session_context_unknown_is_not_cached_and_returns_live_project(
-    isolated_home, tmp_path, monkeypatch
-):
-    """'unknown' round-trips: no cache file is written for it, and the project
-    comes from the live canonical_project_name() rather than a stale entry."""
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: "unknown")
-
-    vault = tmp_path / "vault"
-    (vault / "claude-sessions").mkdir(parents=True)
-    here = tmp_path / "live-project"
-    here.mkdir()
-    monkeypatch.chdir(here)
-
-    ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-    assert ctx == {
-        "session_id": "unknown",
-        "hash": "",
-        "project": "live-project",
-        "session_note_name": "",
-        "cwd": os.getcwd(),
-    }
-    secure = isolated_home / ".claude" / "obsidian-brain"
-    assert list(secure.glob("cache-unknown*")) == []
+def test_get_session_context_missing_index_returns_bound_identity_without_creating_state(selected_host_context):
+    context = selected_host_context
+    assert not context.index_path.exists()
+    result = _native_result(context)
+    assert result == {"session_id": context.native_session_id, "hash": context.session_key[:16],
+        "project": context.canonical_project_root.name, "session_note_name": "", "cwd": str(context.worktree)}
+    assert not context.index_path.exists()
+    assert not context.state_path.exists()
 
 
 def test_glob_project_jsonls_prefers_the_dir_encoding_this_cwd(
@@ -1778,31 +1563,13 @@ def test_resolve_session_id_readable_cwd_still_refuses_the_recent_bootstrap(
     assert obsidian_utils._resolve_session_id() == "unknown"
 
 
-def test_get_session_context_announces_an_unresolvable_session_once(
-    isolated_home, tmp_path, monkeypatch, capsys
-):
-    """I4: 'unknown' is the most common exit from the resolver and was the only
-    one with no diagnostic. Downstream, /retro prints "no prior-session evidence
-    found", asserting a fact about the VAULT when the truth is a fact about the
-    RESOLVER — the user cannot tell a fresh session from a resolution failure.
-    """
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: "unknown")
-
-    vault = tmp_path / "vault"
-    (vault / "claude-sessions").mkdir(parents=True)
-    here = tmp_path / "live-project"
-    here.mkdir()
-    monkeypatch.chdir(here)
-
-    for _ in range(5):
-        ctx = obsidian_utils.get_session_context(str(vault), "claude-sessions")
-        assert ctx["session_id"] == "unknown"
-
-    err = capsys.readouterr().err
-    assert err.count("could not identify the current session") == 1, err
-    assert os.getcwd() in err
-    assert "session-scoped evidence" in err
+def test_get_session_context_rejects_invalid_identity_before_lookup(selected_host_context):
+    from runtime_context import RuntimeContextError, resolve_runtime_context
+    with pytest.raises(RuntimeContextError, match="native session ID"):
+        resolve_runtime_context(selected_host_context.host, selected_host_context.client,
+            {"session_id": "", "cwd": str(selected_host_context.worktree)},
+            {"config_path": selected_host_context.config_path, "resource_root": selected_host_context.resource_root})
+    assert not selected_host_context.index_path.exists()
 
 
 # ─── #330 task 1: allow_env plumbing (no behavior yet) ─────────────────
@@ -2048,78 +1815,23 @@ def test_resolve_session_id_env_absent_matches_pre_existing_scan_behavior(
     assert obsidian_utils._resolve_session_id() == scan_sid
 
 
-def test_get_session_context_stable_under_env_unstable_without_it(
-    isolated_home, monkeypatch, tmp_path
-):
-    """Core #330 regression, reproduced directly: two consecutive
-    get_session_context() calls must resolve to the SAME session while a
-    competing transcript becomes the newest-mtime winner in between — this
-    is the exact shape of the crossed retro note (source_session and
-    source_session_note disagreeing because two calls in one note write
-    resolved via two different newest-mtime winners).
-
-    The negative control (same scenario, no env var) must resolve
-    DIFFERENTLY on the second call — proving the stability comes from the
-    env layer actually being consulted, not from get_session_context()'s own
-    cache or from the test being trivially true either way."""
-    import time
-
-    # --- with the env var: stable across both calls -----------------
-    project = "stability-env-proj"
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{_unique_sid()}.jsonl").write_text("{}\n")
-
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
-
-    env_sid = _unique_sid()
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
-
-    ctx1 = obsidian_utils.get_session_context()
-
-    # Touch a competing transcript so it becomes the newest-mtime winner.
-    later_sid = _unique_sid()
-    later_path = cc_dir / f"{later_sid}.jsonl"
-    later_path.write_text("{}\n")
-    later_ts = time.time() + 3600
-    os.utime(later_path, (later_ts, later_ts))
-
-    ctx2 = obsidian_utils.get_session_context()
-
-    assert ctx1["session_id"] == env_sid
-    assert ctx2["session_id"] == env_sid
-    assert ctx1["session_note_name"] == ctx2["session_note_name"]
-
-    # --- negative control: no env var → the winner changes -----------
-    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
-
-    project2 = "stability-noenv-proj"
-    cc_dir2 = isolated_home / ".claude" / "projects" / f"-Users-test-{project2}"
-    cc_dir2.mkdir(parents=True, exist_ok=True)
-    first_sid = _unique_sid()
-    (cc_dir2 / f"{first_sid}.jsonl").write_text("{}\n")
-
-    target2 = tmp_path / project2
-    target2.mkdir()
-    monkeypatch.chdir(target2)
-
-    ctx3 = obsidian_utils.get_session_context()
-    assert ctx3["session_id"] == first_sid
-
-    second_sid = _unique_sid()
-    second_path = cc_dir2 / f"{second_sid}.jsonl"
-    second_path.write_text("{}\n")
-    later_ts2 = time.time() + 3600
-    os.utime(second_path, (later_ts2, later_ts2))
-
-    ctx4 = obsidian_utils.get_session_context()
-    assert ctx4["session_id"] == second_sid
-    assert ctx3["session_id"] != ctx4["session_id"], (
-        "negative control did not reproduce instability — the test setup "
-        "cannot distinguish env-layer stability from an unrelated cache hit"
-    )
+def test_get_session_context_stays_bound_when_ambient_session_and_cwd_change(selected_host_context, tmp_path, monkeypatch):
+    context = selected_host_context
+    first = _native_result(context)
+    other = tmp_path / "unrelated-project"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    for variable in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+        monkeypatch.setenv(variable, "foreign-newest-session")
+    assert _native_result(context) == first
+    from runtime_context import resolve_runtime_context, using_runtime_context
+    changed = resolve_runtime_context(context.host, context.client,
+        {"session_id": "new-explicit-session", "cwd": str(other)},
+        {"config_path": context.config_path, "resource_root": context.resource_root})
+    with using_runtime_context(changed):
+        second = _native_result(changed)
+    assert second["session_id"] != first["session_id"]
+    assert second["cwd"] != first["cwd"]
 
 
 def test_check_hook_status_ignores_env_var_uses_jsonl_scan(
@@ -2369,22 +2081,11 @@ def test_resolve_session_id_ignores_blank_codex_marker_and_codex_home(
     assert obsidian_utils._resolve_session_id() == sid
 
 
-def test_get_session_context_under_codex_returns_unknown_and_warns_once(
-    isolated_home, monkeypatch, tmp_path, capsys
-):
-    """End to end through the entry point skills call: no session id, no note
-    link, and one WARN naming the marker."""
-    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-ctx-proj")
-    monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000002")
-    ctx = obsidian_utils.get_session_context(str(tmp_path / "vault"), "claude-sessions")
-    obsidian_utils.get_session_context(str(tmp_path / "vault"), "claude-sessions")
-    assert ctx["session_id"] == "unknown"
-    assert ctx["session_note_name"] == ""
-    err = capsys.readouterr().err
-    assert err.count("CODEX_THREAD_ID is set") == 1, err
-    # The generic 'unknown' WARN says no Claude transcript resolves, which is
-    # false here: one did, and was refused. Only the Codex WARN may appear.
-    assert "could not identify the current session" not in err, err
+def test_get_session_context_rejects_foreign_provider_even_with_same_full_id(selected_host_context):
+    context = selected_host_context
+    foreign = "codex" if context.host == "claude" else "claude"
+    _native_index_notes(context, [("foreign-provider.md", foreign, context.native_session_id, "claude-session")])
+    assert _native_result(context)["session_note_name"] == ""
 
 
 @pytest.mark.parametrize("sid", ["unknown", ""])

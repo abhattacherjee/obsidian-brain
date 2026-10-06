@@ -63,7 +63,7 @@
     "packageManager": "none (stdlib only)"
   },
   "diagram": {
-    "intro": "Claude lifecycle handlers and explicit-host native CLI entry points use a shared stdlib runtime. Capture retains facts and immutable checkpoints before revision-checked note publication. On-demand AI runs only through the invoking native host. Task 4 is committed; Task 5 implementation is under validation. Task 6 packaging, the full host/client matrix and desktop hook dispatch acceptance remain pending. This is not a shipped parity claim.",
+    "intro": "Claude and Codex lifecycle descriptors enter an explicit-host shared runtime. Capture retains facts and immutable checkpoints before revision-checked note publication. Native AI runs through the invoking host. Tasks 4 and 5 are committed; Task 6 packaging and conformance are implemented under review. Actual installed-client acceptance remains pending, including blocked Codex Desktop dispatch. Parity has not shipped.",
     "tiers": [
       {
         "arrowLabel": null,
@@ -145,7 +145,7 @@
       }
     ],
     "notes": [
-      "Registered lifecycle hooks remain Claude-specific. Codex native hook packaging and full parity acceptance are pending.",
+      "Claude and Codex lifecycle descriptors are implemented. Actual installed-client dispatch and full parity acceptance remain pending.",
       "Vault OS ownership precedes session ownership. A living holder is never stolen by age; process death releases OS ownership.",
       "Atomic note publication follows a durable prepared operation. Cursor acknowledgment follows verified applied publication.",
       "Managed capture/summary hashes protect manual edits. Deferred AI receives an exact pre-generation source revision and runs without vault ownership.",
@@ -221,7 +221,7 @@
       "id": "shared-core",
       "name": "Shared Core (obsidian_utils)",
       "color": "#22D3EE",
-      "description": "Shared stdlib modules resolve explicit host context, normalize bounded native transcripts, retain capture facts, scrub secrets, prepare deferred summaries, and publish revision-checked vault changes. Task 4 native handlers are in progress; registered plugin packaging and final live acceptance remain pending.",
+      "description": "Explicit host context, bounded native transcripts, retained capture facts, secret scrubbing, native AI and revision-checked vault publication. Installed-client acceptance remains pending.",
       "components": [
         {
           "id": "runtime-context",
@@ -237,7 +237,7 @@
             "hooks/runtime_adapters/codex.py",
             "hooks/brain_cli.py"
           ],
-          "purpose": "Resolves an explicitly selected host and client. Native payload IDs take precedence over that host's tool environment; another host's IDs are never used. Resolves Git worktree roots, installed resources, config, shared index and separate host state. Config selection is CLI, OBSIDIAN_BRAIN_CONFIG, then native home. Existing shared indexes are preserved; new defaults are qualified by the resolved vault. The context CLI reads bounded JSON. brain_cli provides explicit-host context, capture, recover, and hook commands. Native lifecycle handlers are under implementation; plugin packaging and final live acceptance remain pending under #272."
+          "purpose": "Resolves explicitly selected host and client, canonical project root, frozen native home, config, vault, shared index and private host state. Codex requires codex-cli or codex-desktop; unresolved frontend identity returns a diagnostic instead of guessing. brain_cli routes bounded context, capture, recovery, hooks and trusted skill operations."
         },
         {
           "id": "load-config",
@@ -490,7 +490,7 @@
             "hooks/native_lifecycle.py",
             "hooks/brain_cli.py"
           ],
-          "purpose": "Thin explicit-host CLI wrapper records its entry time before handler work. Start/resume rotate through at most eight registered sources within one second, then capture and read one bounded indexed context hint. Stop captures before the retro gate; capture failure cannot itself block. PreCompact captures and publishes an immutable snapshot. SessionEnd flushes with a 2.5-second work deadline; only this explicit event marks a session ended. turn_aborted marks interruption; task_complete ends a turn. Hooks do not invoke AI, scan the full vault, or rebuild the index. Task 4 is in progress; fixture subprocess checks are not desktop-native dispatch proof."
+          "purpose": "Shared bounded Start/resume, Stop, PreCompact and End handlers capture before legacy retro gates, retain pending input, and recover bounded registered sources. Claude and Codex descriptors enter native_entry; fixtures prove shared behavior, not actual Desktop dispatch."
         },
         {
           "id": "native-ai-backend",
@@ -521,6 +521,34 @@
             "hooks/session_lookup.py"
           ],
           "purpose": "Read-only bounded lookup verifies full host/native session identity in frontmatter before adopting an existing session note. Short display hashes, a changed date or another project worktree do not prove identity. Candidate overflow, ambiguous matches, unusable index or deadline expiry stays pending. It does not scan the whole vault, create an index or guess a host."
+        },
+        {
+          "id": "native-entry",
+          "name": "Native hook entry and descriptors",
+          "kind": "module",
+          "hosts": [
+            "claude",
+            "codex"
+          ],
+          "files": [
+            "hooks/native_entry.py",
+            "hooks/hooks.json",
+            "hooks/codex-hooks.json"
+          ],
+          "purpose": "Selects native actor and verified current client before dispatch. Codex events without client proof retain a deferred diagnostic; another frontend is never inferred from transcript origin."
+        },
+        {
+          "id": "session-auxiliary-state",
+          "name": "Private session auxiliary state",
+          "kind": "module",
+          "hosts": [
+            "claude",
+            "codex"
+          ],
+          "files": [
+            "hooks/session_auxiliary_state.py"
+          ],
+          "purpose": "Owner-only caches, calendar, locks and retro decisions use vault, host, native session ID and canonical project root. State remains outside the selected vault and rejects symlinks."
         }
       ]
     },
@@ -1233,7 +1261,7 @@
           "files": [
             "tests/"
           ],
-          "purpose": "84 test_*.py files plus conftest.py, coverage source=hooks, fail_under=90. Hook simulation pattern pipes synthetic JSON into installed hooks; import-time state-dir constants isolated via autouse conftest monkeypatch."
+          "purpose": "Pytest tests isolate native homes and outbound transport. Coverage remains at least 90%; collection checks actual selected-host behavior and exact reviewed launcher source hashes."
         },
         {
           "id": "ops-security-tests",
@@ -1243,6 +1271,20 @@
             "scripts/test-security.sh"
           ],
           "purpose": "Runs the security regression suite (path containment, secret scrub, temp-path safety) with OB_HOOKS_DIR=hooks."
+        },
+        {
+          "id": "host-conformance-ci",
+          "name": "Invoking-host conformance and acceptance",
+          "kind": "ops",
+          "files": [
+            ".github/workflows/host-conformance.yml",
+            ".github/workflows/native-fixture-refresh.yml",
+            "tests/parity_collection_plugin.py",
+            "docs/parity/capabilities.json",
+            "scripts/dev-test/capture-synthetic-host-fixtures.py",
+            "scripts/ci-checks/check-parity-acceptance.py"
+          ],
+          "purpose": "Collection requires reviewed behavior contracts and actual selected Claude/Codex contexts. Platform/Python CI runs paired contracts. Weekly isolated synthetic capture records exact source hashes and cannot prove native installed dispatch. Release acceptance requires hashed exact-commit evidence for all three clients and seven criteria; absent Desktop proof blocks acceptance. Native acceptance reads an external per-feature-SHA repository variable, validates contained hashed JSON evidence, and uploads an audit artifact. The tracked pending ledger cannot certify its own commit."
         }
       ]
     }
@@ -1251,7 +1293,7 @@
     {
       "id": "explicit-host-context",
       "name": "Explicit host context",
-      "description": "The shared context CLI resolves identity and paths for Claude Code or Codex. Native Codex lifecycle dispatch and packaging remain pending under #272.",
+      "description": "The shared context CLI resolves explicit identity and paths for Claude Code or Codex. Native descriptors are implemented; actual installed-client dispatch remains unverified under #272.",
       "steps": [
         {
           "from": "runtime-context",
@@ -2146,8 +2188,8 @@
     },
     {
       "id": "native-capture-lifecycle",
-      "name": "Bounded native capture lifecycle (Task 4 in progress)",
-      "description": "Retain native facts and source state before visible publication; recover only registered sources. Plugin packaging and desktop-native execution acceptance remain pending.",
+      "name": "Bounded native capture lifecycle",
+      "description": "Retain native facts and source state before visible publication; recover only registered sources. Plugin descriptors are implemented; actual Desktop execution acceptance remains pending.",
       "steps": [
         {
           "from": "runtime-context",
@@ -2194,7 +2236,7 @@
     {
       "id": "native-ai-analysis",
       "name": "Native analysis and conditional publication",
-      "description": "Implemented Task 5 path under validation; Task 6 packaging and full parity acceptance remain pending.",
+      "description": "Task 5 is committed. Task 6 packaging and conformance are under review; actual installed-client acceptance remains pending.",
       "steps": [
         {
           "from": "runtime-context",
@@ -2665,7 +2707,7 @@
   "testing": {
     "unitSuite": {
       "tool": "pytest",
-      "fileCount": 111,
+      "fileCount": 172,
       "duration": "fast (stdlib, no network)",
       "environments": {
         "python": "3.12",
@@ -2685,7 +2727,7 @@
       "devices": [
         "hook simulation: pipe synthetic SessionEnd/SessionStart/PreCompact JSON into installed hooks",
         "json.load validation of hooks.json and plugin.json",
-        "Shared transaction/capture/cache fixtures cover process death, replay, immutable checkpoints, manual edits, raw-byte repair, moves/deletes and owner-only cache publication. Native Codex dispatch acceptance remains a later required gate."
+        "Paired synthetic capture, writer, CLI and skill contracts preserve origin identity and manual prose. Actual native Claude Code, Codex CLI and Codex Desktop installed dispatch requires separate exact-commit evidence; Desktop acceptance remains blocked."
       ],
       "rationale": "No build/test framework for the prompt-based skills; hooks are validated by feeding synthetic lifecycle JSON and asserting vault writes + telemetry outcomes."
     }

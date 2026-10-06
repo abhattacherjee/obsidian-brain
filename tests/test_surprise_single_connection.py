@@ -38,7 +38,7 @@ def _seed_theme(db: str, project: str = "p") -> None:
         conn.close()
 
 
-def test_upgrade_opens_at_most_two_connections(tmp_path, monkeypatch):
+def test_upgrade_opens_at_most_two_connections(tmp_path, monkeypatch, selected_host_context):
     """upgrade_note_with_summary must open <=2 sqlite connections for the
     index+theme+surprise pipeline (importance + upsert share conn A;
     assign_to_theme including surprise is conn B).
@@ -49,7 +49,7 @@ def test_upgrade_opens_at_most_two_connections(tmp_path, monkeypatch):
     # Minimal vault + DB setup.
     vault = tmp_path / "vault"
     sess = vault / "claude-sessions"
-    sess.mkdir(parents=True)
+    sess.mkdir(parents=True, exist_ok=True)
     note = sess / "s.md"
     # Raw note body uses terms that will survive into the summary.
     note.write_text(
@@ -57,7 +57,8 @@ def test_upgrade_opens_at_most_two_connections(tmp_path, monkeypatch):
         "title: s\nstatus: auto-logged\n---\n\n"
         "python work changes cannot avoid broken\n"
     )
-    db = str(tmp_path / "idx.db")
+    from runtime_context import current_runtime_context
+    db = str(current_runtime_context().index_path)
     vault_index.rebuild_index(str(vault), ["claude-sessions"], db_path=db, full=True)
 
     # Seed a theme whose centroid overlaps the summarized note content.
@@ -100,20 +101,21 @@ def _build_upgrade_setup(tmp_path):
     """Shared setup for surprise-value tests: vault + note + DB + theme."""
     vault = tmp_path / "vault"
     sess = vault / "claude-sessions"
-    sess.mkdir(parents=True)
+    sess.mkdir(parents=True, exist_ok=True)
     note = sess / "s.md"
     note.write_text(
         "---\ntype: session\nproject: p\ndate: 2026-06-15\n"
         "title: s\nstatus: auto-logged\n---\n\n"
         "python work changes cannot avoid broken\n"
     )
-    db = str(tmp_path / "idx.db")
+    from runtime_context import current_runtime_context
+    db = str(current_runtime_context().index_path)
     vault_index.rebuild_index(str(vault), ["claude-sessions"], db_path=db, full=True)
     _seed_theme(db)
     return vault, note, db
 
 
-def test_upgrade_surprise_value_new_member(tmp_path, monkeypatch):
+def test_upgrade_surprise_value_new_member(tmp_path, monkeypatch, selected_host_context):
     """surprise stored in theme_members equals oracle computed from full file.
 
     Oracle: read the note file raw (frontmatter + body) — same input as Fix 1
@@ -171,7 +173,7 @@ def test_upgrade_surprise_value_new_member(tmp_path, monkeypatch):
     )
 
 
-def test_upgrade_surprise_value_reassignment(tmp_path, monkeypatch):
+def test_upgrade_surprise_value_reassignment(tmp_path, monkeypatch, selected_host_context):
     """On reassignment, surprise is recomputed against the UNCHANGED centroid.
 
     Call assign_to_theme directly a second time with explicit note_text; assert
@@ -288,7 +290,7 @@ def test_upgrade_surprise_value_reassignment(tmp_path, monkeypatch):
     )
 
 
-def test_connection_a_rollback_does_not_block_upgrade(tmp_path, monkeypatch):
+def test_connection_a_rollback_does_not_block_upgrade(tmp_path, monkeypatch, selected_host_context):
     """Connection-A (index + importance) exception rolls back cleanly.
 
     Best-effort contract: if _upsert_note raises inside the BEGIN IMMEDIATE
@@ -340,7 +342,7 @@ def test_connection_a_rollback_does_not_block_upgrade(tmp_path, monkeypatch):
     )
 
 
-def test_surprise_body_read_failure_still_assigns_theme(tmp_path, monkeypatch):
+def test_surprise_body_read_failure_still_assigns_theme(tmp_path, monkeypatch, selected_host_context):
     """When the surprise-body read fails (OSError), theme assignment still runs.
 
     Regression test for C-001: the old code placed the open() call INSIDE

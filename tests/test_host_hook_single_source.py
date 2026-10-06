@@ -26,8 +26,8 @@ def test_codex_policy_hooks_use_one_source():
     assert {path.name for path in wrappers} <= {"lifecycle.py"}
     for wrapper in wrappers:
         source = wrapper.read_text()
-        assert "from brain_cli import main" in source
-        assert source.index("STARTED_AT = time.monotonic()") < source.index("from brain_cli import main")
+        assert "from native_entry import run" in source
+        assert source.index("STARTED_AT = time.monotonic()") < source.index("from native_entry import run")
         assert "capture_checkpoint" not in source and "decision" not in source
     claude = json.loads((ROOT / ".claude/settings.json").read_text())
     codex = json.loads((ROOT / ".codex/hooks.json").read_text())

@@ -4,8 +4,8 @@ import check_items_report
 import obsidian_utils
 
 
-def test_dashboard_preserves_manual_edit_during_render(tmp_path, monkeypatch):
-    vault = tmp_path / 'vault'
+def test_dashboard_preserves_manual_edit_during_render(selected_host_context, monkeypatch):
+    vault = selected_host_context.vault_path
     folder = vault / 'claude-check-items'
     folder.mkdir(parents=True)
     note = folder / 'check-items-project-2026-10-05.md'

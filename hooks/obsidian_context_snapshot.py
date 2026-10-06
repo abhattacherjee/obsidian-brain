@@ -4,7 +4,7 @@ obsidian_context_snapshot.py -- PreCompact hook for obsidian-brain plugin.
 
 Captures a snapshot of the current session context before compaction or
 context clear, writing it to the Obsidian vault. Uses raw message extraction
-(no claude -p call) to avoid timing issues. Always exits 0.
+(no native analysis call) to avoid timing issues. Always exits 0.
 """
 
 from __future__ import annotations

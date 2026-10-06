@@ -320,6 +320,8 @@ def execute_ai(context, operation, request):
         if len(prompt.encode("utf-8")) > MAX_INPUT_BYTES:
             raise _BackendFailure("unavailable", "input_limit")
         deadline = time.monotonic() + request.timeout
+        if context.native_home is None:
+            raise _BackendFailure("unavailable", "native_home_missing")
         env = dict(os.environ)
         env["OBSIDIAN_BRAIN_NESTED_AI"] = "1"
         with tempfile.TemporaryDirectory(prefix="obsidian-ai-") as private:

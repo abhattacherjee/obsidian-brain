@@ -1,9 +1,8 @@
 # AGENTS.md
 
 Read [CLAUDE.md](CLAUDE.md) for the repository's shared development, security,
-architecture, and Git Flow rules. Its `.claude-plugin/` paths, `~/.claude/`
-configuration, and `claude -p` commands describe the current implementation;
-do not replace them with Codex paths unless the corresponding code exists.
+architecture, and Git Flow rules. Shared runtime rules live there; native
+storage and execution are selected by explicit host adapters.
 
 ## Codex guidance
 
@@ -11,8 +10,11 @@ do not replace them with Codex paths unless the corresponding code exists.
   coverage gate and the repository checks.
 - Codex parity is specified in
   [docs/codex-claude-parity-design.md](docs/codex-claude-parity-design.md).
-  The shared runtime, Codex lifecycle hooks, and Codex plugin packaging in
-  that design have not shipped. Do not claim parity from this repository's
-  Codex project guidance alone.
+  The shared runtime and plugin packaging are implemented on this branch,
+  but full parity has not shipped. Current-client binding and native Desktop
+  dispatch remain unverified. See [acceptance evidence](docs/parity/acceptance-evidence.md).
+- Native Codex context requires `codex-cli` or `codex-desktop` explicitly.
+  Do not infer the current frontend from a thread's creation metadata or a
+  daemon's environment. Missing identity defers native hook capture.
 - Keep host-specific instructions in this file. Put shared rules in
   `CLAUDE.md` and link to them here so the two instruction files stay in step.

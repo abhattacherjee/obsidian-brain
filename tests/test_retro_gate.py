@@ -33,25 +33,28 @@ SID = "test-retro-session-abc123"
 # ---------------------------------------------------------------------------
 
 
+def _native_command(context):
+    return [sys.executable, str(REPO_ROOT / 'hooks' / 'brain_cli.py'),
+        '--host', context.host, '--client', context.client, '--event', 'stop',
+        '--config', str(context.config_path), '--resource-root', str(context.resource_root),
+        '--index', str(context.index_path), '--state', str(context.state_path), 'hook']
+
+
 def _run_hook(payload: dict, tmp_home: Path) -> subprocess.CompletedProcess:
-    """Run the retro-gate hook with the given JSON payload and isolated HOME."""
-    env = {**os.environ, "HOME": str(tmp_home)}
-    return subprocess.run(
-        [sys.executable, str(HOOK_SCRIPT)],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    assert context is not None
+    payload = dict(payload, cwd=str(context.worktree))
+    return subprocess.run(_native_command(context), input=json.dumps(payload),
+        capture_output=True, text=True, env=dict(os.environ), timeout=5)
 
 
 def _write_sentinel(tmp_home: Path, session_id: str, retro_path: str = "/tmp/retro.md",
                     created_at: float | None = None) -> Path:
     """Write a sentinel file directly into the tmp HOME's retro-gate dir."""
-    gate_dir = tmp_home / ".claude" / "obsidian-brain" / "retro-gate"
+    gate_dir = obsidian_utils._retro_gate_dir()
     gate_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    sanitized = "".join(c if c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" else "_"
-                        for c in session_id)
+    sanitized = obsidian_utils._retro_sentinel_key(session_id)
     sentinel = gate_dir / f"{sanitized}.json"
     payload = {
         "session_id": session_id,
@@ -69,9 +72,13 @@ def _write_sentinel(tmp_home: Path, session_id: str, retro_path: str = "/tmp/ret
 
 
 class TestRetroGateSubprocess:
+    @pytest.fixture(autouse=True)
+    def _bind_native(self, selected_host_context):
+        return selected_host_context
+
     def test_blocks_when_pending_fresh(self, tmp_path):
         """Fresh sentinel + stop_hook_active False → decision==block."""
-        tmp_home = tmp_path / "home"
+        tmp_home = tmp_path / "legacy-home"
         tmp_home.mkdir()
         _write_sentinel(tmp_home, SID)
 
@@ -86,7 +93,7 @@ class TestRetroGateSubprocess:
 
     def test_allows_when_absent(self, tmp_path):
         """No sentinel → exit 0, empty stdout (no block)."""
-        tmp_home = tmp_path / "home"
+        tmp_home = tmp_path / "legacy-home"
         tmp_home.mkdir()
         # Don't write a sentinel.
 
@@ -98,7 +105,7 @@ class TestRetroGateSubprocess:
 
     def test_allows_and_clears_when_stop_hook_active(self, tmp_path):
         """Sentinel present + stop_hook_active True → no block + sentinel removed."""
-        tmp_home = tmp_path / "home"
+        tmp_home = tmp_path / "legacy-home"
         tmp_home.mkdir()
         sentinel = _write_sentinel(tmp_home, SID)
         assert sentinel.exists()
@@ -112,7 +119,7 @@ class TestRetroGateSubprocess:
 
     def test_allows_and_clears_when_stale(self, tmp_path):
         """Stale sentinel (3 hours old) → no block + sentinel removed."""
-        tmp_home = tmp_path / "home"
+        tmp_home = tmp_path / "legacy-home"
         tmp_home.mkdir()
         stale_ts = time.time() - 3 * 3600  # 3 hours ago
         sentinel = _write_sentinel(tmp_home, SID, created_at=stale_ts)
@@ -127,16 +134,16 @@ class TestRetroGateSubprocess:
 
     def test_fail_open_on_malformed_stdin(self, tmp_path):
         """Malformed JSON stdin → exit 0, no block output."""
-        tmp_home = tmp_path / "home"
+        tmp_home = tmp_path / "legacy-home"
         tmp_home.mkdir()
 
         env = {**os.environ, "HOME": str(tmp_home)}
         result = subprocess.run(
-            [sys.executable, str(HOOK_SCRIPT)],
+            _native_command(__import__("runtime_context").current_runtime_context()),
             input="not valid json {{{{",
             capture_output=True,
             text=True,
-            env=env,
+            env=env, timeout=5,
         )
 
         assert result.returncode == 0
@@ -161,8 +168,8 @@ class TestRetroGateSubprocess:
 
 class TestRetroGateCrossSource:
     @pytest.fixture(autouse=True)
-    def _redirect_home(self, tmp_path, monkeypatch):
-        self._tmp_home = tmp_path / "home"
+    def _redirect_home(self, tmp_path, monkeypatch, selected_host_context):
+        self._tmp_home = tmp_path / "legacy-home"
         self._tmp_home.mkdir()
         monkeypatch.setenv("HOME", str(self._tmp_home))
 
@@ -172,44 +179,34 @@ class TestRetroGateCrossSource:
             self._tmp_home,
         )
 
-    def test_arm_via_get_session_context_then_check_via_hook(self, monkeypatch):
-        """The real arm->check path, end to end.
-
-        Arm: resolve the sid via get_session_context() (layer 0 = the
-        CLAUDE_CODE_SESSION_ID env var, same as skills/retro/SKILL.md Step 7
-        does via ctx["session_id"]), then call
-        mark_retro_classification_pending() with THAT resolved value.
-
-        Check: drive hooks/obsidian_retro_gate.py as a subprocess with the
-        SAME id in its synthetic stdin JSON, as the harness does. This is the
-        pairing that was previously untested — every other test in this file
-        writes the sentinel directly with a hardcoded sid.
-        """
-        sid = "e2e-cross-source-9f8e7d1c"
-        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
-
+    def test_arm_via_get_session_context_then_check_via_hook(self, selected_host_context, monkeypatch):
+        """The skill and explicit native hook share the selected session identity."""
+        selected = selected_host_context
+        foreign_id = 'foreign-inherited-session'
+        monkeypatch.setenv('CLAUDE_CODE_SESSION_ID', foreign_id)
+        monkeypatch.setenv('CODEX_THREAD_ID', foreign_id)
         ctx = obsidian_utils.get_session_context()
-        assert ctx["session_id"] == sid, "layer 0 should resolve the env var verbatim"
-
-        result = obsidian_utils.mark_retro_classification_pending(ctx["session_id"], "/vault/e2e-retro.md")
-        assert result, "Expected a non-empty sentinel path"
-
-        blocked = self._run_hook_here(sid, stop_hook_active=False)
+        assert ctx['session_id'] == selected.native_session_id
+        assert obsidian_utils.mark_retro_classification_pending(ctx['session_id'], '/synthetic/retro.md')
+        def run(active=False):
+            env = dict(os.environ)
+            env['CODEX_HOME' if selected.host == 'codex' else 'CLAUDE_CONFIG_DIR'] = str(selected.native_home)
+            command = [sys.executable, str(REPO_ROOT / 'hooks' / 'brain_cli.py'),
+                       '--host', selected.host, '--client', selected.client, '--event', 'stop',
+                       '--config', str(selected.config_path), '--resource-root', str(selected.resource_root),
+                       '--index', str(selected.index_path), '--state', str(selected.state_path), 'hook']
+            return subprocess.run(command,
+                input=json.dumps({'session_id': selected.native_session_id,
+                                  'cwd': str(selected.worktree), 'stop_hook_active': active}),
+                capture_output=True, text=True, env=env, timeout=5)
+        blocked = run()
         assert blocked.returncode == 0
-        stdout = blocked.stdout.strip()
-        assert stdout, "Expected block output but got empty stdout"
-        data = json.loads(stdout)
-        assert data["decision"] == "block"
-
-        # Clear (as the hook itself does on a stop_hook_active re-entry) and
-        # confirm enforcement stops.
-        cleared = self._run_hook_here(sid, stop_hook_active=True)
+        assert json.loads(blocked.stdout)['decision'] == 'block'
+        cleared = run(True)
         assert cleared.returncode == 0
-        assert cleared.stdout.strip() == ""
-
-        after_clear = self._run_hook_here(sid, stop_hook_active=False)
-        assert after_clear.returncode == 0
-        assert after_clear.stdout.strip() == "", "Gate should no longer block after clearing"
+        assert cleared.stdout.strip() == ''
+        assert obsidian_utils.get_retro_classification_pending(selected.native_session_id) is None
+        assert run().stdout.strip() == ''
 
     def test_crossing_regression_arm_a_check_b_does_not_block(self, monkeypatch):
         """Pins the #330 failure mode: arm under one sid, check under another.
@@ -253,7 +250,7 @@ class TestRetroGateHelpers:
     @pytest.fixture(autouse=True)
     def _redirect_home(self, tmp_path, monkeypatch):
         """Redirect HOME so retro-gate helpers land in tmp_path."""
-        self._tmp_home = tmp_path / "home"
+        self._tmp_home = tmp_path / "legacy-home"
         self._tmp_home.mkdir()
         monkeypatch.setenv("HOME", str(self._tmp_home))
         # Also patch Path.home() by overriding it in the module under test.
@@ -528,3 +525,15 @@ class TestRetroGateHelpers:
         result = obsidian_utils._reap_stale_retro_sentinels()
         assert result == 0
         assert non_json.exists(), ".tmp file must not be reaped"
+
+
+@pytest.fixture
+def selected_host_context(selected_host_context, host):
+    from runtime_context import resolve_runtime_context, using_runtime_context
+    original = selected_host_context
+    selected = resolve_runtime_context(host, original.client,
+        {'session_id': SID, 'cwd': str(original.worktree)},
+        {'config_path': original.config_path, 'resource_root': original.resource_root,
+         'index_path': original.index_path, 'state_path': original.state_path})
+    with using_runtime_context(selected):
+        yield selected

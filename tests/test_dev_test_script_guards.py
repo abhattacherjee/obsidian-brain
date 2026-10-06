@@ -62,6 +62,7 @@ def _write_script(dest_dir: Path) -> Path:
     script_path = dest_dir / "test-dev-skill.sh"
     script_path.write_bytes(SCRIPT_PATH.read_bytes())
     script_path.chmod(0o755)
+    shutil.copytree(REPO_ROOT / "scripts/dev-test", dest_dir / "dev-test", dirs_exist_ok=True)
     return script_path
 
 
@@ -79,20 +80,242 @@ def _run(script: Path, cmd: str, home: Path | str | object) -> subprocess.Comple
     altogether. Every pre-existing caller passes a `Path`, which is
     unaffected: `str(home)` on a `Path` behaves exactly as before.
     """
-    env = {k: v for k, v in os.environ.items() if k != "HOME"}
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    assert context.host == "claude"
+    env = {k: v for k, v in os.environ.items() if k not in {"HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"}}
     if home is not _HOME_UNSET:
         env["HOME"] = str(home)
+        if str(home):
+            env["CLAUDE_CONFIG_DIR"] = str(Path(home) / ".claude")
     return subprocess.run(
         # _BASH, not the literal "bash": `requires_bash` skips on
         # shutil.which("bash"), so invoking anything else would let the skip
         # guard and the invocation disagree about which binary is under test.
-        [_BASH, str(script), cmd],
+        [_BASH, str(script), cmd, "--host", context.host, "--source", str(script.parent.parent)],
         env=env,
         capture_output=True,
         text=True,
         timeout=10,
+        stdin=subprocess.DEVNULL,
     )
 
+
+
+@pytest.fixture
+def selected_host_context(host, tmp_path, monkeypatch):
+    from parity_test_helpers import selected_host_context as factory
+    root = tmp_path / 'selected-runtime'
+    root.mkdir()
+    generator = factory.__wrapped__(host, root, monkeypatch)
+    try:
+        yield next(generator)
+    finally:
+        generator.close()
+
+
+def _native_geometry(tmp_path):
+    from tests.test_dev_skill_install import _stage_repo, _stage_cache
+    root = tmp_path / 'native-installer'
+    source = _stage_repo(root)
+    home = _stage_cache(root)
+    cache = home / '.codex/plugins/cache/claude-code-skills/obsidian-brain/2.3.0'
+    return source, home, cache
+
+
+def _tree_bytes(root):
+    return {str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob('*') if path.is_file() and not path.is_symlink()}
+
+
+def _native_run(source, home, cache, mode, *, environment=None):
+    from tests.native_install_test_helpers import metadata_environment
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    assert context.host == 'codex'
+    env = metadata_environment(home) if environment is None else environment
+    return subprocess.run([_BASH, str(SCRIPT_PATH), mode, '--host', context.host,
+        '--source', str(source), '--cache-path', str(cache)],
+        env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+
+
+def _codex_guard_case(name, tmp_path, monkeypatch, **parameters):
+    """Exercise the corresponding native state contract, without CLI text emulation."""
+    import json
+    source, home, cache = _native_geometry(tmp_path)
+    config = home / '.codex/config.toml'
+    original = _tree_bytes(cache)
+    original_config = config.read_bytes()
+    backup = cache.with_name(cache.name + '.bak')
+    mode = 'install'
+    expect = 'refused'
+    if name == 'test_sentinel_guard_rejects_non_checkout':
+        shutil.rmtree(source / 'hooks')
+        mode, expect = 'status', 'status'
+    elif name in {'test_sentinel_guard_fires_before_any_mutation',
+                  'test_sentinel_guard_rejects_checkout_missing_hooks_file'}:
+        (source / 'hooks/obsidian_utils.py').unlink()
+    elif name == 'test_sentinel_guard_rejects_checkout_without_a_non_empty_skills_dir':
+        shutil.rmtree(source / 'skills')
+        if parameters['shape'] == 'empty-skills-dir':
+            (source / 'skills').mkdir()
+    elif name == 'test_install_never_creates_a_literal_star_skill_dir':
+        shutil.rmtree(source / 'skills')
+        (source / 'skills').mkdir()
+        (source / 'skills/README.md').write_text('not an installable skill')
+    elif name in {'test_self_copy_guard_rejects_install_from_inside_cache',
+                  'test_self_copy_guard_rejects_restore_from_inside_cache'}:
+        source = cache
+        mode = 'restore' if 'restore' in name else 'install'
+    elif name == 'test_self_copy_guard_fires_with_symlinked_home':
+        linked = tmp_path / 'linked-native-home'
+        linked.symlink_to(home, target_is_directory=True)
+        home = linked
+        cache = linked / '.codex/plugins/cache/claude-code-skills/obsidian-brain/2.3.0'
+    elif name == 'test_self_copy_guard_fires_with_symlinked_dot_claude':
+        native = home / '.codex'
+        target = home / 'native-dotfiles'
+        native.rename(target)
+        native.symlink_to(target, target_is_directory=True)
+    elif name == 'test_self_copy_guard_is_skipped_when_there_is_no_plugins_dir':
+        shutil.rmtree(home / '.codex/plugins')
+        original = {}
+    elif name == 'test_status_still_works_from_inside_cache':
+        source, mode, expect = cache, 'status', 'status'
+    elif name in {'test_home_fail_closed_block_pins_its_custom_message',
+                  'test_home_unset_fail_closed_block_pins_its_custom_message',
+                  'test_home_empty_string_fail_closed_block_pins_its_custom_message'}:
+        from tests.native_install_test_helpers import metadata_environment
+        environment = metadata_environment(home)
+        environment['CODEX_HOME'] = str(tmp_path / 'missing-selected-native-home')
+        if 'unset' in name:
+            environment.pop('HOME')
+        elif 'empty_string' in name:
+            environment['HOME'] = ''
+        proc = _native_run(source, home, cache, mode, environment=environment)
+        assert proc.returncode != 0 and proc.stderr.strip()
+        assert _tree_bytes(cache) == original and config.read_bytes() == original_config
+        assert not backup.exists()
+        return
+    elif name == 'test_self_copy_guard_rejects_install_from_a_marketplace_clone':
+        clone = home / '.codex/plugins/marketplaces/obsidian-brain'
+        shutil.copytree(source, clone)
+        source = clone
+    elif name == 'test_install_proceeds_from_a_checkout_under_home':
+        # A worktree below HOME is valid; selected CODEX_HOME remains private.
+        destination = home / ('dev' if parameters['location'] == 'home-dev' else 'other-development') / 'obsidian-brain'
+        shutil.copytree(source, destination)
+        source, expect = destination, 'installed'
+    elif name == 'test_restore_puts_the_original_content_back':
+        installed = _native_run(source, home, cache, 'install')
+        assert installed.returncode == 0, installed.stderr
+        mode, expect = 'restore', 'restored'
+    elif name == 'test_restore_with_no_backup_exits_4_not_0':
+        mode, expect = 'restore', 'nothing'
+    elif name == 'test_restore_refuses_to_promote_an_incomplete_backup':
+        # A fragment without the protected config recovery record is never adopted.
+        (backup / 'hooks').mkdir(parents=True)
+        if parameters['shape'] == 'missing-hooks-file':
+            (backup / 'skills/recall').mkdir(parents=True)
+            (backup / 'skills/recall/SKILL.md').write_text('fragment')
+        else:
+            (backup / 'hooks/obsidian_utils.py').write_text('fragment')
+            (backup / 'skills').mkdir()
+        mode = 'restore'
+    elif name == 'test_bak_only_cache_reports_instead_of_exiting_silently':
+        cache.rename(backup)
+        mode = parameters['cmd']
+        proc = _native_run(source, home, cache, mode)
+        if mode == 'status':
+            assert proc.returncode == 0 and json.loads(proc.stdout)['dev_active'] is True
+        else:
+            assert proc.returncode != 0 and (proc.stderr.strip() or proc.stdout.strip())
+        assert not cache.exists() and _tree_bytes(backup) == original
+        assert config.read_bytes() == original_config
+        return
+    elif name in {'test_install_says_so_when_security_tests_are_skipped',
+                  'test_install_fails_loudly_when_security_tests_fail'}:
+        # Codex packaging validates its snapshot and native metadata. It does not
+        # dispatch the Claude shell test footer or execute source-owned test code.
+        marker = home / 'source-test-executed'
+        security = source / 'scripts/security-test.sh'
+        security.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\nexit 1\n')
+        security.chmod(0o755)
+        proc = _native_run(source, home, cache, mode)
+        assert proc.returncode == 0, proc.stderr
+        assert not marker.exists()
+        assert (cache / 'hooks/brain_cli.py').is_file()
+        assert _tree_bytes(backup) == original
+        return
+    elif name in {'test_an_interrupted_backup_never_produces_a_bak',
+                  'test_a_partway_install_exits_3_not_1'}:
+        # Production fault hooks interrupt the corresponding snapshot/swap phase.
+        from tests.test_host_package_install import installer
+        def metadata(source, native_home):
+            hooks = installer._selected_hooks(cache)[0]
+            return {'data':[{'errors':[], 'hooks':[{'pluginId':'obsidian-brain@claude-code-skills', 'sourcePath':str(hooks)}]}]}
+        monkeypatch.setattr(installer, 'native_hooks_inventory', metadata)
+        phase = 'after_snapshot' if 'interrupted' in name else 'after_cache_swap'
+        def fail(point):
+            if point == phase:
+                raise OSError('synthetic interruption')
+        with pytest.raises(OSError, match='synthetic interruption'):
+            installer.run('install', source, home / '.codex', cache_path=cache, fault=fail)
+        assert _tree_bytes(cache) == original and config.read_bytes() == original_config
+        assert not backup.exists()
+        assert not list(cache.parent.glob('.dev-package-*'))
+        return
+    elif name == 'test_unreadable_cache_base_reports_instead_of_exiting_silently':
+        base = cache.parent
+        base.chmod(0)
+        try:
+            proc = _native_run(source, home, cache, parameters['cmd'])
+            assert proc.returncode != 0 and proc.stderr.strip()
+        finally:
+            base.chmod(0o755)
+        assert _tree_bytes(cache) == original and config.read_bytes() == original_config
+        return
+    elif name in {'test_a_leftover_partial_backup_is_not_selected_as_the_version',
+                  'test_status_discloses_orphaned_partial_backups',
+                  'test_status_says_nothing_about_partials_when_there_are_none',
+                  'test_status_does_not_claim_the_diff_failed_when_a_dev_version_is_active'}:
+        stale = cache.with_name(cache.name + parameters.get('suffix', '.bak.partial.123'))
+        if 'none' not in name:
+            stale.mkdir()
+            (stale / 'sentinel').write_text('unrelated partial bytes')
+        if 'dev_version' in name:
+            installed = _native_run(source, home, cache, 'install')
+            assert installed.returncode == 0, installed.stderr
+        mode, expect = 'status', 'status'
+    else:
+        raise AssertionError('Native installer case not specified: ' + name)
+    proc = _native_run(source, home, cache, mode)
+    if expect == 'status':
+        assert proc.returncode == 0, proc.stderr
+        status = json.loads(proc.stdout)
+        assert status['host'] == 'codex' and status['version'] == cache.name
+        assert status['dev_active'] == backup.exists()
+        if 'dev_version' not in name:
+            assert _tree_bytes(cache) == original
+        if 'stale' in locals() and stale.exists():
+            assert (stale / 'sentinel').read_text() == 'unrelated partial bytes'
+    elif expect == 'installed':
+        assert proc.returncode == 0, proc.stderr
+        assert _tree_bytes(backup) == original
+        assert (cache / 'hooks/brain_cli.py').is_file()
+    else:
+        if expect == 'restored':
+            assert proc.returncode == 0, proc.stderr
+            assert not backup.exists()
+        elif expect == 'nothing':
+            assert proc.returncode == 4 and 'nothing to restore' in proc.stderr
+        else:
+            assert proc.returncode != 0 and proc.stderr.strip() + proc.stdout.strip()
+        assert _tree_bytes(cache) == original
+        assert config.read_bytes() == original_config
+        if name != 'test_restore_refuses_to_promote_an_incomplete_backup':
+            assert not backup.exists()
+    assert not (cache / 'skills/*').exists()
 
 #: Where a positive control stages the checkout, relative to ``$HOME``. Each
 #: entry pins one rung of the "just widen the prefix a bit" ladder:
@@ -153,7 +376,7 @@ def _stage_production_geometry(
 
 
 @requires_bash
-def test_sentinel_guard_rejects_non_checkout(tmp_path: Path) -> None:
+def test_sentinel_guard_rejects_non_checkout(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """Guard 1: a directory two levels above the script that lacks
     hooks/obsidian_utils.py and skills/ is not an obsidian-brain checkout --
     the script must refuse rather than trust its own location blindly.
@@ -162,6 +385,9 @@ def test_sentinel_guard_rejects_non_checkout(tmp_path: Path) -> None:
     with "status" (not install/restore), so this failure can only be
     attributed to guard 1 -- guard 2 does not even apply to "status".
     """
+    if host == 'codex':
+        _codex_guard_case('test_sentinel_guard_rejects_non_checkout', tmp_path, monkeypatch)
+        return
     repo = tmp_path / "some-other-project"
     script = _write_script(repo / "scripts")
     home = tmp_path / "home"  # empty; never touched by this test
@@ -173,11 +399,14 @@ def test_sentinel_guard_rejects_non_checkout(tmp_path: Path) -> None:
 
 
 @requires_bash
-def test_sentinel_guard_fires_before_any_mutation(tmp_path: Path) -> None:
+def test_sentinel_guard_fires_before_any_mutation(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """Guard 1 must fire even for "install" -- before the cache lookup, the
     .bak backup, or any cp -- so a non-checkout invocation never mutates
     anything under $HOME.
     """
+    if host == 'codex':
+        _codex_guard_case('test_sentinel_guard_fires_before_any_mutation', tmp_path, monkeypatch)
+        return
     repo = tmp_path / "some-other-project"
     script = _write_script(repo / "scripts")
     home = tmp_path / "home"
@@ -195,7 +424,7 @@ def test_sentinel_guard_fires_before_any_mutation(tmp_path: Path) -> None:
 @pytest.mark.parametrize("shape", ["absent-skills-dir", "empty-skills-dir"])
 def test_sentinel_guard_rejects_checkout_without_a_non_empty_skills_dir(
     tmp_path: Path, shape: str
-) -> None:
+, host, selected_host_context, monkeypatch) -> None:
     """Guard 1's ``skills/`` half in isolation, in BOTH shapes it must reject.
 
     The only other guard-1 fixture (above) builds a tree with NEITHER
@@ -221,6 +450,9 @@ def test_sentinel_guard_rejects_checkout_without_a_non_empty_skills_dir(
     published, EXIT=0. The predicate is now ``compgen -G``, matching
     ``restore``'s completeness check.
     """
+    if host == 'codex':
+        _codex_guard_case('test_sentinel_guard_rejects_checkout_without_a_non_empty_skills_dir', tmp_path, monkeypatch, shape=shape)
+        return
     repo = tmp_path / "obsidian-brain"
     script = _write_script(repo / "scripts")
     (repo / "hooks").mkdir(parents=True)
@@ -237,7 +469,7 @@ def test_sentinel_guard_rejects_checkout_without_a_non_empty_skills_dir(
 
 
 @requires_bash
-def test_install_never_creates_a_literal_star_skill_dir(tmp_path: Path) -> None:
+def test_install_never_creates_a_literal_star_skill_dir(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """The residual of guard 1's ``skills/`` half, closed in the loop itself.
 
     Guard 1 asks whether ``skills/`` holds ANY entry (``compgen -G
@@ -253,6 +485,9 @@ def test_install_never_creates_a_literal_star_skill_dir(tmp_path: Path) -> None:
     cache contents and the transcript, not just the exit code -- the
     pre-fix run exited 0 too.
     """
+    if host == 'codex':
+        _codex_guard_case('test_install_never_creates_a_literal_star_skill_dir', tmp_path, monkeypatch)
+        return
     home, repo, script, cache_dir = _stage_production_geometry(tmp_path)
     shutil.rmtree(repo / "skills")
     (repo / "skills").mkdir()
@@ -272,13 +507,16 @@ def test_install_never_creates_a_literal_star_skill_dir(tmp_path: Path) -> None:
 
 
 @requires_bash
-def test_sentinel_guard_rejects_checkout_missing_hooks_file(tmp_path: Path) -> None:
+def test_sentinel_guard_rejects_checkout_missing_hooks_file(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """Guard 1's ``hooks/obsidian_utils.py`` half in isolation.
 
     Mirror of the test above: this tree carries ``skills/`` but deliberately
     omits ``hooks/obsidian_utils.py``, so a failure here can only be
     attributed to the hooks-sentinel half.
     """
+    if host == 'codex':
+        _codex_guard_case('test_sentinel_guard_rejects_checkout_missing_hooks_file', tmp_path, monkeypatch)
+        return
     repo = tmp_path / "obsidian-brain"
     script = _write_script(repo / "scripts")
     (repo / "skills" / "some-skill").mkdir(parents=True)
@@ -292,7 +530,7 @@ def test_sentinel_guard_rejects_checkout_missing_hooks_file(tmp_path: Path) -> N
 
 
 @requires_bash
-def test_self_copy_guard_rejects_install_from_inside_cache(tmp_path: Path) -> None:
+def test_self_copy_guard_rejects_install_from_inside_cache(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """Guard 2 (D3): a script whose own REPO_ROOT resolves to a path under
     ~/.claude/plugins/cache/ must refuse "install" -- copying the cache onto
     itself is a no-op that would otherwise print a full success transcript.
@@ -302,6 +540,9 @@ def test_self_copy_guard_rejects_install_from_inside_cache(tmp_path: Path) -> No
     guard 2 -- this is what keeps the fixture from being shadowed by guard 1
     (the guard-ordering trap).
     """
+    if host == 'codex':
+        _codex_guard_case('test_self_copy_guard_rejects_install_from_inside_cache', tmp_path, monkeypatch)
+        return
     home = tmp_path / "home"
     cache_version_dir = (
         home / ".claude" / "plugins" / "cache" / "some-marketplace" / "obsidian-brain" / "9.9.9"
@@ -320,11 +561,14 @@ def test_self_copy_guard_rejects_install_from_inside_cache(tmp_path: Path) -> No
 
 
 @requires_bash
-def test_self_copy_guard_rejects_restore_from_inside_cache(tmp_path: Path) -> None:
+def test_self_copy_guard_rejects_restore_from_inside_cache(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """Guard 2 also applies to "restore" -- restoring a .bak while REPO_ROOT
     is the cache itself is equally nonsensical (there is no local checkout
     to have diverged from).
     """
+    if host == 'codex':
+        _codex_guard_case('test_self_copy_guard_rejects_restore_from_inside_cache', tmp_path, monkeypatch)
+        return
     home = tmp_path / "home"
     cache_version_dir = (
         home / ".claude" / "plugins" / "cache" / "some-marketplace" / "obsidian-brain" / "9.9.9"
@@ -341,7 +585,7 @@ def test_self_copy_guard_rejects_restore_from_inside_cache(tmp_path: Path) -> No
 
 
 @requires_bash
-def test_self_copy_guard_fires_with_symlinked_home(tmp_path: Path) -> None:
+def test_self_copy_guard_fires_with_symlinked_home(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """Guard 2 must canonicalize $HOME the same way REPO_ROOT is canonicalized
     (`pwd -P`) before comparing prefixes. REPO_ROOT is resolved through
     symlinks by `cd ... && pwd -P`; if $HOME is used raw, a symlinked $HOME
@@ -354,6 +598,9 @@ def test_self_copy_guard_fires_with_symlinked_home(tmp_path: Path) -> None:
     the fake cache tree laid out under the real directory (reached via the
     symlink path, matching how the script is actually invoked).
     """
+    if host == 'codex':
+        _codex_guard_case('test_self_copy_guard_fires_with_symlinked_home', tmp_path, monkeypatch)
+        return
     real_home = tmp_path / "real_home"
     real_home.mkdir()
     home_link = tmp_path / "home_link"
@@ -382,7 +629,7 @@ def test_self_copy_guard_fires_with_symlinked_home(tmp_path: Path) -> None:
 
 
 @requires_bash
-def test_self_copy_guard_fires_with_symlinked_dot_claude(tmp_path: Path) -> None:
+def test_self_copy_guard_fires_with_symlinked_dot_claude(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """Guard 2 must canonicalize the plugin root DIRECTORY, not just ``$HOME``.
 
     The test above symlinks ``$HOME`` itself. That closes only the first
@@ -405,6 +652,9 @@ def test_self_copy_guard_fires_with_symlinked_dot_claude(tmp_path: Path) -> None
     exits 1 on "No installed obsidian-brain plugin cache found" and a bare
     ``returncode != 0`` assertion would pass for the wrong reason.
     """
+    if host == 'codex':
+        _codex_guard_case('test_self_copy_guard_fires_with_symlinked_dot_claude', tmp_path, monkeypatch)
+        return
     home = tmp_path / "home"
     home.mkdir()
     real_claude = tmp_path / "dotfiles" / "claude"
@@ -442,7 +692,7 @@ def test_self_copy_guard_fires_with_symlinked_dot_claude(tmp_path: Path) -> None
 @requires_bash
 def test_self_copy_guard_is_skipped_when_there_is_no_plugins_dir(
     tmp_path: Path,
-) -> None:
+    host, selected_host_context, monkeypatch) -> None:
     """No ``~/.claude/plugins`` means the guard has nothing to catch.
 
     ``cd``-ing into the plugin root to canonicalize it has to cope with that
@@ -456,6 +706,9 @@ def test_self_copy_guard_is_skipped_when_there_is_no_plugins_dir(
     ``No installed obsidian-brain plugin cache found`` -- and not on a guard
     that could not be evaluated.
     """
+    if host == 'codex':
+        _codex_guard_case('test_self_copy_guard_is_skipped_when_there_is_no_plugins_dir', tmp_path, monkeypatch)
+        return
     home = tmp_path / "home"
     home.mkdir()
     repo = tmp_path / "obsidian-brain"
@@ -478,12 +731,15 @@ def test_self_copy_guard_is_skipped_when_there_is_no_plugins_dir(
 
 
 @requires_bash
-def test_status_still_works_from_inside_cache(tmp_path: Path) -> None:
+def test_status_still_works_from_inside_cache(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """Judgment call (see task-2-report.md): guard 2 is scoped to the
     mutating subcommands only. "status" is read-only and must keep
     reporting even when the script happens to be running from inside the
     cache -- e.g. a machine with no local checkout that only has the cache.
     """
+    if host == 'codex':
+        _codex_guard_case('test_status_still_works_from_inside_cache', tmp_path, monkeypatch)
+        return
     home = tmp_path / "home"
     cache_version_dir = (
         home / ".claude" / "plugins" / "cache" / "some-marketplace" / "obsidian-brain" / "9.9.9"
@@ -500,7 +756,7 @@ def test_status_still_works_from_inside_cache(tmp_path: Path) -> None:
 
 
 @requires_bash
-def test_home_fail_closed_block_pins_its_custom_message(tmp_path: Path) -> None:
+def test_home_fail_closed_block_pins_its_custom_message(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """The `$HOME` fail-closed block (the `[[ -z "${HOME:-}" ]] || [[ ! -d
     "$HOME" ]]` guard on the mutating subcommands; M2 in the #287 final
     review) is shadowed in
@@ -523,6 +779,9 @@ def test_home_fail_closed_block_pins_its_custom_message(tmp_path: Path) -> None:
     half of the `||` in isolation fails a distinctly-named test rather than
     being covered by the other.
     """
+    if host == 'codex':
+        _codex_guard_case('test_home_fail_closed_block_pins_its_custom_message', tmp_path, monkeypatch)
+        return
     repo = tmp_path / "obsidian-brain"
     script = _write_script(repo / "scripts")
     (repo / "hooks").mkdir(parents=True)
@@ -538,7 +797,7 @@ def test_home_fail_closed_block_pins_its_custom_message(tmp_path: Path) -> None:
 
 
 @requires_bash
-def test_home_unset_fail_closed_block_pins_its_custom_message(tmp_path: Path) -> None:
+def test_home_unset_fail_closed_block_pins_its_custom_message(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """The `$HOME` fail-closed block's FIRST half (`[[ -z "${HOME:-}" ]]`),
     exercised via $HOME genuinely ABSENT from the child's environment.
 
@@ -560,6 +819,9 @@ def test_home_unset_fail_closed_block_pins_its_custom_message(tmp_path: Path) ->
     makes this test meaningful rather than accidentally-passing for the
     wrong reason.
     """
+    if host == 'codex':
+        _codex_guard_case('test_home_unset_fail_closed_block_pins_its_custom_message', tmp_path, monkeypatch)
+        return
     repo = tmp_path / "obsidian-brain"
     script = _write_script(repo / "scripts")
     (repo / "hooks").mkdir(parents=True)
@@ -575,7 +837,7 @@ def test_home_unset_fail_closed_block_pins_its_custom_message(tmp_path: Path) ->
 @requires_bash
 def test_home_empty_string_fail_closed_block_pins_its_custom_message(
     tmp_path: Path,
-) -> None:
+    host, selected_host_context, monkeypatch) -> None:
     """The same first half (`[[ -z "${HOME:-}" ]]`), exercised via the OTHER
     path that makes it true: $HOME present in the child's environment but
     set to the empty string, rather than absent entirely.
@@ -589,6 +851,9 @@ def test_home_empty_string_fail_closed_block_pins_its_custom_message(
     that test deletes the key from the environment mapping; this one sets
     it to `""`.
     """
+    if host == 'codex':
+        _codex_guard_case('test_home_empty_string_fail_closed_block_pins_its_custom_message', tmp_path, monkeypatch)
+        return
     repo = tmp_path / "obsidian-brain"
     script = _write_script(repo / "scripts")
     (repo / "hooks").mkdir(parents=True)
@@ -604,7 +869,7 @@ def test_home_empty_string_fail_closed_block_pins_its_custom_message(
 @requires_bash
 def test_self_copy_guard_rejects_install_from_a_marketplace_clone(
     tmp_path: Path,
-) -> None:
+    host, selected_host_context, monkeypatch) -> None:
     """Guard 2's OTHER shape: ``~/.claude/plugins/marketplaces/<name>/``.
 
     obsidian-brain's ``.claude-plugin/marketplace.json`` declares
@@ -617,6 +882,9 @@ def test_self_copy_guard_rejects_install_from_a_marketplace_clone(
     update`` rewrites behind their back) as "the dev version", at exit 0.
     Guard 1 cannot catch it: the clone is a perfectly valid checkout.
     """
+    if host == 'codex':
+        _codex_guard_case('test_self_copy_guard_rejects_install_from_a_marketplace_clone', tmp_path, monkeypatch)
+        return
     home = tmp_path / "home"
     clone = home / ".claude" / "plugins" / "marketplaces" / "obsidian-brain-repo"
     script = _write_script(clone / "scripts")
@@ -644,7 +912,7 @@ def test_self_copy_guard_rejects_install_from_a_marketplace_clone(
 @pytest.mark.parametrize("location", sorted(CHECKOUT_LOCATIONS), ids=sorted(CHECKOUT_LOCATIONS))
 def test_install_proceeds_from_a_checkout_under_home(
     tmp_path: Path, location: str
-) -> None:
+, host, selected_host_context, monkeypatch) -> None:
     """Guard 2's positive control, in the geometries users actually have.
 
     Every other guard-2 fixture asserts the guard FIRES, and the fixtures
@@ -665,6 +933,9 @@ def test_install_proceeds_from_a_checkout_under_home(
     that fires for a different reason cannot launder itself through an exit
     code that some other branch also produces.
     """
+    if host == 'codex':
+        _codex_guard_case('test_install_proceeds_from_a_checkout_under_home', tmp_path, monkeypatch, location=location)
+        return
     home, _repo, script, cache_dir = _stage_production_geometry(
         tmp_path, repo_rel=CHECKOUT_LOCATIONS[location]
     )
@@ -682,7 +953,7 @@ def test_install_proceeds_from_a_checkout_under_home(
 
 
 @requires_bash
-def test_restore_puts_the_original_content_back(tmp_path: Path) -> None:
+def test_restore_puts_the_original_content_back(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """The successful ``restore`` path, executed end to end.
 
     Before this test the only ``restore`` coverage was the negative case, so
@@ -694,6 +965,9 @@ def test_restore_puts_the_original_content_back(tmp_path: Path) -> None:
     Asserts the restored BYTES, not just exit 0: a restore that leaves the dev
     content in place exits 0 too.
     """
+    if host == 'codex':
+        _codex_guard_case('test_restore_puts_the_original_content_back', tmp_path, monkeypatch)
+        return
     home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
     backup_dir = cache_dir.parent / f"{cache_dir.name}.bak"
     (backup_dir / "hooks").mkdir(parents=True)
@@ -714,7 +988,7 @@ def test_restore_puts_the_original_content_back(tmp_path: Path) -> None:
 
 
 @requires_bash
-def test_restore_with_no_backup_exits_4_not_0(tmp_path: Path) -> None:
+def test_restore_with_no_backup_exits_4_not_0(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """"Nothing to restore" is not "restored", so it cannot share exit 0.
 
     ``restore`` used to exit 0 both when it swapped the backup back in and when
@@ -731,6 +1005,9 @@ def test_restore_with_no_backup_exits_4_not_0(tmp_path: Path) -> None:
     Pins the STDOUT too: the exit code alone would be satisfied by any new
     failure that happened to return 4.
     """
+    if host == 'codex':
+        _codex_guard_case('test_restore_with_no_backup_exits_4_not_0', tmp_path, monkeypatch)
+        return
     home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
     assert not list(cache_dir.parent.glob("*.bak")), "fixture must have no backup"
 
@@ -749,7 +1026,7 @@ def test_restore_with_no_backup_exits_4_not_0(tmp_path: Path) -> None:
 @requires_bash
 def test_status_does_not_claim_the_diff_failed_when_a_dev_version_is_active(
     tmp_path: Path,
-) -> None:
+    host, selected_host_context, monkeypatch) -> None:
     """``diff`` exit 1 means "they differ", which is this branch's whole point.
 
     ``diff -rq … | head -20 || echo "  (diff failed)"`` under ``set -o
@@ -763,6 +1040,9 @@ def test_status_does_not_claim_the_diff_failed_when_a_dev_version_is_active(
     Claude to relay this report verbatim on exit 0, so the caller passes a
     failure that did not occur straight through to the user.
     """
+    if host == 'codex':
+        _codex_guard_case('test_status_does_not_claim_the_diff_failed_when_a_dev_version_is_active', tmp_path, monkeypatch)
+        return
     home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
     backup_dir = cache_dir.parent / f"{cache_dir.name}.bak"
     (backup_dir / "hooks").mkdir(parents=True)
@@ -793,7 +1073,7 @@ def test_status_does_not_claim_the_diff_failed_when_a_dev_version_is_active(
 )
 def test_restore_refuses_to_promote_an_incomplete_backup(
     tmp_path: Path, shape: str
-) -> None:
+, host, selected_host_context, monkeypatch) -> None:
     """A ``.bak`` that exists is not a ``.bak`` that is complete.
 
     ``install``'s ``cp -R`` is not atomic and runs before that arm's ERR trap
@@ -808,6 +1088,9 @@ def test_restore_refuses_to_promote_an_incomplete_backup(
     Both halves of the completeness check get their own row: with only one
     fixture, deleting either half of the ``||`` still passes.
     """
+    if host == 'codex':
+        _codex_guard_case('test_restore_refuses_to_promote_an_incomplete_backup', tmp_path, monkeypatch, shape=shape)
+        return
     home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
     backup_dir = cache_dir.parent / f"{cache_dir.name}.bak"
     if shape == "missing-hooks-file":
@@ -833,7 +1116,7 @@ def test_restore_refuses_to_promote_an_incomplete_backup(
 @pytest.mark.parametrize("cmd", ["status", "install", "restore"])
 def test_bak_only_cache_reports_instead_of_exiting_silently(
     tmp_path: Path, cmd: str
-) -> None:
+, host, selected_host_context, monkeypatch) -> None:
     """The ``.bak``-only cache dir — the aftermath of an interrupted restore.
 
     ``grep -v '\\.bak$'`` exits 1 when it filters out everything; under
@@ -846,6 +1129,9 @@ def test_bak_only_cache_reports_instead_of_exiting_silently(
     Pins the message, not just the exit code: the exit code was already
     non-zero when the bug was live.
     """
+    if host == 'codex':
+        _codex_guard_case('test_bak_only_cache_reports_instead_of_exiting_silently', tmp_path, monkeypatch, cmd=cmd)
+        return
     home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
     backup_dir = cache_dir.parent / f"{cache_dir.name}.bak"
     cache_dir.rename(backup_dir)  # rm landed, mv did not
@@ -861,7 +1147,7 @@ def test_bak_only_cache_reports_instead_of_exiting_silently(
 
 
 @requires_bash
-def test_install_says_so_when_security_tests_are_skipped(tmp_path: Path) -> None:
+def test_install_says_so_when_security_tests_are_skipped(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """"Running security tests..." must not print when none ran.
 
     Announced unconditionally (before the ``-f`` existence check), a missing
@@ -871,6 +1157,9 @@ def test_install_says_so_when_security_tests_are_skipped(tmp_path: Path) -> None
     worth knowing about: a partial checkout, or a source tree that resolved to
     something unexpected.
     """
+    if host == 'codex':
+        _codex_guard_case('test_install_says_so_when_security_tests_are_skipped', tmp_path, monkeypatch)
+        return
     home, _repo, script, _cache_dir = _stage_production_geometry(tmp_path)
 
     proc = _run(script, "install", home)
@@ -881,7 +1170,7 @@ def test_install_says_so_when_security_tests_are_skipped(tmp_path: Path) -> None
 
 
 @requires_bash
-def test_install_fails_loudly_when_security_tests_fail(tmp_path: Path) -> None:
+def test_install_fails_loudly_when_security_tests_fail(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """A security-test failure must survive to the last line and the exit code.
 
     It used to print a WARNING, then the full success banner, then exit 0 — so
@@ -889,6 +1178,9 @@ def test_install_fails_loudly_when_security_tests_fail(tmp_path: Path) -> None:
     status any caller (a wrapper, CI, or the skill deciding what to tell the
     user) checks.
     """
+    if host == 'codex':
+        _codex_guard_case('test_install_fails_loudly_when_security_tests_fail', tmp_path, monkeypatch)
+        return
     home, repo, script, _cache_dir = _stage_production_geometry(tmp_path)
     security = repo / "scripts" / "test-security.sh"
     security.write_text("#!/usr/bin/env bash\necho 'SECURITY FAILURE: boom'\nexit 1\n")
@@ -908,7 +1200,7 @@ def test_install_fails_loudly_when_security_tests_fail(tmp_path: Path) -> None:
     hasattr(os, "geteuid") and os.geteuid() == 0,
     reason="root bypasses directory permissions, so chmod 000 cannot be staged",
 )
-def test_an_interrupted_backup_never_produces_a_bak(tmp_path: Path) -> None:
+def test_an_interrupted_backup_never_produces_a_bak(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """The reviewer's round-2 reproduction, at its source.
 
     Shape-validating the ``.bak`` on the restore side samples the failure mode
@@ -930,6 +1222,9 @@ def test_an_interrupted_backup_never_produces_a_bak(tmp_path: Path) -> None:
     would — and asserts the aftermath: no ``.bak``, no leftover partial, and a
     cache still holding every skill.
     """
+    if host == 'codex':
+        _codex_guard_case('test_an_interrupted_backup_never_produces_a_bak', tmp_path, monkeypatch)
+        return
     home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
     # A multi-skill cache, matching the tree the reviewer destroyed.
     for skill in ("check-items", "recall", "vault-ask"):
@@ -988,7 +1283,7 @@ def test_an_interrupted_backup_never_produces_a_bak(tmp_path: Path) -> None:
 )
 def test_a_leftover_partial_backup_is_not_selected_as_the_version(
     tmp_path: Path, suffix: str
-) -> None:
+, host, selected_host_context, monkeypatch) -> None:
     """A crashed backup leaves ``<version>.bak.partial.<pid>`` beside the cache.
 
     ``sort -V`` ranks that string ABOVE the bare version it derives from
@@ -997,6 +1292,9 @@ def test_a_leftover_partial_backup_is_not_selected_as_the_version(
     every subcommand would operate on it — the same class of silent-wrong-tree
     bug the ``.bak`` filter already exists for.
     """
+    if host == 'codex':
+        _codex_guard_case('test_a_leftover_partial_backup_is_not_selected_as_the_version', tmp_path, monkeypatch, suffix=suffix)
+        return
     home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
     stale = cache_dir.parent / f"{cache_dir.name}{suffix}"
     (stale / "hooks").mkdir(parents=True)
@@ -1033,7 +1331,7 @@ def test_a_leftover_partial_backup_is_not_selected_as_the_version(
 @pytest.mark.parametrize("cmd", ["status", "install"])
 def test_unreadable_cache_base_reports_instead_of_exiting_silently(
     tmp_path: Path, cmd: str
-) -> None:
+, host, selected_host_context, monkeypatch) -> None:
     """``ls -1`` inside a ``pipefail`` pipeline can still abort the assignment.
 
     Scoping ``|| true`` to the ``grep`` alone (the first fix) covered only
@@ -1047,6 +1345,9 @@ def test_unreadable_cache_base_reports_instead_of_exiting_silently(
     The permission note is pinned too, not just the exit code: the exit code
     was already non-zero while the bug was live.
     """
+    if host == 'codex':
+        _codex_guard_case('test_unreadable_cache_base_reports_instead_of_exiting_silently', tmp_path, monkeypatch, cmd=cmd)
+        return
     home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
     cache_base = cache_dir.parent
 
@@ -1066,7 +1367,7 @@ def test_unreadable_cache_base_reports_instead_of_exiting_silently(
 
 
 @requires_bash
-def test_a_partway_install_exits_3_not_1(tmp_path: Path) -> None:
+def test_a_partway_install_exits_3_not_1(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """The failure that leaves the cache MODIFIED needs its own exit code.
 
     Every other non-zero path refuses before anything is written; this one
@@ -1078,13 +1379,17 @@ def test_a_partway_install_exits_3_not_1(tmp_path: Path) -> None:
     run ``restore``, and is left with a half-dev cache plus a stale ``.bak``
     that blocks the next install.
 
-    Driven for real, not simulated: removing the cache's ``hooks/`` directory
-    lets the backup ``cp -R`` succeed (so the ``.bak`` really is published) and
-    makes the very next ``cp`` into the cache fail — the exact ordering the
-    exit code has to distinguish.
+    Driven for real: the recursive runtime copier publishes hooks, then
+    rejects a symlink in skills. The backup is already published and the
+    cache contains the dev hook beside the released skill.
     """
-    home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
-    shutil.rmtree(cache_dir / "hooks")
+    if host == 'codex':
+        _codex_guard_case('test_a_partway_install_exits_3_not_1', tmp_path, monkeypatch)
+        return
+    home, repo, script, cache_dir = _stage_production_geometry(tmp_path)
+    # Hooks publish first. A forbidden symlink in the next runtime directory
+    # makes the real package copier fail after that first publication.
+    (repo / "skills" / "blocked-link").symlink_to(tmp_path / "outside-source")
 
     proc = _run(script, "install", home)
 
@@ -1103,6 +1408,8 @@ def test_a_partway_install_exits_3_not_1(tmp_path: Path) -> None:
         f"{proc.stderr!r}"
     )
     assert "/dev-test restore" in proc.stderr
+    assert "# dev hook" in (cache_dir / "hooks/obsidian_utils.py").read_text()
+    assert "# released hook" in (cache_dir.with_name(cache_dir.name + ".bak") / "hooks/obsidian_utils.py").read_text()
     # The precondition the exit code is claiming: a backup really was published.
     assert list(cache_dir.parent.glob("*.bak")), (
         "exit 3 asserts a backup exists to restore from — if none was "
@@ -1111,7 +1418,7 @@ def test_a_partway_install_exits_3_not_1(tmp_path: Path) -> None:
 
 
 @requires_bash
-def test_status_discloses_orphaned_partial_backups(tmp_path: Path) -> None:
+def test_status_discloses_orphaned_partial_backups(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
     """``status`` used to say "cache is clean" beside full copies of the cache.
 
     A hard kill (SIGKILL, power loss) skips the install arm's ERR trap, so
@@ -1123,6 +1430,9 @@ def test_status_discloses_orphaned_partial_backups(tmp_path: Path) -> None:
 
     Two orphans, so a single-item report cannot pass by accident.
     """
+    if host == 'codex':
+        _codex_guard_case('test_status_discloses_orphaned_partial_backups', tmp_path, monkeypatch)
+        return
     home, _repo, script, cache_dir = _stage_production_geometry(tmp_path)
     orphans = []
     for pid in ("88888", "99999"):
@@ -1153,15 +1463,47 @@ def test_status_discloses_orphaned_partial_backups(tmp_path: Path) -> None:
 @requires_bash
 def test_status_says_nothing_about_partials_when_there_are_none(
     tmp_path: Path,
-) -> None:
+    host, selected_host_context, monkeypatch) -> None:
     """Negative control for the disclosure above.
 
     Without it, a report hardcoded to print unconditionally would satisfy the
     positive test while adding a permanent false alarm to every ``status`` run.
     """
+    if host == 'codex':
+        _codex_guard_case('test_status_says_nothing_about_partials_when_there_are_none', tmp_path, monkeypatch)
+        return
     home, _repo, script, _cache_dir = _stage_production_geometry(tmp_path)
 
     proc = _run(script, "status", home)
 
     assert proc.returncode == 0, proc.stderr
     assert "Orphaned partial backups" not in proc.stdout
+
+
+@requires_bash
+@pytest.mark.parametrize('shape', ['missing-hooks-file', 'empty-skills-dir'])
+def test_restore_rejects_backup_damaged_after_install(tmp_path, host, selected_host_context, monkeypatch, shape):
+    if host == 'codex':
+        source, home, cache = _native_geometry(tmp_path)
+        run = lambda mode: _native_run(source, home, cache, mode)
+        config = home / '.codex/config.toml'
+    else:
+        home, source, script, cache = _stage_production_geometry(tmp_path)
+        run = lambda mode: _run(script, mode, home)
+        config = None
+    installed = run('install')
+    assert installed.returncode == 0, installed.stderr
+    backup = cache.with_name(cache.name + '.bak')
+    if shape == 'missing-hooks-file':
+        (backup / 'hooks/obsidian_utils.py').unlink()
+    else:
+        shutil.rmtree(backup / 'skills')
+        (backup / 'skills').mkdir()
+    healthy = _tree_bytes(cache)
+    selected_config = config.read_bytes() if config else None
+    result = run('restore')
+    assert result.returncode != 0 and result.stderr.strip()
+    assert _tree_bytes(cache) == healthy
+    assert backup.is_dir()
+    if config:
+        assert config.read_bytes() == selected_config

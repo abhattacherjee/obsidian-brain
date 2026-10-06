@@ -39,45 +39,58 @@ def _env(home: Path) -> dict:
     return env
 
 
-def _run(hooks_dir: Path, script: str, home: Path, stdin: str):
-    return subprocess.run(
-        [sys.executable, str(hooks_dir / script)],
-        input=stdin, text=True, capture_output=True,
-        env=_env(home), cwd=str(home), timeout=60, check=False,
-    )
+def _run(hooks_dir: Path, script: str, home: Path, stdin: str, context):
+    command = [sys.executable, str(ROOT / 'tests' / 'native_hook_test_driver.py'),
+        '--host', context.host, '--client', context.client,
+        '--session-id', context.native_session_id, '--cwd', str(context.worktree),
+        '--vault', str(context.vault_path), '--config', str(context.config_path),
+        '--resource-root', str(hooks_dir.parent), '--index', str(context.index_path),
+        '--state', str(context.state_path), script]
+    result = subprocess.run(command, input=stdin, text=True, capture_output=True,
+        env=dict(os.environ), cwd=context.worktree, timeout=5, check=False)
+    proof = json.loads(next(line.removeprefix('NATIVE_CONTEXT_PROOF:')
+        for line in result.stderr.splitlines() if line.startswith('NATIVE_CONTEXT_PROOF:')))
+    assert proof['host'] == context.host
+    assert proof['native_session_id'] == context.native_session_id
+    assert proof['vault_path'] == str(context.vault_path)
+    assert proof['resource_root'] == str(hooks_dir.parent)
+    return result
 
 
 @pytest.fixture
 def broken_hooks(tmp_path):
     """A copy of hooks/ whose obsidian_utils raises at import, like #371."""
-    hooks_dir = tmp_path / "plugin" / "hooks"
+    hooks_dir = tmp_path / "broken plugin" / "hooks"
     shutil.copytree(ROOT / "hooks", hooks_dir,
                     ignore=shutil.ignore_patterns("__pycache__"))
     (hooks_dir / "obsidian_utils.py").write_text('raise TypeError("x")\n')
-    home = tmp_path / "home"
+    for descriptor in ('.claude-plugin', '.codex-plugin'):
+        (hooks_dir.parent / descriptor).mkdir()
+        (hooks_dir.parent / descriptor / 'plugin.json').write_text('{"name":"synthetic-brain"}')
+    home = tmp_path / "legacy-home"
     home.mkdir()
     return hooks_dir, home
 
 
-def _log_lines(home: Path) -> list[str]:
-    log = home / ".claude" / "obsidian-brain-hook.log"
+def _log_lines(home: Path, native=False) -> list[str]:
+    log = (home if native else home / ".claude") / "obsidian-brain-hook.log"
     return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
 
 
 @pytest.mark.parametrize("script, event", HOOKS)
 @pytest.mark.parametrize("stdin", ["", "realistic"], ids=["empty-stdin", "realistic-stdin"])
-def test_import_failure_exits_0_and_logs_one_line(broken_hooks, script, event, stdin):
+def test_import_failure_exits_0_and_logs_one_line(broken_hooks, script, event, stdin, selected_host_context):
     hooks_dir, home = broken_hooks
     if stdin == "realistic":
         stdin = json.dumps({"session_id": "abcdef12-3456", "cwd": "/work/my proj",
                             "hook_event_name": event})
-        sid, project = "abcdef12", "my_proj"
+        sid, project = selected_host_context.native_session_id[:8], selected_host_context.worktree.name.replace(" ", "_")
     else:
-        sid, project = "unknown", home.name
-    proc = _run(hooks_dir, script, home, stdin)
+        sid, project = selected_host_context.native_session_id[:8], selected_host_context.worktree.name.replace(" ", "_")
+    proc = _run(hooks_dir, script, home, stdin, selected_host_context)
 
     assert proc.returncode == 0, proc.stderr
-    lines = _log_lines(home)
+    lines = _log_lines(selected_host_context.native_home, native=True)
     assert len(lines) == 1, lines
     fields = lines[0].split(" ")
     # Same field order as the SessionEnd writer: `awk '{print $5}'` = outcome.
@@ -85,7 +98,7 @@ def test_import_failure_exits_0_and_logs_one_line(broken_hooks, script, event, s
                            "outcome=IMPORT_FAILED"], lines[0]
     py = sys.version.split()[0]
     assert lines[0].endswith(f"detail=python={py} TypeError: x"), lines[0]
-    log = home / ".claude" / "obsidian-brain-hook.log"
+    log = selected_host_context.native_home / "obsidian-brain-hook.log"
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
 
     if event == "SessionStart":
@@ -99,16 +112,16 @@ def test_import_failure_exits_0_and_logs_one_line(broken_hooks, script, event, s
 
 
 @pytest.mark.parametrize("script, event", HOOKS)
-def test_normal_import_path_is_unchanged(tmp_path, script, event):
+def test_normal_import_path_is_unchanged(tmp_path, script, event, selected_host_context):
     """Negative control: the real obsidian_utils loads, no IMPORT_FAILED."""
     transcript = tmp_path / ".claude" / "projects" / "example" / "sid-normal.jsonl"
     transcript.parent.mkdir(parents=True)
     transcript.write_text("")
     payload = {"session_id": "sid-normal", "cwd": str(tmp_path),
                "transcript_path": str(transcript), "hook_event_name": event}
-    proc = _run(ROOT / "hooks", script, tmp_path, json.dumps(payload))
+    proc = _run(ROOT / "hooks", script, tmp_path, json.dumps(payload), selected_host_context)
     assert proc.returncode == 0, proc.stderr
-    assert not any("IMPORT_FAILED" in line for line in _log_lines(tmp_path))
+    assert not any("IMPORT_FAILED" in line for line in _log_lines(selected_host_context.native_home, native=True))
     assert "failed to load" not in proc.stdout
 
 
@@ -192,3 +205,16 @@ def test_log_constants_match_obsidian_utils():
     import obsidian_utils
     assert hook_bootstrap._HOOK_LOG_NAME == obsidian_utils._HOOK_LOG_NAME
     assert hook_bootstrap._HOOK_LOG_MAX_BYTES == obsidian_utils._HOOK_LOG_MAX_BYTES
+
+
+@pytest.fixture
+def selected_host_context(selected_host_context, host, request):
+    from runtime_context import resolve_runtime_context, using_runtime_context
+    original = selected_host_context
+    root = request.getfixturevalue('broken_hooks')[0].parent if 'broken_hooks' in request.fixturenames else ROOT
+    selected = resolve_runtime_context(host, original.client,
+        {'session_id': original.native_session_id, 'cwd': str(original.worktree)},
+        {'config_path': original.config_path, 'resource_root': root,
+         'index_path': original.index_path, 'state_path': original.state_path})
+    with using_runtime_context(selected):
+        yield selected

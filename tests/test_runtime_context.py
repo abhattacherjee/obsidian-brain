@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hooks"))
 
 
 @pytest.fixture
-def runtime_case(tmp_path, monkeypatch):
+def runtime_case_data(tmp_path, monkeypatch):
     home = tmp_path / "home with spaces"
     codex_home = home / "custom codex"
     worktree = tmp_path / "project worktree"
@@ -36,7 +36,24 @@ def runtime_case(tmp_path, monkeypatch):
     }
 
 
-def resolve(case, host="codex", sid="native-thread", client="codex-cli", **payload):
+@pytest.fixture
+def selected_host_context(runtime_case_data, host):
+    from runtime_context import using_runtime_context
+    case = runtime_case_data
+    case['host'] = host
+    selected = resolve(case)
+    with using_runtime_context(selected):
+        yield selected
+
+
+@pytest.fixture
+def runtime_case(runtime_case_data, selected_host_context):
+    return runtime_case_data
+
+
+def resolve(case, host=None, sid="native-thread", client=None, **payload):
+    host = host or case["host"]
+    client = client or ("codex-cli" if host == "codex" else "claude-code")
     module = importlib.import_module("runtime_context")
     native = {"session_id": sid, "cwd": str(case["worktree"])}
     native.update(payload)
@@ -52,10 +69,10 @@ def test_codex_retro_does_not_link_a_concurrent_claude_session(runtime_case, mon
     recent.mkdir(parents=True)
     (recent / "concurrent-claude-session.jsonl").write_text('{"sessionId":"concurrent-claude-session"}\n')
     context = resolve(case)
-    assert context.host == "codex"
+    assert context.host == case["host"]
     assert context.native_session_id == "native-thread"
     assert context.transcript_path is None
-    assert context.state_path == case["codex_home"] / "obsidian-brain" / "state"
+    assert context.state_path == (case["codex_home"] / "obsidian-brain" / "state" if case["host"] == "codex" else case["home"] / ".claude" / "obsidian-brain")
 
 
 def test_explicit_claude_host_wins_over_inherited_codex_thread(runtime_case, monkeypatch):
@@ -67,7 +84,7 @@ def test_explicit_claude_host_wins_over_inherited_codex_thread(runtime_case, mon
 
 
 def test_equal_ids_have_separate_host_cache_keys(runtime_case):
-    codex = resolve(runtime_case, sid="same/opaque id")
+    codex = resolve(runtime_case, host="codex", sid="same/opaque id")
     claude = resolve(runtime_case, host="claude", client="claude-code", sid="same/opaque id")
     assert codex.session_key != claude.session_key
     assert "/" not in codex.session_key
@@ -127,7 +144,7 @@ def test_missing_native_id_does_not_use_other_host_marker(runtime_case, monkeypa
 def test_tool_shell_uses_only_the_selected_hosts_identity(runtime_case, monkeypatch):
     monkeypatch.setenv("CODEX_THREAD_ID", "current-tool-thread")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "inherited-claude")
-    assert resolve(runtime_case, sid=None).native_session_id == "current-tool-thread"
+    assert resolve(runtime_case, sid=None).native_session_id == ("current-tool-thread" if runtime_case["host"] == "codex" else "inherited-claude")
 
 
 def test_host_and_client_mismatch_is_rejected(runtime_case):
@@ -166,15 +183,17 @@ def test_legacy_utilities_use_bound_context_without_identity_scanning(runtime_ca
         assert utils.load_config()["vault_path"] == str(context.vault_path)
         assert index._default_db_path() == str(context.index_path)
         utils.cache_set(context.native_session_id, "selected", context.host)
-        assert utils.cache_get(context.native_session_id, "selected") == "codex"
-    assert module.current_runtime_context() is None
-    assert (context.state_path / ("cache-" + context.session_key + ".json")).exists()
-    assert not (runtime_case["home"] / ".claude").exists()
+        assert utils.cache_get(context.native_session_id, "selected") == context.host
+    assert module.current_runtime_context().host == runtime_case["host"]
+    from note_transactions import session_state_path
+    assert (session_state_path(context) / "cache" / "values.json").exists()
+    foreign = runtime_case["home"] / ".claude" if runtime_case["host"] == "codex" else runtime_case["codex_home"] / "obsidian-brain"
+    assert not foreign.exists()
 
 
 def test_equal_host_ids_do_not_share_legacy_cache(runtime_case):
     utils = importlib.import_module("obsidian_utils")
-    codex = resolve(runtime_case, sid="equal")
+    codex = resolve(runtime_case, host="codex", sid="equal")
     claude = resolve(runtime_case, host="claude", client="claude-code", sid="equal")
     utils.cache_set("equal", "owner", "codex", context=codex)
     utils.cache_set("equal", "owner", "claude", context=claude)
@@ -191,14 +210,15 @@ def test_dedup_claims_do_not_use_claude_state_for_codex(runtime_case):
         assert not utils.claim_hook_run("SessionStart", context.native_session_id)
         utils.release_hook_run("SessionStart", context.native_session_id)
         assert utils.claim_hook_run("SessionStart", context.native_session_id)
-    assert not (runtime_case["home"] / ".claude").exists()
+    foreign = runtime_case["home"] / ".claude" if runtime_case["host"] == "codex" else runtime_case["codex_home"] / "obsidian-brain"
+    assert not foreign.exists()
 
 
 def test_retro_gate_keys_include_host_when_state_is_shared(runtime_case, monkeypatch):
     utils = importlib.import_module("obsidian_utils")
     runtime = importlib.import_module("runtime_context")
     monkeypatch.setenv("OBSIDIAN_BRAIN_STATE_DIR", str(runtime_case["home"] / "selected shared state"))
-    codex = resolve(runtime_case, sid="equal")
+    codex = resolve(runtime_case, host="codex", sid="equal")
     claude = resolve(runtime_case, host="claude", client="claude-code", sid="equal")
     with runtime.using_runtime_context(codex):
         codex_path = utils.mark_retro_classification_pending("equal", "codex-retro.md")

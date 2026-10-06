@@ -10,10 +10,14 @@ metadata:
 Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
 reference for the invoking host when this skill has paired host references.
 Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
-invocation. Use the selected host's own session ID. Keep curated note taxonomy
+invocation. The current client must be explicitly supplied by the invoking runtime.
+If that binding is unavailable, stop and report it. Never label a Desktop
+invocation as a CLI invocation or infer the frontend from transcript creation
+metadata or inherited environment markers. Use the selected host's own session ID. Keep curated note taxonomy
 separate from `agent_provider` and `agent_session_id` provenance.
 
 ```bash
+: "${OB_CLIENT:?Current native client binding is unavailable; stop without choosing a frontend.}"
 OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
 OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
@@ -48,19 +52,19 @@ Before preparing edits or requesting a summary of an existing note, call
 with `note-apply` and that revision. A conflict leaves the current note intact;
 show the pending result and do not count the note as saved. New curated notes
 use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex until its adapter is verified; shared vault retrieval
+is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
 and wiki filing continue without borrowing another host's memory.
 
 Read `references/host-claude.md` or `references/host-codex.md` when present.
 All note writes described below use `note-create` or revision-bound `note-apply`,
 including bidirectional related links. Content is a JSON string, never shell code.
-Keep this rule when a later step uses the word Write or Edit.
+Every later save or edit follows this revision-bound publication rule.
 
 # Error Log — Capture Error Solutions to Obsidian
 
 Analyze the current conversation for error -> investigation -> fix patterns, structure them as reusable troubleshooting notes, and save to the Obsidian vault.
 
-**Tools needed:** Bash, Read
+**Tools needed:** native shell, native file reading
 
 ## Procedure
 

@@ -1,22 +1,17 @@
 """Summaries bind capture revisions and preserve user-owned text."""
 import hashlib
 import json
-from types import MappingProxyType
 
 import pytest
 
-from runtime_context import RuntimeContext, using_runtime_context
+from runtime_context import using_runtime_context
 from note_transactions import NoteMutation, apply_mutations, read_revision
 from obsidian_utils import upgrade_note_with_summary
 
 
 @pytest.fixture
-def context(tmp_path):
-    vault = tmp_path / 'vault'
-    vault.mkdir()
-    return RuntimeContext('codex', 'codex-cli', 'summary-native', tmp_path, tmp_path,
-                          None, vault, tmp_path / 'config.json', MappingProxyType({}),
-                          tmp_path, tmp_path / 'index.sqlite3', tmp_path / 'state')
+def context(selected_host_context):
+    return selected_host_context
 
 
 def seeded_note(context):
@@ -39,7 +34,7 @@ def test_summary_binds_capture_and_preserves_user_prose(context):
     text = note.read_text()
     assert 'my_field: keep' in text
     assert 'agent_provider: claude' in text
-    assert 'author_host: "codex"' in text
+    assert 'author_host: ' + json.dumps(context.host) in text
     assert 'operation_id:' in text
     assert '# My title\nUser prose.' in text
     assert 'User addition after AI started.' in text

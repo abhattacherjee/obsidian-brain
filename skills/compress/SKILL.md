@@ -10,10 +10,14 @@ metadata:
 Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
 reference for the invoking host when this skill has paired host references.
 Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
-invocation. Use the selected host's own session ID. Keep curated note taxonomy
+invocation. The current client must be explicitly supplied by the invoking runtime.
+If that binding is unavailable, stop and report it. Never label a Desktop
+invocation as a CLI invocation or infer the frontend from transcript creation
+metadata or inherited environment markers. Use the selected host's own session ID. Keep curated note taxonomy
 separate from `agent_provider` and `agent_session_id` provenance.
 
 ```bash
+: "${OB_CLIENT:?Current native client binding is unavailable; stop without choosing a frontend.}"
 OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
 OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
@@ -48,19 +52,19 @@ Before preparing edits or requesting a summary of an existing note, call
 with `note-apply` and that revision. A conflict leaves the current note intact;
 show the pending result and do not count the note as saved. New curated notes
 use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex until its adapter is verified; shared vault retrieval
+is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
 and wiki filing continue without borrowing another host's memory.
 
 Read `references/host-claude.md` or `references/host-codex.md` when present.
 All note writes described below use `note-create` or revision-bound `note-apply`,
 including bidirectional related links. Content is a JSON string, never shell code.
-Keep this rule when a later step uses the word Write or Edit.
+Every later save or edit follows this revision-bound publication rule.
 
 # Compress — Save Session Insights to Obsidian
 
 Analyze the current conversation, extract valuable insights, and save them as structured notes in the Obsidian vault. Supports both interactive multi-insight selection and targeted single-topic extraction.
 
-**Tools needed:** Bash, Read
+**Tools needed:** native shell, native file reading
 
 ## Procedure
 
@@ -165,7 +169,7 @@ This step is reached when the user chose "update" in Step 3.5. The matched note 
 
 #### 4A-update.1 — Read the existing note
 
-Use the Read tool to read the full contents of `$MATCH_PATH`. Note the existing frontmatter tags and whether a `last_updated` field is already present.
+Read the full contents of `$MATCH_PATH`. Note the existing frontmatter tags and whether a `last_updated` field is already present.
 
 #### 4A-update.2 — Draft the update section
 
@@ -203,7 +207,7 @@ If **cancel**, stop here.
 
 #### 4A-update.4 — Append the update section and update frontmatter
 
-Run the note-writer CLI's `append-update` command, piping the drafted `## Update (YYYY-MM-DD)` section (from 4A-update.2) in on stdin. **This single call replaces all three of the old Edit-tool steps** — it finds the correct insertion point (scanning **top-down** for `_(Summary source: ...)_`, `## Tool Usage`, `## Conversation (raw)`, `## Session Metadata`, `## Files Touched` — ignoring any inside a fenced code block, and **stopping at the first `## Update (` heading**, since everything past that is a previously appended update rather than the note's audit trail — and inserting immediately before the first marker it finds, or at end-of-file), bumps `last_updated`, and merges new tags — all in one atomic write. Do NOT use the Edit tool for any of this.
+Run the note-writer CLI's `append-update` command, piping the drafted `## Update (YYYY-MM-DD)` section (from 4A-update.2) in on stdin. **This single call replaces all three of the old Edit-tool steps** — it finds the correct insertion point (scanning **top-down** for `_(Summary source: ...)_`, `## Tool Usage`, `## Conversation (raw)`, `## Session Metadata`, `## Files Touched` — ignoring any inside a fenced code block, and **stopping at the first `## Update (` heading**, since everything past that is a previously appended update rather than the note's audit trail — and inserting immediately before the first marker it finds, or at end-of-file), bumps `last_updated`, and merges new tags — all in one atomic write. Keep this update inside the trusted conditional publication boundary.
 
 Generate 1-3 new topic tags from the update content (same logic as Step 5) and pass them via `--add-tags`. `--last-updated` is opt-in — it must be passed explicitly with today's date, or the note's `last_updated` field will NOT be bumped (that used to happen automatically; it no longer does without this flag).
 
@@ -274,7 +278,7 @@ Scan the current conversation for these patterns. If found, extract the skill/kn
 
 - The `MANDATORY SKILL EVALUATION REQUIRED` banner or the `Skill(skill-kit:extract)` / `skill-kit:extract` reminder (from the activator hook, still named `claudeception-activator.sh`; older transcripts show `Skill(claudeception)`)
 - `Result: PASS` or `Result: FAIL` (from the `skill-kit:extract` skill validator; older transcripts: the claudeception validator)
-- Skill file paths matching `~/.claude/skills/*/SKILL.md` or `.claude/skills/*/SKILL.md`
+- Native skill source paths under the selected installation or project skill directory
 
 If any Layer 1 markers are found, create a candidate for each and label it `[from skill-kit:extract]` (`[from claudeception]` for old transcripts).
 

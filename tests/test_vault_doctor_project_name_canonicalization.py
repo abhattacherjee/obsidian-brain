@@ -1908,3 +1908,9 @@ def test_url_value_not_flagged_as_leftover_tag(canon_vault, tmp_path):
         "source_url: https://example.com/claude/project/url-proj--feat/issues/1"
         in new_content
     )
+
+
+@pytest.fixture(autouse=True)
+def _selected_doctor_actor(selected_host_context):
+    """Resolve and repair note projects with the explicit invoking host."""
+    return selected_host_context

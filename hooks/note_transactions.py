@@ -134,12 +134,10 @@ def context_for_vault(vault_path):
     import obsidian_utils
     import vault_index
     project = Path.cwd().resolve()
-    native_home = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
-    return RuntimeContext("claude", "cli", "", project, project, None, vault,
-                          native_home / "obsidian-brain-config.json", MappingProxyType({}),
-                          Path(__file__).resolve().parent.parent,
-                          Path(vault_index._default_db_path()).resolve(),
-                          Path(obsidian_utils._SECURE_DIR))
+    from runtime_adapters.claude import legacy_writer_context
+    return legacy_writer_context(vault, project, Path(__file__).resolve().parent.parent,
+                                 Path(vault_index._default_db_path()).resolve(),
+                                 Path(obsidian_utils._SECURE_DIR))
 
 
 @contextlib.contextmanager
@@ -406,30 +404,50 @@ def _apply_one(context, connection, mutation):
             _record_read(connection, path, current)
             connection.commit()
             return WriteResult("unchanged", revision)
+    managed = "document" not in mutation.managed_changes and not repair
+    checks = set(mutation.managed_changes)
+    if managed:
+        if "metadata" in checks:
+            checks.remove("metadata")
+            checks.update("metadata:" + field for field in _metadata_changes(mutation.managed_changes))
+        if "summary" in checks:
+            checks.add("capture")
+        # Replacement may have succeeded before its acknowledgement failed.
+        # Preserve later user edits when the owned output is already present.
+        if prior and current is not None:
+            published = _regions(prior[2])
+            now = _regions(current)
+            if all(published.get(region) == now.get(region) for region in checks):
+                if mutation.file_mode is not None:
+                    os.chmod(path, mutation.file_mode)
+                connection.execute("UPDATE operations SET phase='applied', document=?, revision=? WHERE id=?",
+                                   (current, revision, key))
+                _record_read(connection, path, current)
+                connection.commit()
+                return WriteResult("unchanged", revision)
     expected = mutation.expected_revision
     valid = revision == expected
-    if not valid and "document" not in mutation.managed_changes and not repair and expected is not None:
+    if not valid and managed and expected is not None:
         baseline = connection.execute("SELECT regions FROM revisions WHERE path=? AND revision=?",
                                       (str(path), expected)).fetchone()
         if baseline:
             before = json.loads(baseline[0])
             now = _regions(current)
-            checks = set(mutation.managed_changes)
-            if "metadata" in checks:
-                checks.remove("metadata")
-                checks.update("metadata:" + key for key in _metadata_changes(mutation.managed_changes))
-            if "summary" in checks:
-                checks.add("capture")
             valid = current is not None and all(before.get(region) == now.get(region) for region in checks)
     if not valid:
         return WriteResult("conflict", revision, _pending(context, key, payload),
                            ("The source revision changed; the original note was preserved",))
-    rendered = prior[2] if prior else _render(current, mutation.managed_changes)
+    # Region CAS permits unowned edits. Render from the bytes just checked,
+    # never from the whole document retained by an earlier failed attempt.
+    rendered = _render(current, mutation.managed_changes)
     next_revision = _digest(rendered)
     if not prior:
         connection.execute("INSERT INTO operations VALUES (?, ?, 'prepared', ?, ?)",
                            (key, payload, rendered, next_revision))
-        connection.commit()
+    else:
+        connection.execute("UPDATE operations SET document=?, revision=? WHERE id=?",
+                           (rendered, next_revision, key))
+    connection.commit()
     changed = current_bytes != rendered.encode("utf-8")
     if changed:
         if _contained(context, mutation.path) != path:

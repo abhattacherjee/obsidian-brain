@@ -17,6 +17,14 @@ import vault_index
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def tmp_vault(selected_host_context):
+    vault = selected_host_context.vault_path
+    for folder in ("claude-sessions", "claude-insights"):
+        (vault / folder).mkdir()
+    return vault
+
+
 def _write_note(path, frontmatter: dict, body: str = ""):
     lines = ["---"]
     for k, v in frontmatter.items():

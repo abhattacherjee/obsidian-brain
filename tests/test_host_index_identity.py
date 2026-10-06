@@ -12,9 +12,10 @@ from session_lookup import find_existing_session, SessionLookupPending
 
 
 @pytest.fixture
-def indexed(tmp_path):
-    vault = tmp_path / 'vault'; (vault / 'sessions').mkdir(parents=True)
-    database = tmp_path / 'index.sqlite3'
+def indexed(selected_host_context):
+    vault = selected_host_context.vault_path; (vault / 'sessions').mkdir(parents=True)
+    database = selected_host_context.index_path
+    database.parent.mkdir(parents=True, exist_ok=True)
     return vault, database
 
 

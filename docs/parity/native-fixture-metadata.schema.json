@@ -1,0 +1,107 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "tested_sha",
+    "recorded_at",
+    "synthetic_only",
+    "observations"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "tested_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "synthetic_only": {
+      "const": true
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "client",
+          "version",
+          "platform",
+          "status",
+          "fixture_sha256",
+          "manifest_sha256",
+          "discovery_verified",
+          "dispatch_verified",
+          "reason",
+          "fixture_path",
+          "manifest_path"
+        ],
+        "properties": {
+          "client": {
+            "enum": [
+              "claude-code",
+              "codex-cli",
+              "codex-desktop"
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "platform": {
+            "enum": [
+              "macos",
+              "linux"
+            ]
+          },
+          "status": {
+            "enum": [
+              "observed",
+              "unavailable",
+              "blocked"
+            ]
+          },
+          "fixture_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "manifest_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "discovery_verified": {
+            "type": "boolean"
+          },
+          "dispatch_verified": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fixture_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "manifest_path": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

@@ -173,6 +173,13 @@ PY
     echo ""
 fi
 
+# Shared host rules also apply to authored documentation and skip modes.
+echo "Checking shared host boundaries..."
+if ! python3 "$PROJECT_DIR/scripts/ci-checks/host_neutral_lint.py" --root "$PROJECT_DIR"; then
+    rm -f "$TOKEN_FILE"
+    exit 1
+fi
+
 # Handle skip tests mode
 if [ "$SKIP_TESTS" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -181,14 +188,11 @@ if [ "$SKIP_TESTS" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
-    # Even in skip mode, version-sync must be recorded if it ran above
-    # — it is the one check that is NEVER actually skipped. Use a
-    # generic "skipped" marker for everything else (lint, secret scan,
-    # tests are all skipped, not just tests) so the audit trail is
-    # accurate (Copilot iter-5 finding on PR #14).
-    SKIP_CHECKS_RUN="skipped"
+    # Record the host check and any version check even when tests are skipped.
+    # Other checks retain the skipped marker in the audit trail.
+    SKIP_CHECKS_RUN="host-neutral,skipped"
     if [ "$VERSION_SYNC_RAN" = true ]; then
-        SKIP_CHECKS_RUN="version-sync,skipped"
+        SKIP_CHECKS_RUN="version-sync,host-neutral,skipped"
     fi
     TIMESTAMP=$(date +%s)
     TOKEN_DATA=$(cat <<EOF
@@ -210,7 +214,7 @@ EOF
 fi
 
 # Track what we checked
-CHECKS_RUN=""
+CHECKS_RUN="host-neutral,"
 CHECKS_PASSED=true
 
 # ── Secret scanning (always runs) ────────────────────────────

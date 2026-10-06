@@ -1,0 +1,89 @@
+name: Host conformance
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  impact:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Require the PR's Codex impact choice
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr view "$PR_NUMBER" --repo "$GH_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/parity-pr-body.md"
+          python scripts/ci-checks/check-codex-impact.py --body-file "$RUNNER_TEMP/parity-pr-body.md"
+  collection:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Enforce reviewed invoking-host contracts for every test
+        run: PYTHONPATH=tests:hooks:scripts python -m pytest tests --collect-only -q -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json
+  contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.9', '3.12']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install fixture test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Inventory and both-host golden contracts
+        run: python -m pytest tests/test_host_capability_inventory.py tests/test_host_behavior_conformance.py tests/test_host_collection_contract.py -q
+      - name: Native contracts, privacy and isolated publication
+        run: PYTHONPATH=tests:hooks:scripts python -m pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json tests/test_host_ai_backend.py tests/test_host_codex_ai_contract.py tests/test_host_session_lookup.py tests/test_host_summary_publication.py tests/test_host_operation_state.py tests/test_native_lifecycle_integration.py tests/test_host_doctor_source_origin.py tests/test_host_package_install.py tests/test_dev_skill_install.py tests/test_native_entry_binding.py -q
+  acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Require external evidence for the exact feature commit
+        env:
+          TESTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          NATIVE_ACCEPTANCE_BUNDLE: ${{ vars[format('P_{0}', github.event.pull_request.head.sha || github.sha)] }}
+        run: python scripts/ci-checks/check-parity-acceptance.py --matrix docs/parity/capabilities.json --bundle-env --output-dir "$RUNNER_TEMP/native-acceptance" --sha "$TESTED_SHA"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-acceptance-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/native-acceptance
+          if-no-files-found: error
+  required-contracts:
+    if: always()
+    needs: [collection, contracts, acceptance, impact]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every declared platform/Python contract
+        env:
+          CONTRACT_RESULT: ${{ needs.contracts.result }}
+          IMPACT_RESULT: ${{ needs.impact.result }}
+          ACCEPTANCE_RESULT: ${{ needs.acceptance.result }}
+          COLLECTION_RESULT: ${{ needs.collection.result }}
+        run: |
+          test "$CONTRACT_RESULT" = success
+          test "$COLLECTION_RESULT" = success
+          test "$ACCEPTANCE_RESULT" = success
+          test "$IMPACT_RESULT" = success || test "$IMPACT_RESULT" = skipped

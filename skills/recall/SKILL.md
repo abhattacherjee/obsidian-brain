@@ -10,10 +10,14 @@ metadata:
 Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
 reference for the invoking host when this skill has paired host references.
 Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
-invocation. Use the selected host's own session ID. Keep curated note taxonomy
+invocation. The current client must be explicitly supplied by the invoking runtime.
+If that binding is unavailable, stop and report it. Never label a Desktop
+invocation as a CLI invocation or infer the frontend from transcript creation
+metadata or inherited environment markers. Use the selected host's own session ID. Keep curated note taxonomy
 separate from `agent_provider` and `agent_session_id` provenance.
 
 ```bash
+: "${OB_CLIENT:?Current native client binding is unavailable; stop without choosing a frontend.}"
 OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
 OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
@@ -48,19 +52,19 @@ Before preparing edits or requesting a summary of an existing note, call
 with `note-apply` and that revision. A conflict leaves the current note intact;
 show the pending result and do not count the note as saved. New curated notes
 use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex until its adapter is verified; shared vault retrieval
+is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
 and wiki filing continue without borrowing another host's memory.
 
 Read `references/host-claude.md` or `references/host-codex.md` when present.
 All note writes described below use `note-create` or revision-bound `note-apply`,
 including bidirectional related links. Content is a JSON string, never shell code.
-Keep this rule when a later step uses the word Write or Edit.
+Every later save or edit follows this revision-bound publication rule.
 
 # Recall — Load Project Context from Obsidian Vault
 
 Searches the Obsidian vault for session notes and insights matching the current project, upgrades any unsummarized notes with AI summaries, and presents a concise context brief.
 
-**Tools needed:** Bash, Grep, Read, Write
+**Tools needed:** native shell, native content search, native file reading, trusted publication
 
 ## Procedure
 
@@ -114,11 +118,11 @@ Track the returned task IDs — you will update them as each step completes. Imm
 
 > ⚠️ **THIS STEP IS MANDATORY. DO NOT SKIP IT.**
 >
-> If Grep finds any file matching both `status: auto-logged` AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 3. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
+> If pattern search finds any file matching both `status: auto-logged` AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 3. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
 >
 > **Visibility requirement:** Before Step 3, emit a one-line status: `Step 2: processing N unsummarized note(s) for $PROJECT` (or `Step 2: no unsummarized notes for $PROJECT` if the intersection is empty). This makes the decision auditable in the tool trace.
 
-Find unsummarized notes for this project in a single Python call (replaces multiple Grep rounds):
+Find unsummarized notes for this project in a single Python call (replaces multiple pattern search rounds):
 
 Request for `unsummarized` (substitute the values as data):
 
@@ -168,7 +172,7 @@ Update task #2 subject to `No unsummarized notes found` and set to `completed`. 
 
 If N <= 5, create a sub-task for each note (subject `"Upgrade: <basename>"`, activeForm `"Upgrading <basename> via the native backend"`).
 
-**Single Bash tool call** — `upgrade_batch()` uses the invoking host’s bound AI backend and bounded batch concurrency.
+**Single native shell call** — `upgrade_batch()` uses the invoking host’s bound AI backend and bounded batch concurrency.
 
 Request for `upgrade-batch` (substitute the values as data):
 

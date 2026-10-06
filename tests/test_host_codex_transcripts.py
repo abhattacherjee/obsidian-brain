@@ -259,3 +259,6 @@ def test_offset_fallback_rotation_requires_source_generation(tmp_path):
     assert second.records[0].source_id.startswith('offset:' + second.source_generation + ':')
     assert second.source_generation != first.source_generation
     assert second.records[0].text == 'Other source'
+
+
+pytestmark = pytest.mark.host_only("codex", reason="codex-record-format", capability="codex_native_format")

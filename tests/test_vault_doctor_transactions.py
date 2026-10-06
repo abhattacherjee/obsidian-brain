@@ -67,11 +67,11 @@ def test_ordinary_doctor_repair_refuses_invalid_utf8(tmp_path):
     assert path.read_bytes() == original
 
 
-def test_doctor_legacy_issue_honors_configured_vault(tmp_path, monkeypatch):
+def test_doctor_legacy_issue_honors_configured_vault(tmp_path, tmp_path_factory, monkeypatch):
     import obsidian_utils
     selected = tmp_path / "selected"
     selected.mkdir()
-    path = _project_note(tmp_path / "outside")
+    path = _project_note(tmp_path_factory.mktemp('outside-selected-vault'))
     before = path.read_bytes()
     monkeypatch.setattr(obsidian_utils, "load_config", lambda: {"vault_path": str(selected)})
     issue = Issue("project-name-normalization", str(path), "my_project", "", "", "",
@@ -171,3 +171,10 @@ def test_standalone_doctor_cli_uses_shared_writer(tmp_path):
     assert "applied" in result.stderr
     assert path.read_text().endswith("\ufffd")
     assert list((tmp_path / "state").rglob("state.sqlite3"))
+
+
+# Every scoped operation uses the same selected temporary vault.
+from selected_legacy_vault import selected_host_context, native_ai_frontend  # noqa: F401,E402
+import pytest
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

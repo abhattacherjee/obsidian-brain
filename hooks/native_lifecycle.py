@@ -77,12 +77,13 @@ def dispatch(context, event, payload, started_at):
     with using_runtime_context(context):
         try:
             from capture import CaptureEvent, capture_checkpoint, recover_registered
-            if event in {"session_start", "resume", "recover"}:
+            capture_enabled = context.config.get("auto_log_enabled", True) is not False
+            if capture_enabled and event in {"session_start", "resume", "recover"}:
                 recovered = recover_registered(context, max_sources=8, deadline=deadline, include_active=True)
                 if recovered.status != "complete" or recovered.pending_sources or recovered.loss_of_input:
                     _warn("recovery", "; ".join(recovered.warnings) or
                           f"status={recovered.status}, pending={recovered.pending_sources}, loss_of_input={recovered.loss_of_input}")
-            if event != "recover":
+            if capture_enabled and event != "recover":
                 options = {"kind": event, "turn_id": turn_id}
                 if event == "session_end" and payload.get("reason") == "clear":
                     options["trigger"] = "clear"

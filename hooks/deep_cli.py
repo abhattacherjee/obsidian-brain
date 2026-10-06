@@ -166,7 +166,8 @@ def run_present(vault_path: str, sessions_folder: str, insights_folder: str, *, 
     print(output)
 
 
-_ACTED_ITEMS_PATH = os.path.expanduser("~/.claude/obsidian-brain/deep-acted-items.json")
+from runtime_adapters.claude import legacy_private_directory
+_ACTED_ITEMS_PATH = str(legacy_private_directory() / "deep-acted-items.json")
 _ACTED_TTL_SECONDS = 86400  # 24 hours
 
 

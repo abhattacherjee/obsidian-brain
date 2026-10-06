@@ -31,6 +31,19 @@ import check_items_prefilter
 import open_item_dedup as oid
 
 
+@pytest.fixture
+def selected_host_context(host, selected_host_context, tmp_path, tmp_path_factory):
+    from dataclasses import replace
+    from runtime_context import using_runtime_context
+    private = tmp_path_factory.mktemp("evidence-private")
+    vault = tmp_path / "v"
+    selected = replace(selected_host_context, vault_path=vault,
+        state_path=private / "state", index_path=private / "index.sqlite3",
+        config=dict(selected_host_context.config, vault_path=str(vault)))
+    with using_runtime_context(selected):
+        yield selected
+
+
 def _session(path, date, project, summary="Did some work.", open_items=None):
     """Write a minimal claude-session note: optional `- [ ]` items under
     `## Open Questions / Next Steps`, and a `## Summary` body. Mirrors
@@ -138,7 +151,7 @@ def _fake_completed(stdout="", returncode=0):
     return cp
 
 
-def test_pipeline_attaches_note_completions_for_repo_less_project(tmp_path):
+def test_pipeline_attaches_note_completions_for_repo_less_project(selected_host_context, tmp_path):
     """End-to-end through deep_analysis_pipeline for a project with no local
     git repo (_resolve_project_paths -> {}). The gap is still named in
     evidence_gaps, but the project is no longer evidence-less: it has a
@@ -396,7 +409,7 @@ def test_note_evidence_only_caps_every_off_template_bypass_at_med(citation):
     assert tier == "MED", (citation, tier)
 
 
-def test_repo_backed_project_never_gets_note_completions(tmp_path):
+def test_repo_backed_project_never_gets_note_completions(selected_host_context, tmp_path):
     """#318 I3 ruling, REPLACES test_off_template_citation_still_reaches_high_with_git_evidence
     (deliberately removed -- it pinned the exact behaviour this closes).
 
@@ -470,9 +483,9 @@ def test_repo_backed_project_never_gets_note_completions(tmp_path):
 
 
 @pytest.fixture
-def invoking_ai_context(tmp_path, monkeypatch):
+def invoking_ai_context(selected_host_context, tmp_path, monkeypatch):
     from check_items_test_helpers import native_ai_context
-    yield from native_ai_context.__wrapped__(tmp_path, monkeypatch)
+    yield from native_ai_context.__wrapped__(selected_host_context, tmp_path, monkeypatch)
 
 
 def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path, invoking_ai_context):

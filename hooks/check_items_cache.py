@@ -21,7 +21,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-CACHE_DIR: Path = Path.home() / ".claude" / "obsidian-brain"
+from runtime_adapters.claude import legacy_private_directory
+CACHE_DIR: Path = legacy_private_directory()
 CACHE_PATH: Path = CACHE_DIR / "check-items-classifications.json"
 
 # The following constants are used by Tasks 4-7 (load_cache,
@@ -398,7 +399,10 @@ def _warn_if_unusable_ts(cached: dict, now: float, h: str, project: str) -> None
 
 def _cache_ai_identity(context, requested=None):
     from ai_backend import resolve_ai_selection
-    backend, model = resolve_ai_selection(context, "classify_items", requested)
+    # A prior result's model is evidence about that run, not today's native
+    # default. Codex replay must independently resolve its current selection.
+    backend, model = resolve_ai_selection(context, "classify_items",
+                                        requested if context.host == "claude" else None)
     if backend == "claude":
         # An observed ID from a previous run cannot resolve today's alias.
         explicit = context.config.get("classifier_model")

@@ -128,8 +128,8 @@ def _read_source(context, cursor, deadline, parser):
         if context.transcript_path is None:
             raise ValueError("Native transcript path is unavailable")
         path = Path(context.transcript_path).resolve()
-        native_home = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")
-                           if context.host == "claude" else os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        from runtime_adapters import selected_home
+        native_home = selected_home(context.host, context)
         roots = [native_home / "projects"] if context.host == "claude" else [native_home / "sessions", native_home / "archived_sessions"]
         if not cursor.historical and not any(path.is_relative_to(root.resolve()) for root in roots):
             raise ValueError("Transcript is outside the selected native storage")

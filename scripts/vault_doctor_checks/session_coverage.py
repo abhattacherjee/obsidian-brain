@@ -559,7 +559,126 @@ def _index_referenced_by(
     return ref_index
 
 
-def scan(
+def _scan_selected(context, vault_path, sessions_folder, insights_folder, days,
+                   project=None, strict=False, reconstruct=False):
+    """Audit the invoking host's verified normalized records, without writing."""
+    from dataclasses import replace
+    import time
+    from transcripts import SourceCursor, read_records
+    vault = Path(vault_path).resolve()
+    if vault != context.vault_path.resolve():
+        raise ValueError('Session coverage vault differs from the selected runtime')
+    if not context.config.get('auto_log_enabled', True):
+        return []
+    home = context.native_home
+    if home is None:
+        raise ValueError('Selected native storage is unavailable')
+    roots = [home / 'projects'] if context.host == 'claude' else [home / 'sessions', home / 'archived_sessions']
+    covered = set()
+    for note in (vault / sessions_folder).glob('*.md'):
+        try:
+            metadata = _parse_frontmatter(note.read_text(encoding='utf-8'))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if metadata.get('type') == 'claude-snapshot':
+            continue
+        provider = metadata.get('agent_provider', 'claude')
+        sid = metadata.get('agent_session_id') or metadata.get('session_id')
+        if provider == context.host and sid:
+            covered.add(sid)
+    references = _index_referenced_by(vault, insights_folder)
+    cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+    issues, seen = [], set()
+    deadline = time.monotonic() + 10
+    paths = sorted(path for root in roots if root.is_dir() for path in root.rglob('*.jsonl'))
+    if len(paths) > 1024:
+        raise ValueError('Session coverage source limit exceeded; narrow native storage before retry')
+    for path in paths:
+        if time.monotonic() >= deadline:
+            raise ValueError('Session coverage deadline reached; audit is incomplete')
+        if path.stat().st_mtime < cutoff or path.is_symlink():
+            continue
+        if context.host == 'claude':
+            sid = path.stem
+        else:
+            try:
+                with path.open('rb') as stream:
+                    first = stream.readline(65537)
+                header = json.loads(first)
+                payload = header.get('payload', {})
+                sid = payload.get('id') or payload.get('session_id')
+                if header.get('type') != 'session_meta' or not isinstance(sid, str) or not sid:
+                    raise ValueError('Native source identity is unverified')
+                if payload.get('id') and payload.get('session_id') and payload['id'] != payload['session_id']:
+                    raise ValueError('Native source identity conflicts')
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ValueError('Cannot verify native source identity') from exc
+        if sid in seen:
+            raise ValueError('Native source identity is duplicated')
+        seen.add(sid)
+        source_revision = hashlib.sha256(path.read_bytes()).hexdigest()
+        source_context = replace(context, native_session_id=sid, transcript_path=path)
+        batch = read_records(source_context, SourceCursor(historical=True), deadline)
+        if batch.status != 'ok' or batch.loss_of_input or batch.metadata.get('native_session_id') != sid:
+            raise ValueError('Native source audit is incomplete or unverified')
+        if hashlib.sha256(path.read_bytes()).hexdigest() != source_revision:
+            raise ValueError('Native source changed during audit')
+        cwd = batch.metadata.get('cwd')
+        if context.host == 'claude':
+            # The adapter's worktree default describes the invoking actor.
+            # A historical gap needs its own recorded cwd before repair.
+            cwd = None
+            with path.open('rb') as stream:
+                prefix = stream.read(65536)
+            for line in prefix.splitlines():
+                try:
+                    row = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(row, dict) and isinstance(row.get('cwd'), str):
+                    cwd = row['cwd']
+                    break
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+            raise ValueError('Native source project identity is unverified')
+        slug = _slugify(Path(cwd).name)
+        if project and slug != project.replace('_', '-').lower():
+            continue
+        records = [record for record in batch.records if record.kind == 'message' and record.role == 'user' and record.text.strip()]
+        timestamps = [record.timestamp for record in batch.records if record.timestamp]
+        duration = 0
+        if timestamps:
+            times = [datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() for stamp in timestamps]
+            duration = (max(times) - min(times)) / 60
+        if (len(records) < int(context.config.get('min_messages', 3))
+                or 0 < duration < float(context.config.get('min_duration_minutes', 2))):
+            continue
+        if sid in covered:
+            continue
+        date = _first_seen_date_from_ts(timestamps[0] if timestamps else None)
+        note_path = vault / sessions_folder / _make_filename(date, slug, sid)
+        refs = references.get(sid, [])
+        issues.append(Issue(check=NAME, note_path=str(note_path), project=slug,
+                            current_source=str(path), proposed_source=f'[[{note_path.stem}]]',
+                            reason=('FAIL:' if strict and refs else 'WARN:') + ' Native source has no session note',
+                            confidence=.9 if reconstruct else 0,
+                            extra={'unresolved': not reconstruct, 'signal_class':'session-coverage-gap',
+                                   'sid':sid, 'agent_provider':context.host, 'jsonl_path':str(path),
+                                   'source_revision':source_revision,
+                                   'cwd':cwd, 'referenced_by':refs, 'strict_fail':bool(strict and refs)}))
+    return issues
+
+
+def scan(vault_path, sessions_folder, insights_folder, days, project=None, strict=False, reconstruct=False):
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        return _scan_selected(context, vault_path, sessions_folder, insights_folder, days,
+                              project, strict, reconstruct)
+    return _scan_claude_legacy(vault_path, sessions_folder, insights_folder, days,
+                              project, strict, reconstruct)
+
+
+def _scan_claude_legacy(
     vault_path: str,
     sessions_folder: str,
     insights_folder: str,
@@ -852,6 +971,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
         / "dev-test"
         / "replay-sessionend.py"
     )
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
     # Upfront existence check — a broken plugin install must produce a clear
     # per-issue error, not N confusing subprocess launch failures.
     replay_missing = not _REPLAY.exists()
@@ -873,7 +994,7 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
                 f"only session-coverage-gap is reconstructable."
             )
 
-        if replay_missing:
+        if replay_missing and context is None:
             results.append(
                 Result(
                     check=NAME,
@@ -909,6 +1030,53 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
                     ),
                 )
             )
+            continue
+
+        if context is not None:
+            from dataclasses import replace
+            import time
+            from capture import CaptureEvent, capture_checkpoint
+            from runtime_context import using_runtime_context
+            provider = issue.extra.get('agent_provider', context.host)
+            if provider != context.host:
+                results.append(Result(check=NAME, note_path=issue.note_path, status='error',
+                                      error='Foreign-origin recovery cannot change the invoking host'))
+                continue
+            sid = issue.extra.get('sid')
+            source = Path(jsonl_path)
+            if not isinstance(sid, str) or not sid or not source.is_absolute():
+                results.append(Result(check=NAME, note_path=issue.note_path, status='error',
+                                      error='Native source identity/path is missing'))
+                continue
+            roots = ([context.native_home / 'projects'] if context.host == 'claude' else
+                     [context.native_home / 'sessions', context.native_home / 'archived_sessions']) if context.native_home else []
+            if (any(part.is_symlink() for part in (source, *source.parents)) or
+                    not any(source.resolve().is_relative_to(root.resolve()) for root in roots)):
+                results.append(Result(check=NAME, note_path=issue.note_path, status='error',
+                                      error='Native recovery source is outside selected storage'))
+                continue
+            try:
+                current_source_revision = hashlib.sha256(source.read_bytes()).hexdigest()
+            except OSError as exc:
+                results.append(Result(check=NAME, note_path=issue.note_path, status='error', error=str(exc)))
+                continue
+            if issue.extra.get('source_revision') != current_source_revision:
+                results.append(Result(check=NAME, note_path=issue.note_path, status='error',
+                                      error='Native source changed since the approved audit'))
+                continue
+            recovered = replace(context, native_session_id=sid, transcript_path=source,
+                                canonical_project_root=Path(cwd).resolve(), worktree=Path(cwd).resolve())
+            try:
+                with using_runtime_context(recovered):
+                    captured = capture_checkpoint(recovered, CaptureEvent('recover', note_path=Path(issue.note_path)),
+                                                  time.monotonic() + 30)
+                if captured.status == 'complete' and captured.applied_revision is not None and not captured.loss_of_input:
+                    results.append(Result(check=NAME, note_path=issue.note_path, status='applied'))
+                else:
+                    results.append(Result(check=NAME, note_path=issue.note_path, status='error',
+                                          error='Native recovery pending: ' + '; '.join(captured.warnings)))
+            except (OSError, ValueError, RuntimeError) as exc:
+                results.append(Result(check=NAME, note_path=issue.note_path, status='error', error=str(exc)))
             continue
 
         cmd = [
@@ -947,93 +1115,100 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             )
             continue
 
-        # Parse JSON outcome from stdout.
-        try:
-            out = json.loads(proc.stdout)
-        except (json.JSONDecodeError, ValueError) as exc:
+        results.append(_decode_legacy_replay(issue, proc))
+
+    return results
+
+
+def _decode_legacy_replay(issue, proc):
+    """Decode the legacy Claude replay wire format without invoking a writer."""
+    results = []
+    # Parse JSON outcome from stdout.
+    try:
+        out = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
+        results.append(
+            Result(
+                check=NAME,
+                note_path=issue.note_path,
+                status="error",
+                error=(
+                    f"replay stdout parse error: {exc}; "
+                    f"returncode={proc.returncode}; stderr={proc.stderr[:200]}"
+                ),
+            )
+        )
+        return results[0]
+
+    # Coerce outcome to str defensively: a malformed replay payload with
+    # a non-string outcome (number, null) must fall through to the
+    # per-issue error path below, not raise AttributeError on
+    # .startswith() and abort the whole sweep.
+    outcome = str(out.get("outcome", "UNKNOWN"))
+    if outcome in _SUCCESS_OUTCOMES:
+        # vault_writes is the replay's ground truth for what was written
+        # (the predicted issue.note_path may differ in date — see docstring:
+        # the hook's _first_seen_date returns TODAY for never-written
+        # sessions, while the scan predicted from the JSONL first timestamp).
+        # Shape-guard the [path, bytes] entries: a malformed payload
+        # (non-list outer, empty/non-list inner) becomes a per-issue
+        # error Result instead of a TypeError/IndexError crash.
+        vault_writes = out.get("vault_writes", [])
+        first_entry = None
+        if isinstance(vault_writes, list) and vault_writes:
+            candidate = vault_writes[0]
+            if isinstance(candidate, (list, tuple)) and candidate:
+                first_entry = candidate
+        if first_entry is not None:
+            actual_path = str(first_entry[0])
+            results.append(
+                Result(check=NAME, note_path=actual_path, status="applied")
+            )
+        elif vault_writes:
             results.append(
                 Result(
                     check=NAME,
                     note_path=issue.note_path,
                     status="error",
                     error=(
-                        f"replay stdout parse error: {exc}; "
-                        f"returncode={proc.returncode}; stderr={proc.stderr[:200]}"
+                        f"replay reported success ({outcome}) but its "
+                        f"vault_writes is malformed "
+                        f"({str(vault_writes)[:120]!r}); "
+                        f"check whether the note now exists before "
+                        f"re-running"
                     ),
                 )
             )
-            continue
-
-        # Coerce outcome to str defensively: a malformed replay payload with
-        # a non-string outcome (number, null) must fall through to the
-        # per-issue error path below, not raise AttributeError on
-        # .startswith() and abort the whole sweep.
-        outcome = str(out.get("outcome", "UNKNOWN"))
-        if outcome in _SUCCESS_OUTCOMES:
-            # vault_writes is the replay's ground truth for what was written
-            # (the predicted issue.note_path may differ in date — see docstring:
-            # the hook's _first_seen_date returns TODAY for never-written
-            # sessions, while the scan predicted from the JSONL first timestamp).
-            # Shape-guard the [path, bytes] entries: a malformed payload
-            # (non-list outer, empty/non-list inner) becomes a per-issue
-            # error Result instead of a TypeError/IndexError crash.
-            vault_writes = out.get("vault_writes", [])
-            first_entry = None
-            if isinstance(vault_writes, list) and vault_writes:
-                candidate = vault_writes[0]
-                if isinstance(candidate, (list, tuple)) and candidate:
-                    first_entry = candidate
-            if first_entry is not None:
-                actual_path = str(first_entry[0])
-                results.append(
-                    Result(check=NAME, note_path=actual_path, status="applied")
-                )
-            elif vault_writes:
-                results.append(
-                    Result(
-                        check=NAME,
-                        note_path=issue.note_path,
-                        status="error",
-                        error=(
-                            f"replay reported success ({outcome}) but its "
-                            f"vault_writes is malformed "
-                            f"({str(vault_writes)[:120]!r}); "
-                            f"check whether the note now exists before "
-                            f"re-running"
-                        ),
-                    )
-                )
-            else:
-                results.append(
-                    Result(
-                        check=NAME,
-                        note_path=issue.note_path,
-                        status="error",
-                        error=(
-                            f"replay reported success ({outcome}) but wrote "
-                            f"nothing (vault_writes empty); check whether "
-                            f"the note now exists before re-running"
-                        ),
-                    )
-                )
-        elif outcome.startswith("SKIPPED_"):
-            results.append(
-                Result(
-                    check=NAME,
-                    note_path=issue.note_path,
-                    status="skipped",
-                    error=f"replay outcome: {outcome}",
-                )
-            )
         else:
-            detail = out.get("detail", "")
             results.append(
                 Result(
                     check=NAME,
                     note_path=issue.note_path,
                     status="error",
-                    error=f"replay outcome={outcome}: {detail}",
+                    error=(
+                        f"replay reported success ({outcome}) but wrote "
+                        f"nothing (vault_writes empty); check whether "
+                        f"the note now exists before re-running"
+                    ),
                 )
             )
-
-    return results
+    elif outcome.startswith("SKIPPED_"):
+        results.append(
+            Result(
+                check=NAME,
+                note_path=issue.note_path,
+                status="skipped",
+                error=f"replay outcome: {outcome}",
+            )
+        )
+    else:
+        detail = out.get("detail", "")
+        results.append(
+            Result(
+                check=NAME,
+                note_path=issue.note_path,
+                status="error",
+                error=f"replay outcome={outcome}: {detail}",
+            )
+        )
+    return results[0]

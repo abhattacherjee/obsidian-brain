@@ -10,10 +10,14 @@ metadata:
 Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
 reference for the invoking host when this skill has paired host references.
 Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
-invocation. Use the selected host's own session ID. Keep curated note taxonomy
+invocation. The current client must be explicitly supplied by the invoking runtime.
+If that binding is unavailable, stop and report it. Never label a Desktop
+invocation as a CLI invocation or infer the frontend from transcript creation
+metadata or inherited environment markers. Use the selected host's own session ID. Keep curated note taxonomy
 separate from `agent_provider` and `agent_session_id` provenance.
 
 ```bash
+: "${OB_CLIENT:?Current native client binding is unavailable; stop without choosing a frontend.}"
 OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
 OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
@@ -48,19 +52,19 @@ Before preparing edits or requesting a summary of an existing note, call
 with `note-apply` and that revision. A conflict leaves the current note intact;
 show the pending result and do not count the note as saved. New curated notes
 use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex until its adapter is verified; shared vault retrieval
+is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
 and wiki filing continue without borrowing another host's memory.
 
 Read `references/host-claude.md` or `references/host-codex.md` when present.
 All note writes described below use `note-create` or revision-bound `note-apply`,
 including bidirectional related links. Content is a JSON string, never shell code.
-Keep this rule when a later step uses the word Write or Edit.
+Every later save or edit follows this revision-bound publication rule.
 
 # Vault Search
 
 Search the entire Obsidian vault by keyword, tag, or structured field query. Returns ranked results with snippets from both `claude-sessions/` and `claude-insights/` folders.
 
-**Tools needed:** Grep, Read, Bash
+**Tools needed:** native content search, native file reading, native shell
 
 ## Procedure
 
@@ -101,7 +105,7 @@ The user provides a query after `/vault-search`. Determine the search mode:
 - Strip the leading `#`
 - The search target is frontmatter `tags` fields
 - Pattern: the tag string, used as a regex (escape `.`, `+` and other regex characters)
-- Search only the frontmatter, not the body. Step 4 does this with `vault_scan.py grep --frontmatter-only`, because the Grep tool cannot limit a search to frontmatter and the `tags:` block can sit past line 40 (/emerge notes close their fence as deep as line 461)
+- Search only the frontmatter, not the body. Step 4 does this with `vault_scan.py grep --frontmatter-only`, because content search alone cannot limit matches to frontmatter and the `tags:` block can sit past line 40 (/emerge notes close their fence as deep as line 461)
 
 **Structured mode** — query contains `key:value` pairs (e.g. `project:api-service type:decision`):
 - Parse each `key:value` pair
@@ -110,11 +114,11 @@ The user provides a query after `/vault-search`. Determine the search mode:
 
 **Keyword mode** — everything else (e.g. `jwt refresh`):
 - Treat the entire query as a content search
-- Grep for the full phrase first; if zero results, grep for each word individually and intersect
+- Search for the full phrase first; if zero results, grep for each word individually and intersect
 
 ### Step 3 — Try FTS search (fast path)
 
-Before falling back to Grep, try the vault index:
+Before falling back to pattern search, try the vault index:
 
 Request for `search` (substitute the values as data):
 
@@ -136,39 +140,21 @@ If the output is `[]` or the command fails: print a note that the vault index re
 
 ### Step 4 — Search both folders in parallel
 
-Use the Grep tool (never Bash grep) for structured and keyword searches. Tag mode uses `vault_scan.py` instead (see below). If the Grep tool is not in your tool list, go straight to vault_scan.py grep — do not call Grep first. See the fallback below. Launch searches across both `SESSIONS_DIR` and `INSIGHTS_DIR` in parallel.
+Use the fixed `grep` operation. It searches validated indexed folders and emits one matching path per line. Keep only returned paths under the selected sessions and insights folders for this fallback. Query strings stay JSON data, including quotes and leading hyphens; the helper passes `--pattern=` internally, so they cannot become shell commands or CLI flags.
 
-**For tag mode:**
-Run one `vault_scan.py grep --frontmatter-only` call over both folders (not the Grep tool). It searches only each note's frontmatter, however long. A note with no frontmatter cannot match; a note whose frontmatter fence does not close is skipped and counted as `bad_frontmatter` in the stderr summary line. Stdout is one matching path per line. Always write `--pattern=` with the equals sign: with a space, a term that starts with `-` (such as `--no-verify`) is read as a flag and the call fails. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`. The success check below applies to this call too.
-
-Request for `grep` (substitute the values as data):
+**Tag mode:** Set `pattern` to the escaped tag regex, `ignore_case` to true, and `frontmatter_only` to true. Frontmatter is read through its closing fence even past line 40 (an /emerge fence can appear at line 461). A note without frontmatter cannot match; an unclosed fence is skipped and counted as `bad_frontmatter` in stderr.
 
 ```json
-{
-  "pattern": "<pattern>",
-  "ignore_case": true,
-  "frontmatter_only": true
-}
+{"pattern": "<escaped tag regex>", "ignore_case": true, "frontmatter_only": true}
 ```
 
 ```bash
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
 
-**For structured mode:**
-For each `key:value` pair, run two parallel Grep calls (one per folder):
-- `Grep(pattern="^<key>:.*<value>", path=<folder>, glob="*.md", output_mode="files_with_matches", -i=true)`
+**Structured mode:** Run one request per `key:value` pair with `pattern: "^<key>:.*<value>"`, `ignore_case: true`, and `frontmatter_only: true`. Intersect the returned file lists: every pair must match the same file.
 
-Then intersect results across all pairs — only files matching every pair are kept.
-
-**For keyword mode:**
-Run two parallel Grep calls:
-- `Grep(pattern="<query>", path=SESSIONS_DIR, glob="*.md", output_mode="files_with_matches", -i=true)`
-- `Grep(pattern="<query>", path=INSIGHTS_DIR, glob="*.md", output_mode="files_with_matches", -i=true)`
-
-If zero results and query has multiple words, retry by grepping each word separately and intersecting the file lists.
-
-**If the Grep tool is not available in this session** (structured and keyword mode), run each search above with `vault_scan.py grep` instead (#375): one call per pattern, both folder names as arguments, `--pattern='<pattern>'`, `--ignore-case` for `-i=true`. Use stdout as the file list and intersect exactly as above. Always write `--pattern=` with the equals sign: with a space, a term that starts with `-` (such as `--no-verify`) is read as a flag and the call fails. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+**Keyword mode:** Run one request for the complete query with `ignore_case: true`. If it finds no matches and the query contains several words, run one request per word and intersect the file lists.
 
 Check each call before you use its output. It succeeded only if it exited 0 and stderr has the `vault_scan: N match(es), M file(s) scanned, K skipped (...)` summary line; then stdout is the file list, and an empty stdout means no match. Anything else is a failure, not "no match": show the `ERROR:` line (or the whole stderr if there is none) to the user and stop. If K is more than 0, add this line to what you show the user: "K note(s) were not searched (see the breakdown) — run /vault-doctor".
 
@@ -189,7 +175,7 @@ python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_C
 
 If there are more than 20 matched files, sort by filename (which contains the date in YYYY-MM-DD format) descending and keep only the 20 most recent.
 
-Read the metadata of all kept files with one `vault_scan.py meta` call (one quoted path per file). Do not use a fixed-line `Read`: frontmatter can run past line 40 (/emerge notes close their fence as deep as line 461), so a fixed line limit silently drops fields. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+Read all kept files through one fixed `metadata` request with an explicit `paths` array. Do not use a fixed-line reader: frontmatter can run past line 40 (/emerge notes close their fence as deep as line 461), so a fixed line limit silently drops fields. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
 
 Request for `metadata` (substitute the values as data):
 
@@ -277,7 +263,7 @@ After the list, tell the user:
 
 ### Step 7 — Handle user selection
 
-If the user picks a number, read the full content of that file using the Read tool and present it in the conversation.
+If the user picks a number, read the full content of that file using native file reading and present it in the conversation.
 
 **Session-depth loading applies to snapshot picks too.** If the user picks a snapshot result, load the parent session body AND all its snapshot summaries (re-use `fetch_snapshot_summaries()`), not just the snapshot file alone — so the answer reflects the full session arc, not the mid-session fragment. Resolve the parent via the `source_session_note` stem captured in Step 5.
 

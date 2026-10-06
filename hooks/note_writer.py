@@ -1,6 +1,6 @@
 """CLI for deterministic vault note persistence.
 
-Skills previously persisted vault notes via a Write tool call, which breaks
+Skills previously persisted vault notes via a host file tool call, which breaks
 in environments that route writes through a context-blind helper sub-agent
 (#269). This gives skills two deterministic commands instead:
 
@@ -90,7 +90,7 @@ def _validate_folder(folder: str):
     before any filesystem side effect.
 
     Deliberately NOT an allowlist of known vault folder names: folder names
-    are user-configurable (~/.claude/obsidian-brain-config.json) and several
+    are user-configurable in the selected runtime config and several
     skills write to different folders. The rules below (no absolute/home
     path, no vault-root alias, no ``..`` segment, no dot-prefixed segment)
     block the actual vector without that coupling.
@@ -276,8 +276,8 @@ def run_write(
     regardless of what content happens to be piped in.
 
     ``overwrite`` (CLI: ``--overwrite``) must be passed explicitly to
-    replace an existing note. Claude Code's Write tool — which every caller
-    used before #269 — refuses to overwrite a file it has not Read in the
+    replace an existing note. The legacy host file writer — which every caller
+    used before #269 — refuses to overwrite a file it has not read in the
     session, so a filename-hash collision used to be loud; without this
     flag the conversion would silently destroy an existing insight and
     report success. Exactly one call site legitimately overwrites in place

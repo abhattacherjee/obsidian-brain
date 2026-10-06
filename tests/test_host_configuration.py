@@ -6,15 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from test_runtime_context import runtime_case
+from test_runtime_context import runtime_case, runtime_case_data, selected_host_context
 
 
 def context(case, **overrides):
     module = importlib.import_module("runtime_context")
     selected = {"resource_root": case["resource_root"]}
     selected.update(overrides)
-    return module.resolve_runtime_context("codex", "codex-cli", {
-        "session_id": "current-thread", "cwd": str(case["worktree"]),
+    return module.resolve_runtime_context(case["host"], "codex-cli" if case["host"] == "codex" else "claude-code", {
+        "session_id": "native-thread", "cwd": str(case["worktree"]),
     }, selected)
 
 
@@ -25,7 +25,7 @@ def write_config(path, vault, **values):
 
 def test_config_precedence_is_cli_then_explicit_env_then_native_home(runtime_case, monkeypatch):
     case = runtime_case
-    native = case["codex_home"] / "obsidian-brain-config.json"
+    native = (case["codex_home"] if case["host"] == "codex" else case["home"] / ".claude") / "obsidian-brain-config.json"
     write_config(native, case["vault"], selection="native")
     assert context(case).config["selection"] == "native"
     environment = case["home"] / "environment config.json"
@@ -54,7 +54,7 @@ def test_config_relative_paths_do_not_depend_on_unrelated_cwd(runtime_case, monk
 def test_existing_shared_index_is_kept_without_rewriting_it(runtime_case):
     case = runtime_case
     legacy = case["home"] / ".claude" / "obsidian-brain-vault.db"
-    legacy.parent.mkdir()
+    legacy.parent.mkdir(exist_ok=True)
     legacy.write_bytes(b"existing shared index")
     chosen = context(case, config_path=case["config_path"])
     assert chosen.index_path == legacy
@@ -88,17 +88,16 @@ def test_missing_installation_is_reported_instead_of_using_cwd(runtime_case):
     assert error.value.code == "resources_missing"
 
 
-def test_codex_transcript_cannot_point_into_claude_home(runtime_case):
+def test_selected_transcript_cannot_point_into_foreign_native_home(runtime_case):
     module = importlib.import_module("runtime_context")
     case = runtime_case
-    transcript = case["home"] / ".claude/projects/project/thread.jsonl"
+    foreign = (case["home"] / ".claude/projects" if case["host"] == "codex"
+               else case["codex_home"] / "sessions")
+    transcript = foreign / "project/thread.jsonl"
     transcript.parent.mkdir(parents=True)
-    transcript.write_text('{"sessionId":"current-thread"}\n')
+    transcript.write_text('{}\n')
     with pytest.raises(module.RuntimeContextError) as error:
-        module.resolve_runtime_context("codex", "codex-cli", {
-            "session_id": "current-thread", "cwd": str(case["worktree"]),
-            "transcript_path": str(transcript),
-        }, {"config_path": case["config_path"], "resource_root": case["resource_root"]})
+        context(case, config_path=case["config_path"], transcript_path=str(transcript))
     assert error.value.code == "transcript_outside_host"
 
 
@@ -108,7 +107,7 @@ def test_state_override_does_not_change_host_identity_or_index(runtime_case, mon
     monkeypatch.setenv("OBSIDIAN_BRAIN_STATE_DIR", str(state))
     chosen = context(case, config_path=case["config_path"])
     assert chosen.state_path == state
-    assert chosen.host == "codex" and chosen.native_session_id == "current-thread"
+    assert chosen.host == case["host"] and chosen.native_session_id == "native-thread"
     assert chosen.index_path != state
 
 

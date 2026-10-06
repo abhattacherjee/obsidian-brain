@@ -1,0 +1,575 @@
+{
+  "schema": 1,
+  "skills": [
+    "check-items",
+    "compress",
+    "consolidate",
+    "decide",
+    "dev-test",
+    "emerge",
+    "error-log",
+    "link",
+    "obsidian-setup",
+    "recall",
+    "retro",
+    "standup",
+    "vault-ask",
+    "vault-config",
+    "vault-doctor",
+    "vault-import",
+    "vault-reindex",
+    "vault-search",
+    "vault-stats"
+  ],
+  "skill_operations": {
+    "check-items": [
+      "apply-reviewed",
+      "artifact-store",
+      "classify",
+      "collect",
+      "config",
+      "partition",
+      "prepare",
+      "scope",
+      "semantic-merge",
+      "stage-01",
+      "stage-02",
+      "stage-03",
+      "stage-04",
+      "stage-05",
+      "stage-06",
+      "stage-07",
+      "stage-08",
+      "update-cache"
+    ],
+    "compress": [
+      "artifact-store",
+      "clock",
+      "config",
+      "grep",
+      "match-candidates",
+      "metadata",
+      "note-append",
+      "note-apply",
+      "note-create",
+      "note-read",
+      "prepare",
+      "search",
+      "session",
+      "sync"
+    ],
+    "consolidate": [
+      "artifact-store",
+      "config",
+      "consolidate",
+      "prepare",
+      "theme-merge",
+      "theme-split",
+      "theme-stats"
+    ],
+    "decide": [
+      "artifact-store",
+      "clock",
+      "config",
+      "grep",
+      "metadata",
+      "note-create",
+      "prepare",
+      "search",
+      "session",
+      "sync"
+    ],
+    "dev-test": [
+      "artifact-store",
+      "config",
+      "dev-install",
+      "prepare"
+    ],
+    "emerge": [
+      "artifact-store",
+      "build-note",
+      "config",
+      "prepare",
+      "themes"
+    ],
+    "error-log": [
+      "artifact-store",
+      "clock",
+      "config",
+      "grep",
+      "metadata",
+      "note-create",
+      "prepare",
+      "search",
+      "session",
+      "sync"
+    ],
+    "link": [
+      "artifact-store",
+      "config",
+      "grep",
+      "metadata",
+      "note-apply",
+      "note-read",
+      "prepare",
+      "search"
+    ],
+    "obsidian-setup": [
+      "artifact-store",
+      "config",
+      "config-read",
+      "configure",
+      "dependencies",
+      "note-apply",
+      "note-create",
+      "note-read",
+      "prepare",
+      "reindex"
+    ],
+    "recall": [
+      "artifact-store",
+      "brief",
+      "config",
+      "note-apply",
+      "note-read",
+      "prepare",
+      "recurring-themes",
+      "summary-apply",
+      "unsummarized",
+      "upgrade-batch"
+    ],
+    "retro": [
+      "artifact-store",
+      "classification-complete",
+      "classification-pending",
+      "clock",
+      "config",
+      "evidence",
+      "note-create",
+      "prepare",
+      "session",
+      "sync"
+    ],
+    "standup": [
+      "artifact-store",
+      "cascade",
+      "cascade-collect",
+      "config",
+      "deep-checkoffs",
+      "deep-edit",
+      "deep-pipeline",
+      "deep-present",
+      "grep",
+      "metadata",
+      "note-apply",
+      "note-create",
+      "note-read",
+      "prepare",
+      "search",
+      "status",
+      "summary-apply",
+      "unsummarized",
+      "upgrade-batch"
+    ],
+    "vault-ask": [
+      "artifact-store",
+      "config",
+      "grep",
+      "metadata",
+      "prepare",
+      "search",
+      "snapshots",
+      "wiki-count",
+      "wiki-file",
+      "wiki-lookup",
+      "wiki-memgrep",
+      "wiki-rule",
+      "wiki-stale"
+    ],
+    "vault-config": [
+      "artifact-store",
+      "config",
+      "config-read",
+      "configure",
+      "prepare"
+    ],
+    "vault-doctor": [
+      "artifact-store",
+      "config",
+      "doctor",
+      "prepare"
+    ],
+    "vault-import": [
+      "artifact-store",
+      "config",
+      "import-list",
+      "import-read",
+      "note-create",
+      "prepare"
+    ],
+    "vault-reindex": [
+      "artifact-store",
+      "config",
+      "prepare",
+      "reindex"
+    ],
+    "vault-search": [
+      "artifact-store",
+      "config",
+      "grep",
+      "metadata",
+      "prepare",
+      "search",
+      "snapshots"
+    ],
+    "vault-stats": [
+      "artifact-store",
+      "config",
+      "note-create",
+      "prepare",
+      "stats"
+    ]
+  },
+  "legacy_hook_events": [
+    "PreCompact",
+    "SessionEnd",
+    "SessionStart",
+    "Stop"
+  ],
+  "native_payload_fields_by_handler": {
+    "pre_compact": [
+      "cwd",
+      "sessionId",
+      "session_id",
+      "transcript_path",
+      "trigger",
+      "turn_id"
+    ],
+    "recover": [
+      "cwd",
+      "sessionId",
+      "session_id",
+      "transcript_path",
+      "turn_id"
+    ],
+    "resume": [
+      "cwd",
+      "sessionId",
+      "session_id",
+      "transcript_path",
+      "turn_id"
+    ],
+    "session_end": [
+      "cwd",
+      "reason",
+      "sessionId",
+      "session_id",
+      "transcript_path",
+      "turn_id"
+    ],
+    "session_start": [
+      "cwd",
+      "sessionId",
+      "session_id",
+      "source",
+      "transcript_path",
+      "turn_id"
+    ],
+    "stop": [
+      "cwd",
+      "sessionId",
+      "session_id",
+      "stop_hook_active",
+      "transcript_path",
+      "turn_id"
+    ]
+  },
+  "runtime_override_fields": [
+    "config_path",
+    "cwd",
+    "index_path",
+    "resource_root",
+    "session_id",
+    "state_path",
+    "transcript_path",
+    "vault_path"
+  ],
+  "wiki_commands": [
+    "count",
+    "file",
+    "lookup",
+    "memgrep",
+    "rule",
+    "stale"
+  ],
+  "doctor_checks": [
+    "audit-historic-repairs",
+    "crossed-source-session",
+    "encoding-corruption",
+    "memory-index",
+    "missing-frontmatter-fence",
+    "project-name-canonicalization",
+    "project-name-normalization",
+    "session-coverage",
+    "snapshot-integrity",
+    "snapshot-migration",
+    "source-sessions",
+    "spurious-wikilinks",
+    "wiki-pages"
+  ],
+  "config_reads": {
+    "hooks/ai_adapters/claude.py": [
+      "claude_executable"
+    ],
+    "hooks/ai_adapters/codex.py": [
+      "codex_executable"
+    ],
+    "hooks/ai_backend.py": [
+      "codex_ai_model",
+      "codex_summary_model",
+      "summary_model"
+    ],
+    "hooks/capture.py": [
+      "min_duration_minutes",
+      "min_messages",
+      "sessions_folder",
+      "snapshot_on_clear",
+      "snapshot_on_compact"
+    ],
+    "hooks/check_items_cache.py": [
+      "classifier_model"
+    ],
+    "hooks/check_items_cli.py": [
+      "classifier_model"
+    ],
+    "hooks/check_items_report.py": [
+      "check_items_folder"
+    ],
+    "hooks/consolidate_cli.py": [
+      "consolidate_cluster_threshold",
+      "consolidate_max_theme_size",
+      "consolidate_min_cluster_size",
+      "consolidate_unassigned_threshold",
+      "summary_model",
+      "vault_path"
+    ],
+    "hooks/deep_cli.py": [
+      "insights_folder",
+      "sessions_folder",
+      "vault_path"
+    ],
+    "hooks/emerge_cli.py": [
+      "insights_folder",
+      "vault_path"
+    ],
+    "hooks/native_lifecycle.py": [
+      "auto_log_enabled",
+      "sessions_folder"
+    ],
+    "hooks/obsidian_context_snapshot.py": [
+      "sessions_folder",
+      "snapshot_on_clear",
+      "snapshot_on_compact",
+      "vault_path"
+    ],
+    "hooks/obsidian_session_hint.py": [
+      "reaper_enabled",
+      "sessions_folder",
+      "vault_path"
+    ],
+    "hooks/obsidian_session_log.py": [
+      "auto_log_enabled",
+      "min_duration_minutes",
+      "min_messages",
+      "sessions_folder",
+      "vault_path"
+    ],
+    "hooks/obsidian_session_reaper.py": [
+      "min_duration_minutes",
+      "min_messages",
+      "reaper_max_runtime_seconds"
+    ],
+    "hooks/obsidian_utils.py": [
+      "aged_summarize_threshold_days",
+      "codex_summary_model",
+      "insights_folder",
+      "sessions_folder",
+      "summary_batch_size",
+      "summary_pin_tags",
+      "summary_recovery",
+      "vault_path",
+      "wiki_folder",
+      "workspace_roots"
+    ],
+    "hooks/operation_state.py": [
+      "codex_ai_model",
+      "codex_summary_model",
+      "summary_model"
+    ],
+    "hooks/runtime_context.py": [
+      "index_path",
+      "vault_path"
+    ],
+    "hooks/session_lookup.py": [
+      "sessions_folder"
+    ],
+    "hooks/skill_procedures.py": [
+      "folders",
+      "insights_folder",
+      "optional_deps_declined",
+      "optional_deps_prompted",
+      "sessions_folder",
+      "vault_path",
+      "wiki_folder"
+    ],
+    "hooks/wiki.py": [
+      "vault_path",
+      "wiki_folder"
+    ],
+    "scripts/dev-test/prototype-check-items-87.py": [
+      "insights_folder",
+      "sessions_folder",
+      "vault_path"
+    ],
+    "scripts/dev-test/test-issue-123-manual.py": [
+      "vault_path"
+    ],
+    "scripts/dev-test/test-issue-87-manual.py": [
+      "insights_folder",
+      "sessions_folder",
+      "vault_path"
+    ],
+    "scripts/dev-test/validate_phase2.py": [
+      "optional_deps_declined"
+    ],
+    "scripts/tune_compress_rank_gap.py": [
+      "vault_path"
+    ],
+    "scripts/vault_doctor.py": [
+      "insights_folder",
+      "sessions_folder",
+      "vault",
+      "vault_path"
+    ],
+    "scripts/vault_doctor_checks/__init__.py": [
+      "vault_path"
+    ],
+    "scripts/vault_doctor_checks/session_coverage.py": [
+      "auto_log_enabled",
+      "min_duration_minutes",
+      "min_messages"
+    ],
+    "scripts/vault_doctor_checks/wiki_pages.py": [
+      "vault_path",
+      "wiki_folder"
+    ]
+  },
+  "native_config_reads": {
+    "hooks/ai_adapters/codex.py": [
+      "features",
+      "mcp_servers",
+      "model",
+      "plugins",
+      "web_search"
+    ]
+  },
+  "environment_reads": {
+    "hooks/check_items_cli.py": [
+      "CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE",
+      "CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC"
+    ],
+    "hooks/check_items_prefilter.py": [
+      "CHECK_ITEMS_PREFILTER"
+    ],
+    "hooks/memory_sources.py": [
+      "CODEX_SANDBOX",
+      "CODEX_SANDBOX_NETWORK_DISABLED",
+      "CODEX_THREAD_ID"
+    ],
+    "hooks/native_lifecycle.py": [
+      "OBSIDIAN_BRAIN_NESTED_AI"
+    ],
+    "hooks/obsidian_context_snapshot.py": [
+      "OBSIDIAN_BRAIN_NESTED_AI"
+    ],
+    "hooks/obsidian_retro_gate.py": [
+      "OBSIDIAN_BRAIN_NESTED_AI"
+    ],
+    "hooks/obsidian_session_hint.py": [
+      "OBSIDIAN_BRAIN_NESTED_AI"
+    ],
+    "hooks/obsidian_session_log.py": [
+      "OBSIDIAN_BRAIN_NESTED_AI"
+    ],
+    "hooks/obsidian_utils.py": [
+      "CLAUDE_CODE_SESSION_ID",
+      "CLAUDE_PROJECT_DIR",
+      "CODEX_HOME",
+      "CODEX_SANDBOX",
+      "CODEX_SANDBOX_NETWORK_DISABLED",
+      "CODEX_THREAD_ID"
+    ],
+    "hooks/open_item_dedup.py": [
+      "CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC"
+    ],
+    "hooks/runtime_adapters/claude.py": [
+      "CLAUDE_CONFIG_DIR",
+      "OBSIDIAN_BRAIN_DB"
+    ],
+    "hooks/runtime_adapters/codex.py": [
+      "CODEX_HOME"
+    ],
+    "hooks/runtime_context.py": [
+      "CLAUDE_CODE_SESSION_ID",
+      "CLAUDE_CONFIG_DIR",
+      "CLAUDE_PLUGIN_ROOT",
+      "CODEX_HOME",
+      "CODEX_THREAD_ID",
+      "OBSIDIAN_BRAIN_CONFIG",
+      "OBSIDIAN_BRAIN_DB",
+      "OBSIDIAN_BRAIN_STATE_DIR",
+      "PLUGIN_ROOT",
+      "XDG_DATA_HOME"
+    ],
+    "hooks/skill_procedures.py": [
+      "BUCKETS_PATH",
+      "CLASSIFICATIONS_PATH",
+      "EVIDENCE_PATH",
+      "GAPS_PATH",
+      "MERGED_PATH",
+      "PARTITION_PATH",
+      "PART_PATH",
+      "RAW_PATH",
+      "SCOPE_PATH",
+      "SKIPS_FILE"
+    ],
+    "scripts/dev-test/codex_install.py": [
+      "CODEX_HOME"
+    ],
+    "scripts/dev-test/replay-sessionend.py": [
+      "_REAL_VAULT_GUARD"
+    ],
+    "scripts/dev-test/test-issue-125-manual.py": [
+      "HOME"
+    ],
+    "scripts/dev-test/test-issue-128-manual.py": [
+      "HOME"
+    ],
+    "scripts/dev-test/test-issue-192-pollution-guard.py": [
+      "OBSIDIAN_BRAIN_DB",
+      "PYTEST_CURRENT_TEST"
+    ],
+    "scripts/vault_doctor.py": [
+      "OBSIDIAN_BRAIN_INSIGHTS_FOLDER",
+      "OBSIDIAN_BRAIN_SESSIONS_FOLDER",
+      "OBSIDIAN_BRAIN_VAULT"
+    ],
+    "scripts/vault_doctor_checks/audit_historic_repairs.py": [
+      "OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT"
+    ],
+    "scripts/ci-checks/check-parity-acceptance.py": [
+      "NATIVE_ACCEPTANCE_BUNDLE"
+    ]
+  },
+  "unresolved_environment_reads": []
+}

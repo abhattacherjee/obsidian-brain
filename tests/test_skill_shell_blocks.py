@@ -49,19 +49,20 @@ def installed(tmp_path):
     return root
 
 
-def _shell(tmp_path, installed, skill, command, payload, host):
+def _shell(tmp_path, installed, skill, command, payload, host, context):
     _verify_installed_hooks(installed)
     request = tmp_path / 'request.json'
     request.write_text(json.dumps(payload))
     request.chmod(0o600)
-    home = tmp_path / 'native home'
-    home.mkdir(exist_ok=True)
-    vault = tmp_path / 'vault'
-    vault.mkdir(exist_ok=True)
-    config = home / 'config.json'
-    config.write_text(json.dumps({'vault_path': str(vault)}))
-    config.chmod(0o600)
-    environment = dict(os.environ, HOME=str(home), CODEX_HOME=str(home / 'codex'), CLAUDE_CONFIG_DIR=str(home / 'claude'), CLAUDE_CODE_SESSION_ID='poisoned-other-session', CODEX_THREAD_ID='poisoned-other-thread', OB_SKILL_PATH=str(installed / 'skills' / skill / 'SKILL.md'), OB_RESOURCE_ROOT=str(installed), OB_HOST=host, OB_CLIENT='claude-code' if host=='claude' else 'codex-cli', OB_SESSION_ID='explicit-native-session', OB_CWD=str(tmp_path), REQUEST_PATH=str(request), TEST_CONFIG=str(config), TEST_VAULT=str(vault), TEST_STATE=str(home / 'state'), TEST_INDEX=str(home / 'index.sqlite3'))
+    home = context.native_home
+    vault = context.vault_path
+    config = context.config_path
+    environment = dict(os.environ, CLAUDE_CODE_SESSION_ID='poisoned-other-session',
+        CODEX_THREAD_ID='poisoned-other-thread',
+        OB_SKILL_PATH=str(installed / 'skills' / skill / 'SKILL.md'), OB_RESOURCE_ROOT=str(installed),
+        OB_HOST=host, OB_CLIENT=context.client, OB_SESSION_ID=context.native_session_id,
+        OB_CWD=str(context.worktree), REQUEST_PATH=str(request), TEST_CONFIG=str(config),
+        TEST_VAULT=str(vault), TEST_STATE=str(context.state_path), TEST_INDEX=str(context.index_path))
     command = command.replace(' run ', ' --config "$TEST_CONFIG" --vault "$TEST_VAULT" --state "$TEST_STATE" --index "$TEST_INDEX" run ')
     return subprocess.run([BASH, '-c', command], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
 
@@ -76,10 +77,10 @@ def test_changed_installed_source_cannot_enter_combined_coverage(installed):
 @pytest.mark.skipif(BASH is None, reason='bash unavailable')
 @pytest.mark.parametrize('host', ['claude','codex'])
 @pytest.mark.parametrize('identifier,skill,operation,command', BLOCKS, ids=[item[0] for item in BLOCKS])
-def test_authored_content_stays_data_and_collision_keeps_original(tmp_path, installed, host, identifier, skill, operation, command):
+def test_authored_content_stays_data_and_collision_keeps_original(tmp_path, installed, host, identifier, skill, operation, command, selected_host_context):
     def run(op, payload):
         selected = re.sub(r"--operation '[^']+'", "--operation '"+op+"'", command)
-        result = _shell(tmp_path, installed, skill, selected, payload, host)
+        result = _shell(tmp_path, installed, skill, selected, payload, host, selected_host_context)
         assert result.returncode == 0, result.stdout + result.stderr
         return result
     prepared = json.loads(run('prepare', {}).stdout)
@@ -87,7 +88,7 @@ def test_authored_content_stays_data_and_collision_keeps_original(tmp_path, inst
     marker = tmp_path / 'SIDE_EFFECT_MARKER'
     hostile = 'OB_NOTE_EOF\nOB_UPDATE_EOF\nOB_NOTE_EOF_beef\n$(touch ' + str(marker) + ')\n`touch ' + str(marker) + '`\ntouch ' + str(marker) + '\nSENTINEL-LAST-LINE-OF-NOTE\n'
     folder = 'claude-sessions' if skill == 'vault-import' else 'claude-insights'
-    destination = tmp_path / 'vault' / folder / 'note.md'
+    destination = selected_host_context.vault_path / folder / 'note.md'
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = {'operation_id': operation_id}
     if operation == 'note-create':
@@ -110,6 +111,18 @@ def test_authored_content_stays_data_and_collision_keeps_original(tmp_path, inst
     from obsidian_utils import parse_frontmatter_field
     assert parse_frontmatter_field(written, 'author_host') == host
     if operation=='note-create':
-        repeated = _shell(tmp_path, installed, skill, command, payload, host)
+        repeated = _shell(tmp_path, installed, skill, command, payload, host, selected_host_context)
         assert repeated.returncode != 0
         assert destination.read_text() == written
+
+
+@pytest.fixture
+def selected_host_context(selected_host_context, host, installed):
+    from runtime_context import resolve_runtime_context, using_runtime_context
+    original = selected_host_context
+    selected = resolve_runtime_context(host, original.client,
+        {'session_id': original.native_session_id, 'cwd': str(original.worktree)},
+        {'config_path': original.config_path, 'resource_root': installed,
+         'index_path': original.index_path, 'state_path': original.state_path})
+    with using_runtime_context(selected):
+        yield selected

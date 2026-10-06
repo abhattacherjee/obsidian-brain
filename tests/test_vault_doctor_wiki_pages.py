@@ -37,10 +37,10 @@ def _note(vault: Path, folder: str, name: str, ntype: str, body: str = "zebracor
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, selected_host_context):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
-    vault = tmp_path / "v"
+    vault = selected_host_context.vault_path
     for n, t in (("i1", "claude-insight"), ("i2", "claude-insight"), ("d1", "claude-decision")):
         _note(vault, "claude-insights", n, t)
     (vault / "claude-sessions").mkdir(parents=True)
@@ -54,7 +54,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(wiki, "_memory_listing", lambda: (wiki._memory_files(), [], "claude-code"))
     vault_index.ensure_index(str(vault), FOLDERS, db_path=db)
     ctx = {"vault": str(vault), "wiki_folder": "claude-wiki", "folders": FOLDERS, "db": db}
-    return {"vault": vault, "ctx": ctx, "home": home, "cfg": cfg}
+    return {"vault": vault, "ctx": ctx, "home": home, "cfg": cfg,
+            "runtime": selected_host_context}
 
 
 def _file(env, question="How does zebracorn ranking work?", **kw) -> Path:
@@ -72,6 +73,17 @@ def _link_from_session(env, page: Path, form: str = "[[{stem}]]") -> None:
 
 def _scan(env, days=9999, project=None):
     return wp.scan(str(env["vault"]), "claude-sessions", "claude-insights", days, project=project)
+
+
+def _scan_fresh_config(env):
+    from runtime_context import resolve_runtime_context, using_runtime_context
+    selected = env['runtime']
+    fresh = resolve_runtime_context(selected.host, selected.client,
+        {'session_id': selected.native_session_id, 'cwd': str(selected.canonical_project_root)},
+        {'config_path': selected.config_path, 'resource_root': selected.resource_root,
+         'index_path': env['ctx']['db']})
+    with using_runtime_context(fresh):
+        return _scan(env)
 
 
 def _classes(issues, page=None):
@@ -286,34 +298,34 @@ def test_project_filter_limits_page_rows(env):
 
 
 def test_wiki_off_or_missing_reports_nothing(env, capsys):
-    assert _scan(env) == []  # no wiki folder yet
+    assert _scan_fresh_config(env) == []  # no wiki folder yet
     cfg = dict(env["cfg"], wiki_folder="")
-    (env["home"] / ".claude" / "obsidian-brain-config.json").write_text(json.dumps(cfg))
+    env["runtime"].config_path.write_text(json.dumps(cfg))
     _file(env)
-    assert _scan(env) == []
+    assert _scan_fresh_config(env) == []
     assert "wiki is turned off" in capsys.readouterr().err
 
 
 def test_invalid_wiki_folder_raises(env):
     cfg = dict(env["cfg"], wiki_folder="../outside")
-    (env["home"] / ".claude" / "obsidian-brain-config.json").write_text(json.dumps(cfg))
+    env["runtime"].config_path.write_text(json.dumps(cfg))
     with pytest.raises(ValueError):
-        _scan(env)
+        _scan_fresh_config(env)
 
 
 def test_corrupt_config_raises_instead_of_guessing(env):
-    (env["home"] / ".claude" / "obsidian-brain-config.json").write_text("{not json")
-    with pytest.raises(ValueError, match="cannot read"):
-        _scan(env)
+    env["runtime"].config_path.write_text("{not json")
+    with pytest.raises(ValueError, match="configuration"):
+        _scan_fresh_config(env)
 
 
-def test_config_is_read_from_home_at_call_time(env, monkeypatch):
+def test_fresh_context_reads_selected_config(env, monkeypatch):
     # A wiki folder name only the tmp config knows: proves the real config is never read.
     cfg = dict(env["cfg"], wiki_folder="tmp-only-wiki")
-    (env["home"] / ".claude" / "obsidian-brain-config.json").write_text(json.dumps(cfg))
+    env["runtime"].config_path.write_text(json.dumps(cfg))
     (env["vault"] / "tmp-only-wiki" / "queries").mkdir(parents=True)
     (env["vault"] / "tmp-only-wiki" / "index.md").write_text("hand-made\n")
-    assert _scan(env) and _classes(_scan(env)) == ["index-drift"]
+    assert _scan_fresh_config(env) and _classes(_scan_fresh_config(env)) == ["index-drift"]
 
 
 def test_leftover_index_file_is_drift_but_a_user_file_is_not(env):
@@ -411,7 +423,7 @@ def test_odd_backslash_links_do_not_crash(env):
     assert "a\\\\b" in links and "x" in links and "" not in links
 
 
-def test_memory_backed_page_with_deleted_memory_file_is_broken_source(env, tmp_path, monkeypatch):
+def test_memory_backed_page_with_deleted_memory_file_is_broken_source(env, tmp_path, monkeypatch, host):
     store = tmp_path / "home" / ".claude" / "projects" / "proj" / "memory"
     store.mkdir(parents=True)
     x, y = store / "x.md", store / "y.md"
@@ -420,12 +432,13 @@ def test_memory_backed_page_with_deleted_memory_file_is_broken_source(env, tmp_p
     monkeypatch.setattr(wiki, "_memory_files", lambda: [x, y])
     page = _file(env, sources=["i1", "i2"], memory_sources=["proj/x.md"])
     _link_from_session(env, page)
-    assert _scan(env) == []
+    before = _scan(env)
+    assert before == [] if host == "claude" else _classes(before, page) == ["stale"]
     x.unlink()
     monkeypatch.setattr(wiki, "_memory_files", lambda: [y])
     rows = _scan(env)
-    assert _classes(rows, page) == ["broken-source"]
-    assert "missing: memory:proj/x.md" in rows[0].reason
+    assert _classes(rows, page) == (["broken-source"] if host == "claude" else ["stale"])
+    assert ("missing: memory:proj/x.md" if host == "claude" else "unverifiable: memory:proj/x.md") in rows[0].reason
 
 
 def test_split_index_links_do_not_save_a_page_from_orphan(env, monkeypatch):
@@ -577,7 +590,7 @@ def test_a_config_without_vault_path_scans_the_given_vault(env, capsys):
     assert "skipped" not in capsys.readouterr().err
 
 
-def test_memory_listing_runs_once_per_scan(env, tmp_path, monkeypatch):
+def test_memory_listing_runs_once_per_scan(env, tmp_path, monkeypatch, host):
     store = tmp_path / "home" / ".claude" / "projects" / "proj" / "memory"
     store.mkdir(parents=True)
     files = [store / f"{n}.md" for n in "xyz"]
@@ -596,7 +609,10 @@ def test_memory_listing_runs_once_per_scan(env, tmp_path, monkeypatch):
     files[0].write_text("edited\n")
     rows = _scan(env)
     assert calls == [1]
-    assert "stale" in _classes(rows, pages[0]) and "stale" not in _classes(rows, pages[1])
+    assert "stale" in _classes(rows, pages[0])
+    assert ("stale" in _classes(rows, pages[1])) is (host == "codex")
+    if host == "codex":
+        assert all("unverifiable: memory:" in row.reason for row in rows if row.extra["signal_class"] == "stale")
 
 
 def test_no_memory_listing_when_no_page_cites_memory(env, monkeypatch):

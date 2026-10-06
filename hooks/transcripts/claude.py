@@ -4,9 +4,14 @@ import json
 from . import ParsedRecords, SourceRecord, read_source
 
 
-_CATEGORIES = {"Bash": "shell", "Read": "read", "Edit": "edit", "MultiEdit": "edit",
-               "Write": "write", "Grep": "search", "Glob": "search", "Agent": "agent",
-               "Task": "agent", "WebFetch": "web", "WebSearch": "web", "TodoWrite": "planning"}
+def native_tool_categories():
+    """Normalize native source names; these names never select invocation tools."""
+    return {"Bash": "shell", "Read": "read", "Edit": "edit", "MultiEdit": "edit",
+            "Write": "write", "Grep": "search", "Glob": "search", "Agent": "agent",
+            "Task": "agent", "WebFetch": "web", "WebSearch": "web", "TodoWrite": "planning"}
+
+
+_CATEGORIES = native_tool_categories()
 _IGNORED_ROWS = {"progress", "file-history-snapshot", "summary", "queue-operation", "last-prompt",
                  "custom-title", "agent-name", "agent-color", "pr-link", "saved_hook_context",
                  "permission-mode", "attachment"}

@@ -23,7 +23,7 @@ def host(request):
 
 
 @pytest.fixture
-def context(host, tmp_path, monkeypatch):
+def selected_host_context(host, tmp_path, monkeypatch):
     home = tmp_path / 'home'
     home.mkdir()
     monkeypatch.setenv('HOME', str(home))
@@ -42,7 +42,14 @@ def context(host, tmp_path, monkeypatch):
     def no_live_backend(*args, **kwargs):
         pytest.fail('Acceptance fixtures must not launch a native AI backend')
     monkeypatch.setattr(ai_backend, 'execute_ai', no_live_backend)
-    return selected
+    from runtime_context import using_runtime_context
+    with using_runtime_context(selected):
+        yield selected
+
+
+@pytest.fixture
+def context(selected_host_context):
+    return selected_host_context
 
 
 def invoke(context, skill, operation, payload=None, *, success=True):

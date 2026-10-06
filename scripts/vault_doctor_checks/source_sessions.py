@@ -325,27 +325,62 @@ def _jsonl_window(jsonl_path: str) -> tuple[float, float] | None:
     return (first_ts, mtime)
 
 
-def _jsonl_dir_for_project(project: str) -> Path | None:
+def _source_roots(provider):
+    from runtime_context import current_runtime_context, historical_source_roots
+    context = current_runtime_context()
+    if context is not None and context.host == provider:
+        names = ('projects',) if provider == 'claude' else ('sessions', 'archived_sessions')
+        return tuple(context.native_home / name for name in names)
+    return historical_source_roots(provider)
+
+
+def _source_provider(metadata):
+    provider = metadata.get('agent_provider', 'claude')
+    if provider not in {'claude', 'codex'}:
+        raise ValueError('Unknown source provider')
+    return provider
+
+
+def _source_window(path, provider, sid):
+    if provider == 'claude':
+        return _jsonl_window(str(path))
+    from dataclasses import replace
+    from runtime_context import current_runtime_context
+    from transcripts import SourceCursor, read_records
+    context = current_runtime_context()
+    if context is None:
+        return None
+    source = replace(context, host=provider, native_session_id=sid, transcript_path=Path(path))
+    batch = read_records(source, SourceCursor(historical=True), time.monotonic() + 1)
+    if batch.status != 'ok' or not batch.source_complete or batch.loss_of_input:
+        return None
+    timestamps = [_parse_iso_ts(record.timestamp) for record in batch.records if record.timestamp]
+    timestamps = [stamp for stamp in timestamps if stamp is not None]
+    return (min(timestamps), max(timestamps)) if timestamps else None
+
+
+def _jsonl_dir_for_project(project: str, provider='claude') -> Path | None:
     """Find ~/.claude/projects/*<project>/ directory for this project name.
 
     Wraps os.path.getmtime in a try/except so a transient filesystem race
     (a matched directory being deleted between glob and stat) cannot crash
     the scan. Directories that disappear mid-scan are treated as missing.
     """
-    home = os.environ.get("HOME", os.path.expanduser("~"))
+    if provider != 'claude':
+        return None  # Codex lookup uses full native IDs, not directory slugs.
     # glob.escape() neutralizes '*', '?', and '[' inside the project name so a
     # project called e.g. "foo[bar]" cannot cause the glob to match unintended
     # directories under ~/.claude/projects/. The leading '*' before the
     # (escaped) project remains a real wildcard — that's how we match the
     # path-encoded prefix Claude Code adds to the directory name.
     safe_project = glob.escape(project)
-    pattern = os.path.join(home, ".claude", "projects", f"*{safe_project}")
-    matches = glob.glob(pattern)
+    matches = [match for root in _source_roots(provider)
+               for match in glob.glob(str(root / f'*{safe_project}'))]
     # Fallback: Claude Code normalizes underscores to hyphens in project dirs
     if not matches and "_" in safe_project:
         alt = safe_project.replace("_", "-")
-        pattern = os.path.join(home, ".claude", "projects", f"*{alt}")
-        matches = glob.glob(pattern)
+        matches = [match for root in _source_roots(provider)
+                   for match in glob.glob(str(root / f'*{alt}'))]
     if not matches:
         return None
 
@@ -378,7 +413,7 @@ def _jsonl_dir_for_project(project: str) -> Path | None:
 
 
 def _find_jsonl_anywhere(
-    sid: str, cache: dict[str, Path | None] | None = None
+    sid: str, cache: dict[str, Path | None] | None = None, provider='claude'
 ) -> Path | None:
     """Locate ~/.claude/projects/*/<sid>.jsonl across all CC project dirs.
 
@@ -390,18 +425,50 @@ def _find_jsonl_anywhere(
     normalization is irrelevant here — there's no need to normalize the
     input project name (the SID alone is sufficient to disambiguate).
     """
-    if cache is not None and sid in cache:
-        return cache[sid]
-    home = os.environ.get("HOME", os.path.expanduser("~"))
-    pattern = os.path.join(home, ".claude", "projects", "*", f"{sid}.jsonl")
-    matches = sorted(glob.glob(pattern))
+    from runtime_context import current_runtime_context
+    bound = current_runtime_context() is not None
+    key = (provider, sid) if bound else sid
+    if cache is not None and key in cache:
+        return cache[key]
+    if not sid or any(character in sid for character in '*?[]/\\ \t\n\r'):
+        return None
+    roots = _source_roots(provider)
+    if provider == 'claude':
+        matches = sorted(match for root in roots for match in glob.glob(str(root / '*' / f'{sid}.jsonl')))
+    else:
+        import json
+        matches = []
+        candidates = (path for root in roots if root.is_dir() for path in root.rglob('*.jsonl'))
+        for number, path in enumerate(candidates):
+            if number >= 1024:
+                raise ValueError('Native source lookup exceeded candidate limit')
+            try:
+                if any(part.is_symlink() for part in (path, *path.parents)):
+                    continue
+                if not any(path.resolve().is_relative_to(root.resolve()) for root in roots):
+                    continue
+                with path.open('rb') as stream:
+                    raw = stream.readline(64 * 1024 + 1)
+                if len(raw) > 64 * 1024 or not raw.endswith(b'\n'):
+                    continue
+                header = json.loads(raw)
+                metadata = header.get('payload', {})
+                if (header.get('type') == 'session_meta' and
+                        sid in (metadata.get('id'), metadata.get('session_id'))):
+                    if metadata.get('id') and metadata.get('session_id') and metadata['id'] != metadata['session_id']:
+                        raise ValueError('Conflicting native source IDs')
+                    matches.append(str(path))
+            except (OSError, json.JSONDecodeError, AttributeError):
+                continue
+    if len(matches) > 1 and bound:
+        raise ValueError('Multiple native sources match the full source ID')
     result = Path(matches[0]) if matches else None
     if cache is not None:
-        cache[sid] = result
+        cache[key] = result
     return result
 
 
-def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
+def _list_all_session_notes(sessions_dir: Path, provider='claude') -> dict[str, dict]:
     """Map session_id → {path, basename, date, project} across ALL projects.
 
     Used by Phase 1b's UUID-first lookup to handle the case where a note's
@@ -433,7 +500,14 @@ def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
                     file=sys.stderr,
                 )
             continue
-        sid = fm.get("session_id", "")
+        try:
+            if _source_provider(fm) != provider:
+                continue
+        except ValueError:
+            continue
+        sid = fm.get("agent_session_id") or fm.get("session_id", "")
+        if fm.get("agent_session_id") and fm.get("session_id") and fm["agent_session_id"] != fm["session_id"]:
+            continue
         if not sid:
             continue
         if fm.get("type") != "claude-session":
@@ -455,7 +529,7 @@ def _list_all_session_notes(sessions_dir: Path) -> dict[str, dict]:
     return out
 
 
-def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:
+def _list_session_notes(sessions_dir: Path, project: str, provider='claude') -> dict[str, dict]:
     """Map session_id → {path, basename, date} for a project's session notes.
 
     Iterates in sorted order for a deterministic duplicate-SID winner; warns
@@ -480,7 +554,14 @@ def _list_session_notes(sessions_dir: Path, project: str) -> dict[str, dict]:
             continue
         if fm.get("project", "").replace("_", "-") != project.replace("_", "-"):
             continue
-        sid = fm.get("session_id", "")
+        try:
+            if _source_provider(fm) != provider:
+                continue
+        except ValueError:
+            continue
+        sid = fm.get("agent_session_id") or fm.get("session_id", "")
+        if fm.get("agent_session_id") and fm.get("session_id") and fm["agent_session_id"] != fm["session_id"]:
+            continue
         if not sid:
             continue
         if fm.get("type") != "claude-session":
@@ -505,6 +586,7 @@ def _find_matching_session(
     capture_time: float,
     jsonl_dir: Path | None,
     session_note_index: dict[str, dict],
+    provider='claude',
 ) -> dict | None:
     """Return the session note dict (+ 'sid' key) whose JSONL window contains capture_time.
 
@@ -513,14 +595,15 @@ def _find_matching_session(
     a new session's start), the session with the LATEST first_ts wins — the
     most recently started session is the one actively capturing insights.
     """
-    if not jsonl_dir or not jsonl_dir.is_dir():
+    if provider == 'claude' and (not jsonl_dir or not jsonl_dir.is_dir()):
         return None
     candidates: list[tuple[float, str]] = []
-    for jsonl in sorted(jsonl_dir.glob("*.jsonl")):
-        sid = jsonl.stem
-        if sid not in session_note_index:
+    candidates_by_id = ((path.stem, path) for path in sorted(jsonl_dir.glob('*.jsonl'))) if provider == 'claude' else (
+        (sid, _find_jsonl_anywhere(sid, provider=provider)) for sid in session_note_index)
+    for sid, jsonl in candidates_by_id:
+        if sid not in session_note_index or jsonl is None:
             continue
-        window = _jsonl_window(str(jsonl))
+        window = _source_window(jsonl, provider, sid)
         if window is None:
             continue
         first_ts, last_ts = window
@@ -537,6 +620,7 @@ def _find_matching_session_by_day_overlap(
     date_str: str,
     jsonl_dir: Path | None,
     session_note_index: dict[str, dict],
+    provider='claude',
 ) -> dict | None:
     """Return the session note dict whose JSONL window has the largest
     overlap with the UTC calendar day of date_str.
@@ -546,7 +630,7 @@ def _find_matching_session_by_day_overlap(
     evening-only sessions. Tie-break: largest overlap, then latest
     first_ts (mirrors point-match behavior).
     """
-    if not jsonl_dir or not jsonl_dir.is_dir():
+    if provider == 'claude' and (not jsonl_dir or not jsonl_dir.is_dir()):
         return None
     day_start = _parse_date_ts(date_str, hour=0)
     if day_start is None:
@@ -555,11 +639,12 @@ def _find_matching_session_by_day_overlap(
     best_sid: str | None = None
     best_overlap: float = 0
     best_first_ts: float = 0
-    for jsonl in sorted(jsonl_dir.glob("*.jsonl")):
-        sid = jsonl.stem
-        if sid not in session_note_index:
+    candidates_by_id = ((path.stem, path) for path in sorted(jsonl_dir.glob('*.jsonl'))) if provider == 'claude' else (
+        (sid, _find_jsonl_anywhere(sid, provider=provider)) for sid in session_note_index)
+    for sid, jsonl in candidates_by_id:
+        if sid not in session_note_index or jsonl is None:
             continue
-        window = _jsonl_window(str(jsonl))
+        window = _source_window(jsonl, provider, sid)
         if window is None:
             continue
         first_ts, last_ts = window
@@ -599,6 +684,7 @@ def scan(
     imported_skipped = 0
     session_index_cache: dict[str, dict[str, dict]] = {}
     jsonl_dir_cache: dict[str, Path | None] = {}
+    global_indexes = {}
     global_sid_index: dict[str, dict] | None = None  # built lazily on first need
     # Per-scan memoization for _find_jsonl_anywhere — avoids O(N_notes * N_projects)
     # filesystem walks when many notes hit the worktree-suffixed project fallback.
@@ -640,6 +726,23 @@ def scan(
                 imported_skipped += 1
                 continue
 
+            try:
+                provider = _source_provider(fm)
+                if fm.get('agent_session_id') and fm['agent_session_id'] != fm['source_session']:
+                    raise ValueError('Source native ID conflicts with agent_session_id')
+            except ValueError as exc:
+                issues.append(Issue(NAME, str(note), note_project, fm.get('source_session', ''), '',
+                                    str(exc), 0.0, {'unresolved': True, 'signal_class': 'source-origin-unverified'}))
+                continue
+            try:
+                _find_jsonl_anywhere(fm.get('source_session', ''),
+                                     cache=jsonl_anywhere_cache, provider=provider)
+            except ValueError as exc:
+                issues.append(Issue(NAME, str(note), note_project, fm.get('source_session', ''), '',
+                                    str(exc), 0.0, {'unresolved': True, 'signal_class': 'source-origin-unverified'}))
+                continue
+            global_sid_index = global_indexes.get(provider)
+
             # Capture-time for JSONL-window matching uses immutable signals.
             # mtime above is only the --days cutoff, not the matcher input.
             capture_time, capture_conf, capture_signal = _capture_time(note, fm)
@@ -647,10 +750,10 @@ def scan(
                 continue  # corrupt note — no usable signal
 
             # Normalize cache key so personal_ws and personal-ws share index
-            cache_key = note_project.replace("_", "-")
+            cache_key = (provider, note_project.replace("_", "-"))
             if cache_key not in session_index_cache:
-                session_index_cache[cache_key] = _list_session_notes(sessions_dir, note_project)
-                jsonl_dir_cache[cache_key] = _jsonl_dir_for_project(note_project)
+                session_index_cache[cache_key] = _list_session_notes(sessions_dir, note_project, provider)
+                jsonl_dir_cache[cache_key] = _jsonl_dir_for_project(note_project, provider)
 
             idx = session_index_cache[cache_key]
             jsonl_dir = jsonl_dir_cache[cache_key]
@@ -684,12 +787,13 @@ def scan(
             # precision.
             if current_sid and current_sid != "unknown":
                 if global_sid_index is None:
-                    global_sid_index = _list_all_session_notes(sessions_dir)
+                    global_sid_index = _list_all_session_notes(sessions_dir, provider)
+                    global_indexes[provider] = global_sid_index
                 if current_sid in global_sid_index:
                     sess = global_sid_index[current_sid]
                     sess_project = sess.get("project", "")
                     sess_jsonl_dir = (
-                        _jsonl_dir_for_project(sess_project) if sess_project else None
+                        _jsonl_dir_for_project(sess_project, provider) if sess_project else None
                     )
                     note_date = fm.get("date", "")
                     if not note_date:
@@ -700,16 +804,16 @@ def scan(
                     if sess_jsonl_dir is not None:
                         jsonl_path = sess_jsonl_dir / f"{current_sid}.jsonl"
                         if jsonl_path.exists():
-                            window = _jsonl_window(str(jsonl_path))
+                            window = _source_window(jsonl_path, provider, current_sid)
                     if window is None:
                         # I4 fix: when project-dir lookup misses (e.g., worktree-
                         # suffixed project name in the session note), try global
                         # JSONL search by UUID.
                         fallback_path = _find_jsonl_anywhere(
-                            current_sid, cache=jsonl_anywhere_cache
+                            current_sid, cache=jsonl_anywhere_cache, provider=provider
                         )
                         if fallback_path is not None:
-                            window = _jsonl_window(str(fallback_path))
+                            window = _source_window(fallback_path, provider, current_sid)
                     actual_basename = sess["basename"]
                     # Spec #106 nesting: skip when basename matches; only check
                     # day-overlap on basename divergence. Inconclusive overlap
@@ -801,7 +905,7 @@ def scan(
                     # the coverage gap; UUID is authoritative, so don't propose
                     # a different-session rewrite.
                     jsonl_path = _find_jsonl_anywhere(
-                        current_sid, cache=jsonl_anywhere_cache
+                        current_sid, cache=jsonl_anywhere_cache, provider=provider
                     )
                     if jsonl_path is not None:
                         issues.append(
@@ -837,7 +941,7 @@ def scan(
             note_date_for_match = ""
             used_day_overlap = False
             if capture_signal == "created_at":
-                match = _find_matching_session(capture_time, jsonl_dir, idx)
+                match = _find_matching_session(capture_time, jsonl_dir, idx, provider)
             else:
                 note_date_for_match = fm.get("date", "")
                 if not note_date_for_match:
@@ -845,11 +949,11 @@ def scan(
                     note_date_for_match = fn_match.group(1) if fn_match else ""
                 if note_date_for_match:
                     match = _find_matching_session_by_day_overlap(
-                        note_date_for_match, jsonl_dir, idx
+                        note_date_for_match, jsonl_dir, idx, provider
                     )
                     used_day_overlap = True
                 else:
-                    match = _find_matching_session(capture_time, jsonl_dir, idx)
+                    match = _find_matching_session(capture_time, jsonl_dir, idx, provider)
             if match is None:
                 # No JSONL window contains the note's capture_time. Flag as unresolved
                 # ONLY if the current source doesn't resolve to any known session note

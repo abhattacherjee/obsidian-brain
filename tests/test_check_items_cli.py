@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from check_items_test_helpers import native_ai_context, ai_response as _ai_response, verdicts, private_output
+from check_items_test_helpers import selected_host_context, native_ai_context, ai_response as _ai_response, verdicts, private_output
 
 HOOKS_DIR = os.path.join(os.path.dirname(__file__), "..", "hooks")
 if HOOKS_DIR not in sys.path:

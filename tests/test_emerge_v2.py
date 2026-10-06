@@ -26,8 +26,8 @@ NOW = datetime.combine(NOW_D, datetime.min.time(), tzinfo=timezone.utc).isoforma
 
 
 @pytest.fixture
-def db(tmp_vault, monkeypatch):
-    p = str(tmp_vault / "c.db")
+def db(tmp_vault, monkeypatch, selected_host_context):
+    p = str(selected_host_context.index_path)
     vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", p)
     monkeypatch.setenv("HOME", str(tmp_vault))
@@ -299,27 +299,13 @@ def test_get_unassigned_notes_window_and_limit(db):
 # --- run_emerge_themes ----------------------------------------------------
 
 @pytest.fixture
-def emerge_db(db, tmp_vault, monkeypatch):
-    """db fixture + load_config patched to point /emerge at the temp vault."""
-    monkeypatch.setattr(
-        emerge_cli,
-        "load_config",
-        lambda: {"vault_path": str(tmp_vault), "insights_folder": "claude-insights"},
-    )
-    from pathlib import Path
-    from types import MappingProxyType
-    from runtime_context import RuntimeContext, using_runtime_context
+def emerge_db(db, tmp_vault, monkeypatch, selected_host_context):
     from operation_state import operation_directory
-    config = {'vault_path': str(tmp_vault), 'insights_folder': 'claude-insights'}
-    context = RuntimeContext('claude', 'cli', 'emerge-test', tmp_vault, tmp_vault, None,
-                             tmp_vault, tmp_vault / 'config', MappingProxyType(config),
-                             tmp_vault, Path(db), tmp_vault.parent / 'emerge-native-state')
-    with using_runtime_context(context):
-        _, directory = operation_directory(context, 'e' * 32)
-        monkeypatch.setattr(emerge_cli, '_themes_json_path', lambda: str(directory / 'emerge-themes.json'))
-        monkeypatch.setattr(emerge_cli, '_analysis_path', lambda: str(directory / 'emerge-analysis.md'))
-        monkeypatch.setattr(emerge_cli, '_emerge_dir', lambda: str(directory))
-        yield db
+    _, directory = operation_directory(selected_host_context, 'e' * 32)
+    monkeypatch.setattr(emerge_cli, '_themes_json_path', lambda: str(directory / 'emerge-themes.json'))
+    monkeypatch.setattr(emerge_cli, '_analysis_path', lambda: str(directory / 'emerge-analysis.md'))
+    monkeypatch.setattr(emerge_cli, '_emerge_dir', lambda: str(directory))
+    yield db
 
 
 def _recent(days_ago):
@@ -479,3 +465,5 @@ def test_run_build_note_missing_artifact_exits_clean(emerge_db, tmp_vault, capsy
     assert exc.value.code == 1
     err = capsys.readouterr().err
     assert "ERROR could not read emerge artifacts" in err
+
+from selected_legacy_vault import selected_host_context  # noqa: E402,F401

@@ -74,10 +74,10 @@ def test_solo_summary_passes_pre_model_revision(sample_unsummarized_note, tmp_va
     assert note.read_bytes() == original + b'\nManual edit during AI.\n'
 
 
-def test_status_flip_rejects_path_outside_configured_vault(tmp_path, monkeypatch):
+def test_status_flip_rejects_path_outside_configured_vault(tmp_path, tmp_path_factory, monkeypatch):
     vault = tmp_path / 'vault'
-    vault.mkdir()
-    note = tmp_path / 'outside.md'
+    vault.mkdir(exist_ok=True)
+    note = tmp_path_factory.mktemp('outside-selected-vault') / 'outside.md'
     content = '---\nstatus: auto-logged\n---\nBody\n'
     note.write_text(content)
     monkeypatch.setattr(obsidian_utils, 'load_config', lambda: {'vault_path': str(vault)})
@@ -104,3 +104,10 @@ def test_orphan_summary_repair_rejects_concurrent_edit(tmp_vault, monkeypatch):
     ))
     assert result['auto_fixed'] == 0
     assert note.read_text() == original + 'Manual addition\n'
+
+
+# Every scoped operation uses the same selected temporary vault.
+from selected_legacy_vault import selected_host_context, native_ai_frontend  # noqa: F401,E402
+import pytest
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

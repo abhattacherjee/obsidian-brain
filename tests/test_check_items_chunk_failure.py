@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import pytest
 import check_items_cli as cli
-from check_items_test_helpers import native_ai_context, ai_response, verdicts, private_output
+from check_items_test_helpers import selected_host_context, native_ai_context, ai_response, verdicts, private_output
 
 
 def group(number):

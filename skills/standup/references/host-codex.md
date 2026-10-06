@@ -17,3 +17,7 @@ Track shared progress tasks with native progress updates or a concise task list.
 Use native delegated analysis only when available and authorized. If absent,
 run that analysis inline with the same shared prompt and output schema. User
 approval remains explicit; a missing tool is never treated as approval.
+
+The invoking runtime must explicitly supply the current client. If it does not,
+stop with "Current native client binding is unavailable". Do not default Desktop
+to CLI or infer the frontend from a transcript header or environment markers.

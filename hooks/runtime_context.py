@@ -49,6 +49,7 @@ class RuntimeContext:
     resource_root: Path
     index_path: Path
     state_path: Path
+    native_home: Optional[Path] = None
 
     @property
     def session_key(self) -> str:
@@ -143,4 +144,45 @@ def resolve_runtime_context(host: str, client: str, payload: Mapping[str, object
         if not any(transcript.is_relative_to(root.resolve()) for root in transcript_roots):
             raise RuntimeContextError("transcript_outside_host", "The transcript is outside the selected host's storage.")
     return RuntimeContext(host, client, sid, project, worktree, transcript, vault, config_path,
-                          MappingProxyType(copy.deepcopy(config)), resources, index, state)
+                          MappingProxyType(copy.deepcopy(config)), resources, index, state, native_home)
+
+
+def historical_source_roots(source_host, source_root=None):
+    """Select read-only historical origins without changing the invoking host."""
+    if source_host not in {'claude', 'codex'}:
+        raise RuntimeContextError('host_unknown', 'Select the historical source host explicitly.')
+    def checked_directory(value, require_exists=False):
+        if not isinstance(value, (str, os.PathLike)) or not str(value).strip() or '\0' in str(value):
+            raise RuntimeContextError('path_invalid', 'Historical roots must be nonempty path strings.')
+        path = Path(value)
+        if not path.is_absolute():
+            raise RuntimeContextError('path_invalid', 'Historical roots must be absolute directories.')
+        if any(part.is_symlink() for part in (path, *path.parents)):
+            raise RuntimeContextError('path_invalid', 'Historical roots cannot contain symbolic links.')
+        if (require_exists or path.exists()) and not path.is_dir():
+            raise RuntimeContextError('path_invalid', 'Historical root must be a directory.')
+        return path.resolve()
+    if source_root is not None:
+        return (checked_directory(source_root, require_exists=True),)
+    environment, name = ('CLAUDE_CONFIG_DIR', '.claude') if source_host == 'claude' else ('CODEX_HOME', '.codex')
+    native_home = checked_directory(os.environ.get(environment, Path.home() / name))
+    subdirectories = ('projects',) if source_host == 'claude' else ('sessions', 'archived_sessions')
+    return tuple(checked_directory(native_home / name) for name in subdirectories)
+
+
+def native_memory_projects_root(context=None):
+    """Return selected Claude memory storage, without consulting another host."""
+    context = context if context is not None else current_runtime_context()
+    if context is None or context.host != 'claude':
+        return None
+    if context.native_home is None:
+        return historical_source_roots('claude')[0]
+    home = Path(context.native_home)
+    if not home.is_absolute() or any(path.is_symlink() for path in (home, *home.parents)):
+        raise RuntimeContextError('path_invalid', 'Native memory home must be an absolute nonsymlink directory.')
+    if home.exists() and not home.is_dir():
+        raise RuntimeContextError('path_invalid', 'Native memory home must be a directory.')
+    projects = home / 'projects'
+    if projects.is_symlink():
+        raise RuntimeContextError('path_invalid', 'Native memory storage cannot be a symbolic link.')
+    return projects.resolve()

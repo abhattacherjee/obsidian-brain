@@ -569,8 +569,7 @@ def _check_items_stage_07(context, payload):
     elif scope['mode'] == 'project' and scope['project']:
         scope_name = scope['project']
     else:
-        res = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
-        scope_name = os.path.basename(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else 'unknown'
+        scope_name = context.canonical_project_root.name or 'unknown'
     date_str = datetime.date.today().isoformat()
     window_days = scope.get('window_days', 14)
     dry_run = bool(scope.get('dry_run', False))
@@ -1250,15 +1249,8 @@ def _import_list(context, payload):
     host = payload['source_host']
     if host not in {'claude', 'codex'}:
         raise ValueError('Select the historical source host explicitly.')
-    selected = payload.get('source_root')
-    if selected:
-        base = Path(selected)
-        if not base.is_absolute() or base.is_symlink() or not base.is_dir():
-            raise ValueError('Historical source root must be an explicit absolute directory.')
-    else:
-        home = 'CLAUDE_CONFIG_DIR' if host == 'claude' else 'CODEX_HOME'
-        base = Path(os.environ.get(home) or str(Path.home() / ('.claude' if host == 'claude' else '.codex')))
-    roots = [base] if selected else ([base / 'projects'] if host == 'claude' else [base / 'sessions', base / 'archived_sessions'])
+    from runtime_context import historical_source_roots
+    roots = historical_source_roots(host, payload.get('source_root'))
     days = payload.get('days', 30)
     if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
         raise ValueError('Import days must be a positive integer.')

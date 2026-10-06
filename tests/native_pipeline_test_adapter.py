@@ -1,8 +1,8 @@
-"""Explicit temporary Claude context for former pipeline-only fixtures."""
+"""Use the selected actor; retain explicit unbound pipeline compatibility."""
 from pathlib import Path
 from types import MappingProxyType
 
-from runtime_context import RuntimeContext, using_runtime_context
+from runtime_context import RuntimeContext, using_runtime_context, current_runtime_context
 from operation_state import operation_directory
 
 OPERATION_ID = 'b' * 32
@@ -10,6 +10,11 @@ OPERATION_ID = 'b' * 32
 
 def _context(vault):
     vault = Path(vault).resolve()
+    selected = current_runtime_context()
+    if selected is not None:
+        if selected.vault_path.resolve() != vault:
+            raise ValueError("Pipeline test vault differs from selected runtime vault")
+        return selected
     root = vault.parent
     return RuntimeContext('claude', 'cli', 'synthetic-pipeline-test', root, root, None,
         vault, root / 'pipeline-config.json', MappingProxyType({}),

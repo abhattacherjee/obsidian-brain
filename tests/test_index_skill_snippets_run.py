@@ -31,7 +31,7 @@ def _invoke(skill, home, vault, db, environment, full="false"):
     cwd.mkdir(exist_ok=True)
     environment = dict(environment, OB_RESOURCE_ROOT=str(REPO),
         OB_SKILL_PATH=str(REPO / 'skills' / skill / 'SKILL.md'),
-        OB_HOST='claude', OB_CLIENT='cli', OB_SESSION_ID='snippet-test-0000',
+        OB_HOST=environment['OB_HOST'], OB_CLIENT=environment['OB_CLIENT'], OB_SESSION_ID='snippet-test-0000',
         OB_CWD=str(cwd), OB_VAULT=str(vault), REQUEST_PATH=str(request),
         CLAUDE_CONFIG_DIR=str(home / '.claude'), CODEX_HOME=str(home / '.codex'))
     return subprocess.run(['bash', '-c', _rebuild_command(skill)], cwd=cwd,
@@ -44,21 +44,25 @@ def _note(p: Path, t: str) -> None:
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, host):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir()
     vault = tmp_path / "v"
     _note(vault / "claude-sessions" / "s.md", "claude-session")
     _note(vault / "claude-wiki" / "queries" / "2026" / "10-03-q.md", "claude-wiki")
     _note(vault / "claude-wiki" / "index.md", "claude-wiki-index")
     db = tmp_path / "i.db"
     e = dict(os.environ, HOME=str(home), OBSIDIAN_BRAIN_DB=str(db),
-             CLAUDE_CODE_SESSION_ID="snippet-test-0000")
+             CLAUDE_CODE_SESSION_ID="foreign-session", OB_HOST=host,
+             OB_CLIENT="claude-code" if host == "claude" else "codex-cli",
+             OBSIDIAN_BRAIN_STATE_DIR=str(tmp_path / "state"))
+    (home / ("." + host) / "obsidian-brain-config.json").write_text(json.dumps({"vault_path": str(vault)}))
     return home, vault, db, e
 
 
 def _run(skill, home, vault, db, e, wiki_folder="claude-wiki", full="false"):
-    (home / ".claude" / "obsidian-brain-config.json").write_text(
+    (home / ("." + e["OB_HOST"]) / "obsidian-brain-config.json").write_text(
         json.dumps({"vault_path": str(vault), "wiki_folder": wiki_folder}))
     return _invoke(skill, home, vault, db, e, full)
 
@@ -108,8 +112,25 @@ def test_rebuild_snippet_refuses_unreadable_config_and_keeps_rows(skill, env):
     # must refuse instead of pruning rows outside the default folders (C-001).
     home, vault, db, e = env
     assert _run(skill, home, vault, db, e).returncode == 0
-    (home / ".claude" / "obsidian-brain-config.json").write_text('{"vault_path": "x",}')
+    (home / ("." + e["OB_HOST"]) / "obsidian-brain-config.json").write_text('{"vault_path": "x",}')
     r = _invoke(skill, home, vault, db, e)
     assert r.returncode != 0
     assert "configuration" in r.stderr
     assert _paths(db) == {"s.md", "10-03-q.md"}
+
+
+@pytest.fixture(autouse=True)
+def selected_host_context(host, env, monkeypatch):
+    from runtime_context import resolve_runtime_context, using_runtime_context
+    home, vault, db, environment = env
+    cwd = home / 'unrelated cwd with spaces'
+    cwd.mkdir(exist_ok=True)
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(home / '.claude'))
+    monkeypatch.setenv('CODEX_HOME', str(home / '.codex'))
+    selected = resolve_runtime_context(host, environment['OB_CLIENT'],
+        {'session_id': 'snippet-test-0000', 'cwd': str(cwd)},
+        {'config_path': home / ('.' + host) / 'obsidian-brain-config.json',
+         'resource_root': REPO, 'index_path': db, 'state_path': home.parent / 'state'})
+    with using_runtime_context(selected):
+        yield selected

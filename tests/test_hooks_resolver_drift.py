@@ -96,10 +96,10 @@ def test_file_derived_resolver_selects_loaded_tree_not_cwd_or_poison_cache(skill
 
 @pytest.mark.parametrize('host', ['claude', 'codex'])
 @pytest.mark.parametrize('skill', ['recall', 'obsidian-setup', 'dev-test'])
-def test_file_derived_launcher_uses_native_config_and_selected_installation(host, skill, installed):
+def test_file_derived_launcher_uses_native_config_and_selected_installation(host, skill, installed, selected_host_context):
     root, home, vault, cwd, env = installed
     loaded = root / 'skills' / skill / 'SKILL.md'
-    env = dict(env, OB_HOST=host, OB_SKILL_PATH=str(loaded))
+    env = dict(env, OB_HOST=host, OB_CLIENT=selected_host_context.client, OB_SKILL_PATH=str(loaded))
     resolve = _resolve(skill, loaded, cwd, env, root)
     assert resolve.returncode == 0, resolve.stderr
     env['OB_RESOURCE_ROOT'] = resolve.stdout.strip()
@@ -122,11 +122,11 @@ def test_bad_loaded_path_refuses_instead_of_falling_back(loaded, installed):
     assert not result.stdout.strip()
 
 
-def test_operation_cannot_mix_loaded_skill_and_another_launcher(installed):
+def test_operation_cannot_mix_loaded_skill_and_another_launcher(installed, selected_host_context):
     root, _, _, cwd, env = installed
     verify_installed_hooks(root)
     result = subprocess.run([sys.executable, str(root / 'hooks/brain_cli.py'),
-        '--host', 'claude', '--client', 'cli', '--resource-root', str(root),
+        '--host', selected_host_context.host, '--client', selected_host_context.client, '--resource-root', str(root),
         '--session-id', 'synthetic-loaded-skill', '--cwd', str(cwd), 'run',
         '--skill-path', str(REPO / 'skills/recall/SKILL.md'), '--operation', 'config'],
         input='{}', cwd=cwd, env=env, capture_output=True, text=True, timeout=10)
@@ -134,7 +134,7 @@ def test_operation_cannot_mix_loaded_skill_and_another_launcher(installed):
     assert 'loaded installation' in result.stderr
 
 
-def test_dev_install_passes_loaded_root_even_when_cwd_and_cache_disagree(installed):
+def test_dev_install_passes_loaded_root_even_when_cwd_and_cache_disagree(installed, selected_host_context):
     root, _, _, cwd, env = installed
     verify_installed_hooks(root)
     scripts = root / 'scripts'
@@ -147,12 +147,12 @@ def test_dev_install_passes_loaded_root_even_when_cwd_and_cache_disagree(install
     assert commands, 'dev-test must invoke its trusted install procedure'
     request = cwd / 'request.json'
     request.write_text('{"mode":"status"}')
-    env = dict(env, OB_HOST='claude', OB_RESOURCE_ROOT=str(root),
+    env = dict(env, OB_HOST=selected_host_context.host, OB_CLIENT=selected_host_context.client, OB_RESOURCE_ROOT=str(root),
                OB_SKILL_PATH=str(root / 'skills/dev-test/SKILL.md'), REQUEST_PATH=str(request))
     result = subprocess.run(['bash', '-c', commands[0]], cwd=cwd, env=env,
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ['status', '--host', 'claude', '--source', str(root)]
+    assert result.stdout.splitlines() == ['status', '--host', selected_host_context.host, '--source', str(root)]
 
 
 def test_changed_loaded_hook_source_cannot_enter_combined_coverage(installed):
@@ -161,3 +161,19 @@ def test_changed_loaded_hook_source_cannot_enter_combined_coverage(installed):
     source.write_bytes(source.read_bytes() + b'\n# changed fixture source\n')
     with pytest.raises(AssertionError, match='Installed hook source changed'):
         verify_installed_hooks(root)
+
+
+@pytest.fixture
+def selected_host_context(host, installed, monkeypatch):
+    from runtime_context import resolve_runtime_context, using_runtime_context
+    root, home, vault, cwd, env = installed
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(home / '.claude'))
+    monkeypatch.setenv('CODEX_HOME', str(home / '.codex'))
+    selected = resolve_runtime_context(host, 'claude-code' if host == 'claude' else 'codex-cli',
+        {'session_id': env['OB_SESSION_ID'], 'cwd': str(cwd)},
+        {'config_path': home / ('.' + host) / 'obsidian-brain-config.json',
+         'resource_root': root, 'index_path': home.parent / 'index.db',
+         'state_path': home.parent / 'state'})
+    with using_runtime_context(selected):
+        yield selected

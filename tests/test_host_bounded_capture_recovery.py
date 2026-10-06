@@ -109,7 +109,8 @@ def test_expired_deadline_does_not_read_publish_or_lose_retained_input(context, 
 
 
 def test_recovery_queue_does_not_cross_native_hosts(context, monkeypatch):
-    claude = replace(context, host="claude", client="claude-code")
+    other_host = "claude" if context.host == "codex" else "codex"
+    claude = replace(context, host=other_host, client="claude-code" if other_host == "claude" else "codex-cli")
     register(context, monkeypatch)
     register(claude, monkeypatch)
     visited = []
@@ -118,10 +119,10 @@ def test_recovery_queue_does_not_cross_native_hosts(context, monkeypatch):
         return batch(ctx, offset=cursor.offset)
     monkeypatch.setattr(transcripts, "read_records", read)
     capture.recover_registered(context, 8, time.monotonic() + 5)
-    assert visited == [("codex", context.native_session_id)]
+    assert visited == [(context.host, context.native_session_id)]
     visited.clear()
     capture.recover_registered(claude, 8, time.monotonic() + 5)
-    assert visited == [("claude", claude.native_session_id)]
+    assert visited == [(other_host, claude.native_session_id)]
 
 
 def test_duplicate_native_event_replay_is_once_and_changed_content_conflicts(context, monkeypatch):

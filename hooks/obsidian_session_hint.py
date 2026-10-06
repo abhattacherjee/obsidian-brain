@@ -89,7 +89,12 @@ def _append_hook_log(project: str, session_id: str, bootstrap_updated: bool,
     SessionStart is indistinguishable from the hook never firing)."""
     from runtime_context import current_runtime_context
     context = current_runtime_context()
-    log_dir = str(context.state_path) if context else os.path.join(os.path.expanduser("~"), ".claude")
+    if context:
+        from session_auxiliary_state import directory
+        log_dir = str(directory(context, "logs"))
+    else:
+        from runtime_adapters.claude import selected_home
+        log_dir = str(selected_home())
     log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
     try:
         os.makedirs(log_dir, exist_ok=True)

@@ -20,19 +20,10 @@ import pytest
 class TestSecureDirectory:
     """C1: All temp/cache files use ~/.claude/obsidian-brain/ instead of /tmp."""
 
-    def test_secure_dir_constant_points_to_claude_dir(self):
-        # Read the source to verify the constant is defined as the real path.
-        # We check the source rather than the live module attribute because the
-        # global _isolate_secure_dir_globally autouse fixture patches _SECURE_DIR
-        # to a per-test tmp dir; the invariant we care about is the *definition*
-        # in source, not the runtime value under test isolation.
-        import inspect
-        import obsidian_utils
-        src = inspect.getsource(obsidian_utils)
-        expected_def = '_SECURE_DIR = os.path.expanduser("~/.claude/obsidian-brain")'
-        assert expected_def in src, (
-            f"_SECURE_DIR definition not found in source; expected:\n  {expected_def!r}"
-        )
+    def test_secure_dir_constant_uses_the_named_legacy_adapter(self, tmp_path, monkeypatch):
+        from runtime_adapters.claude import legacy_private_directory
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert legacy_private_directory() == tmp_path / ".claude" / "obsidian-brain"
 
     def test_cache_prefix_under_secure_dir(self):
         from obsidian_utils import _CACHE_PREFIX, _SECURE_DIR
@@ -81,6 +72,23 @@ class TestEnvVarOverrideRemoved:
         assert prefix.startswith(_SECURE_DIR)
 
 
+@pytest.fixture
+def selected_host_context(selected_host_context, host, tmp_path, tmp_path_factory):
+    from dataclasses import replace
+    from types import MappingProxyType
+    from runtime_context import using_runtime_context
+    private = tmp_path_factory.mktemp("security-private")
+    config = dict(selected_host_context.config, vault_path=str(tmp_path))
+    config_path = private / "config.json"
+    config_path.write_text(json.dumps(config))
+    selected = replace(selected_host_context, vault_path=tmp_path,
+                       state_path=private / "state", index_path=private / "index.sqlite3",
+                       config_path=config_path, config=MappingProxyType(config))
+    with using_runtime_context(selected):
+        yield selected
+
+
+@pytest.mark.usefixtures("selected_host_context")
 class TestPathTraversal:
     """H1: write_vault_note blocks path traversal."""
 
@@ -625,6 +633,7 @@ class TestFilePermissions:
         src = inspect.getsource(load_config)
         assert "0o077" in src or "0o600" in src, "config permission fix missing"
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_vault_note_written_with_0o600(self, tmp_path):
         from obsidian_utils import write_vault_note
         write_vault_note(
@@ -645,6 +654,7 @@ class TestLikeEscaping:
         assert "ESCAPE" in src, "LIKE ESCAPE clause missing"
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestFlipNoteStatus:
     """M5: flip_note_status uses atomic write."""
 
@@ -707,6 +717,7 @@ class TestFlipNoteStatus:
         assert result is False
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestPathTraversalFilename:
     """Additional path traversal tests for filename and symlink vectors."""
 

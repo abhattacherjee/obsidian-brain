@@ -3,7 +3,7 @@ Report writer for /check-items.
 
 Path: <vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md
 where `check_items_folder` is read from
-`~/.claude/obsidian-brain-config.json` (default: `claude-check-items`).
+the selected runtime configuration (default: `claude-check-items`).
 The folder is configurable so users can keep /check-items notes
 separate from Dataview dashboards.
 

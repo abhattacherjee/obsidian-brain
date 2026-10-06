@@ -22,172 +22,8 @@ def test_snapshot_frontmatter_has_status_and_source_session_note():
     )
 
 
-def test_run_writes_file_with_hhmmss_suffix(tmp_path, monkeypatch):
-    """_run() integrates datetime.now() into the snapshot filename."""
-
-    # Freeze datetime so the suffix is deterministic
-    class FrozenDatetime(datetime.datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return cls(2026, 4, 18, 14, 30, 27)
-
-    monkeypatch.setattr(snap.datetime, "datetime", FrozenDatetime)
-
-    # Set up a vault
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-
-    # Stub load_config — the real one reads ~/.claude/obsidian-brain-config.json
-    # via Path.home() bound at import time, so $HOME monkeypatching won't reach it.
-    monkeypatch.setattr(
-        snap,
-        "load_config",
-        lambda: {
-            "vault_path": str(vault),
-            "sessions_folder": "claude-sessions",
-            "snapshot_on_compact": True,
-        },
-    )
-
-    # transcript_path containment check uses os.path.expanduser("~/.claude/projects")
-    # which still reads $HOME at call time, so point it at tmp_path.
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    # Stub transcript-parsing helpers so _run() doesn't need a real JSONL
-    monkeypatch.setattr(
-        snap,
-        "read_transcript",
-        lambda path: [{"type": "user", "message": {"content": "hello"}}],
-    )
-    monkeypatch.setattr(snap, "extract_user_messages", lambda msgs: ["hello"])
-    monkeypatch.setattr(
-        snap,
-        "extract_session_metadata",
-        lambda msgs, cwd: {
-            "project": "demo",
-            "git_branch": "develop",
-            "duration_minutes": 1,
-        },
-    )
-
-    # transcript_path must sit inside ~/.claude/projects/ to pass the containment check
-    projects_dir = tmp_path / ".claude" / "projects" / "demo"
-    projects_dir.mkdir(parents=True)
-    transcript = projects_dir / "sess.jsonl"
-    transcript.write_text("{}\n", encoding="utf-8")
-
-    stdin_json = json.dumps(
-        {
-            "session_id": "abc-def-ghi",
-            "cwd": str(tmp_path),
-            "transcript_path": str(transcript),
-            "source": "compact",
-        }
-    )
-    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_json))
-
-    snap._run()
-
-    # Exactly one snapshot note should have been written with the HHMMSS suffix
-    written = list(sessions.glob("*.md"))
-    assert len(written) == 1
-    assert written[0].name.endswith("-snapshot-143027.md")
-    assert re.match(
-        r"2026-04-18-demo-[a-f0-9]{4}-snapshot-143027\.md$",
-        written[0].name,
-    )
 
 
-def test_run_writes_forward_reference_when_parent_note_does_not_exist(tmp_path, monkeypatch):
-    """#330 Task 5 regression guard for the deliberate spec deviation.
-
-    obsidian_context_snapshot.py writes `source_session_note` as a FORWARD
-    REFERENCE at PreCompact, which normally fires BEFORE SessionEnd creates
-    the parent session note — vault_index.py:993-1007 relies on this to
-    associate snapshots with parents. #330's write guard (existence +
-    session_id match) applies to the retro/insight path only and must NOT
-    be applied here: doing so would strip the backlink from nearly every
-    snapshot. This test proves the snapshot path still emits the backlink
-    even though the parent note file never existed during this test — if a
-    future change "fixes" this by gating the snapshot path on target
-    existence too, this test goes red, which is the point.
-    """
-    class FrozenDatetime(datetime.datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return cls(2026, 4, 18, 14, 30, 27)
-
-    monkeypatch.setattr(snap.datetime, "datetime", FrozenDatetime)
-
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-
-    monkeypatch.setattr(
-        snap,
-        "load_config",
-        lambda: {
-            "vault_path": str(vault),
-            "sessions_folder": "claude-sessions",
-            "snapshot_on_compact": True,
-        },
-    )
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(
-        snap,
-        "read_transcript",
-        lambda path: [{"type": "user", "message": {"content": "hello"}}],
-    )
-    monkeypatch.setattr(snap, "extract_user_messages", lambda msgs: ["hello"])
-    monkeypatch.setattr(
-        snap,
-        "extract_session_metadata",
-        lambda msgs, cwd: {
-            "project": "demo",
-            "git_branch": "develop",
-            "duration_minutes": 1,
-        },
-    )
-
-    projects_dir = tmp_path / ".claude" / "projects" / "demo"
-    projects_dir.mkdir(parents=True)
-    transcript = projects_dir / "sess.jsonl"
-    transcript.write_text("{}\n", encoding="utf-8")
-
-    stdin_json = json.dumps(
-        {
-            "session_id": "abc-def-ghi",
-            "cwd": str(tmp_path),
-            "transcript_path": str(transcript),
-            "source": "compact",
-        }
-    )
-    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_json))
-
-    # Precondition: the parent session note this snapshot will backlink to
-    # does not exist anywhere in the sessions folder.
-    assert list(sessions.glob("2026-04-18-demo-*.md")) == []
-    parent_matches_before = [
-        p for p in sessions.glob("*.md") if "-snapshot-" not in p.name
-    ]
-    assert parent_matches_before == []
-
-    snap._run()
-
-    written = list(sessions.glob("*-snapshot-143027.md"))
-    assert len(written) == 1
-    content = written[0].read_text(encoding="utf-8")
-    assert re.search(
-        r'\nsource_session_note: "\[\[\d{4}-\d{2}-\d{2}-demo-[a-f0-9]{4}\]\]"\n',
-        content,
-    )
-    # Still no parent note on disk — the backlink is a genuine forward
-    # reference, not one resolved against an existing file.
-    parent_matches_after = [
-        p for p in sessions.glob("*.md") if "-snapshot-" not in p.name
-    ]
-    assert parent_matches_after == []
 
 
 from hooks.obsidian_utils import find_snapshots_for_session
@@ -273,208 +109,10 @@ def test_build_note_omits_snapshots_list_when_empty():
 import hooks.obsidian_session_log as sesslog
 
 
-def test_session_log_writes_anchor_when_snapshots_exist_despite_low_messages(tmp_path, monkeypatch):
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-    # Pre-create a snapshot for session s1. Date must be today's (or yesterday's)
-    # because the hook's early-snapshot glob only scans those two date prefixes
-    # to handle midnight-spanning sessions. Hardcoded dates drift out of the
-    # window and silently break this test (feedback_time_dependent_test_seeds).
-    today = datetime.date.today().isoformat()
-    (sessions / f"{today}-demo-abcd-snapshot-143027.md").write_text(
-        f"---\ntype: claude-snapshot\ndate: {today}\nsession_id: s1\n"
-        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# Snap\n",
-        encoding="utf-8",
-    )
-
-    # Config with very high min_messages to force the early skip path
-    monkeypatch.setattr(sesslog, "load_config", lambda: {
-        "vault_path": str(vault),
-        "sessions_folder": "claude-sessions",
-        "min_messages": 99,  # force early-skip path
-        "min_duration_minutes": 0,
-        "auto_log_enabled": True,
-    })
-
-    # Stub transcript parsing to return exactly 1 user message
-    monkeypatch.setattr(sesslog, "read_transcript", lambda path: [
-        {"type": "user", "message": {"content": "hello"}},
-    ])
-    monkeypatch.setattr(sesslog, "extract_user_messages", lambda msgs: ["hello"])
-    monkeypatch.setattr(sesslog, "extract_assistant_messages", lambda msgs: [])
-    monkeypatch.setattr(sesslog, "extract_tool_uses", lambda msgs: [])
-    monkeypatch.setattr(sesslog, "extract_session_metadata", lambda msgs, cwd: {
-        "project": "demo", "git_branch": "develop", "duration_minutes": 0,
-        "project_path": str(tmp_path), "files_touched": [], "errors": [],
-    })
-    # Use a cwd whose basename is "demo" so the early glob finds the snapshot.
-    demo_cwd = tmp_path / "demo"
-    demo_cwd.mkdir()
-
-    # Fake transcript path inside ~/.claude/projects
-    projects_dir = tmp_path / ".claude" / "projects" / "demo"
-    projects_dir.mkdir(parents=True)
-    transcript = projects_dir / "sess.jsonl"
-    transcript.write_text("{}\n", encoding="utf-8")
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    stdin_json = json.dumps({
-        "session_id": "s1",
-        "cwd": str(demo_cwd),
-        "transcript_path": str(transcript),
-    })
-    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_json))
-
-    sesslog._run()
-
-    # Assert a session note (not a snapshot) landed in addition to the pre-seeded snapshot
-    session_notes = [p for p in sessions.glob("*.md") if "-snapshot-" not in p.name]
-    assert len(session_notes) == 1, f"expected anchor session note; found: {[p.name for p in sessions.glob('*.md')]}"
-    content = session_notes[0].read_text(encoding="utf-8")
-    assert "snapshots:" in content
-    assert f"{today}-demo-abcd-snapshot-143027" in content
 
 
-def test_early_skip_bypass_is_independently_exercised(tmp_path, monkeypatch):
-    """Step 5 (message-count skip) must bypass independently of step 6.
-
-    Strategy: use a project directory name that slugifies to match the
-    pre-seeded snapshot, but have extract_session_metadata return a
-    DIFFERENT canonical project. Then step 4a finds the snapshot (via
-    the cwd-derived slug), step 5 bypasses, but step 6a's canonical
-    re-glob runs against the wrong project and would return []. If
-    step 5 weren't properly checking, the run would skip silently.
-    """
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-    # Date must be today's so the hook's today/yesterday-only snapshot glob
-    # can find it (see feedback_time_dependent_test_seeds).
-    today = datetime.date.today().isoformat()
-    (sessions / f"{today}-demo-abcd-snapshot-143027.md").write_text(
-        f"---\ntype: claude-snapshot\ndate: {today}\nsession_id: s1\n"
-        "project: demo\ntrigger: compact\nstatus: auto-logged\n---\n\n# Snap\n",
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr(sesslog, "load_config", lambda: {
-        "vault_path": str(vault),
-        "sessions_folder": "claude-sessions",
-        "min_messages": 99,          # force step 5 skip
-        "min_duration_minutes": 0,
-        "auto_log_enabled": True,
-    })
-    monkeypatch.setattr(sesslog, "read_transcript", lambda path: [
-        {"type": "user", "message": {"content": "hi"}},
-    ])
-    monkeypatch.setattr(sesslog, "extract_user_messages", lambda msgs: ["hi"])
-    monkeypatch.setattr(sesslog, "extract_assistant_messages", lambda msgs: [])
-    monkeypatch.setattr(sesslog, "extract_tool_uses", lambda msgs: [])
-    # Canonical project differs from cwd basename — step 6a re-glob misses
-    monkeypatch.setattr(sesslog, "extract_session_metadata", lambda msgs, cwd: {
-        "project": "unrelated-project",     # snapshot is under 'demo'
-        "git_branch": "develop", "duration_minutes": 0,
-        "project_path": str(tmp_path), "files_touched": [], "errors": [],
-    })
-
-    # cwd basename slugifies to 'demo' → step 4a glob matches the snapshot
-    demo_cwd = tmp_path / "demo"
-    demo_cwd.mkdir()
-    projects_dir = tmp_path / ".claude" / "projects" / "demo"
-    projects_dir.mkdir(parents=True)
-    transcript = projects_dir / "sess.jsonl"
-    transcript.write_text("{}\n", encoding="utf-8")
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    stdin_json = json.dumps({
-        "session_id": "s1",
-        "cwd": str(demo_cwd),
-        "transcript_path": str(transcript),
-    })
-    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_json))
-
-    sesslog._run()
-
-    # If step 5's bypass works, an anchor session note lands (because early
-    # glob found the snapshot). If step 5 weren't bypassing, _run() would
-    # have returned after `should_skip_session(user_msgs, 0, ...)` fires.
-    session_notes = [p for p in sessions.glob("*.md") if "-snapshot-" not in p.name]
-    assert len(session_notes) == 1, (
-        f"step 5 early-bypass did not fire; found: "
-        f"{[p.name for p in sessions.glob('*.md')]}"
-    )
 
 
-def test_session_log_finds_yesterday_snapshot_across_midnight(tmp_path, monkeypatch):
-    """Regression for Copilot PR #43 finding: SessionEnd must scan today AND
-    yesterday's date prefix so day-spanning sessions don't lose their
-    pre-midnight snapshots' back-references.
-    """
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-
-    today = datetime.date.today()
-    yesterday = today - datetime.timedelta(days=1)
-
-    # Seed a snapshot dated yesterday for this session
-    yesterday_snap = sessions / f"{yesterday.isoformat()}-demo-abcd-snapshot-235030.md"
-    yesterday_snap.write_text(
-        f"---\ntype: claude-snapshot\ndate: {yesterday.isoformat()}\n"
-        "session_id: s1\nproject: demo\ntrigger: compact\n"
-        "status: auto-logged\n---\n\n# Snap\n",
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr(sesslog, "load_config", lambda: {
-        "vault_path": str(vault),
-        "sessions_folder": "claude-sessions",
-        "min_messages": 99,  # force bypass-or-skip path
-        "min_duration_minutes": 0,
-        "auto_log_enabled": True,
-    })
-    monkeypatch.setattr(sesslog, "read_transcript", lambda path: [
-        {"type": "user", "message": {"content": "cross midnight"}},
-    ])
-    monkeypatch.setattr(sesslog, "extract_user_messages", lambda msgs: ["cross midnight"])
-    monkeypatch.setattr(sesslog, "extract_assistant_messages", lambda msgs: [])
-    monkeypatch.setattr(sesslog, "extract_tool_uses", lambda msgs: [])
-    monkeypatch.setattr(sesslog, "extract_session_metadata", lambda msgs, cwd: {
-        "project": "demo", "git_branch": "develop", "duration_minutes": 0,
-        "project_path": str(tmp_path), "files_touched": [], "errors": [],
-    })
-
-    demo_cwd = tmp_path / "demo"
-    demo_cwd.mkdir()
-    projects_dir = tmp_path / ".claude" / "projects" / "demo"
-    projects_dir.mkdir(parents=True)
-    transcript = projects_dir / "sess.jsonl"
-    transcript.write_text("{}\n", encoding="utf-8")
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    stdin_json = json.dumps({
-        "session_id": "s1",
-        "cwd": str(demo_cwd),
-        "transcript_path": str(transcript),
-    })
-    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_json))
-
-    sesslog._run()
-
-    # Session note should land (threshold bypass fired because yesterday's
-    # snapshot was discovered via the candidate-dates loop) AND its
-    # snapshots: list must include yesterday's wikilink.
-    session_notes = [p for p in sessions.glob("*.md") if "-snapshot-" not in p.name]
-    assert len(session_notes) == 1, (
-        f"expected anchor session note across midnight; got: "
-        f"{[p.name for p in sessions.glob('*.md')]}"
-    )
-    content = session_notes[0].read_text(encoding="utf-8")
-    assert "snapshots:" in content
-    assert yesterday_snap.stem in content, (
-        f"yesterday's snapshot not back-referenced in session note:\n{content}"
-    )
 
 
 def test_snapshot_body_emits_last_messages_raw_section():
@@ -497,3 +135,62 @@ def test_snapshot_body_emits_last_messages_raw_section():
     assert "**Assistant:** yes, hi" in raw_tail
     assert "**User:** does this work?" in raw_tail
     assert "**Assistant:** it sure does" in raw_tail
+
+from native_capture_test_helpers import selected_host_context, native_batch, checkpoint, session_note
+from dataclasses import replace
+from types import MappingProxyType
+import transcripts
+
+def test_native_snapshot_filename_is_stable_on_replay(selected_host_context,native_batch):
+    context=selected_host_context
+    assert checkpoint(context,'pre_compact',trigger='manual').status=='complete'
+    snapshots=[p for p in context.vault_path.rglob('*.md') if 'type: "claude-snapshot"' in p.read_text()]
+    assert len(snapshots)==1
+    before=snapshots[0].read_bytes()
+    assert re.match(r'2026-04-18-'+context.host+r'-snapshot-[a-f0-9]{64}\.md$',snapshots[0].name)
+    assert checkpoint(context,'pre_compact',trigger='manual').status=='complete'
+    assert snapshots[0].read_bytes()==before
+    assert len(list(context.vault_path.rglob('*snapshot*.md')))==1
+
+def test_native_snapshot_points_to_its_published_parent(selected_host_context,native_batch):
+    context=selected_host_context
+    assert list(context.vault_path.rglob('*.md'))==[]
+    assert checkpoint(context,'pre_compact').status=='complete'
+    parent=session_note(context)
+    snapshot=next(context.vault_path.rglob('*snapshot*.md'))
+    assert 'parent_session: "[['+parent.stem+']]"' in snapshot.read_text()
+    assert 'First native fact.' in parent.read_text()
+    assert 'source_revision:' in snapshot.read_text()
+
+def test_native_terminal_capture_keeps_parent_after_threshold_changes(selected_host_context,native_batch):
+    context=selected_host_context
+    assert checkpoint(context,'pre_compact').status=='complete'
+    parent=session_note(context)
+    stricter=replace(context,config=MappingProxyType(dict(context.config,min_messages=99)))
+    native_batch.append(transcripts.SourceRecord('terminal-fact','user','Last native fact.',100))
+    assert checkpoint(stricter,'session_end').status=='complete'
+    assert session_note(context)==parent
+    assert 'First native fact.' in parent.read_text()
+    assert 'Last native fact.' in parent.read_text()
+    assert 'capture_state: "ended"' in parent.read_text()
+
+def test_native_terminal_capture_keeps_identity_after_project_change(selected_host_context,native_batch,tmp_path):
+    context=selected_host_context
+    assert checkpoint(context,'pre_compact').status=='complete'
+    parent=session_note(context)
+    project=tmp_path/'different-project';project.mkdir()
+    moved=replace(context,canonical_project_root=project,worktree=project)
+    assert checkpoint(moved,'session_end').status=='complete'
+    assert session_note(context)==parent
+
+def test_native_snapshot_and_parent_keep_first_date_across_midnight(selected_host_context,native_batch):
+    context=selected_host_context
+    assert checkpoint(context,'pre_compact').status=='complete'
+    parent=session_note(context)
+    native_batch.append(transcripts.SourceRecord('next-day-fact','user','After midnight.',100,
+                                                timestamp='2026-04-19T00:10:00Z'))
+    assert checkpoint(context,'session_end').status=='complete'
+    assert session_note(context)==parent
+    assert parent.name.startswith('2026-04-18-')
+    assert 'After midnight.' in parent.read_text()
+    assert 'parent_session: "[['+parent.stem+']]"' in next(context.vault_path.rglob('*snapshot*.md')).read_text()

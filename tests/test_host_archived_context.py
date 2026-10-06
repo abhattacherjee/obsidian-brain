@@ -1,43 +1,35 @@
-"""Runtime and source containment agree about native archived transcripts."""
+"""Runtime and source containment agree about selected native transcript roots."""
 import importlib
-
 import pytest
+from test_runtime_context import runtime_case, runtime_case_data, selected_host_context, resolve
 
-from test_runtime_context import runtime_case, resolve
 
-
-@pytest.mark.parametrize("root", ["sessions", "archived_sessions"])
-def test_codex_context_accepts_native_current_and_archived_roots(runtime_case, root):
-    path = runtime_case["codex_home"] / root / "rollout-native-thread.jsonl"
+@pytest.mark.parametrize("root", ["projects", "sessions", "archived_sessions"])
+def test_context_accepts_only_selected_native_transcript_roots(runtime_case, selected_host_context, root):
+    path = selected_host_context.native_home / root / "nested.jsonl"
     path.parent.mkdir(parents=True)
-    path.write_text('{"type":"session_meta","payload":{"id":"native-thread"}}\n')
-    assert resolve(runtime_case, transcript_path=str(path)).transcript_path == path.resolve()
+    path.write_text('{}\n')
+    supported = root == 'projects' if selected_host_context.host == 'claude' else root in {'sessions', 'archived_sessions'}
+    if supported:
+        assert resolve(runtime_case, transcript_path=str(path)).transcript_path == path.resolve()
+    else:
+        module = importlib.import_module("runtime_context")
+        with pytest.raises(module.RuntimeContextError) as error:
+            resolve(runtime_case, transcript_path=str(path))
+        assert error.value.code == "transcript_outside_host"
 
 
 @pytest.mark.parametrize("symlink", [False, True])
-def test_codex_context_rejects_outside_and_archived_symlink_escape(runtime_case, symlink):
+def test_context_rejects_outside_and_native_symlink_escape(runtime_case, selected_host_context, symlink):
     module = importlib.import_module("runtime_context")
     outside = runtime_case["worktree"] / "outside.jsonl"
     outside.write_text('{}\n')
     path = outside
     if symlink:
-        path = runtime_case["codex_home"] / "archived_sessions" / "escaped.jsonl"
+        root = 'projects' if selected_host_context.host == 'claude' else 'archived_sessions'
+        path = selected_host_context.native_home / root / "escaped.jsonl"
         path.parent.mkdir(parents=True)
         path.symlink_to(outside)
     with pytest.raises(module.RuntimeContextError) as error:
         resolve(runtime_case, transcript_path=str(path))
     assert error.value.code == "transcript_outside_host"
-
-
-@pytest.mark.parametrize("root", ["projects", "sessions", "archived_sessions"])
-def test_claude_context_accepts_only_native_projects(runtime_case, root):
-    module = importlib.import_module("runtime_context")
-    path = runtime_case["home"] / ".claude" / root / "nested.jsonl"
-    path.parent.mkdir(parents=True)
-    path.write_text('{}\n')
-    if root == "projects":
-        assert resolve(runtime_case, host="claude", client="claude-code", transcript_path=str(path)).transcript_path == path.resolve()
-    else:
-        with pytest.raises(module.RuntimeContextError) as error:
-            resolve(runtime_case, host="claude", client="claude-code", transcript_path=str(path))
-        assert error.value.code == "transcript_outside_host"

@@ -148,8 +148,16 @@ def _configuration(rpc, context):
     return result["config"]
 
 
+def _native_environment(context, env):
+    """Bind discovery and execution to the selected native configuration."""
+    if context.native_home is None:
+        raise _BackendFailure("unavailable", "native_home_missing")
+    return dict(env, CODEX_HOME=str(context.native_home))
+
+
 def discover_restrictions(binary, context, env, deadline):
     """Enumerate configured and installed servers before a model can run."""
+    env = _native_environment(context, env)
     arguments = restrictions()
     rpc = NativeRpc(binary, arguments, context, env, deadline)
     try:
@@ -265,6 +273,7 @@ def discover_restrictions(binary, context, env, deadline):
 
 
 def execute(context, prompt, schema, requested_model, deadline, env, directory):
+    env = _native_environment(context, env)
     metadata = directory.lstat()
     if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid()
             or stat.S_IMODE(metadata.st_mode) != 0o700

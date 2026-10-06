@@ -63,7 +63,9 @@ def test_upgrade_batch_returns_dicts_with_all_five_fields(monkeypatch, tmp_path,
 
 def test_upgrade_batch_writes_telemetry_record(monkeypatch, tmp_path, fake_note):
     """Telemetry sink gets exactly one record per upgrade_batch call, with embedded per-note array."""
-    metrics_path = tmp_path / "metrics.jsonl"
+    from runtime_context import current_runtime_context
+    from runtime_adapters import metrics_path as selected_metrics_path
+    metrics_path = selected_metrics_path(current_runtime_context())
     monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
 
     def fake_uun(path, *a, **kw):
@@ -91,7 +93,9 @@ def test_upgrade_batch_writes_telemetry_record(monkeypatch, tmp_path, fake_note)
 
 def test_upgrade_batch_per_note_failure_captured_with_reason(monkeypatch, tmp_path, fake_note):
     """A note that failed with fallback_reason carries it through into the dict + telemetry."""
-    metrics_path = tmp_path / "metrics.jsonl"
+    from runtime_context import current_runtime_context
+    from runtime_adapters import metrics_path as selected_metrics_path
+    metrics_path = selected_metrics_path(current_runtime_context())
     monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
 
     def fake_uun(path, *a, **kw):
@@ -119,7 +123,9 @@ def test_upgrade_batch_per_note_failure_captured_with_reason(monkeypatch, tmp_pa
 
 def test_single_element_batch_emits_record(monkeypatch, tmp_path, fake_note):
     """The /standup call shape — upgrade_batch([single_path], ...) — emits exactly one record with n_notes=1."""
-    metrics_path = tmp_path / "metrics.jsonl"
+    from runtime_context import current_runtime_context
+    from runtime_adapters import metrics_path as selected_metrics_path
+    metrics_path = selected_metrics_path(current_runtime_context())
     monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", metrics_path)
 
     def fake_uun(path, *a, **kw):
@@ -142,3 +148,9 @@ def test_single_element_batch_emits_record(monkeypatch, tmp_path, fake_note):
     assert rec["project"] == "obsidian-brain"
     assert rec["n_notes"] == 1
     assert len(rec["notes"]) == 1
+
+
+# Every scoped operation uses the same selected temporary vault.
+from selected_legacy_vault import selected_host_context, native_ai_frontend  # noqa: F401,E402
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

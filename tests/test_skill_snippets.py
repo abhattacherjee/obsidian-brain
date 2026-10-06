@@ -1093,7 +1093,16 @@ def test_every_template_starts_with_the_frontmatter_fence():
     )
 
 
-def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root=None):
+@pytest.fixture
+def selected_host_context(host, selected_host_context):
+    from dataclasses import replace
+    from runtime_context import using_runtime_context
+    selected = replace(selected_host_context, config=dict(selected_host_context.config))
+    with using_runtime_context(selected):
+        yield selected
+
+
+def _run_step8(selected_host_context, tmp_path, groups, review, skips, symlinked_vault=False, skip_root=None):
     """Run the real Step 8 heredoc against a scratch vault and return
     (completed process, sessions dir, buckets after the run).
 
@@ -1101,7 +1110,7 @@ def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root
     or Dropbox vault. skip_root: directory the skip paths are written under
     (default: the sessions dir the config names)."""
     home = tmp_path / "home"
-    (home / ".claude").mkdir(parents=True)
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
     vault = tmp_path / "vault"
     sessions = vault / "claude-sessions"
     sessions.mkdir(parents=True)
@@ -1109,7 +1118,7 @@ def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root
     if symlinked_vault:
         config_vault = tmp_path / "vault-link"
         config_vault.symlink_to(vault)
-    (home / ".claude" / "obsidian-brain-config.json").write_text(
+    selected_host_context.config_path.write_text(
         json.dumps({"vault_path": str(config_vault), "sessions_folder": "claude-sessions"})
     )
     files = {}
@@ -1119,13 +1128,12 @@ def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root
     for name, lines in files.items():
         body = [lines.get(i, "filler") for i in range(1, max(lines) + 1)]
         (sessions / name).write_text("\n".join(body) + "\n")
-    from dataclasses import replace
     import io
     import hashlib
     import skill_procedures
-    from note_transactions import context_for_vault
     from operation_state import operation_directory, store_artifact, read_artifact
-    context = replace(context_for_vault(config_vault), config_path=home / '.claude' / 'obsidian-brain-config.json', state_path=tmp_path / 'native-state', index_path=tmp_path / 'index.sqlite3', native_session_id='isolated-stage-eight', config={'vault_path': str(config_vault), 'sessions_folder': 'claude-sessions'})
+    context = selected_host_context
+    context.config.update(vault_path=str(config_vault), sessions_folder='claude-sessions')
     identifier, work = operation_directory(context)
     merged_groups = []
     for group in groups:
@@ -1147,7 +1155,7 @@ def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root
     return proc, sessions, buckets
 
 
-def test_step8_cascades_only_groups_the_user_flipped(tmp_path):
+def test_step8_cascades_only_groups_the_user_flipped(selected_host_context, tmp_path):
     """#340: a DONE group the user did not flip must not be cascaded. Before
     the fix, Step 8 cascaded every DONE group, so the deselected group's lines
     were checked off in the vault while Step 9's report (which renders from
@@ -1170,7 +1178,7 @@ def test_step8_cascades_only_groups_the_user_flipped(tmp_path):
         {"group_id": "g-deselected", "classification": "DONE", "tier": "HIGH",
          "canonical_text": "Fix the gadget"},
     ]
-    proc, sessions, buckets = _run_step8(tmp_path, groups, review, skips=[("a.md", 1)])
+    proc, sessions, buckets = _run_step8(selected_host_context, tmp_path, groups, review, skips=[("a.md", 1)])
     assert proc.returncode == 0, proc.stderr
     assert "cascaded_total=1" in proc.stdout, proc.stdout
 
@@ -1204,14 +1212,14 @@ def _two_group_fixture():
     return groups, review
 
 
-def test_step8_matches_skips_through_a_symlinked_vault(tmp_path):
+def test_step8_matches_skips_through_a_symlinked_vault(selected_host_context, tmp_path):
     """#340 review: the stamp now gates the cascade, so a path spelling
     difference must not cancel it. Config names a symlink to the vault; the
     primary-flip loop recorded the resolved path. The sibling must still be
     cascaded and the group stamped."""
     groups, review = _two_group_fixture()
     proc, sessions, buckets = _run_step8(
-        tmp_path, groups, review, skips=[("a.md", 1)],
+        selected_host_context, tmp_path, groups, review, skips=[("a.md", 1)],
         symlinked_vault=True, skip_root=(tmp_path / "vault" / "claude-sessions"),
     )
     assert proc.returncode == 0, proc.stderr
@@ -1220,7 +1228,7 @@ def test_step8_matches_skips_through_a_symlinked_vault(tmp_path):
     assert buckets["review"][0].get("applied") is True
 
 
-def test_step8_warns_when_recorded_flips_match_no_group(tmp_path):
+def test_step8_warns_when_recorded_flips_match_no_group(selected_host_context, tmp_path):
     """#340 review: recorded flips that match no group member leave nothing
     stamped and nothing cascaded. That must be said, not printed as an
     ordinary cascaded_total=0."""
@@ -1228,7 +1236,7 @@ def test_step8_warns_when_recorded_flips_match_no_group(tmp_path):
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     proc, sessions, buckets = _run_step8(
-        tmp_path, groups, review, skips=[("a.md", 1)], skip_root=elsewhere,
+        selected_host_context, tmp_path, groups, review, skips=[("a.md", 1)], skip_root=elsewhere,
     )
     assert proc.returncode == 0, proc.stderr
     assert "cascaded_total=0" in proc.stdout

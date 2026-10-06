@@ -1,25 +1,23 @@
-"""A selected host must not silently borrow another host's memory files."""
-
+"""Selected memory discovery cannot borrow inherited foreign host storage."""
 import importlib
+from test_runtime_context import runtime_case, runtime_case_data, selected_host_context
 
-from test_runtime_context import resolve, runtime_case
 
-
-def test_unsupported_codex_memory_is_reported_and_cannot_trigger_pruning(runtime_case):
+def test_selected_memory_reports_supported_empty_or_explicit_unsupported(selected_host_context):
     module = importlib.import_module("memory_sources")
-    runtime = importlib.import_module("runtime_context")
-    context = resolve(runtime_case)
     errors = []
-    with runtime.using_runtime_context(context):
-        assert module.memory_sources(module.detect_host(), errors=errors) == []
+    assert module.detect_host() == ('claude-code' if selected_host_context.host == 'claude' else 'codex')
+    assert module.memory_sources(module.detect_host(), errors=errors) == []
+    if selected_host_context.host == 'codex':
         assert errors[0]["unsupported"] is True
         assert module.failed_scopes(errors)[0] is True
+    else:
+        assert errors == []
+        assert module.failed_scopes(errors) == (False, set(), set())
 
 
-def test_explicit_claude_context_ignores_inherited_codex_memory_marker(runtime_case, monkeypatch):
+def test_selected_context_ignores_inherited_foreign_memory_markers(selected_host_context, monkeypatch):
     module = importlib.import_module("memory_sources")
-    runtime = importlib.import_module("runtime_context")
-    monkeypatch.setenv("CODEX_THREAD_ID", "inherited")
-    context = resolve(runtime_case, host="claude", client="claude-code")
-    with runtime.using_runtime_context(context):
-        assert module.detect_host() == "claude-code"
+    monkeypatch.setenv("CODEX_THREAD_ID", "inherited-codex")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "inherited-claude")
+    assert module.detect_host() == ('claude-code' if selected_host_context.host == 'claude' else 'codex')

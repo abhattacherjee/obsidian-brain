@@ -62,7 +62,7 @@ def _note(vault, folder, name, ntype, extra="", body="zebracorn body", date="202
 
 
 @pytest.fixture(autouse=True)
-def _no_live_memory(monkeypatch):
+def _no_live_memory(monkeypatch, selected_host_context):
     """Tests never read the real ~/.claude/projects; the mem fixture opts in.
     The listing seam reads through ``_memory_files``, so a test that sets
     ``_memory_files`` also sets what ``stale`` sees."""
@@ -71,8 +71,8 @@ def _no_live_memory(monkeypatch):
 
 
 @pytest.fixture
-def vault(tmp_path):
-    v = tmp_path / "v"
+def vault(tmp_path, selected_host_context):
+    v = selected_host_context.vault_path
     _note(v, "claude-insights", "i1", "claude-insight")
     _note(v, "claude-insights", "i2", "claude-insight")
     _note(v, "claude-insights", "d1", "claude-decision")
@@ -321,7 +321,7 @@ def test_file_happy_path(ctx):
     assert rows[page.name] == "claude-wiki" and "index.md" not in rows and "log-2026.md" not in rows
 
 
-def test_file_golden_page(ctx):
+def test_file_golden_page(ctx, selected_host_context):
     out = wiki.file_page(ctx, _payload(topics=[]), D)
     text = Path(out["path"]).read_text()
     fp = {n: wiki.fingerprint(Path(ctx["vault"]) / "claude-insights" / f"{n}.md") for n in ("i1", "i2", "d1")}
@@ -339,6 +339,7 @@ def test_file_golden_page(ctx):
         f"sources_fingerprint: {json.dumps(fp)}\n"
         'confidence: "high"\n'
         'filed_by: "user"\n'
+        f'author_host: "{selected_host_context.host}"\n'
         "tags:\n  - claude/wiki\n  - claude/wiki/confidence-high\n  - claude/project/demo\n"
         "---\n"
         "Ranking uses bm25.\n\n### Sources\n- [[i1]]\n"
@@ -837,14 +838,14 @@ def test_file_records_memory_sources_and_fingerprints(ctx, mem):
     assert "- memory: proj/x.md" in got and "[[proj/x.md]]" not in got
 
 
-def test_stale_sees_a_changed_or_deleted_memory_file(ctx, mem):
+def test_stale_sees_a_changed_or_deleted_memory_file(ctx, mem, host):
     page = Path(wiki.file_page(ctx, _payload(sources=["i1", "i2"], memory_sources=["proj/x.md"]), D)["path"])
     roots = [str(Path(ctx["vault"]) / f) for f in FOLDERS]
-    assert wiki.stale(ctx["db"], page, roots)["reasons"] == []
+    assert wiki.stale(ctx["db"], page, roots)["reasons"] == _memory_expected(host, [])
     mem["x"].write_text("changed\n")
-    assert "changed: memory:proj/x.md" in wiki.stale(ctx["db"], page, roots)["reasons"]
+    assert wiki.stale(ctx["db"], page, roots)["reasons"] == _memory_expected(host, ["changed: memory:proj/x.md"])
     mem["x"].unlink()
-    assert "missing: memory:proj/x.md" in wiki.stale(ctx["db"], page, roots)["reasons"]
+    assert wiki.stale(ctx["db"], page, roots)["reasons"] == _memory_expected(host, ["missing: memory:proj/x.md"])
 
 
 def test_memory_source_without_fingerprint_is_unverifiable(ctx, mem):
@@ -923,16 +924,21 @@ def _block_memory_page(ctx, mem):
     return page
 
 
-def test_block_style_page_with_memory_keys_is_fresh_then_changed(ctx, mem):
+def test_block_style_page_with_memory_keys_is_fresh_then_changed(ctx, mem, host):
     page = _block_memory_page(ctx, mem)
     roots = [str(Path(ctx["vault"]) / f) for f in FOLDERS]
     assert set(wiki.read_page(page)[0]["sources_fingerprint"]) == {
         "i1", "i2", "memory:proj/x.md", "memory:proj/y.md"}
-    assert wiki.stale(ctx["db"], page, roots)["reasons"] == []
+    assert wiki.stale(ctx["db"], page, roots)["reasons"] == _memory_expected(host, [], names=("proj/x.md", "proj/y.md"))
     mem["x"].write_text("edited\n")
     mem["y"].write_text("edited too\n")
-    assert wiki.stale(ctx["db"], page, roots)["reasons"] == [
-        "changed: memory:proj/x.md", "changed: memory:proj/y.md"]
+    assert wiki.stale(ctx["db"], page, roots)["reasons"] == _memory_expected(host, [
+        "changed: memory:proj/x.md", "changed: memory:proj/y.md"], names=("proj/x.md", "proj/y.md"))
+
+
+def _memory_expected(host, claude_reasons, names=("proj/x.md",)):
+    # Codex cannot verify a Claude native-memory store.
+    return claude_reasons if host == "claude" else [f"unverifiable: memory:{name}" for name in names]
 
 
 def _roots_of(ctx):
@@ -943,11 +949,11 @@ def _mem_page(ctx):
     return Path(wiki.file_page(ctx, _payload(sources=["i1", "i2"], memory_sources=["proj/x.md"]), D)["path"])
 
 
-def test_memory_file_gone_from_a_good_listing_is_missing(ctx, mem, monkeypatch):
+def test_memory_file_gone_from_a_good_listing_is_missing(ctx, mem, monkeypatch, host):
     page = _mem_page(ctx)
     mem["x"].unlink()
     monkeypatch.setattr(wiki, "_memory_files", lambda: [mem["y"]])
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["missing: memory:proj/x.md"]
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, ["missing: memory:proj/x.md"])
 
 
 def test_memory_on_another_host_is_unverifiable(ctx, mem, monkeypatch):
@@ -965,14 +971,14 @@ def test_memory_root_error_is_unverifiable(ctx, mem, monkeypatch):
     assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["unverifiable: memory:proj/x.md"]
 
 
-def test_memory_project_error_is_unverifiable_for_that_project_only(ctx, mem, monkeypatch):
+def test_memory_project_error_is_unverifiable_for_that_project_only(ctx, mem, monkeypatch, host):
     import memory_sources as ms
     page = Path(wiki.file_page(ctx, _payload(sources=["i1", "i2"], memory_sources=["proj/x.md"]), D)["path"])
-    err = [{"path": str(ms._projects_root() / "proj" / "memory"), "error": "Permission denied"}]
+    err = [{"path": str(mem["x"].parent), "error": "Permission denied"}]
     monkeypatch.setattr(wiki, "_memory_listing", lambda: ([], err, "claude-code"))
     assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["unverifiable: memory:proj/x.md"]
-    err[0]["path"] = str(ms._projects_root() / "other" / "memory")
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["missing: memory:proj/x.md"]
+    err[0]["path"] = str(mem["x"].parent.parent.parent / "other" / "memory")
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, ["missing: memory:proj/x.md"])
 
 
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores file permissions")
@@ -986,10 +992,10 @@ def test_listed_but_unreadable_memory_file_is_unverifiable(ctx, mem):
     assert reasons == ["unverifiable: memory:proj/x.md"]
 
 
-def test_stale_returns_memory_paths(ctx, mem):
+def test_stale_returns_memory_paths(ctx, mem, host):
     page = _mem_page(ctx)
     assert wiki.stale(ctx["db"], page, _roots_of(ctx)) == {
-        "stale": False, "reasons": [], "memory_paths": {"proj/x.md": str(mem["x"])}}
+        "stale": host == "codex", "reasons": _memory_expected(host, []), "memory_paths": {"proj/x.md": str(mem["x"])}}
 
 
 def test_memgrep_reports_unreadable_files(mem, tmp_path):
@@ -999,7 +1005,7 @@ def test_memgrep_reports_unreadable_files(mem, tmp_path):
     assert [s["path"] for s in skipped] == [str(tmp_path / "gone.md")] and skipped[0]["error"]
 
 
-def test_memory_file_and_vault_note_with_one_name_stay_apart(ctx, mem, monkeypatch):
+def test_memory_file_and_vault_note_with_one_name_stay_apart(ctx, mem, monkeypatch, host):
     m = mem["x"].parent / "i1.md"
     m.write_text("memory i1\n")
     monkeypatch.setattr(wiki, "_memory_files", lambda: [mem["x"], mem["y"], m])
@@ -1007,7 +1013,7 @@ def test_memory_file_and_vault_note_with_one_name_stay_apart(ctx, mem, monkeypat
     fps = wiki.read_page(page)[0]["sources_fingerprint"]
     assert {"i1", "memory:proj/i1.md"} <= set(fps) and fps["i1"] != fps["memory:proj/i1.md"]
     m.write_text("memory i1 edited\n")
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["changed: memory:proj/i1.md"]
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, ["changed: memory:proj/i1.md"], names=("proj/i1.md",))
 
 
 def test_memory_paths_cover_fingerprint_keys_missing_from_the_list(ctx, mem):
@@ -1028,13 +1034,13 @@ def _three_mem(mem, monkeypatch):
     return ["proj/x.md", "proj/y.md", "proj/z.md"]
 
 
-def test_memory_only_page_is_fresh_then_changed(ctx, mem, monkeypatch):
+def test_memory_only_page_is_fresh_then_changed(ctx, mem, monkeypatch, host):
     names = _three_mem(mem, monkeypatch)
     page = Path(wiki.file_page(ctx, _payload(sources=[], memory_sources=names), D)["path"])
     assert wiki.read_page(page)[0]["sources"] == []
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == []
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, [], names=names)
     mem["y"].write_text("edited\n")
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["changed: memory:proj/y.md"]
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, ["changed: memory:proj/y.md"], names=names)
 
 
 @pytest.mark.parametrize("sources_line,memory_line", [
@@ -1065,14 +1071,14 @@ def test_memory_only_page_with_malformed_names_is_never_fresh(ctx, mem, monkeypa
     assert r["stale"] and r["reasons"][0] == f"unverifiable: memory:{bad}"
 
 
-def test_stale_uses_a_given_memory_listing(ctx, mem, monkeypatch):
+def test_stale_uses_a_given_memory_listing(ctx, mem, monkeypatch, host):
     page = _mem_page(ctx)
     calls = []
     monkeypatch.setattr(wiki, "_memory_listing", lambda: calls.append(1) or ([mem["x"]], [], "claude-code"))
     listing = ([mem["y"]], [], "claude-code")  # x is not in the given listing
     r = wiki.stale(ctx["db"], page, _roots_of(ctx), memory_listing=listing)
-    assert calls == [] and r["reasons"] == ["missing: memory:proj/x.md"]
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == [] and calls == [1]
+    assert calls == [] and r["reasons"] == _memory_expected(host, ["missing: memory:proj/x.md"])
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, []) and calls == [1]
 
 
 def test_filing_owns_vault_before_legacy_wiki_lock(ctx, monkeypatch):

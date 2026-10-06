@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides shared development rules for this repository. Native Codex guidance is in `AGENTS.md`.
 
 ## Project Overview
 
@@ -10,7 +10,7 @@ Obsidian Brain is a Claude Code plugin that turns an Obsidian vault into a persi
 
 ## Development Commands
 
-There is no build step or linter. This is a Python (stdlib only) + Markdown plugin with a pytest suite and a 90% coverage gate. Run `./scripts/commit-preflight.sh` before committing. Individual checks include:
+There is no build step. This Python (stdlib only) + Markdown plugin has a pytest suite, a 90% coverage gate, and a strict host-neutral source check. Run `./scripts/commit-preflight.sh` before committing. Individual checks include:
 
 ```bash
 # Verify hook registration is valid JSON
@@ -29,27 +29,57 @@ python3 hooks/obsidian_context_snapshot.py
 
 ### Two execution modes
 
-1. **Hooks (auto-running Python scripts)** — Triggered by Claude Code lifecycle events. Registered in `hooks/hooks.json`. Must exit 0, use only Python stdlib, and write atomically (temp file + rename).
-2. **Skills (prompt-based procedures)** — Each `skills/*/SKILL.md` is a step-by-step prompt that Claude Code follows. No code files — skills use standard CC tools (Bash, Read, Write, Grep). Changes to SKILL.md directly change skill behavior.
+1. **Native hooks** use `hooks/native_entry.py` and `hooks/native_lifecycle.py`.
+   Claude registers `hooks/hooks.json`; Codex registers `hooks/codex-hooks.json`
+   through `.codex-plugin/plugin.json`. Entry time is recorded before shared
+   imports. Capture failures fail open, and Stop policy output uses the native
+   JSON contract. Codex capture defers when current-client binding is absent.
+2. **Skills** use the loaded `skills/*/SKILL.md`, explicit runtime context, and
+   named operations in `hooks/skill_procedures.py`. The loaded skill and imported
+   runtime must belong to the same installation. Paired host references contain
+   native setup details.
 
 ### Key files
 
-- `hooks/obsidian_utils.py` — Shared utility module used by the lifecycle hooks. Contains transcript parsing, metadata extraction, summarization (shells out to `claude -p --model haiku`), and atomic vault writes.
-- `hooks/obsidian_session_log.py` — SessionEnd: writes raw session note immediately (AI summarization deferred to `/recall`), and appends a structured outcome line to `~/.claude/obsidian-brain-hook.log` for every exit path.
-- `hooks/obsidian_session_hint.py` — SessionStart: injects last-session context hint for the current project.
-- `hooks/obsidian_context_snapshot.py` — PreCompact: saves context snapshot before compression.
-- `templates/` — Markdown templates for each note type (session, insight, decision, error-fix, snapshot, imported-session).
-- `dashboards/` — Dataview query templates installed to the user's vault.
+- `hooks/runtime_context.py` — immutable invoking host, client, full native session
+  ID, project, worktree, config, vault, resource, index, and state selection.
+- `hooks/transcripts/` — native source parsing and visible-record normalization.
+- `hooks/capture.py` — checkpoints, retained events, committed cursors, recovery,
+  and snapshots. Partial input remains pending.
+- `hooks/note_transactions.py` — revision checks and vault publication locks.
+- `hooks/ai_backend.py` and `hooks/ai_adapters/` — bounded native analysis with
+  strict output validation and no cross-host fallback.
+- `hooks/operation_state.py` and `hooks/session_auxiliary_state.py` — private,
+  versioned state scoped by vault, provider, full session identity, and project.
+- `hooks/obsidian_utils.py` and `hooks/obsidian_session_*.py` — shared utilities
+  and legacy compatibility entry points.
+- `templates/` and `dashboards/` — compatible vault notes and Dataview views.
 
 ### Data flow
 
-Sessions are logged with a **write-first pattern**: the raw note (with conversation excerpts, tool usage, metadata) is always saved to the vault immediately. AI summarization is deferred entirely: notes are written in raw form and upgraded by `/recall` on demand.
+Native capture retains normalized visible events before advancing the committed
+cursor. Revision checks preserve user edits. Recovery replays retained input;
+partial or unavailable input never becomes a completed session claim. Native
+hooks do not run AI. Summary upgrades use the invoking host's analysis adapter
+and publish only after output and source revisions pass validation.
 
-Structured outcome telemetry is appended to `~/.claude/obsidian-brain-hook.log` for every SessionEnd exit path (success, all skip reasons, write failure, exception) and every SessionStart bootstrap event. The log uses one line per event with grep-friendly `key=value` fields, rotates at 100 KB to `obsidian-brain-hook.log.1`, and is the primary diagnostic surface for sessions that did not produce a vault note. Inspect with `awk '/SessionEnd/ {print $5}' ~/.claude/obsidian-brain-hook.log | sort | uniq -c` for a SessionEnd outcome distribution.
+Private runtime state stays outside the vault. Bound diagnostics follow the
+selected session's state. The legacy Claude compatibility log remains
+`~/.claude/obsidian-brain-hook.log`, rotates at 100 KB, and uses `key=value` fields.
 
 ### Configuration
 
-Machine-local config at `~/.claude/obsidian-brain-config.json` (outside the vault, outside this repo). Created by `/obsidian-setup`. Contains vault path, folder names, filtering thresholds, and feature flags.
+Native storage uses the selected `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, with the
+corresponding default home when unset. `OBSIDIAN_BRAIN_CONFIG` selects an
+independent config file; `OBSIDIAN_BRAIN_DB` and `OBSIDIAN_BRAIN_STATE_DIR` select
+index and private state independently. An already-bound context retains its
+selection when environment variables change. Native skills and operations
+cannot switch that context to another vault or loaded installation.
+
+Legacy Claude config remains `~/.claude/obsidian-brain-config.json`. Vault folder
+names, tags, and note types are taxonomy and stay compatible across hosts.
+Full parity is not certified by the current source changes. See
+`docs/parity/acceptance-evidence.md` for the required native checks.
 
 ### Tag convention
 

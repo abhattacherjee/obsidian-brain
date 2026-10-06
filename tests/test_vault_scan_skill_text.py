@@ -18,22 +18,6 @@ SKILLS = {
     "vault-search": REPO / "skills" / "vault-search" / "SKILL.md",
 }
 
-_FALLBACK_HEAD = "**If the Grep tool is not available in this session**"
-_FALLBACK_CMD = {
-    "vault-ask": (
-        "python3 \"$HOOKS/vault_scan.py\" grep '<vault_path>' '<sessions_folder>' "
-        "'<insights_folder>' '<wiki_folder>' --pattern='<term>' --ignore-case"
-    ),
-    "vault-search": (
-        "python3 \"$HOOKS/vault_scan.py\" grep '<vault_path>' '<sessions_folder>' "
-        "'<insights_folder>' --pattern='<pattern>' --ignore-case"
-    ),
-}
-_META_CMD = "python3 \"$HOOKS/vault_scan.py\" meta '<vault_path>' '<file_1>' '<file_2>'"
-_NO_GREP_FIRST = (
-    "If the Grep tool is not in your tool list, go straight to vault_scan.py grep "
-    "— do not call Grep first."
-)
 _SKIPPED_LINE = "K note(s) were not searched (see the breakdown) — run /vault-doctor"
 
 
@@ -49,7 +33,7 @@ def _step(skill: str, number: str) -> str:
 def _fallback_section(skill: str) -> str:
     """From the fallback paragraph to the end of the code block that follows it."""
     step = _step(skill, "4")
-    start = step.index(_FALLBACK_HEAD)
+    start = step.index("Request for `grep`")
     block_open = step.index("```bash\n", start)
     block_close = step.index("\n```", block_open + len("```bash\n"))
     return step[start:block_close]
@@ -79,17 +63,18 @@ def test_vault_search_tag_command_does_not_satisfy_the_fallback_pin():
 
 def test_vault_ask_step4_keeps_the_agent3_tag_search():
     step = _step("vault-ask", "4")
-    assert 'Grep(pattern="claude/topic/.*<term>", path=SESSIONS_DIR' in step
-    assert 'Grep(pattern="claude/topic/.*<term>", path=INSIGHTS_DIR' in step
-    assert "--pattern='claude/topic/.*<term>'" in _fallback_section("vault-ask")
+    assert "**Job 3 — Tag search:**" in step
+    assert '"pattern": "claude/topic/.*<term>"' in step
+    assert '"frontmatter_only": true' in step
+    assert "both source folders and enabled wiki pages" in step
 
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))
 def test_step4_says_skip_grep_when_it_is_not_in_the_tool_list(skill):
     step = _step(skill, "4")
-    assert _NO_GREP_FIRST in step
-    # Said before the first Grep( call, so it is read before one is made.
-    assert step.index(_NO_GREP_FIRST) < step.index("Grep(")
+    assert "Use the fixed `grep` operation." in step
+    assert "Grep(" not in step
+    assert step.index("Use the fixed `grep` operation.") < step.index("--operation 'grep'")
 
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))
@@ -128,7 +113,7 @@ def test_rationale_says_frontmatter_runs_past_a_fixed_limit(skill, number):
 
 def test_vault_search_tag_mode_is_frontmatter_only():
     assert '--frontmatter-only' in _step('vault-search','2')
-    part=_step('vault-search','4').split('**For tag mode:**',1)[1].split('**For structured mode:**',1)[0]
+    part=_step('vault-search','4').split('**Tag mode:**',1)[1].split('**Structured mode:**',1)[0]
     calls=_scan_calls(part)
     assert len(calls)==1 and "--operation 'grep'" in calls[0]
     assert '"frontmatter_only": true' in part

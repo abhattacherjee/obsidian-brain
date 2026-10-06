@@ -100,7 +100,7 @@ def test_refresh_leaves_the_page_out_of_sources():
 def test_memory_search_uses_memgrep_on_every_ask_that_reaches_step_3():
     assert 'wiki-memgrep' in SKILL
     assert 'The memory search runs on every ask that reaches Step 3' in SKILL
-    assert 'even when Step 3 skipped the Grep searches' in SKILL
+    assert 'even when Step 3 skipped the pattern searches' in SKILL
     assert 'a fresh wiki answer from Step 2b stops before it, by design' in SKILL
 
 
@@ -140,7 +140,7 @@ def test_memory_reason_forms_are_listed():
 def test_memgrep_skipped_and_host_are_reported():
     assert '"host"' in SKILL and '"skipped"' in SKILL
     assert "N memory file(s) could not be read" in SKILL
-    assert "this host has no memory files" in SKILL
+    assert "native memory discovery is unsupported for this host" in SKILL
 
 
 def test_rejected_names_bullet_covers_memory_sources():

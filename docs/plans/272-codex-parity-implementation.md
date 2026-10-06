@@ -134,8 +134,10 @@
 
 ### Task 5 implementation evidence (2026-10-05)
 
-Task 5 remains under validation; Task 6 packaging, full host/client acceptance,
-preflight and whole-branch review have not passed for this change-set. See
+Task 5 committed as `40ba4a078a66b7e36d225be41e581b2f85bf6ff5` after normal
+preflight passed with 5,084 tests, 30 expected failures and 91.28% coverage.
+Task 6 packaging, full host/client acceptance and whole-branch review remain
+pending. See
 [Native AI runtime implementation](../parity/ai-runtime.md) for the current
 contracts and focused fixture commands. This is not a shipped parity claim.
 

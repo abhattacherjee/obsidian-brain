@@ -1,19 +1,7 @@
-"""Tests for classifier failure visibility and the `partial` classifier mode.
+"""Classifier failures remain visible under either invoking host.
 
-Issue #297 defect 1: classify_groups_with_agent's retry loop silently
-swallowed the child process's diagnostics (bare `continue` on both a
-non-zero return code / missing output and a schema-validation failure),
-and the terminal `parsed is None` branch set 'heuristic-fallback' without
-printing anything. This left `heuristic-fallback` ambiguous between a
-diagnosed 1 MB payload-cap hit (which does print) and an undiagnosed
-classifier failure (which did not).
-
-Issue #297 defect 2: a chunked classifier run can now succeed on some
-chunks and fail on others (Task 2). Before this change, that scenario was
-indistinguishable from full success — the caller had no way to know some
-group_ids were never classified. This file also exercises the new
-`partial` mode that makes that case visible.
-
+Issue #297 diagnostics cover retries, missing output and invalid schema.
+Native calls reject incomplete results rather than publish partial success.
 Spec: .superpowers/sdd/2026-08-10-issue-297-classifier-degradation-plan/
 task-3-brief.md
 """
@@ -50,6 +38,18 @@ def _reset_classifier_mode():
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _mock_bound_cli(monkeypatch, fake, operation="classifier"):
+    """Mock the trusted wrapper call; native transport is tested separately."""
+    import check_items_cli
+    def invoke(payload, output):
+        result = fake(["trusted-cli", "wrapper", operation, output], input=payload)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        return result.returncode
+    monkeypatch.setattr(check_items_cli,
+                        "run_classifier" if operation == "classifier" else "run_semantic_merge", invoke)
+
+
 def _make_group(group_id: str, text: str, mtime: float = 0.0, project: str = "obsidian-brain") -> dict:
     return {
         "group_id": group_id,
@@ -83,7 +83,7 @@ def _out_path_from_cmd(cmd) -> str:
 # Test 1: failed attempt (non-zero rc / no output) forwards child stderr
 # ---------------------------------------------------------------------------
 
-def test_failed_attempt_forwards_child_stderr(monkeypatch, capsys):
+def test_failed_attempt_forwards_child_stderr(selected_host_context, monkeypatch, capsys):
     merged_groups = [_make_group("g1", "Fix bug #87")]
 
     mock_cp = MagicMock()
@@ -97,7 +97,7 @@ def test_failed_attempt_forwards_child_stderr(monkeypatch, capsys):
         # Deliberately do NOT write out_path — simulates a hard failure.
         return mock_cp
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_run)
+    _mock_bound_cli(monkeypatch, fake_run)
 
     result = oid.classify_groups_with_agent(merged_groups, EVIDENCE)
 
@@ -116,7 +116,7 @@ def test_failed_attempt_forwards_child_stderr(monkeypatch, capsys):
 # Test 2: total failure prints the terminal diagnostic
 # ---------------------------------------------------------------------------
 
-def test_total_failure_prints_terminal_diagnostic(monkeypatch, capsys):
+def test_total_failure_prints_terminal_diagnostic(selected_host_context, monkeypatch, capsys):
     merged_groups = [_make_group("g1", "Fix bug #87"), _make_group("g2", "Other item")]
 
     mock_cp = MagicMock()
@@ -127,7 +127,7 @@ def test_total_failure_prints_terminal_diagnostic(monkeypatch, capsys):
     def fake_run(cmd, *args, **kwargs):
         return mock_cp
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_run)
+    _mock_bound_cli(monkeypatch, fake_run)
 
     result = oid.classify_groups_with_agent(merged_groups, EVIDENCE)
 
@@ -143,10 +143,10 @@ def test_total_failure_prints_terminal_diagnostic(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# Test 3: partial result (some chunks failed) sets `partial` mode
+# Test 3: incomplete native results cannot report partial success
 # ---------------------------------------------------------------------------
 
-def test_partial_result_sets_partial_mode(monkeypatch, capsys):
+def test_partial_native_result_is_rejected(selected_host_context, monkeypatch, capsys):
     merged_groups = [
         _make_group("g1", "Fix bug #87"),
         _make_group("g2", "Other item"),
@@ -166,24 +166,21 @@ def test_partial_result_sets_partial_mode(monkeypatch, capsys):
         Path(out_path).write_text(json.dumps(payload), encoding="utf-8")
         return mock_cp
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_run)
+    _mock_bound_cli(monkeypatch, fake_run)
 
     result = oid.classify_groups_with_agent(merged_groups, EVIDENCE)
 
     captured = capsys.readouterr()
-    assert len(result) == 2
-    assert oid.get_last_classifier_mode() == "partial"
-    assert "1" in captured.err, (
-        f"Expected missing count '1' named in stderr; got: {captured.err!r}"
-    )
-    assert "PARTIAL" in captured.err
+    assert result == []
+    assert oid.get_last_classifier_mode() == "heuristic-fallback"
+    assert "PARTIAL" not in captured.err
 
 
 # ---------------------------------------------------------------------------
 # Test 4: full result sets `ok` mode, no PARTIAL/FAILED noise
 # ---------------------------------------------------------------------------
 
-def test_full_result_sets_ok_mode(monkeypatch, capsys):
+def test_full_result_sets_ok_mode(selected_host_context, monkeypatch, capsys):
     merged_groups = [
         _make_group("g1", "Fix bug #87"),
         _make_group("g2", "Other item"),
@@ -201,7 +198,7 @@ def test_full_result_sets_ok_mode(monkeypatch, capsys):
         Path(out_path).write_text(json.dumps(payload), encoding="utf-8")
         return mock_cp
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_run)
+    _mock_bound_cli(monkeypatch, fake_run)
 
     result = oid.classify_groups_with_agent(merged_groups, EVIDENCE)
 
@@ -216,7 +213,7 @@ def test_full_result_sets_ok_mode(monkeypatch, capsys):
 # Test 5: schema-validation failure is reported, not silent
 # ---------------------------------------------------------------------------
 
-def test_validation_failure_is_reported(monkeypatch, capsys):
+def test_validation_failure_is_reported(selected_host_context, monkeypatch, capsys):
     merged_groups = [_make_group("g1", "Fix bug #87")]
 
     # Structurally invalid: missing required fields.
@@ -232,7 +229,7 @@ def test_validation_failure_is_reported(monkeypatch, capsys):
         Path(out_path).write_text(json.dumps(invalid_payload), encoding="utf-8")
         return mock_cp
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_run)
+    _mock_bound_cli(monkeypatch, fake_run)
 
     result = oid.classify_groups_with_agent(merged_groups, EVIDENCE)
 

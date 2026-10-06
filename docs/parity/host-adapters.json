@@ -1,0 +1,170 @@
+{
+  "hooks/obsidian_context_snapshot.py:_run": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_session_log.py:_build_note": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_session_log.py:_run": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:_append_sessionend_log": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:_cc_encoded_dirnames": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:_current_session_cwd": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:_cwd_project_dirnames": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:_default_plugin_install_paths": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:_dirs_by_transcript_cwd": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:_first_seen_date": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:_get_session_id_fast": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:_glob_project_jsonls_union": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:_hook_payload_codex_reason": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:_project_glob_variants": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:_recent_bootstrap_sid": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:_resolve_project_basename": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:_resolve_project_basename_with_source": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:_resolve_session_id": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:_restrict_matches_to_cwd_project": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:_retro_gate_dir": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:_slow_path_newest_sid": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:_try_slow_jsonl_glob": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:describe_plugin_install_divergence": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:extract_tool_uses": {
+    "claude": "supported",
+    "codex": "unsupported:legacy-claude-compatibility-api; native Codex uses the explicit runtime adapter"
+  },
+  "hooks/obsidian_utils.py:find_transcript_jsonl": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:get_session_context": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:get_workspace_roots": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:load_config": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:mark_retro_classification_pending": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:upgrade_batch": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/obsidian_utils.py:upgrade_unsummarized_note": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/runtime_adapters/claude.py:legacy_config_path": {
+    "claude": "supported",
+    "codex": "unsupported:claude-native-storage-and-legacy-compatibility-adapter"
+  },
+  "hooks/runtime_adapters/claude.py:legacy_foreign_host_markers": {
+    "claude": "supported",
+    "codex": "unsupported:claude-native-storage-and-legacy-compatibility-adapter"
+  },
+  "hooks/runtime_adapters/claude.py:legacy_index_path": {
+    "claude": "supported",
+    "codex": "unsupported:claude-native-storage-and-legacy-compatibility-adapter"
+  },
+  "hooks/runtime_adapters/claude.py:legacy_private_directory": {
+    "claude": "supported",
+    "codex": "unsupported:claude-native-storage-and-legacy-compatibility-adapter"
+  },
+  "hooks/runtime_adapters/claude.py:selected_home": {
+    "claude": "supported",
+    "codex": "unsupported:claude-native-storage-and-legacy-compatibility-adapter"
+  },
+  "hooks/runtime_adapters/codex.py:selected_home": {
+    "claude": "unsupported:codex-native-storage-adapter",
+    "codex": "supported"
+  },
+  "hooks/runtime_context.py:historical_source_roots": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/runtime_context.py:resolve_runtime_context": {
+    "claude": "supported",
+    "codex": "supported"
+  },
+  "hooks/transcripts/claude.py:native_tool_categories": {
+    "claude": "supported",
+    "codex": "unsupported:claude-source-tool-name-format; historical imports select source format explicitly"
+  },
+  "hooks/ai_adapters/claude.py:execute": {
+    "claude": "supported",
+    "codex": "unsupported:claude-native-analysis-environment; shared analysis selects the invoking provider"
+  },
+  "hooks/ai_adapters/codex.py:_native_environment": {
+    "claude": "unsupported:codex-native-analysis-environment; shared analysis selects the invoking provider",
+    "codex": "supported"
+  }
+}

@@ -12,7 +12,7 @@ import pytest
     ("obsidian_session_log", "_run"),
     ("obsidian_retro_gate", "main"),
 ])
-def test_nested_analysis_returns_before_context_or_stdin(monkeypatch, module_name, entry):
+def test_nested_analysis_returns_before_context_or_stdin(selected_host_context, monkeypatch, module_name, entry):
     import runtime_context
 
     def forbidden():
@@ -30,7 +30,7 @@ def test_nested_analysis_returns_before_context_or_stdin(monkeypatch, module_nam
     ("obsidian_session_log", "_run"),
     ("obsidian_retro_gate", "main"),
 ])
-def test_other_marker_values_do_not_skip_capture(monkeypatch, marker, module_name, entry):
+def test_other_marker_values_do_not_skip_capture(selected_host_context, monkeypatch, marker, module_name, entry):
     import runtime_context
 
     def reached():
@@ -42,11 +42,11 @@ def test_other_marker_values_do_not_skip_capture(monkeypatch, marker, module_nam
         getattr(importlib.import_module(module_name), entry)()
 
 
-def test_native_nested_guard_runs_before_dispatch(monkeypatch):
+def test_native_nested_guard_runs_before_dispatch(selected_host_context, monkeypatch):
     import native_lifecycle
 
     monkeypatch.setenv("OBSIDIAN_BRAIN_NESTED_AI", "1")
-    assert native_lifecycle.dispatch(None, "unknown", {}, time.monotonic()) is None
+    assert native_lifecycle.dispatch(selected_host_context, "unknown", {}, time.monotonic()) is None
     monkeypatch.delenv("OBSIDIAN_BRAIN_NESTED_AI")
     with pytest.raises(ValueError, match="Unknown lifecycle event"):
-        native_lifecycle.dispatch(None, "unknown", {}, time.monotonic())
+        native_lifecycle.dispatch(selected_host_context, "unknown", {}, time.monotonic())

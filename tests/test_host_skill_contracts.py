@@ -7,16 +7,15 @@ import note_transactions
 import skill_procedures
 
 ROOT = Path(__file__).resolve().parents[1]
-PAIRED = {'standup', 'emerge', 'recall', 'obsidian-setup', 'retro'}
+PAIRED = {'standup', 'emerge', 'recall', 'obsidian-setup', 'retro', 'vault-doctor'}
 
 
 @pytest.fixture
-def tmp_vault(tmp_path, monkeypatch):
+def tmp_vault(selected_host_context, tmp_path, monkeypatch):
     import obsidian_utils
     import vault_index
     monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path / 'claude-home'))
-    vault = tmp_path / 'vault'
-    vault.mkdir()
+    vault = selected_host_context.vault_path
     (vault / 'claude-insights').mkdir()
     (vault / 'claude-sessions').mkdir()
     monkeypatch.setattr(obsidian_utils, '_SECURE_DIR', str(tmp_path / 'state'))
@@ -103,8 +102,7 @@ def test_curated_apply_keeps_edit_made_after_source_read(tmp_vault):
 def test_curated_metadata_keeps_origin_provider_separate_from_author(tmp_vault):
     from dataclasses import replace
     import json
-    context = replace(note_transactions.context_for_vault(tmp_vault), host='codex',
-                      client='codex-cli', native_session_id='codex-own-session')
+    context = replace(note_transactions.context_for_vault(tmp_vault), native_session_id='invoking-session')
     destination = tmp_vault / 'claude-insights' / 'existing.md'
     original = '---\ntype: claude-insight\nagent_provider: claude\nagent_session_id: original-claude-session\n---\n\nOriginal\n'
     destination.write_text(original)
@@ -122,7 +120,7 @@ def test_curated_metadata_keeps_origin_provider_separate_from_author(tmp_vault):
     content = destination.read_text()
     assert 'agent_provider: claude\n' in content
     assert 'agent_session_id: original-claude-session\n' in content
-    assert 'author_host: codex\n' in content
+    assert 'author_host: ' + context.host + '\n' in content
     assert 'operation_id: ' + operation_id + '\n' in content
 
 
@@ -168,7 +166,7 @@ def test_historical_import_keeps_source_host_and_invoking_author(tmp_vault, tmp_
     import json
     import session_lookup
     monkeypatch.setattr(session_lookup, 'find_existing_session', lambda *args: None)
-    context = replace(note_transactions.context_for_vault(tmp_vault), host='codex', client='codex-cli', native_session_id='invoking-codex')
+    context = replace(note_transactions.context_for_vault(tmp_vault), native_session_id='invoking-session')
     transcript = tmp_path / 'historic.jsonl'
     transcript.write_text(json.dumps({'type': 'user', 'sessionId': 'source-claude', 'uuid': 'human', 'message': {'content': 'Remember source facts'}}) + '\n' + json.dumps({'type': 'assistant', 'sessionId': 'source-claude', 'uuid': 'answer', 'message': {'content': 'Visible answer'}}) + '\n')
     prepared = io.StringIO()
@@ -182,7 +180,7 @@ def test_historical_import_keeps_source_host_and_invoking_author(tmp_vault, tmp_
     content = (tmp_vault / 'claude-sessions' / 'old-date-original-project.md').read_text()
     assert 'agent_provider: claude\n' in content
     assert 'agent_session_id: source-claude\n' in content
-    assert 'author_host: codex\n' in content
+    assert 'author_host: ' + context.host + '\n' in content
     assert 'fabricated' not in content
 
 
@@ -270,7 +268,7 @@ def test_reviewed_checkoffs_apply_primary_and_sibling_only(tmp_vault):
     for filename in ('primary.md', 'sibling.md'):
         content = (tmp_vault / 'claude-sessions' / filename).read_text()
         assert '- [x] Ship feature' in content
-        assert 'author_host: claude' in content
+        assert 'author_host: ' + context.host in content
         assert 'operation_id: ' + operation in content
     assert '- [ ] Ship feature' in (tmp_vault / 'claude-sessions' / 'deselected.md').read_text()
     assert json.loads(output.getvalue()) == {'cascaded': 1, 'primary': 1, 'skipped': 0, 'status': 'applied'}
@@ -310,3 +308,23 @@ def test_historical_import_rejects_source_changed_after_analysis(tmp_vault, tmp_
     assert skill_procedures.run_operation(context, 'vault-import', 'note-create', {'operation_id': operation, 'filename': 'imported.md', 'content': '---\ntype: claude-session\n---\n\nSummary\n'}, io.StringIO(), stderr) == 1
     assert 'changed during summary generation' in stderr.getvalue()
     assert not (tmp_vault / 'claude-sessions' / 'imported.md').exists()
+
+
+@pytest.mark.parametrize('skill', sorted(skill_procedures.SKILLS))
+def test_missing_current_client_stops_before_skill_launch(selected_host_context, tmp_path, skill):
+    import os
+    import re
+    import subprocess
+    source = (ROOT / 'skills' / skill / 'SKILL.md').read_text()
+    block = re.search(r'```bash\n(.*?)\n```', source, re.S).group(1)
+    environment = dict(os.environ)
+    environment.pop('OB_CLIENT', None)
+    result = subprocess.run(['bash', '-c', block], env=environment,
+                            cwd=selected_host_context.worktree, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode != 0
+    assert 'Current native client binding is unavailable' in result.stderr
+    assert not result.stdout
+    assert not list(selected_host_context.vault_path.iterdir())
+    assert 'infer the frontend from transcript creation' in source
+    assert 'OB_CLIENT=codex-cli' not in block

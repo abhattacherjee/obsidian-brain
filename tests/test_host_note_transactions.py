@@ -7,20 +7,18 @@ import subprocess
 import sys
 from pathlib import Path
 from types import MappingProxyType
+from dataclasses import replace
 
 import pytest
 
-from runtime_context import RuntimeContext
+from runtime_context import RuntimeContext, using_runtime_context
 from note_transactions import NoteMutation, apply_mutations, read_revision
 
 
 @pytest.fixture
-def context(tmp_path):
-    vault = tmp_path / "vault"
-    vault.mkdir()
-    return RuntimeContext("codex", "codex-cli", "native-id", tmp_path, tmp_path,
-                          None, vault, tmp_path / "config.json", MappingProxyType({}),
-                          tmp_path, tmp_path / "index.sqlite3", tmp_path / "state")
+def context(selected_host_context):
+    selected_host_context.index_path.parent.mkdir(parents=True, exist_ok=True)
+    return selected_host_context
 
 
 def test_new_note_operation_is_idempotent(context):
@@ -178,3 +176,85 @@ def test_process_death_releases_ownership(context):
     result = apply_mutations(context, [NoteMutation(note, None, {"document": "new"}, "after-death")])
     assert result.status == "applied"
     assert note.read_text() == "new"
+
+
+@pytest.mark.parametrize('publication', ['before_replace', 'after_replace'])
+@pytest.mark.parametrize('existing_capture', [False, True])
+def test_prepared_retry_preserves_later_unowned_prose_and_metadata(
+        selected_host_context, monkeypatch, publication, existing_capture):
+    import note_transactions as transactions
+    actor = selected_host_context
+    note = actor.vault_path / 'prepared-retry.md'
+    original = '---\ntype: claude-session\nhuman_field: initial\ncapture_state: "active"\n---\nOriginal prose.\n'
+    if existing_capture:
+        original += ('<!-- obsidian-brain:capture:start -->\nold facts\n'
+                     '<!-- obsidian-brain:capture:end -->\n')
+    note.write_text(original)
+    expected = read_revision(actor, note)
+    mutation = NoteMutation(note, expected, {'capture':'new facts',
+        'metadata':json.dumps({'capture_state':'ended'})}, 'prepared-retry-operation')
+    failed = False
+    atomic = transactions._atomic_write
+    def write(path, document, file_mode=None):
+        nonlocal failed
+        if path == note and publication == 'before_replace' and not failed:
+            failed = True
+            raise OSError('synthetic failure before publication')
+        if path == note and publication == 'before_replace':
+            with transactions.connect_coordination(actor) as connection:
+                prepared = connection.execute("SELECT document, revision FROM operations WHERE phase='prepared'").fetchone()
+            assert prepared[0] == document
+            assert prepared[1] == hashlib.sha256(document.encode()).hexdigest()
+            assert 'Human addition after the failed attempt.' in prepared[0]
+        return atomic(path, document, file_mode)
+    def fault(point):
+        nonlocal failed
+        if publication == 'after_replace' and point == 'after_replace' and not failed:
+            failed = True
+            raise OSError('synthetic crash after publication')
+    monkeypatch.setattr(transactions, '_atomic_write', write)
+    monkeypatch.setattr(transactions, '_fault', fault)
+    assert apply_mutations(actor, [mutation]).status == 'pending'
+    current = note.read_text().replace('human_field: initial', 'human_field: edited\nnew_human_field: keep')
+    note.write_text(current + '\nHuman addition after the failed attempt.\n')
+    retried = apply_mutations(actor, [mutation])
+    assert retried.status == ('applied' if publication == 'before_replace' else 'unchanged'), retried.warnings
+    final = note.read_text()
+    assert 'human_field: edited\nnew_human_field: keep' in final
+    assert 'Human addition after the failed attempt.' in final
+    assert 'Original prose.' in final
+    assert 'capture_state: "ended"' in final
+    assert final.count('new facts') == 1
+    assert final.count('<!-- obsidian-brain:capture:start -->') == 1
+    assert apply_mutations(actor, [mutation]).status == 'unchanged'
+    assert note.read_text() == final
+
+
+@pytest.mark.parametrize('change', ['document', 'capture', 'metadata'])
+def test_prepared_retry_refuses_later_edits_to_its_owned_input(selected_host_context, monkeypatch, change):
+    import note_transactions as transactions
+    actor = selected_host_context
+    note = actor.vault_path / 'prepared-conflict.md'
+    original = ('---\ncapture_state: "active"\n---\nManual body.\n'
+                '<!-- obsidian-brain:capture:start -->\nold facts\n'
+                '<!-- obsidian-brain:capture:end -->\n')
+    note.write_text(original)
+    expected = read_revision(actor, note)
+    changes = ({'document':'replacement document'} if change == 'document' else
+               {'capture':'new facts'} if change == 'capture' else
+               {'metadata':json.dumps({'capture_state':'ended'})})
+    mutation = NoteMutation(note, expected, changes, 'prepared-conflict-operation')
+    atomic = transactions._atomic_write
+    def fail(path, document, file_mode=None):
+        if path == note:
+            raise OSError('synthetic write failure')
+        return atomic(path, document, file_mode)
+    monkeypatch.setattr(transactions, '_atomic_write', fail)
+    assert apply_mutations(actor, [mutation]).status == 'pending'
+    human = (original + 'Later human body.\n' if change == 'document' else
+             original.replace('old facts', 'human capture') if change == 'capture' else
+             original.replace('capture_state: "active"', 'capture_state: "manual"'))
+    note.write_text(human)
+    monkeypatch.setattr(transactions, '_atomic_write', atomic)
+    assert apply_mutations(actor, [mutation]).status == 'conflict'
+    assert note.read_text() == human

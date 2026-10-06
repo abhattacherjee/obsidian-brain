@@ -343,8 +343,9 @@ def _doctor_tests_do_not_read_live_config(request, monkeypatch):
         return
     import obsidian_utils
     import hooks.obsidian_utils as qualified_utils
-    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {})
-    monkeypatch.setattr(qualified_utils, "load_config", lambda: {})
+    isolated_config = lambda context=None: dict(context.config) if context is not None else {}
+    monkeypatch.setattr(obsidian_utils, "load_config", isolated_config)
+    monkeypatch.setattr(qualified_utils, "load_config", isolated_config)
 
 
 @pytest.fixture(autouse=True)
@@ -366,18 +367,17 @@ def _block_unmocked_native_ai_processes(monkeypatch):
 
 
 @pytest.fixture
-def native_ai_frontend(tmp_path, monkeypatch):
-    """Frontend tests bind Claude explicitly and fake the backend, not a CLI."""
-    from types import MappingProxyType
+def native_ai_frontend(selected_host_context, monkeypatch):
+    """Frontend tests use the selected invoking host and replace AI transport."""
     import ai_backend
     import native_ai_test_adapter
-    from runtime_context import RuntimeContext, using_runtime_context
-    vault = tmp_path / "native-ai-vault"
-    vault.mkdir()
-    context = RuntimeContext("claude", "cli", "test-native-ai", tmp_path, tmp_path,
-                             None, vault, tmp_path / "native-ai-config.json",
-                             MappingProxyType({}), Path(_REPO_ROOT),
-                             tmp_path / "native-ai-index.sqlite3", tmp_path / "native-ai-state")
+    from runtime_context import using_runtime_context
+    context = selected_host_context
     monkeypatch.setattr(ai_backend, "execute_ai", native_ai_test_adapter.execute_ai)
     with using_runtime_context(context):
         yield context
+
+
+# Invoking-host conformance uses an explicit active context. Individual modules
+# may specialize its vault/config fixture while keeping this host contract.
+from parity_test_helpers import host, selected_host_context, host_identity_scenario  # noqa: E402, F401

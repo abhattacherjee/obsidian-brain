@@ -12,11 +12,8 @@ from runtime_context import RuntimeContext, using_runtime_context
 
 
 @pytest.fixture
-def context(tmp_path):
-    vault = tmp_path / 'vault'; vault.mkdir()
-    return RuntimeContext('codex', 'codex-cli', 'edit-native', tmp_path, tmp_path,
-                          None, vault, tmp_path / 'config', MappingProxyType({'vault_path': str(vault)}),
-                          tmp_path, tmp_path / 'index', tmp_path / 'state')
+def context(selected_host_context):
+    return selected_host_context
 
 
 def prepared(context, notes):
@@ -110,7 +107,7 @@ def test_edit_records_invoking_actor_without_changing_origin(context, monkeypatc
     text = note.read_text()
     assert 'agent_provider: claude' in text
     assert 'agent_session_id: original-session' in text
-    assert 'author_host: "codex"' in text
+    assert 'author_host: ' + json.dumps(context.host) in text
     assert 'operation_id: ' + json.dumps(identity) in text
     assert '- [x] First.' in text
 

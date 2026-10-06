@@ -1,13 +1,12 @@
 """Memory files the wiki can cite (#396, epic #383).
 
-This is the one place that knows where a host keeps its memory files. On
-Claude Code they are ``~/.claude/projects/<project-dir>/memory/*.md``. On any
-other host there are none until #272 adds Codex. Skills never name these
-paths; they call ``wiki.py memgrep``, which asks this module.
+The runtime resolver selects the host's memory root. Codex native memory
+discovery is unsupported because it has no equivalent memory-file API.
+Skills call ``wiki.py memgrep``, which asks this module.
 
 Every listed file is a regular, non-symlinked ``*.md`` directly inside a
 non-symlinked ``memory/`` folder of a non-symlinked project folder, resolved
-and checked to sit under ``~/.claude/projects``. ``MEMORY.md`` is an index,
+and checked to sit under the selected projects root. ``MEMORY.md`` is an index,
 not a memory, so it is skipped.
 """
 
@@ -34,9 +33,18 @@ def detect_host() -> str:
     return "claude-code"
 
 
-def _projects_root() -> Path:
-    # Path.home() reads $HOME on POSIX, so tests can point it at a tmp dir.
-    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+def _projects_root() -> Path | None:
+    from runtime_context import current_runtime_context, native_memory_projects_root
+    context = current_runtime_context()
+    if context is not None:
+        return native_memory_projects_root(context)
+    return _legacy_projects_root()
+
+
+def _legacy_projects_root() -> Path:
+    """Read-only memory discovery for explicit unbound compatibility callers."""
+    from runtime_context import historical_source_roots
+    return historical_source_roots("claude")[0]
 
 
 def memory_sources(host: str, config: dict | None = None, errors: list | None = None) -> list:
@@ -48,6 +56,10 @@ def memory_sources(host: str, config: dict | None = None, errors: list | None = 
     "error"}``: a projects root that exists but cannot be listed, a project
     or ``memory/`` folder that cannot be read, or a file that cannot be
     resolved. A missing root is not an error (no memory yet)."""
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        host = context.host
     if host not in {"claude-code", "claude"}:
         if errors is not None:
             errors.append({"path": "", "error": "Native memory discovery is unsupported for " + host,
@@ -59,6 +71,8 @@ def memory_sources(host: str, config: dict | None = None, errors: list | None = 
             errors.append({"path": str(path), "error": str(exc)})
 
     root = _projects_root()
+    if root is None:
+        return []
     try:
         real_root = root.resolve(strict=True)
         projects = sorted(root.iterdir())
@@ -96,7 +110,11 @@ def failed_scopes(errors) -> tuple:
     names)``: whether the projects root itself failed, the project folders
     whose ``memory/`` could not be read, and the ``<project>/<file>.md``
     names that could not be resolved. A path outside the root is ignored."""
+    if any(error.get("unsupported") for error in errors or []):
+        return True, set(), set()
     root = _projects_root()
+    if root is None:
+        return True, set(), set()
     root_failed, projects, names = False, set(), set()
     for e in errors or []:
         if e.get("unsupported"):

@@ -1,9 +1,8 @@
 """Inline check-items requests publish only validated host-owned results."""
-from types import SimpleNamespace
 import json
 import pytest
 import check_items_cli as cli
-from check_items_test_helpers import native_ai_context, private_output
+from check_items_test_helpers import selected_host_context, native_ai_context, private_output
 _REAL_REQUEST_AI = cli._request_ai
 
 
@@ -24,7 +23,11 @@ def verdict(gid):
 
 
 def result(data):
-    return SimpleNamespace(data=data,backend='codex',model='configured-model')
+    from ai_backend import AIResult
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    model = context.config['classifier_model' if context.host == 'claude' else 'codex_ai_model']
+    return AIResult('ok', data, 'fixture-revision', '', context.host, model)
 
 
 @pytest.mark.parametrize('merges,before,after', [
@@ -95,59 +98,60 @@ def test_exhausted_chunk_cannot_publish_partial_results(monkeypatch,tmp_path):
     assert output.read_text()=='previous'
 
 
-def test_native_default_model_cannot_authorize_cache_replay(tmp_path):
+def test_native_default_model_cannot_authorize_cache_replay(native_ai_context):
     import check_items_cache as cache
-    from runtime_context import using_runtime_context
-    context=SimpleNamespace(host='codex',config={},vault_path=tmp_path/'vault',
-                            canonical_project_root=tmp_path/'project')
+    for key in ('classifier_model', 'codex_ai_model', 'codex_summary_model'):
+        native_ai_context.config.pop(key, None)
     group={'group_id':'one','canonical_hash':'h','canonical_text':'work'}
-    with using_runtime_context(context):
-        assert cache._provenance(group,'p',{'complete':True,'evidence':{},'classifier_model':'haiku'}) is None
+    assert cache._provenance(group,'p',{'complete':True,'evidence':{},'classifier_model':'haiku'}) is None
 
 
-def test_cache_fingerprint_uses_effective_classifier_model_and_prompt(tmp_path,monkeypatch):
+def test_cache_fingerprint_uses_effective_classifier_model_and_prompt(native_ai_context,monkeypatch):
     import check_items_cache as cache
-    from runtime_context import using_runtime_context
-    context=SimpleNamespace(host='claude',config={'summary_model':'haiku'},vault_path=tmp_path/'vault',
-                            canonical_project_root=tmp_path/'project')
+    context = native_ai_context
     group={'group_id':'one','canonical_hash':'h','canonical_text':'work'}
-    with using_runtime_context(context):
-        context.config['classifier_model']='claude-haiku-4-5-20251001'
-        small=cache._provenance(group,'p',{'complete':True,'evidence':{},'classifier_model':'claude-haiku-4-5-20251001'})
-        context.config['classifier_model']='claude-sonnet-4-5-20250929'
-        large=cache._provenance(group,'p',{'complete':True,'evidence':{},'classifier_model':'claude-sonnet-4-5-20250929'})
-        assert small and large and small != large
-        monkeypatch.setattr(cli,'CLASSIFIER_PROMPT',cli.CLASSIFIER_PROMPT+'\nnew contract')
-        assert cache._provenance(group,'p',{'complete':True,'evidence':{},'classifier_model':'claude-sonnet-4-5-20250929'}) != large
+    key = 'classifier_model' if context.host == 'claude' else 'codex_ai_model'
+    models = ('claude-haiku-4-5-20251001', 'claude-sonnet-4-5-20250929') if context.host == 'claude' else ('gpt-native-small', 'gpt-native-large')
+    context.config[key] = models[0]
+    small=cache._provenance(group,'p',{'complete':True,'evidence':{},'classifier_model':models[0]})
+    context.config[key] = models[1]
+    large=cache._provenance(group,'p',{'complete':True,'evidence':{},'classifier_model':models[1]})
+    assert small and large and small != large
+    monkeypatch.setattr(cli,'CLASSIFIER_PROMPT',cli.CLASSIFIER_PROMPT+'\nnew contract')
+    assert cache._provenance(group,'p',{'complete':True,'evidence':{},'classifier_model':models[1]}) != large
 
 
 @pytest.mark.parametrize('unsafe', ['markdown', 'outside', 'symlink', 'public_mode', 'private_json'])
 def test_private_result_boundary_preserves_notes_even_with_state_in_vault(
         native_ai_context, tmp_path, unsafe):
     context=native_ai_context
-    context.state_path=context.vault_path
-    output=private_output('result.md' if unsafe=='markdown' else 'result.json')
-    output.write_text('previous')
-    if unsafe=='outside':
-        output=context.vault_path/'outside.json'
-        output.write_text('previous');output.chmod(0o600)
-    elif unsafe=='symlink':
-        note=context.vault_path/'manual.md';note.write_text('manual edit')
-        output.unlink();output.symlink_to(note)
-    elif unsafe=='public_mode':
-        output.chmod(0o644)
-    with pytest.raises(ValueError):
-        cli._publish_private_json(str(output),{'replacement':'unsafe'})
-    assert output.read_text() == ('manual edit' if unsafe=='symlink' else 'previous')
+    from dataclasses import replace
+    from runtime_context import using_runtime_context
+    context = replace(context, state_path=context.vault_path)
+    with using_runtime_context(context):
+        output=private_output('result.md' if unsafe=='markdown' else 'result.json')
+        output.write_text('previous')
+        if unsafe=='outside':
+            output=context.vault_path/'outside.json'
+            output.write_text('previous');output.chmod(0o600)
+        elif unsafe=='symlink':
+            note=context.vault_path/'manual.md';note.write_text('manual edit')
+            output.unlink();output.symlink_to(note)
+        elif unsafe=='public_mode':
+            output.chmod(0o644)
+        with pytest.raises(ValueError):
+            cli._publish_private_json(str(output),{'replacement':'unsafe'})
+        assert output.read_text() == ('manual edit' if unsafe=='symlink' else 'previous')
 
 
-@pytest.mark.parametrize('host,client,requested_model',[('claude','claude-code','sonnet'),
-                                                        ('codex','codex-cli',None)])
 def test_request_binds_actual_host_inline_json_and_revision(
-        native_ai_context,monkeypatch,host,client,requested_model):
+        native_ai_context,monkeypatch,host):
+    client = native_ai_context.client
+    requested_model = 'sonnet' if host == 'claude' else None
     import ai_backend
     from ai_backend import AIResult
-    context=native_ai_context;context.host=host;context.client=client
+    context=native_ai_context
+    assert context.host == host and context.client == client
     context.config.pop("classifier_model", None)
     seen=[]
     def execute(selected,operation,request):
@@ -170,11 +174,12 @@ def test_request_binds_actual_host_inline_json_and_revision(
     assert 'Input JSON:' in request.input and '<input-json-path>' not in request.input
 
 
-@pytest.mark.parametrize('host,client',[('claude','claude-code'),('codex','codex-cli')])
 def test_bound_legacy_orchestrators_keep_context_and_do_not_launch_nested_cli(
-        native_ai_context,monkeypatch,host,client):
+        native_ai_context,monkeypatch,host):
+    client = native_ai_context.client
     import open_item_dedup as dedup
-    context=native_ai_context;context.host=host;context.client=client
+    context=native_ai_context
+    assert context.host == host and context.client == client
     monkeypatch.setattr(dedup,'_check_items_workdir',lambda:pytest.fail('legacy workdir selected'))
     def execute(operation,prompt,payload,model,requested):
         from runtime_context import current_runtime_context
@@ -287,7 +292,8 @@ def test_complete_evidence_changes_cache_namespace(native_ai_context, monkeypatc
     inputs = groups()
     first = cache.build_classifier_provenance(native_ai_context, inputs, {'p':{'commits':['abc']}})
     second = cache.build_classifier_provenance(native_ai_context, inputs, {'p':{'commits':['def']}})
-    assert first['classifier_model_by_id'] == {'one':'claude-haiku-4-5-20251001', 'two':'claude-haiku-4-5-20251001'}
+    selected = 'claude-haiku-4-5-20251001' if native_ai_context.host == 'claude' else 'gpt-native-configured'
+    assert first['classifier_model_by_id'] == {'one': selected, 'two': selected}
     assert cache._provenance(inputs[0], 'p', first) != cache._provenance(inputs[0], 'p', second)
     assert cache._provenance(inputs[0], 'p') is None
 
@@ -302,8 +308,9 @@ def test_actual_model_must_match_approved_cache_selection(native_ai_context, mon
 
 def test_unknown_native_default_never_authorizes_cache_replay(native_ai_context, monkeypatch):
     import check_items_cache as cache
-    native_ai_context.host = 'codex'
-    native_ai_context.client = 'codex-cli'
+    native_ai_context.config.pop('classifier_model', None)
+    native_ai_context.config.pop('codex_ai_model', None)
+    native_ai_context.config.pop('codex_summary_model', None)
     monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
     bundle = cache.build_classifier_provenance(native_ai_context, groups(), {})
     assert bundle['classifier_model_by_id'] == {'one':None, 'two':None}
@@ -313,16 +320,18 @@ def test_unknown_native_default_never_authorizes_cache_replay(native_ai_context,
 def test_claude_alias_remap_never_replays_prior_actual_model(native_ai_context, monkeypatch):
     import hashlib
     import check_items_cache as cache
-    native_ai_context.config.pop('classifier_model')
+    native_ai_context.config.pop('classifier_model', None)
+    native_ai_context.config.pop('codex_ai_model', None)
+    native_ai_context.config.pop('codex_summary_model', None)
     monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
     inputs = [dict(groups()[0], canonical_hash='hash-one', members=[])]
     evidence = {'p':{'commits':['abc']}}
     before = cache.build_classifier_provenance(native_ai_context, inputs, evidence)
     assert before['classifier_model_by_id']['one'] is None
     stored = {'runs':{}}
-    for model in ('claude-haiku-model-A', 'claude-haiku-model-B'):
+    for model in (('claude-haiku-model-A', 'claude-haiku-model-B') if native_ai_context.host == 'claude' else ('gpt-native-model-A', 'gpt-native-model-B')):
         observed = dict(verdict('one'), canonical_hash='hash-one', members=[],
-                        classifier_source='agent', ai_backend='claude', ai_model=model,
+                        classifier_source='agent', ai_backend=native_ai_context.host, ai_model=model,
                         ai_prompt_version='check-items-classifier-v3',
                         ai_prompt_sha256=hashlib.sha256(cli.CLASSIFIER_PROMPT.encode()).hexdigest())
         cache.update_cache(stored, 'p', inputs, [observed], 'head', now=100, provenance=before)
@@ -338,18 +347,15 @@ def test_claude_alias_remap_never_replays_prior_actual_model(native_ai_context, 
         assert cache._provenance(inputs[0], 'p', previous_observation) is None
 
 
-@pytest.mark.parametrize('host,operation,expected', [
-    ('claude', 'classify_items', 'claude-sonnet-4-5-20250929'),
-    ('claude', 'semantic_merge', 'haiku'),
-    ('codex', 'classify_items', None),
-    ('codex', 'semantic_merge', None),
-])
+@pytest.mark.parametrize('operation', ['classify_items', 'semantic_merge'])
 def test_explicit_classifier_model_controls_only_claude_classifier_request(
-        native_ai_context, monkeypatch, host, operation, expected):
+        native_ai_context, monkeypatch, host, operation):
+    expected = (('claude-sonnet-4-5-20250929' if operation == 'classify_items' else 'haiku')
+                if host == 'claude' else None)
     import ai_backend
     from ai_backend import AIResult
     context = native_ai_context
-    context.host = host
+    assert context.host == host
     context.config['classifier_model'] = 'claude-sonnet-4-5-20250929'
     context.config['codex_ai_model'] = 'gpt-native-configured'
     seen = []
@@ -393,13 +399,16 @@ def test_shared_backend_contract_change_invalidates_cache(native_ai_context, mon
 @pytest.mark.parametrize('function', ['merge_groups_semantically', 'classify_groups_with_agent'])
 def test_bound_wrapper_rejects_state_inside_vault_before_private_artifacts(native_ai_context, function):
     import open_item_dedup as dedup
-    native_ai_context.state_path = native_ai_context.vault_path
-    with pytest.raises(ValueError, match='outside'):
-        if function == 'merge_groups_semantically':
-            dedup.merge_groups_semantically(groups())
-        else:
-            dedup.classify_groups_with_agent(groups(), {})
-    assert list(native_ai_context.vault_path.iterdir()) == []
+    from dataclasses import replace
+    from runtime_context import using_runtime_context
+    native_ai_context = replace(native_ai_context, state_path=native_ai_context.vault_path)
+    with using_runtime_context(native_ai_context):
+        with pytest.raises(ValueError, match='outside'):
+            if function == 'merge_groups_semantically':
+                dedup.merge_groups_semantically(groups())
+            else:
+                dedup.classify_groups_with_agent(groups(), {})
+        assert list(native_ai_context.vault_path.iterdir()) == []
 
 
 @pytest.mark.parametrize('failure', ['flush', 'replace'])

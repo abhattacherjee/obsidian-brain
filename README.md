@@ -34,6 +34,18 @@ CC Session Lifecycle
 
 All data flows are **one-directional filesystem writes** — no MCP server, no REST API, no Obsidian plugins required (except Dataview for dashboards). A local SQLite + FTS5 index enables fast full-text search as the vault scales. Works even when Obsidian isn't running.
 
+## Codex parity status
+
+The shared runtime and native analysis adapters are implemented on this branch.
+Full Codex CLI/Desktop parity has not shipped. Native Codex hooks defer capture
+until the current frontend can be bound reliably; Desktop dispatch and the
+final acceptance checks remain unverified. See the
+[acceptance evidence](docs/parity/acceptance-evidence.md).
+
+Shared skills use the loaded plugin's runtime and an explicit invoking host,
+client, and session. Native analysis uses that host's CLI; it does not fall back
+to another host. Existing vault folders, tags, and note types remain compatible.
+
 ## Installation
 
 ### Install

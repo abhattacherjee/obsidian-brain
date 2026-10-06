@@ -1238,7 +1238,7 @@ def _resolve_project_paths() -> dict[str, str]:
 
 
 # Bounds for #264 Task 2's widened git ground truth (tags, changed_paths).
-# Kept small and deterministic — these feed a claude -p prompt payload and an
+# Kept small and deterministic — these feed a native analysis payload and an
 # L2 evidence-text blob, so an unbounded git dump would blow both budgets.
 _MAX_EVIDENCE_TAGS = 20
 _MAX_EVIDENCE_CHANGED_PATHS = 200
@@ -2127,8 +2127,9 @@ def merge_records_from_groups(groups) -> list:
 
 
 def _check_items_workdir():
-    """Return the 0o700 workdir under ~/.claude/obsidian-brain."""
-    p = Path.home() / ".claude" / "obsidian-brain"
+    """Return selected private state or the named legacy compatibility workdir."""
+    from runtime_adapters import private_workdir
+    p = private_workdir()
     p.mkdir(mode=0o700, parents=True, exist_ok=True)
     return p
 
@@ -3171,7 +3172,7 @@ def partition_for_review(classifications, show_all=False):
 def verify_before_edit(file_path: str, line_number: int, expected_text: str) -> bool:
     """
     Re-read target line and compare against expected text BEFORE flipping
-    a checkbox via Edit tool.
+    a checkbox through revision-bound publication.
 
     Strips the checkbox prefix (`- [ ]`, `- [x]`, `- [X]`) and surrounding
     whitespace from the file side before comparing to `expected_text`. The
@@ -3180,7 +3181,7 @@ def verify_before_edit(file_path: str, line_number: int, expected_text: str) -> 
     out-of-range line, or read error.
 
     Memory feedback_open_item_checkoff_verify_before_edit: verification
-    is mandatory before Edit-tool dispatch.
+    is mandatory before publishing a checkoff.
     """
     try:
         with open(file_path, "r", encoding="utf-8") as f:

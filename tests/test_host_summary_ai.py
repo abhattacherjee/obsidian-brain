@@ -7,32 +7,38 @@ import obsidian_utils
 from runtime_context import RuntimeContext, current_runtime_context, using_runtime_context
 
 @pytest.fixture
-def context(tmp_path):
-    return RuntimeContext('codex', 'cli', 'summary-ai-native', tmp_path, tmp_path, None,
-                          tmp_path / 'vault', tmp_path / 'config',
-                          MappingProxyType({'codex_summary_model': 'native-model'}),
-                          tmp_path, tmp_path / 'index', tmp_path / 'state')
+def selected_host_context(selected_host_context, host):
+    from dataclasses import replace
+    selected = replace(selected_host_context, config=MappingProxyType(dict(selected_host_context.config, codex_summary_model='native-model')))
+    with using_runtime_context(selected):
+        yield selected
+
+@pytest.fixture
+def context(selected_host_context):
+    return selected_host_context
 
 def test_helpers_dispatch_only_bound_native_model(context, monkeypatch):
     seen = []
     def execute(ctx, operation, request):
         seen.append((ctx, operation, request))
         data = [{'name': 'Theme', 'summary': 'Theme body'}] if operation == 'theme_names' else '## Summary\nFact.\n'
-        return ai_backend.AIResult('ok', data, request.input_revision, backend='codex', model='actual-native-model')
+        return ai_backend.AIResult('ok', data, request.input_revision, backend=context.host, model='actual-native-model')
     monkeypatch.setattr(ai_backend, 'execute_ai', execute)
     with using_runtime_context(context):
         assert obsidian_utils.generate_snapshot_summary(['ask'], ['answer'], {'input_revision': 'capture-sha'}, model='haiku')[1] is None
         assert obsidian_utils.generate_theme_names([{'top_terms': ['x'], 'sample_titles': ['title']}], model='sonnet')[1] is None
         assert obsidian_utils.generate_summary(['ask'], ['answer'], {'input_revision': 'capture-sha'}, model='opus')[1] is None
-        assert obsidian_utils._escalation_models('haiku') == ['haiku']
+        assert obsidian_utils._escalation_models('haiku') == (['haiku'] if context.host == 'codex' else ['haiku', 'sonnet', 'opus'])
     assert [item[1] for item in seen] == ['snapshot_summary', 'theme_names', 'session_summary']
-    assert all(item[0] is context and item[2].model == 'native-model' for item in seen)
+    assert all(item[0] is context for item in seen)
+    assert [item[2].model for item in seen] == (['native-model'] * 3 if context.host == 'codex' else ['haiku', 'sonnet', 'opus'])
     assert seen[0][2].input_revision == seen[2][2].input_revision == 'capture-sha'
     assert seen[1][2].input_revision
 
-def test_no_context_cannot_invoke_backend(monkeypatch):
+def test_no_context_cannot_invoke_backend(selected_host_context, monkeypatch):
     monkeypatch.setattr(ai_backend, 'execute_ai', lambda *args: pytest.fail('backend must not run'))
-    assert obsidian_utils.generate_theme_names([{'top_terms': ['x'], 'sample_titles': []}])[0] is None
+    with using_runtime_context(None):
+        assert obsidian_utils.generate_theme_names([{'top_terms': ['x'], 'sample_titles': []}])[0] is None
 
 def test_parallel_upgrades_copy_native_context_per_worker(context, monkeypatch):
     seen = []
@@ -47,14 +53,11 @@ def test_parallel_upgrades_copy_native_context_per_worker(context, monkeypatch):
     assert len(seen) == 3 and all(item is context for item in seen)
     assert all(item['model_used'] == 'actual-native-model' for item in results)
 
-@pytest.mark.parametrize('host,requested,selected', [
-    ('claude', 'haiku', 'haiku'),
-    ('codex', 'haiku', 'native-model'),
-    ('codex', 'opus', 'native-model'),
-])
-def test_observed_model_does_not_become_requested_alias(context, monkeypatch, host, requested, selected):
-    from dataclasses import replace
-    bound = replace(context, host=host)
+@pytest.mark.parametrize('requested', ['haiku', 'opus'])
+def test_observed_model_does_not_become_requested_alias(context, monkeypatch, requested):
+    host = context.host
+    bound = context
+    selected = 'native-model' if host == 'codex' else requested
     requests = []
     def execute(ctx, operation, request):
         requests.append(request)
@@ -95,7 +98,7 @@ def test_batch_adapter_preserves_indexes_and_source_revision(context, monkeypatc
     def execute(ctx, operation, request):
         requests.append((operation, request))
         return ai_backend.AIResult('ok', {2: 'Second.', 1: 'First.'}, request.input_revision,
-                                   backend='codex', model='observed-model')
+                                   backend=context.host, model='observed-model')
     monkeypatch.setattr(ai_backend, 'execute_ai', execute)
     with using_runtime_context(context):
         result = obsidian_utils._execute_summary_ai('Batch input', 'session_summaries', 'haiku', 10,
@@ -114,5 +117,5 @@ def test_timeout_clears_previous_model_and_retains_native_host(context, monkeypa
         with pytest.raises(subprocess.TimeoutExpired) as failure:
             obsidian_utils._execute_summary_ai('Input', 'session_summary', 'haiku', 7)
         assert obsidian_utils._SUMMARY_NATIVE_MODEL.get() is None
-    assert failure.value.cmd == ['codex']
+    assert failure.value.cmd == [context.host]
     assert failure.value.timeout == 7
