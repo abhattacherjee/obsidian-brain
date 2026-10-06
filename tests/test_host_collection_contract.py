@@ -54,8 +54,19 @@ def _collect(tmp_path, test_source, fixture_source='', helper_files=None,
     for name in ('OBSIDIAN_BRAIN_CONFIG', 'OBSIDIAN_BRAIN_STATE_DIR', 'OBSIDIAN_BRAIN_DB',
                  'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
         env.pop(name, None)
-    return subprocess.run(command,stdin=subprocess.DEVNULL,capture_output=True,text=True,
-                          timeout=10,cwd=tmp_path,env=env)
+    # Full-suite coverage starts and flushes measured child processes. Keep
+    # this orchestration bound separate from production hook deadlines.
+    try:
+        return subprocess.run(command,stdin=subprocess.DEVNULL,capture_output=True,text=True,
+                              timeout=60,cwd=tmp_path,env=env)
+    except subprocess.TimeoutExpired as exc:
+        def tail(value):
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            return (value or "")[-4000:]
+        pytest.fail("Scratch pytest exceeded its 60s deadline.\nstdout:\n"
+                    + tail(exc.stdout) + "\nstderr:\n" + tail(exc.stderr),
+                    pytrace=False)
 
 
 def test_unannotated_new_writer_fails_collection(tmp_path):
@@ -310,3 +321,17 @@ def test_only_actual_ai_service_can_return_context_required(selected_host_contex
                                            ai_backend.AIResult('complete', error_code='context_required'))
     assert not _actual_ai_context_rejection(actual, 'ai_backend.execute_ai', None,
                                            ai_backend.AIResult('unavailable', error_code='transport_error'))
+
+
+def test_scratch_timeout_reports_bounded_child_output(tmp_path, monkeypatch):
+    def timed_out(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"],
+            output=b"x" * 5000 + b"child stdout tail",
+            stderr=b"y" * 5000 + b"child stderr tail")
+    monkeypatch.setattr(subprocess, "run", timed_out)
+    with pytest.raises(pytest.fail.Exception) as failure:
+        _collect(tmp_path, "def test_value():\n    assert True\n")
+    diagnostic = str(failure.value)
+    assert "exceeded its 60s deadline" in diagnostic
+    assert "child stdout tail" in diagnostic and "child stderr tail" in diagnostic
+    assert "x" * 4001 not in diagnostic and "y" * 4001 not in diagnostic

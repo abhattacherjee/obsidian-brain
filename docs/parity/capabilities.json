@@ -1300,8 +1300,8 @@
     },
     {
       "source": "tests/test_host_collection_contract.py",
-      "expression": "subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10, cwd=tmp_path, env=env)",
-      "source_sha256": "b5307a858ab07adeb8423904304c52785b3d2e8d92159afa9600fcdd4924bcac",
+      "expression": "subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, cwd=tmp_path, env=env)",
+      "source_sha256": "a80a033d0c7a9c029c273837ca32167d367df4ef23029810cee795574dbda0c5",
       "scope": "structural",
       "reason": "Isolated pytest collection negative controls; validates the contract gate itself without a native plugin invocation."
     },

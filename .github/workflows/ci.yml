@@ -65,8 +65,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Install pytest and coverage
-        run: pip install pytest pytest-cov
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
       - name: Run tests with coverage
         run: pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90
 
@@ -82,8 +82,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.9'
-      - name: Install pytest
-        run: pip install pytest
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
       - name: Run tests on Python 3.9
         run: pytest tests/ -q --tb=short
 
