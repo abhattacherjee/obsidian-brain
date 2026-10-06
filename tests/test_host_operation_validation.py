@@ -25,7 +25,8 @@ def context(tmp_path):
     ('answer.txt', b'{}', 'artifact name'),
     ('answer.json', {'unencoded': True}, 'artifact content'),
     ('answer.json', b'x' * 4_000_001, 'artifact content'),
-])
+], ids=['managed-manifest', 'path-traversal', 'wrong-extension',
+        'unencoded-content', 'oversized-content'])
 def test_invalid_publication_never_registers_artifacts(context, name, content, error):
     operation_id, directory = state.operation_directory(context)
     with pytest.raises(ValueError, match=error):

@@ -461,6 +461,14 @@ def _scope(item, capabilities, launchers=(), errors=None):
 
 
 def pytest_collection_modifyitems(config, items):
+    # Large automatic IDs can stall CI logs and overflow Linux subprocess env.
+    for item in items:
+        if len(item.nodeid.encode('utf-8')) > 4096:
+            # Pytest prints collected items even when this hook raises.
+            items.clear()
+            raise pytest.UsageError(
+                f'{item.nodeid[:160]}: test ID exceeds 4096 bytes; '
+                'give large parameters explicit short ids.')
     path = config.getoption('--parity-matrix')
     if not path:
         raise pytest.UsageError('Parity capability matrix is required for collection.')

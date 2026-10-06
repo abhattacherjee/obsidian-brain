@@ -71,6 +71,43 @@ def _collect(tmp_path, test_source, fixture_source='', helper_files=None,
                     pytrace=False)
 
 
+def test_oversized_test_id_fails_before_verbose_output(tmp_path):
+    source = ('@pytest.mark.parametrize("value", [b"x" * 20_000])\n'
+              'def test_large(value):\n    assert len(value) == 20_000\n')
+    result = _collect(tmp_path, source)
+    assert result.returncode != 0
+    assert 'test ID exceeds 4096 bytes' in result.stderr
+    assert len(result.stdout + result.stderr) < 4096
+
+
+def test_explicit_short_id_keeps_large_payload_executable(tmp_path):
+    source = ('@pytest.mark.parametrize("value", [b"x" * 20_000], ids=["large-payload"])\n'
+              'def test_large(value):\n    assert len(value) == 20_000\n')
+    result = _collect(tmp_path, source, execute=True)
+    assert result.returncode == 0
+    assert '1 passed' in result.stdout
+    assert len(result.stdout + result.stderr) < 4096
+
+
+@pytest.mark.parametrize('byte_length', [4096, 4097])
+def test_test_id_limit_counts_utf8_bytes_at_boundary(tmp_path, byte_length):
+    prefix = 'test_case.py::test_boundary['
+    parameter_id = '\u00e9' + 'x' * (byte_length - len(prefix.encode('utf-8')) - 3)
+    nodeid = prefix + parameter_id + ']'
+    assert len(nodeid.encode('utf-8')) == byte_length
+    source = ('@pytest.mark.parametrize("value", [1], ids=[' + repr(parameter_id) + '])\n'
+              'def test_boundary(value):\n    assert value == 1\n')
+    result = _collect(tmp_path, source, helper_files={
+        'pytest.ini': '[pytest]\ndisable_test_id_escaping_and_forfeit_all_rights_to_community_support = True\n'})
+    if byte_length == 4096:
+        assert result.returncode == 0
+        assert nodeid in result.stdout
+    else:
+        assert result.returncode != 0
+        assert 'test ID exceeds 4096 bytes' in result.stderr
+        assert len(result.stdout + result.stderr) < 4096
+
+
 def test_unannotated_new_writer_fails_collection(tmp_path):
     result = _collect(tmp_path,'def test_new():\n    apply_mutations(ctx, edits)\n')
     assert result.returncode != 0 and 'needs host fixture' in result.stderr
